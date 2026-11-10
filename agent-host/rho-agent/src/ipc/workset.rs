@@ -37,21 +37,6 @@ pub enum Attach {
     Shell {
         agent: rho_agent_types::AgentId,
     },
-    /// One end of a GCCP byte stream; the port then runs
-    /// [`crate::ipc::stream::pipe`].
-    Stream(StreamEnd),
-}
-
-/// What the workset process joins a byte stream to.
-#[derive(Encode, Decode)]
-pub enum StreamEnd {
-    /// The Unix socket at `path`, which an agent opened as a service: the
-    /// workset process connects to it.
-    Service { path: String },
-    /// A connection that a forward of the workset process accepted, and
-    /// asked the host to open a stream for
-    /// ([`PyRequest::ExternalOpen`]).
-    Accepted(u64),
 }
 
 #[derive(Encode, Decode)]
@@ -60,8 +45,13 @@ pub enum Reply {
     Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
     Shells(Vec<rho_shell_view::protocol::ShellInfo>),
     Error(String),
-    Desktop { socket: String },
+    Desktop {
+        socket: String,
+    },
     DesktopSessions(Vec<rho_desktop_client::protocol::DesktopSession>),
+    /// The answer to [`Message::Connect`]: the connected socket's
+    /// descriptor comes with the packet.
+    Socket,
 }
 
 /// What the workset's Python asks of the agent host (`_rho`).
@@ -177,14 +167,14 @@ pub(crate) enum PyRequest {
         peer: String,
         service: String,
     },
-    /// A forward of the agent's accepted the connection `conn`: open a byte
-    /// stream to `service` at `peer` and attach it
-    /// ([`StreamEnd::Accepted`]). `Done` once it is attached.
+    /// A forward of the agent's accepted a connection, whose descriptor
+    /// comes with the request: open a byte stream to `service` at `peer`
+    /// and join the two. `Done` once they are joined; the host closes the
+    /// connection otherwise.
     ExternalOpen {
         agent: rho_agent_types::AgentId,
         peer: String,
         service: String,
-        conn: u64,
     },
 }
 
@@ -251,6 +241,14 @@ pub(crate) enum Message {
         id: u64,
         output: String,
         error: Option<String>,
+    },
+    /// Host to worker: connect to the Unix socket at `path`, which an
+    /// agent of the workset opened as a service, and answer with
+    /// [`Reply::Socket`] and the socket. The workset process does it
+    /// because the path is the workset's: the host may not see that file.
+    Connect {
+        id: u64,
+        path: String,
     },
 }
 

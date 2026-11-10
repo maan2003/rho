@@ -58,7 +58,7 @@ pub fn pair() -> (Endpoint, Endpoint) {
             tokio::select! {
                 _ = incoming.closed() => {}
                 _ = async {
-                    while let Ok(packet) = receiver.next().await {
+                    while let Ok((packet, _)) = receiver.next().await {
                         if incoming.send(packet).is_err() { break; }
                     }
                 } => {}
@@ -150,7 +150,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
             .keep()
             .unwrap();
         std::fs::write(&init, TEST_POLICY).unwrap();
-        let call: crate::worker::python::HostCall = std::sync::Arc::new(|request| {
+        let call: crate::worker::python::HostCall = std::sync::Arc::new(|request, _socket| {
             Box::pin(async move {
                 let db = |agent| {
                     AGENTS

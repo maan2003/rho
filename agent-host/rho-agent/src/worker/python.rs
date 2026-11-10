@@ -32,9 +32,14 @@ use crate::record::{AgentSpec, Runtime};
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How `_rho` reaches the agent host: over the workset port, or a test's
-/// stand-in.
+/// stand-in. A request may take a socket with it, as a descriptor.
 pub(crate) type HostCall = Arc<
-    dyn Fn(PyRequest) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>> + Send + Sync,
+    dyn Fn(
+            PyRequest,
+            Option<std::os::fd::OwnedFd>,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<PyReply>>
+        + Send
+        + Sync,
 >;
 
 /// The workset process's link to the agent host for `_rho`.
@@ -63,15 +68,17 @@ impl PyHost {
         isolated: bool,
         streams: Arc<super::streams::Streams>,
     ) -> Self {
-        let call: HostCall = Arc::new(move |request| {
+        let call: HostCall = Arc::new(move |request, socket| {
             let sender = sender.clone();
             Box::pin(async move {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
                 let (reply, answer) = oneshot::channel();
                 PENDING.lock().expect("poison").insert(id, reply);
-                let sent = sender
-                    .send(Port::Workset, encode(&Message::Python { id, request })?)
-                    .await;
+                let message = encode(&Message::Python { id, request })?;
+                let sent = match socket {
+                    Some(socket) => sender.send_with_fd(Port::Workset, message, socket).await,
+                    None => sender.send(Port::Workset, message).await,
+                };
                 if let Err(error) = sent {
                     PENDING.lock().expect("poison").remove(&id);
                     return Err(error.into());
@@ -91,7 +98,16 @@ impl PyHost {
     }
 
     async fn call(&self, request: PyRequest) -> anyhow::Result<PyReply> {
-        match (self.call)(request).await? {
+        self.call_with(request, None).await
+    }
+
+    /// [`PyHost::call`], with a socket for the host to have.
+    async fn call_with(
+        &self,
+        request: PyRequest,
+        socket: Option<std::os::fd::OwnedFd>,
+    ) -> anyhow::Result<PyReply> {
+        match (self.call)(request, socket).await? {
             PyReply::Error(error) => Err(anyhow::anyhow!(error)),
             reply => Ok(reply),
         }
@@ -815,14 +831,13 @@ fn external_connect(agent: &str, address: String, service: String, path: String)
         .parse::<rho_agent_types::ServiceName>()
         .map_err(invalid)?;
     let host = host()?;
-    let open: super::streams::Open = Arc::new(move |conn| {
+    let open: super::streams::Open = Arc::new(move |socket| {
         let request = PyRequest::ExternalOpen {
             agent,
             peer: address.clone(),
             service: service.clone(),
-            conn,
         };
-        Box::pin(async move { host.call(request).await.map(|_| ()) })
+        Box::pin(async move { host.call_with(request, Some(socket)).await.map(|_| ()) })
     });
     // A listener belongs to the runtime it was made in.
     let _runtime = host.runtime.enter();

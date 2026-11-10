@@ -4,14 +4,16 @@
 //! of one clanker's to a socket of another's. Both sockets are the
 //! workset's: it is the workset process that connects to a service an agent
 //! opened, and that listens where an agent wants a service of another
-//! host's to appear. The host only carries the bytes
-//! ([`crate::ipc::stream`]), so a socket is reached as the agents reach it,
-//! in the workset's view of the files.
+//! host's to appear, so a socket is reached as the agents reach it, in the
+//! workset's view of the files. Each connected socket then goes to the
+//! host as a descriptor ([`crate::ipc::transport::Sender::send_with_fd`]),
+//! and the host carries the bytes between it and the other harness: no
+//! byte of a stream passes through this process.
 
 use std::collections::HashMap;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -23,22 +25,23 @@ pub(crate) struct Streams {
     root: PathBuf,
     /// The forwards, by the path each listens at.
     forwards: Mutex<HashMap<PathBuf, tokio::task::JoinHandle<()>>>,
-    /// The connections the forwards accepted, each until the host has a
-    /// stream for it.
-    accepted: Mutex<HashMap<u64, UnixStream>>,
-    next: AtomicU64,
 }
 
-/// Asks the host for a stream for the accepted connection of that id.
-pub(crate) type Open = Arc<dyn Fn(u64) -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
+/// Gives the host a connection that a forward accepted, to join to a
+/// stream. The host closes one that it gets no stream for, which is all
+/// its client learns.
+pub(crate) type Open = Arc<dyn Fn(OwnedFd) -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
+
+/// A connected socket as the descriptor the host gets.
+fn descriptor(socket: UnixStream) -> io::Result<OwnedFd> {
+    Ok(socket.into_std()?.into())
+}
 
 impl Streams {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             forwards: Mutex::default(),
-            accepted: Mutex::default(),
-            next: AtomicU64::new(1),
         }
     }
 
@@ -78,19 +81,20 @@ impl Streams {
         Ok(resolved)
     }
 
-    /// Connects to the service socket at `path`.
-    pub(crate) async fn service(&self, path: &str) -> anyhow::Result<UnixStream> {
+    /// Connects to the service socket at `path`, for the host.
+    pub(crate) async fn service(&self, path: &str) -> anyhow::Result<OwnedFd> {
         let resolved = self.inside(Path::new(path))?;
-        UnixStream::connect(&resolved)
+        let socket = UnixStream::connect(&resolved)
             .await
-            .with_context(|| format!("connecting to {path}"))
+            .with_context(|| format!("connecting to {path}"))?;
+        Ok(descriptor(socket)?)
     }
 
-    /// Listens at `path`, and has `open` get a stream for each connection.
+    /// Listens at `path`, and gives each connection to `open`.
     /// A forward that listened there already ends, and so does a socket
     /// file that nothing listens at: the forward of a workset process that
     /// is gone leaves one.
-    pub(crate) fn forward(self: &Arc<Self>, path: &Path, open: Open) -> anyhow::Result<()> {
+    pub(crate) fn forward(&self, path: &Path, open: Open) -> anyhow::Result<()> {
         let shown = path.display();
         anyhow::ensure!(path.is_absolute(), "{shown} is not an absolute path");
         let mut forwards = self.forwards.lock().expect("poison");
@@ -103,12 +107,12 @@ impl Streams {
             let _ = std::fs::remove_file(path);
         }
         let listener = UnixListener::bind(path).with_context(|| format!("listening at {shown}"))?;
-        let streams = self.clone();
         let at = path.to_owned();
         let accepting = tokio::spawn(async move {
             loop {
-                let socket = match listener.accept().await {
-                    Ok((socket, _)) => socket,
+                let accepted = listener.accept().await;
+                let socket = match accepted.and_then(|(socket, _)| descriptor(socket)) {
+                    Ok(socket) => socket,
                     Err(error) => {
                         eprintln!("rho-agent: forward at {}: {error}", at.display());
                         // Out of file descriptors, most likely: not at once
@@ -117,19 +121,9 @@ impl Streams {
                         continue;
                     }
                 };
-                let conn = streams.next.fetch_add(1, Ordering::Relaxed);
-                streams
-                    .accepted
-                    .lock()
-                    .expect("poison")
-                    .insert(conn, socket);
-                let (streams, open, at) = (streams.clone(), open.clone(), at.clone());
+                let (open, at) = (open.clone(), at.clone());
                 tokio::spawn(async move {
-                    let opened = open(conn).await;
-                    // Taken if the host attached a stream. Otherwise it
-                    // closes here, which is all its client learns.
-                    streams.accepted.lock().expect("poison").remove(&conn);
-                    if let Err(error) = opened {
+                    if let Err(error) = open(socket).await {
                         eprintln!("rho-agent: forward at {}: {error:#}", at.display());
                     }
                 });
@@ -137,15 +131,6 @@ impl Streams {
         });
         forwards.insert(path.to_owned(), accepting);
         Ok(())
-    }
-
-    /// The connection a forward accepted under `conn`, once.
-    pub(crate) fn take(&self, conn: u64) -> anyhow::Result<UnixStream> {
-        self.accepted
-            .lock()
-            .expect("poison")
-            .remove(&conn)
-            .context("the connection is gone")
     }
 }
 
@@ -196,49 +181,79 @@ mod tests {
         }
     }
 
-    /// A forward hands each connection it accepts to the host under an id
-    /// of its own, which takes it once. A connection the host got no stream
-    /// for closes. The path is taken over from a forward that is replaced
-    /// and from one that died, and not from someone who listens.
+    /// A forward gives each connection it accepts to the host, as the
+    /// socket itself. A connection the host drops closes. The path is taken
+    /// over from a forward that is replaced and from one that died, and not
+    /// from someone who listens.
     #[tokio::test]
-    async fn a_forward_gives_each_connection_to_the_host_once() {
-        use tokio::io::AsyncReadExt as _;
+    async fn a_forward_gives_each_connection_to_the_host() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("there.sock");
         let streams = Arc::new(Streams::new(dir.path()));
         let (opened, mut opens) = tokio::sync::mpsc::unbounded_channel();
-        let open = |label: &'static str, attach: bool| -> Open {
+        let open = |label: &'static str| -> Open {
             let opened = opened.clone();
-            Arc::new(move |conn| {
-                let _ = opened.send((label, conn));
-                Box::pin(async move {
-                    anyhow::ensure!(attach, "refused");
-                    Ok(())
-                })
+            Arc::new(move |socket| {
+                let _ = opened.send((label, socket));
+                Box::pin(async { Ok(()) })
             })
         };
 
         // Somebody else listens: the path is theirs.
         let theirs = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(streams.forward(&path, open("first", true)).is_err());
+        assert!(streams.forward(&path, open("first")).is_err());
         // They died and left the file.
         drop(theirs);
         assert!(path.exists());
-        streams.forward(&path, open("first", false)).unwrap();
+        streams.forward(&path, open("first")).unwrap();
 
-        // No stream: the client's connection closes.
+        // What the host gets is the other end of the client's connection.
         let mut client = UnixStream::connect(&path).await.unwrap();
-        let (label, conn) = opens.recv().await.unwrap();
+        let (label, socket) = opens.recv().await.unwrap();
         assert_eq!(label, "first");
-        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
-        assert!(streams.take(conn).is_err());
+        let socket = std::os::unix::net::UnixStream::from(socket);
+        let mut hosts = UnixStream::from_std(socket).unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut ping = [0; 4];
+        hosts.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"ping");
+        // The host is all that holds it: dropped there, it closes here.
+        drop(hosts);
+        assert_eq!(client.read(&mut ping).await.unwrap(), 0);
 
         // Replaced: connections go to the new forward only.
-        streams.forward(&path, open("second", true)).unwrap();
+        streams.forward(&path, open("second")).unwrap();
         let _client = UnixStream::connect(&path).await.unwrap();
-        let (label, second) = opens.recv().await.unwrap();
-        assert_eq!(label, "second");
-        assert_ne!(second, conn);
+        assert_eq!(opens.recv().await.unwrap().0, "second");
+    }
+
+    /// The socket of a service is connected for the host, and only if its
+    /// path is in the workset.
+    #[tokio::test]
+    async fn a_service_is_connected_for_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workset");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = UnixListener::bind(root.join("web.sock")).unwrap();
+        let _outside = UnixListener::bind(dir.path().join("host.sock")).unwrap();
+        let streams = Streams::new(&root);
+        let path = |path: std::path::PathBuf| path.to_str().unwrap().to_owned();
+
+        streams.service(&path(root.join("web.sock"))).await.unwrap();
+        inside.accept().await.unwrap();
+        assert!(
+            streams
+                .service(&path(dir.path().join("host.sock")))
+                .await
+                .is_err()
+        );
+        assert!(
+            streams
+                .service(&path(root.join("later.sock")))
+                .await
+                .is_err()
+        );
     }
 }

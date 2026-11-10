@@ -1156,13 +1156,13 @@ impl AgentPool {
     /// What answers a workset's `_rho` calls.
     fn python_handler(self: &Arc<Self>, workset: WorksetId) -> crate::host::process::PythonHandler {
         let pool = Arc::downgrade(self);
-        Arc::new(move |request| {
+        Arc::new(move |request, socket| {
             let pool = pool.clone();
             Box::pin(async move {
                 let Some(pool) = pool.upgrade() else {
                     return PyReply::Error("the agent host is shutting down".into());
                 };
-                pool.python(workset, request)
+                pool.python(workset, request, socket)
                     .await
                     .unwrap_or_else(|error| PyReply::Error(format!("{error:#}")))
             })
@@ -1181,10 +1181,13 @@ impl AgentPool {
         Ok(head.spec)
     }
 
+    /// Answers one `_rho` call of a workset. `socket` is the descriptor
+    /// that came with the request, for the one request that takes one.
     async fn python(
         self: &Arc<Self>,
         workset: WorksetId,
         request: PyRequest,
+        socket: Option<std::os::fd::OwnedFd>,
     ) -> anyhow::Result<PyReply> {
         Ok(match request {
             PyRequest::CreateAgent(spec) => {
@@ -1457,11 +1460,9 @@ impl AgentPool {
                 agent,
                 peer,
                 service,
-                conn,
             } => {
                 self.own_agent(workset, agent)?;
-                self.external_open(workset, agent, &peer, &service, conn)
-                    .await?;
+                self.external_open(agent, &peer, &service, socket).await?;
                 PyReply::Done
             }
         })

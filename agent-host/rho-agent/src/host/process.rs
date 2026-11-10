@@ -19,7 +19,10 @@ pub(crate) type AgentRoute = mpsc::UnboundedSender<(transport::Packet, Arc<()>)>
 
 /// Answers the workset's `_rho` calls; the pool's, bound to the workset.
 pub(crate) type PythonHandler = Arc<
-    dyn Fn(workset::PyRequest) -> futures::future::BoxFuture<'static, workset::PyReply>
+    dyn Fn(
+            workset::PyRequest,
+            Option<std::os::fd::OwnedFd>,
+        ) -> futures::future::BoxFuture<'static, workset::PyReply>
         + Send
         + Sync,
 >;
@@ -96,8 +99,28 @@ impl Process {
     pub async fn action(&self, action: workset::Action) -> anyhow::Result<workset::Reply> {
         let admission = self.admission.clone().read_owned().await;
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.request(id, workset::Message::Action { id, action }, Some(admission))
-            .await
+        let (reply, _) = self
+            .request(id, workset::Message::Action { id, action }, Some(admission))
+            .await?;
+        Ok(reply)
+    }
+
+    /// Has the workset process connect to the Unix socket at `path`, which
+    /// an agent of the workset opened as a service: the connected socket.
+    ///
+    /// Only for a process that knows the request, which one that opened a
+    /// service does.
+    pub(crate) async fn connect_service(
+        &self,
+        path: String,
+    ) -> anyhow::Result<std::os::fd::OwnedFd> {
+        let admission = self.admission.clone().read_owned().await;
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let message = workset::Message::Connect { id, path };
+        match self.request(id, message, Some(admission)).await? {
+            (workset::Reply::Socket, Some(socket)) => Ok(socket),
+            _ => anyhow::bail!("unexpected workset reply"),
+        }
     }
 
     /// Whether nothing but its agents runs in the workset: no terminal or
@@ -113,8 +136,8 @@ impl Process {
                 .request(id, workset::Message::Action { id, action }, None)
                 .await?
             {
-                workset::Reply::Terminals(terminals) => terminals.is_empty(),
-                workset::Reply::Shells(shells) => shells.is_empty(),
+                (workset::Reply::Terminals(terminals), _) => terminals.is_empty(),
+                (workset::Reply::Shells(shells), _) => shells.is_empty(),
                 _ => anyhow::bail!("unexpected workset reply"),
             };
             if !empty {
@@ -129,7 +152,7 @@ impl Process {
         id: u64,
         message: workset::Message,
         admission: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    ) -> anyhow::Result<workset::Reply> {
+    ) -> anyhow::Result<(workset::Reply, Option<std::os::fd::OwnedFd>)> {
         anyhow::ensure!(!*self.closed.borrow(), "workset process closed");
         let (reply, response) = oneshot::channel();
         self.pending
@@ -141,7 +164,7 @@ impl Process {
             anyhow::bail!("workset process closed");
         }
         match response.await.context("workset process closed")? {
-            workset::Reply::Error(error) => anyhow::bail!(error),
+            (workset::Reply::Error(error), _) => anyhow::bail!(error),
             reply => Ok(reply),
         }
     }
@@ -170,7 +193,6 @@ impl Process {
         let port = match &attach {
             workset::Attach::Terminal { .. } => transport::Port::Terminal(id),
             workset::Attach::Shell { .. } => transport::Port::Shell(id),
-            workset::Attach::Stream(_) => transport::Port::Stream(id),
         };
         let (send, incoming) = mpsc::channel(32);
         self.clients.lock().expect("poison").insert(port, send);
@@ -509,7 +531,7 @@ impl Process {
                     } => result,
                     result = async {
                         // Only a request carries a live in-flight token.
-                        let route = |packet: transport::Packet, token: Arc<()>| -> anyhow::Result<()> {
+                        let route = |(packet, fd): transport::Received, token: Arc<()>| -> anyhow::Result<()> {
                             match packet.port {
                                 transport::Port::Agent(id) => {
                                     let routes = routes.lock().expect("poison");
@@ -521,7 +543,7 @@ impl Process {
                                 transport::Port::Workset => {
                                     match workset::decode(&packet.bytes)? {
                                         workset::Message::Reply { id, body } => {
-                                            if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send(body); }
+                                            if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send((body, fd)); }
                                         }
                                         workset::Message::Policy(message) => {
                                             policy_incoming.try_send((message, token)).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
@@ -531,7 +553,7 @@ impl Process {
                                         }
                                         workset::Message::Python { id, request } => {
                                             // The reply carries the request's token: a handoff waits for it.
-                                            let answer = python(request);
+                                            let answer = python(request, fd);
                                             let replies = python_replies.clone();
                                             tokio::spawn(async move {
                                                 let body = answer.await;
@@ -544,7 +566,7 @@ impl Process {
                                         _ => anyhow::bail!("unexpected workset reply"),
                                     }
                                 }
-                                port @ (transport::Port::Terminal(_) | transport::Port::Shell(_) | transport::Port::Stream(_)) => {
+                                port @ (transport::Port::Terminal(_) | transport::Port::Shell(_)) => {
                                     let mut clients = client_routes.lock().expect("poison");
                                     if packet.bytes.is_empty() {
                                         clients.remove(&port);
@@ -732,7 +754,7 @@ mod tests {
     use crate::ipc::protocol::{Message, Request};
 
     fn no_python() -> PythonHandler {
-        Arc::new(|_| Box::pin(async { workset::PyReply::Error("no Python here".into()) }))
+        Arc::new(|_, _| Box::pin(async { workset::PyReply::Error("no Python here".into()) }))
     }
 
     fn frame(message: &Message<'_>) -> Bytes {
@@ -834,6 +856,140 @@ mod tests {
             }
         }
         assert_eq!((requests, answers), (vec![2, 3], vec![9]));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A socket that a worker sends arrives with the request it was sent
+    /// with, and with the reply it was sent with, and with no other
+    /// packet. One that is sent while the host hands over is read by the
+    /// successor, with its request.
+    #[tokio::test]
+    async fn a_socket_arrives_with_its_request_or_reply_also_across_a_handoff() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream as Pipe;
+
+        let (host_end, worker) = Pipe::pair().unwrap();
+        let (host_requests, worker_requests) = Pipe::pair().unwrap();
+        let (worker, mut worker_receiver) = worker_end(worker);
+        let (worker_requests, _worker_answers) = worker_end(worker_requests);
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let inference = crate::inference::testing::accounts();
+        let agent = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        // What the host's Python handler got: the service a request named,
+        // and the mark read from the socket that came with it.
+        let (seen, mut requests) = mpsc::unbounded_channel();
+        let python: PythonHandler = Arc::new(move |request, socket| {
+            let service = match request {
+                workset::PyRequest::ExternalOpen { service, .. } => service,
+                _ => "other".to_owned(),
+            };
+            let mark = socket.map(|socket| {
+                let mut mark = [0];
+                Pipe::from(socket).read_exact(&mut mark).unwrap();
+                mark[0]
+            });
+            seen.send((service, mark)).unwrap();
+            Box::pin(async { workset::PyReply::Done })
+        });
+        // A socket whose other end has written `mark` and stays open.
+        let mut kept = Vec::new();
+        let mut marked = |mark: u8| -> std::os::fd::OwnedFd {
+            let (mut ours, theirs) = Pipe::pair().unwrap();
+            ours.write_all(&[mark]).unwrap();
+            kept.push(ours);
+            theirs.into()
+        };
+        let open = |id, service: &str| {
+            let request = workset::PyRequest::ExternalOpen {
+                agent,
+                peer: String::new(),
+                service: service.to_owned(),
+            };
+            workset::encode(&workset::Message::Python { id, request }).unwrap()
+        };
+        let plain = |id| {
+            let request = workset::PyRequest::Agents;
+            workset::encode(&workset::Message::Python { id, request }).unwrap()
+        };
+        let port = transport::Port::Workset;
+
+        let old = Process::connect(
+            &inference,
+            host_end.try_clone().unwrap(),
+            host_requests.try_clone().unwrap(),
+            Worker::open(child.id()).unwrap(),
+            None,
+            1,
+            Default::default(),
+            false,
+            python.clone(),
+        )
+        .await
+        .unwrap();
+        old.resume();
+        worker_requests.send(port, plain(1)).await.unwrap();
+        worker_requests
+            .send_with_fd(port, open(2, "a"), marked(2))
+            .await
+            .unwrap();
+        worker_requests.send(port, plain(3)).await.unwrap();
+        for expected in [("other", None), ("a", Some(2)), ("other", None)] {
+            let (service, mark) = requests.recv().await.unwrap();
+            assert_eq!((service.as_str(), mark), expected);
+        }
+
+        // The host asks the worker to connect a service, and the socket
+        // comes with the reply, while other replies come without one.
+        let connecting = tokio::spawn({
+            let old = old.clone();
+            async move { old.connect_service("/src/web.sock".to_owned()).await }
+        });
+        let (packet, _) = worker_receiver.next().await.unwrap();
+        let workset::Message::Connect { id, path } = workset::decode(&packet.bytes).unwrap() else {
+            panic!("the worker was not asked to connect");
+        };
+        assert_eq!(path, "/src/web.sock");
+        let body = workset::Reply::Socket;
+        let reply = workset::encode(&workset::Message::Reply { id, body }).unwrap();
+        worker.send_with_fd(port, reply, marked(4)).await.unwrap();
+        let mut connected = Pipe::from(connecting.await.unwrap().unwrap());
+        let mut mark = [0];
+        connected.read_exact(&mut mark).unwrap();
+        assert_eq!(mark, [4]);
+
+        old.stop_requests().await.unwrap();
+        worker_requests
+            .send_with_fd(port, open(5, "b"), marked(5))
+            .await
+            .unwrap();
+        worker_requests.send(port, plain(6)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(requests.try_recv().is_err(), "requests wait unread");
+        old.stop_reading().await.unwrap();
+        let handed = old.hand(rho_agent_types::WorksetId([1; 6])).await.unwrap();
+
+        let new = Process::connect(
+            &inference,
+            host_end,
+            host_requests,
+            Worker::open(child.id()).unwrap(),
+            None,
+            handed.next,
+            Default::default(),
+            false,
+            python,
+        )
+        .await
+        .unwrap();
+        new.resume();
+        for expected in [("b", Some(5)), ("other", None)] {
+            let (service, mark) = requests.recv().await.unwrap();
+            assert_eq!((service.as_str(), mark), expected);
+        }
         let _ = child.kill();
         let _ = child.wait();
     }

@@ -12,10 +12,11 @@
 //!
 //! A byte stream joins a Unix socket in one agent's workset to one in
 //! another's. An agent opens a socket as a service to one address it
-//! accepted, and only that address is joined to it. Both sockets are the
-//! workset processes' ([`crate::worker::streams`]); the host carries the
-//! bytes between the other harness and the workset
-//! ([`crate::ipc::stream`]) and never opens a socket of an agent's itself.
+//! accepted, and only that address is joined to it. Both sockets are made
+//! by the workset processes ([`crate::worker::streams`]), which hand each
+//! connected one to the host as a descriptor. The host copies bytes
+//! between that and the other harness, and never opens a path of an
+//! agent's itself.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -23,15 +24,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures::future::BoxFuture;
-use rho_agent_types::{
-    AgentId, ContentPart, EndpointId, LocalId, PeerAddress, Role, ServiceName, WorksetId,
-};
-use tokio::io::{AsyncRead, AsyncWrite};
+use rho_agent_types::{AgentId, ContentPart, EndpointId, LocalId, PeerAddress, Role, ServiceName};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::UnixStream;
 
 use super::AgentPool;
-use crate::host::workset_client;
 use crate::ipc::protocol::Control;
-use crate::ipc::workset::{Attach, StreamEnd};
 use crate::store::{GccpContact, GccpRead as _, GccpWrite as _, StoreRead as _};
 
 /// One message as GCCP carries it. The harness it is from is not in it: the
@@ -73,11 +71,10 @@ pub struct ByteStream {
     pub writer: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
-/// A byte stream the host accepted for a service: the port of the workset
-/// process that the service's socket is behind, and what the stream is
-/// open by.
+/// A byte stream the host accepted for a service: the socket connected to
+/// the service, and what the stream is open by.
 pub struct Joined {
-    port: workset_client::Client,
+    socket: UnixStream,
     pool: Arc<AgentPool>,
     agent: AgentId,
     peer: PeerAddress,
@@ -89,7 +86,7 @@ impl Joined {
     /// service is no longer open to its other end.
     pub async fn carry(self, stream: ByteStream) {
         let Self {
-            port,
+            socket,
             pool,
             agent,
             peer,
@@ -101,8 +98,71 @@ impl Joined {
                 .gccp_service(agent, &peer, &service)
                 .is_some()
         };
-        pool.carry(port, stream, open).await;
+        pool.carry(socket, stream, open).await;
     }
+}
+
+/// A socket that a workset process connected, or accepted, as the host
+/// uses it.
+fn socket(fd: std::os::fd::OwnedFd) -> std::io::Result<UnixStream> {
+    let socket = std::os::unix::net::UnixStream::from(fd);
+    socket.set_nonblocking(true)?;
+    UnixStream::from_std(socket)
+}
+
+/// Which side a way of a stream ended on, if not with the end of its
+/// bytes.
+enum Broke {
+    Reader,
+    Writer,
+}
+
+/// Copies one way of a stream to the end of its bytes, and ends the
+/// writer's with them.
+async fn copy(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), Broke> {
+    let mut chunk = vec![0; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => return writer.shutdown().await.map_err(|_| Broke::Writer),
+            Ok(read) => writer
+                .write_all(&chunk[..read])
+                .await
+                .map_err(|_| Broke::Writer)?,
+            Err(_) => return Err(Broke::Reader),
+        }
+    }
+}
+
+/// Carries a byte stream between the other harness and a socket of a
+/// workset's, to the end of both ways. Each way ends on its own, as the
+/// halves of a socket do. The sockets' own buffers hold a fast sender back.
+///
+/// A stream that broke ends both ways at once: the socket closes, and the
+/// stream is dropped, which tells the other harness. A socket that only
+/// takes no more, because its program closed it, ends the way to it and
+/// lets the way back finish: an answer already written still arrives.
+async fn splice(stream: ByteStream, socket: UnixStream) {
+    let ByteStream {
+        mut reader,
+        mut writer,
+    } = stream;
+    let (mut from_socket, mut to_socket) = socket.into_split();
+    let inward = async {
+        match copy(&mut reader, &mut to_socket).await {
+            Err(Broke::Reader) => Err(()),
+            Ok(()) | Err(Broke::Writer) => Ok(()),
+        }
+    };
+    let outward = async {
+        match copy(&mut from_socket, &mut writer).await {
+            Err(Broke::Writer) => Err(()),
+            Ok(()) | Err(Broke::Reader) => Ok(()),
+        }
+    };
+    let _ = tokio::try_join!(inward, outward);
 }
 
 /// Carries messages and byte streams to other harnesses.
@@ -412,23 +472,24 @@ impl AgentPool {
         Ok(())
     }
 
-    /// A forward of `agent`'s, in the process of `workset`, accepted the
-    /// connection `conn`: opens a byte stream to `service` at `peer`, which
-    /// the agent accepted, and joins the two. Returns once they are joined;
-    /// the bytes are carried after that, until the stream ends or the agent
-    /// no longer accepts `peer`. A host that re-executes breaks it: the new
-    /// host adopts no stream.
+    /// A forward of `agent`'s accepted the connection `accepted`: opens a
+    /// byte stream to `service` at `peer`, which the agent accepted, and
+    /// joins the two. Returns once they are joined; the bytes are carried
+    /// after that, until the stream ends or the agent no longer accepts
+    /// `peer`. A host that re-executes breaks it: the new host adopts no
+    /// stream. The connection closes with any error here, which is all its
+    /// client learns.
     ///
     /// One try: a connection that waited minutes for its other end would
     /// serve its client worse than one that closed.
     pub(super) async fn external_open(
         self: &Arc<Self>,
-        workset: WorksetId,
         agent: AgentId,
         peer: &str,
         service: &str,
-        conn: u64,
+        accepted: Option<std::os::fd::OwnedFd>,
     ) -> anyhow::Result<()> {
+        let accepted = socket(accepted.context("no connection came with the request")?)?;
         let peer: PeerAddress = peer.parse().map_err(anyhow::Error::msg)?;
         let service: ServiceName = service.parse().map_err(anyhow::Error::msg)?;
         let own = self.external_address(agent)?;
@@ -465,18 +526,10 @@ impl AgentPool {
                     open.service,
                 )
             })?;
-        // The process that asked: only it has the connection.
-        let process = self
-            .running(workset)
-            .await
-            .context("the workset process is gone")?;
-        let port = process
-            .attach(Attach::Stream(StreamEnd::Accepted(conn)))
-            .await?;
         let pool = self.clone();
         tokio::spawn(async move {
-            let accepted = || pool.db.read().gccp_contact(agent, &peer).is_some();
-            pool.carry(port, stream, accepted).await;
+            let allowed = || pool.db.read().gccp_contact(agent, &peer).is_some();
+            pool.carry(accepted, stream, allowed).await;
         });
         Ok(())
     }
@@ -484,20 +537,14 @@ impl AgentPool {
     /// Carries a joined stream for as long as `allowed` holds, which is
     /// asked again whenever something is taken back: what the user or an
     /// agent takes back ends the streams it had let through, and not only
-    /// refuses the next. A stream that broke is an end like another: both
-    /// its sockets close.
-    async fn carry(
-        &self,
-        port: workset_client::Client,
-        stream: ByteStream,
-        allowed: impl Fn() -> bool,
-    ) {
+    /// refuses the next.
+    async fn carry(&self, socket: UnixStream, stream: ByteStream, allowed: impl Fn() -> bool) {
         let mut taken = self.gccp_taken.subscribe();
-        let piped = port.pipe(stream.reader, stream.writer);
-        tokio::pin!(piped);
+        let spliced = splice(stream, socket);
+        tokio::pin!(spliced);
         while allowed() {
             tokio::select! {
-                _ = &mut piped => return,
+                () = &mut spliced => return,
                 changed = taken.changed() => if changed.is_err() { return },
             }
         }
@@ -508,8 +555,8 @@ impl AgentPool {
     /// only while the recipient's workset runs: a stream starts no process.
     /// `None` is a refusal, and says no more to the other harness.
     ///
-    /// The join is to the workset process, which connects the socket: the
-    /// path is read where the agent wrote it.
+    /// The workset process connects the socket and hands it over: the path
+    /// is read where the agent wrote it.
     pub async fn gccp_join(
         self: &Arc<Self>,
         endpoint: EndpointId,
@@ -533,12 +580,10 @@ impl AgentPool {
         // open a service, and one that takes its place is no older, so the
         // process of a workset that has a service knows them.
         let process = self.running(head.workset).await?;
-        match process
-            .attach(Attach::Stream(StreamEnd::Service { path }))
-            .await
-        {
-            Ok(port) => Some(Joined {
-                port,
+        let connected = process.connect_service(path).await;
+        match connected.and_then(|connected| Ok(socket(connected)?)) {
+            Ok(socket) => Some(Joined {
+                socket,
                 pool: self.clone(),
                 agent,
                 peer,
