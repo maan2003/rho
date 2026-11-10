@@ -163,8 +163,8 @@ length as an unsigned 16-bit integer, and then the map of
   must return `false` for a header it cannot read.
 - With no result, there is no byte stream.
 
-The opening harness may write bytes after the header before it has the
-result. A harness that refuses the stream discards them.
+The opening harness must not write bytes after the header until it has the
+result `true`.
 
 After the result the protocol says no more. What the bytes mean, and when
 and how each side ends the stream, is between the service and whoever uses
