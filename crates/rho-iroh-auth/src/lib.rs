@@ -3,7 +3,11 @@
 //! This crate intentionally does not decide what an authenticated client may
 //! do. It only provides the auth-only first-stream exchange, enrollment and
 //! code parsing, and client helpers.
+//!
+//! It also keeps the other kind of endpoint the user approves, a GCCP host
+//! ([`gccp_hosts`]), apart from the clients.
 
+pub mod gccp_hosts;
 mod server;
 mod shared;
 

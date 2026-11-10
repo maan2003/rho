@@ -85,20 +85,22 @@ An agent talks to an agent on another harness over GCCP
 ([docs/gccp.md](../../docs/gccp.md)). That is not chat: nothing of it is in the
 chat log and no client syncs it. An agent's address is the host's iroh endpoint
 id and the agent's id, so only a host that listens over iroh speaks GCCP. Trust
-has two levels. The user approves a harness by its endpoint (`rho gccp
-approve`), which gives it nothing that a client of the host has. An agent then
-accepts an address on an approved harness under a name
-(`agents.external.accept`). The host closes a GCCP connection from a harness
-the user did not approve, and takes a message only for an agent that accepted
-the sender's address; it refuses everything else and keeps no trace of it. A
-message it takes is input to the agent with a tool's authority, none, and
-counts as taken once the agent holds it. The host remembers the messages it
-took last in memory and gives none of them twice; after a restart it remembers
-none, so a message sent again across one is given twice. What an agent sends
-waits in an outbox in the store, in order for each address, until the other
-harness takes it or the host gives up after three tries; the host then drops
-it with what waits behind it and tells the agent. The user sees and takes back
-approvals and acceptances with `rho gccp`.
+has two levels. The user approves a harness by its endpoint (`rho iroh approve
+--role gccp`). That approval is kept apart from the clients', and each lets an
+endpoint through on its own ALPN only, so a harness never gets what a client
+of the host has. An agent then accepts an address on an approved harness under
+a name (`agents.external.accept`). The host takes a message only for an agent
+that accepted the sender's address; it refuses everything else and keeps no
+trace of it. A message it takes is input to the agent with a tool's authority,
+none, and counts as taken once the agent holds it, which is in memory until
+the agent's next request records it. The host remembers the
+messages it took last in memory and gives none of them twice; after a restart
+it remembers none, so a message sent again across one is given twice. The host
+keeps no message: an agent's send is tried once while its call waits, under an
+id picked at random, and the call ends with what the other harness said, so
+the agent decides whether to send again. The user sees approved harnesses and
+acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
+and `rho gccp remove`.
 
 An agent leaves a topic itself (`chat.leave`), or the user takes it out.
 The user, or an agent of the topic through Python, may rename a topic, move

@@ -666,7 +666,7 @@ async fn gccp_two_hosts() {
     let error = accept(&here, here_workset, ann, &bob_address, "bob")
         .await
         .unwrap_err();
-    let approve = format!("rho gccp approve {} <name>", "b2".repeat(32));
+    let approve = format!("rho iroh approve --role gccp {} <name>", "b2".repeat(32));
     assert!(error.contains(&approve), "{error}");
     let error = send(&here, here_workset, ann, &bob_address, "too early")
         .await
@@ -791,7 +791,8 @@ async fn gccp_two_hosts() {
         body: "pong again".to_owned(),
         ..pong
     };
-    here.gccp_revoke(THERE).await.unwrap();
+    assert!(here.gccp_revoke(THERE).await);
+    assert!(!here.gccp_revoke(THERE).await);
     assert_eq!(
         here.gccp_receive(THERE, later).await,
         MessageResult::Refused

@@ -104,9 +104,27 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
         .to_owned();
     let socket = &socket_path;
     match args.command {
-        IrohCommand::Approve { code } => {
+        IrohCommand::Approve {
+            role: IrohRole::Client,
+            id: code,
+            name,
+        } => {
+            anyhow::ensure!(name.is_none(), "a client has no name: give only its code");
             let endpoint_id = client::call(socket, host::IrohApprove { code }).await?;
             println!("enrolled iroh client {endpoint_id}");
+        }
+        IrohCommand::Approve {
+            role: IrohRole::Gccp,
+            id: endpoint,
+            name,
+        } => {
+            let name = name.context("a GCCP host needs a name after its endpoint id")?;
+            let call = host::GccpApprove {
+                endpoint: endpoint.clone(),
+                name: name.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("approved GCCP host {endpoint} as {name:?}");
         }
         IrohCommand::TrustInMemory { endpoint_id } => {
             let call = host::IrohTrustInMemory {
@@ -117,15 +135,15 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
         }
         IrohCommand::Revoke { endpoint_id } => {
             let endpoint_id = client::call(socket, host::IrohRevoke { endpoint_id }).await?;
-            println!("revoked iroh client {endpoint_id}");
+            println!("revoked iroh endpoint {endpoint_id}");
         }
     }
     Ok(())
 }
 
-/// The user's control over which harnesses reach their agents, over the
-/// agent host's Unix socket: approving a harness, seeing what agents
-/// accepted on the approved ones, and taking either back.
+/// What the user sees of GCCP, over the agent host's Unix socket: the hosts
+/// approved with `rho iroh approve --role gccp`, and what agents accepted
+/// on them, which the user can take back.
 async fn run_gccp(args: GccpArgs) -> Result<()> {
     let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
@@ -155,21 +173,6 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
                     }
                 }
             }
-        }
-        GccpCommand::Approve { endpoint, name } => {
-            let call = host::GccpApprove {
-                endpoint: endpoint.clone(),
-                name: name.clone(),
-            };
-            client::call(socket, call).await?;
-            println!("approved host {endpoint} as {name:?}");
-        }
-        GccpCommand::Revoke { endpoint } => {
-            let call = host::GccpRevoke {
-                endpoint: endpoint.clone(),
-            };
-            client::call(socket, call).await?;
-            println!("revoked host {endpoint}");
         }
         GccpCommand::Remove { agent, address } => {
             let call = host::GccpRemove {
@@ -264,7 +267,7 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    /// Approve other hosts for GCCP, and see and take back what agents
+    /// See the hosts approved for GCCP, and see and take back what agents
     /// accepted on them.
     Gccp(GccpArgs),
     /// Print a link that pairs rho-gui with this machine's agent host (what
@@ -341,12 +344,32 @@ pub(crate) struct IrohArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum IrohCommand {
-    /// Approve a pending iroh client enrollment by its displayed code.
-    Approve { code: String },
+    /// Approve another iroh endpoint, as what `--role` says and no more.
+    Approve {
+        /// `client`: a rho GUI, which gets full access to this host. `gccp`:
+        /// another host, whose agents may message agents here that accepted
+        /// them, and which gets no other access.
+        #[arg(long, value_enum)]
+        role: IrohRole,
+        /// For a client, the enrollment code it displays. For a GCCP host,
+        /// its endpoint id: 64 hex digits, as its own `rho gccp list`
+        /// prints it.
+        id: String,
+        /// For a GCCP host, what you and your agents will know it by.
+        name: Option<String>,
+    },
     /// Directly trust an endpoint in agent host memory (for use through SSH).
     TrustInMemory { endpoint_id: String },
-    /// Revoke a previously enrolled iroh client endpoint.
+    /// Revoke an approved iroh endpoint, whatever it was approved as. For a
+    /// GCCP host this also takes back every acceptance on it.
     Revoke { endpoint_id: String },
+}
+
+/// What an iroh endpoint is approved as.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum IrohRole {
+    Client,
+    Gccp,
 }
 
 #[derive(Clone, clap::Args)]
@@ -359,21 +382,10 @@ pub(crate) struct GccpArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum GccpCommand {
-    /// Show this host's endpoint id, the hosts you approved, and the
-    /// addresses on them that agents accepted.
+    /// Show this host's endpoint id, the hosts you approved with
+    /// `rho iroh approve --role gccp`, and the addresses on them that
+    /// agents accepted.
     List,
-    /// Approve another host by its endpoint id: your agents may then accept
-    /// addresses on it, and its agents may message the ones that did. It
-    /// gets no other access to this host.
-    Approve {
-        /// The other host's endpoint id: 64 hex digits, as its own
-        /// `rho gccp list` prints it.
-        endpoint: String,
-        /// What you and your agents will know the host by.
-        name: String,
-    },
-    /// Take back the approval of a host, and every acceptance on it.
-    Revoke { endpoint: String },
     /// Take back one agent's acceptance of an address.
     Remove {
         /// The agent's id, as `rho gccp list` prints it.

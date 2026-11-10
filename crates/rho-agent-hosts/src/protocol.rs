@@ -75,7 +75,6 @@ rho_rpc::calls! {
         ShutdownIfIdle(ShutdownIfIdle) -> ();
         GccpList(GccpList) -> GccpState;
         GccpApprove(GccpApprove) -> ();
-        GccpRevoke(GccpRevoke) -> ();
         GccpRemove(GccpRemove) -> ();
     }
 }
@@ -136,7 +135,9 @@ pub struct IrohTrustInMemory {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohPair;
 
-/// Revokes persistent trust for an iroh client endpoint.
+/// Revokes what an iroh endpoint was approved as: a client's persistent
+/// trust, or a GCCP host's approval with every acceptance of an address on
+/// it.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohRevoke {
     pub endpoint_id: String,
@@ -177,21 +178,15 @@ pub struct GccpContact {
     pub name: String,
 }
 
-/// Approves the harness at an endpoint, under a name: the host's agents may
-/// accept addresses on it, and it may open GCCP connections. It is not a
-/// client of the host and gets nothing an `IrohApprove`d one does.
-/// Approving it again renames it.
+/// Approves the harness at an endpoint as a GCCP host, under a name: the
+/// host's agents may accept addresses on it, and it may open GCCP
+/// connections. It is not a client of the host and gets nothing an
+/// `IrohApprove`d one does. Approving it again renames it. `IrohRevoke`
+/// takes the approval back.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GccpApprove {
     pub endpoint: String,
     pub name: String,
-}
-
-/// Takes back the approval of a harness, and with it every acceptance of an
-/// address on it.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct GccpRevoke {
-    pub endpoint: String,
 }
 
 /// Takes back an agent's acceptance of a GCCP address: nothing more crosses

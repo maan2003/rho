@@ -7,9 +7,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
-    GccpRevoke, GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
-    IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus,
-    Request, ShutdownIfIdle, Snapshot,
+    GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove,
+    IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request,
+    ShutdownIfIdle, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -259,11 +259,12 @@ where
                 let auth = iroh()?;
                 let endpoint_id = endpoint_id
                     .parse::<iroh::EndpointId>()
-                    .context("invalid iroh client endpoint id")?;
-                anyhow::ensure!(
-                    auth.revoke(endpoint_id).await,
-                    "iroh client is not enrolled"
-                );
+                    .context("invalid iroh endpoint id")?;
+                // Whatever the endpoint was approved as.
+                let client = auth.revoke(endpoint_id).await;
+                let host = rho_agent_types::EndpointId(*endpoint_id.as_bytes());
+                let host = services.pool.gccp_revoke(host).await;
+                anyhow::ensure!(client || host, "this iroh endpoint is not approved");
                 Ok(endpoint_id.to_string())
             })
             .await
@@ -296,16 +297,12 @@ where
         }
         Request::GccpApprove(call) => {
             respond(writer, call, |GccpApprove { endpoint, name }| async move {
+                // A host without an endpoint speaks no GCCP.
+                iroh()?;
                 services
                     .pool
                     .gccp_approve(gccp_endpoint(&endpoint)?, &name)
                     .await
-            })
-            .await
-        }
-        Request::GccpRevoke(call) => {
-            respond(writer, call, |GccpRevoke { endpoint }| async move {
-                services.pool.gccp_revoke(gccp_endpoint(&endpoint)?).await
             })
             .await
         }
@@ -323,10 +320,15 @@ where
     }
 }
 
-/// A harness's endpoint id as `rho gccp` takes it.
+/// A harness's endpoint id as the user gives it: the 64 hex digits of an
+/// address, and an id an iroh endpoint can have.
 fn gccp_endpoint(text: &str) -> anyhow::Result<rho_agent_types::EndpointId> {
-    text.parse()
-        .map_err(|error| anyhow::anyhow!("invalid GCCP endpoint: {error}"))
+    let endpoint: rho_agent_types::EndpointId = text
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid GCCP endpoint: {error}"))?;
+    iroh::EndpointId::from_bytes(&endpoint.0)
+        .with_context(|| format!("invalid GCCP endpoint: {text} is no iroh endpoint id"))?;
+    Ok(endpoint)
 }
 
 /// Stops the host unless a client is attached or an agent is working.

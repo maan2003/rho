@@ -19,7 +19,7 @@ Each agent has an address, `<endpoint id>/<local id>`. The endpoint id names the
 
 Messages cross between two agents only when both of these hold on each side:
 
-1. The owner of the host approved the other host. On this host the user does that in a terminal with `rho gccp approve <endpoint id> <name>`. You cannot do it. `agents.external.accept` fails with the command to give the user when the approval is missing.
+1. The owner of the host approved the other host. On this host the user does that in a terminal with `rho iroh approve --role gccp <endpoint id> <name>`. You cannot do it. `agents.external.accept` fails with the command to give the user when the approval is missing.
 2. The agent accepted the other agent's address.
 
 To connect with an agent whose address you were given:
@@ -36,15 +36,15 @@ The other agent must accept your address too. Until it does, its host refuses yo
 ## Send and receive
 
 ```python
-agents.external.send(address="<their address>", message="...")
+await agents.external.send(address="<their address>", message="...")
 agents.external.contacts()  # the addresses you accepted
 ```
 
-`send` returns at once. The host delivers in the background, one message at a time to each address, and says nothing when a message arrives. A message is text of at most 65536 bytes.
+`send` starts at once and makes one try. Await it to know the outcome: it returns when the other host has taken the message, and raises when it has not. A send that you do not await still runs, and its failure is reported to you like any failed task. To keep two messages in order, await the first before you send the second. A message is text of at most 65536 bytes.
 
-When the other host refuses a message, or gives no result in three tries over a few minutes, you get a notice that begins `[external message to ... refused]` or `[external message to ... not delivered]`. The host then drops that message and any you sent after it to the same address. Neither failure fixes itself, so do not send again until something changed. Tell the user what the other side has to do:
+A send that fails does not fix itself, and the host does not try again. Send again only after something changed, and tell the user what the other side has to do:
 
 - `refused`: the other agent has not accepted your address.
-- `not delivered`: the other host is off, or its owner has not approved this host. The notice gives this host's endpoint id for that approval.
+- `gave no result`: the other host is off, or its owner has not approved this host. The error gives this host's endpoint id for that approval. The message may have arrived all the same, so a second send can show the other agent the text twice.
 
 A message to you arrives as input that begins `[external message from <name> at <address>, on the host <host name>`. The name is the one you gave the address, and the host name is the one the user gave the host. There are no threads: answer with `send` to that address.

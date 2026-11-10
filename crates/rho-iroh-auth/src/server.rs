@@ -220,6 +220,7 @@ impl TrustedClients {
             .get_or_init(|| async {
                 let mut write = self.db.write().await;
                 write.open_table(TRUSTED_CLIENTS);
+                crate::gccp_hosts::init(&mut write);
                 write.commit();
             })
             .await;
@@ -443,6 +444,14 @@ impl IrohAuth {
             return true;
         }
         self.inner.trusted.is_trusted(client_endpoint_id).await
+    }
+
+    /// Whether the user approved the endpoint as a GCCP host
+    /// ([`crate::gccp_hosts`]). That says nothing about it as a client.
+    pub async fn is_gccp_host(&self, endpoint_id: EndpointId) -> bool {
+        self.inner.trusted.ensure_tables().await;
+        let read = self.inner.trusted.db.read();
+        crate::gccp_hosts::name(&read, endpoint_id.as_bytes()).is_some()
     }
 
     /// A new pairing key, good for one client within [`PAIRING_TTL`].

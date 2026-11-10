@@ -2,7 +2,8 @@
 //! whom it talks to. A message is never kept: the host sends one while its
 //! agent waits, and gives one it takes straight to its agent.
 //!
-//! Trust has two levels. The user approves a harness, by its endpoint. An
+//! Trust has two levels. The user approves a harness, by its endpoint
+//! ([`rho_iroh_auth::gccp_hosts`], which the iroh listener reads too). An
 //! agent accepts an address, and only one on a harness the user approved.
 //! So no agent, whatever it is told, opens the host to a harness the user
 //! does not know. Taking an approval back takes back every acceptance on
@@ -14,11 +15,9 @@
 use redb::TableDefinition;
 use rho_agent_types::{AgentId, EndpointId, PeerAddress};
 use rho_db::{ReadTxn, WriteTxn};
+use rho_iroh_auth::gccp_hosts;
 use senax_encoder::{Decode, Encode};
 
-/// The harnesses the user approved, each endpoint id as text: the name the
-/// user gave it.
-const HOSTS: TableDefinition<String, String> = TableDefinition::new("gccp_hosts");
 /// `(agent, address)`: the name the agent gave an address it accepted.
 const CONTACTS: TableDefinition<(AgentId, String), String> = TableDefinition::new("gccp_contacts");
 /// The longest name a harness or an address is given.
@@ -63,16 +62,14 @@ pub trait GccpRead {
 
 impl GccpRead for ReadTxn {
     fn gccp_hosts(&self) -> Vec<(EndpointId, String)> {
-        self.open_table(HOSTS)
-            .iter()
-            .map(|(endpoint, name)| (endpoint_of(&endpoint.value()), name.value()))
+        let hosts = gccp_hosts::all(self).into_iter();
+        hosts
+            .map(|(endpoint, name)| (EndpointId(endpoint), name))
             .collect()
     }
 
     fn gccp_host(&self, endpoint: EndpointId) -> Option<String> {
-        self.open_table(HOSTS)
-            .get(endpoint.to_string())
-            .map(|name| name.value())
+        gccp_hosts::name(self, &endpoint.0)
     }
 
     fn gccp_contact(&self, agent: AgentId, peer: &PeerAddress) -> Option<String> {
@@ -94,10 +91,6 @@ impl GccpRead for ReadTxn {
             })
             .collect()
     }
-}
-
-fn endpoint_of(text: &str) -> EndpointId {
-    text.parse().expect("the store keeps endpoint ids")
 }
 
 fn address_of(text: &str) -> PeerAddress {
@@ -124,22 +117,17 @@ pub trait GccpWrite {
 
 impl GccpWrite for WriteTxn {
     fn init_gccp_tables(&mut self) {
-        self.open_table(HOSTS);
+        gccp_hosts::init(self);
         self.open_table(CONTACTS);
     }
 
     fn gccp_approve(&mut self, endpoint: EndpointId, name: &str) -> anyhow::Result<()> {
-        let name = checked_name(name)?;
-        self.open_table(HOSTS).insert(endpoint.to_string(), name);
+        gccp_hosts::approve(self, &endpoint.0, checked_name(name)?);
         Ok(())
     }
 
     fn gccp_revoke(&mut self, endpoint: EndpointId) -> bool {
-        if self
-            .open_table(HOSTS)
-            .remove(endpoint.to_string())
-            .is_none()
-        {
+        if !gccp_hosts::revoke(self, &endpoint.0) {
             return false;
         }
         let there: Vec<(AgentId, String)> = self
@@ -163,11 +151,9 @@ impl GccpWrite for WriteTxn {
     ) -> anyhow::Result<()> {
         let name = checked_name(name)?;
         anyhow::ensure!(
-            self.open_table(HOSTS)
-                .get(peer.endpoint.to_string())
-                .is_some(),
+            gccp_hosts::name_in(self, &peer.endpoint.0).is_some(),
             "the user has not approved the host {endpoint}. Nothing on it can be accepted \
-             until the user runs `rho gccp approve {endpoint} <name>` on this host",
+             until the user runs `rho iroh approve --role gccp {endpoint} <name>` on this host",
             endpoint = peer.endpoint
         );
         let mut contacts = self.open_table(CONTACTS);
@@ -244,7 +230,7 @@ mod tests {
 
         let refused = write.gccp_accept(a, &dpc, "dpc").unwrap_err().to_string();
         assert!(
-            refused.contains(&format!("rho gccp approve {}", dpc.endpoint)),
+            refused.contains(&format!("rho iroh approve --role gccp {}", dpc.endpoint)),
             "{refused}"
         );
         write.gccp_approve(dpc.endpoint, "dpc's laptop").unwrap();

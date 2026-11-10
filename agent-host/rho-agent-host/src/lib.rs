@@ -487,8 +487,9 @@ pub struct HostArgs {
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
     /// Remote clients must be enrolled once via
-    /// `rho iroh approve <code>` on this machine. The same endpoint gives
-    /// agents their GCCP addresses, where agents of other hosts reach them.
+    /// `rho iroh approve --role client <code>` on this machine. The same
+    /// endpoint gives agents their GCCP addresses, where agents of hosts
+    /// approved with `--role gccp` reach them.
     #[arg(long = "iroh")]
     pub iroh: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
@@ -696,7 +697,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         let (listener, auth) = rho_rpc::AuthenticatedIrohListener::bind(
             db.clone(),
             rho_rpc::protocol::IROH_ALPN,
-            vec![gccp::ALPN.to_vec()],
+            gccp::ALPN,
         )
         .await?;
         eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
@@ -806,7 +807,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                     match rho_rpc::AuthenticatedIrohListener::bind(
                         services.db.clone(),
                         rho_rpc::protocol::IROH_ALPN,
-                        vec![gccp::ALPN.to_vec()],
+                        gccp::ALPN,
                     )
                     .await
                     {
@@ -944,13 +945,11 @@ async fn run_iroh_listener(
         _ = &mut shutdown => None,
     } {
         let connection = match accepted {
-            Ok(rho_rpc::Accepted::Approved(connection)) => connection,
-            // Not a client of this host. It may be another harness: that
-            // speaks GCCP and nothing else, and only if the user approved it.
-            Ok(rho_rpc::Accepted::Open(connection)) => {
-                if connection.alpn() == gccp::ALPN {
-                    tokio::spawn(gccp::serve(services.pool.clone(), connection));
-                }
+            Ok(rho_rpc::Accepted::Client(connection)) => connection,
+            // Another harness the user approved: it speaks GCCP and nothing
+            // else.
+            Ok(rho_rpc::Accepted::GccpHost(connection)) => {
+                tokio::spawn(gccp::serve(services.pool.clone(), connection));
                 continue;
             }
             Err(error) => {

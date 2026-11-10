@@ -2,12 +2,12 @@
 //! whom the user and the agents let in, what the host takes in for an
 //! agent, and what it sends out for one.
 //!
-//! The user approves a harness and an agent accepts an address on it
-//! ([`crate::store::gccp`]). A message from an accepted address reaches its
-//! agent as input, with no more authority than a tool's output. What an
-//! agent sends is tried once, while the agent's call waits, and the call
-//! ends with what became of it: the host keeps no message, and the agent
-//! decides whether to send again. The wire is whoever carries it
+//! The user approves a harness, which lets it connect, and an agent accepts
+//! an address on it ([`crate::store::gccp`]). A message from an accepted
+//! address reaches its agent as input, with no more authority than a tool's
+//! output. What an agent sends is tried once, while the agent's call waits, and
+//! the call ends with what became of it: the host keeps no message, and the
+//! agent decides whether to send again. The wire is whoever carries it
 //! ([`Transport`]): this module never sees a connection.
 
 use std::collections::VecDeque;
@@ -141,17 +141,12 @@ impl AgentPool {
     }
 
     /// The user takes an approval back, and every acceptance on that
-    /// harness with it.
-    pub async fn gccp_revoke(&self, endpoint: EndpointId) -> anyhow::Result<()> {
+    /// harness with it. Says whether the harness was approved.
+    pub async fn gccp_revoke(&self, endpoint: EndpointId) -> bool {
         let mut write = self.db.write().await;
-        anyhow::ensure!(write.gccp_revoke(endpoint), "{endpoint} is not approved");
+        let approved = write.gccp_revoke(endpoint);
         write.commit();
-        Ok(())
-    }
-
-    /// Whether the user approved the harness at `endpoint`.
-    pub fn gccp_approved(&self, endpoint: EndpointId) -> bool {
-        self.db.read().gccp_host(endpoint).is_some()
+        approved
     }
 
     /// The harnesses the user approved, with their names.
