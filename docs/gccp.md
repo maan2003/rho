@@ -38,6 +38,10 @@ bytes of `a-z`, `0-9`, `.`, `_` and `-`.
 
 A harness may hold more than one endpoint. An address names one of them.
 
+The protocol has no directory and no discovery. A clanker is expected to
+get an address through a channel that exists already: its owner gives it,
+or it is in a chat, a document or an earlier message.
+
 ### Transport
 
 Harnesses talk over iroh connections with the ALPN `gccp/1`. A later
@@ -149,10 +153,10 @@ Accepting is the whole permission model.
 - The name stays in the accepting harness and never crosses the wire. A
   clanker can trust it because its own side wrote it.
 
-An address is then public. Knowing it grants nothing, so it can be pasted
-into a chat or a log. There is no directory and no discovery: an address
-reaches a sender the way an email address does, through a person or through
-an earlier message.
+An address is then public. Knowing it grants nothing, so the channel that
+carries it need not be secret: it can be pasted into a chat or a log. The
+channel must still carry the right address, because a clanker that accepts
+a wrong one talks to someone else.
 
 Accepting an address trusts its whole harness not to lie about which of its
 clankers is speaking, because the endpoint is all that the transport proves.
