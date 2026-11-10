@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use c2c::{Answer, Envelope, MAX_BODY_LEN, Transport};
+pub use c2c::{Envelope, MAX_BODY_LEN, MessageResult, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,

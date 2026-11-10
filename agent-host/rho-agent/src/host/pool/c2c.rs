@@ -36,9 +36,10 @@ pub struct Envelope {
     pub body: String,
 }
 
-/// What a harness says of a message it was sent.
+/// What a harness says of a message it was sent: its result, as
+/// docs/c2c.md has it. It is not a reply from the recipient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Answer {
+pub enum MessageResult {
     /// Stored for its recipient.
     Delivered,
     /// Not taken: no such recipient, or it has not accepted the sender. A
@@ -49,13 +50,13 @@ pub enum Answer {
 /// Carries messages to other harnesses.
 pub trait Transport: Send + Sync + 'static {
     /// Takes one message to the harness at `endpoint` and brings back its
-    /// answer. An error is a harness that could not be reached or did not
-    /// answer; the message may have arrived all the same.
+    /// result. An error is a harness that could not be reached or gave
+    /// none; the message may have arrived all the same.
     fn send<'a>(
         &'a self,
         endpoint: [u8; 32],
         envelope: &'a Envelope,
-    ) -> BoxFuture<'a, anyhow::Result<Answer>>;
+    ) -> BoxFuture<'a, anyhow::Result<MessageResult>>;
 }
 
 /// The longest body C2C carries, in bytes of UTF-8.
@@ -180,10 +181,14 @@ impl AgentPool {
     /// A message the harness at `endpoint` sent. It is delivered only to an
     /// agent that accepted the sender's address; anything else is refused
     /// and leaves no trace.
-    pub async fn c2c_receive(self: &Arc<Self>, endpoint: [u8; 32], envelope: Envelope) -> Answer {
+    pub async fn c2c_receive(
+        self: &Arc<Self>,
+        endpoint: [u8; 32],
+        envelope: Envelope,
+    ) -> MessageResult {
         let Envelope { to, from, id, body } = envelope;
         let Ok(agent) = AgentId::from_encoded(to.as_str()) else {
-            return Answer::Refused;
+            return MessageResult::Refused;
         };
         let peer = PeerAddress {
             endpoint,
@@ -192,7 +197,7 @@ impl AgentPool {
         // A stranger's message costs a read and no more.
         let read = self.db.read();
         let (Some(_), Some(topic)) = (read.agent(agent), read.peer_topic(agent, &peer)) else {
-            return Answer::Refused;
+            return MessageResult::Refused;
         };
         drop(read);
         let content = vec![ContentPart::Text { text: body }];
@@ -202,11 +207,11 @@ impl AgentPool {
             Ok(Some(message)) => {
                 write.commit();
                 self.wake_receivers(message, None);
-                Answer::Delivered
+                MessageResult::Delivered
             }
-            // Its newest again: the answer to the first was lost.
-            Ok(None) => Answer::Delivered,
-            Err(_) => Answer::Refused,
+            // Its newest again: the result of the first was lost.
+            Ok(None) => MessageResult::Delivered,
+            Err(_) => MessageResult::Refused,
         }
     }
 
@@ -242,11 +247,11 @@ impl AgentPool {
                         body: rho_agent_types::transcript::text_content(&out.content),
                     };
                     let send = transport.send(out.peer.endpoint, &envelope);
-                    let answer = match tokio::time::timeout(SEND_TIMEOUT, send).await {
-                        Ok(answer) => answer,
-                        Err(_) => Err(anyhow::anyhow!("no answer in {SEND_TIMEOUT:?}")),
+                    let result = match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("no result in {SEND_TIMEOUT:?}")),
                     };
-                    (out, answer)
+                    (out, result)
                 });
             }
             let next_retry = retries.values().map(|retry| retry.at).min();
@@ -260,9 +265,9 @@ impl AgentPool {
             // Until something changes what there is to send.
             loop {
                 tokio::select! {
-                    Some((out, answer)) = flying.next() => {
+                    Some((out, result)) = flying.next() => {
                         busy.remove(&out.topic);
-                        self.peer_answered(&mut retries, out, answer).await;
+                        self.peer_tried(&mut retries, out, result).await;
                         break;
                     }
                     appended = feed.recv() => match appended {
@@ -278,18 +283,18 @@ impl AgentPool {
     }
 
     /// One try at one message ended.
-    async fn peer_answered(
+    async fn peer_tried(
         self: &Arc<Self>,
         retries: &mut HashMap<TopicId, Retry>,
         out: PeerOutgoing,
-        answer: anyhow::Result<Answer>,
+        result: anyhow::Result<MessageResult>,
     ) {
-        let refused = match answer {
-            Ok(Answer::Delivered) => {
+        let refused = match result {
+            Ok(MessageResult::Delivered) => {
                 self.peer_done(&out).await;
                 return;
             }
-            Ok(Answer::Refused) => true,
+            Ok(MessageResult::Refused) => true,
             Err(_) => false,
         };
         let waited = Duration::from_millis(UnixMs::now().0.saturating_sub(out.at.0));

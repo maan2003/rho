@@ -583,7 +583,7 @@ impl rho_agent::host::pool::Transport for Wires {
         &'a self,
         endpoint: [u8; 32],
         envelope: &'a rho_agent::host::pool::Envelope,
-    ) -> futures::future::BoxFuture<'a, anyhow::Result<rho_agent::host::pool::Answer>> {
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<rho_agent::host::pool::MessageResult>> {
         Box::pin(async move {
             self.sent.lock().unwrap().push(envelope.clone());
             let host = self.hosts.lock().unwrap().get(&endpoint).cloned();
@@ -594,7 +594,7 @@ impl rho_agent::host::pool::Transport for Wires {
 }
 
 async fn c2c_two_hosts() {
-    use rho_agent::host::pool::Answer;
+    use rho_agent::host::pool::MessageResult;
     const HERE: [u8; 32] = [0xa1; 32];
     const THERE: [u8; 32] = [0xb2; 32];
 
@@ -759,9 +759,12 @@ async fn c2c_two_hosts() {
         .clone();
     assert_eq!(
         here.c2c_receive(THERE, pong.clone()).await,
-        Answer::Delivered
+        MessageResult::Delivered
     );
-    assert_eq!(here.c2c_receive([0xc3; 32], pong).await, Answer::Refused);
+    assert_eq!(
+        here.c2c_receive([0xc3; 32], pong).await,
+        MessageResult::Refused
+    );
 
     // The user takes Bob's acceptance back: Ann is refused again, and Bob
     // can no longer write to her.

@@ -1,5 +1,5 @@
 //! C2C on the wire ([docs/c2c.md](../../../docs/c2c.md)): one CBOR map
-//! on a stream of its own, answered on that stream. What the host does
+//! on a stream of its own, and its result on that stream. What the host does
 //! with a message is the pool's
 //! ([`rho_agent::host::pool::AgentPool::c2c_receive`]); this module only
 //! carries.
@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures::future::BoxFuture;
 use iroh::endpoint::Connection;
-use rho_agent::host::pool::{AgentPool, Answer, Envelope, MAX_BODY_LEN, Transport};
+use rho_agent::host::pool::{AgentPool, Envelope, MAX_BODY_LEN, MessageResult, Transport};
 
 /// The ALPN C2C is spoken on. A change old peers cannot read takes a new
 /// number.
@@ -23,7 +23,7 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// The longest message read: the longest body and room for the rest of
 /// its map.
 const MAX_MESSAGE_LEN: usize = MAX_BODY_LEN + 512;
-const MAX_ANSWER_LEN: usize = 256;
+const MAX_RESULT_LEN: usize = 256;
 /// How long a connection may carry nothing before the host closes it, so a
 /// harness that went quiet does not keep one of the connections there are.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,8 +40,8 @@ struct WireMessage {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct WireAnswer {
-    answer: String,
+struct WireResult {
+    result: String,
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
@@ -71,30 +71,30 @@ fn decode_message(bytes: &[u8]) -> anyhow::Result<Envelope> {
     })
 }
 
-fn encode_answer(answer: Answer) -> Vec<u8> {
-    encode(&WireAnswer {
-        answer: match answer {
-            Answer::Delivered => "delivered",
-            Answer::Refused => "refused",
+fn encode_result(result: MessageResult) -> Vec<u8> {
+    encode(&WireResult {
+        result: match result {
+            MessageResult::Delivered => "delivered",
+            MessageResult::Refused => "refused",
         }
         .to_owned(),
     })
 }
 
-fn decode_answer(bytes: &[u8]) -> anyhow::Result<Answer> {
-    let WireAnswer { answer } = ciborium::from_reader(bytes).context("not a C2C answer")?;
-    match answer.as_str() {
-        "delivered" => Ok(Answer::Delivered),
-        "refused" => Ok(Answer::Refused),
-        other => anyhow::bail!("an answer this version does not know: {other:?}"),
+fn decode_result(bytes: &[u8]) -> anyhow::Result<MessageResult> {
+    let WireResult { result } = ciborium::from_reader(bytes).context("not a C2C result")?;
+    match result.as_str() {
+        "delivered" => Ok(MessageResult::Delivered),
+        "refused" => Ok(MessageResult::Refused),
+        other => anyhow::bail!("a result this version does not know: {other:?}"),
     }
 }
 
-/// Answers every message another harness sends on `connection`, for as
+/// Gives every message another harness sends on `connection` a result, for as
 /// long as it stays open. Whatever is not a message is refused like one
 /// to nobody: a harness says no more than that.
 pub async fn serve(pool: Arc<AgentPool>, connection: Connection) {
-    answer_messages(connection, move |endpoint, envelope| {
+    serve_messages(connection, move |endpoint, envelope| {
         let pool = pool.clone();
         async move { pool.c2c_receive(endpoint, envelope).await }
     })
@@ -102,10 +102,10 @@ pub async fn serve(pool: Arc<AgentPool>, connection: Connection) {
 }
 
 /// [`serve`], with what a message is given to left open.
-async fn answer_messages<F, Fut>(connection: Connection, receive: F)
+async fn serve_messages<F, Fut>(connection: Connection, receive: F)
 where
     F: Fn([u8; 32], Envelope) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Answer> + Send,
+    Fut: Future<Output = MessageResult> + Send,
 {
     let endpoint = *connection.remote_id().as_bytes();
     loop {
@@ -123,26 +123,26 @@ where
             else {
                 return;
             };
-            let answer = match read.map(|bytes| decode_message(&bytes)) {
+            let result = match read.map(|bytes| decode_message(&bytes)) {
                 Ok(Ok(envelope)) => receive(endpoint, envelope).await,
                 // Not a message, longer than one can be, or cut off.
-                Ok(Err(_)) | Err(_) => Answer::Refused,
+                Ok(Err(_)) | Err(_) => MessageResult::Refused,
             };
-            if send.write_all(&encode_answer(answer)).await.is_ok() {
+            if send.write_all(&encode_result(result)).await.is_ok() {
                 let _ = send.finish();
-                // Hold the stream until the peer has the answer.
+                // Hold the stream until the peer has the result.
                 let _ = send.stopped().await;
             }
         });
     }
 }
 
-/// Sends one message on `connection` and reads its answer.
-async fn exchange(connection: &Connection, envelope: &Envelope) -> anyhow::Result<Answer> {
+/// Sends one message on `connection` and reads its result.
+async fn exchange(connection: &Connection, envelope: &Envelope) -> anyhow::Result<MessageResult> {
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&encode_message(envelope)).await?;
     send.finish()?;
-    decode_answer(&recv.read_to_end(MAX_ANSWER_LEN).await?)
+    decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)
 }
 
 /// Carries messages over the host's own iroh endpoint, so a harness that
@@ -189,15 +189,15 @@ impl Transport for IrohTransport {
         &'a self,
         endpoint: [u8; 32],
         envelope: &'a Envelope,
-    ) -> BoxFuture<'a, anyhow::Result<Answer>> {
+    ) -> BoxFuture<'a, anyhow::Result<MessageResult>> {
         Box::pin(async move {
             if let Some(connection) = self.held(endpoint) {
                 // A held connection may have closed on the way; a message
                 // sent twice arrives once, so it is tried on a new one.
-                if let Ok(answer) = exchange(&connection, envelope).await {
-                    return Ok(answer);
+                if let Ok(result) = exchange(&connection, envelope).await {
+                    return Ok(result);
                 }
-                connection.close(0u32.into(), b"no answer");
+                connection.close(0u32.into(), b"no result");
             }
             exchange(&self.connect(endpoint).await?, envelope).await
         })
@@ -242,11 +242,12 @@ mod tests {
                 (Value::Text("body".into()), Value::Text("hi".into())),
             ])
         );
-        let answer: Value = ciborium::from_reader(&encode_answer(Answer::Refused)[..]).unwrap();
+        let result: Value =
+            ciborium::from_reader(&encode_result(MessageResult::Refused)[..]).unwrap();
         assert_eq!(
-            answer,
+            result,
             Value::Map(vec![(
-                Value::Text("answer".into()),
+                Value::Text("result".into()),
                 Value::Text("refused".into())
             )])
         );
@@ -287,16 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_this_version_does_not_know_is_an_error() {
-        for answer in [Answer::Delivered, Answer::Refused] {
-            assert_eq!(decode_answer(&encode_answer(answer)).unwrap(), answer);
+    fn a_result_this_version_does_not_know_is_an_error() {
+        for result in [MessageResult::Delivered, MessageResult::Refused] {
+            assert_eq!(decode_result(&encode_result(result)).unwrap(), result);
         }
-        let later = map(&[("answer", Value::Text("later".into()))]);
-        assert!(decode_answer(&later).is_err());
+        let later = map(&[("result", Value::Text("later".into()))]);
+        assert!(decode_result(&later).is_err());
     }
 
     /// Two endpoints: what one sends reaches the other with the sender's
-    /// endpoint id, and its answer comes back, on one connection for as
+    /// endpoint id, and its result comes back, on one connection for as
     /// long as it lasts; what is not a message is refused without reaching
     /// anything.
     #[tokio::test]
@@ -326,14 +327,14 @@ mod tests {
                         };
                         connected.send(connection.clone()).unwrap();
                         let seen = seen.clone();
-                        tokio::spawn(answer_messages(connection, move |endpoint, envelope| {
-                            let answer = if envelope.body == "knock" {
-                                Answer::Refused
+                        tokio::spawn(serve_messages(connection, move |endpoint, envelope| {
+                            let result = if envelope.body == "knock" {
+                                MessageResult::Refused
                             } else {
-                                Answer::Delivered
+                                MessageResult::Delivered
                             };
                             seen.send((endpoint, envelope)).unwrap();
-                            async move { answer }
+                            async move { result }
                         }));
                     }
                 }
@@ -341,7 +342,7 @@ mod tests {
 
             assert_eq!(
                 transport.send(to, &envelope("hello")).await?,
-                Answer::Delivered
+                MessageResult::Delivered
             );
             assert_eq!(
                 received.recv().await.unwrap(),
@@ -349,7 +350,7 @@ mod tests {
             );
             assert_eq!(
                 transport.send(to, &envelope("knock")).await?,
-                Answer::Refused
+                MessageResult::Refused
             );
             received.recv().await.unwrap();
             let first = connections.recv().await.unwrap();
@@ -359,8 +360,8 @@ mod tests {
             send.write_all(b"not a message").await?;
             send.finish()?;
             assert_eq!(
-                decode_answer(&recv.read_to_end(MAX_ANSWER_LEN).await?)?,
-                Answer::Refused
+                decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)?,
+                MessageResult::Refused
             );
             assert!(received.try_recv().is_err());
 
@@ -368,8 +369,8 @@ mod tests {
             send.write_all(&vec![b'x'; MAX_MESSAGE_LEN + 1]).await?;
             send.finish()?;
             assert_eq!(
-                decode_answer(&recv.read_to_end(MAX_ANSWER_LEN).await?)?,
-                Answer::Refused,
+                decode_result(&recv.read_to_end(MAX_RESULT_LEN).await?)?,
+                MessageResult::Refused,
                 "too long to be a message"
             );
             assert!(received.try_recv().is_err());
@@ -379,7 +380,7 @@ mod tests {
             first.close(0u32.into(), b"idle");
             assert_eq!(
                 transport.send(to, &envelope("again")).await?,
-                Answer::Delivered
+                MessageResult::Delivered
             );
             assert_eq!(received.recv().await.unwrap().1, envelope("again"));
             connections.recv().await.unwrap();
