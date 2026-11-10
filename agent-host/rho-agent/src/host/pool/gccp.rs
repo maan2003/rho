@@ -5,22 +5,22 @@
 //! The user approves a harness and an agent accepts an address on it
 //! ([`crate::store::gccp`]). A message from an accepted address reaches its
 //! agent as input, with no more authority than a tool's output. What an
-//! agent sends waits in the outbox until the other harness took it or the
-//! host gave up, and then the agent is told. The wire is whoever carries it
+//! agent sends is tried once, while the agent's call waits, and the call
+//! ends with what became of it: the host keeps no message, and the agent
+//! decides whether to send again. The wire is whoever carries it
 //! ([`Transport`]): this module never sees a connection.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
-use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use rho_agent_types::{AgentId, ContentPart, EndpointId, LocalId, PeerAddress, Role};
 
 use super::AgentPool;
 use crate::ipc::protocol::Control;
-use crate::store::{GccpContact, GccpOutgoing, GccpRead as _, GccpWrite as _, StoreRead as _};
+use crate::store::{GccpContact, GccpRead as _, GccpWrite as _, StoreRead as _};
 
 /// One message as GCCP carries it. The harness it is from is not in it: the
 /// transport proves that.
@@ -58,16 +58,12 @@ pub trait Transport: Send + Sync + 'static {
 
 /// The longest body GCCP carries, in bytes of UTF-8.
 pub const MAX_BODY_LEN: usize = 64 * 1024;
-/// The waits before the second and the third try at a message whose
-/// harness could not be reached. After the last the message is given up on:
-/// an agent that is told so decides better than a queue when to send again.
-pub const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(120)];
-/// How long one try may take before the harness counts as unreachable.
+/// How long the other harness has to give a message its result.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many messages the host remembers that it took. A harness that got no
-/// result sends a message again within minutes or not at all, so a copy
-/// finds itself here unless this many messages came in between.
+/// result sends a message again at once or not at all, so a copy finds
+/// itself here unless this many messages came in between.
 const STORED_IDS: usize = 256;
 
 /// A message the host took: its recipient, its sender, and the id its
@@ -101,13 +97,6 @@ impl Stored {
     }
 }
 
-/// A message whose harness could not be reached, and when it is tried next.
-struct Retry {
-    id: u64,
-    failures: usize,
-    at: Instant,
-}
-
 /// An agent's id as the local id of its address.
 fn local_id(agent: AgentId) -> LocalId {
     agent.encoded().parse().expect("an agent id is a local id")
@@ -120,6 +109,11 @@ impl AgentPool {
         self.endpoint
             .set(endpoint)
             .expect("the host's endpoint is named once");
+    }
+
+    /// What carries the agents' messages to other harnesses from now on.
+    pub fn set_transport(&self, transport: Arc<dyn Transport>) {
+        *self.gccp_transport.lock().expect("poison") = Some(transport);
     }
 
     /// The host's own endpoint, if it has one.
@@ -171,7 +165,7 @@ impl AgentPool {
     }
 
     /// The user takes back `agent`'s acceptance of `peer`: nothing more
-    /// crosses between them, and what waited to be sent is dropped.
+    /// crosses between them.
     pub async fn gccp_remove(&self, agent: AgentId, peer: &PeerAddress) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
         anyhow::ensure!(
@@ -209,8 +203,14 @@ impl AgentPool {
         Ok(())
     }
 
-    /// `agent` sends `body` to `peer`, which it accepted: the message waits
-    /// for [`Self::gccp_send`]. Answers the name the agent gave the peer.
+    /// `agent` sends `body` to `peer`, which it accepted, and waits for what
+    /// the peer's harness says. Answers the name the agent gave the peer
+    /// once that harness took the message; every other end is an error that
+    /// tells the agent what happened.
+    ///
+    /// One call is one message under one id, picked at random: the
+    /// transport may carry it twice, and the other harness then knows the
+    /// copy. A call made again is a new message.
     pub(super) async fn external_send(
         &self,
         agent: AgentId,
@@ -218,22 +218,45 @@ impl AgentPool {
         body: String,
     ) -> anyhow::Result<String> {
         let peer: PeerAddress = peer.parse().map_err(anyhow::Error::msg)?;
-        self.endpoint()?;
+        let own = self.external_address(agent)?;
         anyhow::ensure!(!body.trim().is_empty(), "a message needs text");
         anyhow::ensure!(
             body.len() <= MAX_BODY_LEN,
             "a message to another host is at most {MAX_BODY_LEN} bytes, and this is {}",
             body.len()
         );
-        let mut write = self.db.write().await;
-        write.gccp_enqueue(agent, &peer, body)?;
-        write.commit();
-        self.gccp_outbox.notify_one();
-        Ok(self
+        let name = self
             .db
             .read()
             .gccp_contact(agent, &peer)
-            .unwrap_or_else(|| peer.to_string()))
+            .with_context(|| format!("{peer} is not an address you accepted"))?;
+        let transport = self.gccp_transport.lock().expect("poison").clone();
+        let transport = transport.context("this host's iroh endpoint is down")?;
+        let envelope = Envelope {
+            to: peer.local.clone(),
+            from: own.local.clone(),
+            id: rand::random(),
+            body,
+        };
+        let sent = transport.send(peer.endpoint, &envelope);
+        let result = match tokio::time::timeout(SEND_TIMEOUT, sent).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("no result in {SEND_TIMEOUT:?}")),
+        };
+        match result {
+            Ok(MessageResult::Delivered) => Ok(name),
+            Ok(MessageResult::Refused) => anyhow::bail!(
+                "the host of {name} ({peer}) refused the message: {name} has not accepted \
+                 your address {own}, or there is no such address. Sending again changes \
+                 nothing until it has."
+            ),
+            Err(error) => anyhow::bail!(
+                "the host of {name} ({peer}) gave no result: {error:#}. It is off, or its \
+                 user has not approved this host ({host}). The message may have arrived all \
+                 the same.",
+                host = own.endpoint
+            ),
+        }
     }
 
     /// A message the harness at `endpoint` sent. It reaches only an agent
@@ -301,186 +324,6 @@ impl AgentPool {
             }
         }
     }
-
-    /// Sends what waits in the outbox, for as long as the host runs: an
-    /// agent's messages to one address in order, the next only once the
-    /// address's harness took the one before. Addresses do not wait for
-    /// each other.
-    ///
-    /// A message its harness refuses is given up on at once. One whose
-    /// harness cannot be reached is tried again after each of `retry_waits`
-    /// and then given up on. Giving up drops the message and all that wait
-    /// behind it, which were written on top of it, and tells the agent: it
-    /// sends again if and when it wants to.
-    pub async fn gccp_send(
-        self: &Arc<Self>,
-        transport: Arc<dyn Transport>,
-        retry_waits: &'static [Duration],
-    ) {
-        let mut flying = futures::stream::FuturesUnordered::new();
-        let mut busy: HashSet<(AgentId, PeerAddress)> = HashSet::new();
-        let mut retries: HashMap<(AgentId, PeerAddress), Retry> = HashMap::new();
-        loop {
-            let outgoing = self.db.read().gccp_outgoing();
-            // A retry is of the message at the head of its outbox.
-            retries.retain(|(agent, peer), retry| {
-                outgoing
-                    .iter()
-                    .any(|out| out.agent == *agent && out.peer == *peer && out.id == retry.id)
-            });
-            let now = Instant::now();
-            for out in outgoing {
-                let key = (out.agent, out.peer.clone());
-                let waits = retries.get(&key).is_some_and(|retry| retry.at > now);
-                if waits || !busy.insert(key) {
-                    continue;
-                }
-                let transport = transport.clone();
-                flying.push(async move {
-                    let envelope = Envelope {
-                        to: out.peer.local.clone(),
-                        from: local_id(out.agent),
-                        id: out.id,
-                        body: out.body.clone(),
-                    };
-                    let send = transport.send(out.peer.endpoint, &envelope);
-                    let result = match tokio::time::timeout(SEND_TIMEOUT, send).await {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!("no result in {SEND_TIMEOUT:?}")),
-                    };
-                    (out, result)
-                });
-            }
-            let next_retry = retries.values().map(|retry| retry.at).min();
-            let retry_due = async {
-                match next_retry {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
-            // Until something changes what there is to send.
-            tokio::select! {
-                Some((out, result)) = flying.next() => {
-                    busy.remove(&(out.agent, out.peer.clone()));
-                    self.gccp_tried(&mut retries, retry_waits, out, result).await;
-                }
-                () = self.gccp_outbox.notified() => {}
-                () = retry_due => {}
-            }
-        }
-    }
-
-    /// One try at one message ended.
-    async fn gccp_tried(
-        self: &Arc<Self>,
-        retries: &mut HashMap<(AgentId, PeerAddress), Retry>,
-        retry_waits: &[Duration],
-        out: GccpOutgoing,
-        result: anyhow::Result<MessageResult>,
-    ) {
-        let failure = match result {
-            Ok(MessageResult::Delivered) => {
-                let mut write = self.db.write().await;
-                write.gccp_done(out.agent, &out.peer, out.id);
-                write.commit();
-                return;
-            }
-            Ok(MessageResult::Refused) => Failure::Refused,
-            Err(_) => {
-                let retry = retries
-                    .entry((out.agent, out.peer.clone()))
-                    .or_insert(Retry {
-                        id: out.id,
-                        failures: 0,
-                        at: Instant::now(),
-                    });
-                retry.failures += 1;
-                if let Some(wait) = retry_waits.get(retry.failures - 1) {
-                    retry.at = Instant::now() + *wait;
-                    return;
-                }
-                Failure::Unreachable {
-                    tries: retry.failures,
-                }
-            }
-        };
-        self.gccp_give_up(out, failure).await;
-    }
-
-    /// Drops `out` and what waits behind it, and tells the agent why.
-    async fn gccp_give_up(self: &Arc<Self>, out: GccpOutgoing, failure: Failure) {
-        // What waits now, not what did when the try began.
-        let waiting = self.db.read().gccp_outgoing();
-        let Some(out) = waiting
-            .into_iter()
-            .find(|waits| waits.agent == out.agent && waits.peer == out.peer && waits.id == out.id)
-        else {
-            // Its acceptance was taken back meanwhile, and its messages with
-            // it.
-            return;
-        };
-        {
-            let mut write = self.db.write().await;
-            write.gccp_done(out.agent, &out.peer, out.newest);
-            write.commit();
-        }
-        let to = format!("{} ({})", out.name, out.peer);
-        let why = match failure {
-            Failure::Refused => {
-                let own = self
-                    .external_address(out.agent)
-                    .map_or_else(|_| "your address".to_owned(), |own| own.to_string());
-                format!(
-                    "[external message to {to} refused]\nIts host did not take the message: \
-                     it has not accepted your address {own}, or there is no such address."
-                )
-            }
-            Failure::Unreachable { tries } => {
-                let host = self
-                    .gccp_endpoint()
-                    .map_or_else(String::new, |own| format!(" ({own})"));
-                format!(
-                    "[external message to {to} not delivered]\nIts host could not be reached, \
-                     or gave no result: it is off, or its user has not approved this \
-                     host{host}. That was {tries} tries."
-                )
-            }
-        };
-        let began: String = out.body.chars().take(200).collect();
-        let dropped = match out.waiting - 1 {
-            0 => "The message was dropped".to_owned(),
-            1 => "It and the message you sent after it were dropped".to_owned(),
-            after => format!("It and the {after} messages you sent after it were dropped"),
-        };
-        let text = format!(
-            "{why} {dropped}: nothing is tried again. Send again if and when it is worth it. \
-             The message began: {began}"
-        );
-        let input = Control::Input {
-            content: vec![ContentPart::Text { text }],
-            role: Role::Tool,
-            message: None,
-        };
-        let told = async {
-            let (_, client, _) = self.load(out.agent).await?;
-            client.control(input).await
-        };
-        if let Err(error) = told.await {
-            eprintln!(
-                "rho-agent: telling {} about its message to {}: {error:#}",
-                out.agent.encoded(),
-                out.peer
-            );
-        }
-    }
-}
-
-/// Why a message is given up on.
-enum Failure {
-    /// Its harness did not take it.
-    Refused,
-    /// Its harness was not reached, or gave no result, this many times.
-    Unreachable { tries: usize },
 }
 
 #[cfg(test)]

@@ -253,8 +253,19 @@ class Tools(WorksetCase):
         self.assertEqual(printed, mine + "\n")
         self.assertEqual(run(external.contacts)[0], "You have accepted no address.\n")
 
-        with self.assertRaisesRegex(ValueError, "is not an address you accepted"):
-            external.send(address=theirs, message="early")
+        def send(text, awaited=True):
+            """A cell that sends, and awaits the send or lets it run."""
+
+            async def cell():
+                sending = external.send(address=theirs, message=text)
+                if awaited:
+                    return await sending
+                await asyncio.sleep(0.05)
+
+            return run(lambda: asyncio.run(cell()))
+
+        with self.assertRaisesRegex(RuntimeError, "is not an address you accepted"):
+            send("early")
         with self.assertRaisesRegex(ValueError, "has not approved the host " + "cd" * 32):
             external.accept(address=theirs, name="dpc's agent")
         with self.assertRaisesRegex(ValueError, "an address is <endpoint id>/<local id>"):
@@ -271,16 +282,21 @@ class Tools(WorksetCase):
         with self.assertRaisesRegex(ValueError, "already accepted as \"dpc's agent\""):
             external.accept(address=theirs, name="someone else")
         with self.assertRaisesRegex(ValueError, "a message needs text"):
-            external.send(address=theirs, message="  ")
+            send("  ")
 
-        printed, _ = run(lambda: external.send(address=theirs, message="Hello."))
-        self.assertEqual(printed, "Sending to dpc's agent. A notice follows if its host does not take it.\n")
-        self.assertEqual(self.state.sent, [(self.root, theirs, "Hello.")])
+        # The send ends with what the other host said. It runs whether or
+        # not the cell awaits it.
+        printed, returned = send("Hello.")
+        self.assertEqual((printed, returned), ("Delivered to dpc's agent.\n", "Delivered to dpc's agent."))
+        printed, _ = send("And again.", awaited=False)
+        self.assertEqual(printed, "Delivered to dpc's agent.\n")
+        self.assertEqual(self.state.sent, [(self.root, theirs, "Hello."), (self.root, theirs, "And again.")])
         self.assertEqual(self.state.messages, [], "it is no chat message")
-        self.assertEqual(
-            run(external.contacts)[0],
-            f"dpc's agent: {theirs}, 1 of your messages not delivered yet\n",
-        )
+        self.state.refusing.add(theirs)
+        with self.assertRaisesRegex(RuntimeError, "refused the message"):
+            send("Anyone?")
+        self.assertEqual(len(self.state.sent), 2)
+        self.assertEqual(run(external.contacts)[0], f"dpc's agent: {theirs}\n")
 
         # Another agent has accepted nothing, and an Advisor talks to no
         # other host. `agents.message` stays inside this host.
@@ -292,7 +308,7 @@ class Tools(WorksetCase):
         self.assertFalse(hasattr(adv["agents"], "external"))
         with self.assertRaises((ValueError, RuntimeError)):
             ns["agents"].message(agent_id=theirs, message="Hello.")
-        self.assertEqual(len(self.state.sent), 1)
+        self.assertEqual(len(self.state.sent), 2)
 
         self.state.endpoint = None
         with self.assertRaisesRegex(ValueError, "no iroh endpoint"):

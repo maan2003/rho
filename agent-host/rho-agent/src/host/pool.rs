@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
+pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, Transport};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -66,8 +66,8 @@ pub struct AgentPool {
     /// The GCCP messages taken last, so that one sent again is not given to
     /// its agent twice.
     gccp_stored: std::sync::Mutex<gccp::Stored>,
-    /// Woken when an agent puts a message in the GCCP outbox.
-    gccp_outbox: tokio::sync::Notify,
+    /// What carries GCCP messages out, while the host's endpoint is up.
+    gccp_transport: std::sync::Mutex<Option<Arc<dyn Transport>>>,
     agents: Mutex<HashMap<AgentId, AgentClient>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -151,7 +151,7 @@ impl AgentPool {
             init,
             endpoint: std::sync::OnceLock::new(),
             gccp_stored: std::sync::Mutex::default(),
-            gccp_outbox: tokio::sync::Notify::new(),
+            gccp_transport: std::sync::Mutex::default(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
@@ -1100,8 +1100,7 @@ impl AgentPool {
         }
         {
             let mut write = self.db.write().await;
-            // An agent that is gone accepts no one: its address refuses
-            // already, and nothing of its is left to send.
+            // An agent that is gone accepts no one.
             for &agent in &agents {
                 write.gccp_forget(agent);
             }

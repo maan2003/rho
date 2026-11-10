@@ -7,6 +7,7 @@ reports, it prints, so the model sees it with its cell, and returns as an
 awaitable string, so the model may `await` it or not.
 """
 
+import asyncio
 import os
 
 import _rho
@@ -287,21 +288,23 @@ class External:
         )
 
     def send(self, *, address, message):
-        """Send `message` to `address`, which you accepted. A notice follows
-        only if its host does not take the message."""
-        name = _host(_rho.external_send, self._agent, str(address).strip(), _text(message))
-        return report(f"Sending to {name}. A notice follows if its host does not take it.")
+        """Send `message` to `address`, which you accepted. The send starts
+        now; await it to know that the address's host took the message. It
+        raises when that host refuses the message or gives no result."""
+        address, text = str(address).strip(), _text(message)
+
+        async def external_send():
+            name = await _rho.external_send(self._agent, address, text)
+            return report(f"Delivered to {name}.")
+
+        return asyncio.ensure_future(external_send())
 
     def contacts(self):
         """The addresses on other hosts you have accepted."""
         held = _rho.external_contacts(self._agent)
         if not held:
             return report("You have accepted no address.")
-        lines = []
-        for contact in held:
-            waiting = f", {contact['unsent']} of your messages not delivered yet" if contact["unsent"] else ""
-            lines.append(f"{contact['name']}: {contact['address']}{waiting}")
-        return report("\n".join(lines))
+        return report("\n".join(f"{contact['name']}: {contact['address']}" for contact in held))
 
     def __repr__(self):
         return "<agents.external>"

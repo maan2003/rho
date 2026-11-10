@@ -288,7 +288,6 @@ where
                             agent: contact.agent.encoded(),
                             address: contact.peer.to_string(),
                             name: contact.name,
-                            unsent: contact.unsent,
                         })
                         .collect(),
                 })

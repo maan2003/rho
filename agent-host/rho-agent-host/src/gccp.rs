@@ -1,7 +1,6 @@
 //! GCCP on the wire ([docs/gccp.md](../../../docs/gccp.md)): a stream says
 //! its kind first, and a message stream then carries one CBOR map and
-//! brings back its result. What the host does
-//! with a message is the pool's
+//! brings back its result. What the host does with a message is the pool's
 //! ([`rho_agent::host::pool::AgentPool::gccp_receive`]); this module only
 //! carries.
 
@@ -24,17 +23,10 @@ pub const ALPN: &[u8] = b"gccp/1";
 const KIND_MESSAGE: u16 = 1;
 /// The code a stream of a kind this host does not know is reset with.
 const UNKNOWN_KIND: u32 = 1;
-/// How many harnesses may hold a connection at once. Nobody approved them,
-/// so what they can make the host hold is bounded: this many connections,
-/// each with as many streams as the endpoint allows, each one message.
-pub const MAX_CONNECTIONS: usize = 64;
 /// The longest message read: the longest body and room for the rest of
 /// its map.
 const MAX_MESSAGE_LEN: usize = MAX_BODY_LEN + 512;
 const MAX_RESULT_LEN: usize = 256;
-/// How long a connection may carry nothing before the host closes it, so a
-/// harness that went quiet does not keep one of the connections there are.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a peer has to say all of one message.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -127,14 +119,7 @@ async fn serve_messages<F, Fut>(
         connection.close(0u32.into(), b"");
         return;
     }
-    loop {
-        let Ok(stream) = tokio::time::timeout(IDLE_TIMEOUT, connection.accept_bi()).await else {
-            connection.close(0u32.into(), b"idle");
-            return;
-        };
-        let Ok((mut send, mut recv)) = stream else {
-            return;
-        };
+    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         let receive = receive.clone();
         tokio::spawn(async move {
             let said = async {
@@ -179,8 +164,7 @@ async fn exchange(connection: &Connection, envelope: &Envelope) -> anyhow::Resul
 
 /// Carries messages over the host's own iroh endpoint, so a harness that
 /// receives one sees this host's id. One connection to a harness carries
-/// every message to it, until it closes: the other side closes one that
-/// goes quiet.
+/// every message to it, until it closes.
 pub struct IrohTransport {
     endpoint: iroh::Endpoint,
     connections: std::sync::Mutex<HashMap<EndpointId, Connection>>,
@@ -453,7 +437,7 @@ mod tests {
 
             // The other side closed the connection: the next message takes a
             // new one, and nobody hears of it.
-            first.close(0u32.into(), b"idle");
+            first.close(0u32.into(), b"");
             assert_eq!(
                 transport.send(to, &envelope("again")).await?,
                 MessageResult::Delivered

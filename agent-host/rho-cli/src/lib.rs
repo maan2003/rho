@@ -149,10 +149,9 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
                         agent,
                         address,
                         name,
-                        unsent,
                     } = contact;
                     if address.starts_with(&endpoint) {
-                        println!("  {agent} accepted {address}\t{name:?}\t{unsent} unsent");
+                        println!("  {agent} accepted {address}\t{name:?}");
                     }
                 }
             }

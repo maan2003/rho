@@ -138,8 +138,9 @@ pub(crate) enum PyRequest {
         peer: String,
         name: String,
     },
-    /// The agent sends a message to an address it accepted; answered with
-    /// the name it gave the address (`Text`).
+    /// The agent sends a message to an address it accepted. Answered once
+    /// the address's host took it, with the name the agent gave the address
+    /// (`Text`), or with what went wrong.
     ExternalSend {
         agent: rho_agent_types::AgentId,
         peer: String,

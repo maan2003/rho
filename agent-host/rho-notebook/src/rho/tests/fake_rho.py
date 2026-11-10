@@ -23,7 +23,8 @@ class State:
         self.endpoint = "ab" * 32  # the host's own; None for a host without iroh
         self.hosts = set()  # the endpoints the user approved
         self.contacts = {}  # (agent, address) -> name
-        self.sent = []  # (agent, address, text), not taken yet
+        self.sent = []  # (agent, address, text) that the address's host took
+        self.refusing = set()  # addresses whose host refuses
         self.contexts = {}  # cwd -> Context
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
@@ -191,20 +192,24 @@ def external_accept(agent, address, name):
             raise RuntimeError(f"{address} is already accepted as {held!r}")
 
 
-def external_send(agent, address, text):
+async def external_send(agent, address, text):
+    await asyncio.sleep(0)
     with STATE.lock:
         assert agent in STATE.agents
         _endpoint(address)
         if (agent, address) not in STATE.contacts:
             raise RuntimeError(f"{address} is not an address you accepted")
+        name = STATE.contacts[agent, address]
+        if address in STATE.refusing:
+            raise RuntimeError(f"the host of {name} ({address}) refused the message")
         STATE.sent.append((agent, address, text))
-        return STATE.contacts[agent, address]
+        return name
 
 
 def external_contacts(agent):
     with STATE.lock:
         return [
-            {"address": address, "name": name, "unsent": sum(1 for sent in STATE.sent if sent[:2] == (holder, address))}
+            {"address": address, "name": name}
             for (holder, address), name in STATE.contacts.items()
             if holder == agent
         ]

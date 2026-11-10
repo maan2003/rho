@@ -175,8 +175,6 @@ pub struct GccpContact {
     pub address: String,
     /// What the agent named it.
     pub name: String,
-    /// How many of the agent's messages it has not taken yet.
-    pub unsent: u64,
 }
 
 /// Approves the harness at an endpoint, under a name: the host's agents may
@@ -197,7 +195,7 @@ pub struct GccpRevoke {
 }
 
 /// Takes back an agent's acceptance of a GCCP address: nothing more crosses
-/// between the two, and what waited to be sent is dropped.
+/// between the two.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GccpRemove {
     pub agent: String,

@@ -704,19 +704,25 @@ fn external_accept(py: Python<'_>, agent: &str, address: String, name: String) -
     }
 }
 
-/// The agent sends a message to an address it accepted; returns the name
-/// it gave the address.
+/// The agent sends a message to an address it accepted, as an awaitable
+/// of the caller's loop: the name it gave the address, once that address's
+/// host took the message.
 #[pyfunction]
-fn external_send(py: Python<'_>, agent: &str, address: String, text: String) -> PyResult<String> {
+fn external_send(
+    py: Python<'_>,
+    agent: &str,
+    address: String,
+    text: String,
+) -> PyResult<Py<PyAny>> {
     let request = PyRequest::ExternalSend {
         agent: agent_id(agent)?,
         peer: address,
         body: text,
     };
-    match PyHost::block(py, request)? {
-        PyReply::Text(name) => Ok(name),
+    later(py, request, |py, reply| match reply {
+        PyReply::Text(name) => Ok(name.into_pyobject(py)?.into_any()),
         _ => Err(unexpected()),
-    }
+    })
 }
 
 /// The addresses the agent accepted, each a dict.
@@ -729,7 +735,6 @@ fn external_contacts(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
                 let held = PyDict::new(py);
                 held.set_item("address", contact.peer.to_string())?;
                 held.set_item("name", contact.name)?;
-                held.set_item("unsent", contact.unsent)?;
                 out.append(held)?;
             }
             Ok(out.into_any().unbind())
@@ -913,27 +918,38 @@ fn message_to_py<'py>(
 /// loop.
 #[pyfunction]
 fn inbox(py: Python<'_>, agent: &str, after: u64) -> PyResult<Py<PyAny>> {
-    let agent = agent_id(agent)?;
+    let request = PyRequest::Inbox {
+        agent: agent_id(agent)?,
+        after: ChatSeq(after),
+    };
+    later(py, request, |py, reply| match reply {
+        PyReply::Messages(messages) => messages
+            .iter()
+            .map(|message| message_to_py(py, message))
+            .collect::<PyResult<Vec<_>>>()
+            .and_then(|messages| Ok(PyList::new(py, messages)?.into_any())),
+        _ => Err(unexpected()),
+    })
+}
+
+/// A host call as an awaitable of the caller's loop: `value` makes what it
+/// resolves to from the host's reply, and a refusal raises `RuntimeError`
+/// in whoever awaits.
+fn later(
+    py: Python<'_>,
+    request: PyRequest,
+    value: impl for<'py> FnOnce(Python<'py>, PyReply) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
+) -> PyResult<Py<PyAny>> {
     let host = host()?;
     let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
     let future = event_loop.call_method0("create_future")?;
     let (event_loop, settle) = (event_loop.unbind(), future.clone().unbind());
     host.runtime.spawn(async move {
-        let reply = host
-            .call(PyRequest::Inbox {
-                agent,
-                after: ChatSeq(after),
-            })
-            .await;
+        let reply = host.call(request).await;
         Python::attach(|py| {
             let settle = settle.bind(py);
             let outcome = match reply {
-                Ok(PyReply::Messages(messages)) => messages
-                    .iter()
-                    .map(|message| message_to_py(py, message))
-                    .collect::<PyResult<Vec<_>>>()
-                    .and_then(|messages| Ok(PyList::new(py, messages)?.into_any())),
-                Ok(_) => Err(unexpected()),
+                Ok(reply) => value(py, reply),
                 Err(error) => Err(PyRuntimeError::new_err(format!("{error:#}"))),
             };
             let result = (|| -> PyResult<()> {

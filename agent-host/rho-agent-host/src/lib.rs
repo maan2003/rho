@@ -934,15 +934,11 @@ async fn run_iroh_listener(
 ) {
     // What agents send other harnesses leaves by this endpoint, so they see
     // this host's id.
-    let gccp_sender = tokio::spawn({
-        let pool = services.pool.clone();
-        let transport = Arc::new(gccp::IrohTransport::new(listener.endpoint().clone()));
-        async move {
-            pool.gccp_send(transport, &rho_agent::host::pool::RETRY_WAITS)
-                .await
-        }
-    });
-    let gccp_connections = Arc::new(tokio::sync::Semaphore::new(gccp::MAX_CONNECTIONS));
+    services
+        .pool
+        .set_transport(Arc::new(gccp::IrohTransport::new(
+            listener.endpoint().clone(),
+        )));
     while let Some(accepted) = tokio::select! {
         accepted = listener.accept() => accepted,
         _ = &mut shutdown => None,
@@ -953,16 +949,7 @@ async fn run_iroh_listener(
             // speaks GCCP and nothing else, and only if the user approved it.
             Ok(rho_rpc::Accepted::Open(connection)) => {
                 if connection.alpn() == gccp::ALPN {
-                    match gccp_connections.clone().try_acquire_owned() {
-                        Ok(held) => {
-                            let pool = services.pool.clone();
-                            tokio::spawn(async move {
-                                gccp::serve(pool, connection).await;
-                                drop(held);
-                            });
-                        }
-                        Err(_) => connection.close(0u32.into(), b"too many GCCP connections"),
-                    }
+                    tokio::spawn(gccp::serve(services.pool.clone(), connection));
                 }
                 continue;
             }
@@ -1031,7 +1018,6 @@ async fn run_iroh_listener(
             uni_task.abort();
         });
     }
-    gccp_sender.abort();
     listener.close().await;
 }
 
