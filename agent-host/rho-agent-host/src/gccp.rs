@@ -62,6 +62,7 @@ fn encode_message(envelope: &Envelope) -> Vec<u8> {
 fn decode_message(bytes: &[u8]) -> anyhow::Result<Envelope> {
     let WireMessage { to, from, id, body } =
         ciborium::from_reader(bytes).context("not a GCCP message")?;
+    anyhow::ensure!(!body.trim().is_empty(), "a GCCP body is blank");
     anyhow::ensure!(body.len() <= MAX_BODY_LEN, "a GCCP body is too long");
     Ok(Envelope {
         to: to.parse().map_err(anyhow::Error::msg)?,
@@ -275,6 +276,9 @@ mod tests {
         negative[2].1 = Value::Integer((-1).into());
         assert!(decode_message(&map(&negative)).is_err());
 
+        for blank in ["", " \n\t"] {
+            assert!(decode_message(&encode_message(&envelope(blank))).is_err());
+        }
         let longest = "x".repeat(MAX_BODY_LEN);
         assert_eq!(
             decode_message(&encode_message(&envelope(&longest))).unwrap(),
