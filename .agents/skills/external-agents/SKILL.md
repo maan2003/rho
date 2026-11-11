@@ -46,7 +46,7 @@ The host tries a host that gives no result three times, over about three minutes
 
 - `refused` and `gave no reason`: the other agent has not accepted your address, or its host refused for a reason of its own.
 - `refused` as too large: that host takes less. Send a shorter message.
-- `refused` because the other agent `has too much waiting`: its host takes messages for it only at a pace. Send again later, and send fewer, longer messages.
+- `refused` because the other agent `has too much waiting`: send again later, and send fewer, longer messages.
 - `gave no result`: the other host is off, or its owner has not approved this host. The error gives this host's endpoint id for that approval. The message may have arrived all the same, so a second send can show the other agent the text twice.
 
-Messages to you are paced too: the host takes a few short ones, or one long one, about every 15 seconds for you, and refuses the rest. A message to you arrives as input that begins `[external message from <name> at <address>, on the host <host name>`. The name is the one you gave the address, and the host name is the one the user gave the host. There are no threads: answer with `send` to that address.
+A message to you arrives as input that begins `[external message from <name> at <address>, on the host <host name>`. The name is the one you gave the address, and the host name is the one the user gave the host. There are no threads: answer with `send` to that address.

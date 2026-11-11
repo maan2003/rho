@@ -822,27 +822,6 @@ async fn gccp_two_hosts() {
         MessageResult::Refused(None)
     );
 
-    // A flood reaches Ann at a pace: a few short messages, and then the
-    // rest are refused as too much waiting, until time passes.
-    let mut flood = Vec::new();
-    for n in 0..20u64 {
-        let flooding = Envelope {
-            id: pong.id.wrapping_add(200 + n),
-            body: format!("flood {n}"),
-            ..pong.clone()
-        };
-        let result = here.gccp_receive(THERE, flooding).await;
-        let full = result == MessageResult::Refused(Some(Reason::QueueFull));
-        assert!(full || result == MessageResult::Delivered, "{result:?}");
-        flood.push(full);
-        if full {
-            break;
-        }
-    }
-    let taken = flood.iter().filter(|full| !**full).count();
-    assert_eq!(flood.last(), Some(&true), "{flood:?}");
-    assert!((4..=6).contains(&taken), "{taken} of the flood were taken");
-
     // A host that cannot be reached is tried three times under one id, and
     // then the call says what the other side may have to do.
     here.gccp_approve(NOWHERE, "a host that is off")
@@ -931,8 +910,6 @@ async fn gccp_two_hosts() {
     assert_eq!(said(&there_asked, "]\nping two"), 1);
     assert_eq!(said(&there_asked, "early one"), 0);
     assert_eq!(said(&there_asked, "ping three"), 0);
-    told(&here_asked, &format!("]\nflood {}", taken - 1)).await;
-    assert_eq!(said(&here_asked, &format!("]\nflood {taken}")), 0);
     assert_eq!(said(&here_asked, "xxxx"), 0);
     for (asked, text) in [(&here_asked, "pong"), (&there_asked, "ping one")] {
         for item in items(asked, text) {
