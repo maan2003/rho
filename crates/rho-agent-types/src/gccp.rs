@@ -2,34 +2,46 @@
 //! endpoint a harness is reached at, a recipient inside it, and the address
 //! the two make.
 
+use std::fmt::Write as _;
+
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-/// A harness's iroh endpoint id: its public key. As text it is 64 lowercase
-/// hexadecimal digits.
+/// An iroh endpoint id: its public key. As text, everywhere rho shows or
+/// reads one, it is z-base-32 as pkarr and iroh's `to_z32` write it: 52 of
+/// [`Z32`], most significant bit first, the last 4 bits zero.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
 )]
 pub struct EndpointId(pub [u8; 32]);
 
+/// The z-base-32 alphabet: each symbol stands for its index.
+const Z32: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+/// The symbols of an endpoint id: 256 bits, 5 to a symbol.
+const Z32_LEN: usize = 52;
+
 impl std::str::FromStr for EndpointId {
     type Err = String;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let shape = || format!("an endpoint id is 64 lowercase hex digits, not {text:?}");
-        let digit = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            _ => None,
-        };
-        if text.len() != 64 {
+        let shape = || format!("an endpoint id is {Z32_LEN} of z-base-32, not {text:?}");
+        if text.len() != Z32_LEN {
             return Err(shape());
         }
         let mut endpoint = [0; 32];
-        for (byte, pair) in endpoint.iter_mut().zip(text.as_bytes().chunks(2)) {
-            let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
-                return Err(shape());
-            };
-            *byte = high << 4 | low;
+        let (mut bits, mut held, mut at) = (0u32, 0u32, 0);
+        for symbol in text.bytes() {
+            let value = Z32.iter().position(|&z| z == symbol).ok_or_else(shape)?;
+            bits = bits << 5 | value as u32;
+            held += 5;
+            if held >= 8 {
+                held -= 8;
+                endpoint[at] = (bits >> held) as u8;
+                at += 1;
+            }
+        }
+        // One text for each id: the bits past the last byte are zero.
+        if bits & ((1 << held) - 1) != 0 {
+            return Err(shape());
         }
         Ok(Self(endpoint))
     }
@@ -37,8 +49,18 @@ impl std::str::FromStr for EndpointId {
 
 impl std::fmt::Display for EndpointId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (mut bits, mut held) = (0u32, 0u32);
+        let mut symbol = |value: u32| f.write_char(char::from(Z32[(value & 31) as usize]));
         for byte in self.0 {
-            write!(f, "{byte:02x}")?;
+            bits = bits << 8 | u32::from(byte);
+            held += 8;
+            while held >= 5 {
+                held -= 5;
+                symbol(bits >> held)?;
+            }
+        }
+        if held > 0 {
+            symbol(bits << (5 - held))?;
         }
         Ok(())
     }
@@ -112,30 +134,47 @@ impl std::fmt::Display for PeerAddress {
 mod tests {
     use super::*;
 
+    /// Bytes 0 to 31 in z-base-32, as an encoder apart from this one
+    /// writes them.
+    const COUNTING: &str = "yyyoryarywdyqnyjbefoadeqbhebnrounoktcfaadrpbs8y7daxo";
+
     #[test]
     fn an_address_reads_back_as_it_is_written() {
-        let text = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f/x4.b_c-9";
+        let counting = EndpointId(std::array::from_fn(|n| n as u8));
+        assert_eq!(counting.to_string(), COUNTING);
+        let text = format!("{COUNTING}/x4.b_c-9");
         let address: PeerAddress = text.parse().unwrap();
-        assert_eq!(address.endpoint.0[1], 1);
-        assert_eq!(address.endpoint.0[31], 0x1f);
+        assert_eq!(address.endpoint, counting);
         assert_eq!(address.local.as_str(), "x4.b_c-9");
         assert_eq!(address.to_string(), text);
-        assert_eq!(text[..64].parse::<EndpointId>().unwrap(), address.endpoint);
+        for endpoint in [[0; 32], [0xff; 32], [0xa1; 32]] {
+            let endpoint = EndpointId(endpoint);
+            let written = endpoint.to_string();
+            assert_eq!(written.len(), 52);
+            assert_eq!(written.parse(), Ok(endpoint));
+        }
+        assert_eq!(EndpointId([0; 32]).to_string(), "y".repeat(52));
     }
 
     #[test]
     fn an_address_outside_the_grammar_is_no_address() {
-        let endpoint = "00".repeat(32);
+        let endpoint = "y".repeat(52);
         for bad in [
             endpoint.clone(),
             format!("{endpoint}/"),
             format!("{endpoint}/Upper"),
             format!("{endpoint}/a/b"),
             format!("{endpoint}/{}", "a".repeat(65)),
-            format!("{}/a", "0".repeat(63)),
-            format!("{}/a", "0".repeat(66)),
-            format!("{}/a", "AB".repeat(32)),
-            format!("{}/a", "zz".repeat(32)),
+            format!("{}/a", "y".repeat(51)),
+            format!("{}/a", "y".repeat(53)),
+            format!("{}/a", "Y".repeat(52)),
+            // Not in the alphabet: z-base-32 has no 0, 2 or l.
+            format!("{}0/a", "y".repeat(51)),
+            format!("{}l/a", "y".repeat(51)),
+            // The bits past the last byte are not zero: `b` is 00001.
+            format!("{}b/a", "y".repeat(51)),
+            // The hex that rho wrote before.
+            format!("{}/a", "00".repeat(32)),
         ] {
             assert!(bad.parse::<PeerAddress>().is_err(), "{bad}");
         }

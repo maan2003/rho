@@ -51,7 +51,11 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "9a6cf67f";
+const CURRENT_AGENT_DB_FORMAT: &str = "7cfd7d03";
+/// Temporary (`temp-migration`): the format before GCCP acceptances were
+/// keyed by endpoint bytes, which
+/// [`crate::store::gccp::key_contacts_by_endpoint`] moves from.
+const PREVIOUS_AGENT_DB_FORMAT: &str = "9a6cf67f";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -387,6 +391,23 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
+    if stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT) {
+        // Temporary (`temp-migration`): `rho debug rollback` puts the store
+        // back from this savepoint.
+        let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
+        db.persistent_savepoint(|write, id| {
+            write.open_table(RECOVERY).insert(hop, id);
+        })
+        .await;
+        let mut write = db.write().await;
+        crate::store::gccp::key_contacts_by_endpoint(&mut write);
+        write
+            .open_table(FORMAT)
+            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
+        write.init_agent_tables();
+        write.commit();
+        return;
+    }
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -507,4 +528,92 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .get(MACHINE_SEED_KEY)
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
+}
+
+/// Temporary (`temp-migration`).
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::{AgentId, AgentIdDomain, EndpointId, PeerAddress};
+
+    use super::*;
+    use crate::store::GccpRead as _;
+
+    const HEX_CONTACTS: TableDefinition<(AgentId, String), String> =
+        TableDefinition::new("gccp_contacts");
+
+    /// `prepare` moves each acceptance from its hex key to its endpoint's
+    /// bytes once, and the rollback puts back the stamp and the old table.
+    #[tokio::test]
+    async fn gccp_acceptances_move_to_endpoint_keys_once_and_roll_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let agent = |n| AgentId::from_counter(n, &AgentIdDomain(7)).unwrap();
+        let tau = EndpointId(std::array::from_fn(|n| 0xf0 ^ n as u8));
+        // As format 9a6cf67f wrote them: 64 hex digits, by hand.
+        let hex: String = tau.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(hex.starts_with("f0f1f2"), "{hex}");
+        let mut write = db.write().await;
+        write
+            .open_table(FORMAT)
+            .insert((), PREVIOUS_AGENT_DB_FORMAT.to_owned());
+        rho_iroh_auth::gccp_hosts::init(&mut write);
+        rho_iroh_auth::gccp_hosts::approve(&mut write, &tau.0, "dpc-tau".into());
+        let mut old = write.open_table(HEX_CONTACTS);
+        old.insert(
+            (agent(1), format!("{hex}/coordinator-p65r")),
+            "tau".to_owned(),
+        );
+        old.insert((agent(2), format!("{hex}/x.y_z")), "tau for 2".to_owned());
+        drop(old);
+        write.commit();
+        let state = || {
+            let read = db.read();
+            let mut contacts: Vec<(AgentId, PeerAddress, String)> = read
+                .gccp_contacts()
+                .into_iter()
+                .map(|contact| (contact.agent, contact.peer, contact.name))
+                .collect();
+            contacts.sort_by_key(|contact| contact.0);
+            (
+                read.open_table(FORMAT).get(()).unwrap().value(),
+                read.has_table("gccp_contacts"),
+                contacts,
+            )
+        };
+        let address = |local: &str| PeerAddress {
+            endpoint: tau,
+            local: local.parse().unwrap(),
+        };
+        let moved = (
+            CURRENT_AGENT_DB_FORMAT.to_owned(),
+            false,
+            vec![
+                (agent(1), address("coordinator-p65r"), "tau".to_owned()),
+                (agent(2), address("x.y_z"), "tau for 2".to_owned()),
+            ],
+        );
+
+        prepare(&db).await;
+        assert_eq!(state(), moved);
+        assert_eq!(
+            db.read()
+                .gccp_contact(agent(1), &address("coordinator-p65r"))
+                .as_deref(),
+            Some("tau")
+        );
+        prepare(&db).await;
+        assert_eq!(state(), moved);
+
+        let hop = rollback(&db).await.unwrap();
+        assert_eq!(
+            hop,
+            format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}")
+        );
+        let read = db.read();
+        assert_eq!(
+            read.open_table(FORMAT).get(()).unwrap().value(),
+            PREVIOUS_AGENT_DB_FORMAT
+        );
+        assert_eq!(read.open_table(HEX_CONTACTS).iter().count(), 2);
+    }
 }

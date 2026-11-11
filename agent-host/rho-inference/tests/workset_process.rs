@@ -689,14 +689,8 @@ async fn gccp_two_hosts() {
     let bob_address = agents_tool(&there, there_workset, bob, "external.address()")
         .await
         .unwrap();
-    assert_eq!(
-        ann_address,
-        format!("{}/{}", "a1".repeat(32), ann.encoded())
-    );
-    assert_eq!(
-        bob_address,
-        format!("{}/{}", "b2".repeat(32), bob.encoded())
-    );
+    assert_eq!(ann_address, format!("{HERE}/{}", ann.encoded()));
+    assert_eq!(bob_address, format!("{THERE}/{}", bob.encoded()));
     let accept = async |pool: &Arc<AgentPool>, workset, agent, address: &str, name: &str| {
         let call = format!("external.accept(address={address:?}, name={name:?})");
         agents_tool(pool, workset, agent, &call).await
@@ -716,7 +710,7 @@ async fn gccp_two_hosts() {
     let error = accept(&here, here_workset, ann, &bob_address, "bob")
         .await
         .unwrap_err();
-    let approve = format!("rho iroh approve --role gccp {} <name>", "b2".repeat(32));
+    let approve = format!("rho iroh approve --role gccp {THERE} <name>");
     assert!(error.contains(&approve), "{error}");
     let error = send(&here, here_workset, ann, &bob_address, "too early")
         .await

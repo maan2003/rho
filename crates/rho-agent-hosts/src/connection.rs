@@ -938,9 +938,9 @@ async fn trust_in_memory_over_ssh(
         is_safe_remote_executable(remote_rho),
         "invalid remote rho executable path"
     );
-    // EndpointId's text form has a fixed safe alphabet even though OpenSSH
-    // sends the remote argv through the login shell.
-    let endpoint_id = endpoint_id.to_string();
+    // An endpoint id's text form has a fixed safe alphabet even though
+    // OpenSSH sends the remote argv through the login shell.
+    let endpoint_id = rho_agent_types::EndpointId(*endpoint_id.as_bytes()).to_string();
     let status = tokio::process::Command::new("ssh")
         .arg("--")
         .arg(destination)

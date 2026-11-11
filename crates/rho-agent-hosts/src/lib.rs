@@ -178,9 +178,12 @@ impl HostSpec {
                     ),
                     None => (rest, IrohAccess::Fido),
                 };
+                // The one text form rho gives an endpoint id.
+                let endpoint_id: rho_agent_types::EndpointId = endpoint_id
+                    .parse()
+                    .map_err(|error| format!("invalid iroh endpoint id: {error}"))?;
                 AttachTarget::Iroh {
-                    endpoint_id: endpoint_id
-                        .parse()
+                    endpoint_id: iroh::EndpointId::from_bytes(&endpoint_id.0)
                         .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
                     access,
                 }
@@ -268,21 +271,26 @@ mod parse_tests {
     #[test]
     fn iroh_access_forms_keep_the_same_endpoint() {
         let id = iroh::SecretKey::from([7; 32]).public();
-        let fido = HostSpec::parse(&format!("fern=iroh:{id}"), "/opt/rho").unwrap();
+        let z32 = id.to_z32();
+        assert!(
+            HostSpec::parse(&format!("fern=iroh:{id}"), "/opt/rho").is_err(),
+            "hex"
+        );
+        let fido = HostSpec::parse(&format!("fern=iroh:{z32}"), "/opt/rho").unwrap();
         assert_eq!(fido.name, "fern");
         assert!(
             matches!(fido.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Fido } if endpoint_id == id)
         );
         let key = "ab".repeat(32);
-        let link = HostSpec::parse(&format!("phone=rho://{id}?key={key}"), "rho").unwrap();
+        let link = HostSpec::parse(&format!("phone=rho://{z32}?key={key}"), "rho").unwrap();
         assert_eq!(link.name, "phone");
         assert!(
             matches!(&link.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Link { key: shown } } if *endpoint_id == id && shown.to_string() == key)
         );
         // The client names the host, never the link.
-        assert!(HostSpec::parse(&format!("rho://{id}?key={key}"), "rho").is_err());
-        assert!(HostSpec::parse(&format!("=rho://{id}?key={key}"), "rho").is_err());
-        let ssh = HostSpec::parse(&format!("fern=iroh:{id}@other-host"), "/opt/rho").unwrap();
+        assert!(HostSpec::parse(&format!("rho://{z32}?key={key}"), "rho").is_err());
+        assert!(HostSpec::parse(&format!("=rho://{z32}?key={key}"), "rho").is_err());
+        let ssh = HostSpec::parse(&format!("fern=iroh:{z32}@other-host"), "/opt/rho").unwrap();
         assert!(
             matches!(ssh.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Ssh { ssh_destination, remote_rho } } if endpoint_id == id && ssh_destination == "other-host" && remote_rho == "/opt/rho")
         );

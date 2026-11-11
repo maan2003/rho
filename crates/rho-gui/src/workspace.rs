@@ -4148,7 +4148,9 @@ impl Workspace {
                 return self.notice_on(None, &message, StyleClass::StatusError, cx);
             }
         };
-        let id = link.endpoint_id.fmt_short().to_string();
+        // The start of the id in the one text form rho gives it.
+        let id =
+            rho_agent_types::EndpointId(*link.endpoint_id.as_bytes()).to_string()[..10].to_owned();
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,

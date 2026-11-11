@@ -161,7 +161,7 @@ pub struct GccpState {
 /// A harness the user approved.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GccpHost {
-    /// Its endpoint id: 64 lowercase hex digits.
+    /// Its endpoint id: 52 of z-base-32.
     pub endpoint: String,
     /// What the user named it.
     pub name: String,
