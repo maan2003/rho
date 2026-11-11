@@ -35,13 +35,58 @@ pub struct Envelope {
 
 /// What a harness says of a message it was sent: its result, as
 /// docs/gccp.md has it. It is not a reply from the recipient.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageResult {
     /// Stored for its recipient.
     Delivered,
-    /// Not taken: no such recipient, or it has not accepted the sender. A
-    /// harness does not say which.
-    Refused,
+    /// Not taken, and maybe why. No such recipient and a recipient that has
+    /// not accepted the sender are both a refusal with no reason, so a
+    /// stranger learns nothing from it.
+    Refused(Option<Reason>),
+}
+
+/// Why a harness refused a message, when it says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// The body is larger than that harness takes.
+    MsgTooLarge,
+    /// The recipient has too much waiting.
+    QueueFull,
+    /// A reason a later version added. It is shown, and acted on as none.
+    Unknown(String),
+}
+
+/// The longest reason, in bytes: a result has to stay short.
+const MAX_REASON_LEN: usize = 64;
+
+impl Reason {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::MsgTooLarge => "msg-too-large",
+            Self::QueueFull => "queue-full",
+            Self::Unknown(reason) => reason,
+        }
+    }
+}
+
+impl std::str::FromStr for Reason {
+    type Err = String;
+
+    /// 1 to [`MAX_REASON_LEN`] bytes of `a-z`, `0-9` and `-`.
+    fn from_str(reason: &str) -> Result<Self, String> {
+        let valid = (1..=MAX_REASON_LEN).contains(&reason.len())
+            && reason
+                .bytes()
+                .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+        if !valid {
+            return Err(format!("{reason:?} is not a GCCP reason"));
+        }
+        Ok(match reason {
+            "msg-too-large" => Self::MsgTooLarge,
+            "queue-full" => Self::QueueFull,
+            _ => Self::Unknown(reason.to_owned()),
+        })
+    }
 }
 
 /// Carries messages to other harnesses.
@@ -57,7 +102,11 @@ pub trait Transport: Send + Sync + 'static {
 }
 
 /// The longest body GCCP carries, in bytes of UTF-8.
-pub const MAX_BODY_LEN: usize = 64 * 1024;
+pub const WIRE_MAX_BODY_LEN: usize = 64 * 1024;
+/// The longest body this host takes and its agents send: the least that
+/// docs/gccp.md says each harness should take, so it fits every one. A
+/// message costs its reader context, so more goes in pieces.
+pub const MAX_BODY_LEN: usize = 1024;
 /// The waits before the second and the third try at a message whose
 /// harness could not be reached. After the last the send ends: an agent
 /// that is told so decides better than a queue when to send again.
@@ -239,7 +288,8 @@ impl AgentPool {
         anyhow::ensure!(!body.trim().is_empty(), "a message needs text");
         anyhow::ensure!(
             body.len() <= MAX_BODY_LEN,
-            "a message to another host is at most {MAX_BODY_LEN} bytes, and this is {}",
+            "a message to another host is at most {MAX_BODY_LEN} bytes, and this is {}: \
+             split it, or send where to find it",
             body.len()
         );
         let envelope = Envelope {
@@ -283,11 +333,9 @@ impl AgentPool {
             let error = tokio::select! {
                 tried = tried => match tried {
                     Ok(MessageResult::Delivered) => return Ok(name),
-                    Ok(MessageResult::Refused) => anyhow::bail!(
-                        "the host of {name} ({peer}) refused the message: {name} has not \
-                         accepted your address {own}, or there is no such address. Sending \
-                         again changes nothing until it has."
-                    ),
+                    Ok(MessageResult::Refused(reason)) => {
+                        return Err(refusal(&name, &peer, &own, reason.as_ref()));
+                    }
                     Err(error) => error,
                 },
                 _ = handing.wait_for(|handing| *handing) => {
@@ -306,7 +354,7 @@ impl AgentPool {
 
     /// A message the harness at `endpoint` sent. It reaches only an agent
     /// that accepted the sender's address, as input; anything else is
-    /// refused and leaves no trace.
+    /// refused and leaves no trace. Only an accepted sender hears why.
     pub async fn gccp_receive(
         self: &Arc<Self>,
         endpoint: EndpointId,
@@ -314,7 +362,7 @@ impl AgentPool {
     ) -> MessageResult {
         let Envelope { to, from, id, body } = envelope;
         let Ok(agent) = AgentId::from_encoded(to.as_str()) else {
-            return MessageResult::Refused;
+            return MessageResult::Refused(None);
         };
         let peer = PeerAddress {
             endpoint,
@@ -327,9 +375,12 @@ impl AgentPool {
             read.gccp_host(endpoint),
             read.gccp_contact(agent, &peer),
         ) else {
-            return MessageResult::Refused;
+            return MessageResult::Refused(None);
         };
         drop(read);
+        if body.len() > MAX_BODY_LEN {
+            return MessageResult::Refused(Some(Reason::MsgTooLarge));
+        }
         // Remembered before the agent has it, so that a copy that comes
         // meanwhile is not a second message.
         let key = (agent, peer.clone(), id);
@@ -365,8 +416,36 @@ impl AgentPool {
                     "rho-agent: giving {} a message from {peer}: {error:#}",
                     agent.encoded()
                 );
-                MessageResult::Refused
+                MessageResult::Refused(None)
             }
+        }
+    }
+}
+
+/// What an agent is told of a refusal: what it can do about it, which only
+/// the reason says.
+fn refusal(
+    name: &str,
+    peer: &PeerAddress,
+    own: &PeerAddress,
+    reason: Option<&Reason>,
+) -> anyhow::Error {
+    let refused = format!("the host of {name} ({peer}) refused the message");
+    match reason {
+        None => anyhow::anyhow!(
+            "{refused} and gave no reason: {name} has not accepted your address {own}, there is \
+             no such address, or that host refuses it for a reason of its own. Sending again \
+             changes nothing until something has changed."
+        ),
+        Some(Reason::MsgTooLarge) => anyhow::anyhow!(
+            "{refused} as too large for it. The same message never fits there: send a \
+             shorter one."
+        ),
+        Some(Reason::QueueFull) => {
+            anyhow::anyhow!("{refused}: {name} has too much waiting. Send it again later.")
+        }
+        Some(Reason::Unknown(reason)) => {
+            anyhow::anyhow!("{refused} with the reason `{reason}`, which this host does not know.")
         }
     }
 }
@@ -411,6 +490,60 @@ mod tests {
             "one more forgot it"
         );
         assert_eq!(stored.0.len(), STORED_IDS);
+    }
+
+    /// A reason is 1 to 64 bytes of `a-z`, `0-9` and `-`. The two this
+    /// version knows are themselves, and any other is kept as it came.
+    #[test]
+    fn a_reason_is_short_and_plain() {
+        assert_eq!("msg-too-large".parse(), Ok(Reason::MsgTooLarge));
+        assert_eq!("queue-full".parse(), Ok(Reason::QueueFull));
+        let longest = "a".repeat(MAX_REASON_LEN);
+        assert_eq!(longest.parse(), Ok(Reason::Unknown(longest.clone())));
+        assert_eq!("gone-2".parse(), Ok(Reason::Unknown("gone-2".into())));
+        for not_a_reason in [
+            "",
+            &("a".repeat(MAX_REASON_LEN + 1)),
+            "Queue-full",
+            "queue_full",
+            "queue full",
+            "ünknown",
+        ] {
+            assert!(not_a_reason.parse::<Reason>().is_err(), "{not_a_reason:?}");
+        }
+        for reason in [
+            Reason::MsgTooLarge,
+            Reason::QueueFull,
+            Reason::Unknown("x".into()),
+        ] {
+            assert_eq!(reason.as_str().parse(), Ok(reason));
+        }
+    }
+
+    /// Each reason tells the agent something different to do, and no
+    /// reason does not claim to know which refusal it was.
+    #[test]
+    fn an_agent_is_told_what_a_refusal_means() {
+        let address = |local: &str| PeerAddress {
+            endpoint: EndpointId([9; 32]),
+            local: local.parse().unwrap(),
+        };
+        let (peer, own) = (address("bob"), address("ann"));
+        let told =
+            |reason: Option<Reason>| refusal("bob", &peer, &own, reason.as_ref()).to_string();
+        let none = told(None);
+        assert!(none.contains("gave no reason"), "{none}");
+        assert!(
+            none.contains(&format!("has not accepted your address {own}")),
+            "{none}"
+        );
+        assert!(told(Some(Reason::MsgTooLarge)).contains("send a shorter one"));
+        assert!(told(Some(Reason::QueueFull)).contains("Send it again later"));
+        let unknown = told(Some(Reason::Unknown("gone-fishing".into())));
+        assert!(
+            unknown.contains("`gone-fishing`, which this host does not know"),
+            "{unknown}"
+        );
     }
 
     /// Every agent has an address, and the address names no other agent.

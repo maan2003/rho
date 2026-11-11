@@ -40,11 +40,13 @@ await agents.external.send(address="<their address>", message="...")
 agents.external.contacts()  # the addresses you accepted
 ```
 
-`send` starts at once. Await it to know the outcome: it returns when the other host has taken the message, and raises when it has not. A send that you do not await still runs, and its failure is reported to you like any failed task. To keep two messages in order, await the first before you send the second. A message is text of at most 65536 bytes.
+`send` starts at once. Await it to know the outcome: it returns when the other host has taken the message, and raises when it has not. A send that you do not await still runs, and its failure is reported to you like any failed task. To keep two messages in order, await the first before you send the second. A message is text of at most 1024 bytes: split a longer one, or send where to find it.
 
 The host tries a host that gives no result three times, over about three minutes, so an awaited send can take that long. After that, and after a refusal at once, the send fails and the host tries no more. Send again only after something changed, and tell the user what the other side has to do:
 
-- `refused`: the other agent has not accepted your address.
+- `refused` and `gave no reason`: the other agent has not accepted your address, or its host refused for a reason of its own.
+- `refused` as too large: that host takes less. Send a shorter message.
+- `refused` because the other agent `has too much waiting`: send again later, and send fewer, longer messages.
 - `gave no result`: the other host is off, or its owner has not approved this host. The error gives this host's endpoint id for that approval. The message may have arrived all the same, so a second send can show the other agent the text twice.
 
 A message to you arrives as input that begins `[external message from <name> at <address>, on the host <host name>`. The name is the one you gave the address, and the host name is the one the user gave the host. There are no threads: answer with `send` to that address.

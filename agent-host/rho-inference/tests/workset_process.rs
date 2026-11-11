@@ -646,7 +646,7 @@ impl rho_agent::host::pool::Transport for Wires {
 }
 
 async fn gccp_two_hosts() {
-    use rho_agent::host::pool::{Envelope, MessageResult};
+    use rho_agent::host::pool::{Envelope, MAX_BODY_LEN, MessageResult, Reason};
     const HERE: EndpointId = EndpointId([0xa1; 32]);
     const THERE: EndpointId = EndpointId([0xb2; 32]);
     const NOWHERE: EndpointId = EndpointId([0xdd; 32]);
@@ -740,8 +740,9 @@ async fn gccp_two_hosts() {
         .unwrap();
     assert!(accepted.contains(&ann_address), "{accepted}");
     let refused = format!(
-        "the host of bob of dpc ({bob_address}) refused the message: bob of dpc has not \
-         accepted your address {ann_address}, or there is no such address."
+        "the host of bob of dpc ({bob_address}) refused the message and gave no reason: bob of \
+         dpc has not accepted your address {ann_address}, there is no such address, or that \
+         host refuses it for a reason of its own."
     );
     let error = send(&here, here_workset, ann, &bob_address, "early one")
         .await
@@ -795,7 +796,30 @@ async fn gccp_two_hosts() {
     assert_eq!(
         here.gccp_receive(EndpointId([0xc3; 32]), pong.clone())
             .await,
-        MessageResult::Refused
+        MessageResult::Refused(None)
+    );
+
+    // A body over what this host takes is refused before it is tried, and
+    // one that comes anyway is refused as too large, but only a sender the
+    // agent accepted hears why.
+    let long = "x".repeat(MAX_BODY_LEN + 1);
+    let error = send(&here, here_workset, ann, &bob_address, &long)
+        .await
+        .unwrap_err();
+    assert!(error.contains("at most 1024 bytes"), "{error}");
+    assert_eq!(tries(&long), 0);
+    let too_large = Envelope {
+        id: pong.id.wrapping_add(100),
+        body: long.clone(),
+        ..pong.clone()
+    };
+    assert_eq!(
+        here.gccp_receive(THERE, too_large.clone()).await,
+        MessageResult::Refused(Some(Reason::MsgTooLarge))
+    );
+    assert_eq!(
+        here.gccp_receive(EndpointId([0xc3; 32]), too_large).await,
+        MessageResult::Refused(None)
     );
 
     // A host that cannot be reached is tried three times under one id, and
@@ -850,7 +874,7 @@ async fn gccp_two_hosts() {
     assert!(!here.gccp_revoke(THERE).await);
     assert_eq!(
         here.gccp_receive(THERE, later).await,
-        MessageResult::Refused
+        MessageResult::Refused(None)
     );
     let error = send(&here, here_workset, ann, &bob_address, "ping four")
         .await
@@ -886,6 +910,7 @@ async fn gccp_two_hosts() {
     assert_eq!(said(&there_asked, "]\nping two"), 1);
     assert_eq!(said(&there_asked, "early one"), 0);
     assert_eq!(said(&there_asked, "ping three"), 0);
+    assert_eq!(said(&here_asked, "xxxx"), 0);
     for (asked, text) in [(&here_asked, "pong"), (&there_asked, "ping one")] {
         for item in items(asked, text) {
             assert_eq!(item["type"], "custom_tool_call_output", "{item}");
