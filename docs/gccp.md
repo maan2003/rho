@@ -11,7 +11,9 @@ and often offline.
 GCCP (global clanker communication protocol) lets a clanker on one harness
 send a message to a clanker on another, whoever built either harness. It is
 mail for clankers: an address, a message, and a result that says whether
-the message was taken.
+the message was taken. It also carries a byte stream from a clanker to a
+service that another clanker runs: a web server that it started, for
+example.
 
 This document has two parts.
 
@@ -19,8 +21,8 @@ This document has two parts.
   another one.
 - [What a harness may do](#what-a-harness-may-do) is an example of what the
   protocol leaves to each harness: whose messages it takes, what it does
-  with a refusal, and what it shows its clankers. Nothing in that part is
-  needed to interoperate.
+  with a refusal, what it shows its clankers, and which services it opens.
+  Nothing in that part is needed to interoperate.
 
 ## The protocol
 
@@ -59,9 +61,10 @@ Everything is carried on bidirectional streams. The harness that opens a
 stream first writes two bytes: the kind of the stream, an unsigned 16-bit
 integer, most significant byte first.
 
-| Kind | Stream                    |
-| ---- | ------------------------- |
-| 1    | A message and its result. |
+| Kind | Stream                      |
+| ---- | --------------------------- |
+| 1    | A message and its result.   |
+| 2    | A byte stream to a service. |
 
 The kind says what the rest of the stream carries in both directions, and
 how it ends. So the header holds no length: that belongs to each kind.
@@ -154,12 +157,53 @@ The `id` keeps the message from being stored twice.
 - A harness chooses how many ids it remembers, so a late copy can be stored
   twice.
 
+### Byte streams
+
+A byte stream joins a clanker to a service that another clanker runs. It
+has kind 2. One stream carries one connection to the service, so a harness
+opens a stream for each connection.
+
+After the kind, the opening harness writes a header: the length of a CBOR
+map in bytes, as an unsigned 16-bit integer, most significant byte first,
+and then the map:
+
+| Key       | Value                                                     |
+| --------- | --------------------------------------------------------- |
+| `to`      | Text: the local id of the clanker that runs the service.  |
+| `from`    | Text: the local id of the clanker that opens the stream.  |
+| `service` | Text: the name of the service, in the form of a local id. |
+
+The addresses are as for a message. Only the receiving harness gives the
+name of a service meaning: it is not a port, and it says nothing about the
+machine. A receiver must ignore keys it does not know.
+
+The receiving harness answers with a result, written the same way: its
+length as an unsigned 16-bit integer, and then the map of
+[Results](#results).
+
+- `true` means the receiving harness has joined the stream to the service.
+  From then on each harness passes the bytes on unchanged: what the opening
+  side writes reaches the service, and what the service writes reaches the
+  opening side.
+- `false` means the receiving harness refused the stream, and finishes its
+  side. It gives no reason, and a harness may refuse any stream. A harness
+  must return `false` for a header it cannot read.
+- With no result, there is no byte stream.
+
+The opening harness must not write bytes after the header until it has the
+result `true`.
+
+After the result the protocol says no more. What the bytes mean, and when
+and how each side ends the stream, is between the service and whoever uses
+it: the harnesses only pass that on. Nothing resumes a byte stream that
+broke.
+
 ## What a harness may do
 
 The protocol does not say whose messages a harness takes, what a harness
-does when a message is refused, or what a clanker sees. This part describes
-one set of choices that work together. A harness can make others and still
-talk to every other harness.
+does when a message is refused, what a clanker sees, or which services a
+harness opens. This part describes one set of choices that work together. A
+harness can make others and still talk to every other harness.
 
 ### Take messages only from accepted addresses
 
@@ -214,9 +258,34 @@ an address on it.
   minutes, so an older id never comes again. After a restart it remembers
   none, and a message sent again across the restart is stored twice.
 
-There is no call and no session. A connection is only how bytes travel:
-either harness may close one at any time, and a clanker is never told that
-a connection opened or closed.
+For messages there is no call and no session. A connection is only how
+bytes travel: either harness may close one at any time, and a clanker is
+never told that a connection opened or closed.
+
+### Open a service only to an address its clanker names
+
+A message is information. A byte stream is access: whoever opens one talks
+to a program on the other owner's machine. So accepting an address opens no
+service.
+
+- A clanker opens a service under a name, to one address that it has
+  accepted. The harness refuses every other stream. An unknown clanker, an
+  unknown service and a service that is not open to the sender get the same
+  `false`, so nobody can search for services.
+- The harness joins a stream only to something of the clanker's own: for
+  example a Unix socket among the clanker's files, and not a port of the
+  machine. Then a clanker cannot open what it cannot reach itself, whatever
+  a message persuaded it to do.
+- On the opening side, the harness gives its clanker a local socket for the
+  service. Each connection to that socket opens one stream.
+- A clanker learns the name of a service as it learns an address: the other
+  clanker writes it in a message. There is no list of services.
+- The harness does not try a refused or broken stream again. Its clanker
+  sees a connection that failed, and decides.
+- The harness does not close a connection that carries a byte stream only
+  because no message has passed for a while.
+- The owner can see which services are open and to whom, and take each one
+  back.
 
 ### Limit what an endpoint can cost
 
@@ -249,6 +318,5 @@ with the sender's address, apart from what the owner says.
 
 ## Not part of this
 
-Groups, discovery, attachments, and byte streams between clankers (a tunnel
-to a service a clanker runs) are left out. A byte stream would be another kind
-of stream beside the message, and would reuse the same addresses.
+Groups, discovery, attachments, datagrams, and a list of the services a
+clanker runs are left out.
