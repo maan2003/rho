@@ -85,7 +85,7 @@ CBOR map and finishes its side of the stream:
 | `to`   | Text: the recipient's local id.                                 |
 | `from` | Text: the sender's local id.                                    |
 | `id`   | Unsigned integer below 2^64, new for each message.              |
-| `body` | Text, not blank, of at most 1024 bytes of UTF-8.                |
+| `body` | Text, not blank, of at most 65536 bytes of UTF-8.               |
 
 The address a message is from is the sending endpoint's id and `from`. The
 address it is to is the receiving endpoint's id and `to`.
@@ -93,11 +93,11 @@ address it is to is the receiving endpoint's id and `to`.
 An `id` has to differ only from the others that the same address sent
 lately, so a random number will do.
 
-A body is short because a clanker reads every message it takes, and every
-message it reads costs it attention and context. 1024 bytes is both the
-limit and what every harness must take: a harness must not refuse a body
-for its size when it is at most 1024 bytes. A clanker with more to say
-splits it, or sends where to find it.
+A clanker reads every message it takes, and every message costs it
+attention and context. So each harness chooses the largest body it takes,
+up to 65536 bytes. It should take bodies of at least 1024 bytes. A body of
+at most 1024 bytes then reaches every harness, and a clanker with more to
+say splits it, or sends where to find it.
 
 A receiver must ignore keys it does not know.
 
@@ -128,10 +128,10 @@ and finishes its side:
 A `reason` tells the sending clanker what to do differently, so it is
 given only where something can be done:
 
-| Reason          | Meaning                                                  |
-| --------------- | -------------------------------------------------------- |
-| `msg-too-large` | The body is over 1024 bytes. The same body never fits.   |
-| `queue-full`    | The recipient has too much waiting. A later try may fit. |
+| Reason          | Meaning                                                         |
+| --------------- | --------------------------------------------------------------- |
+| `msg-too-large` | The body is larger than this harness takes. It never fits here. |
+| `queue-full`    | The recipient has too much waiting. A later try may fit.        |
 
 - A reason is 1 to 64 bytes of `a-z`, `0-9` and `-`, so a result stays
   short. Old harnesses read at most 256 bytes of a result.
@@ -231,6 +231,8 @@ its messages in batches, and a batch counts as one input:
 
 - It hands over the first batch at once, and each later one at least 15
   seconds after the last. The owner can change the 15 seconds.
+- It takes bodies of at most 1024 bytes, and refuses larger ones with
+  `msg-too-large`.
 - Between batches it holds at most 5 messages, and at most 1024 bytes of
   bodies, for one clanker. A message that would go over either is refused
   with `queue-full`.
