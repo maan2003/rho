@@ -642,37 +642,60 @@ async fn workset_props_are_set_before_the_first_agent_only() {
     let workset = WorksetId([3; 6]);
     let mut write = db.write().await;
     write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
-    let props = |policy: &str| -> rho_agent_types::Props {
-        [("policy".to_owned(), policy.to_owned())].into()
-    };
-    let set = |write: &mut rho_db::WriteTxn, props| {
-        write.append(
-            workset,
-            &Record {
-                at: UnixMs(2),
-                event: Event::WorksetPropsSet { props },
-            },
-        )
-    };
-    set(&mut write, props("first")).unwrap();
-    set(&mut write, props("second")).unwrap();
+    set_props(&mut write, workset, policy("first")).unwrap();
+    set_props(&mut write, workset, policy("second")).unwrap();
+    create_agent(&mut write, workset, 1);
+    let error = set_props(&mut write, workset, policy("third")).unwrap_err();
+    assert!(error.to_string().contains("once after it"), "{error}");
+    write.commit();
+    assert_eq!(db.read().workset(workset).unwrap().props, policy("second"));
+}
+
+/// A workset made before its policy named it gets its props once, also
+/// with agents, and keeps them from then on.
+#[tokio::test]
+async fn a_workset_without_props_sets_them_once_after_its_first_agent() {
+    let (_dir, db) = db().await;
+    let workset = WorksetId([4; 6]);
+    let mut write = db.write().await;
+    write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+    create_agent(&mut write, workset, 2);
+    set_props(&mut write, workset, policy("late")).unwrap();
+    let error = set_props(&mut write, workset, policy("again")).unwrap_err();
+    assert!(error.to_string().contains("once after it"), "{error}");
+    write.commit();
+    assert_eq!(db.read().workset(workset).unwrap().props, policy("late"));
+}
+
+fn policy(name: &str) -> rho_agent_types::Props {
+    [("policy".to_owned(), name.to_owned())].into()
+}
+
+fn set_props(
+    write: &mut rho_db::WriteTxn,
+    workset: WorksetId,
+    props: rho_agent_types::Props,
+) -> anyhow::Result<Wpos> {
+    write.append(
+        workset,
+        &Record {
+            at: UnixMs(2),
+            event: Event::WorksetPropsSet { props },
+        },
+    )
+}
+
+fn create_agent(write: &mut rho_db::WriteTxn, workset: WorksetId, n: u64) {
     write
         .append(
             workset,
             &Record {
                 at: UnixMs(3),
                 event: Event::AgentCreated {
-                    agent: agent(1),
+                    agent: agent(n),
                     spec: spec("a"),
                 },
             },
         )
         .unwrap();
-    let error = set(&mut write, props("third")).unwrap_err();
-    assert!(
-        error.to_string().contains("before its first agent"),
-        "{error}"
-    );
-    write.commit();
-    assert_eq!(db.read().workset(workset).unwrap().props, props("second"));
 }

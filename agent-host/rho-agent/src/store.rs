@@ -30,8 +30,9 @@ const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> =
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct WorksetHead {
     pub kind: WorksetKind,
-    /// What Python said the workset is, before its first agent
-    /// (`WorksetPropsSet`). Only Python reads them.
+    /// What Python said the workset is (`WorksetPropsSet`): replaced at
+    /// will before its first agent, and set once after it if they were
+    /// never set. Only Python reads them.
     pub props: Props,
     pub created_at: UnixMs,
     /// Where the next row goes.
@@ -422,8 +423,8 @@ impl StoreWrite for WriteTxn {
             }
             (Event::WorksetPropsSet { props }, _) => {
                 anyhow::ensure!(
-                    head.agents.is_empty(),
-                    "a workset's props are set before its first agent"
+                    head.agents.is_empty() || head.props.is_empty(),
+                    "a workset's props are set before its first agent, or once after it"
                 );
                 head.props = props.clone();
             }

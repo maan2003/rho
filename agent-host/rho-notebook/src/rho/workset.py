@@ -22,8 +22,9 @@ def props() -> dict[str, str]:
 
 
 def set_props(props: dict[str, str]) -> None:
-    """Name the workset's props, replacing any. Only before its first
-    agent is created; they are then kept for good."""
+    """Name the workset's props, replacing any, before its first agent is
+    created. A workset with agents whose props were never set may set them
+    once. They are then kept for good."""
     _rho.set_workset_props(props)
 
 
