@@ -144,9 +144,10 @@ impl std::str::FromStr for PairingKey {
 }
 
 /// What an agent host prints for a client to pair with it:
-/// `rho://<endpoint-id>?key=<pairing-key>`. The endpoint id is all iroh
-/// needs to find the host. The link names nothing: the client asks its user
-/// what to call the host.
+/// `rho://<endpoint-id>?key=<pairing-key>`, the endpoint id in the one text
+/// form rho gives it ([`rho_agent_types::EndpointId`]). The endpoint id is
+/// all iroh needs to find the host. The link names nothing: the client asks its
+/// user what to call the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairingLink {
     pub endpoint_id: EndpointId,
@@ -157,7 +158,8 @@ pub const PAIRING_SCHEME: &str = "rho://";
 
 impl fmt::Display for PairingLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{PAIRING_SCHEME}{}?key={}", self.endpoint_id, self.key)
+        let endpoint_id = rho_agent_types::EndpointId(*self.endpoint_id.as_bytes());
+        write!(f, "{PAIRING_SCHEME}{endpoint_id}?key={}", self.key)
     }
 }
 
@@ -170,9 +172,11 @@ impl std::str::FromStr for PairingLink {
             .strip_prefix(PAIRING_SCHEME)
             .ok_or_else(|| format!("a pairing link starts with {PAIRING_SCHEME}"))?;
         let (endpoint_id, query) = rest.split_once('?').ok_or("a pairing link has a key")?;
-        let endpoint_id = endpoint_id
+        let endpoint_id: rho_agent_types::EndpointId = endpoint_id
             .trim_end_matches('/')
             .parse()
+            .map_err(|error| format!("invalid endpoint id in pairing link: {error}"))?;
+        let endpoint_id = EndpointId::from_bytes(&endpoint_id.0)
             .map_err(|error| format!("invalid endpoint id in pairing link: {error}"))?;
         let mut key = None;
         // Other parameters are room for what a later host adds.
@@ -267,12 +271,28 @@ mod pairing_tests {
             key: PairingKey::from_bytes([0xa5; 32]),
         };
         let text = link.to_string();
-        assert!(text.starts_with("rho://"), "{text}");
+        let z32 = link.endpoint_id.to_z32();
+        assert!(text.starts_with(&format!("rho://{z32}?")), "{text}");
         assert!(text.contains(&"a5".repeat(32)), "{text}");
         assert_eq!(text.parse::<PairingLink>().unwrap(), link);
         // A later host may add parameters, in any order.
-        let reordered = format!("rho://{}?v=2&key={}", link.endpoint_id, link.key);
+        let reordered = format!("rho://{z32}?v=2&key={}", link.key);
         assert_eq!(reordered.parse::<PairingLink>().unwrap(), link);
+        // Iroh's own hex is not rho's text for an endpoint.
+        let hex = format!("rho://{}?key={}", link.endpoint_id, link.key);
+        assert!(hex.parse::<PairingLink>().is_err(), "{hex}");
+    }
+
+    /// Rho's z-base-32 is iroh's, both ways, for any key.
+    #[test]
+    fn an_endpoint_id_is_written_as_iroh_writes_z32() {
+        for seed in [0u8, 3, 0x7f, 0xff] {
+            let id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+            let ours = rho_agent_types::EndpointId(*id.as_bytes());
+            assert_eq!(ours.to_string(), id.to_z32());
+            assert_eq!(id.to_z32().parse(), Ok(ours));
+            assert_eq!(EndpointId::from_z32(&ours.to_string()).unwrap(), id);
+        }
     }
 
     #[test]

@@ -352,7 +352,7 @@ pub(crate) enum IrohCommand {
         #[arg(long, value_enum)]
         role: IrohRole,
         /// For a client, the enrollment code it displays. For a GCCP host,
-        /// its endpoint id: 64 hex digits, as its own `rho gccp list`
+        /// its endpoint id: 52 of z-base-32, as its own `rho gccp list`
         /// prints it.
         id: String,
         /// For a GCCP host, what you and your agents will know it by.

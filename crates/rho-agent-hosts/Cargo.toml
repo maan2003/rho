@@ -35,6 +35,7 @@ test-support = ["client"]
 [dependencies]
 bytes.workspace = true
 camino.workspace = true
+rho-agent-types.workspace = true
 rho-rpc.workspace = true
 senax-encoder.workspace = true
 

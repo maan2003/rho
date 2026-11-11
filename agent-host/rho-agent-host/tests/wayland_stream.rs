@@ -118,9 +118,10 @@ layout { background-color "#315b97"; }
         let mut status=tokio::io::BufReader::new(rho_desktop_proto::local::connect(descriptor["socket"].as_str().unwrap()).await?);
         rho_desktop_proto::local::request(&mut status,rho_desktop_proto::Request::Hello{version:rho_desktop_proto::VERSION}).await?;
         ensure!(desktop_status(&mut status).await?==(false,0,0),"video work exists without subscriber");
-        let endpoint:iroh::EndpointId=endpoint.parse()?;
+        let endpoint:rho_agent_types::EndpointId=endpoint.parse().map_err(anyhow::Error::msg)?;
+        let endpoint=iroh::EndpointId::from_bytes(&endpoint.0)?;
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
-        rho_rpc::protocol::client::call(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
+        rho_rpc::protocol::client::call(&socket,host::IrohTrustInMemory {endpoint_id:rho_agent_types::EndpointId(*client.id().as_bytes()).to_string()}).await.context("trust")?;
         let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_rpc::protocol::IROH_ALPN)).await??;
         ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id(),None).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());

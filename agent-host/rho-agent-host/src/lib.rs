@@ -700,7 +700,10 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             gccp::ALPN,
         )
         .await?;
-        eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
+        eprintln!(
+            "rho-agent-host iroh endpoint: {}",
+            rho_agent_types::EndpointId(*listener.endpoint_id().as_bytes())
+        );
         phases.mark("iroh");
         Some((listener, auth))
     } else {

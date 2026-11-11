@@ -18,8 +18,10 @@ use rho_db::{ReadTxn, WriteTxn};
 use rho_iroh_auth::gccp_hosts;
 use senax_encoder::{Decode, Encode};
 
-/// `(agent, address)`: the name the agent gave an address it accepted.
-const CONTACTS: TableDefinition<(AgentId, String), String> = TableDefinition::new("gccp_contacts");
+/// `(agent, endpoint, local id)`: the name the agent gave an address it
+/// accepted. The endpoint is its bytes, so no text form of it is kept.
+const CONTACTS: TableDefinition<(AgentId, [u8; 32], String), String> =
+    TableDefinition::new("gccp_contacts_by_endpoint");
 /// The longest name a harness or an address is given.
 const MAX_NAME_LEN: usize = 80;
 
@@ -74,7 +76,7 @@ impl GccpRead for ReadTxn {
 
     fn gccp_contact(&self, agent: AgentId, peer: &PeerAddress) -> Option<String> {
         self.open_table(CONTACTS)
-            .get((agent, peer.to_string()))
+            .get(key(agent, peer))
             .map(|name| name.value())
     }
 
@@ -82,10 +84,10 @@ impl GccpRead for ReadTxn {
         self.open_table(CONTACTS)
             .iter()
             .map(|(key, name)| {
-                let (agent, address) = key.value();
+                let (agent, endpoint, local) = key.value();
                 GccpContact {
                     agent,
-                    peer: address_of(&address),
+                    peer: address_of(endpoint, &local),
                     name: name.value(),
                 }
             })
@@ -93,8 +95,52 @@ impl GccpRead for ReadTxn {
     }
 }
 
-fn address_of(text: &str) -> PeerAddress {
-    text.parse().expect("the store keeps addresses")
+/// Temporary (`temp-migration`): the acceptances as format 9a6cf67f kept
+/// them, `(agent, "<64 hex digits>/<local id>")`.
+const HEX_CONTACTS: TableDefinition<(AgentId, String), String> =
+    TableDefinition::new("gccp_contacts");
+
+/// Temporary (`temp-migration`): moves each acceptance from [`HEX_CONTACTS`]
+/// to [`CONTACTS`], and drops the old table.
+pub(crate) fn key_contacts_by_endpoint(write: &mut WriteTxn) {
+    let rows: Vec<((AgentId, String), String)> = write
+        .open_table(HEX_CONTACTS)
+        .iter()
+        .map(|(key, name)| (key.value(), name.value()))
+        .collect();
+    for ((agent, address), name) in rows {
+        let peer = hex_address(&address).expect("format 9a6cf67f kept addresses in hex");
+        write.open_table(CONTACTS).insert(key(agent, &peer), name);
+    }
+    write.delete_table("gccp_contacts");
+}
+
+/// Temporary (`temp-migration`).
+fn hex_address(text: &str) -> Option<PeerAddress> {
+    let (hex, local) = text.split_once('/')?;
+    let hex = hex.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut endpoint = [0; 32];
+    for (byte, pair) in endpoint.iter_mut().zip(hex.chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(PeerAddress {
+        endpoint: EndpointId(endpoint),
+        local: local.parse().ok()?,
+    })
+}
+
+fn key(agent: AgentId, peer: &PeerAddress) -> (AgentId, [u8; 32], String) {
+    (agent, peer.endpoint.0, peer.local.to_string())
+}
+
+fn address_of(endpoint: [u8; 32], local: &str) -> PeerAddress {
+    PeerAddress {
+        endpoint: EndpointId(endpoint),
+        local: local.parse().expect("the store keeps local ids"),
+    }
 }
 
 pub trait GccpWrite {
@@ -130,11 +176,11 @@ impl GccpWrite for WriteTxn {
         if !gccp_hosts::revoke(self, &endpoint.0) {
             return false;
         }
-        let there: Vec<(AgentId, String)> = self
+        let there: Vec<(AgentId, [u8; 32], String)> = self
             .open_table(CONTACTS)
             .iter()
             .map(|(key, _)| key.value())
-            .filter(|(_, address)| address_of(address).endpoint == endpoint)
+            .filter(|(_, there, _)| *there == endpoint.0)
             .collect();
         let mut contacts = self.open_table(CONTACTS);
         for key in there {
@@ -157,7 +203,7 @@ impl GccpWrite for WriteTxn {
             endpoint = peer.endpoint
         );
         let mut contacts = self.open_table(CONTACTS);
-        let key = (agent, peer.to_string());
+        let key = key(agent, peer);
         let held = contacts.get(key.clone()).map(|held| held.value());
         match held {
             Some(held) => anyhow::ensure!(
@@ -173,22 +219,19 @@ impl GccpWrite for WriteTxn {
     }
 
     fn gccp_remove(&mut self, agent: AgentId, peer: &PeerAddress) -> bool {
-        self.open_table(CONTACTS)
-            .remove((agent, peer.to_string()))
-            .is_some()
+        self.open_table(CONTACTS).remove(key(agent, peer)).is_some()
     }
 
     fn gccp_forget(&mut self, agent: AgentId) {
-        let accepted: Vec<String> = self
+        let accepted: Vec<(AgentId, [u8; 32], String)> = self
             .open_table(CONTACTS)
-            .range((agent, String::new())..)
+            .range((agent, [0; 32], String::new())..)
             .map(|(key, _)| key.value())
-            .take_while(|(holder, _)| *holder == agent)
-            .map(|(_, address)| address)
+            .take_while(|(holder, _, _)| *holder == agent)
             .collect();
         let mut contacts = self.open_table(CONTACTS);
-        for address in accepted {
-            contacts.remove((agent, address));
+        for key in accepted {
+            contacts.remove(key);
         }
     }
 }

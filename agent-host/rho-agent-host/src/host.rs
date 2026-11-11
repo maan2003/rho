@@ -224,7 +224,7 @@ where
                     .approve_code(&code)
                     .await
                     .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
-                Ok(endpoint_id.to_string())
+                Ok(endpoint_text(endpoint_id))
             })
             .await
         }
@@ -234,9 +234,7 @@ where
                 call,
                 |IrohTrustInMemory { endpoint_id }| async move {
                     let auth = iroh()?;
-                    let endpoint_id = endpoint_id
-                        .parse::<iroh::EndpointId>()
-                        .context("invalid iroh client endpoint id")?;
+                    let endpoint_id = iroh_endpoint(&endpoint_id)?;
                     auth.trust_in_memory(endpoint_id).await;
                     Ok(())
                 },
@@ -257,15 +255,13 @@ where
         Request::IrohRevoke(call) => {
             respond(writer, call, |IrohRevoke { endpoint_id }| async move {
                 let auth = iroh()?;
-                let endpoint_id = endpoint_id
-                    .parse::<iroh::EndpointId>()
-                    .context("invalid iroh endpoint id")?;
+                let endpoint_id = iroh_endpoint(&endpoint_id)?;
                 // Whatever the endpoint was approved as.
                 let client = auth.revoke(endpoint_id).await;
                 let host = rho_agent_types::EndpointId(*endpoint_id.as_bytes());
                 let host = services.pool.gccp_revoke(host).await;
                 anyhow::ensure!(client || host, "this iroh endpoint is not approved");
-                Ok(endpoint_id.to_string())
+                Ok(endpoint_text(endpoint_id))
             })
             .await
         }
@@ -320,15 +316,25 @@ where
     }
 }
 
-/// A harness's endpoint id as the user gives it: the 64 hex digits of an
+/// A harness's endpoint id as the user gives it: the z-base-32 of an
 /// address, and an id an iroh endpoint can have.
 fn gccp_endpoint(text: &str) -> anyhow::Result<rho_agent_types::EndpointId> {
+    let endpoint = iroh_endpoint(text)?;
+    Ok(rho_agent_types::EndpointId(*endpoint.as_bytes()))
+}
+
+/// An iroh endpoint id as the user gives it, in the one text form rho uses
+/// ([`rho_agent_types::EndpointId`]).
+fn iroh_endpoint(text: &str) -> anyhow::Result<iroh::EndpointId> {
     let endpoint: rho_agent_types::EndpointId = text
         .parse()
-        .map_err(|error| anyhow::anyhow!("invalid GCCP endpoint: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid iroh endpoint id: {error}"))?;
     iroh::EndpointId::from_bytes(&endpoint.0)
-        .with_context(|| format!("invalid GCCP endpoint: {text} is no iroh endpoint id"))?;
-    Ok(endpoint)
+        .with_context(|| format!("invalid iroh endpoint id: {text} is no public key"))
+}
+
+fn endpoint_text(endpoint: iroh::EndpointId) -> String {
+    rho_agent_types::EndpointId(*endpoint.as_bytes()).to_string()
 }
 
 /// Stops the host unless a client is attached or an agent is working.

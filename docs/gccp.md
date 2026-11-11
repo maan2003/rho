@@ -31,10 +31,16 @@ address is
 
     <endpoint id>/<local id>
 
-The endpoint id is the endpoint's public key, written as 64 lowercase
-hexadecimal digits. The local id names a recipient at that endpoint, and
-only the harness there gives it meaning: a clanker, usually. It is 1 to 64
-bytes of `a-z`, `0-9`, `.`, `_` and `-`.
+The endpoint id is the endpoint's public key, written in z-base-32 as
+pkarr writes it: 52 symbols of `ybndrfg8ejkmcpqxot1uwisza345h769`, most
+significant bit first, with the last 4 bits zero. iroh's `to_z32` writes
+it so. A harness writes and reads an endpoint id in this form wherever it
+is text, so that an address is short to paste. On the wire an endpoint is
+never text: the transport names it.
+
+The local id names a recipient at that endpoint, and only the harness there
+gives it meaning: a clanker, usually. It is 1 to 64 bytes of `a-z`, `0-9`,
+`.`, `_` and `-`.
 
 A harness may hold more than one endpoint. An address names one of them.
 

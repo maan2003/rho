@@ -159,10 +159,10 @@ fn a_link_that_comes_while_another_is_named_waits_for_it(cx: &mut TestAppContext
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     let link = |seed: u8| {
-        let id = iroh::SecretKey::from([seed; 32]).public();
+        let id = iroh::SecretKey::from([seed; 32]).public().to_z32();
         (
             format!("rho://{id}?key={}", "ab".repeat(32)),
-            id.fmt_short().to_string(),
+            id[..10].to_owned(),
         )
     };
     let ((first, first_id), (second, second_id)) = (link(1), link(2));
