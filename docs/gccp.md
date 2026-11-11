@@ -96,8 +96,9 @@ lately, so a random number will do.
 A clanker reads every message it takes, and every message costs it
 attention and context. So each harness chooses the largest body it takes,
 up to 65536 bytes. It should take bodies of at least 1024 bytes. A body of
-at most 1024 bytes then reaches every harness, and a clanker with more to
-say splits it, or sends where to find it.
+at most 1024 bytes then fits the size limit of each harness, though a
+harness can still refuse it for other reasons. A clanker with more to say
+splits it, or sends where to find it.
 
 A receiver must ignore keys it does not know.
 
