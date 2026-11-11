@@ -32,7 +32,7 @@ class State:
         self.builtin = []  # [Skill]
         self.agents_files = {}  # path -> AgentsFile
         self.current = None  # the agent whose notebook is calling
-        self.slack_owner = None
+        self.slack_owner = None  # the workspace route's agent
         self.slack_routes = {}  # Slack event ts -> the agent it goes to
         self.slack_claims = []  # (channel, thread_ts, agent)
         self.ids = itertools.count(1)
@@ -345,19 +345,20 @@ def current_agent():
     return STATE.current
 
 
-def slack_owner():
-    return STATE.slack_owner
 
-
-def set_slack_owner(agent):
-    STATE.slack_owner = agent
-
-
-def slack_route(event, bot):
-    STATE.calls.append(("slack_route", (event["ts"], bot)))
+def slack_who_hears(event, bot):
+    STATE.calls.append(("slack_who_hears", (event["ts"], bot)))
     return STATE.slack_routes.get(event["ts"])
+
+
+def slack_owner(channel=None, thread_ts=None):
+    return STATE.slack_owner
 
 
 def slack_claim(channel, thread_ts, agent):
     STATE.slack_claims.append((channel, thread_ts, agent))
     return agent
+
+
+def slack_route(agent, channel=None, thread_ts=None, mode=None):
+    STATE.calls.append(("slack_route", (agent, channel, thread_ts, mode)))

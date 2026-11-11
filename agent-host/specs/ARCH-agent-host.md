@@ -152,26 +152,29 @@ Slack server as Python, and a workset may route its Slack messages to its agents
 ## Slack
 
 The host holds the Slack app's connection and buffers its events in memory;
-agents read Slack and post through the host's Slack server. A workset routes
-Slack once Python names its owner (`rho.slack`). Its routes are workset
-state, kept by the workset process in `slack.redb` in the workset's state
-directory, so they outlive the process and go with the workset: the owner,
-a rule for each channel an agent changed (an owner and a mode), and the
-owner of each thread an agent took part in. Rust decides who hears a
-message; one Python poll per workset asks it for each event and hands the
-event through `hooks.on_slack`, where the policy chooses the text and the
-role.
+agents read Slack and post through the host's Slack server. In a workset
+process, one Python poll serves every handler that `rho.slack` adds, a
+notebook's or the workset's own; handlers live until their process or
+notebook ends.
 
-A message is heard when it mentions the bot, is in a thread an agent owns,
-or is in a channel whose mode delivers it: `mentions`, where every channel
-starts, delivers nothing more, `top_level` each new top-level message, and
-`all` every message. It goes to the thread's owner, else the channel's, else
-the workset's. A mention gives its thread to the agent it goes to, so the
-replies that follow reach that agent before it answers; a post in a thread
-nobody owns gives the thread to the posting agent. Only an explicit
-delegation moves a thread that has an owner. Direct messages, edits,
-reactions and the bot's own posts are not delivered. Events the host lost,
-as across its restart, reach the workset's owner as one notice.
+A workset's Slack is routed when its policy routes it, at each start
+(`rho.slack.route_messages`). Its routes are workset state, kept by the
+workset process in `workset.redb` in the workset's state directory, so they
+outlive the process and go with the workset. A route gives a scope to one
+agent: the workspace, a channel, or one thread, and the most specific route
+wins. Rust decides who hears a message; the policy's Python decides what the
+agent is given, and with which role.
+
+A thread route hears every new message of its thread. A workspace or
+channel route hears mentions of the bot and what its mode adds: `mentions`
+nothing more, `top_level` each new top-level message, `all` every message.
+A mention in a thread with no route routes the thread to the agent it goes
+to, so the replies that follow reach that agent before it answers; a post
+from an agent's notebook routes a thread with no route to that agent. Only
+a new route moves a routed thread. The workspace route's agent also gets
+the bot's joins to channels and the notice that the host lost events.
+Direct messages, edits, reactions and the bot's own posts are not routed;
+a handler of the policy's own may act on them.
 
 ## GUI sync
 

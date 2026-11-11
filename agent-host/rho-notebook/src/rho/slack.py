@@ -1,88 +1,175 @@
-"""Who in this workset hears Slack: the workset's routes, which Rust keeps in
-the workset's state directory across restarts ([ARCH-agent-host](../../../specs/ARCH-agent-host.md#slack)).
+"""Slack for the workset: one poll of the host's Slack events, the handlers
+that see them, and the workset's routes, which Rust keeps across restarts
+([ARCH-agent-host](../../../specs/ARCH-agent-host.md#slack)).
 
-A workset routes Slack once it has an owner (`set_owner`). Then one poll of
-the host's Slack events serves the whole workset, and each message someone
-hears goes to one agent through `hooks.on_slack`. A message is heard when it
-mentions the bot, is in a thread an agent owns, or is in a channel whose
-mode delivers it. It goes to the thread's owner, else the channel's, else
-the workset's. A mention gives its thread to the agent it goes to, and so
-does a post an agent makes in a thread nobody owns. Direct messages, edits,
-reactions and the bot's own posts are not delivered.
+`add_event_handler` gives a handler every event, until its process or
+notebook ends. `route_messages`, which a policy calls at each start, routes
+new messages to agents: a route gives the workspace, a channel or one thread
+to an agent, and the most specific route wins. A thread route hears its
+whole thread; a workspace or channel route hears mentions of the bot and
+what its mode adds. A mention, or a post from an agent's notebook, in a
+thread with no route routes that thread to the agent. Direct messages,
+edits, reactions and the bot's own posts are not routed; a handler of its
+own sees them.
 """
 
 import asyncio
+import contextvars
+import inspect
 import sys
 import traceback
 
 import _rho
 from slack_sdk.web.async_base_client import AsyncBaseClient
 
-from . import agents, hooks
+from . import agents
 
-#: What a channel delivers besides mentions and owned threads.
+#: What a workspace or channel route hears besides mentions of the bot:
+#: nothing more, each new top-level message, or every message.
 MODES = ("mentions", "top_level", "all")
 
 #: Seconds before a failed poll is tried again.
 RETRY_SECONDS = 5
 
 
-def owner() -> str | None:
-    """The agent that gets what no rule gives another; None while the
-    workset does not route Slack."""
-    return _rho.slack_owner()
+class _Handler:
+    """A handler, run on the loop it was added from, one event at a time."""
+
+    def __init__(self, function, loop):
+        self.function = function
+        self.loop = loop
+        self.queue = asyncio.Queue()
+        self.removed = False
+        self.task = loop.create_task(self._run())
+
+    def give(self, event) -> bool:
+        """Queue `event`; False once the handler's loop is gone."""
+        try:
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
+            return True
+        except RuntimeError:
+            return False
+
+    async def _run(self):
+        while True:
+            event = await self.queue.get()
+            if self.removed:
+                return
+            try:
+                result = self.function(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                print("rho: a Slack event handler failed:", file=sys.stderr)
+                traceback.print_exc()
 
 
-def set_owner(agent: str) -> None:
-    """Route the workset's Slack, with `agent` as its owner."""
-    _rho.set_slack_owner(agents.Agent(agent).id)
+_handlers: list[_Handler] = []
+_poll: asyncio.Task | None = None
+_bot: str | None = None
+_routing = False
+
+
+def add_event_handler(handler):
+    """Call `handler(event)`, sync or async, with each Slack event the host
+    receives from now on: messages, edits, deletions, reactions, file
+    changes and joins, as Slack sends them. It runs on the loop it was added
+    from, a notebook's or the workset's, one event at a time.
+    `{"type": "rho_truncated"}` means the host lost events, for example
+    across its restart, and `{"type": "rho_error", "error": ...}` that it
+    refuses the poll, such as without an app token; polling goes on. Lives
+    until the process or the notebook ends.
+    Returns a function that removes it."""
+    entry = _Handler(handler, asyncio.get_running_loop())
+    _handlers.append(entry)
     from . import _boot
 
-    _boot.serve_slack_soon()
+    _boot._loop.call_soon_threadsafe(_start)
+
+    def remove():
+        entry.removed = True
+        if entry in _handlers:
+            _handlers.remove(entry)
+        entry.give(None)
+
+    return remove
 
 
-def delegate(channel: str, to: str, thread_ts: str | None = None) -> None:
-    """Give one thread, or with no `thread_ts` the whole channel, to agent
-    `to`. A thread's owner wins over its channel's."""
-    _rho.slack_delegate(channel, thread_ts, agents.Agent(to).id)
+def bot_user() -> str | None:
+    """The bot's Slack user id, once the poll asked Slack."""
+    return _bot
 
 
-def set_mode(channel: str, mode: str) -> None:
-    """What `channel` delivers besides mentions and owned threads: nothing
-    more ("mentions", where every channel starts), each new top-level
-    message ("top_level"), or every message ("all")."""
-    _rho.slack_set_mode(channel, mode)
+def route_messages(hand) -> None:
+    """Route the workset's new Slack messages for this run of its process:
+    each one that someone hears goes to `hand(agent, event)`, sync or async,
+    on the workset loop. The workspace route's agent also gets lost-event
+    notices and the bot's joins to channels. Call once, at each start: a
+    policy that does not call it routes nothing."""
+    global _routing
+    if _routing:
+        raise RuntimeError("rho.slack.route_messages: the workset routes already")
+    _routing = True
+
+    async def on_event(event):
+        kind = event["type"]
+        if kind == "message":
+            to = await asyncio.to_thread(_rho.slack_who_hears, event, _bot)
+        elif kind == "rho_truncated" or (kind == "member_joined_channel" and event.get("user") == _bot):
+            to = _rho.slack_owner()
+        else:
+            return
+        if to is not None:
+            result = hand(agents.Agent(to), event)
+            if inspect.isawaitable(result):
+                await result
+
+    add_event_handler(on_event)
 
 
-def watch(channel: str, thread_ts: str) -> str:
-    """Hear a thread without posting in it: the calling agent takes it
-    unless another agent owns it. Returns the thread's owner."""
-    agent = _rho.current_agent()
-    if agent is None:
-        raise RuntimeError("rho.slack.watch: only an agent's notebook watches a thread")
-    return _rho.slack_claim(channel, thread_ts, agent)
+def route(agent: str, channel: str | None = None, thread_ts: str | None = None, mode: str | None = None) -> None:
+    """Route the workspace, a channel, or with `thread_ts` one thread of the
+    channel, to `agent`, replacing its route. A workspace or channel route
+    hears mentions and what its `mode` adds ("mentions" without one); a
+    thread route hears its whole thread and takes no mode."""
+    _rho.slack_route(agents.Agent(agent).id, channel, thread_ts, mode)
+
+
+def unroute(channel: str | None = None, thread_ts: str | None = None) -> None:
+    """Remove the route of the workspace, a channel or a thread."""
+    _rho.slack_unroute(channel, thread_ts)
+
+
+def owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
+    """The agent of the most specific route that covers the thread, the
+    channel, or the workspace."""
+    return _rho.slack_owner(channel, thread_ts)
 
 
 def routes() -> dict:
-    """Every route: `{"owner": agent, "channels": {channel: {"owner",
-    "mode"}}, "threads": {(channel, thread_ts): agent}}`."""
+    """Every route: `{"workspace": {"agent", "mode"} | None, "channels":
+    {channel: {"agent", "mode"}}, "threads": {(channel, thread_ts): agent}}`."""
     return _rho.slack_routes()
 
 
 def render(event: dict) -> str:
     """An event as an agent reads it: where it is first, so the agent can
     answer there."""
-    if event["type"] == "rho_truncated":
+    kind = event["type"]
+    if kind == "rho_truncated":
         return "[Slack] The agent host lost Slack events. Read your threads again with `conversations_replies`."
+    if kind == "member_joined_channel":
+        return f"[Slack {event['channel']}] The bot was added to this channel."
     thread = event.get("thread_ts") or event["ts"]
     return f"[Slack {event['channel']} thread {thread}, from <@{event.get('user') or event.get('bot_id')}>]\n{event.get('text', '')}"
 
 
 def _posted(response: dict) -> None:
-    """A notebook's `chat.postMessage` went through: its agent takes the
-    thread unless another agent owns it."""
+    """A notebook's `chat.postMessage` went through: in a workset that routes
+    Slack, its thread is routed to the notebook's agent unless it has a
+    route."""
     agent = _rho.current_agent()
-    if agent is None or _rho.slack_owner() is None:
+    if agent is None or not _routing:
         return
     thread = response.get("message", {}).get("thread_ts") or response["ts"]
     _rho.slack_claim(response["channel"], thread, agent)
@@ -91,44 +178,46 @@ def _posted(response: dict) -> None:
 AsyncBaseClient.posted = staticmethod(_posted)
 
 
-async def serve() -> None:
-    """Hand each heard event to its agent while the process runs. The host
-    keeps events only from now on, so a restart says it lost some."""
+def _start() -> None:
+    """On the workset loop: poll, unless it does already."""
+    global _poll
+    if _poll is None:
+        from . import _boot
+
+        _poll = _boot.spawn(_serve())
+
+
+async def _serve() -> None:
     from slack_sdk.errors import SlackApiError
     from slack_sdk.rho import Events
     from slack_sdk.web.async_client import AsyncWebClient
 
+    global _bot
     client = AsyncWebClient()
     events = Events(client, _Log())
-    bot = None
+    refused = False
     while True:
         try:
-            if bot is None:
-                bot = (await client.auth_test())["user_id"]
+            if _bot is None:
+                _bot = (await client.auth_test())["user_id"]
             for event in await events.poll():
-                if event["type"] == "rho_truncated":
-                    to = owner()
-                else:
-                    to = await asyncio.to_thread(_rho.slack_route, event, bot)
-                if to is not None:
-                    await _hand(to, event)
-        except Exception as error:
-            print("rho: routing Slack:", file=sys.stderr)
-            if isinstance(error, SlackApiError):
-                print(f"the host refused: {error.response['error']}", file=sys.stderr)
-            else:
-                traceback.print_exc()
+                for handler in list(_handlers):
+                    if not handler.give(event) and handler in _handlers:
+                        _handlers.remove(handler)
+        except SlackApiError as error:
+            # Said to the handlers once, until a poll succeeds.
+            if not refused:
+                refused = True
+                for handler in list(_handlers):
+                    handler.give({"type": "rho_error", "error": error.response["error"]})
             await asyncio.sleep(RETRY_SECONDS)
-
-
-async def _hand(to: str, event: dict) -> None:
-    try:
-        result = hooks.on_slack(agents.Agent(to), event)
-        if asyncio.iscoroutine(result):
-            await result
-    except Exception:
-        print(f"rho: handing a Slack event to {to}:", file=sys.stderr)
-        traceback.print_exc()
+            continue
+        except Exception:
+            print("rho: polling Slack:", file=sys.stderr)
+            traceback.print_exc()
+            await asyncio.sleep(RETRY_SECONDS)
+            continue
+        refused = False
 
 
 class _Log:

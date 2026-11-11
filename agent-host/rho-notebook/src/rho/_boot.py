@@ -21,14 +21,12 @@ import traceback
 
 import _rho
 
-from . import agents, default, hooks, slack, workset
+from . import agents, default, hooks, workset
 
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: int | None = None
 #: Agents `hooks.deliver` started for, so each gets it once.
 _announced: set[str] = set()
-#: The task routing the workset's Slack, once it routes Slack.
-_slack: asyncio.Task | None = None
 #: Where the running `_eval`'s output goes; unset elsewhere.
 _output: contextvars.ContextVar = contextvars.ContextVar("rho_eval_output", default=None)
 _evals = itertools.count(1)
@@ -52,8 +50,6 @@ def _main(init_path, ready) -> None:
             return
     for id in _rho.agents():
         _announce(id)
-    if slack.owner() is not None:
-        _serve_slack()
     ready(None)
     _loop.run_forever()
 
@@ -124,18 +120,6 @@ def _announce(agent_id: str) -> None:
             spawn(result)
     except Exception:
         traceback.print_exc()
-
-
-def serve_slack_soon() -> None:
-    """Start routing the workset's Slack on the workset loop, from any
-    thread, unless it already runs."""
-    _loop.call_soon_threadsafe(_serve_slack)
-
-
-def _serve_slack() -> None:
-    global _slack
-    if _slack is None:
-        _slack = spawn(slack.serve())
 
 
 _tasks: set[asyncio.Task] = set()

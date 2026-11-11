@@ -200,26 +200,31 @@ async def inbox(agent: str, after: int) -> list[MessageRecord]:
     some."""
 
 # -- Slack routes ------------------------------------------------------------
-# The workset's, in `slack.redb` in its state directory; `rho.slack` wraps
-# them. Agent ids must be of this workset.
+# The workset's, in `workset.redb` in its state directory; `rho.slack` wraps
+# them. Agent ids must be of this workset. A route without `channel` is the
+# workspace's; one with `thread_ts` too is a thread's.
 
-def slack_owner() -> str | None:
-    """The agent that gets what no rule gives another; None while the
-    workset does not route Slack."""
-def set_slack_owner(agent: str) -> None: ...
-def slack_route(event: dict, bot: str) -> str | None:
-    """The agent a Slack event goes to, if anyone hears it, given the bot's
-    user id. A mention in a thread nobody owns gives the thread to that
-    agent."""
+def slack_who_hears(event: dict, bot: str) -> str | None:
+    """The agent a new Slack message goes to, if anyone hears it, given the
+    bot's user id. A mention in a thread with no route routes the thread to
+    that agent."""
+def slack_owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
+    """The agent of the most specific route that covers the scope."""
+def slack_route(
+    agent: str,
+    channel: str | None = None,
+    thread_ts: str | None = None,
+    mode: Literal["mentions", "top_level", "all"] | None = None,
+) -> None:
+    """Route the scope to `agent`. A thread route takes no mode; the others
+    hear "mentions" without one."""
+def slack_unroute(channel: str | None = None, thread_ts: str | None = None) -> None: ...
 def slack_claim(channel: str, thread_ts: str, agent: str) -> str:
-    """`agent` takes the thread unless another agent owns it; returns its
-    owner."""
-def slack_delegate(channel: str, thread_ts: str | None, agent: str) -> None:
-    """Give the thread, or with no `thread_ts` the channel, to `agent`."""
-def slack_set_mode(channel: str, mode: Literal["mentions", "top_level", "all"]) -> None: ...
+    """Route the thread to `agent` unless it has a route; returns the agent
+    it routes to."""
 def slack_routes() -> dict:
-    """`{"owner": str | None, "channels": {channel: {"owner": str | None,
-    "mode": str}}, "threads": {(channel, thread_ts): str}}`."""
+    """`{"workspace": {"agent", "mode"} | None, "channels": {channel:
+    {"agent", "mode"}}, "threads": {(channel, thread_ts): agent}}`."""
 
 # -- inside an agent's notebook ----------------------------------------------
 

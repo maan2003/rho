@@ -1,28 +1,33 @@
-"""Routing a workset's Slack: the poll, the hook, and posts that take a
-thread. Which agent hears what is Rust's, and tested there; here the fake
-`_rho` answers with routes a test sets."""
+"""The workset's Slack: one poll, its handlers, the routing loop, and posts
+that route a thread. Which agent hears what is Rust's, and tested there;
+here the fake `_rho` answers with routes a test sets."""
 
 import asyncio
+import threading
 import time
 
 from slack_sdk.rho import Events
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import fake_rho
 from .support import WorksetCase, add_agent, claude, wait_for
 
-from rho import _boot, slack
+from rho import slack, workset
 
 
-def message(ts, text, thread_ts=None):
-    event = {"type": "message", "channel": "C1", "user": "UPERSON", "ts": ts, "text": text}
+def message(ts, text, thread_ts=None, user="UPERSON"):
+    event = {"type": "message", "channel": "C1", "user": user, "ts": ts, "text": text}
     if thread_ts is not None:
         event["thread_ts"] = thread_ts
     return event
 
 
+JOINED = {"type": "member_joined_channel", "channel": "C2", "user": "UBOT"}
+SOMEONE_JOINED = {"type": "member_joined_channel", "channel": "C2", "user": "UPERSON"}
+REACTION = {"type": "reaction_added", "user": "UPERSON", "item": {"channel": "C1", "ts": "1.0"}}
+
+
 class FakeHost:
-    """The host's Slack server: `auth.test` and the batches `rho.events`
+    """The host's Slack server: `auth.test`, then the batches `rho.events`
     returns, then nothing."""
 
     def __init__(self, test, batches):
@@ -47,13 +52,31 @@ class FakeHost:
         test.addCleanup(restore)
 
 
-class Routing(WorksetCase):
+class SlackCase(WorksetCase):
+    batches = []
+
     def setUp(self):
-        self.host = FakeHost(self, [
-            [message("1.0", "<@UBOT> hi"), message("2.0", "nobody hears this")],
-            [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0")],
-        ])
+        slack._handlers.clear()
+        slack._poll = None
+        slack._bot = None
+        slack._routing = False
+        self.host = FakeHost(self, self.batches)
         super().setUp()
+
+
+ROUTING = """
+from rho import slack
+got = []
+slack.route_messages(lambda agent, event: got.append((agent.id, event.get("ts") or event["type"])))
+"""
+
+
+class Routing(SlackCase):
+    init = ROUTING
+    batches = [
+        [message("1.0", "<@UBOT> hi"), message("2.0", "nobody hears this"), JOINED, SOMEONE_JOINED, REACTION],
+        [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0")],
+    ]
 
     def seed(self, state):
         self.main = add_agent(state, claude(), cwd="/")
@@ -61,65 +84,83 @@ class Routing(WorksetCase):
         state.slack_owner = self.main
         state.slack_routes = {"1.0": self.main, "1.1": self.child}
 
-    def test_each_heard_event_reaches_its_agent_as_a_tool_input(self):
-        wait_for(lambda: len(self.state.inputs) == 3, "three Slack inputs")
-        self.assertEqual(self.state.inputs, [
-            (self.main, "[Slack C1 thread 1.0, from <@UPERSON>]\n<@UBOT> hi", "tool", None),
-            (self.main, slack.render({"type": "rho_truncated"}), "tool", None),
-            (self.child, "[Slack C1 thread 1.0, from <@UPERSON>]\na reply", "tool", None),
+    def test_each_heard_message_and_each_workspace_event_reaches_its_agent(self):
+        got = workset.namespace["got"]
+        wait_for(lambda: len(got) == 4, "four routed events")
+        self.assertEqual(got, [
+            (self.main, "1.0"),
+            (self.main, "member_joined_channel"),
+            (self.main, "rho_truncated"),
+            (self.child, "1.1"),
         ])
         # Rust was asked about each message, with the bot's own user id, and
-        # not about the lost events.
+        # about nothing else.
         self.assertEqual(
-            [args for name, args in self.state.calls if name == "slack_route"],
+            [args for name, args in self.state.calls if name == "slack_who_hears"],
             [("1.0", "UBOT"), ("2.0", "UBOT"), ("1.1", "UBOT")],
         )
 
+    def test_a_second_router_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            slack.route_messages(lambda agent, event: None)
 
-class NotRouted(WorksetCase):
-    def setUp(self):
-        self.host = FakeHost(self, [[message("1.0", "<@UBOT> hi")]])
-        super().setUp()
 
-    def seed(self, state):
-        self.main = add_agent(state, claude(), cwd="/")
+class Handlers(SlackCase):
+    batches = [[REACTION, message("1.0", "hi")], [message("1.1", "after the removal")]]
 
-    def test_a_workset_without_an_owner_does_not_poll_until_it_gets_one(self):
-        self.assertIsNone(_boot._slack)
+    def test_a_handler_on_its_own_loop_sees_every_event_and_stops_when_removed(self):
+        seen, removed = [], threading.Event()
+        loop = asyncio.new_event_loop()
+
+        async def notebook():
+            remove = None
+
+            async def handler(event):
+                seen.append(event["type"])
+                if len(seen) == 2:
+                    remove()
+                    removed.set()
+
+            remove = slack.add_event_handler(handler)
+            assert threading.get_ident() == thread.ident
+            await asyncio.sleep(1)
+
+        thread = threading.Thread(target=loop.run_until_complete, args=(notebook(),))
+        thread.start()
+        wait_for(removed.is_set, "the handler removed itself")
+        wait_for(lambda: self.host.polls == 3, "the third poll")
+        thread.join(5)
+        loop.close()
+        self.assertEqual(seen, ["reaction_added", "message"])
+
+    def test_nothing_polls_without_a_handler(self):
+        time.sleep(0.1)
         self.assertEqual(self.host.polls, 0)
-        fake_rho.STATE.slack_routes = {"1.0": self.main}
-        slack.set_owner(self.main)
-        wait_for(lambda: self.state.inputs, "the mention")
-        self.assertEqual(self.state.slack_owner, self.main)
-        # Setting it again does not start a second poll.
-        slack.set_owner(self.main)
-        time.sleep(0.2)
-        self.assertEqual(self.host.polls, 2)
-
-    def test_an_owner_from_another_workset_is_refused(self):
-        with self.assertRaises(KeyError):
-            slack.set_owner("agent-elsewhere")
-        self.assertIsNone(self.state.slack_owner)
+        self.assertIsNone(slack._poll)
 
 
-class Posting(WorksetCase):
+class Posting(SlackCase):
     def seed(self, state):
         self.main = add_agent(state, claude(), cwd="/")
 
     def post(self, reply):
         AsyncWebClient.posted(reply)
 
-    def test_a_post_takes_its_thread_for_the_notebook_agent(self):
-        self.state.slack_owner = self.main
+    def test_a_post_routes_its_thread_to_the_notebook_agent(self):
+        slack._routing = True
         self.state.current = self.main
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
         self.post({"ok": True, "channel": "C1", "ts": "6.1", "message": {"ts": "6.1", "thread_ts": "6.0"}})
         self.assertEqual(self.state.slack_claims, [("C1", "5.0", self.main), ("C1", "6.0", self.main)])
 
-    def test_posts_take_nothing_off_a_notebook_or_in_a_workset_that_does_not_route(self):
+    def test_posts_route_nothing_off_a_notebook_or_in_a_workset_that_does_not_route(self):
         self.state.current = self.main
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
-        self.state.slack_owner = self.main
+        slack._routing = True
         self.state.current = None
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
         self.assertEqual(self.state.slack_claims, [])
+
+    def test_a_route_names_an_agent_of_the_workset(self):
+        with self.assertRaises(KeyError):
+            slack.route("agent-elsewhere")

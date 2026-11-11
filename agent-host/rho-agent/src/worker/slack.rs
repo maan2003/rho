@@ -1,13 +1,10 @@
 //! Who in the workset hears a Slack message
 //! ([ARCH-agent-host](../../../specs/ARCH-agent-host.md#slack)).
 //!
-//! The routes live in `slack.redb` in the workset's state directory: the
-//! workset's owner, a rule for each channel an agent changed, and the owner
-//! of each thread an agent took part in. Python polls the host's Slack
-//! events and asks [`Routes::route`] which agent gets each one; it then hands
-//! the event to that agent through `hooks.on_slack`.
-
-use std::path::Path;
+//! The routes are workset state, in the workset's own database: a route
+//! gives a scope to one agent. The scope is the whole workspace, a channel,
+//! or one thread; the most specific route wins. Python polls the host's
+//! Slack events and asks [`Routes::who_hears`] which agent gets a message.
 
 use redb::TableDefinition;
 use rho_agent_types::AgentId;
@@ -15,14 +12,21 @@ use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use serde_json::Value;
 
-/// The agent that gets what no channel or thread rule gives another. The
-/// workset routes Slack only once it has one.
-const OWNER: TableDefinition<(), Sen<AgentId>> = TableDefinition::new("slack_owner");
-const CHANNELS: TableDefinition<&str, Sen<Channel>> = TableDefinition::new("slack_channels");
-/// `(channel, thread root ts)` to the agent that owns the thread.
-const THREADS: TableDefinition<(&str, &str), Sen<AgentId>> = TableDefinition::new("slack_threads");
+/// The workspace and channel routes, each with the agent and what it hears.
+const WIDE: TableDefinition<Sen<Wide>, Sen<(AgentId, Mode)>> =
+    TableDefinition::new("slack_wide_routes");
+/// `(channel, thread root ts)` to the agent that hears the whole thread.
+const THREADS: TableDefinition<(&str, &str), Sen<AgentId>> =
+    TableDefinition::new("slack_thread_routes");
 
-/// What a channel delivers besides mentions and owned threads.
+/// A scope wider than a thread.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub(crate) enum Wide {
+    Workspace,
+    Channel(String),
+}
+
+/// What a workspace or channel route hears besides mentions of the bot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum Mode {
     /// Nothing more.
@@ -48,23 +52,6 @@ impl Mode {
             Self::Mentions => "mentions",
             Self::TopLevel => "top_level",
             Self::All => "all",
-        }
-    }
-}
-
-/// A channel an agent changed. A channel with no row is `Mentions` and
-/// belongs to the workset's owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct Channel {
-    pub owner: Option<AgentId>,
-    pub mode: Mode,
-}
-
-impl Default for Channel {
-    fn default() -> Self {
-        Self {
-            owner: None,
-            mode: Mode::Mentions,
         }
     }
 }
@@ -116,63 +103,53 @@ impl<'a> Message<'a> {
 /// Every route of the workset, for `rho.slack.routes()`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct All {
-    pub owner: Option<AgentId>,
-    pub channels: Vec<(String, Channel)>,
+    pub wide: Vec<(Wide, AgentId, Mode)>,
     pub threads: Vec<((String, String), AgentId)>,
 }
 
-pub(crate) struct Routes {
-    db: RhoDb,
+pub(crate) struct Routes<'db> {
+    db: &'db RhoDb,
 }
 
-impl Routes {
-    pub(crate) async fn open(path: &Path) -> Self {
-        Self::with(RhoDb::open(path)).await
-    }
-
-    async fn with(db: RhoDb) -> Self {
+impl<'db> Routes<'db> {
+    /// Make the tables in the workset's database, if new. Once, when it
+    /// opens.
+    pub(crate) async fn create_tables(db: &RhoDb) {
         let mut write = db.write().await;
-        write.open_table(OWNER);
-        write.open_table(CHANNELS);
+        write.open_table(WIDE);
         write.open_table(THREADS);
         write.commit();
+    }
+
+    /// The routes in `db`, the workset's database, whose tables exist.
+    pub(crate) fn of(db: &'db RhoDb) -> Self {
         Self { db }
     }
 
-    pub(crate) fn owner(&self) -> Option<AgentId> {
-        self.db
-            .read()
-            .open_table(OWNER)
-            .get(())
-            .map(|owner| owner.value().into_owned())
-    }
-
-    pub(crate) async fn set_owner(&self, agent: AgentId) {
-        let mut write = self.db.write().await;
-        write.open_table(OWNER).insert((), SenValue::owned(agent));
-        write.commit();
-    }
-
-    /// The agent `event` goes to, if anyone hears it. A mention in a thread
-    /// nobody owns gives the thread to the agent it goes to, so the replies
-    /// that follow reach that agent before it answers.
-    pub(crate) async fn route(&self, event: &Value, bot: &str) -> Option<AgentId> {
+    /// The agent a new message goes to, if anyone hears it. A thread route
+    /// hears every message of its thread; otherwise the channel's route,
+    /// else the workspace's, hears mentions of the bot and what its mode
+    /// adds. A mention in a thread with no route routes the thread to the
+    /// agent it goes to, so the replies that follow reach that agent
+    /// before it answers.
+    pub(crate) async fn who_hears(&self, event: &Value, bot: &str) -> Option<AgentId> {
         let message = Message::of(event, bot)?;
-        let mut write = self.db.write().await;
-        let owner = write.open_table(OWNER).get(())?.value().into_owned();
-        let channel = write
-            .open_table(CHANNELS)
-            .get(message.channel)
-            .map(|channel| channel.value().into_owned())
-            .unwrap_or_default();
         let key = (message.channel, message.thread);
-        let thread = write
-            .open_table(THREADS)
-            .get(key)
-            .map(|agent| agent.value().into_owned());
-        let heard = thread.is_some()
-            || message.mentions_bot
-            || match channel.mode {
+        let mut write = self.db.write().await;
+        if let Some(agent) = write.open_table(THREADS).get(key) {
+            return Some(agent.value().into_owned());
+        }
+        let (agent, mode) = {
+            let wide = write.open_table(WIDE);
+            let channel = wide.get(SenValue::owned(Wide::Channel(message.channel.to_owned())));
+            let route = match channel {
+                Some(route) => route,
+                None => wide.get(SenValue::owned(Wide::Workspace))?,
+            };
+            route.value().into_owned()
+        };
+        let heard = message.mentions_bot
+            || match mode {
                 Mode::Mentions => false,
                 Mode::TopLevel => message.top_level,
                 Mode::All => true,
@@ -180,15 +157,49 @@ impl Routes {
         if !heard {
             return None;
         }
-        let to = thread.or(channel.owner).unwrap_or(owner);
-        if thread.is_none() && message.mentions_bot {
-            write.open_table(THREADS).insert(key, SenValue::owned(to));
+        if message.mentions_bot {
+            write
+                .open_table(THREADS)
+                .insert(key, SenValue::owned(agent));
             write.commit();
         }
-        Some(to)
+        Some(agent)
     }
 
-    /// Give the thread to `agent` unless someone owns it. Returns its owner.
+    /// The agent of the most specific route that covers a thread, or with
+    /// no thread a channel, or with neither the workspace.
+    pub(crate) fn owner(&self, channel: Option<&str>, thread: Option<&str>) -> Option<AgentId> {
+        let read = self.db.read();
+        if let (Some(channel), Some(thread)) = (channel, thread)
+            && let Some(agent) = read.open_table(THREADS).get((channel, thread))
+        {
+            return Some(agent.value().into_owned());
+        }
+        let wide = read.open_table(WIDE);
+        channel
+            .and_then(|channel| wide.get(SenValue::owned(Wide::Channel(channel.to_owned()))))
+            .or_else(|| wide.get(SenValue::owned(Wide::Workspace)))
+            .map(|route| route.value().into_owned().0)
+    }
+
+    pub(crate) async fn route_wide(&self, scope: Wide, agent: AgentId, mode: Mode) {
+        let mut write = self.db.write().await;
+        write
+            .open_table(WIDE)
+            .insert(SenValue::owned(scope), SenValue::owned((agent, mode)));
+        write.commit();
+    }
+
+    pub(crate) async fn route_thread(&self, channel: &str, thread: &str, agent: AgentId) {
+        let mut write = self.db.write().await;
+        write
+            .open_table(THREADS)
+            .insert((channel, thread), SenValue::owned(agent));
+        write.commit();
+    }
+
+    /// Route the thread to `agent` unless it has a route. Returns the
+    /// agent it routes to.
     pub(crate) async fn claim(&self, channel: &str, thread: &str, agent: AgentId) -> AgentId {
         let mut write = self.db.write().await;
         let mut threads = write.open_table(THREADS);
@@ -201,61 +212,37 @@ impl Routes {
         agent
     }
 
-    /// Give a thread, or with no thread the whole channel, to `agent`.
-    pub(crate) async fn delegate(&self, channel: &str, thread: Option<&str>, agent: AgentId) {
+    pub(crate) async fn unroute_wide(&self, scope: Wide) {
         let mut write = self.db.write().await;
-        match thread {
-            Some(thread) => {
-                write
-                    .open_table(THREADS)
-                    .insert((channel, thread), SenValue::owned(agent));
-            }
-            None => {
-                let mut channels = write.open_table(CHANNELS);
-                let mut rule = channels
-                    .get(channel)
-                    .map(|rule| rule.value().into_owned())
-                    .unwrap_or_default();
-                rule.owner = Some(agent);
-                channels.insert(channel, SenValue::owned(rule));
-            }
-        }
+        write.open_table(WIDE).remove(SenValue::owned(scope));
         write.commit();
     }
 
-    pub(crate) async fn set_mode(&self, channel: &str, mode: Mode) {
+    pub(crate) async fn unroute_thread(&self, channel: &str, thread: &str) {
         let mut write = self.db.write().await;
-        let mut channels = write.open_table(CHANNELS);
-        let mut rule = channels
-            .get(channel)
-            .map(|rule| rule.value().into_owned())
-            .unwrap_or_default();
-        rule.mode = mode;
-        channels.insert(channel, SenValue::owned(rule));
-        drop(channels);
+        write.open_table(THREADS).remove((channel, thread));
         write.commit();
     }
 
     pub(crate) fn all(&self) -> All {
         let read = self.db.read();
         All {
-            owner: read
-                .open_table(OWNER)
-                .get(())
-                .map(|owner| owner.value().into_owned()),
-            channels: read
-                .open_table(CHANNELS)
+            wide: read
+                .open_table(WIDE)
                 .iter()
-                .map(|(channel, rule)| (channel.value().to_owned(), rule.value().into_owned()))
+                .map(|(scope, route)| {
+                    let (agent, mode) = route.value().into_owned();
+                    (scope.value().into_owned(), agent, mode)
+                })
                 .collect(),
             threads: read
                 .open_table(THREADS)
                 .iter()
-                .map(|(key, owner)| {
+                .map(|(key, agent)| {
                     let (channel, thread) = key.value();
                     (
                         (channel.to_owned(), thread.to_owned()),
-                        owner.value().into_owned(),
+                        agent.value().into_owned(),
                     )
                 })
                 .collect(),

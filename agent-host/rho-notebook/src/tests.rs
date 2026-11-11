@@ -60,7 +60,7 @@ async fn adapted_slack_sdk_is_importable_in_the_notebook() {
         r#"from slack_sdk import WebClient
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient
-from slack_sdk.rho import Subscriptions
+from slack_sdk.rho import Events, download
 from rho_notion import NotionError, call, text, tools, watch
 assert AsyncWebClient().base_url == "http://slack/api/"
 try:

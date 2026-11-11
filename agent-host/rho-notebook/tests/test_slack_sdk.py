@@ -2,6 +2,7 @@
 import asyncio
 import collections
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -12,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from slack_sdk.rho import Subscriptions, download
+from slack_sdk.rho import Events, download
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -287,103 +288,38 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[0]["query"], {"timeout": ["20"]})
         self.assertEqual(requests[1]["query"], {"cursor": ["7:1"], "timeout": ["20"]})
 
-    async def test_subscriptions_route_events_to_their_threads_and_channels(self):
+    async def test_events_poll_in_order_follow_the_cursor_and_say_when_some_were_lost(self):
         def envelope(event):
             return {"envelope_id": "e", "type": "events_api", "payload": {"event": event}}
 
-        reply_a = {"type": "message", "channel": "D1", "ts": "2.0", "thread_ts": "1.0", "text": "LGTM"}
-        root_a = {"type": "message", "channel": "D1", "ts": "1.0"}
-        same_ts_elsewhere = {"type": "message", "channel": "C9", "ts": "3.0", "thread_ts": "1.0"}
-        edit_b = {"type": "message", "subtype": "message_changed", "channel": "C2",
-                  "message": {"ts": "6.0", "thread_ts": "5.0", "text": "edited"}}
-        reaction_a = {"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}
-        root_c2 = {"type": "message", "channel": "C2", "ts": "9.0", "text": "@bot hello"}
-        canvas_change = {"type": "file_change", "file_id": "F1", "file": {"id": "F1"}}
-        other_file = {"type": "file_change", "file_id": "F2", "file": {"id": "F2"}}
+        reply = {"type": "message", "channel": "D1", "ts": "2.0", "thread_ts": "1.0", "text": "LGTM"}
+        reaction = {"type": "reaction_added", "item": {"channel": "D1", "ts": "1.0"}}
         polls = [
-            {"ok": True, "events": [envelope(e) for e in [reply_a, root_a, same_ts_elsewhere, edit_b, reaction_a, root_c2,
-                                                    canvas_change, other_file]],
+            {"ok": True, "events": [envelope(reply), {"envelope_id": "x", "type": "hello"}, envelope(reaction)],
              "cursor": "7:5", "truncated": False},
-            {"ok": True, "events": [], "cursor": "8:0", "truncated": True},
-            {"ok": True, "events": [], "cursor": "8:0", "truncated": False},
+            {"ok": True, "events": [envelope(reply)], "cursor": "8:1", "truncated": True},
         ]
-        a, b, c2, f1 = [], [], [], []
+        batches = []
 
         async def body():
-            threads = Subscriptions()
-
-            def on_a(event):
-                a.append(event)
-                raise RuntimeError("a failing callback does not stop the others")
-
-            async def on_b(event):
-                b.append(event)
-
-            threads.subscribe("D1", "1.0", on_a)
-            threads.subscribe("C2", "5.0", on_b)
-            threads.subscribe("C2", None, c2.append)
-            threads.subscribe("F1", None, f1.append)
-            while len(self.fake.requests) < 3:
-                await asyncio.sleep(0.01)
-            threads.close()
+            events = Events(AsyncWebClient(), logging.getLogger("test"))
+            batches.append(await events.poll())
+            batches.append(await events.poll())
 
         requests = await self.run_with({"rho.events": polls}, body)
 
-        truncated = {"type": "rho_truncated"}
-        self.assertEqual(a, [reply_a, root_a, reaction_a, truncated])
-        self.assertEqual(b, [edit_b, truncated])
-        self.assertEqual(c2, [edit_b, root_c2, truncated])
-        self.assertEqual(f1, [canvas_change, truncated])
-        self.assertEqual([r["query"].get("cursor") for r in requests[:3]], [None, ["7:5"], ["8:0"]])
+        self.assertEqual(batches, [[reply, reaction], [{"type": "rho_truncated"}, reply]])
+        self.assertEqual([r["query"].get("cursor") for r in requests], [None, ["7:5"]])
 
-    async def test_thread_subscriptions_count_events_from_creation(self):
-        reply = {"type": "message", "channel": "D1", "ts": "2.0", "thread_ts": "1.0"}
-        subscribed = asyncio.Event()
-
-        async def after_subscribe():
-            await subscribed.wait()
-            return {"ok": True, "events": [{"payload": {"event": reply}}], "cursor": "7:1", "truncated": False}
-
-        polls = [after_subscribe, {"ok": True, "events": [], "cursor": "7:1", "truncated": False}]
-        got = []
-
-        async def body():
-            threads = Subscriptions()
-            # The first poll is out before the agent posts and subscribes.
-            while not self.fake.requests:
-                await asyncio.sleep(0.01)
-            threads.subscribe("D1", "1.0", got.append)
-            subscribed.set()
-            while not got:
-                await asyncio.sleep(0.01)
-            threads.close()
-
-        await self.run_with({"rho.events": polls}, body)
-
-        self.assertEqual(got, [reply])
-        self.assertNotIn("cursor", self.fake.requests[0]["query"])
-
-    async def test_thread_subscriptions_stop_on_a_host_refusal_and_resume_on_subscribe(self):
+    async def test_events_raise_on_a_host_refusal(self):
         error = "rho_no_slack_app_token: run `rho slack init` on the agent host"
-        polls = [
-            {"ok": False, "error": error},
-            {"ok": True, "events": [], "cursor": "7:0", "truncated": False},
-        ]
-        got = []
 
         async def body():
-            threads = Subscriptions()
-            threads.subscribe("D1", "1.0", got.append)
-            await asyncio.wait_for(asyncio.shield(threads._poller), 5)
-            self.assertEqual(len(self.fake.requests), 1)
-            threads.subscribe("D1", "1.0", got.append)
-            while len(self.fake.requests) < 2:
-                await asyncio.sleep(0.01)
-            threads.close()
+            with self.assertRaises(SlackApiError) as raised:
+                await Events(AsyncWebClient(), logging.getLogger("test")).poll()
+            self.assertEqual(raised.exception.response["error"], error)
 
-        await self.run_with({"rho.events": polls}, body)
-
-        self.assertEqual(got, [{"type": "rho_error", "error": error}])
+        await self.run_with({"rho.events": {"ok": False, "error": error}}, body)
 
 
 if __name__ == "__main__":

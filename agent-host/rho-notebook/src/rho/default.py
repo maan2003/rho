@@ -9,7 +9,7 @@ import traceback
 
 import _rho
 
-from . import agents, chat, hooks, prompt, skills, slack, tools, workset
+from . import agents, chat, hooks, prompt, skills, tools, workset
 
 #: Seconds before a failed delivery is tried again.
 RETRY_SECONDS = 5
@@ -21,7 +21,6 @@ def install() -> None:
     hooks.on_compaction = on_compaction
     hooks.on_turn_end = on_turn_end
     hooks.deliver = deliver
-    hooks.on_slack = on_slack
     workset.namespace["rho"] = sys.modules["rho"]
     workset.namespace["new_agent"] = new_agent
     workset.namespace["join"] = chat.join
@@ -46,11 +45,6 @@ def on_turn_end(agent, outcome) -> None:
     parent = agent.props.get("parent")
     if outcome["reason"] == "failed" and parent is not None:
         chat.post(agent.id, chat.direct(agent.id, parent), f"Agent hit an error and stopped: {outcome['error']}")
-
-
-async def on_slack(agent, event) -> None:
-    """A Slack event as a `tool` input: Slack is not the user."""
-    await asyncio.to_thread(agent.input, slack.render(event), role="tool")
 
 
 async def deliver(agent) -> None:

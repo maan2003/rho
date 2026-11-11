@@ -30,7 +30,6 @@ class Workset:
         if seed is not None:
             seed(fake_rho.STATE)
         _boot._announced.clear()
-        _boot._slack = None
         for name in hooks.NAMES:
             setattr(hooks, name, hooks._unset)
         workset.namespace.clear()

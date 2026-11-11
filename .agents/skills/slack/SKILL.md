@@ -78,10 +78,10 @@ Path(info["name"]).write_bytes(await download(info["url_private_download"]))
 
 A canvas is a file too: `download` gives its content as HTML. Read it
 before you edit a canvas others also edit, and change only your sections
-with `canvases_edit`. To hear about edits, subscribe to the file ID:
-`subs.subscribe(file_id, None, on_event)` gets each `file_change` event,
-your own edits included. The event names only the file, so download it
-again to see what changed.
+with `canvases_edit`. To hear about edits, act on `file_change` events
+with its `file_id` in an event handler (see "Waiting for replies"); your
+own edits come too. The event names only the file, so download it again
+to see what changed.
 
 The bot sees only files shared in conversations it is in. `missing_scope`
 from `files_info`, or `HTTP 302` from `download`, means the app lacks
@@ -89,44 +89,31 @@ from `files_info`, or `HTTP 302` from `download`, means the app lacks
 
 ## Waiting for replies
 
-Subscribe to every conversation you post in and expect an answer from.
-For a DM, subscribe to the whole DM (`thread_ts=None`): people answer in
-it, not in a thread. In a channel, subscribe to the thread of your message
-(its `ts`), or the existing thread you replied in (its `thread_ts`).
-Nothing else tells you someone answered. One `Subscriptions` per notebook
-serves all subscriptions with one long poll, and each callback gets the
-raw Slack events: messages, edits, deletions, and reactions to a thread's
-root message. The callback decides what matters and calls `notify()`; then
-end your turn instead of polling. Events count from when the object is
-created, so create it before your first post and keep it.
+Nothing tells you someone answered unless you listen. In a workset that
+routes Slack, a post you make routes its thread to you, so replies there
+reach you as turns; route a thread without a post with
+`rho.slack.route(your_id, channel, thread_ts=ts)`. For everything else,
+such as a DM, a reaction or a canvas edit, add an event handler in your
+notebook before you post. It gets every Slack event the host receives,
+so filter, and call `notify()` for what matters; then end your turn
+instead of polling.
 
 ```python
-from slack_sdk.rho import Subscriptions
-subs = Subscriptions(slack)
-sent = await slack.chat_postMessage(channel=dm, text="Could you review #42? <url>")
+import rho.slack
 
 def on_event(event):
-    if event["type"] in ("rho_truncated", "rho_error") or event.get("user") == user:
+    if event["type"] in ("rho_truncated", "rho_error") or (event.get("channel") == dm and event.get("user") == user):
         notify(event)
 
-subs.subscribe(dm, None, on_event)        # a DM: all of it
-# in a channel: subs.subscribe(sent["channel"], sent["ts"], on_event)
-# when done with it, and with all subscriptions:
-subs.unsubscribe(dm, None)
-subs.close()
+remove = rho.slack.add_event_handler(on_event)
+sent = await slack.chat_postMessage(channel=dm, text="Could you review #42? <url>")
+# when done waiting:
+remove()
 ```
 
-A whole-channel subscription includes its threads. Use one in a channel
-only when the task waits for something not in your thread, for example
-someone who mentions the bot there. The bot sees only channels it is a
-member of. Filter in the callback, for example on
-`f"<@{bot_user_id}>" in event.get("text", "")` with `bot_user_id` from
-`auth_test`.
-
+The bot sees only conversations it is a member of. A handler lives until
+your notebook restarts; then add it again.
 `{"type": "rho_truncated"}` means the host lost events, for example after
-it restarted: read the thread or channel again with
-`conversations_replies` or `conversations_history`.
-`{"type": "rho_error", "error": ...}` means the host refused the poll, for
-example without an app token; polling stops until the next `subscribe`.
-Subscriptions live in the notebook only; after a notebook restart,
-subscribe again. The bot's own messages never arrive.
+it restarted: read the conversation again with `conversations_replies` or
+`conversations_history`. `{"type": "rho_error", "error": ...}` means the
+host refuses the poll, for example without an app token.

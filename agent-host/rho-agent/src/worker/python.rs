@@ -47,7 +47,7 @@ pub(crate) struct PyHost {
     pub isolated: bool,
     /// The workset's props: its head's at start, then what Python set.
     pub props: Mutex<rho_agent_types::Props>,
-    /// The workset's state directory, where its Slack routes live.
+    /// The workset's state directory, where `workset.redb` lives.
     pub state: camino::Utf8PathBuf,
 }
 
@@ -385,12 +385,11 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(slack_who_hears, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(slack_owner, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(set_slack_owner, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(slack_route, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(slack_unroute, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(slack_claim, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(slack_delegate, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(slack_set_mode, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(slack_routes, &module)?)?;
     Ok(module)
 }
@@ -1136,53 +1135,115 @@ fn current_agent(py: Python<'_>) -> PyResult<Option<String>> {
         .extract()
 }
 
-// -- Slack routes ------------------------------------------------------------
+// -- the workset's database and its Slack routes ---------------------------
 
-static ROUTES: OnceLock<Routes> = OnceLock::new();
+/// The workset process's own state, in `workset.redb` in the workset's
+/// state directory: what only this workset reads, such as its Slack
+/// routes. Opened on first use, so a workset that keeps nothing has no
+/// file.
+static WORKSET_DB: OnceLock<rho_db::RhoDb> = OnceLock::new();
 
-fn routes_path() -> PyResult<camino::Utf8PathBuf> {
-    Ok(host()?.state.join("slack.redb"))
-}
-
-/// The workset's routes, opened on first use: a workset that never routes
-/// Slack has no file.
-fn routes(py: Python<'_>) -> PyResult<&'static Routes> {
+fn workset_db(py: Python<'_>) -> PyResult<&'static rho_db::RhoDb> {
     let host = host()?;
-    let path = routes_path()?;
-    Ok(
-        py.detach(|| {
-            ROUTES.get_or_init(|| host.runtime.block_on(Routes::open(path.as_std_path())))
-        }),
-    )
+    let path = host.state.join("workset.redb");
+    Ok(py.detach(|| {
+        WORKSET_DB.get_or_init(|| {
+            let db = rho_db::RhoDb::open(path.as_std_path());
+            host.runtime.block_on(Routes::create_tables(&db));
+            db
+        })
+    }))
 }
 
 /// Run `work` on the routes without the GIL.
-fn on_routes<T: Send>(py: Python<'_>, work: impl AsyncFnOnce(&Routes) -> T + Send) -> PyResult<T> {
-    let routes = routes(py)?;
+fn on_routes<T: Send>(
+    py: Python<'_>,
+    work: impl AsyncFnOnce(Routes<'static>) -> T + Send,
+) -> PyResult<T> {
+    let routes = Routes::of(workset_db(py)?);
     let runtime = &host()?.runtime;
     Ok(py.detach(|| runtime.block_on(work(routes))))
 }
 
-#[pyfunction]
-fn slack_owner(py: Python<'_>) -> PyResult<Option<String>> {
-    if ROUTES.get().is_none() && !routes_path()?.exists() {
-        return Ok(None);
+fn wide(channel: Option<String>) -> slack::Wide {
+    match channel {
+        Some(channel) => slack::Wide::Channel(channel),
+        None => slack::Wide::Workspace,
     }
-    Ok(routes(py)?.owner().map(|agent| agent.encoded().to_string()))
 }
 
 #[pyfunction]
-fn set_slack_owner(py: Python<'_>, agent: &str) -> PyResult<()> {
-    let agent = agent_id(agent)?;
-    on_routes(py, async move |routes| routes.set_owner(agent).await)
-}
-
-#[pyfunction]
-fn slack_route(py: Python<'_>, event: Bound<'_, PyAny>, bot: String) -> PyResult<Option<String>> {
+fn slack_who_hears(
+    py: Python<'_>,
+    event: Bound<'_, PyAny>,
+    bot: String,
+) -> PyResult<Option<String>> {
     let event: serde_json::Value = pythonize::depythonize(&event)
         .map_err(|error| PyValueError::new_err(format!("not a Slack event: {error}")))?;
-    let to = on_routes(py, async move |routes| routes.route(&event, &bot).await)?;
+    let to = on_routes(py, async move |routes| routes.who_hears(&event, &bot).await)?;
     Ok(to.map(|agent| agent.encoded().to_string()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (channel = None, thread_ts = None))]
+fn slack_owner(
+    py: Python<'_>,
+    channel: Option<&str>,
+    thread_ts: Option<&str>,
+) -> PyResult<Option<String>> {
+    let routes = Routes::of(workset_db(py)?);
+    Ok(routes
+        .owner(channel, thread_ts)
+        .map(|agent| agent.encoded().to_string()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (agent, channel = None, thread_ts = None, mode = None))]
+fn slack_route(
+    py: Python<'_>,
+    agent: &str,
+    channel: Option<String>,
+    thread_ts: Option<String>,
+    mode: Option<&str>,
+) -> PyResult<()> {
+    let agent = agent_id(agent)?;
+    match (channel, thread_ts, mode) {
+        (Some(channel), Some(thread_ts), None) => on_routes(py, async move |routes| {
+            routes.route_thread(&channel, &thread_ts, agent).await
+        }),
+        (_, Some(_), Some(_)) => Err(PyValueError::new_err(
+            "a thread route hears its whole thread: it takes no mode",
+        )),
+        (None, Some(_), None) => Err(PyValueError::new_err("a thread is in a channel")),
+        (channel, None, mode) => {
+            let mode = slack::Mode::parse(mode.unwrap_or("mentions")).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "a mode is \"mentions\", \"top_level\" or \"all\", not {mode:?}"
+                ))
+            })?;
+            on_routes(py, async move |routes| {
+                routes.route_wide(wide(channel), agent, mode).await
+            })
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (channel = None, thread_ts = None))]
+fn slack_unroute(
+    py: Python<'_>,
+    channel: Option<String>,
+    thread_ts: Option<String>,
+) -> PyResult<()> {
+    match (channel, thread_ts) {
+        (Some(channel), Some(thread_ts)) => on_routes(py, async move |routes| {
+            routes.unroute_thread(&channel, &thread_ts).await
+        }),
+        (None, Some(_)) => Err(PyValueError::new_err("a thread is in a channel")),
+        (channel, None) => on_routes(py, async move |routes| {
+            routes.unroute_wide(wide(channel)).await
+        }),
+    }
 }
 
 #[pyfunction]
@@ -1200,47 +1261,27 @@ fn slack_claim(
 }
 
 #[pyfunction]
-#[pyo3(signature = (channel, thread_ts, agent))]
-fn slack_delegate(
-    py: Python<'_>,
-    channel: String,
-    thread_ts: Option<String>,
-    agent: &str,
-) -> PyResult<()> {
-    let agent = agent_id(agent)?;
-    on_routes(py, async move |routes| {
-        routes.delegate(&channel, thread_ts.as_deref(), agent).await
-    })
-}
-
-#[pyfunction]
-fn slack_set_mode(py: Python<'_>, channel: String, mode: &str) -> PyResult<()> {
-    let mode = slack::Mode::parse(mode).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "a mode is \"mentions\", \"top_level\" or \"all\", not {mode:?}"
-        ))
-    })?;
-    on_routes(py, async move |routes| {
-        routes.set_mode(&channel, mode).await
-    })
-}
-
-#[pyfunction]
 fn slack_routes(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let all = routes(py)?.all();
-    let out = PyDict::new(py);
-    out.set_item("owner", all.owner.map(|agent| agent.encoded().to_string()))?;
-    let channels = PyDict::new(py);
-    for (channel, rule) in all.channels {
+    let all = Routes::of(workset_db(py)?).all();
+    let route = |agent: AgentId, mode: slack::Mode| -> PyResult<Bound<'_, PyDict>> {
         let row = PyDict::new(py);
-        row.set_item("owner", rule.owner.map(|agent| agent.encoded().to_string()))?;
-        row.set_item("mode", rule.mode.name())?;
-        channels.set_item(channel, row)?;
+        row.set_item("agent", agent.encoded().to_string())?;
+        row.set_item("mode", mode.name())?;
+        Ok(row)
+    };
+    let out = PyDict::new(py);
+    out.set_item("workspace", py.None())?;
+    let channels = PyDict::new(py);
+    for (scope, agent, mode) in all.wide {
+        match scope {
+            slack::Wide::Workspace => out.set_item("workspace", route(agent, mode)?)?,
+            slack::Wide::Channel(channel) => channels.set_item(channel, route(agent, mode)?)?,
+        }
     }
     out.set_item("channels", channels)?;
     let threads = PyDict::new(py);
-    for ((channel, thread), owner) in all.threads {
-        threads.set_item((channel, thread), owner.encoded().to_string())?;
+    for ((channel, thread), agent) in all.threads {
+        threads.set_item((channel, thread), agent.encoded().to_string())?;
     }
     out.set_item("threads", threads)?;
     Ok(out)
@@ -1428,25 +1469,28 @@ mod tests {
 import _rho
 main, other = {main:?}, {other:?}
 assert _rho.slack_owner() is None
-_rho.set_slack_owner(main)
-assert _rho.slack_owner() == main
+_rho.slack_route(main)
+assert _rho.slack_owner("C1", "1.0") == main
 mention = {{"type": "message", "channel": "C1", "channel_type": "channel", "user": "U1",
     "ts": "1.0", "text": "<@UBOT> hi", "blocks": [{{"type": "rich_text", "elements": []}}], "edited": None}}
-assert _rho.slack_route(mention, "UBOT") == main
-assert _rho.slack_route(dict(mention, ts="2.0", text="hi"), "UBOT") is None
+assert _rho.slack_who_hears(mention, "UBOT") == main
+assert _rho.slack_who_hears(dict(mention, ts="2.0", text="hi"), "UBOT") is None
 assert _rho.slack_claim("C1", "1.0", other) == main
-_rho.slack_delegate("C3", None, other)
-_rho.slack_set_mode("C2", "top_level")
-try:
-    _rho.slack_set_mode("C2", "loud")
-except ValueError:
-    pass
-else:
-    raise AssertionError("a mode that does not exist was taken")
+_rho.slack_route(other, "C3")
+_rho.slack_route(main, "C2", mode="top_level")
+_rho.slack_route(other, "C4", "4.0")
+for bad in (dict(channel="C2", mode="loud"), dict(channel="C2", thread_ts="1.0", mode="all"), dict(thread_ts="1.0")):
+    try:
+        _rho.slack_route(main, **bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"took {{bad}}")
+_rho.slack_unroute("C4", "4.0")
 routes = _rho.slack_routes()
 assert routes == {{
-    "owner": main,
-    "channels": {{"C2": {{"owner": None, "mode": "top_level"}}, "C3": {{"owner": other, "mode": "mentions"}}}},
+    "workspace": {{"agent": main, "mode": "mentions"}},
+    "channels": {{"C2": {{"agent": main, "mode": "top_level"}}, "C3": {{"agent": other, "mode": "mentions"}}}},
     "threads": {{("C1", "1.0"): main}},
 }}, routes
 "#,
@@ -1455,6 +1499,6 @@ assert routes == {{
         );
         let (output, error) = runtime.block_on(eval(code)).unwrap();
         assert_eq!(error, None, "{output}");
-        assert!(host().unwrap().state.join("slack.redb").exists());
+        assert!(host().unwrap().state.join("workset.redb").exists());
     }
 }
