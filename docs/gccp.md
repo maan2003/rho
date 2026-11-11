@@ -133,8 +133,11 @@ given only where something can be done:
 | `msg-too-large` | The body is over 1024 bytes. The same body never fits.   |
 | `queue-full`    | The recipient has too much waiting. A later try may fit. |
 
-- A refusal with no `reason`, or with one the sending harness does not
-  know, is a refusal with no reason. A later version may add reasons.
+- A reason is 1 to 64 bytes of `a-z`, `0-9` and `-`, so a result stays
+  short. Old harnesses read at most 256 bytes of a result.
+- A later version may add reasons. A sending harness must not act on a
+  reason it does not know, or on a missing one, other than as a refusal.
+  It may still show an unknown reason to its clanker as text.
 - A harness may leave the reason out of any refusal. It must leave it out
   where the reason tells the sender more than it may learn: for example,
   that a local id exists.
