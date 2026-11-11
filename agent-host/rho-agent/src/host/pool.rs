@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-pub use gccp::{Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Transport};
+pub use gccp::{
+    Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
+};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
     TopicId, UnixMs, WorksetKind,
@@ -66,6 +68,8 @@ pub struct AgentPool {
     /// The GCCP messages taken last, so that one sent again is not given to
     /// its agent twice.
     gccp_stored: std::sync::Mutex<gccp::Stored>,
+    /// How fast GCCP text may still reach each agent.
+    gccp_paces: std::sync::Mutex<gccp::Paces>,
     /// What carries GCCP messages out, while the host's endpoint is up, and
     /// the waits before the tries after the first.
     gccp_transport: std::sync::Mutex<Option<gccp::Carrier>>,
@@ -152,6 +156,7 @@ impl AgentPool {
             init,
             endpoint: std::sync::OnceLock::new(),
             gccp_stored: std::sync::Mutex::default(),
+            gccp_paces: std::sync::Mutex::default(),
             gccp_transport: std::sync::Mutex::default(),
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
