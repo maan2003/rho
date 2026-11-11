@@ -233,6 +233,8 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                 workset: rho_agent_types::WorksetId([0; 6]),
                 isolated: false,
                 props: Default::default(),
+                state: camino::Utf8PathBuf::from_path_buf(tempfile::tempdir().unwrap().keep())
+                    .unwrap(),
             },
             Some(camino::Utf8PathBuf::from_path_buf(init).unwrap()),
             |_| {},

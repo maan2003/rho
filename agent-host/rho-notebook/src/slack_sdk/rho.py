@@ -1,104 +1,55 @@
-"""Thread and channel subscriptions over the agent host's Slack event buffer,
-and downloads of files Slack hosts.
+"""The agent host's Slack event buffer, and downloads of files Slack hosts.
 
-Not part of upstream slack_sdk. An agent subscribes to the threads and
-channels it cares about. One long poll of `rho.events` serves them all and
-calls each matching callback with the raw Slack event; the callback decides
-what to do, such as calling `notify()`. Subscriptions live in this process
-only.
+Not part of upstream slack_sdk. `Events` long-polls `rho.events`; the
+workset's `rho.slack` polls once for all its handlers and routes.
 """
 
 import asyncio
-import inspect
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import List, Optional
 
 import httpx
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-Callback = Callable[[dict], Any]
 
+class Events:
+    """The host's Slack events in order, one long poll of `rho.events` at a
+    time, from the first poll on. `{"type": "rho_truncated"}` comes first in
+    a batch when the host lost events before it."""
 
-class Subscriptions:
-    """`subscribe(channel, thread_ts, callback)` calls `callback(event)` for
-    each new message, edit or deletion in that thread, and each reaction to
-    its root message. With `thread_ts=None` it does so for everything in the
-    channel, threads included. `subscribe(file_id, None, callback)` calls it
-    for each `file_change` of that file, such as a canvas. Sync and async
-    callbacks both work.
-
-    Events count from when this object was created, so create it before
-    posting the message whose replies you wait for.
-
-    `{"type": "rho_truncated"}` means the host lost events: read the thread
-    or channel again with `conversations_replies` or
-    `conversations_history`. `{"type": "rho_error", "error": ...}`
-    means the host refused the poll, for example because it has no app
-    token; polling stops until the next `subscribe`."""
-
-    def __init__(self, client: Optional[AsyncWebClient] = None, logger: Optional[logging.Logger] = None):
-        self.client = client or AsyncWebClient()
-        self.logger = logger or logging.getLogger(__name__)
-        self.subscriptions: Dict[Tuple[str, Optional[str]], Callback] = {}
+    def __init__(self, client: AsyncWebClient, logger: logging.Logger):
+        self.client = client
+        self.logger = logger
         self._cursor: Optional[str] = None
-        self._poller = asyncio.ensure_future(self._poll())
+        self._unreachable = False
 
-    def subscribe(self, channel: str, thread_ts: Optional[str], callback: Callback) -> None:
-        self.subscriptions[(channel, thread_ts)] = callback
-        if self._poller.done():
-            self._poller = asyncio.ensure_future(self._poll())
-
-    def unsubscribe(self, channel: str, thread_ts: Optional[str]) -> None:
-        self.subscriptions.pop((channel, thread_ts), None)
-
-    def close(self) -> None:
-        """Stops polling."""
-        self._poller.cancel()
-
-    async def _poll(self) -> None:
-        unreachable = False
-        while True:
-            try:
-                reply = await self.client.api_call(
-                    "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": 20}
-                )
-            except SlackApiError as e:
-                for callback in list(self.subscriptions.values()):
-                    await self._call(callback, {"type": "rho_error", "error": e.response["error"]})
-                return
-            except httpx.HTTPError as e:
-                # The host may be restarting; say so once, then keep trying.
-                if not unreachable:
-                    self.logger.warning(f"The agent host's Slack server is unreachable: {e}")
-                    unreachable = True
-                await asyncio.sleep(5)
-                continue
-            unreachable = False
-            self._cursor = reply["cursor"]
-            if reply["truncated"]:
-                for callback in list(self.subscriptions.values()):
-                    await self._call(callback, {"type": "rho_truncated"})
-            for envelope in reply["events"]:
-                event = envelope.get("payload", {}).get("event")
-                if not event:
-                    continue
-                channel, thread_ts = _thread(event)
-                for key in dict.fromkeys(((channel, thread_ts), (channel, None))):
-                    callback = self.subscriptions.get(key)
-                    if callback:
-                        await self._call(callback, event)
-
-    async def _call(self, callback: Callback, event: dict) -> None:
+    async def poll(self, timeout: float = 20) -> List[dict]:
+        """The next events, after at most about `timeout` seconds. Raises
+        `SlackApiError` when the host refuses the poll. While the host is
+        unreachable it says so once and returns nothing after 5 seconds."""
         try:
-            result = callback(event)
-            if inspect.isawaitable(result):
-                await result
-        except Exception:
-            self.logger.exception("A Slack subscription callback failed")
+            reply = await self.client.api_call(
+                "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": timeout}
+            )
+        except httpx.HTTPError as e:
+            # The host may be restarting; say so once, then keep trying.
+            if not self._unreachable:
+                self.logger.warning(f"The agent host's Slack server is unreachable: {e}")
+                self._unreachable = True
+            await asyncio.sleep(5)
+            return []
+        self._unreachable = False
+        self._cursor = reply["cursor"]
+        events = [{"type": "rho_truncated"}] if reply["truncated"] else []
+        for envelope in reply["events"]:
+            event = envelope.get("payload", {}).get("event")
+            if event:
+                events.append(event)
+        return events
 
 
 async def download(url: str, *, timeout: float = 300) -> bytes:
@@ -116,14 +67,3 @@ async def download(url: str, *, timeout: float = 300) -> bytes:
             error = f"HTTP {resp.status_code}"
         raise SlackApiError(f"Downloading {url} failed", {"ok": False, "error": error})
     return resp.content
-
-
-def _thread(event: dict) -> Tuple[Optional[str], Optional[str]]:
-    """The (channel, thread root ts) an event belongs to. A file event belongs
-    to the file, as a channel without threads."""
-    # Edits and deletions carry the message one level down; reactions name
-    # theirs as an item.
-    item = event.get("item") or {}
-    message = event.get("message") or event.get("previous_message") or event
-    channel = event.get("channel") or item.get("channel") or event.get("file_id")
-    return channel, message.get("thread_ts") or message.get("ts") or item.get("ts")

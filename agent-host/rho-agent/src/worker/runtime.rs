@@ -166,6 +166,7 @@ pub(crate) async fn run(
             startup.workset,
             startup.layout.mount.is_some(),
             startup.props.clone(),
+            startup.layout.state.clone(),
         ),
         startup.init.clone(),
         {

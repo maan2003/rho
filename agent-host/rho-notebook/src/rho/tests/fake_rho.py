@@ -31,6 +31,11 @@ class State:
         self.skill_dirs = {}  # directory -> [Skill]
         self.builtin = []  # [Skill]
         self.agents_files = {}  # path -> AgentsFile
+        self.current = None  # the agent whose notebook is calling
+        self.slack_owner = None  # the workspace route's agent
+        self.slack_routes = {}  # Slack event ts -> the agent it goes to
+        self.slack_claims = []  # (channel, thread_ts, agent)
+        self.slack_table = {"workspace": None, "channels": {}, "threads": {}}  # what slack_routes returns
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
 
@@ -338,4 +343,27 @@ async def inbox(agent, after):
 
 
 def current_agent():
-    return None
+    return STATE.current
+
+
+
+def slack_who_hears(event, bot_user, bot_id):
+    STATE.calls.append(("slack_who_hears", (event["ts"], bot_user, bot_id)))
+    return STATE.slack_routes.get(event["ts"])
+
+
+def slack_owner(channel=None, thread_ts=None):
+    return STATE.slack_owner
+
+
+def slack_routes():
+    return copy.deepcopy(STATE.slack_table)
+
+
+def slack_claim(channel, thread_ts, agent):
+    STATE.slack_claims.append((channel, thread_ts, agent))
+    return agent
+
+
+def slack_route(agent, channel=None, thread_ts=None, mode=None):
+    STATE.calls.append(("slack_route", (agent, channel, thread_ts, mode)))

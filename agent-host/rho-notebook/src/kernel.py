@@ -298,13 +298,15 @@ class Notebook:
         self.flags = 0
         self.cells = {}
         self.streams = {}
-        self.context = contextvars.copy_context()
+        self.context = None
         self.namespace = namespace(exports)
         self.loop = None
         self.tasks = {}
         self.recent = {}
 
     def run(self):
+        # Taken now, after the startup hook: what it set reaches every cell.
+        self.context = contextvars.copy_context()
         self.loop = NotebookEventLoop(self)
         self.loop.add_reader(self.driver.fd, self.drain)
         try:

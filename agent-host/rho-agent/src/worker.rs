@@ -9,6 +9,7 @@ pub(crate) mod python;
 mod runtime;
 pub(crate) mod shared;
 pub mod shell;
+mod slack;
 mod ste;
 pub mod terminal;
 mod workset;

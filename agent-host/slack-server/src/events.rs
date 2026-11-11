@@ -1,6 +1,7 @@
 //! Slack events, fast: the host holds the app's Socket Mode connection and
 //! keeps its recent envelopes in memory, and agents long-poll them with
-//! `rho.events`. The host acknowledges each envelope itself.
+//! `rho.events`. The host acknowledges each envelope itself, and keeps all
+//! of them, the bot's own too: who hears what is for the workset to decide.
 //!
 //! The buffer only says what happened lately. It is not a mirror: when an
 //! agent's cursor falls behind the buffer, or comes from an earlier host
@@ -167,17 +168,8 @@ async fn connect(
 ) -> Result<()> {
     let tokens = || (present(bot_token), present(app_token));
     let installed = tokens();
-    let (bot, Some(app)) = &installed else {
+    let (_, Some(app)) = &installed else {
         return Ok(());
-    };
-    // The bot's own messages would wake every agent that waits after it posts.
-    let me = match bot {
-        Some(bot) => call(client, slack_api_url, "auth.test", bot).await?,
-        None => Value::Null,
-    };
-    let own = |event: &Value| {
-        (me.get("user_id").is_some() && event.get("user") == me.get("user_id"))
-            || (me.get("bot_id").is_some() && event.get("bot_id") == me.get("bot_id"))
     };
     let open = call(client, slack_api_url, "apps.connections.open", app).await?;
     let url = open["url"]
@@ -213,9 +205,7 @@ async fn connect(
                 .await
                 .context("acknowledging")?;
         }
-        if envelope.get("envelope_id").is_some()
-            && !envelope.pointer("/payload/event").is_some_and(own)
-        {
+        if envelope.get("envelope_id").is_some() {
             events.push(envelope);
         }
     }
@@ -356,23 +346,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socket_mode_acknowledges_every_envelope_and_keeps_others() {
+    async fn socket_mode_acknowledges_and_keeps_every_envelope_also_the_bots_own() {
         let ws = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_url = format!("ws://{}/", ws.local_addr().unwrap());
-        let http = Router::new()
-            .route(
-                "/api/auth.test",
-                post(|| async {
-                    axum::Json(json!({"ok": true, "user_id": "UBOT", "bot_id": "BBOT"}))
-                }),
-            )
-            .route(
-                "/api/apps.connections.open",
-                post(move |headers: axum::http::HeaderMap| async move {
-                    assert_eq!(headers["authorization"], "Bearer xapp-1");
-                    axum::Json(json!({"ok": true, "url": ws_url}))
-                }),
-            );
+        let http = Router::new().route(
+            "/api/apps.connections.open",
+            post(move |headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer xapp-1");
+                axum::Json(json!({"ok": true, "url": ws_url}))
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = Url::parse(&format!("http://{}/api/", listener.local_addr().unwrap())).unwrap();
         tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
@@ -427,7 +410,10 @@ mod tests {
             .iter()
             .map(|(_, e)| e.clone())
             .collect();
-        assert_eq!(buffered, [others(), interactive()]);
+        assert_eq!(
+            buffered,
+            [own_message(), own_bot(), others(), interactive()]
+        );
     }
 
     #[tokio::test]
@@ -435,15 +421,10 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ws = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_url = format!("ws://{}/", ws.local_addr().unwrap());
-        let http = Router::new()
-            .route(
-                "/api/auth.test",
-                post(|| async { axum::Json(json!({"ok": true, "user_id": "UBOT"})) }),
-            )
-            .route(
-                "/api/apps.connections.open",
-                post(move || async move { axum::Json(json!({"ok": true, "url": ws_url})) }),
-            );
+        let http = Router::new().route(
+            "/api/apps.connections.open",
+            post(move || async move { axum::Json(json!({"ok": true, "url": ws_url})) }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = Url::parse(&format!("http://{}/api/", listener.local_addr().unwrap())).unwrap();
         tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
