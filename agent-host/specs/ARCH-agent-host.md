@@ -57,7 +57,9 @@ evaluated code, the workset's props, agent creation and whole-spec changes,
 inputs, and the runtime rows of each loop. Workset props are strings Python
 sets before the first agent, typically from the function the GUI's creation
 code calls; they are fixed after that, so an agent cannot change what its
-workset's policy reads at the next start. An agent's spec is its typed runtime (native or Claude,
+workset's policy reads at the next start. A workset whose props were never
+set may set them once later, so that a workset made before its policy named
+it can join that policy; its props are then fixed too. An agent's spec is its typed runtime (native or Claude,
 model, effort, and the runtime's session identity) plus string props that
 Python sets and the GUI reads (name, title, parent, and `origin`, the message
 it was started from as `chat:<message id>`).
