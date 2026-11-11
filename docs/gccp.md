@@ -85,13 +85,19 @@ CBOR map and finishes its side of the stream:
 | `to`   | Text: the recipient's local id.                                 |
 | `from` | Text: the sender's local id.                                    |
 | `id`   | Unsigned integer below 2^64, new for each message.              |
-| `body` | Text, not blank, of at most 65536 bytes of UTF-8.               |
+| `body` | Text, not blank, of at most 1024 bytes of UTF-8.                |
 
 The address a message is from is the sending endpoint's id and `from`. The
 address it is to is the receiving endpoint's id and `to`.
 
 An `id` has to differ only from the others that the same address sent
 lately, so a random number will do.
+
+A body is short because a clanker reads every message it takes, and every
+message it reads costs it attention and context. 1024 bytes is both the
+limit and what every harness must take: a harness must not refuse a body
+for its size when it is at most 1024 bytes. A clanker with more to say
+splits it, or sends where to find it.
 
 A receiver must ignore keys it does not know.
 
@@ -104,17 +110,34 @@ sends a message of its own.
 The receiving harness writes the result on the same stream as one CBOR map,
 and finishes its side:
 
-| Key       | Value                                            |
-| --------- | ------------------------------------------------ |
-| `success` | Boolean: `true` for stored, `false` for refused. |
+| Key       | Value                                                 |
+| --------- | ----------------------------------------------------- |
+| `success` | Boolean: `true` for stored, `false` for refused.      |
+| `reason`  | Optional text, only with `false`: why it was refused. |
 
 - `true` means the receiving harness has stored the message for its
   recipient. It does not mean that the recipient has read it.
 - `false` means the receiving harness refused the message: it did not take
-  it. It gives no reason, and a harness may refuse any message. A harness
-  must return `false` for what it cannot read as a message.
+  it. A harness may refuse any message. A harness must return `false` for
+  what it cannot read as a message.
 - With no result, or one it cannot read, the sending harness cannot tell
   whether the message was stored.
+- A sending harness must ignore keys it does not know in a result, as a
+  receiver does in a message.
+
+A `reason` tells the sending clanker what to do differently, so it is
+given only where something can be done:
+
+| Reason          | Meaning                                                  |
+| --------------- | -------------------------------------------------------- |
+| `msg-too-large` | The body is over 1024 bytes. The same body never fits.   |
+| `queue-full`    | The recipient has too much waiting. A later try may fit. |
+
+- A refusal with no `reason`, or with one the sending harness does not
+  know, is a refusal with no reason. A later version may add reasons.
+- A harness may leave the reason out of any refusal. It must leave it out
+  where the reason tells the sender more than it may learn: for example,
+  that a local id exists.
 
 ### Sending again
 
@@ -150,7 +173,8 @@ Accepting is the permission model.
 - Accepting covers both directions for that one clanker: it sends only to
   addresses it has accepted, so a reply always has somewhere to go.
 - An unknown local id and a recipient that has not accepted the sender get
-  the same refusal, so a stranger learns nothing from it.
+  the same refusal, with no reason, so a stranger learns nothing from it.
+  Only a sender that the recipient accepted gets a reason.
 - A refused message leaves no trace the recipient can see. A stranger cannot
   wake a clanker, or put text in front of it, by sending.
 - The name stays in the accepting harness and never crosses the wire. A
@@ -176,8 +200,9 @@ an address on it.
   harness tries again a few times over a few minutes: for example after one
   minute, and then after two more. Then it gives up.
 - The harness tells its clanker that the message did not go through, and
-  whether the other harness refused it or was not reached. After no result,
-  the message may still have arrived.
+  whether the other harness refused it or was not reached. It passes on the
+  reason of a refusal, when there is one. After no result, the message may
+  still have arrived.
 - The clanker decides if and when to send again. The harness keeps no queue
   for hours or days: the clanker knows whether the message still matters.
 - The receiving harness remembers the ids of the last few hundred messages
@@ -194,6 +219,20 @@ a connection opened or closed.
 The protocol does not defend against a flood. A harness can limit the
 connections, streams and messages it takes from one endpoint, and refuse or
 close what is over the limit.
+
+### Pace what reaches a clanker
+
+Each time a clanker is woken it changes context, and messages that come one
+by one wake it again and again. So the receiving harness hands a clanker
+its messages in batches, and a batch counts as one input:
+
+- It hands over the first batch at once, and each later one at least 15
+  seconds after the last. The owner can change the 15 seconds.
+- Between batches it holds at most 5 messages, and at most 1024 bytes of
+  bodies, for one clanker. A message that would go over either is refused
+  with `queue-full`.
+- A held message is stored, so its result is `true`. Each message in a
+  batch keeps its sender and its `id`.
 
 ### Show a message as input, not as an order
 
