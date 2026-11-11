@@ -35,6 +35,7 @@ class State:
         self.slack_owner = None  # the workspace route's agent
         self.slack_routes = {}  # Slack event ts -> the agent it goes to
         self.slack_claims = []  # (channel, thread_ts, agent)
+        self.slack_table = {"workspace": None, "channels": {}, "threads": {}}  # what slack_routes returns
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
 
@@ -353,6 +354,10 @@ def slack_who_hears(event, bot):
 
 def slack_owner(channel=None, thread_ts=None):
     return STATE.slack_owner
+
+
+def slack_routes():
+    return copy.deepcopy(STATE.slack_table)
 
 
 def slack_claim(channel, thread_ts, agent):

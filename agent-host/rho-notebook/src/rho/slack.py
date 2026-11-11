@@ -23,6 +23,8 @@ import _rho
 from slack_sdk.web.async_base_client import AsyncBaseClient
 
 from . import agents
+from .prompt import label
+from .tools import resolve
 
 #: What a workspace or channel route hears besides mentions of the bot:
 #: nothing more, each new top-level message, or every message.
@@ -127,12 +129,13 @@ def route_messages(hand) -> None:
     add_event_handler(on_event)
 
 
-def route(agent: str, channel: str | None = None, thread_ts: str | None = None, mode: str | None = None) -> None:
+def route(agent_id: str, channel: str | None = None, thread_ts: str | None = None, mode: str | None = None) -> None:
     """Route the workspace, a channel, or with `thread_ts` one thread of the
-    channel, to `agent`, replacing its route. A workspace or channel route
-    hears mentions and what its `mode` adds ("mentions" without one); a
-    thread route hears its whole thread and takes no mode."""
-    _rho.slack_route(agents.Agent(agent).id, channel, thread_ts, mode)
+    channel, to the agent `agent_id` names ("eng-<id>", "adv-<id>" or the
+    bare id), replacing its route. A workspace or channel route hears
+    mentions and what its `mode` adds ("mentions" without one); a thread
+    route hears its whole thread and takes no mode."""
+    _rho.slack_route(agents.Agent(resolve(agent_id)).id, channel, thread_ts, mode)
 
 
 def unroute(channel: str | None = None, thread_ts: str | None = None) -> None:
@@ -141,15 +144,23 @@ def unroute(channel: str | None = None, thread_ts: str | None = None) -> None:
 
 
 def owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
-    """The agent of the most specific route that covers the thread, the
-    channel, or the workspace."""
-    return _rho.slack_owner(channel, thread_ts)
+    """The agent id, as agents name it ("eng-<id>"), of the most specific
+    route that covers the thread, the channel, or the workspace."""
+    agent = _rho.slack_owner(channel, thread_ts)
+    return None if agent is None else label(agent)
 
 
 def routes() -> dict:
-    """Every route: `{"workspace": {"agent", "mode"} | None, "channels":
-    {channel: {"agent", "mode"}}, "threads": {(channel, thread_ts): agent}}`."""
-    return _rho.slack_routes()
+    """Every route, with agent ids as agents name them: `{"workspace":
+    {"agent", "mode"} | None, "channels": {channel: {"agent", "mode"}},
+    "threads": {(channel, thread_ts): agent}}`."""
+    found = _rho.slack_routes()
+    wide = lambda route: route and {**route, "agent": label(route["agent"])}
+    return {
+        "workspace": wide(found["workspace"]),
+        "channels": {channel: wide(route) for channel, route in found["channels"].items()},
+        "threads": {thread: label(agent) for thread, agent in found["threads"].items()},
+    }
 
 
 def render(event: dict) -> str:
