@@ -347,8 +347,8 @@ def current_agent():
 
 
 
-def slack_who_hears(event, bot):
-    STATE.calls.append(("slack_who_hears", (event["ts"], bot)))
+def slack_who_hears(event, bot_user, bot_id):
+    STATE.calls.append(("slack_who_hears", (event["ts"], bot_user, bot_id)))
     return STATE.slack_routes.get(event["ts"])
 
 

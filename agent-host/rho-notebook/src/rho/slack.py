@@ -45,7 +45,10 @@ class _Handler:
         self.task = loop.create_task(self._run())
 
     def give(self, event) -> bool:
-        """Queue `event`; False once the handler's loop is gone."""
+        """Queue `event`; False once the handler's loop is gone. A notebook
+        that shuts down stops its loop without closing it."""
+        if self.task.done() or not self.loop.is_running():
+            return False
         try:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
             return True
@@ -69,6 +72,7 @@ class _Handler:
 _handlers: list[_Handler] = []
 _poll: asyncio.Task | None = None
 _bot: str | None = None
+_bot_id: str | None = None
 _routing = False
 
 
@@ -116,7 +120,7 @@ def route_messages(hand) -> None:
     async def on_event(event):
         kind = event["type"]
         if kind == "message":
-            to = await asyncio.to_thread(_rho.slack_who_hears, event, _bot)
+            to = await asyncio.to_thread(_rho.slack_who_hears, event, _bot, _bot_id)
         elif kind == "rho_truncated" or (kind == "member_joined_channel" and event.get("user") == _bot):
             to = _rho.slack_owner()
         else:
@@ -203,15 +207,22 @@ async def _serve() -> None:
     from slack_sdk.rho import Events
     from slack_sdk.web.async_client import AsyncWebClient
 
-    global _bot
+    global _bot, _bot_id
     client = AsyncWebClient()
     events = Events(client, _Log())
+    # The first poll sets the cursor at once, so that what arrives while
+    # Slack says who the bot is still reaches the handlers.
+    first = None
     refused = False
     while True:
         try:
+            if first is None:
+                first = await events.poll(timeout=0)
             if _bot is None:
-                _bot = (await client.auth_test())["user_id"]
-            for event in await events.poll():
+                me = await client.auth_test()
+                _bot, _bot_id = me["user_id"], me["bot_id"]
+            batch, first = first or await events.poll(), []
+            for event in batch:
                 for handler in list(_handlers):
                     if not handler.give(event) and handler in _handlers:
                         _handlers.remove(handler)

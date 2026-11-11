@@ -3,7 +3,10 @@ use serde_json::json;
 
 use super::*;
 
-const BOT: &str = "UBOT";
+const BOT: Bot = Bot {
+    user: "UBOT",
+    id: "BBOT",
+};
 
 fn agent(n: u64) -> AgentId {
     AgentId::from_counter(n, &AgentIdDomain(0)).unwrap()
@@ -99,8 +102,17 @@ async fn direct_messages_edits_other_mentions_and_the_bots_own_posts_are_not_hea
     assert_eq!(routes.who_hears(&other, BOT).await, None);
     routes.route_thread("C1", "4.0", agent(2)).await;
     let mut own = message("C1", "4.1", Some("4.0"), "my answer");
-    own["user"] = json!(BOT);
+    own["user"] = json!(BOT.user);
+    own["bot_id"] = json!(BOT.id);
     assert_eq!(routes.who_hears(&own, BOT).await, None);
+    let mut own_by_bot_id = message("C1", "4.1", Some("4.0"), "my answer");
+    own_by_bot_id.as_object_mut().unwrap().remove("user");
+    own_by_bot_id["bot_id"] = json!(BOT.id);
+    assert_eq!(routes.who_hears(&own_by_bot_id, BOT).await, None);
+    let mut other_app = message("C1", "4.3", Some("4.0"), "CI failed");
+    other_app["user"] = json!("UCIBOT");
+    other_app["bot_id"] = json!("BCI");
+    assert_eq!(routes.who_hears(&other_app, BOT).await, Some(agent(2)));
     let mut broadcast = message("C1", "4.2", Some("4.0"), "also sent to the channel");
     broadcast["subtype"] = json!("thread_broadcast");
     assert_eq!(routes.who_hears(&broadcast, BOT).await, Some(agent(2)));

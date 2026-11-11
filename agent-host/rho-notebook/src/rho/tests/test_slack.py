@@ -33,16 +33,22 @@ class FakeHost:
     def __init__(self, test, batches):
         self.batches = list(batches)
         self.polls = 0
+        self.log = []
         originals = (Events.poll, AsyncWebClient.auth_test)
 
-        async def poll(events):
+        async def poll(events, timeout=20):
+            self.log.append(("poll", timeout))
+            if timeout == 0:
+                # Without a cursor the host starts at its newest event.
+                return []
             self.polls += 1
-            if self.batches:
-                return self.batches.pop(0)
-            await asyncio.sleep(3600)
+            while not self.batches:
+                await asyncio.sleep(0.01)
+            return self.batches.pop(0)
 
         async def auth_test(client, **kwargs):
-            return {"ok": True, "user_id": "UBOT"}
+            self.log.append(("auth",))
+            return {"ok": True, "user_id": "UBOT", "bot_id": "BBOT"}
 
         Events.poll, AsyncWebClient.auth_test = poll, auth_test
 
@@ -59,6 +65,7 @@ class SlackCase(WorksetCase):
         slack._handlers.clear()
         slack._poll = None
         slack._bot = None
+        slack._bot_id = None
         slack._routing = False
         self.host = FakeHost(self, self.batches)
         super().setUp()
@@ -97,8 +104,13 @@ class Routing(SlackCase):
         # about nothing else.
         self.assertEqual(
             [args for name, args in self.state.calls if name == "slack_who_hears"],
-            [("1.0", "UBOT"), ("2.0", "UBOT"), ("1.1", "UBOT")],
+            [("1.0", "UBOT", "BBOT"), ("2.0", "UBOT", "BBOT"), ("1.1", "UBOT", "BBOT")],
         )
+
+    def test_the_cursor_is_set_before_slack_says_who_the_bot_is(self):
+        # A reply that comes while `auth.test` waits is after the cursor.
+        wait_for(lambda: len(self.host.log) >= 3, "three host calls")
+        self.assertEqual(self.host.log[:3], [("poll", 0), ("auth",), ("poll", 20)])
 
     def test_a_second_router_is_refused(self):
         with self.assertRaises(RuntimeError):
@@ -139,6 +151,32 @@ class Handlers(SlackCase):
         self.assertIsNone(slack._poll)
 
 
+class Shutdown(SlackCase):
+    batches = []
+
+    def test_a_handler_of_a_stopped_notebook_is_dropped(self):
+        # A notebook that shuts down stops its loop but does not close it.
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever)
+        thread.start()
+
+        async def add():
+            slack.add_event_handler(lambda event: None)
+
+        asyncio.run_coroutine_threadsafe(add(), loop).result(5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        self.assertFalse(loop.is_closed())
+        self.assertEqual(len(slack._handlers), 1)
+        self.host.batches.append([message("2.0", "after the shutdown")])
+        wait_for(lambda: not slack._handlers, "the handler dropped")
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        loop.close()
+
+
 class Posting(SlackCase):
     def seed(self, state):
         self.main = add_agent(state, claude(), cwd="/")
@@ -160,7 +198,6 @@ class Posting(SlackCase):
         self.state.current = None
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
         self.assertEqual(self.state.slack_claims, [])
-
 
 
 class Naming(SlackCase):

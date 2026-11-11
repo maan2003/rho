@@ -57,6 +57,13 @@ impl Mode {
 }
 
 /// A Slack message as routing reads it.
+/// Who the bot is, as `auth.test` names it: its user and its bot id.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bot<'a> {
+    pub user: &'a str,
+    pub id: &'a str,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Message<'a> {
     channel: &'a str,
@@ -70,7 +77,7 @@ impl<'a> Message<'a> {
     /// The new message `event` is, if it is one routing delivers: not an
     /// edit, deletion or reaction, not in a direct conversation, and not
     /// one of the bot's own.
-    fn of(event: &'a Value, bot: &str) -> Option<Self> {
+    fn of(event: &'a Value, bot: Bot<'_>) -> Option<Self> {
         let field = |name: &str| event.get(name).and_then(Value::as_str);
         if field("type") != Some("message") {
             return None;
@@ -84,13 +91,13 @@ impl<'a> Message<'a> {
         if matches!(field("channel_type"), Some("im" | "mpim")) {
             return None;
         }
-        if field("user") == Some(bot) {
+        if field("user") == Some(bot.user) || field("bot_id") == Some(bot.id) {
             return None;
         }
         let channel = field("channel")?;
         let ts = field("ts")?;
         let thread = field("thread_ts").unwrap_or(ts);
-        let mention = format!("<@{bot}>");
+        let mention = format!("<@{}>", bot.user);
         Some(Self {
             channel,
             thread,
@@ -132,7 +139,7 @@ impl<'db> Routes<'db> {
     /// adds. A mention in a thread with no route routes the thread to the
     /// agent it goes to, so the replies that follow reach that agent
     /// before it answers.
-    pub(crate) async fn who_hears(&self, event: &Value, bot: &str) -> Option<AgentId> {
+    pub(crate) async fn who_hears(&self, event: &Value, bot: Bot<'_>) -> Option<AgentId> {
         let message = Message::of(event, bot)?;
         let key = (message.channel, message.thread);
         let mut write = self.db.write().await;

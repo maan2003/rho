@@ -1176,11 +1176,18 @@ fn wide(channel: Option<String>) -> slack::Wide {
 fn slack_who_hears(
     py: Python<'_>,
     event: Bound<'_, PyAny>,
-    bot: String,
+    bot_user: String,
+    bot_id: String,
 ) -> PyResult<Option<String>> {
     let event: serde_json::Value = pythonize::depythonize(&event)
         .map_err(|error| PyValueError::new_err(format!("not a Slack event: {error}")))?;
-    let to = on_routes(py, async move |routes| routes.who_hears(&event, &bot).await)?;
+    let to = on_routes(py, async move |routes| {
+        let bot = slack::Bot {
+            user: &bot_user,
+            id: &bot_id,
+        };
+        routes.who_hears(&event, bot).await
+    })?;
     Ok(to.map(|agent| agent.encoded().to_string()))
 }
 
@@ -1473,8 +1480,8 @@ _rho.slack_route(main)
 assert _rho.slack_owner("C1", "1.0") == main
 mention = {{"type": "message", "channel": "C1", "channel_type": "channel", "user": "U1",
     "ts": "1.0", "text": "<@UBOT> hi", "blocks": [{{"type": "rich_text", "elements": []}}], "edited": None}}
-assert _rho.slack_who_hears(mention, "UBOT") == main
-assert _rho.slack_who_hears(dict(mention, ts="2.0", text="hi"), "UBOT") is None
+assert _rho.slack_who_hears(mention, "UBOT", "BBOT") == main
+assert _rho.slack_who_hears(dict(mention, ts="2.0", text="hi"), "UBOT", "BBOT") is None
 assert _rho.slack_claim("C1", "1.0", other) == main
 _rho.slack_route(other, "C3")
 _rho.slack_route(main, "C2", mode="top_level")

@@ -27,13 +27,13 @@ class Events:
         self._cursor: Optional[str] = None
         self._unreachable = False
 
-    async def poll(self) -> List[dict]:
-        """The next events, after at most about 20 seconds. Raises
+    async def poll(self, timeout: float = 20) -> List[dict]:
+        """The next events, after at most about `timeout` seconds. Raises
         `SlackApiError` when the host refuses the poll. While the host is
         unreachable it says so once and returns nothing after 5 seconds."""
         try:
             reply = await self.client.api_call(
-                "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": 20}
+                "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": timeout}
             )
         except httpx.HTTPError as e:
             # The host may be restarting; say so once, then keep trying.
