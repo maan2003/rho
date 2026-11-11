@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 from ssl import SSLContext
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 
@@ -29,6 +29,9 @@ from .internal_utils import (
 
 class AsyncBaseClient:
     BASE_URL = "http://slack/api/"
+    #: Called with each `chat.postMessage` reply that went through; `rho.slack`
+    #: sets it, so the posting agent takes the thread.
+    posted: Optional[Callable[[dict], None]] = None
 
     def __init__(
         self,
@@ -104,9 +107,12 @@ class AsyncBaseClient:
         )
         show_deprecation_warning_if_any(api_method)
         response = await self._request(http_verb=http_verb, api_url=api_url, req_args=req_args)
-        return AsyncSlackResponse(
+        reply = AsyncSlackResponse(
             client=self, http_verb=http_verb, api_url=api_url, req_args=req_args, **response
         ).validate()
+        if api_method == "chat.postMessage" and self.posted is not None:
+            self.posted(reply.data)
+        return reply
 
     async def _request(self, *, http_verb, api_url, req_args) -> Dict[str, Any]:
         """Sends one request. `AsyncSlackResponse` pagination calls this for each page."""

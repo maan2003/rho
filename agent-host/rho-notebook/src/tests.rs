@@ -613,6 +613,35 @@ async fn reports_from_new_notebooks_with_reused_session_labels_stay_separate() {
     assert_eq!(report.render().text, "first lifetime\n\nsecond lifetime");
 }
 
+/// What a startup hook sets in its thread's context, such as whose notebook
+/// this is, every cell and task of the notebook sees.
+#[tokio::test]
+async fn context_the_startup_hook_sets_reaches_cells() {
+    let hook: crate::OnStart = Box::new(|py, namespace| {
+        use pyo3::types::PyAnyMethods as _;
+        let var = py
+            .import("contextvars")?
+            .getattr("ContextVar")?
+            .call1(("startup_var",))?;
+        var.call_method1("set", ("from startup",))?;
+        use pyo3::types::PyDictMethods as _;
+        namespace.set_item("startup_var", var)?;
+        Ok(())
+    });
+    let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
+    let wake = Arc::new(Notify::new());
+    let notebook = Notebook::new(shell, Vec::new(), wake.clone(), Some(hook))
+        .await
+        .unwrap();
+    let cell = notebook.run(
+        "import asyncio\nasync def later():\n    return startup_var.get(None)\nprint(startup_var.get(None), await asyncio.create_task(later()))".into(),
+    );
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(text.starts_with("from startup from startup\n"), "{text}");
+    notebook.shutdown().await.unwrap();
+}
+
 /// A startup hook can require IPC or timers on the same async executor that
 /// creates the notebook. A blocking constructor stalls that executor.
 #[tokio::test]

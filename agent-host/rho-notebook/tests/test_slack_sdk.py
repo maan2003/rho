@@ -16,6 +16,7 @@ from slack_sdk.rho import Subscriptions, download
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.aiohttp import SocketModeClient as AsyncSocketModeClient
 from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.web.async_base_client import AsyncBaseClient
 from slack_sdk.web.async_client import AsyncWebClient
 
 METHODS_FILE = Path(__file__).parents[2] / "slack-server" / "methods.json"
@@ -107,6 +108,27 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(open_["query"], {"users": ["U1,U2"]})
         self.assertEqual((replies["method"], replies["query"]),
                          ("GET", {"channel": ["D1"], "ts": ["1.5"], "inclusive": ["1"]}))
+
+    async def test_a_post_that_went_through_reaches_the_posted_hook(self):
+        seen = []
+
+        async def body():
+            client = AsyncWebClient()
+            with patch.object(AsyncBaseClient, "posted", staticmethod(seen.append)):
+                await client.chat_postMessage(channel="C1", text="hi", thread_ts="1.0")
+                with self.assertRaises(SlackApiError):
+                    await client.chat_postMessage(channel="C2", text="refused")
+                await client.chat_update(channel="C1", ts="1.5", text="edited")
+
+        await self.run_with({
+            "chat.postMessage": [
+                {"ok": True, "channel": "C1", "ts": "1.5", "message": {"ts": "1.5", "thread_ts": "1.0"}},
+                {"ok": False, "error": "not_in_channel"},
+            ],
+            "chat.update": {"ok": True, "channel": "C1", "ts": "1.5"},
+        }, body)
+
+        self.assertEqual(seen, [{"ok": True, "channel": "C1", "ts": "1.5", "message": {"ts": "1.5", "thread_ts": "1.0"}}])
 
     async def test_async_client_calls_share_one_host_connection(self):
         async def body():

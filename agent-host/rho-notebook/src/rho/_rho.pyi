@@ -199,6 +199,28 @@ async def inbox(agent: str, after: int) -> list[MessageRecord]:
     """What `agent` receives after message `after`, waiting until there is
     some."""
 
+# -- Slack routes ------------------------------------------------------------
+# The workset's, in `slack.redb` in its state directory; `rho.slack` wraps
+# them. Agent ids must be of this workset.
+
+def slack_owner() -> str | None:
+    """The agent that gets what no rule gives another; None while the
+    workset does not route Slack."""
+def set_slack_owner(agent: str) -> None: ...
+def slack_route(event: dict, bot: str) -> str | None:
+    """The agent a Slack event goes to, if anyone hears it, given the bot's
+    user id. A mention in a thread nobody owns gives the thread to that
+    agent."""
+def slack_claim(channel: str, thread_ts: str, agent: str) -> str:
+    """`agent` takes the thread unless another agent owns it; returns its
+    owner."""
+def slack_delegate(channel: str, thread_ts: str | None, agent: str) -> None:
+    """Give the thread, or with no `thread_ts` the channel, to `agent`."""
+def slack_set_mode(channel: str, mode: Literal["mentions", "top_level", "all"]) -> None: ...
+def slack_routes() -> dict:
+    """`{"owner": str | None, "channels": {channel: {"owner": str | None,
+    "mode": str}}, "threads": {(channel, thread_ts): str}}`."""
+
 # -- inside an agent's notebook ----------------------------------------------
 
 def current_agent() -> str | None:

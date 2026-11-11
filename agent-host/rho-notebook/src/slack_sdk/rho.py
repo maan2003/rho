@@ -5,7 +5,7 @@ Not part of upstream slack_sdk. An agent subscribes to the threads and
 channels it cares about. One long poll of `rho.events` serves them all and
 calls each matching callback with the raw Slack event; the callback decides
 what to do, such as calling `notify()`. Subscriptions live in this process
-only.
+only; a workset that routes Slack (`rho.slack`) keeps its routes for good.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -21,6 +21,42 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
 Callback = Callable[[dict], Any]
+
+
+class Events:
+    """The host's Slack events in order, one long poll of `rho.events` at a
+    time, from the first poll on. `{"type": "rho_truncated"}` comes first in
+    a batch when the host lost events before it."""
+
+    def __init__(self, client: AsyncWebClient, logger: logging.Logger):
+        self.client = client
+        self.logger = logger
+        self._cursor: Optional[str] = None
+        self._unreachable = False
+
+    async def poll(self) -> List[dict]:
+        """The next events, after at most about 20 seconds. Raises
+        `SlackApiError` when the host refuses the poll. While the host is
+        unreachable it says so once and returns nothing after 5 seconds."""
+        try:
+            reply = await self.client.api_call(
+                "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": 20}
+            )
+        except httpx.HTTPError as e:
+            # The host may be restarting; say so once, then keep trying.
+            if not self._unreachable:
+                self.logger.warning(f"The agent host's Slack server is unreachable: {e}")
+                self._unreachable = True
+            await asyncio.sleep(5)
+            return []
+        self._unreachable = False
+        self._cursor = reply["cursor"]
+        events = [{"type": "rho_truncated"}] if reply["truncated"] else []
+        for envelope in reply["events"]:
+            event = envelope.get("payload", {}).get("event")
+            if event:
+                events.append(event)
+        return events
 
 
 class Subscriptions:
@@ -44,7 +80,7 @@ class Subscriptions:
         self.client = client or AsyncWebClient()
         self.logger = logger or logging.getLogger(__name__)
         self.subscriptions: Dict[Tuple[str, Optional[str]], Callback] = {}
-        self._cursor: Optional[str] = None
+        self._events = Events(self.client, self.logger)
         self._poller = asyncio.ensure_future(self._poll())
 
     def subscribe(self, channel: str, thread_ts: Optional[str], callback: Callback) -> None:
@@ -60,31 +96,17 @@ class Subscriptions:
         self._poller.cancel()
 
     async def _poll(self) -> None:
-        unreachable = False
         while True:
             try:
-                reply = await self.client.api_call(
-                    "rho.events", http_verb="GET", params={"cursor": self._cursor, "timeout": 20}
-                )
+                events = await self._events.poll()
             except SlackApiError as e:
                 for callback in list(self.subscriptions.values()):
                     await self._call(callback, {"type": "rho_error", "error": e.response["error"]})
                 return
-            except httpx.HTTPError as e:
-                # The host may be restarting; say so once, then keep trying.
-                if not unreachable:
-                    self.logger.warning(f"The agent host's Slack server is unreachable: {e}")
-                    unreachable = True
-                await asyncio.sleep(5)
-                continue
-            unreachable = False
-            self._cursor = reply["cursor"]
-            if reply["truncated"]:
-                for callback in list(self.subscriptions.values()):
-                    await self._call(callback, {"type": "rho_truncated"})
-            for envelope in reply["events"]:
-                event = envelope.get("payload", {}).get("event")
-                if not event:
+            for event in events:
+                if event["type"] == "rho_truncated":
+                    for callback in list(self.subscriptions.values()):
+                        await self._call(callback, event)
                     continue
                 channel, thread_ts = _thread(event)
                 for key in dict.fromkeys(((channel, thread_ts), (channel, None))):
