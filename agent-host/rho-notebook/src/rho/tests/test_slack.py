@@ -170,11 +170,12 @@ class Naming(SlackCase):
         self.main = add_agent(state, claude(), cwd="/")
         state.elsewhere.add("zzelsewhere")
 
-    def test_a_route_takes_an_agent_id_as_agents_write_it(self):
+    def test_a_route_takes_an_agent_id_as_agents_write_it_also_a_short_one(self):
         slack.route(f"eng-{self.main}", "C1")
         slack.route(self.main, "C1", thread_ts="1.0")
+        slack.route(f"eng-{self.main[:4]}", "C2")
         routed = [args for name, args in self.state.calls if name == "slack_route"]
-        self.assertEqual(routed, [(self.main, "C1", None, None), (self.main, "C1", "1.0", None)])
+        self.assertEqual(routed, [(self.main, "C1", None, None), (self.main, "C1", "1.0", None), (self.main, "C2", None, None)])
 
     def test_a_route_names_an_agent_of_the_workset(self):
         with self.assertRaises(KeyError):
