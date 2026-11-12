@@ -112,7 +112,8 @@ impl<'a> Message<'a> {
     }
 }
 
-/// A reaction as routing reads it: someone's, not the bot's, to a message.
+/// A reaction as routing reads it, added or removed: someone's, not the
+/// bot's, on a message.
 #[derive(Debug, PartialEq, Eq)]
 struct Reaction<'a> {
     channel: &'a str,
@@ -123,7 +124,9 @@ struct Reaction<'a> {
 impl<'a> Reaction<'a> {
     fn of(event: &'a Value, bot: Bot<'_>) -> Option<Self> {
         let field = |name: &str| event.get(name).and_then(Value::as_str);
-        if field("type") != Some("reaction_added") || field("user") == Some(bot.user) {
+        if !matches!(field("type"), Some("reaction_added" | "reaction_removed"))
+            || field("user") == Some(bot.user)
+        {
             return None;
         }
         let item = event.get("item")?;
@@ -165,14 +168,14 @@ impl<'db> Routes<'db> {
         Self { db }
     }
 
-    /// The agent a new message, or a reaction to one of the bot's posts,
-    /// goes to, if anyone hears it, with the root of the thread it is in.
-    /// A reaction goes to the agent that wrote the post. A thread route
-    /// hears every message of its thread; otherwise the channel's route,
-    /// else the workspace's, hears mentions of the bot and what its mode
-    /// adds. A mention in a thread with no route routes the thread to the
-    /// agent it goes to, so the replies that follow reach that agent
-    /// before it answers.
+    /// The agent a new message, or a reaction added to or removed from one
+    /// of the bot's posts, goes to, if anyone hears it, with the root of
+    /// the thread it is in. A reaction goes to the agent that wrote the post. A
+    /// thread route hears every message of its thread; otherwise the
+    /// channel's route, else the workspace's, hears mentions of the bot and
+    /// what its mode adds. A mention in a thread with no route routes the
+    /// thread to the agent it goes to, so the replies that follow reach
+    /// that agent before it answers.
     pub(crate) async fn who_hears(&self, event: &Value, bot: Bot<'_>) -> Option<(AgentId, String)> {
         if let Some(reaction) = Reaction::of(event, bot) {
             let read = self.db.read();

@@ -238,9 +238,13 @@ async fn a_reaction_to_a_post_goes_to_the_agent_that_wrote_it_with_its_thread() 
     let mut on_a_file = reaction("UPERSON", "C1", "1.3");
     on_a_file["item"] = json!({"type": "file", "file": "F1"});
     assert_eq!(hears(&routes, &on_a_file).await, None);
+    // A removed reaction goes the same way.
     let mut removed = reaction("UPERSON", "C1", "1.3");
     removed["type"] = json!("reaction_removed");
-    assert_eq!(hears(&routes, &removed).await, None);
+    assert_eq!(hears(&routes, &removed).await, Some(agent(2)));
+    let mut other = reaction("UPERSON", "C1", "1.3");
+    other["type"] = json!("reaction_changed");
+    assert_eq!(hears(&routes, &other).await, None);
 }
 
 #[tokio::test]

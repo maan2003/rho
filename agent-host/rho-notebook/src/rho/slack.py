@@ -8,10 +8,10 @@ new messages to agents: a route gives the workspace, a channel or one thread
 to an agent, and the most specific route wins. A thread route hears its
 whole thread; a workspace or channel route hears mentions of the bot and
 what its mode adds. A mention, or a post from an agent's notebook, in a
-thread with no route routes that thread to the agent. A reaction to a post
-from an agent's notebook goes to that agent. Direct messages, edits, other
-reactions and the bot's own posts are not routed; a handler of its own sees
-them.
+thread with no route routes that thread to the agent. A reaction added to
+or removed from a post from an agent's notebook goes to that agent. Direct
+messages, edits, other reactions and the bot's own posts are not routed; a
+handler of its own sees them.
 """
 
 import asyncio
@@ -110,7 +110,8 @@ def bot_user() -> str | None:
 def route_messages(hand) -> None:
     """Route the workset's new Slack messages for this run of its process:
     each one that someone hears goes to `hand(agent, event)`, sync or async,
-    on the workset loop. So does each reaction to an agent's post, with
+    on the workset loop. So does each reaction added to or removed from an
+    agent's post, with
     `thread_ts`, the post's thread, added to its `item`. The workspace
     route's agent also gets lost-event notices and the bot's joins to
     channels. Call once, at each start: a policy that does not call it
@@ -122,12 +123,12 @@ def route_messages(hand) -> None:
 
     async def on_event(event):
         kind = event["type"]
-        if kind in ("message", "reaction_added"):
+        if kind in ("message", "reaction_added", "reaction_removed"):
             heard = await asyncio.to_thread(_rho.slack_who_hears, event, _bot, _bot_id)
             if heard is None:
                 return
             to, thread = heard
-            if kind == "reaction_added":
+            if kind != "message":
                 event = {**event, "item": {**event["item"], "thread_ts": thread}}
         elif kind == "rho_truncated" or (kind == "member_joined_channel" and event.get("user") == _bot):
             to = _rho.slack_owner()
@@ -183,9 +184,11 @@ def render(event: dict) -> str:
         return "[Slack] The agent host lost Slack events. Read your threads again with `conversations_replies`."
     if kind == "member_joined_channel":
         return f"[Slack {event['channel']}] The bot was added to this channel."
-    if kind == "reaction_added":
+    if kind in ("reaction_added", "reaction_removed"):
         item = event["item"]
-        return f"[Slack {item['channel']} thread {item['thread_ts']}, ts {item['ts']}] <@{event['user']}> reacted :{event['reaction']}: to your post."
+        did = "reacted with" if kind == "reaction_added" else "removed"
+        to = "to" if kind == "reaction_added" else "from"
+        return f"[Slack {item['channel']} thread {item['thread_ts']}, ts {item['ts']}] <@{event['user']}> {did} :{event['reaction']}: {to} your post."
     thread = event.get("thread_ts") or event["ts"]
     return f"[Slack {event['channel']} thread {thread}, from <@{event.get('user') or event.get('bot_id')}>]\n{event.get('text', '')}"
 

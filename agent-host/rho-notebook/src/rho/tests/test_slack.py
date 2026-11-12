@@ -85,7 +85,7 @@ class Routing(SlackCase):
     init = ROUTING
     batches = [
         [message("1.0", "<@UBOT> hi"), message("2.0", "nobody hears this"), JOINED, SOMEONE_JOINED, REACTION],
-        [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0"), REACTION_TO_POST],
+        [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0"), REACTION_TO_POST, dict(REACTION_TO_POST, type="reaction_removed")],
     ]
 
     def seed(self, state):
@@ -96,7 +96,7 @@ class Routing(SlackCase):
 
     def test_each_heard_message_and_each_workspace_event_reaches_its_agent(self):
         got = workset.namespace["got"]
-        wait_for(lambda: len(got) == 5, "five routed events")
+        wait_for(lambda: len(got) == 6, "six routed events")
         # A reaction comes with the thread of the post it is on.
         post = {"type": "message", "channel": "C1", "ts": "1.2", "thread_ts": "1.0"}
         self.assertEqual(got, [
@@ -105,17 +105,23 @@ class Routing(SlackCase):
             (self.main, "rho_truncated"),
             (self.child, "1.1"),
             (self.child, post),
+            (self.child, post),
         ])
         # Rust was asked about each message and reaction, with the bot's own
         # user id, and about nothing else.
         self.assertEqual(
             [args for name, args in self.state.calls if name == "slack_who_hears"],
             [("message", "1.0", "UBOT", "BBOT"), ("message", "2.0", "UBOT", "BBOT"), ("reaction_added", "3.0", "UBOT", "BBOT"),
-             ("message", "1.1", "UBOT", "BBOT"), ("reaction_added", "1.2", "UBOT", "BBOT")],
+             ("message", "1.1", "UBOT", "BBOT"), ("reaction_added", "1.2", "UBOT", "BBOT"),
+             ("reaction_removed", "1.2", "UBOT", "BBOT")],
         )
         self.assertEqual(
             slack.render({**REACTION_TO_POST, "item": post}),
-            "[Slack C1 thread 1.0, ts 1.2] <@UPERSON> reacted :+1: to your post.",
+            "[Slack C1 thread 1.0, ts 1.2] <@UPERSON> reacted with :+1: to your post.",
+        )
+        self.assertEqual(
+            slack.render({**REACTION_TO_POST, "type": "reaction_removed", "item": post}),
+            "[Slack C1 thread 1.0, ts 1.2] <@UPERSON> removed :+1: from your post.",
         )
 
     def test_the_cursor_is_set_before_slack_says_who_the_bot_is(self):

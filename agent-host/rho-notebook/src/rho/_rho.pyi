@@ -205,10 +205,11 @@ async def inbox(agent: str, after: int) -> list[MessageRecord]:
 # workspace's; one with `thread_ts` too is a thread's.
 
 def slack_who_hears(event: dict, bot_user: str, bot_id: str) -> tuple[str, str] | None:
-    """The agent a new Slack message, or a reaction to an agent's post, goes
-    to, if anyone hears it, and the root ts of the thread it is in, given
-    the bot's user id and bot id, as `auth.test` gives them. A mention in a
-    thread with no route routes the thread to that agent."""
+    """The agent a new Slack message, or a reaction added to or removed from
+    an agent's post, goes to, if anyone hears it, and the root ts of the
+    thread it is in, given the bot's user id and bot id, as `auth.test`
+    gives them. A mention in a thread with no route routes the thread to
+    that agent."""
 def slack_owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
     """The agent of the most specific route that covers the scope."""
 def slack_route(
