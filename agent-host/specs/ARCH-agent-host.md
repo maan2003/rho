@@ -173,10 +173,12 @@ nothing more, `top_level` each new top-level message, `all` every message.
 A mention in a thread with no route routes the thread to the agent it goes
 to, so the replies that follow reach that agent before it answers; a post
 from an agent's notebook routes a thread with no route to that agent. Only
-a new route moves a routed thread. The workspace route's agent also gets
-the bot's joins to channels and the notice that the host lost events.
-Direct messages, edits, reactions and the bot's own posts are not routed;
-a handler of the policy's own may act on them.
+a new route moves a routed thread. The workset also keeps which agent wrote
+each post from a notebook, and a reaction added to or removed from that post
+goes to that agent, with the post's thread. The workspace route's agent also gets the bot's
+joins to channels and the notice that the host lost events. Direct
+messages, edits, other reactions and the bot's own posts are not routed; a
+handler of the policy's own may act on them.
 
 ## GUI sync
 

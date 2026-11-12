@@ -23,7 +23,10 @@ def message(ts, text, thread_ts=None, user="UPERSON"):
 
 JOINED = {"type": "member_joined_channel", "channel": "C2", "user": "UBOT"}
 SOMEONE_JOINED = {"type": "member_joined_channel", "channel": "C2", "user": "UPERSON"}
-REACTION = {"type": "reaction_added", "user": "UPERSON", "item": {"channel": "C1", "ts": "1.0"}}
+#: A reaction to a message no agent wrote.
+REACTION = {"type": "reaction_added", "user": "UPERSON", "reaction": "eyes", "item": {"type": "message", "channel": "C1", "ts": "3.0"}}
+#: A reaction to the post 1.2, which an agent wrote in thread 1.0.
+REACTION_TO_POST = {"type": "reaction_added", "user": "UPERSON", "reaction": "+1", "item": {"type": "message", "channel": "C1", "ts": "1.2"}}
 
 
 class FakeHost:
@@ -74,7 +77,7 @@ class SlackCase(WorksetCase):
 ROUTING = """
 from rho import slack
 got = []
-slack.route_messages(lambda agent, event: got.append((agent.id, event.get("ts") or event["type"])))
+slack.route_messages(lambda agent, event: got.append((agent.id, event.get("ts") or event.get("item") or event["type"])))
 """
 
 
@@ -82,29 +85,43 @@ class Routing(SlackCase):
     init = ROUTING
     batches = [
         [message("1.0", "<@UBOT> hi"), message("2.0", "nobody hears this"), JOINED, SOMEONE_JOINED, REACTION],
-        [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0")],
+        [{"type": "rho_truncated"}, message("1.1", "a reply", thread_ts="1.0"), REACTION_TO_POST, dict(REACTION_TO_POST, type="reaction_removed")],
     ]
 
     def seed(self, state):
         self.main = add_agent(state, claude(), cwd="/")
         self.child = add_agent(state, claude(), cwd="/")
         state.slack_owner = self.main
-        state.slack_routes = {"1.0": self.main, "1.1": self.child}
+        state.slack_routes = {"1.0": (self.main, "1.0"), "1.1": (self.child, "1.0"), "1.2": (self.child, "1.0")}
 
     def test_each_heard_message_and_each_workspace_event_reaches_its_agent(self):
         got = workset.namespace["got"]
-        wait_for(lambda: len(got) == 4, "four routed events")
+        wait_for(lambda: len(got) == 6, "six routed events")
+        # A reaction comes with the thread of the post it is on.
+        post = {"type": "message", "channel": "C1", "ts": "1.2", "thread_ts": "1.0"}
         self.assertEqual(got, [
             (self.main, "1.0"),
             (self.main, "member_joined_channel"),
             (self.main, "rho_truncated"),
             (self.child, "1.1"),
+            (self.child, post),
+            (self.child, post),
         ])
-        # Rust was asked about each message, with the bot's own user id, and
-        # about nothing else.
+        # Rust was asked about each message and reaction, with the bot's own
+        # user id, and about nothing else.
         self.assertEqual(
             [args for name, args in self.state.calls if name == "slack_who_hears"],
-            [("1.0", "UBOT", "BBOT"), ("2.0", "UBOT", "BBOT"), ("1.1", "UBOT", "BBOT")],
+            [("message", "1.0", "UBOT", "BBOT"), ("message", "2.0", "UBOT", "BBOT"), ("reaction_added", "3.0", "UBOT", "BBOT"),
+             ("message", "1.1", "UBOT", "BBOT"), ("reaction_added", "1.2", "UBOT", "BBOT"),
+             ("reaction_removed", "1.2", "UBOT", "BBOT")],
+        )
+        self.assertEqual(
+            slack.render({**REACTION_TO_POST, "item": post}),
+            "[Slack C1 thread 1.0, ts 1.2] <@UPERSON> reacted with :+1: to your post.",
+        )
+        self.assertEqual(
+            slack.render({**REACTION_TO_POST, "type": "reaction_removed", "item": post}),
+            "[Slack C1 thread 1.0, ts 1.2] <@UPERSON> removed :+1: from your post.",
         )
 
     def test_the_cursor_is_set_before_slack_says_who_the_bot_is(self):
@@ -184,12 +201,12 @@ class Posting(SlackCase):
     def post(self, reply):
         AsyncWebClient.posted(reply)
 
-    def test_a_post_routes_its_thread_to_the_notebook_agent(self):
+    def test_a_post_is_the_notebook_agents_and_routes_its_thread_to_it(self):
         slack._routing = True
         self.state.current = self.main
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
         self.post({"ok": True, "channel": "C1", "ts": "6.1", "message": {"ts": "6.1", "thread_ts": "6.0"}})
-        self.assertEqual(self.state.slack_claims, [("C1", "5.0", self.main), ("C1", "6.0", self.main)])
+        self.assertEqual(self.state.slack_posts, [("C1", "5.0", "5.0", self.main), ("C1", "6.1", "6.0", self.main)])
 
     def test_posts_route_nothing_off_a_notebook_or_in_a_workset_that_does_not_route(self):
         self.state.current = self.main
@@ -197,7 +214,7 @@ class Posting(SlackCase):
         slack._routing = True
         self.state.current = None
         self.post({"ok": True, "channel": "C1", "ts": "5.0", "message": {"ts": "5.0"}})
-        self.assertEqual(self.state.slack_claims, [])
+        self.assertEqual(self.state.slack_posts, [])
 
 
 class Naming(SlackCase):
