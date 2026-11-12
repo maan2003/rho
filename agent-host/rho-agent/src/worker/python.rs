@@ -360,6 +360,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(agents_file, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(models, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(create_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(runs, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(agents, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(set_spec, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(input, &module)?)?;
@@ -606,6 +607,20 @@ fn create_agent(py: Python<'_>, spec: Bound<'_, PyDict>) -> PyResult<String> {
         PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
         _ => Err(unexpected()),
     }
+}
+
+/// Whether this run's permissions let `agent` run: an auto workset runs no
+/// native agent, so nothing can hand one input.
+#[pyfunction]
+fn runs(py: Python<'_>, agent: &str) -> PyResult<bool> {
+    let agent = agent_id(agent)?;
+    let spec = all_agents(py)?
+        .into_iter()
+        .find(|(id, _)| *id == agent)
+        .map(|(_, spec)| spec)
+        .ok_or_else(|| PyValueError::new_err(format!("no agent {}", agent.encoded())))?;
+    let native = matches!(spec.runtime, Runtime::Native { .. });
+    Ok(permissions::admits(&PERMISSIONS.fix(), native).is_ok())
 }
 
 fn all_agents(py: Python<'_>) -> PyResult<Vec<(AgentId, AgentSpec)>> {

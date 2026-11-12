@@ -104,6 +104,11 @@ def create_agent(spec):
     return id
 
 
+def runs(agent):
+    with STATE.lock:
+        return not (STATE.permissions == "auto" and STATE.agents[agent]["runtime"]["kind"] == "native")
+
+
 def agents():
     with STATE.lock:
         return copy.deepcopy(STATE.agents)
