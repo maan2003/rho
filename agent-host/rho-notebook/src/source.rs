@@ -5,8 +5,9 @@
 //! running when a report goes out is announced under its session ID, and
 //! later pieces name that ID again.
 
+use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use rho_agent_types::UnixMs;
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
@@ -147,12 +148,63 @@ pub struct StreamProgress {
 }
 
 pub(crate) struct Log {
-    pub(crate) file: std::fs::File,
+    /// The retained output, until retention discards it and closes the file.
+    pub(crate) file: Option<std::fs::File>,
     pub(crate) len: usize,
     pub(crate) dropped: usize,
     pub(crate) cursor: usize,
     pub(crate) exit: Option<Result<CommandExit, String>>,
-    pub(crate) gone: bool,
+}
+
+impl Log {
+    /// Give up the retained output; later output is not kept either.
+    pub(crate) fn discard(&mut self) {
+        self.file = None;
+        self.len = 0;
+        self.cursor = 0;
+    }
+}
+
+/// Ended commands whose output stays retained, across every notebook in the
+/// process: each retained log holds an open file, and the notebooks share the
+/// process's descriptor limit.
+const ENDED_LOGS_KEPT: usize = 1000;
+
+/// Ended commands that still hold a log file, oldest end first.
+struct EndedLogs {
+    kept: usize,
+    ended: VecDeque<Weak<Source>>,
+}
+
+static ENDED_LOGS: Mutex<EndedLogs> = Mutex::new(EndedLogs {
+    kept: ENDED_LOGS_KEPT,
+    ended: VecDeque::new(),
+});
+
+/// `job` has ended: retain its log, and discard the logs of the oldest ended
+/// commands past the process-wide cap, whichever notebook started them.
+pub(crate) fn retain_ended(job: &Arc<Source>) {
+    let mut logs = ENDED_LOGS.lock().unwrap();
+    // Logs that a notebook's 50 MB limit or its end let go of hold nothing.
+    logs.ended.retain(|source| {
+        source.upgrade().is_some_and(|source| {
+            (source.state.lock().unwrap().log.as_ref()).is_some_and(|log| log.file.is_some())
+        })
+    });
+    logs.ended.push_back(Arc::downgrade(job));
+    while logs.ended.len() > logs.kept {
+        let oldest = logs.ended.pop_front().expect("longer than the cap");
+        if let Some(source) = oldest.upgrade()
+            && let Some(log) = source.state.lock().unwrap().log.as_mut()
+        {
+            log.discard();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn keep_ended_logs(kept: usize) {
+    ENDED_LOGS.lock().unwrap().kept = kept;
 }
 
 impl State {
@@ -402,18 +454,17 @@ fn page(state: &mut State, max_tokens: usize) -> Part {
     let Some(log) = state.log.as_mut() else {
         return Part::Text("[only a command can be paged]".to_owned());
     };
-    if log.gone {
-        return Part::Text(
-            "[retained output is gone: notebook reached its 50 MB limit]".to_owned(),
-        );
-    }
+    let Some(file) = log.file.as_mut() else {
+        return Part::Text(format!(
+            "[retained output is gone: Rho keeps the output of the newest {ENDED_LOGS_KEPT} ended commands across all agents, and 50 MB per notebook]"
+        ));
+    };
     let start = log.cursor;
     let size = (log.len - start).min(max_tokens * 4);
     let mut bytes = vec![0; size];
-    let read = log
-        .file
+    let read = file
         .seek(SeekFrom::Start(start as u64))
-        .and_then(|_| log.file.read_exact(&mut bytes));
+        .and_then(|_| file.read_exact(&mut bytes));
     if let Err(error) = read {
         return Part::Text(format!("[the retained output could not be read: {error}]"));
     }

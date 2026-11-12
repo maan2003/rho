@@ -62,13 +62,12 @@ fn new_job(
                     })
                     .join("rho/notebook-output");
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                tempfile::tempfile_in(dir).map_err(|e| e.to_string())?
+                Some(tempfile::tempfile_in(dir).map_err(|e| e.to_string())?)
             },
             len: 0,
             dropped: 0,
             cursor: 0,
             exit: None,
-            gone: false,
         }),
     ));
     jobs.insert(id, Arc::clone(&job));
@@ -181,6 +180,7 @@ pub(crate) fn command(
             state.finished = Some(UnixMs::now());
             state.failed = failed;
             drop(state);
+            crate::source::retain_ended(&job);
             process.done.send_replace(true);
             wake.notify_one();
             result
@@ -454,17 +454,16 @@ pub(crate) async fn run_command(
                     shared.retain_space(job.id, chunk.len());
                     let mut state = job.state.lock().unwrap();
                     let log = state.log.as_mut().expect("a command keeps a log");
-                    let keep = if log.gone {
-                        0
-                    } else {
-                        chunk.len().min(LOG_LIMIT - log.len)
+                    let keep = match log.file.as_mut() {
+                        Some(file) => {
+                            let keep = chunk.len().min(LOG_LIMIT - log.len);
+                            file.seek(SeekFrom::Start(log.len as u64))
+                                .map_err(|e| e.to_string())?;
+                            file.write_all(&chunk[..keep]).map_err(|e| e.to_string())?;
+                            keep
+                        }
+                        None => 0,
                     };
-                    log.file
-                        .seek(SeekFrom::Start(log.len as u64))
-                        .map_err(|e| e.to_string())?;
-                    log.file
-                        .write_all(&chunk[..keep])
-                        .map_err(|e| e.to_string())?;
                     log.len += keep;
                     log.dropped = log.dropped.saturating_add(chunk.len() - keep);
                     state.output(&chunk);
