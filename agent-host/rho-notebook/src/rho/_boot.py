@@ -111,9 +111,14 @@ def announce_soon(agent_id: str) -> None:
 
 
 def _announce(agent_id: str) -> None:
+    """Start `hooks.deliver` for the agent, once, if this run's permissions
+    let it run: input to one they refuse could never be handed, and would
+    be retried forever."""
     if agent_id in _announced:
         return
     _announced.add(agent_id)
+    if not _rho.runs(agent_id):
+        return
     try:
         result = hooks.deliver(agents.Agent(agent_id))
         if inspect.isawaitable(result):

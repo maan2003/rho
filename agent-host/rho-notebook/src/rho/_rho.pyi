@@ -96,6 +96,9 @@ def create_agent(spec: Spec) -> str:
     """Log `AgentCreated` and start the agent's loop. Returns its id once the
     row is durable. Raises when the host is at its agent cap or the runtime
     is not available."""
+def runs(agent: str) -> bool:
+    """Whether this run's permissions let the agent run: an auto workset
+    runs no native agent."""
 def agents() -> dict[str, Spec]:
     """Every agent of this workset, by id."""
 def set_spec(agent: str, spec: Spec) -> None:

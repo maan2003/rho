@@ -206,3 +206,22 @@ rho.hooks.deliver = deliver
         wait_for(lambda: self.state.inputs, "the mention")
         self.assertEqual([(a, m) for a, _, _, m in self.state.inputs], [(self.a, first)])
         self.assertEqual(self.state.topics[topic]["agents"], [])
+
+
+class AutoWorkset(WorksetCase):
+    """An auto workset runs no native agent: its delivery never starts,
+    rather than failing and retrying forever."""
+
+    init = "from rho import workset\nworkset.set_permissions(\"auto\")\n"
+
+    def seed(self, state):
+        self.lead = add_agent(state, claude(), preset="engineer", cwd="/")
+        self.dead = add_agent(state, native(), preset="child", parent=self.lead, cwd="/")
+        self.child = add_agent(state, claude(), preset="child", parent=self.lead, cwd="/")
+        fake_rho.post(self.lead, fake_rho.direct(self.lead, self.dead), "to the native agent")
+        fake_rho.post(self.lead, fake_rho.direct(self.lead, self.child), "to the claude agent")
+
+    def test_only_the_agents_it_runs_get_their_messages(self):
+        wait_for(lambda: any(a == self.child for a, *_ in self.state.inputs), "delivery to the claude agent")
+        self.assertEqual([a for a, *_ in self.state.inputs], [self.child])
+        self.assertEqual(rho._boot._announced, {self.lead, self.dead, self.child})
