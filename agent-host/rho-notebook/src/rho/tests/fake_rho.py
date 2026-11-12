@@ -33,8 +33,8 @@ class State:
         self.agents_files = {}  # path -> AgentsFile
         self.current = None  # the agent whose notebook is calling
         self.slack_owner = None  # the workspace route's agent
-        self.slack_routes = {}  # Slack event ts -> the agent it goes to
-        self.slack_claims = []  # (channel, thread_ts, agent)
+        self.slack_routes = {}  # Slack event ts, or a reacted post's ts -> (the agent it goes to, thread)
+        self.slack_posts = []  # (channel, ts, thread_ts, agent)
         self.slack_table = {"workspace": None, "channels": {}, "threads": {}}  # what slack_routes returns
         self.ids = itertools.count(1)
         self.lock = threading.Lock()
@@ -348,8 +348,9 @@ def current_agent():
 
 
 def slack_who_hears(event, bot_user, bot_id):
-    STATE.calls.append(("slack_who_hears", (event["ts"], bot_user, bot_id)))
-    return STATE.slack_routes.get(event["ts"])
+    ts = event["ts"] if event["type"] == "message" else event["item"]["ts"]
+    STATE.calls.append(("slack_who_hears", (event["type"], ts, bot_user, bot_id)))
+    return STATE.slack_routes.get(ts)
 
 
 def slack_owner(channel=None, thread_ts=None):
@@ -360,8 +361,8 @@ def slack_routes():
     return copy.deepcopy(STATE.slack_table)
 
 
-def slack_claim(channel, thread_ts, agent):
-    STATE.slack_claims.append((channel, thread_ts, agent))
+def slack_posted(channel, ts, thread_ts, agent):
+    STATE.slack_posts.append((channel, ts, thread_ts, agent))
     return agent
 
 

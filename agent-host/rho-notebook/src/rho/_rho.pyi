@@ -204,10 +204,11 @@ async def inbox(agent: str, after: int) -> list[MessageRecord]:
 # them. Agent ids must be of this workset. A route without `channel` is the
 # workspace's; one with `thread_ts` too is a thread's.
 
-def slack_who_hears(event: dict, bot_user: str, bot_id: str) -> str | None:
-    """The agent a new Slack message goes to, if anyone hears it, given the
-    bot's user id and bot id, as `auth.test` gives them. A mention in a thread with no route routes the thread to
-    that agent."""
+def slack_who_hears(event: dict, bot_user: str, bot_id: str) -> tuple[str, str] | None:
+    """The agent a new Slack message, or a reaction to an agent's post, goes
+    to, if anyone hears it, and the root ts of the thread it is in, given
+    the bot's user id and bot id, as `auth.test` gives them. A mention in a
+    thread with no route routes the thread to that agent."""
 def slack_owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
     """The agent of the most specific route that covers the scope."""
 def slack_route(
@@ -219,9 +220,10 @@ def slack_route(
     """Route the scope to `agent`. A thread route takes no mode; the others
     hear "mentions" without one."""
 def slack_unroute(channel: str | None = None, thread_ts: str | None = None) -> None: ...
-def slack_claim(channel: str, thread_ts: str, agent: str) -> str:
-    """Route the thread to `agent` unless it has a route; returns the agent
-    it routes to."""
+def slack_posted(channel: str, ts: str, thread_ts: str, agent: str) -> str:
+    """`agent` wrote the bot's post `ts` in the thread: reactions to it go to
+    `agent`, and the thread is routed to `agent` unless it has a route.
+    Returns the agent the thread routes to."""
 def slack_routes() -> dict:
     """`{"workspace": {"agent", "mode"} | None, "channels": {channel:
     {"agent", "mode"}}, "threads": {(channel, thread_ts): agent}}`."""
