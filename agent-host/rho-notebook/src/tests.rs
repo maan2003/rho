@@ -356,6 +356,59 @@ async fn notebook_retention_discards_oldest_command_log() {
     assert!(text.contains("retained output is gone"), "{text}");
 }
 
+fn open_output_files() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy().contains("notebook-output"))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_process_keeps_logs_of_its_newest_ended_commands_across_notebooks() {
+    // Nextest runs each test in its own process, so the cap and the
+    // descriptor count are this test's alone.
+    crate::source::keep_ended_logs(2);
+    let (a, a_wake) = notebook().await;
+    let (b, b_wake) = notebook().await;
+    let before = open_output_files();
+    // End order a1, a2, fast, slow, a3: in b, the command started first ends
+    // last.
+    for (notebook, wake, code) in [
+        (
+            &a,
+            &a_wake,
+            "a1 = command('true')\nawait a1\na2 = command('true')\nawait a2",
+        ),
+        (
+            &b,
+            &b_wake,
+            "slow = command('sleep 0.3')\nfast = command('true')\nawait slow\nawait fast",
+        ),
+        (&a, &a_wake, "a3 = command('true')\nawait a3"),
+    ] {
+        let cell = notebook.run(code.into());
+        finished(wake, &cell).await;
+    }
+    assert_eq!(open_output_files() - before, 2);
+    let _ = (a.report(), b.report());
+    for (notebook, wake, job, gone) in [
+        (&a, &a_wake, "a2", true),
+        (&b, &b_wake, "fast", true),
+        (&b, &b_wake, "slow", false),
+        (&a, &a_wake, "a3", false),
+    ] {
+        let page = notebook.run(format!("{job}.more_output()"));
+        finished(wake, &page).await;
+        let text = notebook.report().unwrap().render().text;
+        assert_eq!(
+            text.contains("retained output is gone"),
+            gone,
+            "{job}: {text}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_failure_reports_once_after_twenty_seconds() {
     let (notebook, wake) = notebook().await;

@@ -25,6 +25,8 @@ use crate::source::{
 const CELL_TOKENS: usize = 100_000;
 /// Images one source may show.
 const IMAGE_LIMIT: usize = 20;
+/// Bytes of command output one notebook retains for paging.
+const RETAINED_LOG_BYTES: usize = 50 * 1024 * 1024;
 
 pub struct Notebook {
     shared: Arc<Shared>,
@@ -462,18 +464,12 @@ impl Shared {
             .filter_map(|source| source.state.lock().unwrap().log.as_ref().map(|log| log.len))
             .sum();
         for source in sources.values().filter(|source| source.id != current) {
-            if total + incoming <= 50 * 1024 * 1024 {
+            if total + incoming <= RETAINED_LOG_BYTES {
                 break;
             }
-            let mut state = source.state.lock().unwrap();
-            if let Some(log) = state.log.as_mut()
-                && !log.gone
-            {
+            if let Some(log) = source.state.lock().unwrap().log.as_mut() {
                 total -= log.len;
-                log.gone = true;
-                log.len = 0;
-                log.cursor = 0;
-                let _ = log.file.set_len(0);
+                log.discard();
             }
         }
     }
