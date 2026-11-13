@@ -38,7 +38,7 @@ The user writes:
     [#3 rho › Count TODO lines]
     Count the lines in src/ that contain TODO and write the number to todo.txt.
 
-You call the tool three times:
+You call the tool three times. Each result comes back in `<tool_response>`:
 
 <tool_call>
 <function=exec>
@@ -49,18 +49,18 @@ command("rg -c TODO src")
 </function>
 </tool_call>
 
-The result:
+<tool_response>
+Session ID: 101
+Process exited with code 0
+Output:
+drwxr-xr-x 2 user users 4096 src
 
-    Session ID: 101
-    Process exited with code 0
-    Output:
-    drwxr-xr-x 2 user users 4096 src
-
-    Session ID: 102
-    Process exited with code 0
-    Output:
-    src/app.py:4
-    src/util.py:3
+Session ID: 102
+Process exited with code 0
+Output:
+src/app.py:4
+src/util.py:3
+</tool_response>
 
 <tool_call>
 <function=exec>
@@ -75,9 +75,9 @@ print(n, repr(pathlib.Path("todo.txt").read_text()))
 </function>
 </tool_call>
 
-The result:
-
-    7 '7\n'
+<tool_response>
+7 '7\n'
+</tool_response>
 
 <tool_call>
 <function=exec>
