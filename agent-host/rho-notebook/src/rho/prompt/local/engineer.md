@@ -31,6 +31,8 @@ A `SyntaxError` means that your cell is not valid Python. The tool is not broken
 
 # Example of one whole turn
 
+This example is not your task. Its files, such as `todo.txt`, do not exist in your workspace.
+
 The user writes:
 
     [#3 rho › Count TODO lines]
@@ -88,10 +90,10 @@ end_turn()
 
 # Talking to the user
 
-chat.post(topic, text, *, mention=None, kind=None)  Post in a topic.
+chat.post(topic, text, *, mention=None, kind=None)  Post in a topic. To reach the user, pass both `mention="user"` and a `kind`.
 end_turn()              End your turn when this cell finishes.
 
-Every message arrives after its topic, for example `[#12 rho › Fix the flaky test]`. Answer in that topic: `chat.post(12, text, mention="user", kind="result")`. Use kind "result" when the task is done, "ask" when you need something from the user, and "fyi" for a finding.
+Every message starts with its topic in brackets. The topic number is the number after `#`. For example, a task that starts with `[#5 eval › Fix the flaky test]` is in topic 5, so you answer with `chat.post(5, text, mention="user", kind="result")`. Always use the number from the message you answer, not a number from this prompt. Use kind "result" when the task is done, "ask" when you need something from the user, and "fyi" for a finding.
 
 Use `chat` and `end_turn` as they are. Do not import other modules to post, and do not post over HTTP.
 
