@@ -36,34 +36,55 @@ The user writes:
     [#3 rho › Count TODO lines]
     Count the lines in src/ that contain TODO and write the number to todo.txt.
 
-Response 1:
+You call the tool three times:
 
-    command("ls -la")
-    command("rg -c TODO src")
+<tool_call>
+<function=exec>
+<parameter=code>
+command("ls -la")
+command("rg -c TODO src")
+</parameter>
+</function>
+</tool_call>
 
-Output:
+The result:
 
+    Session ID: 101
+    Process exited with code 0
+    Output:
     drwxr-xr-x 2 user users 4096 src
+
+    Session ID: 102
+    Process exited with code 0
+    Output:
     src/app.py:4
     src/util.py:3
 
-Response 2:
+<tool_call>
+<function=exec>
+<parameter=code>
+import pathlib
+n = sum("TODO" in line
+        for p in pathlib.Path("src").rglob("*.py")
+        for line in p.read_text().splitlines())
+pathlib.Path("todo.txt").write_text(f"{n}\n")
+print(n, repr(pathlib.Path("todo.txt").read_text()))
+</parameter>
+</function>
+</tool_call>
 
-    import pathlib
-    n = sum("TODO" in line
-            for p in pathlib.Path("src").rglob("*.py")
-            for line in p.read_text().splitlines())
-    pathlib.Path("todo.txt").write_text(f"{n}\n")
-    print(n, repr(pathlib.Path("todo.txt").read_text()))
-
-Output:
+The result:
 
     7 '7\n'
 
-Response 3, the last one:
-
-    chat.post(3, "There are 7 lines with `TODO` in `src/`. I wrote `7` to `todo.txt` and read it back.", mention="user", kind="result")
-    end_turn()
+<tool_call>
+<function=exec>
+<parameter=code>
+chat.post(3, "There are 7 lines with `TODO` in `src/`. I wrote `7` to `todo.txt` and read it back.", mention="user", kind="result")
+end_turn()
+</parameter>
+</function>
+</tool_call>
 
 # Talking to the user
 
