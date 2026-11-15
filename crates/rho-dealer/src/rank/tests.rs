@@ -1,21 +1,16 @@
 //! The cases in `cases.md`, each under its row's name, and the rules
 //! every history keeps.
+//!
+//! The sources here are stand-ins: a thread that asks and answers, and a
+//! Slack-shaped conversation that is read or not. Each claims the way its
+//! real source does for the one or two cases the dealer's own rules need;
+//! what a real source must claim for each of its cases is that source's
+//! own test, beside its code.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned};
-use rho_agent_types::{
-    Address, AgentId, AgentIdDomain, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention,
-    MentionKind, StreamId, TopicId, UnixMs, props,
-};
-use rho_agents_client::chat::{HostChat, Told};
-use rho_agents_client::fold::MirroredAgent;
-use rho_agents_client::protocol::transcript::{InferenceState, RuntimeState};
-use rho_agents_client::{AgentIdentity, AgentMap, HostId};
-use rho_slack::config::WorkspaceName;
-use rho_slack::model::Model;
-use rho_slack::types::{ChannelId, Conversation, ConversationKind, Message, Ts, User, UserId};
 
 use super::*;
 use crate::curve::*;
@@ -23,35 +18,55 @@ use crate::facts::{Device, Entry, Fact, Seen};
 use crate::notes::NoteRev;
 use crate::until::Until;
 
-/// What the user says in these scenarios, about the node it is said to.
+/// What the user says in these scenarios, about the address it is said to.
 enum Said {
     Done,
     Mute,
-    Unmute,
     Snooze { until: Until },
     Deadline { by: Until, lead_days: u32 },
 }
 
+/// One thing a stand-in source holds.
+enum Thing {
+    /// A chat thread between the user and one agent: posts in order, each
+    /// numbered the way a host numbers them.
+    Thread { posts: Vec<Post> },
+    /// A Slack conversation: a direct one, or a thread in a room with
+    /// this many people in it.
+    Slack {
+        reason: String,
+        head_start: f64,
+        room: Option<Address>,
+        /// A conversation with the user: what it slept through counts.
+        direct: bool,
+        messages: Vec<Msg>,
+        read_through: Option<String>,
+    },
+}
+
+struct Post {
+    seq: u64,
+    at: Timestamp,
+    from_user: bool,
+    /// A mention of the user: an ask or a result; `None` says nothing.
+    ask: Option<bool>,
+}
+
+struct Msg {
+    ts: String,
+    at: Timestamp,
+    from_me: bool,
+}
+
 /// Everything `rank` reads, and a clock to move.
 struct World {
-    agents: AgentMap,
-    host: HostId,
-    /// Agents made so far, for the next one's id.
-    made: u64,
-    /// The host's chat log, folded, and its newest event.
-    log: HostChat,
+    things: BTreeMap<Address, Thing>,
     seq: u64,
-    /// The topics the window holds: the host's, as the model hands it up.
-    chat: ChatMap,
-    /// The one topic each agent has with the user here, and its agent.
-    topic_agents: HashMap<NodeId, AgentId>,
-    slack: Model,
     ts: u64,
     marks: Marks,
     skips: Skips,
-    cache: Cache,
     now: Zoned,
-    names: HashMap<NodeId, String>,
+    names: HashMap<Address, String>,
 }
 
 fn world() -> World {
@@ -59,52 +74,12 @@ fn world() -> World {
 }
 
 fn world_in(zone: TimeZone) -> World {
-    let mut slack = Model::new(WorkspaceName("acme".into()));
-    slack.set_self(UserId("ME".into()));
-    slack.add_users(["ME", "U1", "U2", "U3", "U4"].map(|id| User {
-        id: UserId(id.into()),
-        name: id.to_lowercase(),
-        handle: id.to_lowercase(),
-    }));
-    slack.add_conversations([
-        Conversation {
-            id: ChannelId("C1".into()),
-            kind: ConversationKind::Channel,
-            name: "design".into(),
-            user: None,
-            members: Vec::new(),
-        },
-        Conversation {
-            id: ChannelId("D1".into()),
-            kind: ConversationKind::DirectMessage,
-            name: "u1".into(),
-            user: Some(UserId("U1".into())),
-            members: Vec::new(),
-        },
-        Conversation {
-            id: ChannelId("D2".into()),
-            kind: ConversationKind::DirectMessage,
-            name: "u2".into(),
-            user: Some(UserId("U2".into())),
-            members: Vec::new(),
-        },
-    ]);
-    let mut agents = AgentMap::default();
-    let host = HostId::default();
-    agents.set_host_data(host, 0, 0);
     World {
-        agents,
-        host,
-        made: 0,
-        log: HostChat::default(),
+        things: BTreeMap::new(),
         seq: 0,
-        chat: ChatMap::default(),
-        topic_agents: HashMap::new(),
-        slack,
         ts: 0,
         marks: Marks::default(),
         skips: Skips::default(),
-        cache: Cache::default(),
         now: "2026-08-23T09:00:00Z"
             .parse::<Timestamp>()
             .unwrap()
@@ -126,137 +101,140 @@ impl World {
         self.now = self.now.checked_add(by).unwrap();
     }
 
-    fn ms(&self) -> u64 {
-        self.now.timestamp().as_millisecond() as u64
+    fn at(&self) -> Timestamp {
+        self.now.timestamp()
     }
 
-    /// One agent as the model would hand it up, changed by `change`.
-    fn fold(&mut self, agent_id: AgentId, change: impl FnOnce(&mut MirroredAgent)) {
-        let mut mirrored = self
-            .agents
-            .mirrored(agent_id)
-            .expect("an agent made by the world")
-            .clone();
-        change(&mut mirrored);
-        self.agents.told(vec![mirrored]);
+    // Threads
+
+    fn agent(&mut self, name: &str) -> Address {
+        let address = Address::new("thread", format!("0/{}", self.things.len() + 1));
+        self.things
+            .insert(address.clone(), Thing::Thread { posts: Vec::new() });
+        self.names.insert(address.clone(), name.into());
+        address
     }
 
-    /// One event on the host's chat log, folded the way the client folds
-    /// it: into the host's topics, and each message into the digests of
-    /// the agents it reaches.
-    fn record(&mut self, event: ChatEvent) -> ChatSeq {
+    fn post_in(&mut self, address: &Address, from_user: bool, ask: Option<bool>) {
         self.seq += 1;
-        let record = ChatRecord {
-            seq: ChatSeq(self.seq),
-            at: UnixMs(self.ms()),
-            event,
+        let at = self.at();
+        let Some(Thing::Thread { posts }) = self.things.get_mut(address) else {
+            panic!("not a thread")
         };
-        if let Told::Topic {
-            message: Some((message, parties)),
-            ..
-        } = self.log.tell(&record)
-        {
-            for agent_id in parties {
-                if self.agents.mirrored(agent_id).is_some() {
-                    self.fold(agent_id, |mirrored| mirrored.digest.tell(&message));
-                }
-            }
-        }
-        self.chat.load(self.host, Some(0), self.log.clone());
-        record.seq
-    }
-
-    /// One message in a topic, mentioning whom it mentions.
-    fn post_in(&mut self, node: &NodeId, from: Address, mentions: Vec<Mention>) {
-        let topic = node.topic().expect("a topic").topic;
-        self.record(ChatEvent::Posted {
-            topic,
-            from,
-            mentions,
-            content: vec![ContentPart::Text {
-                text: "update".into(),
-            }],
+        posts.push(Post {
+            seq: self.seq,
+            at,
+            from_user,
+            ask,
         });
     }
 
-    /// An agent the user's policy made, and a topic the user started with
-    /// it: the user's unless it has a parent.
-    fn agent_under(&mut self, name: &str, parent: Option<AgentId>) -> NodeId {
-        self.made += 1;
-        let agent_id = AgentId::from_counter(self.made, &AgentIdDomain(0)).unwrap();
-        let spec_props = match parent {
-            Some(parent) => [(props::PARENT.to_owned(), parent.encoded())].into(),
-            None => Default::default(),
-        };
-        let identity = AgentIdentity::for_test(agent_id, spec_props, UnixMs(self.ms()));
-        self.agents
-            .told(vec![MirroredAgent::new(self.host, identity)]);
-        if self.log.streams.is_empty() {
-            self.record(ChatEvent::StreamCreated { name: "rho".into() });
-        }
-        let topic = self.record(ChatEvent::TopicStarted {
-            stream: StreamId(ChatSeq(1)),
-            name: name.into(),
-            by: Address::User,
-        });
-        self.record(ChatEvent::Joined {
-            topic: TopicId(topic),
-            agent: agent_id,
-        });
-        let node = NodeId::Topic(HostTopic {
-            machine_seed: 0,
-            topic: TopicId(topic),
-        });
-        self.topic_agents.insert(node.clone(), agent_id);
-        self.names.insert(node.clone(), name.into());
-        node
+    fn finishes(&mut self, address: &Address) {
+        self.post_in(address, false, Some(false));
     }
 
-    fn agent(&mut self, name: &str) -> NodeId {
-        self.agent_under(name, None)
-    }
-
-    fn id(&self, node: &NodeId) -> AgentId {
-        self.topic_agents[node]
-    }
-
-    /// The topic's agent mentions the user.
-    fn sends(&mut self, node: &NodeId, kind: MentionKind) {
-        let from = Address::Agent(self.id(node));
-        self.post_in(
-            node,
-            from,
-            vec![Mention {
-                to: Address::User,
-                kind,
-            }],
-        );
-    }
-
-    fn finishes(&mut self, node: &NodeId) {
-        self.sends(node, MentionKind::Result);
-    }
-
-    fn asks(&mut self, node: &NodeId) {
-        self.sends(node, MentionKind::Ask);
+    fn asks(&mut self, address: &Address) {
+        self.post_in(address, false, Some(true));
     }
 
     /// Says what it is doing, mentioning nobody: nothing the dealer reads.
-    fn works(&mut self, node: &NodeId) {
-        let from = Address::Agent(self.id(node));
-        self.post_in(node, from, Vec::new());
+    fn works(&mut self, address: &Address) {
+        self.post_in(address, false, None);
     }
 
-    fn writes_to(&mut self, node: &NodeId) {
-        self.post_in(node, Address::User, Vec::new());
+    fn writes_to(&mut self, address: &Address) {
+        self.post_in(address, true, None);
     }
 
-    /// The newest message in a topic.
-    fn newest(&self, node: &NodeId) -> u64 {
-        self.log.topics[&node.topic().unwrap().topic]
-            .newest
-            .map_or(0, |(newest, _)| newest.0.0)
+    // Slack
+
+    fn next_ts(&mut self) -> String {
+        self.ts += 1;
+        format!("{}.{:06}", self.now.timestamp().as_second(), self.ts)
     }
+
+    fn slack(
+        &mut self,
+        address: Address,
+        name: &str,
+        reason: &str,
+        head_start: f64,
+        room: Option<Address>,
+        direct: bool,
+    ) -> Address {
+        if !self.things.contains_key(&address) {
+            self.things.insert(
+                address.clone(),
+                Thing::Slack {
+                    reason: reason.into(),
+                    head_start,
+                    room,
+                    direct,
+                    messages: Vec::new(),
+                    read_through: None,
+                },
+            );
+        }
+        self.names.insert(address.clone(), name.into());
+        address
+    }
+
+    fn post(&mut self, address: &Address, from_me: bool) {
+        let ts = self.next_ts();
+        let at = self.at();
+        let Some(Thing::Slack { messages, .. }) = self.things.get_mut(address) else {
+            panic!("not slack")
+        };
+        messages.push(Msg { ts, at, from_me });
+    }
+
+    /// A direct message from the user `channel` is with.
+    fn dm(&mut self, channel: &str, user: &str) -> Address {
+        let address = self.slack(
+            Address::new("slack", format!("acme/{channel}")),
+            channel,
+            &format!("unread in @{user} · needs reply · {{age}}"),
+            SLACK_DM_HEAD_START,
+            None,
+            true,
+        );
+        self.post(&address, false);
+        address
+    }
+
+    /// A thread in #design the user follows, with a reply from each of
+    /// `users` in turn.
+    fn thread(&mut self, users: &[&str]) -> Address {
+        let root = self.next_ts();
+        let room = Address::new("slack", "acme/C1");
+        let address = self.slack(
+            Address::new("slack", format!("acme/C1/{root}")),
+            "thread",
+            "#design · needs reply · {age}",
+            SLACK_THREAD_HEAD_START,
+            Some(room),
+            users.len() < SLACK_SMALL_THREAD_PEOPLE,
+        );
+        self.post(&address, true);
+        for _ in users {
+            self.post(&address, false);
+        }
+        address
+    }
+
+    fn read(&mut self, address: &Address) {
+        let Some(Thing::Slack {
+            messages,
+            read_through,
+            ..
+        }) = self.things.get_mut(address)
+        else {
+            panic!("not slack")
+        };
+        *read_through = messages.last().map(|message| message.ts.clone());
+    }
+
+    // The user
 
     fn tell(&mut self, fact: Fact) {
         // Said now, or just after the last thing said.
@@ -269,27 +247,25 @@ impl World {
         }]);
     }
 
-    /// How far the user has seen `node`: everything its source has.
-    fn seen(&self, node: &NodeId) -> Seen {
-        match node {
-            NodeId::Topic(_) => Seen::Topic(self.newest(node)),
-            NodeId::Slack(unit) => self
-                .slack
-                .unit(&model_unit(unit))
-                .map_or(Seen::Whole, |facts| Seen::Slack(facts.newest.0.clone())),
-            _ => Seen::Whole,
+    /// How far the user has seen `address`: everything its source has.
+    fn seen(&self, address: &Address) -> Seen {
+        match self.things.get(address) {
+            Some(Thing::Thread { posts }) => Seen::Topic(posts.last().map_or(0, |post| post.seq)),
+            Some(Thing::Slack { messages, .. }) => messages
+                .last()
+                .map_or(Seen::Whole, |message| Seen::Slack(message.ts.clone())),
+            None => Seen::Whole,
         }
     }
 
-    fn say(&mut self, node: &NodeId, said: Said) {
-        let node = node.clone();
+    fn say(&mut self, address: &Address, said: Said) {
+        let node = address.clone();
         let fact = match said {
             Said::Done => Fact::Settled {
                 seen: self.seen(&node),
                 node,
             },
             Said::Mute => Fact::Mute { node },
-            Said::Unmute => Fact::Unmute { node },
             Said::Snooze { until } => Fact::Snooze { node, until },
             Said::Deadline { by, lead_days } => Fact::Deadline {
                 node,
@@ -300,52 +276,33 @@ impl World {
         self.tell(fact);
     }
 
-    fn snooze(&mut self, node: &NodeId, until: SignedDuration) {
+    fn snooze(&mut self, address: &Address, until: SignedDuration) {
         self.say(
-            node,
+            address,
             Said::Snooze {
                 until: Until::In(until),
             },
         );
     }
 
-    fn done(&mut self, node: &NodeId) {
-        self.say(node, Said::Done);
+    fn done(&mut self, address: &Address) {
+        self.say(address, Said::Done);
     }
 
-    /// Done with the topic through `seen`, which may be short of its
-    /// newest message.
-    fn done_through(&mut self, node: &NodeId, seen: Seen) {
-        self.tell(Fact::Settled {
-            node: node.clone(),
-            seen,
-        });
-    }
-
-    /// What an older build wrote for "marked read".
-    fn reads(&mut self, node: &NodeId) {
-        self.tell(Fact::Read {
-            node: node.clone(),
-            seen: self.seen(node),
-        });
-    }
-
-    fn todo(&mut self, node: &NodeId, start: Option<Until>) {
+    fn todo(&mut self, address: &Address, start: Option<Until>) {
         self.tell(Fact::Todo {
-            node: node.clone(),
+            node: address.clone(),
             start,
-            seen: self.seen(node),
+            seen: self.seen(address),
         });
     }
 
-    fn write_note(&mut self, node: &NodeId, body: &str, deleted: bool) {
-        let NodeId::Note(note) = node else {
-            panic!("not a note")
-        };
+    fn write_note(&mut self, address: &Address, body: &str, deleted: bool) {
+        let note = address.as_note().expect("a note");
         let at = self.marks.next_at(&self.now);
         self.now = at.clone();
         self.marks.apply_notes([NoteRev {
-            note: *note,
+            note,
             device: Device([0; 16]),
             created: at.timestamp(),
             at,
@@ -354,139 +311,181 @@ impl World {
         }]);
     }
 
-    fn next_ts(&mut self) -> Ts {
-        // Slack's timestamps are seconds with a sequence in the micros, so
-        // two messages in one second are still two.
-        self.ts += 1;
-        Ts(format!(
-            "{}.{:06}",
-            self.now.timestamp().as_second(),
-            self.ts
-        ))
-    }
+    // The deal
 
-    fn post(&mut self, channel: &str, thread: Option<&Ts>, user: &str, text: &str) -> Ts {
-        let ts = self.next_ts();
-        let message = Message {
-            ts: ts.clone(),
-            thread_ts: thread.cloned(),
-            channel: ChannelId(channel.into()),
-            user: Some(UserId(user.into())),
-            bot_name: None,
-            bot_id: None,
-            blocks: Vec::new(),
-            text: text.into(),
-            attachments: Vec::new(),
-            files: Vec::new(),
-            subtype: None,
-            reply_count: 0,
-            reply_users: Vec::new(),
-            latest_reply: None,
-            edited: false,
-            reactions: Vec::new(),
-        };
-        self.slack.note_message(&message, self.ms() as i64);
-        ts
-    }
-
-    fn slack_node(&mut self, channel: &str, thread: Option<&Ts>, name: &str) -> NodeId {
-        let node = NodeId::Slack(SlackUnit {
-            workspace: "acme".into(),
-            channel: channel.into(),
-            thread: thread.map(|ts| ts.0.clone()),
-        });
-        self.names.insert(node.clone(), name.into());
-        node
-    }
-
-    /// A direct message from `user`.
-    fn dm(&mut self, channel: &str, user: &str) -> NodeId {
-        self.post(channel, None, user, "hey");
-        self.slack_node(channel, None, channel)
-    }
-
-    /// A thread in #design the user follows, with a reply from each of
-    /// `users` in turn.
-    fn thread(&mut self, users: &[&str]) -> (NodeId, Ts) {
-        let root = self.post("C1", None, "ME", "a question");
-        self.slack.follow(&ChannelId("C1".into()), &root);
-        for user in users {
-            self.post("C1", Some(&root), user, "an answer");
-        }
-        let node = self.slack_node("C1", Some(&root), "thread");
-        (node, root)
-    }
-
-    fn read(&mut self, node: &NodeId) {
-        let unit = model_unit(node.slack().unwrap());
-        let newest = self.slack.unit(&unit).unwrap().newest.clone();
-        match &unit.thread {
-            Some(root) => {
-                let key = self.slack.key(&unit.channel, root);
-                self.slack.mark_thread_read(&key, &newest);
+    /// What the stand-in sources claim right now, the way the real ones
+    /// do for these cases.
+    fn claims(&self, trace: Option<&mut Trace>) -> Vec<Claim> {
+        let at = self.at();
+        let mut claims = Vec::new();
+        let mut trace = trace;
+        for (address, thing) in &self.things {
+            let facts = self.marks.get(address).facts();
+            match thing {
+                Thing::Thread { posts } => {
+                    // Done, or the user's own words, see through to there.
+                    let seen = facts.seen_topic().unwrap_or(0).max(
+                        posts
+                            .iter()
+                            .filter(|post| post.from_user)
+                            .map(|post| post.seq)
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    let unseen: Vec<&Post> = posts
+                        .iter()
+                        .filter(|post| post.ask.is_some() && post.seq > seen)
+                        .collect();
+                    let (mention, curve, reason) =
+                        if let Some(ask) = unseen.iter().find(|post| post.ask == Some(true)) {
+                            (
+                                *ask,
+                                Curve::Waiting {
+                                    head_start: AGENT_BLOCKED_HEAD_START,
+                                    since: ask.at,
+                                },
+                                "asks · {age}",
+                            )
+                        } else if let Some(result) = unseen.last() {
+                            (
+                                *result,
+                                Curve::Fading {
+                                    head_start: AGENT_FINISHED_HEAD_START,
+                                    since: result.at,
+                                    gone_days: AGENT_FINISHED_GONE_DAYS,
+                                },
+                                "result · {age} ago",
+                            )
+                        } else {
+                            if let Some(trace) = trace.as_deref_mut() {
+                                trace.outcome(address, "no card: nothing unread".to_owned());
+                            }
+                            continue;
+                        };
+                    let mut claim = Claim::new(
+                        address.clone(),
+                        curve,
+                        reason,
+                        unseen.last().unwrap().seq.to_string(),
+                    );
+                    claim.title = self.names[address].clone();
+                    if let Some(spoke) = posts
+                        .iter()
+                        .filter(|post| post.from_user)
+                        .map(|post| post.at)
+                        .max()
+                    {
+                        claim.bonus = recency_bonus(spoke, at);
+                        if mention.at.duration_since(spoke) <= REPLY_BREAKTHROUGH {
+                            claim.breaks_snooze_set_by = Some(spoke);
+                        }
+                    }
+                    claims.push(claim);
+                }
+                Thing::Slack {
+                    reason,
+                    head_start,
+                    room,
+                    direct,
+                    messages,
+                    read_through,
+                } => {
+                    let Some(newest) = messages.last() else {
+                        continue;
+                    };
+                    if read_through.as_deref() == Some(newest.ts.as_str())
+                        || facts
+                            .seen_slack()
+                            .is_some_and(|seen| seen >= newest.ts.as_str())
+                    {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.outcome(address, "no card: read".to_owned());
+                        }
+                        continue;
+                    }
+                    let mut claim = Claim::new(
+                        address.clone(),
+                        Curve::Waiting {
+                            head_start: *head_start,
+                            since: newest.at,
+                        },
+                        reason.clone(),
+                        newest.ts.clone(),
+                    );
+                    claim.title = self.names[address].clone();
+                    claim.under = room.clone();
+                    if *direct {
+                        claim.others = messages
+                            .iter()
+                            .filter(|message| !message.from_me)
+                            .map(|message| message.at)
+                            .collect();
+                    }
+                    claims.push(claim);
+                }
             }
-            None => {
-                self.slack.mark_read(&unit.channel, &newest);
-            }
         }
+        claims
     }
 
-    fn deal(&mut self) -> Hand {
-        let sources = Sources {
-            agents: &self.agents,
-            chat: &self.chat,
-            slack: Some(Slack {
-                model: &self.slack,
-                mirror: None,
-            }),
-            marks: &self.marks,
-            skips: &self.skips,
+    fn deal(&self) -> Hand {
+        let claims = self.claims(None);
+        let names = |address: &Address| {
+            self.names
+                .get(address)
+                .map(|name| (name.clone(), String::new()))
         };
-        rank(&sources, &self.now, &mut self.cache)
+        rank(
+            &Sources {
+                claims: &claims,
+                marks: &self.marks,
+                skips: &self.skips,
+                names: &names,
+            },
+            &self.now,
+        )
+    }
+
+    fn traced(&self) -> (Hand, Trace) {
+        let mut trace = Trace::default();
+        let claims = self.claims(Some(&mut trace));
+        let names = |address: &Address| {
+            self.names
+                .get(address)
+                .map(|name| (name.clone(), String::new()))
+        };
+        rank_traced(
+            &Sources {
+                claims: &claims,
+                marks: &self.marks,
+                skips: &self.skips,
+                names: &names,
+            },
+            &self.now,
+            trace,
+        )
     }
 
     /// The hand as lines of `name · label`, top first.
-    fn traced(&mut self) -> (Hand, Trace) {
-        let sources = Sources {
-            agents: &self.agents,
-            chat: &self.chat,
-            slack: Some(Slack {
-                model: &self.slack,
-                mirror: None,
-            }),
-            marks: &self.marks,
-            skips: &self.skips,
-        };
-        rank_traced(&sources, &self.now, &mut self.cache)
-    }
-
-    fn hand(&mut self) -> String {
-        let hand = self.deal();
-        hand.cards
+    fn hand(&self) -> String {
+        self.deal()
+            .cards
             .iter()
-            .map(|card| {
-                let name = self
-                    .names
-                    .get(&card.node)
-                    .cloned()
-                    .unwrap_or(card.node.key());
-                format!("{name} · {}", card.label)
-            })
+            .map(|card| format!("{} · {}", card.heading(), card.label))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn priority(&mut self, node: &NodeId) -> Option<f64> {
+    fn priority(&self, address: &Address) -> Option<f64> {
         self.deal()
             .cards
             .into_iter()
-            .find(|card| &card.node == node)
+            .find(|card| &card.address == address)
             .map(|card| card.priority)
     }
 
-    fn top(&mut self) -> Option<String> {
-        let hand = self.deal();
-        hand.top(None).map(|card| self.names[&card.node].clone())
+    fn top(&self) -> Option<String> {
+        self.deal().top(None).map(|card| card.title.clone())
     }
 }
 
@@ -494,233 +493,17 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-3
 }
 
-// Agents
-
-#[test]
-fn a1_an_unread_ask_rises() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 0m");
-    let first = w.priority(&a).unwrap();
-    assert!(first >= AGENT_BLOCKED_HEAD_START);
-    w.pass(hours(1));
-    assert!(w.priority(&a).unwrap() > first);
+fn note(w: &mut World, name: &str) -> Address {
+    let address = Address::note(uuid::Uuid::new_v4());
+    w.write_note(&address, name, false);
+    address
 }
 
-#[test]
-fn a2_a_result_is_below_an_ask_and_gone_in_three_days() {
-    let mut w = world();
-    let a = w.agent("a");
-    let b = w.agent("b");
-    w.finishes(&a);
-    w.asks(&b);
-    assert_eq!(w.hand(), "b · asks · 0m\na · result · 0m ago");
-    assert!(w.priority(&a).unwrap() < LAMP_THRESHOLD);
-    w.pass(hours(71));
-    assert!(w.hand().ends_with("a · result · 3.0d ago"), "{}", w.hand());
-    w.pass(hours(1));
-    assert_eq!(w.hand(), "b · asks · 3.0d");
-}
-
-#[test]
-fn a3_an_fyi_is_no_card() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.sends(&a, MentionKind::Fyi);
-    assert_eq!(w.hand(), "");
-    w.finishes(&a);
-    w.sends(&a, MentionKind::Fyi);
-    assert_eq!(w.hand(), "a · result · 0m ago", "nor does it hide one");
-}
-
-#[test]
-fn a4_a_status_is_no_card() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.works(&a);
-    assert_eq!(w.hand(), "");
-    w.finishes(&a);
-    w.works(&a);
-    assert_eq!(w.hand(), "a · result · 0m ago", "nor does it hide one");
-}
-
-#[test]
-fn a5_several_unseen_mentions_are_one_card_an_ask_above_a_result() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.pass(hours(1));
-    w.sends(&a, MentionKind::Fyi);
-    assert_eq!(w.hand(), "a · result · 1.0h ago", "an fyi hides nothing");
-    w.asks(&a);
-    w.pass(hours(1));
-    w.finishes(&a);
-    assert_eq!(
-        w.hand(),
-        "a · asks · 1.0h",
-        "an ask unseen outranks a newer result, waiting from when it asked"
-    );
-    w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 1.0h", "from the first ask unseen");
-}
-
-#[test]
-fn a6_done_or_writing_holds_until_a_newer_mention() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.done(&a);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(2));
-    w.works(&a);
-    assert_eq!(
-        w.hand(),
-        "",
-        "a message that mentions nobody is nothing new"
-    );
-    w.finishes(&a);
-    assert_eq!(w.hand(), "a · result · 0m ago");
-    w.pass(mins(1));
-    w.writes_to(&a);
-    assert_eq!(w.hand(), "", "writing reads it too");
-}
-
-#[test]
-fn a7_a_topic_the_user_just_wrote_in_comes_back_on_top_and_chimes() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.writes_to(&a);
-    w.pass(mins(5));
-    let d = w.dm("D1", "U1");
-    w.finishes(&a);
-    assert_eq!(w.top().as_deref(), Some("a"));
-    assert!(w.priority(&a).unwrap() >= CHIME_THRESHOLD);
-    assert!(w.priority(&d).is_some());
-}
-
-#[test]
-fn a8_done_through_a_message_leaves_the_mentions_after_it() {
-    let mut w = world();
-    let a = w.agent("a");
-    let b = w.agent("b");
-    w.finishes(&a);
-    let result = w.seen(&a);
-    w.pass(mins(1));
-    w.asks(&a);
-    w.done_through(&a, result);
-    assert_eq!(w.hand(), "a · asks · 0m", "the ask came after the done");
-    w.done(&a);
-    assert_eq!(w.hand(), "");
-    // An older build's "marked read" is a done that takes nothing back:
-    // it handles an ask as well as a result.
-    w.asks(&b);
-    w.reads(&b);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a10_another_agents_message_is_context_never_unread() {
-    let mut w = world();
-    let parent = w.agent("parent");
-    let a = w.agent("a");
-    let (from, to) = (Address::Agent(w.id(&parent)), Address::Agent(w.id(&a)));
-    w.post_in(
-        &a,
-        from,
-        vec![Mention {
-            to,
-            kind: MentionKind::Ask,
-        }],
-    );
-    assert_eq!(w.hand(), "", "a mention of another agent is not the user's");
-    w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 0m");
-}
-
-#[test]
-fn a11_an_agent_made_by_an_agent_deals_only_by_mentioning_the_user() {
-    let mut w = world();
-    let parent = w.agent("parent");
-    let parent_id = w.id(&parent);
-    let child = w.agent_under("child", Some(parent_id));
-    w.works(&child);
-    assert_eq!(w.hand(), "");
-    w.asks(&child);
-    assert_eq!(w.hand(), "child · asks · 0m", "a mention draws the user");
-}
-
-#[test]
-fn a12_running_waiting_idle_or_stopped_changes_nothing() {
-    let mut w = world();
-    let a = w.agent("a");
-    let b = w.agent("b");
-    runtime(&mut w, &a, 2, false, false);
-    runtime(&mut w, &b, 0, true, false);
-    assert_eq!(w.hand(), "");
-    w.finishes(&a);
-    w.asks(&b);
-    let hand = w.hand();
-    for (running, waiting, archived) in [(0, false, false), (3, true, true)] {
-        runtime(&mut w, &a, running, waiting, archived);
-        runtime(&mut w, &b, running, waiting, archived);
-        assert_eq!(w.hand(), hand);
-    }
-    let at = UnixMs(w.ms());
-    for inference in [
-        InferenceState::Failed {
-            error: "boom".into(),
-        },
-        InferenceState::Retrying {
-            at,
-            error: "overloaded".into(),
-        },
-    ] {
-        for node in [&a, &b] {
-            let agent_id = w.id(node);
-            w.agents.set_runtime(
-                agent_id,
-                RuntimeState {
-                    inference: inference.clone(),
-                    ..Default::default()
-                },
-            );
-        }
-        assert_eq!(w.hand(), hand, "a stop or a retry is no message");
-    }
-}
-
-#[test]
-fn a13_a_muted_topic_or_one_whose_host_or_agents_are_gone_has_nothing() {
-    let mut w = world();
-    let a = w.agent("a");
-    let b = w.agent("b");
-    w.asks(&a);
-    w.asks(&b);
-    w.say(&a, Said::Mute);
-    assert_eq!(w.hand(), "b · asks · 0m");
-    w.say(&a, Said::Unmute);
-    let both = w.hand();
-    assert!(both.contains("a · asks"), "{both}");
-    let b_id = w.id(&b);
-    w.agents.forget_agents(&[b_id].into());
-    assert_eq!(w.hand(), "a · asks · 0m", "b's agent is deleted");
-    w.chat.detach_host(w.host);
-    assert_eq!(w.hand(), "");
-}
-
-/// The agent's live state, as the runtime publishes it.
-fn runtime(w: &mut World, node: &NodeId, running_tasks: u32, awaiting_human: bool, archived: bool) {
-    let agent_id = w.id(node);
-    w.agents.set_runtime(
-        agent_id,
-        rho_agents_client::protocol::transcript::RuntimeState {
-            running_tasks,
-            awaiting_human,
-            archived,
-            ..Default::default()
-        },
-    );
+fn pile(w: &mut World, address: &Address, pile: &str) {
+    w.tell(Fact::Piled {
+        node: address.clone(),
+        pile: pile.into(),
+    });
 }
 
 // Snoozes
@@ -728,7 +511,7 @@ fn runtime(w: &mut World, node: &NodeId, running_tasks: u32, awaiting_human: boo
 #[test]
 fn z1_a_snooze_holds_until_it_ends() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     w.snooze(&d, hours(1));
     assert_eq!(w.hand(), "");
     w.pass(mins(59));
@@ -740,7 +523,7 @@ fn z1_a_snooze_holds_until_it_ends() {
 #[test]
 fn z2_a_node_back_from_a_snooze_counts_from_its_end() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     w.snooze(&d, hours(1));
     w.pass(mins(90));
     assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 30m");
@@ -759,7 +542,7 @@ fn z3_a_snooze_ending_on_a_node_that_wants_nothing_brings_nothing() {
     w.pass(mins(5));
     w.writes_to(&a);
     w.works(&a);
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     w.snooze(&d, hours(1));
     w.read(&d);
     w.pass(hours(2));
@@ -796,14 +579,14 @@ fn z4_a_reply_within_the_hour_of_the_users_message_comes_through_a_snooze() {
 #[test]
 fn z5_a_direct_conversation_comes_back_higher_for_what_it_slept_through() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     w.snooze(&d, hours(2));
-    let (big, root) = w.thread(&["U1", "U2", "U3", "U4"]);
+    let big = w.thread(&["U1", "U2", "U3", "U4"]);
     w.snooze(&big, hours(2));
     w.pass(hours(1));
-    w.post("D1", None, "U1", "still there?");
-    w.post("D1", None, "U1", "hello?");
-    w.post("C1", Some(&root), "U2", "and another");
+    w.post(&d, false);
+    w.post(&d, false);
+    w.post(&big, false);
     w.pass(hours(1));
     assert!(close(
         w.priority(&d).unwrap(),
@@ -815,7 +598,7 @@ fn z5_a_direct_conversation_comes_back_higher_for_what_it_slept_through() {
 #[test]
 fn z6_every_snooze_is_kept() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     for _ in 0..3 {
         w.snooze(&d, hours(1));
         w.pass(hours(1));
@@ -824,25 +607,29 @@ fn z6_every_snooze_is_kept() {
     assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
 }
 
-// Todos and deadlines
-
-fn pile(w: &mut World, node: &NodeId, pile: &str) {
-    w.tell(Fact::Piled {
-        node: node.clone(),
-        pile: pile.into(),
-    });
+#[test]
+fn z7_a_snoozed_room_holds_what_is_under_it() {
+    let mut w = world();
+    let room = Address::new("slack", "acme/C1");
+    w.snooze(&room, hours(1));
+    let thread = w.thread(&["U1"]);
+    assert_eq!(w.hand(), "");
+    w.pass(hours(1));
+    assert!(w.priority(&thread).is_some());
 }
+
+// Piles
 
 #[test]
 fn p1_a_card_on_a_pile_stays_there_whatever_its_source_says() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     let a = w.agent("a");
     w.asks(&a);
     pile(&mut w, &d, "ask ada");
     pile(&mut w, &a, "ask ada");
     w.pass(mins(1));
-    w.post("D1", None, "U1", "still there?");
+    w.post(&d, false);
     w.writes_to(&a);
     w.works(&a);
     w.pass(mins(5));
@@ -873,7 +660,7 @@ fn p2_a_todo_done_or_a_snooze_takes_the_card_off_its_pile() {
     w.pass(hours(2));
     assert_eq!(w.hand(), "n · todo · 2.0h", "back as the todo it was");
 
-    let d = w.dm("D2", "U2");
+    let d = w.dm("D2", "u2");
     pile(&mut w, &d, "friday");
     w.done(&d);
     assert_eq!(w.marks.get(&d).facts().pile(), None);
@@ -882,13 +669,13 @@ fn p2_a_todo_done_or_a_snooze_takes_the_card_off_its_pile() {
 #[test]
 fn p3_the_piles_are_named_oldest_first_and_then_everything_snoozed() {
     let mut w = world();
-    let a = w.dm("D1", "U1");
-    let b = w.dm("D2", "U2");
-    let c = w.dm("D3", "U3");
-    let later = w.dm("D4", "U4");
-    let sooner = w.dm("D5", "U5");
-    let over = w.dm("D6", "U6");
-    let muted = w.dm("D7", "U7");
+    let a = w.dm("D1", "u1");
+    let b = w.dm("D2", "u2");
+    let c = w.dm("D3", "u3");
+    let later = w.dm("D4", "u4");
+    let sooner = w.dm("D5", "u5");
+    let over = w.dm("D6", "u6");
+    let muted = w.dm("D7", "u7");
     pile(&mut w, &b, "on laptop");
     w.pass(mins(1));
     pile(&mut w, &a, "on laptop");
@@ -901,7 +688,7 @@ fn p3_the_piles_are_named_oldest_first_and_then_everything_snoozed() {
     w.pass(mins(2));
     let now = w.now.timestamp();
     let piles = w.marks.piles(now);
-    let shown: Vec<(Option<&str>, Vec<&NodeId>)> = piles
+    let shown: Vec<(Option<&str>, Vec<&Address>)> = piles
         .iter()
         .map(|pile| (pile.name.as_deref(), pile.nodes.iter().collect()))
         .collect();
@@ -922,12 +709,7 @@ fn p3_the_piles_are_named_oldest_first_and_then_everything_snoozed() {
     assert!(sooner_until < w.marks.get(&later).facts().snooze().unwrap().until);
 }
 
-fn note(w: &mut World, name: &str) -> NodeId {
-    let node = NodeId::Note(uuid::Uuid::new_v4());
-    w.write_note(&node, name, false);
-    w.names.insert(node.clone(), name.into());
-    node
-}
+// Todos and deadlines
 
 #[test]
 fn t1_a_todo_stays_on_the_plate_rising_slowly_until_done() {
@@ -976,7 +758,7 @@ fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
 }
 
 #[test]
-fn t4_a_todo_on_an_agent_stays_whatever_the_agent_is_doing() {
+fn t4_a_todo_on_a_thread_stays_whatever_its_source_says() {
     let mut w = world();
     let a = w.agent("a");
     w.finishes(&a);
@@ -984,12 +766,13 @@ fn t4_a_todo_on_an_agent_stays_whatever_the_agent_is_doing() {
     assert_eq!(w.hand(), "a · todo · 0m");
     w.writes_to(&a);
     w.works(&a);
-    runtime(&mut w, &a, 2, false, false);
     assert_eq!(w.hand(), "a · todo · 0m");
+    // Named by the source, since no claim names it.
+    assert_eq!(w.deal().cards[0].title, "a");
 }
 
 #[test]
-fn t5_writing_to_an_agent_keeps_its_todo() {
+fn t5_writing_to_a_thread_keeps_its_todo() {
     let mut w = world();
     let a = w.agent("a");
     w.finishes(&a);
@@ -1019,104 +802,6 @@ fn t6_done_or_mute_takes_back_the_todo_the_deadline_and_the_snooze() {
     }
 }
 
-// Slack
-
-#[test]
-fn s1_a_direct_message_asks_before_a_mention_before_a_big_thread() {
-    let mut w = world();
-    let (big, _) = w.thread(&["U1", "U2", "U3"]);
-    let (small, _) = w.thread(&["U1"]);
-    w.post("C1", None, "U2", "<@ME> can you look");
-    let mention = w.slack_node("C1", None, "mention");
-    let dm = w.dm("D1", "U1");
-    assert!(close(w.priority(&dm).unwrap(), SLACK_DM_HEAD_START));
-    assert!(close(w.priority(&small).unwrap(), SLACK_DM_HEAD_START));
-    assert!(close(
-        w.priority(&mention).unwrap(),
-        SLACK_MENTION_HEAD_START
-    ));
-    assert!(close(w.priority(&big).unwrap(), SLACK_THREAD_HEAD_START));
-    w.pass(hours(2));
-    assert!(close(
-        w.priority(&big).unwrap(),
-        SLACK_THREAD_HEAD_START + WAITING_SLOPE_PER_DAY / 12.0
-    ));
-}
-
-#[test]
-fn s2_channel_traffic_is_barely_there_and_gone_within_the_day() {
-    let mut w = world();
-    w.post("C1", None, "U1", "lunch?");
-    let room = w.slack_node("C1", None, "room");
-    assert!(close(
-        w.priority(&room).unwrap(),
-        CHANNEL_TRAFFIC_HEAD_START
-    ));
-    w.pass(hours(23));
-    assert!(w.priority(&room).is_some());
-    w.pass(hours(1));
-    assert!(w.priority(&room).is_none());
-
-    let mut w = world();
-    w.post("C1", None, "U1", "lunch?");
-    w.post("C1", None, "U2", "yes");
-    let room = w.slack_node("C1", None, "room");
-    w.pass(hours(12));
-    assert!(w.priority(&room).is_none(), "someone else answered");
-}
-
-#[test]
-fn s3_s4_read_or_replied_is_nothing_until_a_new_message() {
-    let mut w = world();
-    let d = w.dm("D1", "U1");
-    w.read(&d);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(1));
-    w.post("D1", None, "U1", "one more thing");
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
-    w.post("D1", None, "ME", "sure");
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn s3_s4_done_on_another_device_holds_until_a_newer_message() {
-    let mut w = world();
-    let d = w.dm("D1", "U1");
-    // Said on the phone: this device's Slack still has it unread.
-    w.done(&d);
-    assert_eq!(w.hand(), "");
-    w.post("D1", None, "U1", "one more thing");
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
-}
-
-#[test]
-fn s5_a_todo_on_a_thread_outlasts_reading_it() {
-    let mut w = world();
-    let (thread, _) = w.thread(&["U1", "U2", "U3"]);
-    w.read(&thread);
-    w.todo(&thread, None);
-    assert_eq!(w.hand(), "thread · todo · 0m");
-}
-
-#[test]
-fn s6_a_room_muted_in_slack_has_nothing() {
-    let mut w = world();
-    w.dm("D1", "U1");
-    w.slack.set_muted([ChannelId("D1".into())]);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn s7_a_snoozed_room_holds_its_threads() {
-    let mut w = world();
-    let room = w.slack_node("C1", None, "room");
-    w.snooze(&room, hours(1));
-    let (thread, _) = w.thread(&["U1"]);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(1));
-    assert!(w.priority(&thread).is_some());
-}
-
 // Notes
 
 #[test]
@@ -1127,6 +812,35 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
     w.todo(&gone, None);
     w.write_note(&gone, "gone", true);
     assert_eq!(w.hand(), "");
+}
+
+#[test]
+fn a_note_and_a_label_name_themselves_and_file_under_their_labels() {
+    let mut w = world();
+    let n = note(&mut w, "buy milk\nand eggs");
+    let label = uuid::Uuid::new_v4();
+    w.tell(Fact::Label {
+        label,
+        name: "home".into(),
+        parent: None,
+    });
+    w.tell(Fact::Labeled {
+        node: n.clone(),
+        label,
+        present: true,
+    });
+    w.todo(&n, None);
+    w.todo(&Address::label(label), None);
+    let hand = w.deal();
+    let card = |address: &Address| {
+        hand.cards
+            .iter()
+            .find(|card| &card.address == address)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(card(&n).heading(), "home › buy milk");
+    assert_eq!(card(&Address::label(label)).heading(), "home");
 }
 
 // Every history
@@ -1149,14 +863,14 @@ fn x1_a_node_is_one_card_at_its_strongest() {
 #[test]
 fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
     let mut w = world();
-    let a = w.dm("D1", "U1");
+    let a = w.dm("D1", "u1");
     w.pass(hours(3));
-    w.dm("D2", "U2");
+    w.dm("D2", "u2");
     w.pass(hours(1));
-    w.dm("D3", "U3");
+    w.dm("D3", "u3");
     let skip_top = |w: &mut World| {
         let card = w.deal().cards[0].clone();
-        w.skips.skip(card.node, card.cursor, w.now.timestamp());
+        w.skips.skip(card.address, card.cursor, w.now.timestamp());
         w.pass(mins(1));
         w.top()
     };
@@ -1169,10 +883,10 @@ fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
     assert_eq!(skip_top(&mut w).as_deref(), Some("D1"));
     assert!(w.deal().cards.iter().all(|card| card.skipped));
 
-    w.post("D1", None, "U1", "urgent");
+    w.post(&a, false);
     let first = w.deal().cards[0].clone();
     assert!(
-        first.node == a && !first.skipped,
+        first.address == a && !first.skipped,
         "something new voids the skip"
     );
     w.pass(SKIP_HOLD);
@@ -1185,7 +899,7 @@ fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
 #[test]
 fn x3_the_hand_says_when_it_next_changes() {
     let mut w = world();
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     w.snooze(&d, hours(1));
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + hours(1)));
     w.pass(hours(1));
@@ -1200,7 +914,7 @@ fn x4_tomorrow_is_the_users_own_midnight() {
     let mut w = world_in(TimeZone::fixed(
         Offset::from_seconds(5 * 3600 + 1800).unwrap(),
     ));
-    let d = w.dm("D1", "U1");
+    let d = w.dm("D1", "u1");
     // 09:00 UTC is 14:30 on the user's clock; tomorrow starts at 18:30 UTC.
     w.say(
         &d,
@@ -1214,7 +928,7 @@ fn x4_tomorrow_is_the_users_own_midnight() {
     assert!(w.priority(&d).is_some());
 }
 
-// The rules every history keeps (X1, X3, X5, Z1), over random ones.
+// The rules every history keeps (X1, X3, Z1), over random ones.
 
 #[derive(Clone, Debug)]
 enum Step {
@@ -1251,8 +965,8 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
     ]
 }
 
-fn nodes(hand: &Hand) -> BTreeSet<NodeId> {
-    hand.cards.iter().map(|card| card.node.clone()).collect()
+fn addresses(hand: &Hand) -> BTreeSet<Address> {
+    hand.cards.iter().map(|card| card.address.clone()).collect()
 }
 
 proptest::proptest! {
@@ -1261,10 +975,10 @@ proptest::proptest! {
     #[test]
     fn every_history_keeps_the_rules(steps in proptest::collection::vec(step(), 1..40)) {
         let mut w = world();
-        let agents: Vec<NodeId> = ["a0", "a1", "a2"].iter().map(|name| w.agent(name)).collect();
+        let agents: Vec<Address> = ["a0", "a1", "a2"].iter().map(|name| w.agent(name)).collect();
         let dms = ["D1", "D2"];
-        let dm_nodes: Vec<NodeId> = dms.iter().map(|channel| w.slack_node(channel, None, channel)).collect();
-        let all: Vec<NodeId> = agents.iter().chain(&dm_nodes).cloned().collect();
+        let dm_nodes: Vec<Address> = dms.iter().map(|channel| Address::new("slack", format!("acme/{channel}"))).collect();
+        let all: Vec<Address> = agents.iter().chain(&dm_nodes).cloned().collect();
         for step in steps {
             match step {
                 Step::Pass(minutes) => w.pass(mins(minutes)),
@@ -1272,9 +986,9 @@ proptest::proptest! {
                 Step::Asks(i) => w.asks(&agents[i]),
                 Step::Works(i) => w.works(&agents[i]),
                 Step::WritesTo(i) => w.writes_to(&agents[i]),
-                Step::Dm(i) => { w.dm(dms[i], ["U1", "U2"][i]); }
+                Step::Dm(i) => { w.dm(dms[i], ["u1", "u2"][i]); }
                 Step::Read(i) => {
-                    if w.slack.unit(&model_unit(dm_nodes[i].slack().unwrap())).is_some() {
+                    if w.things.contains_key(&dm_nodes[i]) {
                         w.read(&dm_nodes[i]);
                     }
                 }
@@ -1284,34 +998,32 @@ proptest::proptest! {
                 Step::Todo(i, days) => w.todo(&all[i], days.map(|days| Until::In(hours(24 * days)))),
                 Step::SkipTop => {
                     if let Some(card) = w.deal().cards.first().cloned() {
-                        w.skips.skip(card.node, card.cursor, w.now.timestamp());
+                        w.skips.skip(card.address, card.cursor, w.now.timestamp());
                     }
                 }
             }
-            let warm = w.deal();
-            // X5: a warm cache changes nothing.
-            w.cache = Cache::default();
-            let fresh = w.deal();
-            proptest::prop_assert_eq!(&warm, &fresh);
-            // X1: one card per node.
-            proptest::prop_assert_eq!(nodes(&fresh).len(), fresh.cards.len());
+            let hand = w.deal();
+            // Dealing twice is dealing once: nothing is kept between deals.
+            proptest::prop_assert_eq!(&hand, &w.deal());
+            // X1: one card per address.
+            proptest::prop_assert_eq!(addresses(&hand).len(), hand.cards.len());
             let at = w.now.timestamp();
-            for card in &fresh.cards {
-                let facts = w.marks.get(&card.node).facts();
+            for card in &hand.cards {
+                let facts = w.marks.get(&card.address).facts();
                 proptest::prop_assert!(!facts.muted());
                 // Z1: nothing snoozed shows, but for an agent's quick reply.
                 if let Some(snooze) = facts.snooze() && at < snooze.until {
-                    proptest::prop_assert!(matches!(card.node, NodeId::Topic(_)));
+                    proptest::prop_assert_eq!(card.address.kind(), "thread");
                 }
             }
             // X3: nothing arrives by itself before the next change.
-            let before = fresh.next_change.map_or(at + hours(24), |next| next - SignedDuration::from_millis(1));
+            let before = hand.next_change.map_or(at + hours(24), |next| next - SignedDuration::from_millis(1));
             if before > at {
                 let now = w.now.clone();
                 w.now = before.to_zoned(now.time_zone().clone());
                 let later = w.deal();
                 w.now = now;
-                proptest::prop_assert!(nodes(&later).is_subset(&nodes(&fresh)), "{:?} arrived", nodes(&later).difference(&nodes(&fresh)).collect::<Vec<_>>());
+                proptest::prop_assert!(addresses(&later).is_subset(&addresses(&hand)), "{:?} arrived", addresses(&later).difference(&addresses(&hand)).collect::<Vec<_>>());
             }
         }
     }
@@ -1320,27 +1032,31 @@ proptest::proptest! {
 #[test]
 fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
     let mut w = world();
-    let asking = w.dm("D1", "U1");
-    let snoozed = w.dm("D2", "U2");
+    let asking = w.dm("D1", "u1");
+    let snoozed = w.dm("D2", "u2");
     w.snooze(&snoozed, hours(1));
     let quiet = w.agent("a");
     w.finishes(&quiet);
     w.done(&quiet);
     let (hand, trace) = w.traced();
     assert_eq!(hand, w.deal());
-    let outcome = |node: &NodeId| trace.nodes[node].outcome.clone();
+    let outcome = |address: &Address| trace.nodes[address].outcome.clone();
     assert!(
         outcome(&asking).starts_with("card at "),
         "{}",
         outcome(&asking)
     );
     assert!(outcome(&snoozed).starts_with("no card: snoozed until"));
-    assert_eq!(outcome(&quiet), "no card: nothing unread");
+    assert_eq!(
+        outcome(&quiet),
+        "no card: nothing unread",
+        "what the source said stays"
+    );
     assert!(
         trace.nodes[&asking]
             .inputs
             .iter()
-            .any(|(key, _)| *key == "unit facts")
+            .any(|(key, _)| *key == "snoozes")
     );
     assert!(!trace.nodes[&asking].parts.is_empty());
 }

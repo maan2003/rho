@@ -107,36 +107,23 @@ pub enum NodeIdentity {
         path: String,
     },
     /// A chat topic: its host's database seed, and the event that started
-    /// it there.
+    /// it there. Older builds wrote it; a thread is an `Address` now.
     Topic {
         machine_seed: u64,
         topic: u64,
     },
+    /// Anything with an address, by its key: `thread:<seed>/<id>`,
+    /// `slack:<workspace>/<channel>`. Later than every typed variant, so
+    /// their records still decode.
+    Address {
+        key: String,
+    },
 }
 
-impl From<rho_dealer::NodeId> for NodeIdentity {
-    fn from(id: rho_dealer::NodeId) -> Self {
-        use rho_dealer::NodeId;
-        match id {
-            NodeId::Note(uuid) => Self::Note {
-                uuid: *uuid.as_bytes(),
-            },
-            NodeId::Label(uuid) => Self::Label {
-                uuid: *uuid.as_bytes(),
-            },
-            NodeId::Agent(agent) => Self::Agent {
-                agent: agent.encoded(),
-            },
-            NodeId::Slack(unit) => Self::Slack {
-                workspace: unit.workspace,
-                channel: unit.channel,
-                thread: unit.thread,
-            },
-            NodeId::PullRequest { repo, number } => Self::PullRequest { repo, number },
-            NodeId::Topic(topic) => Self::Topic {
-                machine_seed: topic.machine_seed,
-                topic: topic.topic.0.0,
-            },
+impl From<rho_dealer::Address> for NodeIdentity {
+    fn from(address: rho_dealer::Address) -> Self {
+        Self::Address {
+            key: address.into_key(),
         }
     }
 }

@@ -135,10 +135,35 @@ impl HostChat {
         self.children(None)
     }
 
-    /// The thread a message belongs to. A root is a stream, and a message
-    /// right under a root starts a thread of its own; anything deeper is a
-    /// reply in its parent's thread.
+    /// The thread a message belongs to: the message right under the root
+    /// above it, which is what a screen opens and what a card is. A root
+    /// is a stream and belongs to itself; a message right under a root
+    /// starts a thread.
     pub fn thread_of(&self, id: MessageId) -> MessageId {
+        let mut cursor = id;
+        loop {
+            let Some(parent) = self
+                .messages
+                .get(&cursor)
+                .and_then(|message| message.parent)
+            else {
+                return cursor;
+            };
+            if self
+                .messages
+                .get(&parent)
+                .is_none_or(|message| message.parent.is_none())
+            {
+                return cursor;
+            }
+            cursor = parent;
+        }
+    }
+
+    /// The nearest head above a message: itself for a root or a thread,
+    /// its parent for anything deeper, where a reply to a reply is a
+    /// subthread of its own.
+    pub fn subthread_of(&self, id: MessageId) -> MessageId {
         let Some(parent) = self.messages.get(&id).and_then(|message| message.parent) else {
             return id;
         };
@@ -367,7 +392,7 @@ mod tests {
             chat.tell(&posted(5, Some(4), Address::User, "deeper")),
             Told::Posted {
                 message: id(5),
-                thread: id(4)
+                thread: id(2)
             }
         );
         assert_eq!(
@@ -418,7 +443,9 @@ mod tests {
         assert_eq!(chat.thread_of(id(1)), id(1));
         assert_eq!(chat.thread_of(id(2)), id(2));
         assert_eq!(chat.thread_of(id(4)), id(2));
-        assert_eq!(chat.thread_of(id(5)), id(4));
+        assert_eq!(chat.thread_of(id(5)), id(2));
+        assert_eq!(chat.subthread_of(id(4)), id(2));
+        assert_eq!(chat.subthread_of(id(5)), id(4));
         assert_eq!(chat.root_of(id(5)), id(1));
         assert_eq!(chat.name(id(2)).as_deref(), Some("Fixed it"));
         assert_eq!(chat.name(id(4)).as_deref(), Some("on it"));

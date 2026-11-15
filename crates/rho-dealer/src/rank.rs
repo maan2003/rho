@@ -1,50 +1,100 @@
-//! The hand: every node that wants the user, ranked, read straight off the
-//! sources and what the user said about them.
+//! The hand: every address that wants the user, ranked, read off what the
+//! sources claim and what the user said about them.
 //!
-//! [`rank`] is the whole algorithm. It takes the agents as the agents map
-//! holds them, Slack as its model holds it, and the user's own facts, and
-//! works each card out from scratch; nothing it decides is kept between
-//! calls except the [`Cache`], which only saves reading the same Slack
-//! title twice and never changes an answer. The cases it must meet are in
-//! `cases.md`, and each has a test under its name.
+//! [`rank`] is the whole algorithm. A source hands it [`Claim`]s: for each
+//! thing of its own that wants the user, where that stands in time and how
+//! it presses. The dealer adds the user's own dates from their facts,
+//! holds back what they snoozed, muted or piled, and works each card out
+//! from scratch; nothing it decides is kept between calls. What a source
+//! must claim for each of its cases is that source's own test; the cases
+//! the dealer itself must meet are in `cases.md`, and each has a test
+//! under its name.
 
 use std::collections::{BTreeMap, HashMap};
 
 use jiff::{Timestamp, Zoned};
-use rho_agent_types::{ChatSeq, MentionKind, MessageId};
-use rho_agents_client::{AgentMap, ChatMap, HostTopic};
-use rho_slack::model::{Attention, Model, Unit};
 
+use crate::address::Address;
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
-use crate::facts::{Snooze, slack_ts_order};
+use crate::facts::Snooze;
 use crate::marks::Marks;
-use crate::node::{NodeId, SlackUnit};
 
-/// What kind of thing a card is, which decides how it opens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CardKind {
-    /// A chat topic.
-    Topic,
-    Slack,
-    /// A note, or anything else only the user's own dates bring back.
-    Dated,
+/// One thing a source says wants the user.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Claim {
+    pub address: Address,
+    /// What the card is called, and where it is: `context › title`.
+    pub title: String,
+    pub context: String,
+    pub curve: Curve,
+    /// The words beside the age, `asks · {age}`; `{age}` is filled in
+    /// when the hand is read.
+    pub reason: String,
+    /// Where the source stands: a skip holds on to it, and the source
+    /// moving past it voids the skip.
+    pub cursor: String,
+    /// What the user having just written to it adds.
+    pub bonus: f64,
+    /// A reply this soon after the user's own words comes through a
+    /// snooze said before them (Z4).
+    pub breaks_snooze_set_by: Option<Timestamp>,
+    /// When the other side wrote: a snooze that slept through some of it
+    /// brings the card back a little higher (Z5).
+    pub others: Vec<Timestamp>,
+    /// An address a snooze on which holds this one too: the room a thread
+    /// is in (S7).
+    pub under: Option<Address>,
 }
 
-/// A node wanting the user, ranked.
+impl Claim {
+    pub fn new(
+        address: Address,
+        curve: Curve,
+        reason: impl Into<String>,
+        cursor: impl Into<String>,
+    ) -> Self {
+        Self {
+            address,
+            title: String::new(),
+            context: String::new(),
+            curve,
+            reason: reason.into(),
+            cursor: cursor.into(),
+            bonus: 0.0,
+            breaks_snooze_set_by: None,
+            others: Vec::new(),
+            under: None,
+        }
+    }
+}
+
+/// An address wanting the user, ranked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Card {
-    pub node: NodeId,
-    pub kind: CardKind,
+    pub address: Address,
     pub title: String,
     pub context: String,
     pub label: String,
     pub priority: f64,
-    /// Where the node's source stood: a skip holds on to it, and the source
+    /// Where the source stood: a skip holds on to it, and the source
     /// moving past it voids the skip.
     pub cursor: String,
     /// Passed over this sitting: behind every card that was not, until its
     /// source moves or the skip runs out.
     pub skipped: bool,
+}
+
+impl Card {
+    /// What the card is called on one line: where it is and what it is
+    /// about, or only what it is about.
+    pub fn heading(&self) -> String {
+        let title = self.title.lines().next().unwrap_or_default();
+        match (self.context.is_empty(), title.is_empty()) {
+            (true, _) => title.to_owned(),
+            (false, true) => self.context.clone(),
+            (false, false) => format!("{} › {title}", self.context),
+        }
+    }
 }
 
 /// Every card above the floor, pressing hardest first, and when the hand
@@ -57,17 +107,19 @@ pub struct Hand {
 
 impl Hand {
     /// The card a pull deals: the top one that is not already in view.
-    pub fn top(&self, exclude: Option<&NodeId>) -> Option<&Card> {
-        self.cards.iter().find(|card| exclude != Some(&card.node))
+    pub fn top(&self, exclude: Option<&Address>) -> Option<&Card> {
+        self.cards
+            .iter()
+            .find(|card| exclude != Some(&card.address))
     }
 }
 
-/// Everything one deal weighed, for the journal: every node that came up,
-/// what became of it, and what it was weighed from. Free-form text, for
-/// reading back a bad deal, never for deciding anything.
+/// Everything one deal weighed, for the journal: every address that came
+/// up, what became of it, and what it was weighed from. Free-form text,
+/// for reading back a bad deal, never for deciding anything.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Trace {
-    pub nodes: BTreeMap<NodeId, Weighed>,
+    pub nodes: BTreeMap<Address, Weighed>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,42 +130,32 @@ pub struct Weighed {
 }
 
 impl Trace {
-    fn input(&mut self, node: &NodeId, key: &'static str, value: String) {
+    /// What a source weighed on the way to a claim, or to none.
+    pub fn input(&mut self, address: &Address, key: &'static str, value: String) {
         self.nodes
-            .entry(node.clone())
+            .entry(address.clone())
             .or_default()
             .inputs
             .push((key, value));
     }
 
-    fn outcome(&mut self, node: &NodeId, outcome: String) {
-        self.nodes.entry(node.clone()).or_default().outcome = outcome;
+    pub fn outcome(&mut self, address: &Address, outcome: String) {
+        self.nodes.entry(address.clone()).or_default().outcome = outcome;
     }
 }
 
-/// Slack, as the session holds it: the model, and the mirror the words
-/// of a card come from.
-#[derive(Clone, Copy)]
-pub struct Slack<'a> {
-    pub model: &'a Model,
-    pub mirror: Option<&'a rho_slack::mirror::Mirror>,
-}
+/// What a thing is called when no claim says: a title and where it is.
+pub type Namer<'a> = &'a dyn Fn(&Address) -> Option<(String, String)>;
 
 /// Everything [`rank`] reads.
 #[derive(Clone, Copy)]
 pub struct Sources<'a> {
-    pub agents: &'a AgentMap,
-    pub chat: &'a ChatMap,
-    pub slack: Option<Slack<'a>>,
+    pub claims: &'a [Claim],
     pub marks: &'a Marks,
     pub skips: &'a Skips,
-}
-
-/// What [`rank`] keeps between calls to save work: the words of each Slack
-/// card, by the message they were read from.
-#[derive(Default)]
-pub struct Cache {
-    titles: BTreeMap<Unit, (rho_slack::types::Ts, String)>,
+    /// Names for the addresses only the user's own dates bring up, which
+    /// no claim named. Notes and labels name themselves.
+    pub names: Namer<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,265 +168,118 @@ struct Skip {
 /// sitting, not something to remember.
 #[derive(Default)]
 pub struct Skips {
-    skips: HashMap<NodeId, Skip>,
+    skips: HashMap<Address, Skip>,
 }
 
 impl Skips {
-    pub fn skip(&mut self, node: NodeId, cursor: String, now: Timestamp) {
-        self.skips.insert(node, Skip { at: now, cursor });
+    pub fn skip(&mut self, address: Address, cursor: String, now: Timestamp) {
+        self.skips.insert(address, Skip { at: now, cursor });
     }
 
-    pub fn clear(&mut self, node: &NodeId) -> bool {
-        self.skips.remove(node).is_some()
+    pub fn clear(&mut self, address: &Address) -> bool {
+        self.skips.remove(address).is_some()
     }
 
-    pub fn contains(&self, node: &NodeId) -> bool {
-        self.skips.contains_key(node)
+    pub fn contains(&self, address: &Address) -> bool {
+        self.skips.contains_key(address)
     }
 
-    /// When the card was skipped and when that runs out, if its source
-    /// has not moved since.
-    fn held(&self, node: &NodeId, cursor: &str, now: Timestamp) -> Option<(Timestamp, Timestamp)> {
-        let skip = self.skips.get(node).filter(|skip| skip.cursor == cursor)?;
+    /// Whether a skip still holds the address, given where its source
+    /// stands now: when it was skipped and when the skip runs out.
+    fn held(
+        &self,
+        address: &Address,
+        cursor: &str,
+        now: Timestamp,
+    ) -> Option<(Timestamp, Timestamp)> {
+        let skip = self.skips.get(address)?;
         let gone = skip.at + curve::SKIP_HOLD;
-        (now < gone).then_some((skip.at, gone))
+        (skip.cursor == cursor && now < gone).then_some((skip.at, gone))
     }
 }
 
-/// One reason a node wants the user. A node's card is its strongest.
+/// One reason an address wants the user, as weighed.
 struct Part {
     curve: Curve,
     reason: String,
-    /// On top of the curve: the user having just written to it.
-    bonus: f64,
     cursor: String,
-    /// Said by the node's source, rather than by the user's own dates: the
-    /// kind a snooze ending moves to count from its end.
-    from_source: bool,
-    /// An agent reply to the user's message at this time, soon enough
-    /// after it to reach them through a snooze said before it.
+    bonus: f64,
     breaks_snooze_set_by: Option<Timestamp>,
-    /// When somebody else wrote, in a conversation where each message
-    /// makes a snoozed card come back a little higher.
     others: Vec<Timestamp>,
+    /// From a source, which a snooze's end moves; the user's own dates
+    /// stand where they were said.
+    from_source: bool,
 }
 
 impl Part {
-    fn source(curve: Curve, reason: String, cursor: String) -> Self {
+    fn claimed(claim: &Claim) -> Self {
         Self {
-            curve,
-            reason,
-            bonus: 0.0,
-            cursor,
+            curve: claim.curve,
+            reason: claim.reason.clone(),
+            cursor: claim.cursor.clone(),
+            bonus: claim.bonus,
+            breaks_snooze_set_by: claim.breaks_snooze_set_by,
+            others: claim.others.clone(),
             from_source: true,
-            breaks_snooze_set_by: None,
-            others: Vec::new(),
         }
     }
 
     fn dated(curve: Curve, cursor: String) -> Self {
         Self {
+            curve,
+            reason: String::new(),
+            cursor,
+            bonus: 0.0,
+            breaks_snooze_set_by: None,
+            others: Vec::new(),
             from_source: false,
-            ..Self::source(curve, String::new(), cursor)
         }
     }
 }
 
-fn unix(ms: impl Into<i64>) -> Timestamp {
-    Timestamp::from_millisecond(ms.into()).unwrap_or(Timestamp::UNIX_EPOCH)
+/// The hand right now.
+pub fn rank(sources: &Sources<'_>, now: &Zoned) -> Hand {
+    rank_into(sources, now, None)
 }
 
-/// The hand, as everything stands at `now`.
-pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
-    rank_into(sources, now, cache, None)
-}
-
-/// [`rank`], with everything it weighed.
-pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> (Hand, Trace) {
-    let mut trace = Trace::default();
-    let hand = rank_into(sources, now, cache, Some(&mut trace));
+/// [`rank`], with everything it weighed, added to what the sources wrote
+/// into `trace` on their way to their claims.
+pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, mut trace: Trace) -> (Hand, Trace) {
+    let hand = rank_into(sources, now, Some(&mut trace));
     (hand, trace)
 }
 
-fn rank_into(
-    sources: &Sources<'_>,
-    now: &Zoned,
-    cache: &mut Cache,
-    mut trace: Option<&mut Trace>,
-) -> Hand {
+fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) -> Hand {
     let at = now.timestamp();
     let marks = sources.marks;
-    let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
+    let mut parts: BTreeMap<Address, Vec<Part>> = BTreeMap::new();
+    let mut named: HashMap<Address, (String, String)> = HashMap::new();
+    let mut under: HashMap<Address, Address> = HashMap::new();
 
-    // Topics (A1–A13): a topic that mentions the user where they have not
-    // seen it. An ask outranks a result; an fyi makes no card.
-    for (topic, _, held) in sources.chat.topics() {
-        let node = NodeId::Topic(topic);
-        // A13: nobody is left to answer, and what they said went with them.
-        if held.agents().next().is_some()
-            && !held
-                .agents()
-                .any(|agent| sources.agents.agent_workset(agent).is_some())
-        {
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&node, "no card: its agents are gone".to_owned());
-            }
-            continue;
-        }
-        let facts = marks.get(&node).facts();
-        let message = |seen: u64| MessageId(ChatSeq(seen));
-        // A mention is handled once the user is done with the topic
-        // through it, or wrote after it.
-        let seen = held.seen(facts.seen_topic().map(message));
-        if let Some(trace) = trace.as_deref_mut() {
-            trace.input(&node, "mentions", format!("{:?}", held.mentions));
-            trace.input(&node, "seen through", format!("{seen:?}"));
-        }
-        let unseen = held.unseen(seen).collect::<Vec<_>>();
-        let asks = unseen
-            .iter()
-            .filter(|mention| mention.kind == MentionKind::Ask);
-        let results = unseen
-            .iter()
-            .filter(|mention| mention.kind == MentionKind::Result);
-        // An ask waits from the first one unanswered; a result fades from
-        // the newest.
-        let (mention, curve, reason) = if let Some(ask) = asks.clone().next() {
-            (
-                ask,
-                Curve::Waiting {
-                    head_start: curve::AGENT_BLOCKED_HEAD_START,
-                    since: unix(ask.at.0 as i64),
-                },
-                "asks · {age}",
-            )
-        } else if let Some(result) = results.clone().next_back() {
-            (
-                result,
-                Curve::Fading {
-                    head_start: curve::AGENT_FINISHED_HEAD_START,
-                    since: unix(result.at.0 as i64),
-                    gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-                },
-                "result · {age} ago",
-            )
-        } else {
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&node, "no card: nothing unread".to_owned());
-            }
-            continue;
-        };
-        let since = unix(mention.at.0 as i64);
-        // The newest mention unseen is where the card's source last moved.
-        let cursor = unseen
-            .last()
-            .map_or(mention.message, |newest| newest.message);
-        let mut part = Part::source(curve, reason.to_owned(), cursor.0.0.to_string());
-        if let Some((_, wrote)) = held.user_wrote {
-            let spoke = unix(wrote.0 as i64);
-            part.bonus = curve::recency_bonus(spoke, at);
-            if since.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
-                part.breaks_snooze_set_by = Some(spoke);
-            }
-        }
-        parts.entry(node).or_default().push(part);
-    }
-
-    // Slack (S1–S6): whatever Slack itself is badging.
-    if let Some(slack) = sources.slack {
-        let model = slack.model;
-        let workspace = &model.workspace().0;
-        for (unit, attention) in model.asking() {
-            let Some(facts) = model.unit(unit) else {
-                continue;
-            };
-            // Done on another device, having seen this far.
-            let node = NodeId::Slack(slack_unit(workspace, unit));
-            let seen = marks.get(&node).facts().seen_slack().map(str::to_owned);
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.input(&node, "attention", format!("{attention:?}"));
-                trace.input(&node, "unit facts", format!("{facts:?}"));
-                trace.input(&node, "seen through", format!("{seen:?}"));
-            }
-            if seen
-                .as_deref()
-                .is_some_and(|seen| slack_ts_order(&facts.newest.0, seen).is_le())
-            {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.outcome(&node, "no card: done through its newest".to_owned());
-                }
-                continue;
-            }
-            let since = unix(
-                facts
-                    .newest
-                    .millis()
-                    .max(facts.first_seen_ms.min(at.as_millisecond())),
-            );
-            let people = facts.people.len() + usize::from(!facts.people.contains(model.self_id()));
-            let small = people <= curve::SLACK_SMALL_THREAD_PEOPLE;
-            let (state, curve, direct) = match attention {
-                Attention::ChannelTraffic => (
-                    "unread",
-                    Curve::Fading {
-                        head_start: curve::CHANNEL_TRAFFIC_HEAD_START,
-                        since,
-                        gone_days: match facts.others_replied {
-                            true => curve::CHANNEL_ANSWERED_GONE_DAYS,
-                            false => curve::CHANNEL_TRAFFIC_GONE_DAYS,
-                        },
-                    },
-                    false,
-                ),
-                Attention::DirectMessage => (
-                    "needs reply",
-                    waiting(curve::SLACK_DM_HEAD_START, since),
-                    true,
-                ),
-                Attention::Mentioned => (
-                    "needs reply",
-                    waiting(curve::SLACK_MENTION_HEAD_START, since),
-                    false,
-                ),
-                Attention::FollowedThread if small => (
-                    "needs reply",
-                    waiting(curve::SLACK_DM_HEAD_START, since),
-                    true,
-                ),
-                Attention::FollowedThread => (
-                    "needs reply",
-                    waiting(curve::SLACK_THREAD_HEAD_START, since),
-                    false,
-                ),
-            };
-            let why = rho_slack::model::reason_text(attention, &model.label(&unit.channel));
-            let mut part = Part::source(
-                curve,
-                format!("{why} · {state} · {{age}}"),
-                facts.newest.0.clone(),
-            );
-            if direct {
-                part.others = facts
-                    .from_others
-                    .iter()
-                    .map(|ts| unix(ts.millis()))
-                    .collect();
-            }
-            parts.entry(node).or_default().push(part);
+    for claim in sources.claims {
+        parts
+            .entry(claim.address.clone())
+            .or_default()
+            .push(Part::claimed(claim));
+        named
+            .entry(claim.address.clone())
+            .or_insert_with(|| (claim.title.clone(), claim.context.clone()));
+        if let Some(room) = &claim.under {
+            under.insert(claim.address.clone(), room.clone());
         }
     }
 
-    // The user's own dates (T1–T6, N2), on any node.
-    for (node, held) in marks.nodes() {
+    // The user's own dates (T1–T6, N2), on any address.
+    for (address, held) in marks.nodes() {
         let facts = held.facts();
         if let Some(todo) = facts.todo() {
-            parts.entry(node.clone()).or_default().push(Part::dated(
+            parts.entry(address.clone()).or_default().push(Part::dated(
                 Curve::Plate { since: todo.start },
                 format!("todo {}", todo.set.timestamp().as_millisecond()),
             ));
         }
         if let Some(deadline) = facts.deadline() {
-            parts.entry(node.clone()).or_default().push(Part::dated(
+            parts.entry(address.clone()).or_default().push(Part::dated(
                 Curve::Deadline {
                     by: deadline.by,
                     lead_days: deadline.lead_days,
@@ -394,20 +289,20 @@ fn rank_into(
         }
     }
 
-    // One card per node (X1): what the user said about it decides whether
-    // it shows, and its strongest part is the card.
+    // One card per address (X1): what the user said about it decides
+    // whether it shows, and its strongest part is the card.
     let mut steps = Vec::new();
     let mut cards = Vec::new();
-    for (node, mut node_parts) in parts {
-        let held = marks.get(&node);
+    for (address, mut address_parts) in parts {
+        let held = marks.get(&address);
         if let Some(trace) = trace.as_deref_mut() {
             let facts = &held.facts;
             let recent = facts.len().saturating_sub(12);
             for entry in &facts[recent..] {
-                trace.input(&node, "fact", format!("{} {:?}", entry.at, entry.fact));
+                trace.input(&address, "fact", format!("{} {:?}", entry.at, entry.fact));
             }
-            let weighed = trace.nodes.entry(node.clone()).or_default();
-            weighed.parts = node_parts
+            let weighed = trace.nodes.entry(address.clone()).or_default();
+            weighed.parts = address_parts
                 .iter()
                 .map(|part| {
                     format!(
@@ -427,27 +322,20 @@ fn rank_into(
         if held.deleted || held.facts().muted() {
             if let Some(trace) = trace.as_deref_mut() {
                 let why = if held.deleted { "deleted" } else { "muted" };
-                trace.outcome(&node, format!("no card: {why}"));
+                trace.outcome(&address, format!("no card: {why}"));
             }
             continue;
         }
         if let Some((pile, _)) = held.facts().pile() {
             if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&node, format!("no card: on the pile {pile}"));
+                trace.outcome(&address, format!("no card: on the pile {pile}"));
             }
             continue;
         }
-        // A snooze on a Slack room holds every thread in it too.
-        let room = match &node {
-            NodeId::Slack(unit) if unit.thread.is_some() => Some(NodeId::Slack(SlackUnit {
-                thread: None,
-                ..unit.clone()
-            })),
-            _ => None,
-        };
-        let snoozes: Vec<Snooze> = std::iter::once(&node)
-            .chain(room.as_ref())
-            .filter_map(|node| marks.get(node).facts().snooze())
+        // A snooze on the room holds everything in it too.
+        let snoozes: Vec<Snooze> = std::iter::once(&address)
+            .chain(under.get(&address))
+            .filter_map(|address| marks.get(address).facts().snooze())
             .collect();
         // Z1, and Z4's way through.
         if let Some(snooze) = snoozes
@@ -457,11 +345,12 @@ fn rank_into(
         {
             steps.push(snooze.until);
             let set = snooze.set.timestamp();
-            node_parts.retain(|part| part.breaks_snooze_set_by.is_some_and(|spoke| set <= spoke));
-            if node_parts.is_empty() {
+            address_parts
+                .retain(|part| part.breaks_snooze_set_by.is_some_and(|spoke| set <= spoke));
+            if address_parts.is_empty() {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.outcome(
-                        &node,
+                        &address,
                         format!(
                             "no card: snoozed until {} (said {})",
                             snooze.until, snooze.set
@@ -471,15 +360,15 @@ fn rank_into(
                 continue;
             }
         }
-        // Z2 and Z5: a node back from a snooze counts from the snooze's
-        // end, a little higher for every message it slept through.
+        // Z2 and Z5: an address back from a snooze counts from the
+        // snooze's end, a little higher for every message it slept through.
         if let Some(snooze) = snoozes
             .iter()
             .filter(|snooze| snooze.until <= at)
             .max_by_key(|snooze| snooze.until)
         {
             let set = snooze.set.timestamp();
-            for part in node_parts.iter_mut().filter(|part| part.from_source) {
+            for part in address_parts.iter_mut().filter(|part| part.from_source) {
                 match &mut part.curve {
                     Curve::Waiting { since, .. } | Curve::Fading { since, .. }
                         if *since < snooze.until =>
@@ -497,33 +386,33 @@ fn rank_into(
                 }
             }
         }
-        for part in &node_parts {
+        for part in &address_parts {
             steps.extend(part.curve.steps());
         }
-        let Some((part, priority)) = node_parts
+        let Some((part, priority)) = address_parts
             .iter()
             .map(|part| (part, part.curve.priority(at) + part.bonus))
             .filter(|(_, priority)| *priority > DEAL_QUEUE_FLOOR)
             .max_by(|a, b| a.1.total_cmp(&b.1))
         else {
             if let Some(trace) = trace.as_deref_mut() {
-                let best = node_parts
+                let best = address_parts
                     .iter()
                     .map(|part| part.curve.priority(at) + part.bonus)
                     .fold(f64::NEG_INFINITY, f64::max);
-                trace.outcome(&node, format!("no card: below the floor at {best:.3}"));
+                trace.outcome(&address, format!("no card: below the floor at {best:.3}"));
             }
             continue;
         };
-        let skip = sources.skips.held(&node, &part.cursor, at);
+        let skip = sources.skips.held(&address, &part.cursor, at);
         if let Some(trace) = trace.as_deref_mut() {
             let snoozes: Vec<String> = snoozes
                 .iter()
                 .map(|snooze| format!("until {} (said {})", snooze.until, snooze.set))
                 .collect();
-            trace.input(&node, "snoozes", format!("{snoozes:?}"));
+            trace.input(&address, "snoozes", format!("{snoozes:?}"));
             trace.outcome(
-                &node,
+                &address,
                 format!(
                     "card at {:.3}{}",
                     priority,
@@ -536,21 +425,19 @@ fn rank_into(
         if let Some((_, gone)) = skip {
             steps.push(gone);
         }
+        let (title, context) = named
+            .remove(&address)
+            .unwrap_or_else(|| name(sources, &address));
         cards.push((
             skip.map(|(skipped, _)| skipped),
             Card {
-                kind: match node {
-                    NodeId::Topic(_) => CardKind::Topic,
-                    NodeId::Slack(_) => CardKind::Slack,
-                    _ => CardKind::Dated,
-                },
-                title: String::new(),
-                context: String::new(),
+                title,
+                context,
                 label: part.curve.label(&part.reason, at),
                 priority,
                 cursor: part.cursor.clone(),
                 skipped: skip.is_some(),
-                node,
+                address,
             },
         ));
     }
@@ -561,125 +448,49 @@ fn rank_into(
     // round again.
     cards.sort_by(
         |(a_skipped, a), (b_skipped, b)| match (a_skipped, b_skipped) {
-            (Some(a_skipped), Some(b_skipped)) => {
-                a_skipped.cmp(b_skipped).then_with(|| a.node.cmp(&b.node))
-            }
+            (Some(a_skipped), Some(b_skipped)) => a_skipped
+                .cmp(b_skipped)
+                .then_with(|| a.address.cmp(&b.address)),
             (Some(_), None) => std::cmp::Ordering::Greater,
             (None, Some(_)) => std::cmp::Ordering::Less,
             (None, None) => b
                 .priority
                 .total_cmp(&a.priority)
-                // A topic wins an exact tie: it is the user's own work
-                // coming back.
-                .then_with(|| (b.kind == CardKind::Topic).cmp(&(a.kind == CardKind::Topic)))
-                .then_with(|| a.node.cmp(&b.node)),
+                .then_with(|| a.address.cmp(&b.address)),
         },
     );
-    let mut cards: Vec<Card> = cards.into_iter().map(|(_, card)| card).collect();
-    for card in &mut cards {
-        card.title = title(sources, &card.node, cache);
-        card.context = context(sources, &card.node);
-    }
     Hand {
-        cards,
+        cards: cards.into_iter().map(|(_, card)| card).collect(),
         next_change: steps.into_iter().filter(|step| *step > at).min(),
     }
 }
 
-fn waiting(head_start: f64, since: Timestamp) -> Curve {
-    Curve::Waiting { head_start, since }
-}
-
-/// The node a Slack unit is.
-pub fn slack_unit(workspace: &str, unit: &Unit) -> SlackUnit {
-    SlackUnit {
-        workspace: workspace.to_owned(),
-        channel: unit.channel.0.clone(),
-        thread: unit.thread.as_ref().map(|ts| ts.0.clone()),
-    }
-}
-
-/// The Slack model's unit for a node.
-pub fn model_unit(unit: &SlackUnit) -> Unit {
-    Unit {
-        channel: rho_slack::types::ChannelId(unit.channel.clone()),
-        thread: unit.thread.clone().map(rho_slack::types::Ts),
-    }
-}
-
-/// What a node is called on a card.
-pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String {
-    match node {
-        NodeId::Agent(agent_id) => sources
-            .agents
-            .agent_human_name(*agent_id)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
-        NodeId::Topic(topic) => sources
-            .chat
-            .topic(*topic)
-            .map_or_else(|| "topic".to_owned(), |(_, held)| held.name.clone()),
-        NodeId::Slack(unit) => {
-            let Some(slack) = sources.slack else {
-                return unit.channel.clone();
-            };
-            let unit = model_unit(unit);
-            let Some(newest) = slack.model.unit(&unit).map(|facts| facts.newest.clone()) else {
-                return slack.model.label(&unit.channel);
-            };
-            if let Some((read, title)) = cache.titles.get(&unit)
-                && *read == newest
-            {
-                return title.clone();
-            }
-            let title = slack
-                .mirror
-                .map(|mirror| rho_slack::mirror::unit_summary(slack.model, mirror, &unit))
-                .unwrap_or_default();
-            cache.titles.insert(unit, (newest, title.clone()));
-            title
-        }
-        NodeId::Note(_) => match sources.marks.get(node).title() {
+/// What an address only the user's dates brought up is called: a note by
+/// its first line, a label by its path, anything else as its system says,
+/// filed under its labels.
+fn name(sources: &Sources<'_>, address: &Address) -> (String, String) {
+    let marks = sources.marks;
+    let title = if address.as_note().is_some() {
+        match marks.get(address).title() {
             "" => "untitled note".to_owned(),
             title => title.to_owned(),
-        },
-        NodeId::Label(id) => sources.marks.label_path(*id),
-        NodeId::PullRequest { repo, number } => format!("{repo}#{number}"),
-    }
-}
-
-/// Where a node is: a Slack unit's conversation, or the labels on it.
-pub fn context(sources: &Sources<'_>, node: &NodeId) -> String {
-    if let (NodeId::Slack(unit), Some(slack)) = (node, sources.slack) {
-        return slack.model.label(&model_unit(unit).channel);
-    }
-    if let NodeId::Topic(topic) = node {
-        return topic_context(sources, *topic);
-    }
-    let marks = sources.marks;
-    marks
-        .get(node)
+        }
+    } else if let Some(label) = address.as_label() {
+        marks.label_path(label)
+    } else if let Some((title, context)) = (sources.names)(address) {
+        return (title, context);
+    } else {
+        address.key().to_owned()
+    };
+    let context = marks
+        .get(address)
         .labels
         .iter()
-        .filter(|label| !marks.get(&NodeId::Label(**label)).deleted)
+        .filter(|label| !marks.get(&Address::label(**label)).deleted)
         .map(|label| marks.label_path(*label))
         .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Where a topic is: its stream, and its host when the window holds more
-/// than one.
-fn topic_context(sources: &Sources<'_>, topic: HostTopic) -> String {
-    let stream = sources.chat.stream_name(topic).unwrap_or_default();
-    match sources.chat.topic(topic) {
-        Some((host, _)) if sources.agents.hosts().count() > 1 => {
-            format!("{}/{stream}", sources.agents.host_name(host))
-        }
-        _ => stream.to_owned(),
-    }
+        .join(", ");
+    (title, context)
 }
 
 #[cfg(test)]

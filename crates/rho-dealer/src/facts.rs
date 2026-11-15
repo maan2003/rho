@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use jiff::{Timestamp, Zoned};
 use senax_encoder::{Decode, Encode};
 
-use crate::node::NodeId;
+use crate::address::Address;
 use crate::until::Until;
 
 /// A device that writes entries. The ledger names it; here it only tells
@@ -80,35 +80,35 @@ impl Ord for Entry {
 pub enum Fact {
     /// Out of the way until then.
     Snooze {
-        node: NodeId,
+        node: Address,
         until: Until,
     },
     /// On the user's plate until settled: from `start`, or from when it was
     /// said. Handles what the user had seen, and takes back a snooze.
     Todo {
-        node: NodeId,
+        node: Address,
         start: Option<Until>,
         seen: Seen,
     },
     /// Due by `by`, pressing from `lead_days` before.
     Deadline {
-        node: NodeId,
+        node: Address,
         by: Until,
         lead_days: u32,
     },
     /// Done, having seen this far: takes back the node's todo, deadline
     /// and snooze.
     Settled {
-        node: NodeId,
+        node: Address,
         seen: Seen,
     },
     /// Nothing from the node reaches the user, until unmuted. For every
     /// node but a Slack one, which Slack mutes itself.
     Mute {
-        node: NodeId,
+        node: Address,
     },
     Unmute {
-        node: NodeId,
+        node: Address,
     },
 
     /// Makes a label, or renames or moves it.
@@ -127,19 +127,19 @@ pub enum Fact {
         url: Option<String>,
     },
     Labeled {
-        node: NodeId,
+        node: Address,
         label: uuid::Uuid,
         present: bool,
     },
     /// What the user calls a node, over what its source calls it.
     Named {
-        node: NodeId,
+        node: Address,
         name: Option<String>,
     },
     /// What a node is about.
     About {
-        node: NodeId,
-        about: Option<NodeId>,
+        node: Address,
+        about: Option<Address>,
     },
 
     /// Takes back an entry: undo.
@@ -150,7 +150,7 @@ pub enum Fact {
     /// the source brings it back. Last, as a later variant: entries decode
     /// by variant order.
     Piled {
-        node: NodeId,
+        node: Address,
         pile: String,
     },
     /// Which agent host work under a label runs on: the host's identity
@@ -164,14 +164,14 @@ pub enum Fact {
     /// now: done is how the user says they read a topic. It still counts
     /// as seen, and takes nothing back. Later still than `Host`.
     Read {
-        node: NodeId,
+        node: Address,
         seen: Seen,
     },
 }
 
 impl Fact {
     /// The node the fact is about; `None` for a retract.
-    pub fn node(&self) -> Option<NodeId> {
+    pub fn node(&self) -> Option<Address> {
         match self {
             Self::Snooze { node, .. }
             | Self::Piled { node, .. }
@@ -187,7 +187,7 @@ impl Fact {
             Self::Label { label, .. }
             | Self::Unlabel { label }
             | Self::Repository { label, .. }
-            | Self::Host { label, .. } => Some(NodeId::Label(*label)),
+            | Self::Host { label, .. } => Some(Address::label(*label)),
             Self::Retract { .. } => None,
         }
     }
@@ -401,8 +401,8 @@ mod tests {
         }
     }
 
-    fn agent() -> NodeId {
-        NodeId::Agent(rho_agent_types::AgentId::from_encoded("00jvj4xuk96p").unwrap())
+    fn agent() -> Address {
+        Address::new("agent", "00jvj4xuk96p")
     }
 
     #[test]
