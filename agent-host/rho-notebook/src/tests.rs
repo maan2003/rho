@@ -491,7 +491,14 @@ async fn an_exec_ends_when_its_command_ends_just_before_the_wait() {
     finished(&wake, &cell).await;
     let after = notebook.run("print('loop free')".into());
     finished(&wake, &after).await;
-    assert!(notebook.report().unwrap().render().text.contains("loop free"));
+    assert!(
+        notebook
+            .report()
+            .unwrap()
+            .render()
+            .text
+            .contains("loop free")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
