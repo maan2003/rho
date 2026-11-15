@@ -111,11 +111,6 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    pub(crate) fn list_pages(&self) -> Result<Vec<PageRecord>> {
-        let value = self.bridge()?.request("list", json!({ "limit": 1000 }))?;
-        serde_json::from_value(value).context("decode browser page list")
-    }
-
     fn bridge(&self) -> Result<Arc<Bridge>> {
         self.bridge
             .lock()

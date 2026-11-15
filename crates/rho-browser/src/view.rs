@@ -744,8 +744,9 @@ impl BrowserModel {
         ) {
             return;
         }
+        // The runtime reads as exited from here, so the next page wanted
+        // launches a fresh one.
         self.browser.shutdown_background();
-        crate::reset_runtime(&self.browser, cx);
     }
 
     fn begin_frame_barrier(&mut self, handoff: PageHandoff) {
@@ -1227,6 +1228,10 @@ impl BrowserView {
 
     pub fn model(&self) -> &Entity<BrowserModel> {
         &self.model
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
     }
 
     fn local_position(&self, position: gpui::Point<gpui::Pixels>) -> (f64, f64) {
