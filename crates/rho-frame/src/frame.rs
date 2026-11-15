@@ -28,6 +28,7 @@ use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
     CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
 };
+use crate::phone::{Layout, Phone};
 use crate::surface::{AnySurface, Subject};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
@@ -59,8 +60,8 @@ pub struct Frame {
     pub(crate) home: Entity<HomeView>,
     log: Entity<MessageLog>,
     pub(crate) minibuffer: Option<Minibuffer>,
-    menu: Option<OpenMenu>,
-    menu_focus: FocusHandle,
+    pub(crate) menu: Option<OpenMenu>,
+    pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
     overlay_return: Option<FocusHandle>,
     echo: Option<Echo>,
@@ -71,6 +72,8 @@ pub struct Frame {
     pub(crate) chime: Rc<dyn Fn()>,
     /// What `find:` listed last, so the chosen title opens its address.
     found: Vec<Found>,
+    /// A flick or a snap in progress, while the window is a phone's.
+    pub(crate) phone: Phone,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -129,6 +132,7 @@ impl Frame {
             signals: Signals::default(),
             chime,
             found: Vec::new(),
+            phone: Phone::default(),
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
         };
@@ -442,7 +446,7 @@ impl Frame {
     }
 
     /// One step back: to the menu this one is standing on, or out.
-    fn menu_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn menu_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.menu.as_mut() else {
             return;
         };
@@ -533,9 +537,24 @@ impl Frame {
         }
     }
 
+    /// Row `index` of the open menu, picked by pointer: a suffix closes
+    /// the menu, as its key would, and a count typed before carries.
+    pub(crate) fn click_menu_row(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closes = self.menu.as_ref().is_some_and(|open| {
+            open.transient.items()[index].kind() == rho_window::transient::Kind::Suffix
+        });
+        let count = self.menu.as_ref().and_then(|open| open.carried_count);
+        self.run_menu_row(index, count, closes, window, cx);
+    }
+
     /// `space`: the frame's rows, the surface's, and every system's for
     /// what is in view.
-    fn root_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn root_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let point = self.point(cx);
         let mut rows = Rows::new("rho");
         rows.push(Row::run("h", "home", |frame, window, cx| {
@@ -624,7 +643,7 @@ impl Frame {
 
     /// `tab`: the verdicts, over whatever card is in view. With no card
     /// it goes Home, and from Home it is the way back.
-    fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(window, cx);
             self.toggle_home(window, cx);
@@ -662,21 +681,7 @@ impl Frame {
             "todo (count: days from)",
             on(|frame, target, count, window, cx| frame.todo(target, count, window, cx)),
         ));
-        let mut snooze = Rows::new("snooze for").counted();
-        for (key, description, unit) in [
-            ("m", "minutes", SnoozeUnit::Minutes),
-            ("h", "hours", SnoozeUnit::Hours),
-            ("d", "days", SnoozeUnit::Days),
-            ("w", "weeks", SnoozeUnit::Weeks),
-        ] {
-            let target = target.clone();
-            snooze.push(Row::counted(
-                key,
-                description,
-                move |frame, count, window, cx| frame.snooze(&target, unit, count, window, cx),
-            ));
-        }
-        rows.push(Row::menu("s", "snooze", snooze));
+        rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
         rows.push(Row::counted(
             "p",
             "pile",
@@ -696,7 +701,7 @@ impl Frame {
         self.open_menu(rows, window, cx);
     }
 
-    fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home_in_view() {
             true => self.back(window, cx),
             false => self.open_home(window, cx),
@@ -892,7 +897,7 @@ impl Frame {
         cx.notify();
     }
 
-    fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
@@ -912,7 +917,7 @@ impl Frame {
         cx.notify();
     }
 
-    fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
@@ -946,7 +951,7 @@ impl Frame {
     }
 
     /// Enter on Home: the row under the cursor.
-    fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home.read(cx).cursor_target(cx) {
             HomeTarget::Address(address) => self.open(address, window, cx),
             HomeTarget::Pile(name) => self.open_pile(name, window, cx),
@@ -959,10 +964,48 @@ impl Frame {
     fn render_status_line(
         &mut self,
         text_style: &gpui::TextStyle,
+        layout: Layout,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
+        let mode = self
+            .mode_indicator
+            .read(cx)
+            .plain_mode(cx)
+            .unwrap_or_else(|| "normal".to_owned());
+        let mode_color = match mode.contains("insert") {
+            true => status.warning,
+            false => colors.terminal_ansi_bright_cyan,
+        };
+        let mode = mode_word(&mode);
+        let lamp = self.signals.lamp_on.then_some("●");
+        let unwell = self.unwell_hosts();
+        // A heading is cut to what the line has room for: on the desk a
+        // fixed length does, but a phone is too narrow to guess at, and a
+        // cut by length there would push the card's state off the edge.
+        let right_words = lamp
+            .into_iter()
+            .chain(unwell.as_deref())
+            .chain([mode.as_str()])
+            .collect::<Vec<_>>();
+        let fit = |path: &str, state: &str| match layout {
+            Layout::Desktop => (truncate_path(path), state.to_owned()),
+            Layout::Phone => {
+                let measure = crate::phone::measure(text_style, window);
+                let right = right_words
+                    .iter()
+                    .map(|words| measure(words) + px(12.))
+                    .fold(px(0.), |sum, width| sum + width);
+                crate::phone::fit_heading(
+                    path,
+                    state,
+                    window.viewport_size().width - right,
+                    measure,
+                )
+            }
+        };
         // An echo is the answer to the key just pressed, so it takes the
         // line while it lasts. Otherwise the line is about what is in view:
         // a card says which card and why; anything else says its name.
@@ -973,40 +1016,27 @@ impl Frame {
                 .into_any_element(),
             (None, Some(address)) => {
                 let card = self.card_for(&address, cx);
+                let (heading, label) = fit(&card.heading(), &card.label);
                 div()
                     .flex()
                     .flex_row()
                     .gap_3()
-                    .child(truncate_path(&card.heading()))
-                    .child(div().text_color(status.warning).child(card.label.clone()))
+                    .child(heading)
+                    .child(div().text_color(status.warning).child(label))
                     .into_any_element()
             }
             (None, None) => div()
-                .child(truncate_path(&self.current_surface().title(cx)))
+                .child(fit(&self.current_surface().title(cx), "").0)
                 .into_any_element(),
         };
-        let mode = self
-            .mode_indicator
-            .read(cx)
-            .plain_mode(cx)
-            .unwrap_or_else(|| "normal".to_owned());
-        let mode_color = match mode.contains("insert") {
-            true => status.warning,
-            false => colors.terminal_ansi_bright_cyan,
-        };
-        let lamp = self
-            .signals
-            .lamp_on
-            .then(|| div().text_color(status.warning).child("●"));
-        let unwell = self.unwell_hosts();
         let right = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_3()
-            .children(lamp)
+            .children(lamp.map(|lamp| div().text_color(status.warning).child(lamp)))
             .children(unwell.map(|text| div().text_color(status.error).child(text)))
-            .child(div().text_color(mode_color).child(mode_word(&mode)));
+            .child(div().text_color(mode_color).child(mode));
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -1062,6 +1092,25 @@ impl Frame {
     }
 }
 
+/// How long `target` sleeps: a unit, and the count typed before it.
+pub(crate) fn snooze_rows(target: &Address) -> Rows {
+    let mut snooze = Rows::new("snooze for").counted();
+    for (key, description, unit) in [
+        ("m", "minutes", SnoozeUnit::Minutes),
+        ("h", "hours", SnoozeUnit::Hours),
+        ("d", "days", SnoozeUnit::Days),
+        ("w", "weeks", SnoozeUnit::Weeks),
+    ] {
+        let target = target.clone();
+        snooze.push(Row::counted(
+            key,
+            description,
+            move |frame, count, window, cx| frame.snooze(&target, unit, count, window, cx),
+        ));
+    }
+    snooze
+}
+
 fn status_words(status: &HostStatus) -> String {
     match status {
         HostStatus::Connecting => "connecting".to_owned(),
@@ -1113,11 +1162,12 @@ impl Focusable for Frame {
 }
 
 impl Render for Frame {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
-        div()
+        let layout = Layout::of(window.viewport_size().width);
+        let frame = div()
             .id("rho-frame")
             .relative()
             .size_full()
@@ -1173,7 +1223,22 @@ impl Render for Frame {
                     this.minibuffer_complete(window, cx)
                 }),
             )
-            .child(self.render_status_line(&text_style, cx))
+            .child(self.render_status_line(&text_style, layout, window, cx));
+        if layout == Layout::Phone {
+            let body = self.render_phone_surface(&surface, cx);
+            let bar = self.render_phone_bar(window, cx);
+            let sheet = self.render_menu_sheet(&text_style, cx);
+            return frame
+                .child(body)
+                .children(
+                    self.minibuffer
+                        .as_ref()
+                        .map(|minibuffer| minibuffer.render(&text_style, cx)),
+                )
+                .child(bar)
+                .children(sheet);
+        }
+        frame
             .child(div().flex_1().min_h_0().w_full().child(surface.view()))
             // The menu, pinned to the bottom edge and drawn over the buffer
             // rather than in it: nothing reflows, and the point stays where
@@ -1193,13 +1258,7 @@ impl Render for Frame {
                                 row.id(("rho-menu-row", index))
                                     .cursor_pointer()
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        let closes = this.menu.as_ref().is_some_and(|open| {
-                                            open.transient.items()[index].kind()
-                                                == rho_window::transient::Kind::Suffix
-                                        });
-                                        let count =
-                                            this.menu.as_ref().and_then(|open| open.carried_count);
-                                        this.run_menu_row(index, count, closes, window, cx);
+                                        this.click_menu_row(index, window, cx);
                                         cx.stop_propagation();
                                     }))
                                     .into_any_element()

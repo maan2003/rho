@@ -8,7 +8,9 @@
 //! minibuffer ([`minibuffer`]), the menus ([`menu`]), the keymap
 //! ([`keys`]), the attached agent hosts ([`hosts`]), the user's own facts
 //! in the ledger and the dealer that ranks what wants them
-//! ([`attention`], [`deal`]), and Home ([`home`]).
+//! ([`attention`], [`deal`]), and Home ([`home`]). A window narrow
+//! enough to be a phone's is laid out for touch by `phone`, over the
+//! same history and the same surfaces.
 //!
 //! Everything the user looks at belongs to a [`System`]: chat, Slack,
 //! agents, notes, files, the browser. A system plugs in under address
@@ -32,6 +34,7 @@ pub mod link;
 pub mod log;
 pub mod menu;
 pub mod minibuffer;
+mod phone;
 pub mod surface;
 pub mod system;
 pub mod when;
