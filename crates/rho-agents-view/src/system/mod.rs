@@ -119,10 +119,16 @@ impl AgentsSystem {
     /// Whether `agent` of the host whose database seed is `machine_seed`
     /// still exists: `true` for a host this client has not heard from,
     /// since nothing says otherwise.
-    pub fn alive(&self, machine_seed: u64, agent: AgentId) -> bool {
+    /// What the chat calls an agent of the host with `machine_seed`, and
+    /// `None` once the agent is gone. A host not attached keeps every
+    /// agent of its threads, by id.
+    pub fn agent_label(&self, machine_seed: u64, agent: AgentId) -> Option<String> {
         match self.host_of_seed(machine_seed) {
-            Some(_) => self.registry.mirrored(agent).is_some(),
-            None => true,
+            Some(_) => self
+                .registry
+                .mirrored(agent)
+                .map(|_| self.registry.agent_display_label(agent)),
+            None => Some(agent.encoded()),
         }
     }
 

@@ -72,9 +72,9 @@ struct Slot {
     machine_seed: Option<u64>,
 }
 
-/// Whether an agent of the host with this database seed still exists;
-/// the agents system answers, the chat only asks.
-pub type Alive = Rc<dyn Fn(u64, AgentId, &App) -> bool>;
+/// What to call an agent of the host with this database seed, and `None`
+/// once it is gone; the agents system answers, the chat only asks.
+pub type AgentLabel = Rc<dyn Fn(u64, AgentId, &App) -> Option<String>>;
 
 pub struct ChatSystem {
     cache: Cache,
@@ -86,8 +86,9 @@ pub struct ChatSystem {
     drafts: HashMap<(u64, Option<MessageId>), String>,
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
-    /// Whether an agent still exists on a host; the agents system knows.
-    alive: Alive,
+    /// Whether an agent still exists on a host, and its label; the agents
+    /// system knows.
+    agent_label: AgentLabel,
     _pump: Task<()>,
 }
 
@@ -130,15 +131,22 @@ impl ChatSystem {
             chats,
             events,
             frame,
-            alive: Rc::new(|_, _, _| true),
+            agent_label: Rc::new(|_, agent, _| Some(agent.encoded())),
             _pump: pump,
         }
     }
 
-    /// Tells the chat which agents still exist, for the cards: a thread
-    /// whose agents are all gone raises none.
-    pub fn set_alive(&mut self, alive: Alive) {
-        self.alive = alive;
+    /// Tells the chat which agents still exist and what to call them: a
+    /// thread whose agents are all gone raises no card, and a thread's
+    /// participants read by label.
+    pub fn set_agent_label(&mut self, agent_label: AgentLabel) {
+        self.agent_label = agent_label;
+    }
+
+    /// The label of an agent of the host with `machine_seed`, `None` once
+    /// it is gone.
+    pub fn agent_label(&self, machine_seed: u64, agent: AgentId, cx: &App) -> Option<String> {
+        (self.agent_label)(machine_seed, agent, cx)
     }
 
     pub fn chat(&self, machine_seed: u64) -> Option<&HostChat> {
@@ -382,7 +390,7 @@ impl ChatSystem {
     ) -> Option<R> {
         let chat = self.chats.get(&machine_seed)?;
         let name = self.host_name(machine_seed);
-        let alive = |agent: AgentId| (self.alive)(machine_seed, agent, cx);
+        let alive = |agent: AgentId| self.agent_label(machine_seed, agent, cx).is_some();
         let host = cards::Host {
             machine_seed,
             chat,

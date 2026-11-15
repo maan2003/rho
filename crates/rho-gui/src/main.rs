@@ -205,14 +205,15 @@ fn run() -> Result<()> {
                     cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
                 let agents = cx
                     .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
-                // The chat ranks a thread by the agents still in it; the
-                // agents system knows which still exist.
-                let alive = agents.downgrade();
+                // The chat ranks a thread by the agents still in it and
+                // names them; the agents system knows both.
+                let labels = agents.downgrade();
                 chat.update(cx, |chat, _| {
-                    chat.set_alive(Rc::new(move |seed, agent, cx| {
-                        alive
-                            .upgrade()
-                            .is_none_or(|agents| agents.read(cx).alive(seed, agent))
+                    chat.set_agent_label(Rc::new(move |seed, agent, cx| {
+                        labels.upgrade().map_or_else(
+                            || Some(agent.encoded()),
+                            |agents| agents.read(cx).agent_label(seed, agent),
+                        )
                     }))
                 });
                 let browser = cx.new(|cx| {

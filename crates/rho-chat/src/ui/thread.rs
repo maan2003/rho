@@ -189,7 +189,7 @@ impl ThreadView {
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.log.clone(), cx);
-        let items = items(system, thread);
+        let items = items(system, thread, cx);
         view.transcript.reconcile(items, cx);
         view.cursor_to_end(cx);
         view
@@ -202,7 +202,7 @@ impl ThreadView {
             let last = self.transcript.buffer().read(cx).max_point().row;
             self.cursor_row(cx) + 1 >= last
         };
-        let items = items(self.system.read(cx), self.thread);
+        let items = items(self.system.read(cx), self.thread, cx);
         self.transcript.reconcile(items, cx);
         if at_end {
             self.cursor_to_end(cx);
@@ -256,7 +256,7 @@ impl ThreadView {
 }
 
 /// The rows of `thread` as `system` holds it.
-fn items(system: &ChatSystem, thread: ThreadId) -> Vec<Item<Key, Class, Meta>> {
+fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class, Meta>> {
     let seed = thread.machine_seed;
     let Some(chat) = system.chat(seed) else {
         return vec![line(
@@ -294,10 +294,15 @@ fn items(system: &ChatSystem, thread: ThreadId) -> Vec<Item<Key, Class, Meta>> {
         items.push(message_item(message, Meta::None));
     }
     if !head.members.is_empty() {
+        // A gone agent keeps its place under its id: the thread was its.
         let names = head
             .members
             .iter()
-            .map(|agent| agent.encoded())
+            .map(|agent| {
+                system
+                    .agent_label(seed, *agent, cx)
+                    .unwrap_or_else(|| agent.encoded())
+            })
             .collect::<Vec<_>>()
             .join(", ");
         items.push(
