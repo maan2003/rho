@@ -3,9 +3,13 @@
 #
 # Create it at https://api.slack.com/apps ("Create New App", "From a
 # manifest"), install it to the workspace, and make an app-level token with
-# `connections:write` under "Basic Information". Then run `rho slack init`.
+# `connections:write` under "Basic Information". Then run `rho slack init`
+# with the bot token and, from "OAuth & Permissions", the user token.
 #
-# The scopes cover the methods in methods.json and nothing more.
+# The scopes cover the methods in methods.json and nothing more. The user
+# token is only for message search (`assistant.search.context`), which takes
+# a bot token only within a user's request; it reads public channels, as the
+# bot can.
 display_information:
   name: rho agents
 features:

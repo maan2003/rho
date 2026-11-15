@@ -361,6 +361,7 @@ fn spawn_slack_server(
     let router = slack_server::router(
         secret("SLACK_BOT_TOKEN"),
         secret("SLACK_APP_TOKEN"),
+        secret("SLACK_USER_TOKEN"),
         slack_api_url,
         url::Url::parse("https://files.slack.com/")?,
         events,

@@ -114,6 +114,16 @@ class AsyncBaseClient:
             self.posted(reply.data)
         return reply
 
+    async def assistant_search_context(self, *, query: str, **kwargs) -> AsyncSlackResponse:
+        """Searches messages with Slack's Real-time Search API. Not in upstream
+        slack_sdk 3.45.0. The host sends it with its user token, which reaches
+        public channels only; filters such as `in:<#C123>` and `from:<@U123>`
+        go in `query`. Lists such as `channel_types` are sent as JSON arrays.
+        https://docs.slack.dev/reference/methods/assistant.search.context
+        """
+        kwargs.update({"query": query})
+        return await self.api_call("assistant.search.context", json=kwargs)
+
     async def _request(self, *, http_verb, api_url, req_args) -> Dict[str, Any]:
         """Sends one request. `AsyncSlackResponse` pagination calls this for each page."""
         if self._http is None:

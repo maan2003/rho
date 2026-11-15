@@ -54,6 +54,23 @@ cursor pagination:
   `files_upload_v2` (through `files_getUploadURLExternal` and
   `files_completeUploadExternal`).
 
+To search messages, use `assistant_search_context` (Slack's Real-time
+Search API). It searches public channels only, including ones the bot is
+not in. Filters go in `query`, and each result has `channel_id`,
+`message_ts`, `thread_ts`, `author_user_id`, `content` and `permalink`:
+
+```python
+found = await slack.assistant_search_context(
+    query="deploy failed in:<#C0123> from:<@U0123> after:2026-11-01", sort="timestamp")
+for m in found["results"]["messages"]:
+    ...
+```
+
+It allows about 10 calls a minute; page with `cursor` only when needed.
+`rho_no_slack_user_token` means the host has no user token yet: ask the
+user to add the `search:read.public` user scope, reinstall the app and run
+`rho slack init` again.
+
 Writes need no approval: post when the task calls for it. The host refuses
 any other method with `rho_method_unavailable`, and an argument name the
 method does not declare with `rho_invalid_arguments: <names>`; both raise

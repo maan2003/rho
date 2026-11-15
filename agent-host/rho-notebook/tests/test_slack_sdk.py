@@ -110,6 +110,19 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((replies["method"], replies["query"]),
                          ("GET", {"channel": ["D1"], "ts": ["1.5"], "inclusive": ["1"]}))
 
+    async def test_message_search_sends_its_lists_as_json(self):
+        async def body():
+            found = await AsyncWebClient().assistant_search_context(
+                query="deploy in:<#C1>", channel_types=["public_channel"], limit=5, include_bots=False)
+            self.assertEqual(found["results"]["messages"][0]["thread_ts"], "1.0")
+
+        (search,) = await self.run_with({"assistant.search.context": {
+            "ok": True, "results": {"messages": [{"channel_id": "C1", "message_ts": "1.5", "thread_ts": "1.0"}]}}}, body)
+        self.assertEqual((search["method"], search["api"], search["query"]), ("POST", "assistant.search.context", {}))
+        self.assertTrue(search["headers"]["content-type"].startswith("application/json"))
+        self.assertEqual(json.loads(search["body"]), {
+            "query": "deploy in:<#C1>", "channel_types": ["public_channel"], "limit": 5, "include_bots": False})
+
     async def test_a_post_that_went_through_reaches_the_posted_hook(self):
         seen = []
 

@@ -191,6 +191,27 @@
       "initial_comment",
       "thread_ts"
     ],
+    "assistant.search.context": [
+      "query",
+      "channel_types",
+      "content_types",
+      "include_bots",
+      "include_deleted_users",
+      "before",
+      "after",
+      "include_context_messages",
+      "context_channel_id",
+      "cursor",
+      "limit",
+      "sort",
+      "sort_dir",
+      "include_message_blocks",
+      "highlight",
+      "term_clauses",
+      "modifiers",
+      "include_archived_channels",
+      "disable_semantic_search"
+    ],
     "rho.events": [
       "cursor",
       "timeout"
