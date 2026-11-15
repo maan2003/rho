@@ -1,8 +1,9 @@
 //! Native web-page resources for rho.
 //!
 //! The bundled extension owns client-local page identity and persistence; this
-//! crate owns browser runtime integration and GPUI page views. The agent host
-//! and Desk remain unaware of client-local browser processes.
+//! crate owns browser runtime integration and GPUI page views, and with the
+//! `ui` feature the system that plugs pages into the frame ([`ui`]). The
+//! browser runs in the GUI process; the agent host knows nothing of it.
 
 #![cfg(target_os = "linux")]
 
@@ -11,11 +12,14 @@ mod runtime;
 mod store;
 mod view;
 
-use std::path::Path;
+#[cfg(feature = "ui")]
+pub mod ui;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
+use gpui::{App, AppContext as _, Entity, Task};
 pub use native_host::{
     ExtensionCommandStats, PageMetadata, TabStateEvent, snapshot_extension_command_stats,
     snapshot_tab_state_events,
@@ -32,35 +36,85 @@ pub use view::{
     snapshot_handoff_events,
 };
 
-pub struct WebState {
-    state_dir: std::path::PathBuf,
-    socket_path: std::path::PathBuf,
-    runtime: Option<Arc<BrowserRuntime>>,
-    model: Option<Entity<PageModel>>,
+/// The browser this process runs: one Chrome, launched the first time a
+/// page is wanted and again if it died, and the one page model every page
+/// view shares. Whoever owns this owns the browser; dropping it shuts
+/// Chrome down.
+pub struct Browser {
+    state_dir: PathBuf,
+    socket_path: PathBuf,
+    running: Option<Running>,
 }
 
-impl Global for WebState {}
-
-pub fn init(state_dir: &Path, socket_path: std::path::PathBuf, cx: &mut App) {
-    cx.set_global(WebState {
-        state_dir: state_dir.to_owned(),
-        socket_path,
-        runtime: None,
-        model: None,
-    });
+struct Running {
+    runtime: Arc<BrowserRuntime>,
+    model: Entity<PageModel>,
 }
 
-fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
-    if let Some(runtime) = cx.global::<WebState>().runtime.clone() {
-        if !runtime.chrome_exited() {
-            return Ok(runtime);
+impl Browser {
+    /// A browser keeping its state under `state_dir`, its extension
+    /// talking to it over `socket_path`. Nothing launches yet.
+    pub fn new(state_dir: PathBuf, socket_path: PathBuf) -> Self {
+        Self {
+            state_dir,
+            socket_path,
+            running: None,
         }
-        tracing::warn!("browser process died without a compositor event; relaunching");
-        runtime.shutdown_background();
-        reset_runtime(&runtime, cx);
     }
-    let render = match gpui::linux_dmabuf_device() {
-        Some(device) => BrowserRenderConfig::DmaBuf(DmaBufConfig {
+
+    /// The page model, launching the browser when none runs.
+    pub fn model(&mut self, cx: &mut App) -> Result<Entity<PageModel>> {
+        Ok(self.running(cx)?.model.clone())
+    }
+
+    fn running(&mut self, cx: &mut App) -> Result<&Running> {
+        if let Some(running) = &self.running
+            && running.runtime.chrome_exited()
+        {
+            tracing::warn!("browser process died without a compositor event; relaunching");
+            running.runtime.shutdown_background();
+            self.running = None;
+        }
+        if self.running.is_none() {
+            let render = render_config()?;
+            let (runtime, session) =
+                BrowserRuntime::launch(&self.state_dir, &self.socket_path, render)?;
+            let runtime = Arc::new(runtime);
+            let model = cx.new(|cx| PageModel::new(runtime.clone(), session, cx));
+            self.running = Some(Running { runtime, model });
+        }
+        Ok(self.running.as_ref().expect("launched above"))
+    }
+
+    pub fn create_page(&mut self, launch_url: String, cx: &mut App) -> Task<Result<PageRecord>> {
+        let runtime = self.running(cx).map(|running| running.runtime.clone());
+        cx.background_spawn(async move { runtime?.create_page(&launch_url) })
+    }
+
+    /// Brings `id` up in the browser, launching it when none runs.
+    pub fn open_page(&mut self, id: PageId, cx: &mut App) -> Result<Entity<PageModel>> {
+        let model = self.model(cx)?;
+        model.update(cx, |model, cx| model.focus(id, cx));
+        Ok(model)
+    }
+
+    /// Closes `id`'s tab; `None` when no browser runs, so there is no tab.
+    pub fn close_page_if_running(&self, id: PageId, cx: &mut App) -> Option<Task<Result<()>>> {
+        let running = self.running.as_ref()?;
+        let runtime = running.runtime.clone();
+        let close_barrier = running.model.update(cx, |model, _| model.prepare_close(id));
+        Some(cx.background_spawn(async move {
+            if let Some(close_barrier) = close_barrier? {
+                close_barrier.await?;
+            }
+            runtime.close_page(id)
+        }))
+    }
+}
+
+fn render_config() -> Result<BrowserRenderConfig> {
+    match gpui::linux_dmabuf_device() {
+        Some(device) => Ok(BrowserRenderConfig::DmaBuf(DmaBufConfig {
             render_node: device.render_node.clone(),
             device_id: device.device_id,
             formats: device
@@ -68,95 +122,21 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
                 .iter()
                 .map(|format| (format.fourcc, format.modifier))
                 .collect(),
-        }),
+        })),
         None if std::env::var("RHO_BROWSER_SOFTWARE_SHM").as_deref() == Ok("1") => {
             tracing::warn!("using opt-in software SHM browser rendering");
-            BrowserRenderConfig::SoftwareShmQa
+            Ok(BrowserRenderConfig::SoftwareShmQa)
         }
-        None => {
-            return Err(anyhow::anyhow!(
-                "GPUI's Vulkan device does not support DMA-BUF import"
-            ));
-        }
-    };
-    let state_dir = cx.global::<WebState>().state_dir.clone();
-    let socket_path = cx.global::<WebState>().socket_path.clone();
-    let (runtime, session) = BrowserRuntime::launch(&state_dir, &socket_path, render)?;
-    let runtime = Arc::new(runtime);
-    let model = cx.new(|cx| PageModel::new(runtime.clone(), session, cx));
-    cx.update_global::<WebState, _>(|web, _| {
-        web.runtime = Some(runtime.clone());
-        web.model = Some(model);
-    });
-    Ok(runtime)
+        None => Err(anyhow::anyhow!(
+            "GPUI's Vulkan device does not support DMA-BUF import"
+        )),
+    }
 }
 
-fn reset_runtime(expected: &Arc<BrowserRuntime>, cx: &mut App) {
-    cx.update_global::<WebState, _>(|web, _| {
-        if web
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| Arc::ptr_eq(runtime, expected))
-        {
-            web.runtime = None;
-            web.model = None;
-        }
-    });
-}
-
-pub fn create_page(launch_url: String, cx: &mut App) -> Task<Result<PageRecord>> {
-    let runtime = runtime(cx);
-    cx.background_spawn(async move { runtime?.create_page(&launch_url) })
-}
-
-pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
-    runtime(cx).ok()?;
-    let model = cx.global::<WebState>().model.clone()?;
-    model.update(cx, |model, cx| model.focus(id, cx));
-    Some(model)
-}
-
-pub fn close_page(id: PageId, cx: &mut App) -> Task<Result<()>> {
-    let runtime = runtime(cx);
-    close_page_with_runtime(id, runtime, cx)
-}
-
-pub fn close_page_if_running(id: PageId, cx: &mut App) -> Option<Task<Result<()>>> {
-    let runtime = cx.global::<WebState>().runtime.clone()?;
-    Some(close_page_with_runtime(id, Ok(runtime), cx))
-}
-
-fn close_page_with_runtime(
-    id: PageId,
-    runtime: Result<Arc<BrowserRuntime>>,
-    cx: &mut App,
-) -> Task<Result<()>> {
-    let model = cx.global::<WebState>().model.clone();
-    let close_barrier = model.map(|model| model.update(cx, |model, _| model.prepare_close(id)));
-    cx.background_spawn(async move {
-        if let Some(close_barrier) = close_barrier
-            && let Some(close_barrier) = close_barrier?
-        {
-            close_barrier.await?;
-        }
-        runtime?.close_page(id)
-    })
-}
-
-/// The name says it: nothing running, nothing to list. That now includes
-/// "the browser was never set up in this process", which a page row on the
-/// map can reach before anyone opens a tab.
-pub fn list_pages_if_running(cx: &mut App) -> Option<Task<Result<Vec<PageRecord>>>> {
-    let runtime = cx.try_global::<WebState>()?.runtime.clone()?;
-    Some(cx.background_spawn(async move { runtime.list_pages() }))
-}
-
-pub fn page_handle(id: PageId, _cx: &App) -> String {
-    id.to_string()
-}
-
+/// What a page is called while the browser has it open: its title, or the
+/// host it is on.
 pub fn live_page_name(id: PageId) -> Option<String> {
-    let metadata = native_host::page_metadata(&id.to_string())?;
+    let metadata = native_host::page_metadata(id)?;
     let title = metadata
         .title
         .split_whitespace()
@@ -174,57 +154,9 @@ pub fn live_page_name(id: PageId) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_owned))
 }
 
-/// Whether this process has a browser at all. No browser means no tabs,
-/// which is not the same answer as a browser with none open.
-pub fn is_configured(cx: &App) -> bool {
-    cx.has_global::<WebState>()
-}
-
-/// Every tab the browser has open, with where each was opened from. The
-/// map joins this in: a tab is never created in the store, so this is the
-/// only thing that says a burst of tabs belongs under one page.
-pub fn live_pages() -> Vec<(PageId, Option<PageId>)> {
+/// Every tab the browser has open.
+pub fn live_pages() -> Vec<(PageId, PageMetadata)> {
     native_host::page_metadata_entries()
-        .into_iter()
-        .filter_map(|(id, metadata)| {
-            Some((
-                id.parse().ok()?,
-                metadata.opened_from.and_then(|origin| origin.parse().ok()),
-            ))
-        })
-        .collect()
-}
-
-/// Where a live tab came from, when the browser opened it from another
-/// page. The browser is the only thing that knows this and it knows it
-/// only while the tab is open, which is why nothing stores it.
-pub fn live_page_opened_from(id: PageId) -> Option<PageId> {
-    native_host::page_metadata(&id.to_string())?
-        .opened_from?
-        .parse()
-        .ok()
-}
-
-pub fn live_page_url(id: PageId) -> Option<String> {
-    native_host::page_metadata(&id.to_string()).map(|metadata| metadata.url)
-}
-
-pub fn page_name(page: &PageRecord) -> String {
-    let host = url::Url::parse(&page.launch_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| page.launch_url.clone());
-    let stem = host.strip_prefix("www.").unwrap_or(&host);
-    let stem = stem
-        .split('.')
-        .next()
-        .unwrap_or(stem)
-        .replace(['-', '_'], " ");
-    let mut characters = stem.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => "Web page".to_owned(),
-    }
 }
 
 #[cfg(test)]

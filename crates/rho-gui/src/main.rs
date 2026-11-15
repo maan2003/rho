@@ -83,6 +83,14 @@ fn apply_text_rendering_mode(cx: &mut App) {
 }
 
 fn main() {
+    // Chrome starts this binary as the browser extension's native host.
+    if rho_browser::native_host::is_invocation(&std::env::args().collect::<Vec<_>>()) {
+        if let Err(error) = rho_browser::native_host::run() {
+            eprintln!("rho browser native host: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     init_tracing();
     if let Err(error) = run() {
         eprintln!("rho-gui: {error:#}");
@@ -195,8 +203,8 @@ fn run() -> Result<()> {
                 let frame = FrameLink::new(handle);
                 let chat =
                     cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
-                let agents =
-                    cx.new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame, cx));
+                let agents = cx
+                    .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
                 // The chat ranks a thread by the agents still in it; the
                 // agents system knows which still exist.
                 let alive = agents.downgrade();
@@ -207,7 +215,14 @@ fn run() -> Result<()> {
                             .is_none_or(|agents| agents.read(cx).alive(seed, agent))
                     }))
                 });
-                let systems = vec![AnySystem::new(chat), AnySystem::new(agents)];
+                let browser = cx.new(|cx| {
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame, cx)
+                });
+                let systems = vec![
+                    AnySystem::new(chat),
+                    AnySystem::new(agents),
+                    AnySystem::new(browser),
+                ];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {
                     Frame::new(

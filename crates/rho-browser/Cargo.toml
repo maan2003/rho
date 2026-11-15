@@ -6,6 +6,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Pages as the frame shows them: the `page` system and its surfaces.
+ui = ["dep:rho-dealer", "dep:rho-frame", "dep:rho-window"]
+
 [dependencies]
 anyhow.workspace = true
 async-channel = "2"
@@ -14,6 +18,9 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 image = { version = "0.25", default-features = false }
 libc.workspace = true
 rho-browser-wayland.workspace = true
+rho-dealer = { workspace = true, optional = true }
+rho-frame = { workspace = true, optional = true }
+rho-window = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 smallvec = "1"
