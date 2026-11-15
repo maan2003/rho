@@ -14245,6 +14245,7 @@ dependencies = [
  "rho-frame",
  "rho-iroh-auth",
  "rho-journal",
+ "rho-notes",
  "rodio",
  "rust-embed",
  "rustls",
@@ -14404,6 +14405,23 @@ dependencies = [
  "senax-encoder",
  "tempfile",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rho-notes"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "gpui",
+ "jiff",
+ "language",
+ "multi_buffer",
+ "rho-dealer",
+ "rho-frame",
+ "rho-window",
+ "text",
+ "theme",
  "uuid",
 ]
 

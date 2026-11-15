@@ -1,0 +1,25 @@
+# Notes as the frame shows them: the note surface, a label's surface, and
+# the root menu's and `find`'s rows over them. Notes live in the user's
+# ledger, which the frame owns; this crate keeps no state of its own on disk.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-notes"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+language = { path = "../../vendor/zed/crates/language" }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-dealer.workspace = true
+rho-frame.workspace = true
+rho-window.workspace = true
+text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
+uuid.workspace = true
+
+[dev-dependencies]
+jiff.workspace = true

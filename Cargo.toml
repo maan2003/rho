@@ -60,6 +60,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-ledger",
+  "crates/rho-notes",
   "crates/rho-profiling",
   "crates/rho-rpc",
   "crates/rho-rtc",
@@ -160,6 +161,7 @@ rho-inference = { path = "agent-host/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-ledger = { path = "crates/rho-ledger" }
+rho-notes = { path = "crates/rho-notes" }
 rho-ledger-server = { path = "agent-host/rho-ledger-server" }
 rho-notebook = { path = "agent-host/rho-notebook" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
