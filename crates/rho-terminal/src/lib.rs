@@ -21,6 +21,8 @@
 //!
 //! [`protocol`] is what a client and a host say about terminals; the host
 //! and the workset runtime use it alone, without the `client` feature.
+//! With `ui`, [`ui`] is the terminals as the frame shows them: the `term`
+//! system and its surface.
 
 pub mod protocol;
 
@@ -28,6 +30,8 @@ pub mod protocol;
 pub mod channel;
 #[cfg(feature = "client")]
 mod surface;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 #[cfg(feature = "client")]
 pub use surface::*;

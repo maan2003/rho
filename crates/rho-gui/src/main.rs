@@ -218,12 +218,19 @@ fn run() -> Result<()> {
                 let browser = cx.new(|cx| {
                     rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone(), cx)
                 });
-                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame, cx));
+                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
+                let terminals =
+                    cx.new(|cx| rho_terminal::ui::TerminalSystem::new(frame.clone(), cx));
+                let shells = cx.new(|cx| rho_shell_view::ui::ShellSystem::new(frame.clone(), cx));
+                let desktops = cx.new(|cx| rho_desktop_client::ui::DesktopSystem::new(frame, cx));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
                     AnySystem::new(notes),
+                    AnySystem::new(terminals),
+                    AnySystem::new(shells),
+                    AnySystem::new(desktops),
                 ];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {

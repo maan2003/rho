@@ -9,18 +9,36 @@ use crate::protocol::{
     Open, TermClientFrame, TermServerFrame, TerminalInfo, TerminalList, TerminalOpen,
 };
 
-/// Dials a dedicated terminal stream for an agent on the host `link`
-/// reaches, and runs the handshake: attach its first running terminal
-/// (spawning the default one when none run), or spawn a fresh one with
-/// `new`.
+/// Dials a dedicated terminal stream to the agent's terminal
+/// `terminal_id` on the host `link` reaches, and runs the handshake: it
+/// attaches while that terminal runs and spawns it when it does not.
 pub fn open(
     link: &rho_agent_hosts::Link,
     agent: String,
-    new: bool,
+    terminal_id: u64,
     cols: u16,
     rows: u16,
 ) -> impl Future<Output = anyhow::Result<TerminalChannel>> + Send + 'static {
-    link.run(move |dialer| dial_terminal(dialer, agent, new, cols, rows))
+    link.run(move |dialer| dial_terminal(dialer, agent, terminal_id, cols, rows))
+}
+
+/// The running terminals on the host `link` reaches, of one agent when it
+/// names one.
+pub fn list(
+    link: &rho_agent_hosts::Link,
+    agent: Option<String>,
+) -> impl Future<Output = anyhow::Result<Vec<TerminalInfo>>> + Send + 'static {
+    link.run(move |dialer| dial_terminal_list(dialer, agent))
+}
+
+/// The id a fresh terminal of an agent takes: one past the highest of
+/// those running, so it never collides with one.
+pub fn next_terminal_id(running: &[TerminalInfo]) -> u64 {
+    running
+        .iter()
+        .map(|info| info.terminal_id.saturating_add(1))
+        .max()
+        .unwrap_or(0)
 }
 
 /// One attached terminal: a dedicated stream carrying
@@ -33,40 +51,27 @@ pub struct TerminalChannel {
     pub transport: rho_rpc::ChannelTask,
 }
 
-/// One agent's running terminals.
 async fn dial_terminal_list(
     dialer: rho_agent_hosts::Dialer,
-    agent: String,
+    agent: Option<String>,
 ) -> anyhow::Result<Vec<TerminalInfo>> {
     let mut stream = dialer
         .open(<TerminalList as rho_rpc::protocol::Call>::PRIORITY)
         .await?;
-    rho_rpc::protocol::call(&mut stream, TerminalList { agent: Some(agent) }).await
+    rho_rpc::protocol::call(&mut stream, TerminalList { agent }).await
 }
 
-/// Dials a dedicated terminal stream: attach the agent's first running
-/// terminal (creating id 0 when none run), or spawn a fresh one with `new`.
+/// Dials a dedicated terminal stream to `terminal_id`: attach while it
+/// runs, spawn it when it does not.
 async fn dial_terminal(
     dialer: rho_agent_hosts::Dialer,
     agent: String,
-    new: bool,
+    terminal_id: u64,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<TerminalChannel> {
-    let running = dial_terminal_list(dialer.clone(), agent.clone()).await?;
-    let (terminal_id, create) = if new {
-        let next = running
-            .iter()
-            .map(|info| info.terminal_id.saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        (next, true)
-    } else {
-        match running.first() {
-            Some(info) => (info.terminal_id, false),
-            None => (0, true),
-        }
-    };
+    let running = dial_terminal_list(dialer.clone(), Some(agent.clone())).await?;
+    let create = !running.iter().any(|info| info.terminal_id == terminal_id);
     let open = Open::Terminal {
         agent,
         terminal_id,

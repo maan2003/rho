@@ -103,6 +103,12 @@ impl TerminalModel {
     fn send(&self, frame: TermClientFrame) {
         let _ = self.input.clone().try_send(frame);
     }
+
+    /// What the shell in it last called it (OSC title); empty until it
+    /// does.
+    pub fn title(&self) -> &str {
+        &self.screen.title
+    }
 }
 
 /// A terminal's viewport: focus, scroll offset, and mode.
@@ -221,6 +227,10 @@ impl TerminalView {
 
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
+    }
+
+    pub fn model(&self) -> &Entity<TerminalModel> {
+        &self.model
     }
 
     fn half_page(&self, cx: &Context<Self>) -> isize {

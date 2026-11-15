@@ -23,6 +23,8 @@ use crate::protocol::{
 gpui::actions!(
     rho_shell_view,
     [
+        /// Sends the pending input to the shell.
+        ShellSubmit,
         ShellInterrupt,
         ShellEof,
         ShellPagerMore,

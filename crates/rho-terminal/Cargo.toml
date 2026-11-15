@@ -22,6 +22,14 @@ client = [
   "dep:theme_settings",
 ]
 
+# The terminals as the frame shows them: the `term` system and its surface.
+ui = [
+  "client",
+  "dep:rho-dealer",
+  "dep:rho-frame",
+  "dep:rho-window",
+]
+
 [dependencies]
 bytes.workspace = true
 rho-rpc.workspace = true
@@ -31,10 +39,13 @@ anyhow = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
+rho-dealer = { workspace = true, optional = true }
+rho-frame = { workspace = true, optional = true }
+rho-window = { workspace = true, optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = true }
 
 [dev-dependencies]
 # The tests exercise the client too.
-rho-terminal = { path = ".", features = ["client"] }
+rho-terminal = { path = ".", features = ["ui"] }
