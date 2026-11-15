@@ -303,15 +303,20 @@ impl SlackSystem {
         }
     }
 
-    /// The rows of the `slack` menu every screen has.
-    pub(super) fn menu_rows(this: &Entity<Self>, cx: &App) -> Vec<Row> {
+    /// The rows of the `slack` menu every screen has. Built while the
+    /// system may be leased, so it reads nothing of it.
+    pub(super) fn menu_rows(
+        this: &Entity<Self>,
+        session: Option<Entity<Session>>,
+        cx: &App,
+    ) -> Vec<Row> {
         let register = {
             let this = this.clone();
             Row::run("r", "register workspace…", move |frame, window, cx| {
                 prompt_register(this.clone(), frame, window, cx)
             })
         };
-        let Some(session) = this.read(cx).session.clone() else {
+        let Some(session) = session else {
             return vec![register];
         };
         let workspace = session.read(cx).model().workspace().clone();
@@ -434,7 +439,7 @@ impl System for SlackSystem {
         if point.surface.kind() == SlackAddress::KIND {
             return Vec::new();
         }
-        let rows = Self::menu_rows(&cx.entity(), cx);
+        let rows = Self::menu_rows(&cx.entity(), self.session.clone(), cx);
         let mut menu = Rows::new("slack");
         menu.extend(rows);
         vec![Row::menu("s", "slack", menu)]

@@ -1003,7 +1003,11 @@ impl Surface for SlackSurface {
         if let Some(view) = self.conversation_view().cloned() {
             menu.extend(self.conversation_rows(&view, cx));
         }
-        menu.extend(SlackSystem::menu_rows(&self.system, cx));
+        menu.extend(SlackSystem::menu_rows(
+            &self.system,
+            Some(self.session.clone()),
+            cx,
+        ));
         vec![Row::menu("s", "slack", menu)]
     }
 }
