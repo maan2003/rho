@@ -346,9 +346,10 @@ fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
 }
 
 /// The session's one pipe for everything that follows the store: directory
-/// changes, then rows past what the client holds, then the statuses, which arrive after the rows they reflect commit. Rows are read
-/// from the store, never from the feed: an append only says something
-/// landed. A lagged feed sends the directory whole.
+/// changes, then rows past what the client holds, then the statuses, which
+/// arrive after the rows they reflect commit. Rows are read from the store,
+/// never from the feed: an append only says something landed. A lagged feed
+/// sends the directory whole.
 ///
 /// Statuses are full snapshots, the latest per agent: an unsent one is
 /// replaced rather than queued, so a slow connection never falls behind.
