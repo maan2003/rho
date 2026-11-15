@@ -209,10 +209,9 @@ async fn create(
     let agents = pool.db().read().workset(id).unwrap().agents;
     assert_eq!(evaluated.agent, agents.first().copied());
     if let Some(text) = message {
-        pool.start_user_topic(
+        pool.post_user(
             client_id(),
-            pool.create_stream("test".to_owned()).await.unwrap(),
-            "test".to_owned(),
+            None,
             agents.clone(),
             vec![rho_agent_types::ContentPart::Text {
                 text: text.to_owned(),
@@ -456,10 +455,9 @@ async fn streaming_crash() {
         1,
         "load replayed interrupted execution"
     );
-    pool.start_user_topic(
+    pool.post_user(
         client_id(),
-        pool.create_stream("test".to_owned()).await.unwrap(),
-        "inspect".to_owned(),
+        None,
         vec![id],
         vec![rho_agent_types::ContentPart::Text {
             text: "inspect fresh globals".into(),

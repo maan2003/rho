@@ -169,10 +169,7 @@ impl ChatRead for ReadTxn {
                 .map(|(key, joined)| (key.value().1, joined.value()))
                 .collect();
             decide(&mut decided, records);
-            cursor = parents
-                .get(cursor)
-                .expect("a thread is a message")
-                .value();
+            cursor = parents.get(cursor).expect("a thread is a message").value();
         }
         joined(decided)
     }

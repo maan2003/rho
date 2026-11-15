@@ -62,7 +62,7 @@ async fn run(command: Command) -> Result<()> {
             rho_agent_host::debug::run(args).await?;
             Ok(())
         }
-        Command::Eval(args) => eval::run(args).await,
+        Command::Eval(args) => eval::run(*args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Gccp(args) => run_gccp(args).await,
         Command::Share(args) => share::run(args).await,
@@ -232,7 +232,7 @@ enum Command {
     Debug(DebugArgs),
     /// Run a headless agent evaluation; JSONL output, temporary state, real
     /// provider.
-    Eval(eval::EvalArgs),
+    Eval(Box<eval::EvalArgs>),
     Iroh(IrohArgs),
     Gccp(GccpArgs),
     Share(share::ShareArgs),
@@ -266,7 +266,7 @@ enum CliCommand {
     Debug(DebugArgs),
     /// Run a headless agent evaluation; JSONL output, temporary state, real
     /// provider.
-    Eval(eval::EvalArgs),
+    Eval(Box<eval::EvalArgs>),
     Iroh(IrohArgs),
     /// See the hosts approved for GCCP, and see and take back what agents
     /// accepted on them.

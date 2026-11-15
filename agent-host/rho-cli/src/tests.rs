@@ -48,9 +48,10 @@ fn evaluation_accepts_sol_role() {
             .map(str::to_owned),
     )
     .unwrap();
-    assert!(matches!(
-        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "med-eng"
-    ));
+    let Command::Eval(eval) = args.command else {
+        panic!("not an eval");
+    };
+    assert_eq!(eval.role, "med-eng");
 }
 
 #[test]
@@ -69,9 +70,12 @@ fn evaluation_defaults_to_astra_and_requires_a_prompt() {
         .map(str::to_owned),
     )
     .unwrap();
-    assert!(
-        matches!(args.command, Command::Eval(eval::EvalArgs {role, expect, require_tool,..}) if role == "high-eng" && expect == ["PASS"] && require_tool == ["exec"])
-    );
+    let Command::Eval(eval) = args.command else {
+        panic!("not an eval");
+    };
+    assert_eq!(eval.role, "high-eng");
+    assert_eq!(eval.expect, ["PASS"]);
+    assert_eq!(eval.require_tool, ["exec"]);
     assert!(
         Args::try_parse(
             ["eval", "task", "--timeout", "0"]

@@ -2261,6 +2261,41 @@ fn write_generated_source(
     Ok(source)
 }
 
+/// How long each step of taking a message in took, for the log: the time
+/// from a message to Claude Code is latency every reply pays.
+struct Steps {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    marks: Vec<(&'static str, Duration)>,
+}
+
+impl Steps {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            start: now,
+            last: now,
+            marks: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.marks.push((step, now - self.last));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Steps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}:", self.last - self.start)?;
+        for (step, took) in &self.marks {
+            write!(f, " {step} {took:?}")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rho_agent_types::{WorksetId, WorksetKind};
@@ -2496,40 +2531,5 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");
-    }
-}
-
-/// How long each step of taking a message in took, for the log: the time
-/// from a message to Claude Code is latency every reply pays.
-struct Steps {
-    start: std::time::Instant,
-    last: std::time::Instant,
-    marks: Vec<(&'static str, Duration)>,
-}
-
-impl Steps {
-    fn new() -> Self {
-        let now = std::time::Instant::now();
-        Self {
-            start: now,
-            last: now,
-            marks: Vec::new(),
-        }
-    }
-
-    fn mark(&mut self, step: &'static str) {
-        let now = std::time::Instant::now();
-        self.marks.push((step, now - self.last));
-        self.last = now;
-    }
-}
-
-impl std::fmt::Display for Steps {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}:", self.last - self.start)?;
-        for (step, took) in &self.marks {
-            write!(f, " {step} {took:?}")?;
-        }
-        Ok(())
     }
 }

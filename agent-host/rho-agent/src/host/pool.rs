@@ -15,8 +15,8 @@ pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role,
-    UnixMs, WorksetKind,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role, UnixMs,
+    WorksetKind,
 };
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};

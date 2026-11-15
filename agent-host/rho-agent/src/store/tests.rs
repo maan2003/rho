@@ -339,11 +339,21 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     // The user starts work under the root; a resend under its client id
     // is the same message and logs nothing.
     let work = write
-        .post(UnixMs(4), Some(rho), said(Address::User, "Fix it"), Some(78))
+        .post(
+            UnixMs(4),
+            Some(rho),
+            said(Address::User, "Fix it"),
+            Some(78),
+        )
         .unwrap();
     assert_eq!(work, MessageId(ChatSeq(2)));
     let again = write
-        .post(UnixMs(4), Some(rho), said(Address::User, "resent"), Some(78))
+        .post(
+            UnixMs(4),
+            Some(rho),
+            said(Address::User, "resent"),
+            Some(78),
+        )
         .unwrap();
     assert_eq!(again, work);
     assert_eq!(db_head(&mut write), 2);
@@ -358,7 +368,12 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
         .unwrap();
     // `b` replies: `a` hears it through the root, `b` is the sender.
     let reply = write
-        .post(UnixMs(7), Some(work), said(Address::Agent(b), "me too"), None)
+        .post(
+            UnixMs(7),
+            Some(work),
+            said(Address::Agent(b), "me too"),
+            None,
+        )
         .unwrap();
     // A subthread under `b`'s reply reaches both through their joins above.
     let deeper = write
@@ -399,11 +414,20 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     write.leave(UnixMs(12), work, a).unwrap();
     assert_eq!(db_head(&mut write), head + 1);
     let elsewhere = write
-        .post(UnixMs(13), Some(rho), said(Address::User, "still the root"), None)
+        .post(
+            UnixMs(13),
+            Some(rho),
+            said(Address::User, "still the root"),
+            None,
+        )
         .unwrap();
     // Refused, and logs nothing: an empty message, a parent that is not.
     for (parent, text) in [(Some(work), "  "), (Some(MessageId(ChatSeq(999))), "x")] {
-        assert!(write.post(UnixMs(14), parent, said(Address::User, text), None).is_err());
+        assert!(
+            write
+                .post(UnixMs(14), parent, said(Address::User, text), None)
+                .is_err()
+        );
     }
     let seqs = db_head(&mut write);
     write.commit();
@@ -414,14 +438,23 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
         received(&read, a, 0),
         [both, reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
     );
-    assert_eq!(received(&read, b, 0), [both, deeper, mention].map(|id| id.0.0));
+    assert_eq!(
+        received(&read, b, 0),
+        [both, deeper, mention].map(|id| id.0.0)
+    );
     assert_eq!(received(&read, c, 0), [mention.0.0]);
-    assert_eq!(received(&read, a, both.0.0), [reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0));
+    assert_eq!(
+        received(&read, a, both.0.0),
+        [reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
+    );
     // The tree as it stands.
     assert_eq!(ids(&read.thread_messages(None, 10)), [rho]);
     assert_eq!(ids(&read.thread_messages(Some(rho), 10)), [work, elsewhere]);
     assert_eq!(ids(&read.thread_messages(Some(work), 1)), [reply]);
-    assert_eq!(ids(&read.thread_messages(Some(reply), 10)), [deeper, after_leave, mention]);
+    assert_eq!(
+        ids(&read.thread_messages(Some(reply), 10)),
+        [deeper, after_leave, mention]
+    );
     assert_eq!(read.message(deeper).unwrap().parent, Some(reply));
     // Members as a new message under each would see them: the root's `a`
     // left the work, `b` left the reply.
@@ -468,15 +501,28 @@ async fn chat_moves_subtrees_and_names_threads() {
         .post(UnixMs(4), Some(work), said(Address::User, "one"), None)
         .unwrap();
     let aside = write
-        .post(UnixMs(5), Some(kept), said(Address::Agent(b), "an aside"), None)
+        .post(
+            UnixMs(5),
+            Some(kept),
+            said(Address::Agent(b), "an aside"),
+            None,
+        )
         .unwrap();
     // Refused, and logs nothing: under itself, under its own child, a
     // message that is not.
     let before = db_head(&mut write);
     assert!(write.reparent(UnixMs(6), work, Some(work)).is_err());
     assert!(write.reparent(UnixMs(6), work, Some(aside)).is_err());
-    assert!(write.reparent(UnixMs(6), MessageId(ChatSeq(999)), Some(ops)).is_err());
-    assert!(write.reparent(UnixMs(6), kept, Some(MessageId(ChatSeq(999)))).is_err());
+    assert!(
+        write
+            .reparent(UnixMs(6), MessageId(ChatSeq(999)), Some(ops))
+            .is_err()
+    );
+    assert!(
+        write
+            .reparent(UnixMs(6), kept, Some(MessageId(ChatSeq(999))))
+            .is_err()
+    );
     assert_eq!(db_head(&mut write), before);
     // Where it is: nothing.
     write.reparent(UnixMs(6), work, Some(rho)).unwrap();
@@ -489,24 +535,41 @@ async fn chat_moves_subtrees_and_names_threads() {
     write.name(UnixMs(9), work, "  Fixed   it ".into()).unwrap();
     let named = db_head(&mut write);
     write.name(UnixMs(9), work, "Fixed it".into()).unwrap();
-    assert_eq!(db_head(&mut write), named, "a name a thread has logs nothing");
+    assert_eq!(
+        db_head(&mut write),
+        named,
+        "a name a thread has logs nothing"
+    );
     write.name(UnixMs(10), aside, "An aside".into()).unwrap();
     write.name(UnixMs(11), aside, String::new()).unwrap();
-    assert!(write.name(UnixMs(11), MessageId(ChatSeq(999)), "x".into()).is_err());
+    assert!(
+        write
+            .name(UnixMs(11), MessageId(ChatSeq(999)), "x".into())
+            .is_err()
+    );
     write.commit();
 
     let read = db.read();
     assert_eq!(ids(&read.thread_messages(None, 10)), [rho, ops, kept]);
-    assert_eq!(ids(&read.thread_messages(Some(rho), 10)), Vec::<MessageId>::new());
+    assert_eq!(
+        ids(&read.thread_messages(Some(rho), 10)),
+        Vec::<MessageId>::new()
+    );
     assert_eq!(ids(&read.thread_messages(Some(ops), 10)), [work]);
-    assert_eq!(ids(&read.thread_messages(Some(work), 10)), Vec::<MessageId>::new());
+    assert_eq!(
+        ids(&read.thread_messages(Some(work), 10)),
+        Vec::<MessageId>::new()
+    );
     assert_eq!(ids(&read.thread_messages(Some(kept), 10)), [aside]);
     assert_eq!(read.message(work).unwrap().parent, Some(ops));
     assert_eq!(read.message(kept).unwrap().parent, None);
     assert_eq!(read.message(aside).unwrap().parent, Some(kept));
     let thread = read.thread(work).unwrap();
     assert_eq!(thread.name, "Fixed it");
-    assert_eq!(thread.path, vec![(ops, "ops".to_owned()), (work, "Fixed it".to_owned())]);
+    assert_eq!(
+        thread.path,
+        vec![(ops, "ops".to_owned()), (work, "Fixed it".to_owned())]
+    );
     assert_eq!(thread.members, [a]);
     assert_eq!(read.thread(aside).unwrap().name, "an aside");
     assert_eq!(
@@ -532,59 +595,170 @@ async fn chat_moves_subtrees_and_names_threads() {
 /// conversations becomes the forest with every seq kept.
 #[test]
 fn chat_migration_keeps_every_seq() {
-    use super::chat::legacy::{ChatEvent as OldEvent, ChatRecord as OldRecord, StreamId, TopicId, convert};
+    use super::chat::legacy::{
+        ChatEvent as OldEvent, ChatRecord as OldRecord, StreamId, TopicId, convert,
+    };
     let (a, b) = (agent(1), agent(2));
     let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
     let at = UnixMs(1);
     let old = vec![
-        OldRecord { seq: ChatSeq(1), at, event: OldEvent::StreamCreated { name: "rho".into() } },
+        OldRecord {
+            seq: ChatSeq(1),
+            at,
+            event: OldEvent::StreamCreated { name: "rho".into() },
+        },
         OldRecord {
             seq: ChatSeq(2),
             at,
-            event: OldEvent::TopicStarted { stream: StreamId(ChatSeq(1)), name: "Fix it".into(), by: Address::User },
+            event: OldEvent::TopicStarted {
+                stream: StreamId(ChatSeq(1)),
+                name: "Fix it".into(),
+                by: Address::User,
+            },
         },
         OldRecord {
             seq: ChatSeq(3),
             at,
-            event: OldEvent::Posted { topic: TopicId(ChatSeq(2)), from: Address::User, mentions: vec![], content: text("go") },
+            event: OldEvent::Posted {
+                topic: TopicId(ChatSeq(2)),
+                from: Address::User,
+                mentions: vec![],
+                content: text("go"),
+            },
         },
-        OldRecord { seq: ChatSeq(4), at, event: OldEvent::Joined { topic: TopicId(ChatSeq(2)), agent: a } },
-        OldRecord { seq: ChatSeq(5), at, event: OldEvent::DirectStarted { members: [a, b] } },
+        OldRecord {
+            seq: ChatSeq(4),
+            at,
+            event: OldEvent::Joined {
+                topic: TopicId(ChatSeq(2)),
+                agent: a,
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(5),
+            at,
+            event: OldEvent::DirectStarted { members: [a, b] },
+        },
         OldRecord {
             seq: ChatSeq(6),
             at,
-            event: OldEvent::Posted { topic: TopicId(ChatSeq(5)), from: Address::Agent(a), mentions: vec![], content: text("psst") },
+            event: OldEvent::Posted {
+                topic: TopicId(ChatSeq(5)),
+                from: Address::Agent(a),
+                mentions: vec![],
+                content: text("psst"),
+            },
         },
-        OldRecord { seq: ChatSeq(7), at, event: OldEvent::StreamCreated { name: "ops".into() } },
+        OldRecord {
+            seq: ChatSeq(7),
+            at,
+            event: OldEvent::StreamCreated { name: "ops".into() },
+        },
         OldRecord {
             seq: ChatSeq(8),
             at,
-            event: OldEvent::TopicChanged { topic: TopicId(ChatSeq(2)), stream: StreamId(ChatSeq(7)), name: "Fixed".into(), resolved: true },
+            event: OldEvent::TopicChanged {
+                topic: TopicId(ChatSeq(2)),
+                stream: StreamId(ChatSeq(7)),
+                name: "Fixed".into(),
+                resolved: true,
+            },
         },
         OldRecord {
             seq: ChatSeq(9),
             at,
-            event: OldEvent::Moved { messages: vec![MessageId(ChatSeq(3)), MessageId(ChatSeq(6))], to: TopicId(ChatSeq(2)) },
+            event: OldEvent::Moved {
+                messages: vec![MessageId(ChatSeq(3)), MessageId(ChatSeq(6))],
+                to: TopicId(ChatSeq(2)),
+            },
         },
     ];
     let records = convert(&old);
-    let events: Vec<(u64, ChatEvent)> = records.into_iter().map(|record| (record.seq.0, record.event)).collect();
-    let nothing = |seq: u64| ChatEvent::Named { thread: MessageId(ChatSeq(seq)), name: String::new() };
+    let events: Vec<(u64, ChatEvent)> = records
+        .into_iter()
+        .map(|record| (record.seq.0, record.event))
+        .collect();
+    let nothing = |seq: u64| ChatEvent::Named {
+        thread: MessageId(ChatSeq(seq)),
+        name: String::new(),
+    };
     assert_eq!(
         events,
         vec![
-            (1, ChatEvent::Posted { parent: None, from: Address::User, mentions: vec![], content: text("rho") }),
-            (2, ChatEvent::Posted { parent: Some(MessageId(ChatSeq(1))), from: Address::User, mentions: vec![], content: text("Fix it") }),
-            (3, ChatEvent::Posted { parent: Some(MessageId(ChatSeq(2))), from: Address::User, mentions: vec![], content: text("go") }),
-            (4, ChatEvent::Joined { thread: MessageId(ChatSeq(2)), agent: a }),
+            (
+                1,
+                ChatEvent::Posted {
+                    parent: None,
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("rho")
+                }
+            ),
+            (
+                2,
+                ChatEvent::Posted {
+                    parent: Some(MessageId(ChatSeq(1))),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("Fix it")
+                }
+            ),
+            (
+                3,
+                ChatEvent::Posted {
+                    parent: Some(MessageId(ChatSeq(2))),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("go")
+                }
+            ),
+            (
+                4,
+                ChatEvent::Joined {
+                    thread: MessageId(ChatSeq(2)),
+                    agent: a
+                }
+            ),
             (5, nothing(5)),
             (6, nothing(6)),
-            (7, ChatEvent::Posted { parent: None, from: Address::User, mentions: vec![], content: text("ops") }),
-            (8, ChatEvent::Named { thread: MessageId(ChatSeq(2)), name: "Fixed".into() }),
-            (9, ChatEvent::Reparented { message: MessageId(ChatSeq(3)), parent: Some(MessageId(ChatSeq(2))) }),
+            (
+                7,
+                ChatEvent::Posted {
+                    parent: None,
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("ops")
+                }
+            ),
+            (
+                8,
+                ChatEvent::Named {
+                    thread: MessageId(ChatSeq(2)),
+                    name: "Fixed".into()
+                }
+            ),
+            (
+                9,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(3)),
+                    parent: Some(MessageId(ChatSeq(2)))
+                }
+            ),
             // What no longer fits at its seq, after the last.
-            (10, ChatEvent::Reparented { message: MessageId(ChatSeq(2)), parent: Some(MessageId(ChatSeq(7))) }),
-            (11, ChatEvent::Reparented { message: MessageId(ChatSeq(6)), parent: Some(MessageId(ChatSeq(2))) }),
+            (
+                10,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(2)),
+                    parent: Some(MessageId(ChatSeq(7)))
+                }
+            ),
+            (
+                11,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(6)),
+                    parent: Some(MessageId(ChatSeq(2)))
+                }
+            ),
         ]
     );
 }
@@ -604,17 +778,37 @@ async fn chat_migration_rewrites_the_store() {
     {
         let mut log = write.open_table(OLD_LOG);
         for record in [
-            OldRecord { seq: ChatSeq(1), at: UnixMs(1), event: OldEvent::StreamCreated { name: "rho".into() } },
+            OldRecord {
+                seq: ChatSeq(1),
+                at: UnixMs(1),
+                event: OldEvent::StreamCreated { name: "rho".into() },
+            },
             OldRecord {
                 seq: ChatSeq(2),
                 at: UnixMs(2),
-                event: OldEvent::TopicStarted { stream: StreamId(ChatSeq(1)), name: "Fix it".into(), by: Address::User },
+                event: OldEvent::TopicStarted {
+                    stream: StreamId(ChatSeq(1)),
+                    name: "Fix it".into(),
+                    by: Address::User,
+                },
             },
-            OldRecord { seq: ChatSeq(3), at: UnixMs(3), event: OldEvent::Joined { topic: TopicId(ChatSeq(2)), agent: a } },
+            OldRecord {
+                seq: ChatSeq(3),
+                at: UnixMs(3),
+                event: OldEvent::Joined {
+                    topic: TopicId(ChatSeq(2)),
+                    agent: a,
+                },
+            },
             OldRecord {
                 seq: ChatSeq(4),
                 at: UnixMs(4),
-                event: OldEvent::Posted { topic: TopicId(ChatSeq(2)), from: Address::User, mentions: vec![], content: text("go") },
+                event: OldEvent::Posted {
+                    topic: TopicId(ChatSeq(2)),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("go"),
+                },
             },
         ] {
             log.insert(record.seq.0, rho_db::SenValue::borrowed(&record));
@@ -628,7 +822,10 @@ async fn chat_migration_rewrites_the_store() {
     let rho = MessageId(ChatSeq(1));
     let work = MessageId(ChatSeq(2));
     assert_eq!(ids(&read.thread_messages(None, 10)), [rho]);
-    assert_eq!(ids(&read.thread_messages(Some(work), 10)), [MessageId(ChatSeq(4))]);
+    assert_eq!(
+        ids(&read.thread_messages(Some(work), 10)),
+        [MessageId(ChatSeq(4))]
+    );
     assert_eq!(read.thread(work).unwrap().members, [a]);
     assert_eq!(received(&read, a, 0), [4]);
     // The store goes on from the migrated log.

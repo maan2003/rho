@@ -52,10 +52,12 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 const CURRENT_AGENT_DB_FORMAT: &str = "e41b7c2a";
+/// One hop: from a format, to the next, by this rewrite.
+type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// Temporary (`temp-migration`): the hops a store takes to the current
 /// format, one build at a time, each from a savepoint `rho debug rollback`
 /// can put it back to. Oldest first.
-const MIGRATIONS: &[(&str, &str, fn(&mut WriteTxn))] = &[
+const MIGRATIONS: &[Migration] = &[
     // GCCP acceptances keyed by endpoint bytes.
     (
         "9a6cf67f",
@@ -567,9 +569,7 @@ mod tests {
         let hex: String = tau.0.iter().map(|byte| format!("{byte:02x}")).collect();
         assert!(hex.starts_with("f0f1f2"), "{hex}");
         let mut write = db.write().await;
-        write
-            .open_table(FORMAT)
-            .insert((), "9a6cf67f".to_owned());
+        write.open_table(FORMAT).insert((), "9a6cf67f".to_owned());
         rho_iroh_auth::gccp_hosts::init(&mut write);
         rho_iroh_auth::gccp_hosts::approve(&mut write, &tau.0, "dpc-tau".into());
         let mut old = write.open_table(HEX_CONTACTS);
