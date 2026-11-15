@@ -189,8 +189,18 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let chat = cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame, cx));
-                let systems = vec![AnySystem::new(chat)];
+                let chat =
+                    cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
+                let terminals =
+                    cx.new(|cx| rho_terminal::ui::TerminalSystem::new(frame.clone(), cx));
+                let shells = cx.new(|cx| rho_shell_view::ui::ShellSystem::new(frame.clone(), cx));
+                let desktops = cx.new(|cx| rho_desktop_client::ui::DesktopSystem::new(frame, cx));
+                let systems = vec![
+                    AnySystem::new(chat),
+                    AnySystem::new(terminals),
+                    AnySystem::new(shells),
+                    AnySystem::new(desktops),
+                ];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {
                     Frame::new(
