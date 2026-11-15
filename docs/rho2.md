@@ -1,7 +1,9 @@
 # rho2: the final state
 
-Status: working notes from the redesign discussion. High level only; the
-records that must hold come later.
+Status: the design as discussed, with "As built" at the end saying where
+the code that followed it on 2026-11-15 differs. The records that must
+hold are Linked Specs beside the code (`agent-host/specs`,
+`crates/*/specs`).
 
 ## What stays
 
@@ -146,3 +148,29 @@ records that must hold come later.
   in the ledger: an outbox is simpler.
 - Workset creation as a chat message interpreted by the host.
 - A GUI that homes a chat stream: run a host there instead.
+
+## As built
+
+- The shell is `crates/rho-frame`. `Frame` is the window: one surface at
+  a time from a history of addresses, Home, the message log, the
+  minibuffer, the bottom transient, the hosts and the ledger. A system
+  implements `System` (`kinds`, `open`, `streams`, `rows`, `claims`,
+  `name`, `seen`, `home`, `channels`, `find`, `said`, `marks_moved`,
+  `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
+  `rows`); `rho-gui` lists the systems. A system reaches the frame only
+  through `FrameLink`.
+- Address kinds: `thread:<seed>/<id>`, `agent:<id>`, `page:<uuid>`,
+  `note:<uuid>`, `label:<uuid>`, `term:<host>/<agent>/<n>`,
+  `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
+  `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate
+  owns are Linked Specs beside their crates.
+- A host is still named by its machine seed, which the chat session's
+  `Hello` carries: `ThreadId { machine_seed, message }`. The iroh
+  endpoint key as the host's name is not done.
+- The host makes no naming attempt: a thread is named by the user or by
+  an agent (`rho.chat.name`), else by the first line of its message.
+- Starting an agent goes through the agents system's rows on a thread
+  surface: `a start agent here` from the message under the point,
+  `S send and start agent` from a draft; where (`new on`, `here`, `join`)
+  and the runtime are transients.
+- The phone is a layout of the same frame, chosen by window width.

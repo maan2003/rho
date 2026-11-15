@@ -26,6 +26,13 @@ pub mod ui;
 #[cfg(feature = "client")]
 pub use fold::{HostChat, Thread, Told};
 
+/// An agent as an address, `agent:<encoded id>`: what a thread's
+/// participants are named by, and what the agents system opens. The id
+/// is the host's, unique across hosts, so the address carries no host.
+#[cfg(feature = "client")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AgentRef(pub rho_agent_types::AgentId);
+
 /// A thread wherever it is: the log of the host that keeps it, named by
 /// that host's machine seed, which is the same on every device, and the
 /// message the thread hangs under. Its text form, `thread:<seed>/<id>`,

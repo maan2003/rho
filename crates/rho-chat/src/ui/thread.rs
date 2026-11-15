@@ -13,14 +13,14 @@ use gpui::{
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_agent_types::{Address as Party, AgentId, ContentPart, MessageId};
+use rho_agent_types::{Address as Party, ContentPart, MessageId};
 use rho_dealer::{Address, Addressed as _};
 use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
 use super::{ChatSystem, FocusComposer, FocusLog, OpenRow, SendMessage, when};
-use crate::ThreadId;
+use crate::{AgentRef, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
 const KEY_BASE: usize = usize::MAX / 5;
@@ -314,7 +314,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             .with_lines(vec![
                 head.members
                     .first()
-                    .map_or(Meta::None, |agent| Meta::Open(agent_address(*agent))),
+                    .map_or(Meta::None, |agent| Meta::Open(AgentRef(*agent).address())),
             ]),
         );
     }
@@ -410,10 +410,6 @@ impl ThreadView {
         let frame = self.system.read(cx).frame.clone();
         frame.open(address, cx);
     }
-}
-
-fn agent_address(agent: AgentId) -> Address {
-    Address::new("agent", agent.encoded())
 }
 
 fn line(key: Key, text: &str, class: Class) -> Item<Key, Class, Meta> {

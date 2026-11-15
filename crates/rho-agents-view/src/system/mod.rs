@@ -23,26 +23,17 @@ use rho_agents_client::quota::Quotas;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, now_ms};
-use rho_chat::ThreadId;
 use rho_chat::ui::{ChatSystem, Event as ChatEvent};
-use rho_frame::{Address, AnySurface, Found, FrameLink, Marks, Point, Row, System};
+use rho_chat::{AgentRef, ThreadId};
+use rho_frame::{Address, Addressed as _, AnySurface, Found, FrameLink, Marks, Point, Row, System};
 use rho_window::style::StyleClass;
 use surface::AgentSurface;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::transcript::{TranscriptFrame, Transcripts};
 
-/// The kind of an agent's address: `agent:<encoded id>`.
-pub const KIND: &str = "agent";
-
-pub fn address(agent: AgentId) -> Address {
-    Address::new(KIND, agent.encoded())
-}
-
 fn agent_of(address: &Address) -> Option<AgentId> {
-    (address.kind() == KIND)
-        .then(|| AgentId::from_encoded(address.rest()).ok())
-        .flatten()
+    AgentRef::from_address(address).map(|agent| agent.0)
 }
 
 pub struct AgentsSystem {
@@ -254,7 +245,7 @@ impl AgentsSystem {
             self.transcripts.forget(*agent);
             self.models.remove(agent);
             if self.surfaces.remove(agent).is_some() {
-                self.frame.close(address(*agent), cx);
+                self.frame.close(AgentRef(*agent).address(), cx);
             }
         }
         self.registry.forget_agents(&agents);
@@ -448,7 +439,7 @@ impl AgentsSystem {
 
 impl System for AgentsSystem {
     fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+        &[AgentRef::KIND]
     }
 
     fn open(
@@ -536,7 +527,7 @@ impl System for AgentsSystem {
                 let (title, host) = self.label(agent);
                 let facts = self.registry.agent_facts(agent);
                 Found {
-                    address: address(agent),
+                    address: AgentRef(agent).address(),
                     title,
                     description: match facts.runtime.as_ref().map(surface::status_word) {
                         Some(word) => format!("{host} · {word}"),

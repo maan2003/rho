@@ -48,8 +48,8 @@ use rho_dealer::curve::{self, Curve};
 use rho_dealer::rank::Trace;
 use rho_dealer::{Addressed, Claim, Marks};
 
-use crate::ThreadId;
 use crate::fold::HostChat;
+use crate::{AgentRef, ThreadId};
 
 impl Addressed for ThreadId {
     const KIND: &'static str = Self::KIND;
@@ -60,6 +60,18 @@ impl Addressed for ThreadId {
 
     fn from_rest(rest: &str) -> Option<Self> {
         Self::parse(rest)
+    }
+}
+
+impl Addressed for AgentRef {
+    const KIND: &'static str = "agent";
+
+    fn rest(&self) -> String {
+        self.0.encoded()
+    }
+
+    fn from_rest(rest: &str) -> Option<Self> {
+        AgentId::from_encoded(rest).ok().map(Self)
     }
 }
 
