@@ -134,8 +134,13 @@ impl Frame {
         {
             return card;
         }
-        let marks = self.attention.marks.get(address);
-        let (title, context) = match marks.title() {
+        let marks = &self.attention.marks;
+        // A label is called by its path; a note by its first line.
+        let title = match address.as_label() {
+            Some(label) => marks.label_path(label),
+            None => marks.get(address).title().to_owned(),
+        };
+        let (title, context) = match title.as_str() {
             "" => self
                 .name_of(address, cx)
                 .unwrap_or_else(|| (address.key().to_owned(), String::new())),
@@ -173,6 +178,9 @@ impl Frame {
     pub(crate) fn marks_moved(&mut self, touched: BTreeSet<Address>, cx: &mut Context<Self>) {
         if touched.is_empty() {
             return;
+        }
+        for system in self.systems.clone() {
+            system.marks_moved(&touched, cx);
         }
         self.systems_changed(cx);
     }

@@ -6,6 +6,7 @@
 //! keeps to each host. The frame holds systems as a list and asks each
 //! in turn; a system never names another.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -132,6 +133,18 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    /// What `find` lists that lives in the user's own marks: notes,
+    /// labels. Asked beside [`System::find`], with the frame busy, so the
+    /// marks are handed in.
+    fn find_marked(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+        Vec::new()
+    }
+
+    /// What the user said about these addresses moved, on this device or
+    /// from another. Asked with the frame busy: a system reads the marks
+    /// afterwards, through [`crate::FrameLink::read`].
+    fn marks_moved(&mut self, _touched: &BTreeSet<Address>, _cx: &mut Context<Self>) {}
+
     /// The user said this about one of the system's addresses; what the
     /// system does about it outside the ledger, and how to take that back.
     fn said(
@@ -168,6 +181,8 @@ trait SystemHandle {
     fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection>;
     fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow>;
     fn find(&self, cx: &App) -> Vec<Found>;
+    fn find_marked(&self, marks: &Marks, cx: &App) -> Vec<Found>;
+    fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal>;
 }
 
@@ -226,6 +241,14 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn find(&self, cx: &App) -> Vec<Found> {
         self.read(cx).find(cx)
+    }
+
+    fn find_marked(&self, marks: &Marks, cx: &App) -> Vec<Found> {
+        self.read(cx).find_marked(marks, cx)
+    }
+
+    fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
+        self.update(cx, |system, cx| system.marks_moved(touched, cx))
     }
 
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
@@ -296,6 +319,14 @@ impl AnySystem {
 
     pub fn find(&self, cx: &App) -> Vec<Found> {
         self.0.find(cx)
+    }
+
+    pub fn find_marked(&self, marks: &Marks, cx: &App) -> Vec<Found> {
+        self.0.find_marked(marks, cx)
+    }
+
+    pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
+        self.0.marks_moved(touched, cx)
     }
 
     pub fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {

@@ -216,12 +216,14 @@ fn run() -> Result<()> {
                     }))
                 });
                 let browser = cx.new(|cx| {
-                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame, cx)
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone(), cx)
                 });
+                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame, cx));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
+                    AnySystem::new(notes),
                 ];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {
