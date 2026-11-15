@@ -13,6 +13,5 @@ pub mod transcript;
 mod visualization;
 
 pub use agent_view::{AgentModel, AgentModelEvent};
-pub use render::TranscriptView;
 pub use system::AgentsSystem;
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};

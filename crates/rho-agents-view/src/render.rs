@@ -16,26 +16,16 @@ use rho_window::style::StyleClass;
 /// The one projection of an agent's blocks: everything it read and did,
 /// in order. Hidden blocks keep their indices so detail requests, lazy
 /// history, and cursor anchors still agree.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TranscriptView;
-
-impl TranscriptView {
-    pub(crate) fn visible(self, block: &UiBlock) -> bool {
-        block_visible(block)
-    }
-
-    pub(crate) fn render(
-        self,
-        block: &UiBlock,
-        previous: Option<BlockKind>,
-        now_ms: u64,
-        label: &impl Fn(AgentId) -> String,
-    ) -> RenderedBlock {
-        if self.visible(block) {
-            render_block_with_agent_labels(block, previous, now_ms, label)
-        } else {
-            invisible(block_kind(block))
-        }
+pub(crate) fn render(
+    block: &UiBlock,
+    previous: Option<BlockKind>,
+    now_ms: u64,
+    label: &impl Fn(AgentId) -> String,
+) -> RenderedBlock {
+    if block_visible(block) {
+        render_block_with_agent_labels(block, previous, now_ms, label)
+    } else {
+        invisible(block_kind(block))
     }
 }
 
@@ -959,14 +949,14 @@ mod tests {
             text: "Hello".into(),
         };
         let label = |agent: AgentId| if agent == writer { "Ann" } else { "Bob" }.to_owned();
-        assert!(TranscriptView.visible(&source));
-        assert!(TranscriptView.visible(&draft));
-        let drafted = TranscriptView.render(&draft, None, 0, &label);
+        assert!(block_visible(&source));
+        assert!(block_visible(&draft));
+        let drafted = render(&draft, None, 0, &label);
         assert_eq!(text_of(&drafted.spans), "Ann · writing…\nHello\n");
         assert!(drafted.markdown);
         assert_eq!(drafted.spans[0].class, StyleClass::AgentLabel);
         assert_eq!(drafted.spans[1].class, StyleClass::Default);
-        let sourced = TranscriptView.render(&source, None, 0, &label);
+        let sourced = render(&source, None, 0, &label);
         assert!(text_of(&sourced.spans).contains("chat.post(2, 'Hello')"));
         assert!(!text_of(&sourced.spans).contains("writing"));
     }

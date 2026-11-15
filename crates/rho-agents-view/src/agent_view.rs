@@ -19,7 +19,6 @@ use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::FrameSummary;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
-use crate::TranscriptView;
 use crate::transcript::{FillEdge, StorePoint, TranscriptModel};
 
 /// How much history one composition step takes on, in buffer rows.
@@ -81,7 +80,6 @@ impl HistoryWant {
 }
 
 pub struct AgentModel {
-    view: TranscriptView,
     transcript: TranscriptModel,
     multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript cropped flush when the
@@ -125,17 +123,14 @@ impl AgentModel {
         visualization_client: rho_agents_client::remote::AgentsLink,
         cx: &mut Context<Self>,
     ) -> Self {
-        let view = TranscriptView;
         let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let transcript = TranscriptModel::new(
-            view,
             multi_buffer.clone(),
             document_multi_buffer.clone(),
             visualization_client,
         );
         Self {
-            view,
             transcript,
             multi_buffer,
             document_multi_buffer,
@@ -151,10 +146,6 @@ impl AgentModel {
             editors: Vec::new(),
             _subscriptions: Vec::new(),
         }
-    }
-
-    pub fn view(&self) -> TranscriptView {
-        self.view
     }
 
     pub fn initial_load_started(&self) -> bool {
@@ -178,13 +169,10 @@ impl AgentModel {
             return;
         }
         self.initial_load_started = true;
-        let view = self.view;
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
-                .spawn(async move {
-                    TranscriptModel::prepare_initial(view, state, now_ms, agent_labels)
-                })
+                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, agent_labels) })
                 .await;
             let reservations = (0..prepared.buffer_count())
                 .map(|_| cx.reserve_entity::<Buffer>())
