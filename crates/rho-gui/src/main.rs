@@ -83,6 +83,14 @@ fn apply_text_rendering_mode(cx: &mut App) {
 }
 
 fn main() {
+    // Chrome starts this binary as the browser extension's native host.
+    if rho_browser::native_host::is_invocation(&std::env::args().collect::<Vec<_>>()) {
+        if let Err(error) = rho_browser::native_host::run() {
+            eprintln!("rho browser native host: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     init_tracing();
     if let Err(error) = run() {
         eprintln!("rho-gui: {error:#}");
@@ -189,8 +197,12 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let chat = cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame, cx));
-                let systems = vec![AnySystem::new(chat)];
+                let chat =
+                    cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
+                let browser = cx.new(|cx| {
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame, cx)
+                });
+                let systems = vec![AnySystem::new(chat), AnySystem::new(browser)];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {
                     Frame::new(
