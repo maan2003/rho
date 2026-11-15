@@ -17,6 +17,7 @@ use rho_dealer::{Address, Marks, Skips, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Channel, Item, Ledger, Secret};
 
+use crate::frame::Frame;
 use crate::system::Reversal;
 
 /// Something the user says: a fact, or a note's new text or state.
@@ -306,6 +307,17 @@ impl Attention {
             Verdict::Todo { start } => Fact::Todo { node, start, seen },
             Verdict::Pile(pile) => Fact::Piled { node, pile },
         }
+    }
+}
+
+impl Frame {
+    /// What the user said, as this device holds it: every fact, and each
+    /// note's newest revision ([`Marks::note`]). A system whose things are
+    /// the user's own (notes, labels) reads them here and says new ones
+    /// through [`Frame::write_marks`]; a note's revision carries only text
+    /// the user typed.
+    pub fn marks(&self) -> &Marks {
+        &self.attention.marks
     }
 }
 

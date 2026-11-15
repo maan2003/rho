@@ -36,6 +36,16 @@ impl FrameLink {
         });
     }
 
+    /// Runs `f` on the frame now; `None` while the frame is leased. For
+    /// what cannot wait for the end of the update: the app quitting.
+    pub fn update<R>(
+        &self,
+        cx: &mut App,
+        f: impl FnOnce(&mut Frame, &mut Window, &mut gpui::Context<Frame>) -> R,
+    ) -> Option<R> {
+        self.window.update(cx, f).ok()
+    }
+
     /// Reads from the frame now; `None` while the frame is leased.
     pub fn read<R>(&self, cx: &App, f: impl FnOnce(&Frame, &App) -> R) -> Option<R> {
         self.window.read(cx).ok().map(|frame| f(frame, cx))
