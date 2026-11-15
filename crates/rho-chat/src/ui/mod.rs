@@ -666,7 +666,7 @@ impl System for ChatSystem {
         rows
     }
 
-    fn find(&self, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         let mut found = Vec::new();
         for (seed, name) in self.hosts() {
             let Some(chat) = self.chats.get(&seed) else {

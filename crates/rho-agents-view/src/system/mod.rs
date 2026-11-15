@@ -25,7 +25,7 @@ use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, now_ms};
 use rho_chat::ThreadId;
 use rho_chat::ui::{ChatSystem, Event as ChatEvent};
-use rho_frame::{Address, AnySurface, Found, FrameLink, Point, Row, System};
+use rho_frame::{Address, AnySurface, Found, FrameLink, Marks, Point, Row, System};
 use rho_window::style::StyleClass;
 use surface::AgentSurface;
 
@@ -522,7 +522,7 @@ impl System for AgentsSystem {
         Some(self.label(agent))
     }
 
-    fn find(&self, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         self.registry
             .known_agents()
             .copied()

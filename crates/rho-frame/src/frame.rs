@@ -784,8 +784,7 @@ impl Frame {
     pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut found = Vec::new();
         for system in &self.systems {
-            found.extend(system.find(cx));
-            found.extend(system.find_marked(&self.attention.marks, cx));
+            found.extend(system.find(&self.attention.marks, cx));
         }
         found.sort_by_key(|found| std::cmp::Reverse(found.recency));
         self.found = found;

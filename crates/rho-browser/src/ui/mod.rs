@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
 use rho_dealer::{Address, Addressed};
-use rho_frame::{AnySurface, Found, FrameLink, Point, Row, Rows, Subject, Surface};
+use rho_frame::{AnySurface, Found, FrameLink, Marks, Point, Row, Rows, Subject, Surface};
 use rho_window::style::StyleClass;
 
 use self::pages::{GRACE, Pages};
@@ -229,7 +229,7 @@ impl rho_frame::System for PageSystem {
         Some((title(page), "web".to_owned()))
     }
 
-    fn find(&self, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         live_pages()
             .into_iter()
             .map(|(id, metadata)| Found {

@@ -576,7 +576,7 @@ impl System for NoteSystem {
         NoteId::from_address(address).map(|_| (UNTITLED.to_owned(), String::new()))
     }
 
-    fn find_marked(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
         found(marks)
     }
 
