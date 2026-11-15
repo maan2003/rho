@@ -14245,6 +14245,7 @@ dependencies = [
  "rho-frame",
  "rho-iroh-auth",
  "rho-journal",
+ "rho-slack",
  "rodio",
  "rust-embed",
  "rustls",

@@ -33,6 +33,7 @@ gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-chat = { workspace = true, features = ["ui"] }
+rho-slack = { workspace = true, features = ["ui"] }
 rho-db = { workspace = true }
 rho-frame = { workspace = true }
 rho-iroh-auth = { workspace = true }
