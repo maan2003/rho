@@ -13816,6 +13816,7 @@ dependencies = [
  "rho-agents-client",
  "rho-chat",
  "rho-frame",
+ "rho-rpc",
  "rho-window",
  "rustc-hash 2.1.3",
  "serde_json",
