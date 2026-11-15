@@ -1,6 +1,5 @@
 [workspace]
 exclude = [
-  "crates/rho-gui-old",
   "crates/rho-qa",
   "vendor/brush",
   "vendor/devenv",
