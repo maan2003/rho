@@ -191,7 +191,19 @@ impl Frame {
         tracing::debug!(address = %address, ?verdict, "verdict");
         let card = self.card_for(address, cx);
         let seen = self.seen(address, cx);
-        let fact = crate::attention::Attention::fact(address, &verdict, seen);
+        // A mute the system holds itself is only settled here: lifted
+        // there, it is lifted.
+        let ledger = match verdict {
+            Verdict::Mute
+                if self.systems.iter().any(|system| {
+                    system.opens(address, cx) && system.mutes_itself(address, cx)
+                }) =>
+            {
+                Verdict::Done
+            }
+            _ => verdict.clone(),
+        };
+        let fact = crate::attention::Attention::fact(address, &ledger, seen);
         let takeback = self.write_marks(vec![Write::Fact(fact)], cx);
         let mut reversals = Vec::new();
         for system in self.systems.clone() {
@@ -462,6 +474,27 @@ impl Frame {
             reversals: Vec::new(),
         });
         self.echo(&said, StyleClass::SystemInfo, cx);
+    }
+
+    /// Something a system did over many addresses at once, said as one
+    /// thing `shift-u` takes back: the facts it writes and what the system
+    /// did outside the ledger.
+    pub fn say(
+        &mut self,
+        verb: String,
+        writes: Vec<Write>,
+        reversals: Vec<crate::system::Reversal>,
+        cx: &mut Context<Self>,
+    ) {
+        let takeback = self.write_marks(writes, cx);
+        self.attention.push_undo(Undo {
+            sequence: 0,
+            verb,
+            takeback,
+            card: None,
+            reversals,
+        });
+        self.systems_changed(cx);
     }
 
     /// Schedules one evaluation of the lamp, the chime and Home for the

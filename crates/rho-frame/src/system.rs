@@ -132,6 +132,13 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    /// Whether this system holds a mute of the address itself, where the
+    /// user can lift it too: the ledger then only settles it, so a mute
+    /// lifted there is lifted here.
+    fn mutes_itself(&self, _address: &Address) -> bool {
+        false
+    }
+
     /// The user said this about one of the system's addresses; what the
     /// system does about it outside the ledger, and how to take that back.
     fn said(
@@ -168,6 +175,7 @@ trait SystemHandle {
     fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection>;
     fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow>;
     fn find(&self, cx: &App) -> Vec<Found>;
+    fn mutes_itself(&self, address: &Address, cx: &App) -> bool;
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal>;
 }
 
@@ -226,6 +234,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn find(&self, cx: &App) -> Vec<Found> {
         self.read(cx).find(cx)
+    }
+
+    fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
+        self.read(cx).mutes_itself(address)
     }
 
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
@@ -296,6 +308,10 @@ impl AnySystem {
 
     pub fn find(&self, cx: &App) -> Vec<Found> {
         self.0.find(cx)
+    }
+
+    pub fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
+        self.0.mutes_itself(address, cx)
     }
 
     pub fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
