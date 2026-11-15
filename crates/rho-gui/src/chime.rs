@@ -16,7 +16,7 @@ use rodio::{Decoder, DeviceSinkBuilder, Source as _};
 pub struct Chime;
 
 impl Chime {
-    pub fn play(&mut self) {
+    pub fn play(&self) {
         if let Err(error) = std::thread::Builder::new()
             .name("rho-chime".into())
             .spawn(|| {

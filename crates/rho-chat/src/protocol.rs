@@ -83,8 +83,9 @@ pub enum ClientFrame {
 /// What a host says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ServerFrame {
-    /// The first frame: the newest event on the host.
-    Hello { head: ChatSeq },
+    /// The first frame: the newest event on the host, and the host's
+    /// database seed, which names its log wherever a copy of it is held.
+    Hello { head: ChatSeq, machine_seed: u64 },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Chat { records: Vec<ChatRecord> },
@@ -110,7 +111,10 @@ mod tests {
     fn frames_and_requests_round_trip() {
         let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
         round_trips(ClientFrame::Follow { since: ChatSeq(9) });
-        round_trips(ServerFrame::Hello { head: ChatSeq(2) });
+        round_trips(ServerFrame::Hello {
+            head: ChatSeq(2),
+            machine_seed: 7,
+        });
         round_trips(ServerFrame::Chat {
             records: vec![
                 ChatRecord {

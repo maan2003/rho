@@ -385,6 +385,36 @@ where
         self.splice(all, Vec::new(), cx);
     }
 
+    /// Makes the transcript hold exactly `items`, in order, touching as
+    /// little as it can: an item that stayed where it was is replaced (and
+    /// an identical one costs nothing), one that moved is lifted and put
+    /// back, and one nobody wants goes. The cursor, the scroll and every
+    /// untouched row stay as they were.
+    pub fn reconcile(&mut self, items: Vec<Item<K, C, M>>, cx: &mut App) {
+        let wanted = items
+            .iter()
+            .map(|item| item.key.clone())
+            .collect::<HashSet<_>>();
+        for key in self.keys().cloned().collect::<Vec<_>>() {
+            if !wanted.contains(&key) {
+                self.remove(&key, cx);
+            }
+        }
+        let mut previous: Option<K> = None;
+        for item in items {
+            let key = item.key.clone();
+            if !self.contains(&key) {
+                self.insert_after(previous.as_ref(), vec![item], cx);
+            } else if self.key_before(&key).cloned() == previous {
+                self.replace(&key, item, cx);
+            } else {
+                self.remove(&key, cx);
+                self.insert_after(previous.as_ref(), vec![item], cx);
+            }
+            previous = Some(key);
+        }
+    }
+
     /// The one place the buffer is edited: replaces the items in `range`
     /// with `items` in a single edit covering exactly their text.
     fn splice(&mut self, range: Range<usize>, items: Vec<Item<K, C, M>>, cx: &mut App) {

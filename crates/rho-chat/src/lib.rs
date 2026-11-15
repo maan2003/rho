@@ -20,6 +20,8 @@ pub mod fold;
 pub mod outbox;
 #[cfg(feature = "client")]
 pub mod stream;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 #[cfg(feature = "client")]
 pub use fold::{HostChat, Thread, Told};

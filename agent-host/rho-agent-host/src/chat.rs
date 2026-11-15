@@ -58,7 +58,10 @@ where
     });
     let feed = rho_agent::store::feed(&services.db);
     let head = services.db.read().chat_head();
-    let _ = outgoing_tx.send(ServerFrame::Hello { head });
+    let _ = outgoing_tx.send(ServerFrame::Hello {
+        head,
+        machine_seed: services.machine_seed,
+    });
     let (follow_tx, follow_rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(
         Arc::clone(&services),

@@ -1,5 +1,7 @@
 [workspace]
 exclude = [
+  "crates/rho-gui-old",
+  "crates/rho-qa",
   "vendor/brush",
   "vendor/devenv",
   "vendor/libvpx-rs",
@@ -53,12 +55,12 @@ members = [
   "crates/rho-desktop-proto",
   "crates/rho-fake-slack",
   "crates/rho-files",
+  "crates/rho-frame",
   "crates/rho-gui",
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-ledger",
   "crates/rho-profiling",
-  "crates/rho-qa",
   "crates/rho-rpc",
   "crates/rho-rtc",
   "crates/rho-shell-view",
@@ -150,6 +152,7 @@ rho-devshell = { path = "agent-host/rho-devshell" }
 rho-fake-model = { path = "agent-host/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
+rho-frame = { path = "crates/rho-frame" }
 rho-fs-view = { path = "agent-host/rho-fs-view" }
 rho-git = { path = "agent-host/rho-git" }
 rho-image = { path = "agent-host/rho-image" }

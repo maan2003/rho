@@ -14,10 +14,9 @@ use std::collections::HashMap;
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gpui::{App, Window, WindowHandle};
+use rho_frame::Frame;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::{OwnedValue, Value};
-
-use crate::workspace::Workspace;
 
 /// The desktop app id, which the spec makes the bus name.
 pub const NAME: &str = "dev.rho.Gui";
@@ -149,7 +148,7 @@ fn hand_off(bus: &zbus::blocking::Connection, link: Option<String>) -> zbus::Res
 /// Answers what is asked of the name with `window`, from now on and what
 /// waited for it first. Only `rho://` links are taken; each opens the prompt
 /// that asks the user to name the host it reaches.
-pub fn serve(service: Service, window: WindowHandle<Workspace>, cx: &mut App) {
+pub fn serve(service: Service, window: WindowHandle<Frame>, cx: &mut App) {
     let Service {
         _bus: bus,
         mut requests,
@@ -160,13 +159,13 @@ pub fn serve(service: Service, window: WindowHandle<Workspace>, cx: &mut App) {
         let _bus = bus;
         while let Some(request) = requests.next().await {
             tracing::info!(?request, "asked over {INTERFACE}");
-            let _ = window.update(cx, |workspace, window, cx| match request {
+            let _ = window.update(cx, |frame, window, cx| match request {
                 Request::Activate { token } => raise(window, token),
                 Request::Open { uris, token } => {
                     raise(window, token);
                     for uri in uris {
                         if uri.starts_with(rho_iroh_auth::PAIRING_SCHEME) {
-                            workspace.prompt_link_name(uri, window, cx);
+                            frame.prompt_link_name(uri, window, cx);
                         } else {
                             tracing::warn!(%uri, "asked to open a URI that is no pairing link");
                         }

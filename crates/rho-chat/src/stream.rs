@@ -5,6 +5,7 @@
 //! ([`rho_agent_hosts::HostStream`]); what is said on it and where its
 //! frames go are this crate's.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc as futures_mpsc;
@@ -18,8 +19,15 @@ use crate::protocol::{ClientFrame, Open, ServerFrame};
 /// What reaches the fold from one host.
 #[derive(Debug)]
 pub enum ChatEvent {
-    /// The session opened: the newest event on the host.
-    Hello { host: HostId, head: ChatSeq },
+    /// The session opened: whose log the host carries and how far it
+    /// goes. `fresh` says the copy held here was not of this log and was
+    /// dropped: the records that follow start from the beginning.
+    Hello {
+        host: HostId,
+        machine_seed: u64,
+        head: ChatSeq,
+        fresh: bool,
+    },
     /// A run of the log, oldest first.
     Records {
         host: HostId,
@@ -29,48 +37,58 @@ pub enum ChatEvent {
     Closed { host: HostId },
 }
 
-/// Where this client stands in the host's log: what each new session is
-/// asked to send from. Moved by whoever folds the records.
+/// Where this client stands in each log, by the seed of the host that
+/// keeps it: what a session is asked to send from. Shared between the
+/// sessions, which read it on their hello, and whoever folds the records,
+/// who moves it. A log is named by its seed and not by the connection, so
+/// a host attached under a new name goes on from where its copy stands.
 #[derive(Clone, Default)]
-pub struct Cursor(Arc<Mutex<ChatSeq>>);
+pub struct Cursors(Arc<Mutex<HashMap<u64, ChatSeq>>>);
 
-impl Cursor {
-    pub fn new(since: ChatSeq) -> Self {
-        Self(Arc::new(Mutex::new(since)))
+impl Cursors {
+    pub fn new(held: impl IntoIterator<Item = (u64, ChatSeq)>) -> Self {
+        Self(Arc::new(Mutex::new(held.into_iter().collect())))
     }
 
-    pub fn get(&self) -> ChatSeq {
-        *self.0.lock().unwrap()
+    pub fn get(&self, machine_seed: u64) -> ChatSeq {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&machine_seed)
+            .copied()
+            .unwrap_or(ChatSeq::ZERO)
     }
 
-    /// The newest record held; a session asks for everything after it.
-    pub fn advance(&self, to: ChatSeq) {
+    /// The newest record held of a log; a session asks for everything
+    /// after it.
+    pub fn advance(&self, machine_seed: u64, to: ChatSeq) {
         let mut held = self.0.lock().unwrap();
-        *held = (*held).max(to);
+        let at = held.entry(machine_seed).or_insert(ChatSeq::ZERO);
+        *at = (*at).max(to);
     }
 
     /// Back to nothing: the host's log is not the one the copy holds.
-    pub fn reset(&self) {
-        *self.0.lock().unwrap() = ChatSeq::ZERO;
+    pub fn reset(&self, machine_seed: u64) {
+        self.0.lock().unwrap().remove(&machine_seed);
     }
 }
 
 /// One host's chat session, as the host keeps it across reconnects.
 pub struct ChatStream {
     host: HostId,
-    cursor: Cursor,
+    cursors: Cursors,
     events: futures_mpsc::UnboundedSender<ChatEvent>,
 }
 
 impl ChatStream {
     pub fn new(
         host: HostId,
-        cursor: Cursor,
+        cursors: Cursors,
         events: futures_mpsc::UnboundedSender<ChatEvent>,
     ) -> Self {
         Self {
             host,
-            cursor,
+            cursors,
             events,
         }
     }
@@ -85,25 +103,36 @@ impl HostStream for ChatStream {
     /// long as the connection lasts.
     fn run(&self, dialer: Dialer) -> BoxFuture<'static, anyhow::Result<()>> {
         let host = self.host;
-        let cursor = self.cursor.clone();
+        let cursors = self.cursors.clone();
         let events = self.events.clone();
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
             write_open(&mut socket, &Open::Session).await?;
             let result = async {
-                let ServerFrame::Hello { head } = read_frame(&mut socket).await? else {
+                let ServerFrame::Hello { head, machine_seed } = read_frame(&mut socket).await?
+                else {
                     anyhow::bail!("the chat session did not open with its hello");
                 };
+                // A copy that stands past the host's head is of some other
+                // log (the host's database was replaced): it starts over.
+                let mut since = cursors.get(machine_seed);
+                let fresh = since > head;
+                if fresh {
+                    cursors.reset(machine_seed);
+                    since = ChatSeq::ZERO;
+                }
                 if events
-                    .unbounded_send(ChatEvent::Hello { host, head })
+                    .unbounded_send(ChatEvent::Hello {
+                        host,
+                        machine_seed,
+                        head,
+                        fresh,
+                    })
                     .is_err()
                 {
                     return Ok(());
                 }
-                // The fold may have reset the cursor on hearing the hello:
-                // the host's log is not the one the copy holds.
-                let since = cursor.get();
                 write_frame(&mut socket, &ClientFrame::Follow { since }).await?;
                 loop {
                     let frame = read_frame::<_, ServerFrame>(&mut socket).await?;
