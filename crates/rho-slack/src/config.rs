@@ -78,6 +78,13 @@ impl Credentials {
     pub fn parse(workspace: &str, token: &str, cookie: &str) -> anyhow::Result<Self> {
         let workspace = workspace.trim();
         anyhow::ensure!(!workspace.is_empty(), "workspace name is empty");
+        // The name is the first part of every `slack:` address
+        // (`specs/SPEC-slack-addresses.md`), where `/` ends it and `|` ends
+        // the address in a ledger key.
+        anyhow::ensure!(
+            !workspace.contains(['/', '|']),
+            "a workspace name cannot contain / or |"
+        );
         let token = token.trim();
         anyhow::ensure!(
             token.starts_with("xoxc-"),
@@ -216,6 +223,11 @@ mod tests {
         assert_eq!(credentials.workspace, WorkspaceName("acme".into()));
         assert_eq!(credentials.token, "xoxc-123");
         assert_eq!(credentials.cookie, "abc");
+
+        assert!(
+            Credentials::parse("acme/eu", "xoxc-123", "abc").is_err(),
+            "a name with a slash would end early in its addresses"
+        );
 
         let error = Credentials::parse("acme", "xoxb-123", "abc").unwrap_err();
         assert!(error.to_string().contains("xoxc"));

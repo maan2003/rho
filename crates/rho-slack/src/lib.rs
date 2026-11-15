@@ -16,8 +16,12 @@
 //! Only mentions, direct messages, and threads the user has posted in ever
 //! become items; ordinary channel traffic never does.
 
+#[cfg(feature = "ui")]
+pub mod address;
 pub mod api;
 pub mod block;
+#[cfg(feature = "ui")]
+pub mod cards;
 pub mod config;
 pub mod emoji;
 pub mod events;

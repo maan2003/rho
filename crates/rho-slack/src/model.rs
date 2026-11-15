@@ -78,7 +78,7 @@ pub fn reason_text(reason: Attention, conversation: &str) -> String {
 /// message. Slack keeps the identity, so rho only has to say which ones
 /// matter. One card per unit at most, so a channel with three unhandled
 /// mentions is one card rather than three.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Unit {
     pub channel: ChannelId,
     /// `None` for a conversation: a direct or group message, or a channel
