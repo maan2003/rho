@@ -298,7 +298,9 @@ impl Minibuffer {
     /// Enter accepts the highlighted candidate, emacs `completing-read`
     /// style: it replaces the last token before submission whenever the
     /// user has typed something or explicitly moved the selection. A bare
-    /// enter on an untouched minibuffer still submits the empty input.
+    /// enter on an untouched minibuffer still submits the empty input,
+    /// except where the input is one candidate whole (`find:`, a chooser):
+    /// there the highlighted row is the answer.
     pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
         if self.accepts_selected(cx) {
             self.complete_selected(window, cx);
@@ -306,7 +308,7 @@ impl Minibuffer {
     }
 
     pub fn accepts_selected(&self, cx: &App) -> bool {
-        !self.input(cx).trim().is_empty() || self.selection_moved
+        !self.input(cx).trim().is_empty() || self.selection_moved || self.complete_whole_input
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with

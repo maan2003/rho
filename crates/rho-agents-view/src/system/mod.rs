@@ -508,7 +508,7 @@ impl System for AgentsSystem {
             .is_empty();
         if draft {
             rows.push(Row::menu(
-                "S",
+                "shift-s",
                 "send and start agent",
                 start::rows(self, this, thread, start::Origin::Draft, cx),
             ));

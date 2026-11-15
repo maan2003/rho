@@ -518,7 +518,7 @@ impl System for ChatSystem {
                 .and_then(|chat| chat.name(thread.message))
                 .unwrap_or_default();
             rows.push(Row::run(
-                "N",
+                "shift-n",
                 "name this thread",
                 move |frame, window, cx| {
                     let this = this.clone();

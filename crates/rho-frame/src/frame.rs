@@ -550,7 +550,7 @@ impl Frame {
         rows.push(Row::run("u", "undo", |frame, window, cx| {
             frame.undo_verdict(window, cx)
         }));
-        rows.push(Row::menu("H", "hosts", self.hosts_menu()));
+        rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
         rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
         rows.extend(self.current_surface().clone().rows(window, cx));
         for system in self.systems.clone() {
