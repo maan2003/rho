@@ -1,0 +1,638 @@
+//! The live view of a host desktop: its frames painted as they arrive, the
+//! user's mouse and keys sent back, and a frozen frame to draw on and copy.
+//! Dropping the view drops the video subscription.
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui::prelude::*;
+use gpui::*;
+use rho_desktop_proto::Input;
+use theme::ActiveTheme as _;
+
+/// A decoded image and the one frame the renderer draws it from: the
+/// renderer knows a frame by its identity, so an image gets exactly one.
+struct Shown {
+    image: Arc<crate::viewer::Image>,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
+    render: VideoFrame,
+}
+
+impl Shown {
+    fn new(image: Arc<crate::viewer::Image>) -> anyhow::Result<Self> {
+        let render = VideoFrame::new(Arc::new(Planes(image.clone())))?;
+        Ok(Self { image, render })
+    }
+}
+
+struct Planes(Arc<crate::viewer::Image>);
+
+impl Yuv444Data for Planes {
+    fn size(&self) -> (u32, u32) {
+        (self.0.planes.width() as u32, self.0.planes.height() as u32)
+    }
+    fn plane(&self, index: usize) -> &[u8] {
+        self.0.planes.plane(index)
+    }
+    fn stride(&self, index: usize) -> u32 {
+        self.0.planes.stride(index) as u32
+    }
+}
+
+pub struct DesktopView {
+    viewer: crate::viewer::Viewer,
+    image: Option<Rc<Shown>>,
+    frozen: Option<Rc<Shown>>,
+    strokes: Vec<Vec<(u32, u32)>>,
+    drawing: bool,
+    status: Option<String>,
+    size: (usize, usize),
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    focus: FocusHandle,
+    error: Option<String>,
+    first_paint: Rc<Cell<bool>>,
+    painted: Rc<Cell<Option<rho_desktop_proto::FrameId>>>,
+    _updates: Task<()>,
+    _activation: Subscription,
+}
+impl DesktopView {
+    pub fn new(viewer: crate::viewer::Viewer, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let started = viewer.started_at;
+        let desktop_id = viewer.desktop_id;
+        tracing::info!(
+            desktop_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "desktop viewer attached to GUI"
+        );
+        let mut images = viewer.images.clone();
+        let mut errors = viewer.errors.clone();
+        let updates = cx.spawn(async move |this, cx| {
+            loop {
+                let changed = {
+                    let image = Box::pin(images.changed());
+                    let error = Box::pin(errors.changed());
+                    match futures::future::select(image, error).await {
+                        futures::future::Either::Left((result, _)) => result.is_ok(),
+                        futures::future::Either::Right((result, _)) => result.is_ok(),
+                    }
+                };
+                if !changed {
+                    break;
+                }
+                let image = images.borrow_and_update().clone();
+                let error = errors.borrow_and_update().clone();
+                if this
+                    .update(cx, |this, cx| {
+                        this.error = error;
+                        if let Some(image) = image {
+                            if this.image.is_none() {
+                                tracing::info!(
+                                    desktop_id,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    "desktop first frame delivered to GUI"
+                                );
+                            }
+                            match Shown::new(image) {
+                                Ok(shown) => {
+                                    if this.frozen.is_none() {
+                                        this.size = (shown.image.width, shown.image.height);
+                                    }
+                                    this.image = Some(Rc::new(shown));
+                                }
+                                Err(error) => this.error = Some(format!("{error:#}")),
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let focus = cx.focus_handle();
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.viewer.motion.send_replace(None);
+                this.send(Input::ReleaseAll, cx);
+                this.drawing = false;
+            }
+        });
+        Self {
+            first_paint: Rc::new(Cell::new(true)),
+            painted: Rc::new(Cell::new(None)),
+            _activation: activation,
+            viewer,
+            image: None,
+            frozen: None,
+            strokes: Vec::new(),
+            drawing: false,
+            status: None,
+            size: (1, 1),
+            bounds: Rc::new(Cell::new(Bounds::default())),
+            focus,
+            error: None,
+            _updates: updates,
+        }
+    }
+    /// Whether a frozen frame is up to draw on, rather than the live one.
+    pub fn annotating(&self) -> bool {
+        self.frozen.is_some()
+    }
+
+    pub fn toggle_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        self.annotate(cx);
+    }
+    fn annotate(&mut self, cx: &mut Context<Self>) {
+        if self.frozen.is_some() {
+            self.frozen = None;
+            self.strokes.clear();
+            self.drawing = false;
+            if let Some(image) = self.viewer.images.borrow().as_ref() {
+                self.size = (image.width, image.height);
+            }
+        } else {
+            self.send(Input::ReleaseAll, cx);
+            self.viewer.motion.send_replace(None);
+            self.frozen = self.image.clone();
+            self.status = None;
+        }
+        cx.notify();
+    }
+    /// Copies the frozen frame with what is drawn on it.
+    fn export(&mut self, cx: &mut Context<Self>) {
+        let Some(image) = self.frozen.as_ref() else {
+            return;
+        };
+        let mut pixels = match image.image.export_bgra() {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        for stroke in &self.strokes {
+            if let Some(&point) = stroke.first() {
+                draw_line(&mut pixels, self.size, point, point);
+            }
+            for pair in stroke.windows(2) {
+                draw_line(&mut pixels, self.size, pair[0], pair[1]);
+            }
+        }
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        let image =
+            image::RgbaImage::from_raw(self.size.0 as u32, self.size.1 as u32, pixels).unwrap();
+        if let Err(error) = image.write_to(&mut png, image::ImageFormat::Png) {
+            self.error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let bytes = png.into_inner();
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes);
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        self.status = Some("Annotation copied".into());
+        cx.notify();
+    }
+    fn send(&mut self, input: Input, cx: &mut Context<Self>) {
+        if self.viewer.input.try_send(input).is_err() {
+            self.viewer.disconnect();
+            self.error = Some("Viewer disconnected because input could not be delivered".into());
+            cx.notify();
+        }
+    }
+    fn position(&self, p: Point<Pixels>) -> Option<(u32, u32)> {
+        // Before the first frame, the placeholder dimensions are not
+        // coordinates.
+        self.image.as_ref()?;
+        let bounds = self.bounds.get();
+        if !bounds.contains(&p) || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return None;
+        }
+        Some((
+            (((p.x - bounds.origin.x) / bounds.size.width) * self.size.0 as f32) as u32,
+            (((p.y - bounds.origin.y) / bounds.size.height) * self.size.1 as f32) as u32,
+        ))
+        .map(|(x, y)| (x.min(self.size.0 as u32 - 1), y.min(self.size.1 as u32 - 1)))
+    }
+}
+impl Focusable for DesktopView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for DesktopView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let image = self.frozen.clone().or_else(|| self.image.clone());
+        let first_paint = self.first_paint.clone();
+        let painted = self.painted.clone();
+        let started = self.viewer.started_at;
+        let desktop_id = self.viewer.desktop_id;
+        let strokes = self.strokes.clone();
+        let size = self.size;
+        let bounds = self.bounds.clone();
+        let canvas = canvas(
+            move |available, _, _| {
+                let ratio = (f32::from(available.size.width) / size.0 as f32)
+                    .min(f32::from(available.size.height) / size.1 as f32);
+                let size = gpui::size(px(size.0 as f32 * ratio), px(size.1 as f32 * ratio));
+                let fitted = Bounds::new(
+                    available.origin
+                        + point(
+                            (available.size.width - size.width) / 2.,
+                            (available.size.height - size.height) / 2.,
+                        ),
+                    size,
+                );
+                bounds.set(fitted);
+                fitted
+            },
+            move |_, bounds, window, _| {
+                if let Some(image) = image {
+                    #[cfg(target_os = "linux")]
+                    window.paint_video(bounds, image.render.clone());
+                    let presented = image.image.clone();
+                    on_presented(image.image.id, &painted, window, move || {
+                        presented.presented()
+                    });
+                    if first_paint.replace(false) {
+                        tracing::info!(
+                            desktop_id,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "desktop first frame paint queued"
+                        );
+                        // A paint callback only queues primitives. This
+                        // next-frame marker also
+                        // exposes stalls in rendering/presentation.
+                        window.on_next_frame(move |_, _| {
+                            tracing::info!(
+                                desktop_id,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "desktop frame callback after first paint"
+                            );
+                        });
+                    }
+                }
+                let map = |(x, y): (u32, u32)| {
+                    bounds.origin
+                        + point(
+                            bounds.size.width * (x as f32 / size.0 as f32),
+                            bounds.size.height * (y as f32 / size.1 as f32),
+                        )
+                };
+                for stroke in strokes {
+                    let Some(&first) = stroke.first() else {
+                        continue;
+                    };
+                    let mut path =
+                        PathBuilder::stroke(px(4.) * f32::from(bounds.size.width) / size.0 as f32);
+                    path.move_to(map(first));
+                    if stroke.len() == 1 {
+                        let radius = bounds.size.width * (2. / size.0 as f32);
+                        let dot = Bounds::new(
+                            map(first) - point(radius, radius),
+                            gpui::size(radius * 2., radius * 2.),
+                        );
+                        window.paint_quad(fill(dot, rgb(0xff4050)));
+                    }
+                    for p in stroke.into_iter().skip(1) {
+                        path.line_to(map(p));
+                    }
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, rgb(0xff4050));
+                    }
+                }
+            },
+        )
+        .size_full();
+        let mut surface = div()
+            .id("remote-wayland")
+            .track_focus(&self.focus)
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .bg(rgb(0x161616))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if let Some(position) = this.position(event.position) {
+                    if this.frozen.is_some() {
+                        if this.drawing
+                            && let Some(stroke) = this.strokes.last_mut()
+                            && stroke.last() != Some(&position)
+                        {
+                            stroke.push(position);
+                            cx.notify();
+                        }
+                    } else {
+                        this.viewer.motion.send_replace(Some(position));
+                    }
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if this.frozen.is_some() {
+                    return;
+                }
+                let (horizontal, vertical) = match event.delta {
+                    ScrollDelta::Pixels(p) => (-f32::from(p.x) as f64, -f32::from(p.y) as f64),
+                    ScrollDelta::Lines(p) => (-p.x as f64 * 15., -p.y as f64 * 15.),
+                };
+                this.send(
+                    Input::Scroll {
+                        horizontal,
+                        vertical,
+                    },
+                    cx,
+                );
+                cx.stop_propagation();
+            }))
+            .on_physical_key(cx.listener(|this, event: &PhysicalKeyEvent, _, cx| {
+                if this.frozen.is_some() {
+                    return;
+                }
+                let PhysicalKey::LinuxEvdev(code) = event.key;
+                this.send(
+                    Input::Physical {
+                        code,
+                        pressed: event.pressed,
+                    },
+                    cx,
+                );
+                cx.stop_propagation();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.frozen.is_some() {
+                    let key = &event.keystroke;
+                    match key.key.as_str() {
+                        "escape" => this.annotate(cx),
+                        "u" if !key.modifiers.control && !key.modifiers.alt => {
+                            this.strokes.pop();
+                            cx.notify();
+                        }
+                        "y" if !key.modifiers.control && !key.modifiers.alt => this.export(cx),
+                        "g" if key.modifiers.control => this.annotate(cx),
+                        _ => {}
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                if cfg!(target_os = "linux") {
+                    cx.stop_propagation();
+                    return;
+                }
+                let key = &event.keystroke;
+                if !key.modifiers.control
+                    && !key.modifiers.platform
+                    && !key.modifiers.alt
+                    && let Some(text) = &key.key_char
+                {
+                    this.send(Input::Text(text.clone()), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                let mut chord = String::new();
+                if key.modifiers.control {
+                    chord.push_str("ctrl+");
+                }
+                if key.modifiers.alt {
+                    chord.push_str("alt+");
+                }
+                if key.modifiers.shift {
+                    chord.push_str("shift+");
+                }
+                if key.modifiers.platform {
+                    chord.push_str("super+");
+                }
+                chord.push_str(&key.key);
+                this.send(Input::Key(chord), cx);
+                cx.stop_propagation();
+            }))
+            .child(canvas);
+        for (button, code) in [
+            (MouseButton::Left, 0x110),
+            (MouseButton::Right, 0x111),
+            (MouseButton::Middle, 0x112),
+        ] {
+            surface = surface
+                .on_mouse_down(
+                    button,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus, cx);
+                        if let Some((x, y)) = this.position(event.position) {
+                            if this.frozen.is_some() {
+                                if button == MouseButton::Left {
+                                    this.strokes.push(vec![(x, y)]);
+                                    this.drawing = true;
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            this.viewer.motion.send_replace(None);
+                            this.send(Input::Move { x, y }, cx);
+                            this.send(
+                                Input::Button {
+                                    button: code,
+                                    pressed: true,
+                                },
+                                cx,
+                            );
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_up(
+                    button,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        this.drawing = false;
+                        if this.frozen.is_none() {
+                            this.send(
+                                Input::Button {
+                                    button: code,
+                                    pressed: false,
+                                },
+                                cx,
+                            );
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_up_out(
+                    button,
+                    cx.listener(move |this, _, _, cx| {
+                        this.drawing = false;
+                        if this.frozen.is_none() {
+                            this.send(
+                                Input::Button {
+                                    button: code,
+                                    pressed: false,
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                );
+        }
+        let mut root = div()
+            .key_context("RhoDesktop")
+            .size_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .child(surface);
+        if self.frozen.is_some() {
+            let action =
+                |id: &'static str, label: &'static str| div().id(id).cursor_pointer().child(label);
+            let mut mode_line = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py(px(3.))
+                .text_size(px(12.))
+                .bg(cx.theme().colors().editor_background)
+                .text_color(cx.theme().colors().text_muted)
+                .child(
+                    div()
+                        .text_color(cx.theme().colors().text_accent)
+                        .child("DRAW"),
+                )
+                .child(
+                    action("undo", "u undo").on_click(cx.listener(|this, _, _, cx| {
+                        this.strokes.pop();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    action("copy", "y copy")
+                        .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
+                );
+            mode_line = mode_line.child(
+                action("resume", "esc live")
+                    .on_click(cx.listener(|this, _, _, cx| this.annotate(cx))),
+            );
+            if let Some(status) = &self.status {
+                mode_line = mode_line.child(div().child(status.clone()));
+            }
+            root = root.child(mode_line);
+        }
+        if let Some(error) = &self.error {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .p_2()
+                    .bg(rgb(0x401818))
+                    .text_color(rgb(0xffffff))
+                    .child(error.clone()),
+            );
+        }
+        root
+    }
+}
+
+/// A repeated paint (including annotation on a frozen frame) must not refresh
+/// the source's progress clock. Report only after the following GUI frame.
+fn on_presented(
+    id: rho_desktop_proto::FrameId,
+    painted: &Cell<Option<rho_desktop_proto::FrameId>>,
+    window: &Window,
+    report: impl FnOnce() + 'static,
+) {
+    if painted.get().is_none_or(|previous| id > previous) {
+        painted.set(Some(id));
+        // Renderer progress, not a hardware scanout fence.
+        window.on_next_frame(move |_, _| report());
+    }
+}
+
+/// Burn the same output-pixel strokes into the frozen frame, not a later frame.
+fn draw_line(pixels: &mut [u8], size: (usize, usize), from: (u32, u32), to: (u32, u32)) {
+    let (mut x, mut y) = (from.0 as i32, from.1 as i32);
+    let (end_x, end_y) = (to.0 as i32, to.1 as i32);
+    let dx = (end_x - x).abs();
+    let dy = -(end_y - y).abs();
+    let sx = if x < end_x { 1 } else { -1 };
+    let sy = if y < end_y { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        for oy in -2..=2 {
+            for ox in -2..=2 {
+                if ox * ox + oy * oy > 4 {
+                    continue;
+                }
+                let (px, py) = (x + ox, y + oy);
+                if px >= 0 && py >= 0 && (px as usize) < size.0 && (py as usize) < size.1 {
+                    let i = (py as usize * size.0 + px as usize) * 4;
+                    pixels[i..i + 4].copy_from_slice(&[0x50, 0x40, 0xff, 255]);
+                }
+            }
+        }
+        if x == end_x && y == end_y {
+            break;
+        }
+        let twice = 2 * error;
+        if twice >= dy {
+            error += dy;
+            x += sx;
+        }
+        if twice <= dx {
+            error += dx;
+            y += sy;
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{EmptyView, TestAppContext};
+
+    use super::{draw_line, on_presented};
+
+    #[gpui::test]
+    fn presentation_feedback_waits_for_frame_and_ignores_repaints(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let painted = Cell::new(None);
+        let reported = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| {
+                for (epoch, timestamp_us) in [(2, 50), (2, 50), (1, 90), (2, 60)] {
+                    let reported = reported.clone();
+                    on_presented(
+                        rho_desktop_proto::FrameId {
+                            epoch,
+                            timestamp_us,
+                        },
+                        &painted,
+                        window,
+                        move || reported.set(reported.get() + 1),
+                    );
+                }
+                assert_eq!(reported.get(), 0, "paint is not presentation");
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                assert_eq!(window.simulate_next_frame(cx), 2);
+            })
+            .unwrap();
+        assert_eq!(reported.get(), 2, "one callback per advancing frame");
+    }
+
+    #[test]
+    fn stroke_keeps_channels_and_clips_at_image_edges() {
+        let mut pixels = vec![7; 13 * 9 * 4];
+        draw_line(&mut pixels, (13, 9), (0, 1), (11, 7));
+        assert_eq!(&pixels[4 * 13..4 * 13 + 4], &[0x50, 0x40, 0xff, 255]);
+        assert_eq!(
+            &pixels[(7 * 13 + 11) * 4..(7 * 13 + 12) * 4],
+            &[0x50, 0x40, 0xff, 255]
+        );
+        assert_eq!(&pixels[(8 * 13) * 4..(8 * 13 + 1) * 4], &[7; 4]);
+    }
+}
