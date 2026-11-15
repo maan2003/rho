@@ -196,11 +196,11 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
     /// place dealing happens.
     pub fn forward(&mut self) -> Option<&S> {
         let next = self.entry(self.cursor).next?;
-        // A dead entry left behind is one the reader can no longer step
-        // back to, so it does not count as a step gained.
-        if !self.step_to(next) {
-            self.behind += 1;
-        }
+        // The entry left is behind the reader now. If it was dead,
+        // `step_to` unlinks it and `unlink` takes that step off again, so
+        // it is counted first: the count never goes below zero on the way.
+        self.behind += 1;
+        self.step_to(next);
         Some(self.current())
     }
 
@@ -466,6 +466,38 @@ mod tests {
             "and down deals rather than returning to a dead surface"
         );
         assert_eq!(history.back().copied(), Some(0));
+    }
+
+    /// Down off a forgotten entry at the oldest end: the entry goes and
+    /// the reader gains no step back. The count once dipped below zero
+    /// here, which is what closing a surface the reader had walked back to
+    /// the start of history did.
+    #[test]
+    fn forward_off_a_forgotten_oldest_entry_gains_no_step_back() {
+        let mut history = history();
+        history.show("page", 1);
+        history.show("home", 0);
+        history.back();
+        assert_eq!((history.behind(), history.ahead()), (0, 1));
+        history.forget(&"page");
+        assert_eq!(history.forward().copied(), Some(0));
+        assert_eq!(
+            (history.behind(), history.ahead(), history.len()),
+            (0, 0, 1)
+        );
+        assert_eq!(history.back(), None);
+
+        // In the middle, down off a forgotten entry keeps the steps back
+        // the reader had, and no more.
+        let mut history = History::new("home", 0);
+        history.show("a", 1);
+        history.show("b", 2);
+        history.show("c", 3);
+        history.back();
+        history.forget(&"b");
+        assert_eq!(history.forward().copied(), Some(3));
+        assert_eq!((history.behind(), history.ahead()), (2, 0));
+        assert_eq!(back_keys(&history), ["a", "home"]);
     }
 
     #[test]
