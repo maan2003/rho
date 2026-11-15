@@ -1,6 +1,6 @@
 use std::io::Write as _;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use rho_agent_hosts::protocol::{PlatformSecretsSet, PlatformStatus};
 
 use crate::{GithubArgs, GithubCommand, host_call};
@@ -32,11 +32,15 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 }
 
 pub(crate) fn prompt_token(prompt: &str) -> anyhow::Result<String> {
+    prompt_optional(prompt)?.context("no token entered")
+}
+
+/// A token, or `None` when the user just pressed Enter.
+pub(crate) fn prompt_optional(prompt: &str) -> anyhow::Result<Option<String>> {
     eprint!("{prompt}");
     std::io::stderr().flush().ok();
     let mut token = String::new();
     std::io::stdin().read_line(&mut token)?;
-    let token = token.trim().to_owned();
-    anyhow::ensure!(!token.is_empty(), "no token entered");
-    Ok(token)
+    let token = token.trim();
+    Ok((!token.is_empty()).then(|| token.to_owned()))
 }

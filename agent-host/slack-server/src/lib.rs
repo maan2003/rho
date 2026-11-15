@@ -6,6 +6,12 @@
 //! the methods in a fixed list: reads and the writes agents need to work
 //! with people. Slack validates the arguments.
 //!
+//! Message search is the exception: `assistant.search.context` (Slack's
+//! Real-time Search API) takes a bot token only with an `action_token` from
+//! a user's event, so it goes with a user token instead. The manifest grants
+//! that token only `search:read.public`: public channels, which the bot can
+//! already join and read.
+//!
 //! One method is the server's own: `rho.events` long-polls the events the
 //! app's Socket Mode connection receives (see [`events`]). `GET /download`
 //! fetches a file Slack hosts, which also needs the bot token.
@@ -35,6 +41,7 @@ struct AppState {
     client: Client,
     token_provider: TokenProvider,
     app_token: TokenProvider,
+    user_token: TokenProvider,
     slack_api_url: Url,
     slack_files_url: Url,
     events: Arc<Events>,
@@ -89,6 +96,7 @@ fn argument_names(query: &str, headers: &HeaderMap, body: &[u8]) -> Result<Vec<S
 pub fn router(
     token_provider: TokenProvider,
     app_token: TokenProvider,
+    user_token: TokenProvider,
     slack_api_url: Url,
     slack_files_url: Url,
     events: Arc<Events>,
@@ -101,6 +109,7 @@ pub fn router(
             .expect("static Slack HTTP client configuration is valid"),
         token_provider,
         app_token,
+        user_token,
         slack_api_url,
         slack_files_url,
         events,
@@ -116,7 +125,11 @@ pub async fn serve(listener: UnixListener, router: Router) -> Result<()> {
     Ok(())
 }
 
-/// Forwards one Web API call with the bot token in place of any the agent sent.
+/// The one method that goes with the user token.
+const SEARCH: &str = "assistant.search.context";
+
+/// Forwards one Web API call with the host's token in place of any the agent
+/// sent: the user token for [`SEARCH`], the bot token for the rest.
 async fn call(
     State(state): State<Arc<AppState>>,
     Path(method): Path<String>,
@@ -145,8 +158,14 @@ async fn call(
     if method == "rho.events" {
         return wait_for_events(&state, query.as_deref().unwrap_or_default()).await;
     }
-    let Some(token) = bot_token(&state) else {
-        return slack_error(NO_TOKEN);
+    let token = if method == SEARCH {
+        events::present(&state.user_token).ok_or(NO_USER_TOKEN)
+    } else {
+        events::present(&state.token_provider).ok_or(NO_TOKEN)
+    };
+    let token = match token {
+        Ok(token) => token,
+        Err(error) => return slack_error(error),
     };
     let mut url = state.slack_api_url.clone();
     url.path_segments_mut()
@@ -179,13 +198,9 @@ async fn call(
     }
 }
 
-fn bot_token(state: &AppState) -> Option<String> {
-    let token = (state.token_provider)().ok()?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_owned())
-}
-
 const NO_TOKEN: &str = "rho_no_slack_token: run `rho slack init` on the agent host";
+const NO_USER_TOKEN: &str = "rho_no_slack_user_token: give the host's Slack app the \
+     search:read.public user scope, reinstall it and run `rho slack init` with its user token";
 
 /// `GET /download?url=...`: the bytes of a file Slack hosts, such as a
 /// file's `url_private_download`, fetched with the bot token. The token goes
@@ -203,7 +218,7 @@ async fn download(State(state): State<Arc<AppState>>, RawQuery(query): RawQuery)
         );
         return (StatusCode::BAD_REQUEST, slack_error(&error)).into_response();
     };
-    let Some(token) = bot_token(&state) else {
+    let Some(token) = events::present(&state.token_provider) else {
         return (StatusCode::SERVICE_UNAVAILABLE, slack_error(NO_TOKEN)).into_response();
     };
     let response = match state.client.get(url).bearer_auth(token).send().await {
@@ -318,9 +333,18 @@ mod tests {
     }
 
     async fn server(token: &'static str, slack: Url) -> String {
+        server_with_user_token(token, "", slack).await
+    }
+
+    async fn server_with_user_token(
+        token: &'static str,
+        user_token: &'static str,
+        slack: Url,
+    ) -> String {
         let app = router(
             Arc::new(move || Ok(token.to_owned())),
             Arc::new(move || Ok(token.to_owned())),
+            Arc::new(move || Ok(user_token.to_owned())),
             slack.clone(),
             slack,
             Arc::default(),
@@ -407,6 +431,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_goes_with_the_user_token_and_nothing_else_does() {
+        let (slack, seen) = fake_slack().await;
+        let server = server_with_user_token("xoxb-host", "xoxp-host", slack).await;
+        let client = reqwest::Client::new();
+        for (method, body) in [
+            (
+                "assistant.search.context",
+                r#"{"query":"deploy in:<#C1>","channel_types":["public_channel"]}"#,
+            ),
+            ("conversations.history", r#"{"channel":"C1"}"#),
+        ] {
+            client
+                .post(format!("{server}/api/{method}"))
+                .bearer_auth("xoxb-agent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+        }
+        let seen: Vec<(String, String)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.1.clone(), r.2.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "/api/assistant.search.context".to_owned(),
+                    "Bearer xoxp-host".to_owned()
+                ),
+                (
+                    "/api/conversations.history".to_owned(),
+                    "Bearer xoxb-host".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_a_user_token_says_how_to_get_one() {
+        let (slack, seen) = fake_slack().await;
+        let server = server_with_user_token("xoxb-host", " ", slack).await;
+        let body = reqwest::get(format!("{server}/api/assistant.search.context?query=x"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(body, json!({"ok": false, "error": NO_USER_TOKEN}));
+        // The bot token is not a fallback.
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn downloads_only_from_the_file_host_with_the_host_token() {
         let (slack, seen) = fake_slack().await;
         let files = slack.origin().ascii_serialization();
@@ -466,6 +547,7 @@ mod tests {
         let app = router(
             Arc::new(|| Ok("xoxb-host".to_owned())),
             Arc::new(|| Ok("xapp-host".to_owned())),
+            Arc::new(|| Ok("xoxp-host".to_owned())),
             slack.clone(),
             slack,
             events.clone(),
