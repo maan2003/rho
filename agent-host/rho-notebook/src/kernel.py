@@ -367,8 +367,9 @@ class Notebook:
                 owner.cell.finished(None, True)
                 owner.done = True
             elif task._exception is not None:
-                owner.cell.returned(None)
-                owner.failed(task._exception)
+                # The exec's raise is its output, as when its code does not
+                # await: retrieved here, it is no unclaimed task failure.
+                done(format_error(task.exception()))
             elif not owner.done:
                 done(None)
         if task.done():
