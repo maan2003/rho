@@ -19,9 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_types::{ContentPart, WorksetKind};
-use rho_agents_client::protocol::worksets::{
-    ClientFrame, CreateWorkset, LogEvent, ServerFrame, StartTopic,
-};
+use rho_agents_client::protocol::worksets::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
 use rho_agents_client::snippets;
 use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};
@@ -1150,7 +1148,6 @@ async fn probe_async(name: &str) -> Result<()> {
         .await
         .with_context(|| format!("connect to the running rig at {}", socket.display()))?;
     let mut client = Streams::open(client, &socket).await?;
-    let stream = client.create_stream("rig").await?;
     let runtime = snippets::Runtime::parse("").map_err(anyhow::Error::msg)?;
     client.create(CreateWorkset {
         kind: WorksetKind::Host {
@@ -1179,10 +1176,9 @@ async fn probe_async(name: &str) -> Result<()> {
             } => {
                 anyhow::ensure!(error.is_none(), "rig creation code failed: {error:?}");
                 let agent = agent.context("the rig creation code created no agent")?;
-                client.start_topic(StartTopic {
+                client.post(rho_chat::protocol::Post {
                     client_id: 1,
-                    stream,
-                    name: "rig probe".to_owned(),
+                    parent: None,
                     mentions: vec![agent],
                     content: vec![ContentPart::Text {
                         text: "Complete one deterministic rig probe turn.".to_owned(),

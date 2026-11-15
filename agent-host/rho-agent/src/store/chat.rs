@@ -1,14 +1,19 @@
 //! The host's chat ([`rho_agent_types::ChatEvent`]): one log, dense from
 //! one, and the indexes folded from it in the commit of every append.
 //!
-//! Each conversation keeps its members; a message is in the inbox of every
-//! member and every agent it mentions, but not its sender's. The inbox is
-//! written with the message, so an agent's delivery reads only its own.
+//! The log holds a forest of messages. Each message keeps its parent now
+//! ([`PARENT`]) and each parent its children ([`CHILDREN`]), so a thread is
+//! read as a range and a move rewrites two rows. Membership is explicit per
+//! thread ([`MEMBERS`]) and read up the chain of parents: the nearest
+//! record for an agent decides, so a join on a root is a bot in a channel
+//! and a leave on a subthread cuts that branch. A message is in the inbox of
+//! every member and every agent it mentions, but not its sender's. The inbox
+//! is written with the message, so an agent's delivery reads only its own.
 
 use redb::TableDefinition;
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, Message, MessageId,
-    StreamId, TopicId, UnixMs,
+    UnixMs,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
@@ -16,43 +21,23 @@ use senax_encoder::{Decode, Encode};
 use super::{Appended, tell};
 
 const CHAT_LOG: TableDefinition<u64, Sen<ChatRecord>> = TableDefinition::new("chat_log");
-const STREAMS: TableDefinition<u64, String> = TableDefinition::new("chat_streams");
-const STREAM_NAMES: TableDefinition<String, u64> = TableDefinition::new("chat_stream_names");
-const TOPICS: TableDefinition<u64, Sen<TopicHead>> = TableDefinition::new("chat_topics");
-/// `(topic, message)`: a topic's messages in order.
-const TOPIC_MESSAGES: TableDefinition<(u64, u64), ()> = TableDefinition::new("chat_topic_messages");
+/// A message's parent now; zero for a root.
+const PARENT: TableDefinition<u64, u64> = TableDefinition::new("chat_parent");
+/// `(parent, message)`: a thread's messages in order, under zero the roots.
+const CHILDREN: TableDefinition<(u64, u64), ()> = TableDefinition::new("chat_children");
+/// `(thread, agent)`: what the agent last said about the thread, joined
+/// (`true`) or left.
+const MEMBERS: TableDefinition<(u64, AgentId), bool> = TableDefinition::new("chat_members");
 /// `(agent, message)`: what each agent receives, in order.
 const INBOX: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("chat_inbox");
 /// The user's posts by the client's own id for them, so a resend is
 /// logged once: the seq of the event the post made.
 const CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("chat_client_ids");
-/// `(a, b)` with `a < b`: the direct conversation of two agents.
-const DIRECTS: TableDefinition<(AgentId, AgentId), u64> = TableDefinition::new("chat_directs");
-/// A moved message's topic now. A message never moved is in the topic its
-/// `Posted` names.
-const MOVED: TableDefinition<u64, u64> = TableDefinition::new("chat_moved");
+/// A thread's given name, when it has one.
+const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 
-/// Where a conversation is.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Place {
-    /// A topic: anyone may post in it, and agents join and leave it.
-    Stream {
-        stream: StreamId,
-        name: String,
-        resolved: bool,
-    },
-    /// Two agents' own conversation: only they post in it.
-    Direct,
-}
-
-/// A conversation as the log has made it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct TopicHead {
-    pub place: Place,
-    /// Who receives its messages: a topic's in the order they joined, a
-    /// direct conversation's two.
-    pub agents: Vec<AgentId>,
-}
+/// The root of the forest in the children index.
+const ROOT: u64 = 0;
 
 /// A message as its sender gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,19 +47,44 @@ pub struct NewMessage {
     pub content: Vec<ContentPart>,
 }
 
+/// A thread as a reader needs it: its messages are read separately.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ThreadHead {
+    pub id: MessageId,
+    /// Its given name, or the first line of its message.
+    pub name: String,
+    /// From the root down to this thread, each by id and name.
+    pub path: Vec<(MessageId, String)>,
+    /// Who receives what is posted in it, by the nearest record up the
+    /// chain, in the order they joined.
+    pub members: Vec<AgentId>,
+}
+
+fn seq_of(parent: Option<MessageId>) -> u64 {
+    parent.map_or(ROOT, |parent| parent.0.0)
+}
+
+fn parent_of(seq: u64) -> Option<MessageId> {
+    (seq != ROOT).then_some(MessageId(ChatSeq(seq)))
+}
+
 pub trait ChatRead {
     /// The newest event; zero for none.
     fn chat_head(&self) -> ChatSeq;
     /// Up to `limit` events after `after`, in order.
     fn chat_since(&self, after: ChatSeq, limit: usize) -> Vec<ChatRecord>;
+    /// A message, under its parent now.
     fn message(&self, id: MessageId) -> Option<Message>;
-    fn topic(&self, id: TopicId) -> Option<TopicHead>;
-    fn stream_name(&self, id: StreamId) -> Option<String>;
-    fn stream_named(&self, name: &str) -> Option<StreamId>;
+    /// The thread under `id`, if `id` is a message.
+    fn thread(&self, id: MessageId) -> Option<ThreadHead>;
+    /// A thread's `newest` latest messages, oldest first; the roots for
+    /// `None`.
+    fn thread_messages(&self, thread: Option<MessageId>, newest: usize) -> Vec<Message>;
+    /// Who receives a message posted under `parent`: the agents whose
+    /// nearest membership record up the chain is a join, oldest join first.
+    fn members_under(&self, parent: Option<MessageId>) -> Vec<AgentId>;
     /// What `agent` receives after `after`, in order.
     fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message>;
-    /// A topic's `newest` latest messages, oldest first.
-    fn topic_messages(&self, topic: TopicId, newest: usize) -> Vec<Message>;
 }
 
 impl ChatRead for ReadTxn {
@@ -95,29 +105,76 @@ impl ChatRead for ReadTxn {
 
     fn message(&self, id: MessageId) -> Option<Message> {
         let record = self.open_table(CHAT_LOG).get(id.0.0)?.value().into_owned();
-        let moved = self
-            .open_table(MOVED)
-            .get(id.0.0)
-            .map(|topic| TopicId(ChatSeq(topic.value())));
-        where_now(Message::from_record(&record)?, moved)
+        let mut message = Message::from_record(&record)?;
+        message.parent = parent_of(
+            self.open_table(PARENT)
+                .get(id.0.0)
+                .expect("a message has a parent row")
+                .value(),
+        );
+        Some(message)
     }
 
-    fn topic(&self, id: TopicId) -> Option<TopicHead> {
-        self.open_table(TOPICS)
-            .get(id.0.0)
-            .map(|head| head.value().into_owned())
+    fn thread(&self, id: MessageId) -> Option<ThreadHead> {
+        let names = self.open_table(NAMES);
+        let name_of = |message: &Message| {
+            names
+                .get(message.id.0.0)
+                .map(|name| name.value())
+                .unwrap_or_else(|| message.headline())
+        };
+        let anchor = self.message(id)?;
+        let mut path = vec![(id, name_of(&anchor))];
+        let mut cursor = anchor.parent;
+        while let Some(parent) = cursor {
+            let message = self.message(parent).expect("a parent is a message");
+            path.push((parent, name_of(&message)));
+            cursor = message.parent;
+        }
+        path.reverse();
+        Some(ThreadHead {
+            id,
+            name: path.last().expect("the path ends in the thread").1.clone(),
+            path,
+            members: self.members_under(Some(id)),
+        })
     }
 
-    fn stream_name(&self, id: StreamId) -> Option<String> {
-        self.open_table(STREAMS)
-            .get(id.0.0)
-            .map(|name| name.value())
+    fn thread_messages(&self, thread: Option<MessageId>, newest: usize) -> Vec<Message> {
+        let parent = seq_of(thread);
+        let mut seqs: Vec<u64> = self
+            .open_table(CHILDREN)
+            .range((parent, 0)..=(parent, u64::MAX))
+            .rev()
+            .take(newest)
+            .map(|(key, _)| key.value().1)
+            .collect();
+        seqs.reverse();
+        seqs.into_iter()
+            .map(|seq| {
+                self.message(MessageId(ChatSeq(seq)))
+                    .expect("a thread names its messages")
+            })
+            .collect()
     }
 
-    fn stream_named(&self, name: &str) -> Option<StreamId> {
-        self.open_table(STREAM_NAMES)
-            .get(name.to_owned())
-            .map(|id| StreamId(ChatSeq(id.value())))
+    fn members_under(&self, parent: Option<MessageId>) -> Vec<AgentId> {
+        let members = self.open_table(MEMBERS);
+        let parents = self.open_table(PARENT);
+        let mut decided: Vec<(AgentId, bool)> = Vec::new();
+        let mut cursor = seq_of(parent);
+        while cursor != ROOT {
+            let records = members
+                .range((cursor, AgentId::MIN)..=(cursor, AgentId::MAX))
+                .map(|(key, joined)| (key.value().1, joined.value()))
+                .collect();
+            decide(&mut decided, records);
+            cursor = parents
+                .get(cursor)
+                .expect("a thread is a message")
+                .value();
+        }
+        joined(decided)
     }
 
     fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message> {
@@ -133,97 +190,78 @@ impl ChatRead for ReadTxn {
             })
             .collect()
     }
+}
 
-    fn topic_messages(&self, topic: TopicId, newest: usize) -> Vec<Message> {
-        let mut seqs: Vec<u64> = self
-            .open_table(TOPIC_MESSAGES)
-            .range((topic.0.0, 0)..=(topic.0.0, u64::MAX))
-            .rev()
-            .take(newest)
-            .map(|(key, _)| key.value().1)
+/// Decides each agent by the nearest record up the chain: a record for an
+/// agent already decided says nothing new.
+fn decide(decided: &mut Vec<(AgentId, bool)>, records: Vec<(AgentId, bool)>) {
+    for (agent, joined) in records {
+        if decided.iter().all(|(known, _)| *known != agent) {
+            decided.push((agent, joined));
+        }
+    }
+}
+
+fn joined(decided: Vec<(AgentId, bool)>) -> Vec<AgentId> {
+    decided
+        .into_iter()
+        .filter_map(|(agent, joined)| joined.then_some(agent))
+        .collect()
+}
+
+/// [`ChatRead::members_under`] on a write transaction.
+fn members_under_write(write: &mut WriteTxn, parent: Option<MessageId>) -> Vec<AgentId> {
+    let mut decided: Vec<(AgentId, bool)> = Vec::new();
+    let mut cursor = seq_of(parent);
+    while cursor != ROOT {
+        let records = write
+            .open_table(MEMBERS)
+            .range((cursor, AgentId::MIN)..=(cursor, AgentId::MAX))
+            .map(|(key, joined)| (key.value().1, joined.value()))
             .collect();
-        seqs.reverse();
-        seqs.into_iter()
-            .map(|seq| {
-                self.message(MessageId(ChatSeq(seq)))
-                    .expect("a topic names its messages")
-            })
-            .collect()
+        decide(&mut decided, records);
+        cursor = write
+            .open_table(PARENT)
+            .get(cursor)
+            .expect("a thread is a message")
+            .value();
     }
-}
-
-fn where_now(mut message: Message, moved: Option<TopicId>) -> Option<Message> {
-    if let Some(topic) = moved {
-        message.topic = topic;
-    }
-    Some(message)
-}
-
-/// Where messages move to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MoveTo {
-    Topic(TopicId),
-    NewTopic { stream: StreamId, name: String },
+    joined(decided)
 }
 
 pub trait ChatWrite {
     fn init_chat_tables(&mut self);
-    /// The stream named `name`, created if there is none.
-    fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId>;
-    /// A topic with its first message, and no members. With `client_id`, a
-    /// topic already started under that id is returned instead of a second
-    /// one.
-    fn start_topic(
-        &mut self,
-        at: UnixMs,
-        stream: StreamId,
-        name: String,
-        first: NewMessage,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<(TopicId, MessageId)>;
-    /// A topic with no message yet: the start of [`ChatWrite::start_topic`],
-    /// and the new topic of a move.
-    fn open_topic(
-        &mut self,
-        at: UnixMs,
-        stream: StreamId,
-        name: String,
-        by: Address,
-    ) -> anyhow::Result<TopicId>;
-    /// The direct conversation of `a` and `b`, started if they have none.
-    fn direct(&mut self, at: UnixMs, a: AgentId, b: AgentId) -> anyhow::Result<TopicId>;
-    fn join(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()>;
-    fn leave(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()>;
-    /// Gives a topic its whole head: a name, a stream, and whether it is
-    /// resolved. A change to nothing logs nothing.
-    fn change_topic(
-        &mut self,
-        at: UnixMs,
-        topic: TopicId,
-        stream: StreamId,
-        name: String,
-        resolved: bool,
-    ) -> anyhow::Result<()>;
-    /// Moves messages of topics to `to`; returns the topic they are in.
-    /// With `client_id`, a move already made under it is returned instead.
-    fn move_messages(
-        &mut self,
-        at: UnixMs,
-        messages: Vec<MessageId>,
-        to: MoveTo,
-        by: Address,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<TopicId>;
-    /// With `client_id`, as in [`ChatWrite::start_topic`].
+    /// A message under `parent`, or a root. With `client_id`, a message
+    /// already posted under that id is returned instead of a second one.
     fn post(
         &mut self,
         at: UnixMs,
-        topic: TopicId,
+        parent: Option<MessageId>,
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId>;
-    fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead>;
-    fn chat_stream_named(&mut self, name: &str) -> Option<StreamId>;
+    /// Puts a message and its thread under `parent`, or among the roots. A
+    /// move to where it is logs nothing.
+    fn reparent(
+        &mut self,
+        at: UnixMs,
+        message: MessageId,
+        parent: Option<MessageId>,
+    ) -> anyhow::Result<()>;
+    /// `agent` receives `thread` and what is below it from now on. Logs
+    /// nothing when the thread's own record already says so.
+    fn join(&mut self, at: UnixMs, thread: MessageId, agent: AgentId) -> anyhow::Result<()>;
+    /// `agent` stops receiving `thread` and what is below it. Logs nothing
+    /// when the thread's own record already says so, or when nothing up the
+    /// chain made it a member.
+    fn leave(&mut self, at: UnixMs, thread: MessageId, agent: AgentId) -> anyhow::Result<()>;
+    /// Names a thread; empty takes the name back. A name it has logs
+    /// nothing.
+    fn name(&mut self, at: UnixMs, thread: MessageId, name: String) -> anyhow::Result<()>;
+    /// Replays one event into the indexes: what [`ChatWrite::post`] and the
+    /// others do after they append. The migration rebuilds the indexes
+    /// with it.
+    fn index_chat_event(&mut self, seq: ChatSeq, event: &ChatEvent);
 }
 
 fn next_seq(write: &mut WriteTxn) -> ChatSeq {
@@ -258,354 +296,427 @@ fn sent_before(write: &mut WriteTxn, client_id: Option<u64>) -> Option<ChatSeq> 
         .map(|seq| ChatSeq(seq.value()))
 }
 
-fn remember(write: &mut WriteTxn, client_id: Option<u64>, seq: ChatSeq) {
-    if let Some(client_id) = client_id {
-        write.open_table(CLIENT_IDS).insert(client_id, seq.0);
+fn is_message(write: &mut WriteTxn, id: MessageId) -> bool {
+    write.open_table(PARENT).get(id.0.0).is_some()
+}
+
+fn parent_now(write: &mut WriteTxn, id: MessageId) -> Option<MessageId> {
+    parent_of(
+        write
+            .open_table(PARENT)
+            .get(id.0.0)
+            .expect("a message has a parent row")
+            .value(),
+    )
+}
+
+/// Whether `ancestor` is `message` or above it.
+fn is_above_or_self(write: &mut WriteTxn, ancestor: MessageId, message: MessageId) -> bool {
+    let mut cursor = Some(message);
+    while let Some(id) = cursor {
+        if id == ancestor {
+            return true;
+        }
+        cursor = parent_now(write, id);
     }
+    false
 }
 
 impl ChatWrite for WriteTxn {
     fn init_chat_tables(&mut self) {
         self.open_table(CHAT_LOG);
-        self.open_table(STREAMS);
-        self.open_table(STREAM_NAMES);
-        self.open_table(TOPICS);
-        self.open_table(TOPIC_MESSAGES);
+        self.open_table(PARENT);
+        self.open_table(CHILDREN);
+        self.open_table(MEMBERS);
         self.open_table(INBOX);
         self.open_table(CLIENT_IDS);
-        self.open_table(DIRECTS);
-        self.open_table(MOVED);
-    }
-
-    fn stream(&mut self, at: UnixMs, name: String) -> anyhow::Result<StreamId> {
-        let name = name.trim().to_owned();
-        anyhow::ensure!(!name.is_empty(), "a stream needs a name");
-        if let Some(stream) = self.chat_stream_named(&name) {
-            return Ok(stream);
-        }
-        let seq = append(self, at, ChatEvent::StreamCreated { name: name.clone() });
-        self.open_table(STREAMS).insert(seq.0, name.clone());
-        self.open_table(STREAM_NAMES).insert(name, seq.0);
-        Ok(StreamId(seq))
-    }
-
-    fn start_topic(
-        &mut self,
-        at: UnixMs,
-        stream: StreamId,
-        name: String,
-        first: NewMessage,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<(TopicId, MessageId)> {
-        if let Some(seq) = sent_before(self, client_id) {
-            // A client id names a message.
-            let record = self
-                .open_table(CHAT_LOG)
-                .get(seq.0)
-                .expect("a client id names a logged message")
-                .value()
-                .into_owned();
-            let message = Message::from_record(&record).expect("a client id names a message");
-            let moved = self
-                .open_table(MOVED)
-                .get(message.id.0.0)
-                .map(|topic| TopicId(ChatSeq(topic.value())));
-            return Ok((moved.unwrap_or(message.topic), message.id));
-        }
-        anyhow::ensure!(has_content(&first.content), "a message needs content");
-        let topic = self.open_topic(at, stream, name, first.from)?;
-        let first = self.post(at, topic, first, client_id)?;
-        Ok((topic, first))
-    }
-
-    fn open_topic(
-        &mut self,
-        at: UnixMs,
-        stream: StreamId,
-        name: String,
-        by: Address,
-    ) -> anyhow::Result<TopicId> {
-        anyhow::ensure!(
-            self.open_table(STREAMS).get(stream.0.0).is_some(),
-            "no stream {}",
-            stream.0.0
-        );
-        anyhow::ensure!(!name.trim().is_empty(), "a topic needs a name");
-        let seq = append(
-            self,
-            at,
-            ChatEvent::TopicStarted {
-                stream,
-                name: name.clone(),
-                by,
-            },
-        );
-        self.open_table(TOPICS).insert(
-            seq.0,
-            SenValue::borrowed(&TopicHead {
-                place: Place::Stream {
-                    stream,
-                    name,
-                    resolved: false,
-                },
-                agents: Vec::new(),
-            }),
-        );
-        Ok(TopicId(seq))
-    }
-
-    fn direct(&mut self, at: UnixMs, a: AgentId, b: AgentId) -> anyhow::Result<TopicId> {
-        anyhow::ensure!(a != b, "an agent has no direct conversation with itself");
-        let members = if a < b { [a, b] } else { [b, a] };
-        if let Some(seq) = self.open_table(DIRECTS).get((members[0], members[1])) {
-            return Ok(TopicId(ChatSeq(seq.value())));
-        }
-        let seq = append(self, at, ChatEvent::DirectStarted { members });
-        self.open_table(TOPICS).insert(
-            seq.0,
-            SenValue::borrowed(&TopicHead {
-                place: Place::Direct,
-                agents: members.to_vec(),
-            }),
-        );
-        self.open_table(DIRECTS)
-            .insert((members[0], members[1]), seq.0);
-        Ok(TopicId(seq))
-    }
-
-    fn join(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()> {
-        let mut head = self
-            .chat_topic(topic)
-            .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "no one joins a direct conversation"
-        );
-        if head.agents.contains(&agent) {
-            return Ok(());
-        }
-        append(self, at, ChatEvent::Joined { topic, agent });
-        head.agents.push(agent);
-        self.open_table(TOPICS)
-            .insert(topic.0.0, SenValue::borrowed(&head));
-        Ok(())
-    }
-
-    fn leave(&mut self, at: UnixMs, topic: TopicId, agent: AgentId) -> anyhow::Result<()> {
-        let mut head = self
-            .chat_topic(topic)
-            .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "no one leaves a direct conversation"
-        );
-        if !head.agents.contains(&agent) {
-            return Ok(());
-        }
-        append(self, at, ChatEvent::Left { topic, agent });
-        head.agents.retain(|member| *member != agent);
-        self.open_table(TOPICS)
-            .insert(topic.0.0, SenValue::borrowed(&head));
-        Ok(())
-    }
-
-    fn change_topic(
-        &mut self,
-        at: UnixMs,
-        topic: TopicId,
-        stream: StreamId,
-        name: String,
-        resolved: bool,
-    ) -> anyhow::Result<()> {
-        let mut head = self
-            .chat_topic(topic)
-            .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(
-            head.place != Place::Direct,
-            "a direct conversation has no name or stream"
-        );
-        anyhow::ensure!(
-            self.open_table(STREAMS).get(stream.0.0).is_some(),
-            "no stream {}",
-            stream.0.0
-        );
-        let name = name.trim().to_owned();
-        anyhow::ensure!(!name.is_empty(), "a topic needs a name");
-        let place = Place::Stream {
-            stream,
-            name: name.clone(),
-            resolved,
-        };
-        if head.place == place {
-            return Ok(());
-        }
-        append(
-            self,
-            at,
-            ChatEvent::TopicChanged {
-                topic,
-                stream,
-                name,
-                resolved,
-            },
-        );
-        head.place = place;
-        self.open_table(TOPICS)
-            .insert(topic.0.0, SenValue::borrowed(&head));
-        Ok(())
-    }
-
-    fn move_messages(
-        &mut self,
-        at: UnixMs,
-        mut messages: Vec<MessageId>,
-        to: MoveTo,
-        by: Address,
-        client_id: Option<u64>,
-    ) -> anyhow::Result<TopicId> {
-        if let Some(seq) = sent_before(self, client_id) {
-            // A client id names the move's event.
-            let record = self
-                .open_table(CHAT_LOG)
-                .get(seq.0)
-                .expect("a client id names a logged event")
-                .value()
-                .into_owned();
-            let ChatEvent::Moved { to, .. } = record.event else {
-                anyhow::bail!("client id {client_id:?} named no move");
-            };
-            return Ok(to);
-        }
-        messages.sort();
-        messages.dedup();
-        anyhow::ensure!(!messages.is_empty(), "a move needs messages");
-        // Where each is now.
-        let mut from = Vec::with_capacity(messages.len());
-        for id in &messages {
-            let record = self
-                .open_table(CHAT_LOG)
-                .get(id.0.0)
-                .map(|record| record.value().into_owned());
-            let Some(message) = record.as_ref().and_then(Message::from_record) else {
-                anyhow::bail!("no message {}", id.0.0);
-            };
-            let now = self
-                .open_table(MOVED)
-                .get(id.0.0)
-                .map_or(message.topic, |topic| TopicId(ChatSeq(topic.value())));
-            let head = self.chat_topic(now).expect("a message's topic exists");
-            anyhow::ensure!(
-                head.place != Place::Direct,
-                "a direct conversation's messages stay in it"
-            );
-            from.push((*id, message.topic, now));
-        }
-        let to = match to {
-            MoveTo::Topic(topic) => {
-                let head = self
-                    .chat_topic(topic)
-                    .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-                anyhow::ensure!(
-                    head.place != Place::Direct,
-                    "messages move only to a topic in a stream"
-                );
-                topic
-            }
-            MoveTo::NewTopic { stream, name } => self.open_topic(at, stream, name, by)?,
-        };
-        let seq = append(
-            self,
-            at,
-            ChatEvent::Moved {
-                messages: messages.clone(),
-                to,
-            },
-        );
-        let mut index = self.open_table(TOPIC_MESSAGES);
-        for (id, _, now) in &from {
-            index.remove((now.0.0, id.0.0));
-            index.insert((to.0.0, id.0.0), ());
-        }
-        drop(index);
-        let mut moved = self.open_table(MOVED);
-        for (id, posted_in, _) in &from {
-            if *posted_in == to {
-                moved.remove(id.0.0);
-            } else {
-                moved.insert(id.0.0, to.0.0);
-            }
-        }
-        drop(moved);
-        remember(self, client_id, seq);
-        Ok(to)
+        self.open_table(NAMES);
     }
 
     fn post(
         &mut self,
         at: UnixMs,
-        topic: TopicId,
+        parent: Option<MessageId>,
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId> {
         if let Some(seq) = sent_before(self, client_id) {
             return Ok(MessageId(seq));
         }
-        let head = self
-            .chat_topic(topic)
-            .ok_or_else(|| anyhow::anyhow!("no topic {}", topic.0.0))?;
-        anyhow::ensure!(has_content(&message.content), "a message needs content");
-        if head.place == Place::Direct {
-            anyhow::ensure!(
-                matches!(message.from, Address::Agent(agent) if head.agents.contains(&agent)),
-                "only its two agents post in a direct conversation"
-            );
+        if let Some(parent) = parent {
+            anyhow::ensure!(is_message(self, parent), "no message {}", parent.0.0);
         }
+        anyhow::ensure!(has_content(&message.content), "a message needs content");
         let NewMessage {
             from,
             mentions,
             content,
         } = message;
-        let mut receivers: Vec<AgentId> = head.agents.clone();
-        for mention in &mentions {
-            if let Address::Agent(agent) = mention.to
-                && !receivers.contains(&agent)
-            {
-                receivers.push(agent);
-            }
+        let event = ChatEvent::Posted {
+            parent,
+            from,
+            mentions,
+            content,
+        };
+        let seq = append(self, at, event.clone());
+        self.index_chat_event(seq, &event);
+        if let Some(client_id) = client_id {
+            self.open_table(CLIENT_IDS).insert(client_id, seq.0);
         }
-        if let Address::Agent(sender) = from {
-            receivers.retain(|agent| *agent != sender);
-        }
-        let seq = append(
-            self,
-            at,
-            ChatEvent::Posted {
-                topic,
-                from,
-                mentions,
-                content,
-            },
-        );
-        self.open_table(TOPIC_MESSAGES)
-            .insert((topic.0.0, seq.0), ());
-        let mut inbox = self.open_table(INBOX);
-        for agent in receivers {
-            inbox.insert((agent, seq.0), ());
-        }
-        drop(inbox);
-        remember(self, client_id, seq);
         Ok(MessageId(seq))
     }
 
-    fn chat_topic(&mut self, id: TopicId) -> Option<TopicHead> {
-        self.open_table(TOPICS)
-            .get(id.0.0)
-            .map(|head| head.value().into_owned())
+    fn reparent(
+        &mut self,
+        at: UnixMs,
+        message: MessageId,
+        parent: Option<MessageId>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(is_message(self, message), "no message {}", message.0.0);
+        if let Some(parent) = parent {
+            anyhow::ensure!(is_message(self, parent), "no message {}", parent.0.0);
+            anyhow::ensure!(
+                !is_above_or_self(self, message, parent),
+                "a message does not move under itself"
+            );
+        }
+        if parent_now(self, message) == parent {
+            return Ok(());
+        }
+        let event = ChatEvent::Reparented { message, parent };
+        let seq = append(self, at, event.clone());
+        self.index_chat_event(seq, &event);
+        Ok(())
     }
 
-    fn chat_stream_named(&mut self, name: &str) -> Option<StreamId> {
-        self.open_table(STREAM_NAMES)
-            .get(name.to_owned())
-            .map(|id| StreamId(ChatSeq(id.value())))
+    fn join(&mut self, at: UnixMs, thread: MessageId, agent: AgentId) -> anyhow::Result<()> {
+        anyhow::ensure!(is_message(self, thread), "no message {}", thread.0.0);
+        let said = self
+            .open_table(MEMBERS)
+            .get((thread.0.0, agent))
+            .map(|joined| joined.value());
+        if said == Some(true) {
+            return Ok(());
+        }
+        let event = ChatEvent::Joined { thread, agent };
+        let seq = append(self, at, event.clone());
+        self.index_chat_event(seq, &event);
+        Ok(())
+    }
+
+    fn leave(&mut self, at: UnixMs, thread: MessageId, agent: AgentId) -> anyhow::Result<()> {
+        anyhow::ensure!(is_message(self, thread), "no message {}", thread.0.0);
+        let said = self
+            .open_table(MEMBERS)
+            .get((thread.0.0, agent))
+            .map(|joined| joined.value());
+        if said == Some(false) {
+            return Ok(());
+        }
+        let member_above = said.is_none() && {
+            let above = parent_now(self, thread);
+            members_under_write(self, above).contains(&agent)
+        };
+        if said.is_none() && !member_above {
+            return Ok(());
+        }
+        let event = ChatEvent::Left { thread, agent };
+        let seq = append(self, at, event.clone());
+        self.index_chat_event(seq, &event);
+        Ok(())
+    }
+
+    fn name(&mut self, at: UnixMs, thread: MessageId, name: String) -> anyhow::Result<()> {
+        anyhow::ensure!(is_message(self, thread), "no message {}", thread.0.0);
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let now = self
+            .open_table(NAMES)
+            .get(thread.0.0)
+            .map(|name| name.value())
+            .unwrap_or_default();
+        if now == name {
+            return Ok(());
+        }
+        let event = ChatEvent::Named { thread, name };
+        let seq = append(self, at, event.clone());
+        self.index_chat_event(seq, &event);
+        Ok(())
+    }
+
+    fn index_chat_event(&mut self, seq: ChatSeq, event: &ChatEvent) {
+        match event {
+            ChatEvent::Posted {
+                parent,
+                from,
+                mentions,
+                ..
+            } => {
+                let mut receivers = members_under_write(self, *parent);
+                for mention in mentions {
+                    if let Address::Agent(agent) = mention.to
+                        && !receivers.contains(&agent)
+                    {
+                        receivers.push(agent);
+                    }
+                }
+                if let Address::Agent(sender) = from {
+                    receivers.retain(|agent| agent != sender);
+                }
+                self.open_table(PARENT).insert(seq.0, seq_of(*parent));
+                self.open_table(CHILDREN)
+                    .insert((seq_of(*parent), seq.0), ());
+                let mut inbox = self.open_table(INBOX);
+                for agent in receivers {
+                    inbox.insert((agent, seq.0), ());
+                }
+            }
+            ChatEvent::Reparented { message, parent } => {
+                let was = self
+                    .open_table(PARENT)
+                    .get(message.0.0)
+                    .expect("a moved message has a parent row")
+                    .value();
+                self.open_table(PARENT).insert(message.0.0, seq_of(*parent));
+                let mut children = self.open_table(CHILDREN);
+                children.remove((was, message.0.0));
+                children.insert((seq_of(*parent), message.0.0), ());
+            }
+            ChatEvent::Joined { thread, agent } => {
+                self.open_table(MEMBERS).insert((thread.0.0, *agent), true);
+            }
+            ChatEvent::Left { thread, agent } => {
+                self.open_table(MEMBERS).insert((thread.0.0, *agent), false);
+            }
+            ChatEvent::Named { thread, name } => {
+                let mut names = self.open_table(NAMES);
+                if name.is_empty() {
+                    names.remove(thread.0.0);
+                } else {
+                    names.insert(thread.0.0, name.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Temporary (`temp-migration`): the log as it was before chat became a
+/// forest, folded into the forest once. Every event keeps its seq, so the
+/// agents' `origin` props and the messages the transcripts name stay
+/// valid. A stream becomes a root message with its name as text; a topic
+/// becomes a message under its stream; a message's topic becomes its
+/// parent; a move becomes a reparent; a rename becomes a `Named`. Direct
+/// conversations are not chat any more: their events become `Named`
+/// records that name nothing, which the fold ignores. Delete this module
+/// once every host has run it.
+pub(crate) mod legacy {
+    use rho_agent_types::{
+        Address, AgentId, ChatEvent as NewEvent, ChatRecord as NewRecord, ChatSeq, ContentPart,
+        Mention, MessageId, UnixMs,
+    };
+    use rho_db::{Sen, SenValue, WriteTxn};
+    use senax_encoder::{Decode, Encode};
+
+    use super::{CHAT_LOG, ChatWrite as _};
+
+    const RETIRED: [&str; 6] = [
+        "chat_streams",
+        "chat_stream_names",
+        "chat_topics",
+        "chat_topic_messages",
+        "chat_directs",
+        "chat_moved",
+    ];
+    /// The old log, by its own record type: the table's type is its name.
+    pub(crate) const OLD_LOG: redb::TableDefinition<u64, Sen<ChatRecord>> =
+        redb::TableDefinition::new("chat_log");
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    pub struct StreamId(pub ChatSeq);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    pub struct TopicId(pub ChatSeq);
+
+    /// The old event, under its old name so the old table opens.
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub enum ChatEvent {
+        StreamCreated {
+            name: String,
+        },
+        TopicStarted {
+            stream: StreamId,
+            name: String,
+            by: Address,
+        },
+        DirectStarted {
+            members: [AgentId; 2],
+        },
+        Joined {
+            topic: TopicId,
+            agent: AgentId,
+        },
+        Left {
+            topic: TopicId,
+            agent: AgentId,
+        },
+        TopicChanged {
+            topic: TopicId,
+            stream: StreamId,
+            name: String,
+            resolved: bool,
+        },
+        Moved {
+            messages: Vec<MessageId>,
+            to: TopicId,
+        },
+        Posted {
+            topic: TopicId,
+            from: Address,
+            mentions: Vec<Mention>,
+            content: Vec<ContentPart>,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub struct ChatRecord {
+        pub seq: ChatSeq,
+        pub at: UnixMs,
+        pub event: ChatEvent,
+    }
+
+    /// A record that changes nothing: a `Named` of the seq's own position,
+    /// which is no thread, with no name.
+    fn nothing(seq: ChatSeq) -> NewEvent {
+        NewEvent::Named {
+            thread: MessageId(seq),
+            name: String::new(),
+        }
+    }
+
+    /// The forest the old log comes to, in log order, with every seq kept.
+    /// Events that no longer fit at their seq go after the last.
+    pub fn convert(old: &[ChatRecord]) -> Vec<NewRecord> {
+        use std::collections::{HashMap, HashSet};
+        let mut directs: HashSet<u64> = HashSet::new();
+        // Each topic's stream and name as the old log last said.
+        let mut topics: HashMap<u64, (StreamId, String)> = HashMap::new();
+        let mut out = Vec::with_capacity(old.len());
+        let mut tail: Vec<NewEvent> = Vec::new();
+        for record in old {
+            let seq = record.seq;
+            let text = |name: &str| {
+                vec![ContentPart::Text {
+                    text: name.to_owned(),
+                }]
+            };
+            let event = match &record.event {
+                ChatEvent::StreamCreated { name } => NewEvent::Posted {
+                    parent: None,
+                    from: Address::User,
+                    mentions: Vec::new(),
+                    content: text(name),
+                },
+                ChatEvent::TopicStarted { stream, name, by } => {
+                    topics.insert(seq.0, (*stream, name.clone()));
+                    NewEvent::Posted {
+                        parent: Some(MessageId(stream.0)),
+                        from: *by,
+                        mentions: Vec::new(),
+                        content: text(name),
+                    }
+                }
+                ChatEvent::DirectStarted { .. } => {
+                    directs.insert(seq.0);
+                    nothing(seq)
+                }
+                ChatEvent::Joined { topic, agent } => NewEvent::Joined {
+                    thread: MessageId(topic.0),
+                    agent: *agent,
+                },
+                ChatEvent::Left { topic, agent } => NewEvent::Left {
+                    thread: MessageId(topic.0),
+                    agent: *agent,
+                },
+                ChatEvent::TopicChanged {
+                    topic,
+                    stream,
+                    name,
+                    ..
+                } => {
+                    let was = topics.get(&topic.0.0).cloned();
+                    topics.insert(topic.0.0, (*stream, name.clone()));
+                    if was.as_ref().is_some_and(|(was, _)| was != stream) {
+                        tail.push(NewEvent::Reparented {
+                            message: MessageId(topic.0),
+                            parent: Some(MessageId(stream.0)),
+                        });
+                    }
+                    NewEvent::Named {
+                        thread: MessageId(topic.0),
+                        name: name.clone(),
+                    }
+                }
+                ChatEvent::Moved { messages, to } => {
+                    let mut moved = messages.iter().map(|message| NewEvent::Reparented {
+                        message: *message,
+                        parent: Some(MessageId(to.0)),
+                    });
+                    let first = moved.next().unwrap_or_else(|| nothing(seq));
+                    tail.extend(moved);
+                    first
+                }
+                ChatEvent::Posted {
+                    topic,
+                    from,
+                    mentions,
+                    content,
+                } => {
+                    if directs.contains(&topic.0.0) {
+                        nothing(seq)
+                    } else {
+                        NewEvent::Posted {
+                            parent: Some(MessageId(topic.0)),
+                            from: *from,
+                            mentions: mentions.clone(),
+                            content: content.clone(),
+                        }
+                    }
+                }
+            };
+            out.push(NewRecord {
+                seq,
+                at: record.at,
+                event,
+            });
+        }
+        let at = old.last().map_or(UnixMs(0), |record| record.at);
+        let mut seq = old.last().map_or(ChatSeq::ZERO, |record| record.seq);
+        for event in tail {
+            seq = seq.next();
+            out.push(NewRecord { seq, at, event });
+        }
+        out
+    }
+
+    /// Rewrites the log in place and rebuilds every index from it.
+    pub fn migrate_topics_to_forest(write: &mut WriteTxn) {
+        let old: Vec<ChatRecord> = write
+            .open_table(OLD_LOG)
+            .iter()
+            .map(|(_, record)| record.value().into_owned())
+            .collect();
+        let records = convert(&old);
+        for table in RETIRED {
+            write.delete_table(table);
+        }
+        write.delete_table("chat_log");
+        write.delete_table("chat_inbox");
+        write.init_chat_tables();
+        let mut log = write.open_table(CHAT_LOG);
+        for record in &records {
+            log.insert(record.seq.0, SenValue::borrowed(record));
+        }
+        drop(log);
+        for record in &records {
+            write.index_chat_event(record.seq, &record.event);
+        }
     }
 }

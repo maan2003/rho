@@ -1,0 +1,19 @@
+# Chat, as the client holds it: the fold of every host's log, the disk copy,
+# the outbox and the host session. Without the `client` feature it is the
+# chat protocol alone, for the host.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-chat"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+client = []
+
+[dependencies]
+bytes.workspace = true
+rho-agent-types.workspace = true
+rho-rpc.workspace = true
+senax-encoder.workspace = true

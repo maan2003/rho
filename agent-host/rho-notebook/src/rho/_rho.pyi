@@ -35,17 +35,16 @@ MentionKind = Literal["ask", "result", "fyi"]
 class MessageRecord(TypedDict):
     id: int
     at: int  # unix ms
-    topic: int
+    parent: int | None  # the message it hangs under; None for a root
     sender: str  # "user" or an agent id
     mentions: list[tuple[str, MentionKind]]  # (address, kind)
     text: str
 
-class TopicRecord(TypedDict):
-    id: int
-    name: str | None  # None for a direct conversation
-    stream: str | None  # its stream's name; None for a direct conversation
-    resolved: bool  # its work is done; False for a direct conversation
-    agents: list[str]  # its members: who joined a topic, or a direct's two
+class ThreadRecord(TypedDict):
+    id: int  # the message the thread hangs under
+    name: str  # as named, else the first line of its message
+    path: list[tuple[int, str]]  # ids and names from the root down to it
+    agents: list[str]  # who a message posted in it reaches by membership
 
 class AgentsFile(TypedDict):
     path: str
@@ -123,39 +122,29 @@ def new_cache_key(agent: str) -> None:
 
 # -- chat --------------------------------------------------------------------
 #
-# The host's chat: streams of topics of messages, and direct conversations of
-# two agents. Every id is the position of the event that made it in the
-# host's chat log. A message reaches its conversation's members and every
-# agent it mentions, never its sender. A topic's members are the agents that
-# joined it; neither posting nor a mention joins. A direct conversation's
-# members are its two agents, and only they post in it. Messages from the
-# user come only from the GUI, so Python cannot forge them. The user and
-# agents may rename, move and resolve a topic, and move messages between
-# topics.
+# The host's chat: a forest of messages. Every id is the position of the
+# event that made it in the host's chat log; a thread's id is its message's.
+# A message reaches the members of the thread it is posted in and of the
+# threads above it, and every agent it mentions, never its sender. An agent
+# joins or leaves a thread; its nearest record up the chain decides, so a
+# join above and a leave below cut that branch. Neither posting nor a
+# mention joins. Messages from the user come only from the GUI, so Python
+# cannot forge them. Agents mail each other outside the chat.
 
 def post(
     sender: str,
-    topic: int,
+    parent: int | None,
     text: str,
     *,
     mentions: list[tuple[str, MentionKind]] | None = None,
 ) -> int:
-    """Post in `topic` as `sender`, an agent of this workset; returns the
-    message id once durable. A message that mentions "user" must pass the
-    STE check, or this raises ValueError with the findings."""
-def start_topic(
-    sender: str,
-    stream: str,
-    name: str,
-    text: str,
-    *,
-    mentions: list[tuple[str, MentionKind]] | None = None,
-) -> tuple[int, int]:
-    """Start a topic named `name` in the stream named `stream`, made if new,
-    with `text` as its first message; returns `(topic, message)`."""
-def direct(sender: str, other: str) -> int:
-    """The direct conversation of two agents, started if new. They may be
-    in different worksets."""
+    """Post under `parent`, or as a root for None, as `sender`, an agent of
+    this workset; returns the message id once durable. A message that
+    mentions "user" must pass the STE check, or this raises ValueError
+    with the findings."""
+def mail(sender: str, to: str, text: str) -> None:
+    """Hand `text` to agent `to`, any agent of the host, as a tool input.
+    Returns once the agent holds it. Not logged in the chat."""
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
@@ -173,31 +162,23 @@ async def external_send(agent: str, address: str, text: str) -> str:
     the host's three tries."""
 def external_contacts(agent: str) -> list[dict]:
     """The addresses `agent` accepted, each a dict of `address` and `name`."""
-def join(topic: int, agent: str) -> None:
-    """Make `agent` a member of the topic from now on. Not for a direct
-    conversation."""
-def leave(topic: int, agent: str) -> None:
-    """`agent` stops being a member of the topic. Not for a direct
-    conversation."""
-def change_topic(agent: str, topic: int, stream: str, name: str, resolved: bool) -> None:
-    """Give a topic its whole head, for `agent`: the stream of that name,
-    made if new, its name, and whether it is resolved. Not for a direct
-    conversation."""
-def move_messages(
-    agent: str,
-    messages: list[int],
-    to: int | None = None,
-    *,
-    stream: str | None = None,
-    name: str | None = None,
-) -> int:
-    """Move messages for `agent` to topic `to`, or to a new topic `name` in
-    `stream`; returns the topic they are in. A move delivers nothing again."""
-def topic(id: int) -> TopicRecord | None: ...
+def join(thread: int, agent: str) -> None:
+    """Make `agent` a member of the thread from now on."""
+def leave(thread: int, agent: str) -> None:
+    """`agent` stops being a member of the thread, whether it joined it or
+    one above."""
+def reparent(agent: str, message: int, parent: int | None) -> None:
+    """Put a message and the thread under it under `parent`, or among the
+    roots, for `agent`. Not under itself or its own thread. A move
+    delivers nothing again."""
+def name(agent: str, thread: int, name: str) -> None:
+    """Name a thread for `agent`; an empty name takes the name back."""
+def thread(id: int) -> ThreadRecord | None: ...
 def message(id: int) -> MessageRecord | None:
-    """A message, in the topic it is in now: messages may be moved."""
-def read(topic: int, last: int) -> list[MessageRecord]:
-    """The conversation's `last` newest messages, oldest first."""
+    """A message, under the parent it has now: messages may be moved."""
+def read(thread: int | None, last: int) -> list[MessageRecord]:
+    """The `last` newest messages under `thread`, oldest first; the roots
+    for None."""
 async def inbox(agent: str, after: int) -> list[MessageRecord]:
     """What `agent` receives after message `after`, waiting until there is
     some."""

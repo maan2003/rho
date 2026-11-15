@@ -15,8 +15,8 @@ pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, StreamId,
-    TopicId, UnixMs, WorksetKind,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role,
+    UnixMs, WorksetKind,
 };
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
@@ -31,8 +31,7 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, GccpWrite as _, MoveTo, NewMessage, Place, StoreRead as _,
-    StoreWrite as _,
+    ChatRead as _, ChatWrite as _, GccpWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
 };
 
 /// How many agents stay loaded. Past this the least recently used one
@@ -876,12 +875,12 @@ impl AgentPool {
         })
     }
 
-    /// A message from the user. A resend under the same `client_id` is the
-    /// same message.
+    /// A message from the user, under `parent` or as a root. A resend under
+    /// the same `client_id` is the same message.
     pub async fn post_user(
         self: &Arc<Self>,
         client_id: u64,
-        topic: TopicId,
+        parent: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
@@ -891,78 +890,39 @@ impl AgentPool {
             content,
         };
         let mut write = self.db.write().await;
-        let id = write.post(UnixMs::now(), topic, message, Some(client_id))?;
+        let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
         self.wake_receivers(id, None);
         Ok(id)
     }
 
-    /// A topic the user starts. A resend under the same `client_id` is the
-    /// same topic.
-    pub async fn start_user_topic(
-        self: &Arc<Self>,
-        client_id: u64,
-        stream: StreamId,
-        name: String,
-        mentions: Vec<AgentId>,
-        content: Vec<ContentPart>,
-    ) -> anyhow::Result<TopicId> {
-        let first = NewMessage {
-            from: Address::User,
-            mentions: self.user_mentions(mentions)?,
-            content,
-        };
+    /// The user takes `agent` out of `thread`.
+    pub async fn leave_user(&self, thread: MessageId, agent: AgentId) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        let (topic, first) =
-            write.start_topic(UnixMs::now(), stream, name, first, Some(client_id))?;
-        write.commit();
-        self.wake_receivers(first, None);
-        Ok(topic)
-    }
-
-    /// The stream named `name`, created if there is none.
-    pub async fn create_stream(&self, name: String) -> anyhow::Result<StreamId> {
-        let mut write = self.db.write().await;
-        let stream = write.stream(UnixMs::now(), name)?;
-        write.commit();
-        Ok(stream)
-    }
-
-    /// The user takes `agent` out of `topic`.
-    pub async fn leave_user(&self, topic: TopicId, agent: AgentId) -> anyhow::Result<()> {
-        let mut write = self.db.write().await;
-        write.leave(UnixMs::now(), topic, agent)?;
+        write.leave(UnixMs::now(), thread, agent)?;
         write.commit();
         Ok(())
     }
 
-    /// The user renames a topic, moves it to a stream, or resolves it.
-    pub async fn change_topic(
+    /// The user puts a message and its thread under `parent`, or among the
+    /// roots.
+    pub async fn reparent_user(
         &self,
-        topic: TopicId,
-        stream: StreamId,
-        name: String,
-        resolved: bool,
+        message: MessageId,
+        parent: Option<MessageId>,
     ) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        write.change_topic(UnixMs::now(), topic, stream, name, resolved)?;
+        write.reparent(UnixMs::now(), message, parent)?;
         write.commit();
         Ok(())
     }
 
-    /// The user moves messages to a topic. A resend under the same
-    /// `client_id` is the same move.
-    pub async fn move_messages(
-        &self,
-        client_id: u64,
-        messages: Vec<MessageId>,
-        to: MoveTo,
-    ) -> anyhow::Result<TopicId> {
+    /// The user names a thread; empty takes the name back.
+    pub async fn name_user(&self, thread: MessageId, name: String) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        let topic =
-            write.move_messages(UnixMs::now(), messages, to, Address::User, Some(client_id))?;
+        write.name(UnixMs::now(), thread, name)?;
         write.commit();
-        Ok(topic)
+        Ok(())
     }
 
     /// The user's mentions of agents: each asks the agent to read it.
@@ -990,10 +950,7 @@ impl AgentPool {
         let Some(message) = read.message(message) else {
             return;
         };
-        let mut receivers: Vec<AgentId> = read
-            .topic(message.topic)
-            .map(|head| head.agents)
-            .unwrap_or_default();
+        let mut receivers: Vec<AgentId> = read.members_under(message.parent);
         receivers.extend(
             message
                 .mentions
@@ -1258,7 +1215,7 @@ impl AgentPool {
             }
             PyRequest::Post {
                 sender,
-                topic,
+                parent,
                 mentions,
                 content,
             } => {
@@ -1270,117 +1227,73 @@ impl AgentPool {
                     content,
                 };
                 let mut write = self.db.write().await;
-                let id = write.post(UnixMs::now(), topic, message, None)?;
+                let id = write.post(UnixMs::now(), parent, message, None)?;
                 write.commit();
                 self.wake_receivers(id, Some(workset));
                 PyReply::Seq(id.0)
             }
-            PyRequest::StartTopic {
-                sender,
-                stream,
-                name,
-                mentions,
-                content,
-            } => {
+            PyRequest::Mail { sender, to, text } => {
                 self.own_agent(workset, sender)?;
-                self.known_mentions(&mentions)?;
-                let first = NewMessage {
-                    from: Address::Agent(sender),
-                    mentions,
-                    content,
+                self.workset_of(to)?;
+                anyhow::ensure!(sender != to, "an agent does not mail itself");
+                anyhow::ensure!(!text.trim().is_empty(), "a message needs text");
+                let input = Control::Input {
+                    content: vec![ContentPart::Text { text }],
+                    role: Role::Tool,
+                    message: None,
                 };
-                let mut write = self.db.write().await;
-                let stream = write.stream(UnixMs::now(), stream)?;
-                let (_, first) = write.start_topic(UnixMs::now(), stream, name, first, None)?;
-                write.commit();
-                self.wake_receivers(first, Some(workset));
-                let first = self
-                    .db
-                    .read()
-                    .message(first)
-                    .expect("a message just posted");
-                PyReply::Messages(vec![first])
-            }
-            PyRequest::Direct { sender, other } => {
-                self.own_agent(workset, sender)?;
-                self.workset_of(other)?;
-                let mut write = self.db.write().await;
-                let topic = write.direct(UnixMs::now(), sender, other)?;
-                write.commit();
-                PyReply::Seq(topic.0)
+                // Handed means the agent holds it: its ack says so.
+                let (_, client, _) = self.load(to).await?;
+                client.control(input).await?;
+                PyReply::Done
             }
             PyRequest::Message(id) => {
                 PyReply::Messages(self.db.read().message(id).into_iter().collect())
             }
-            PyRequest::Read { topic, last } => {
+            PyRequest::Read { thread, last } => {
                 let read = self.db.read();
-                anyhow::ensure!(read.topic(topic).is_some(), "no topic {}", topic.0.0);
-                PyReply::Messages(read.topic_messages(topic, last as usize))
+                if let Some(thread) = thread {
+                    anyhow::ensure!(read.message(thread).is_some(), "no message {}", thread.0.0);
+                }
+                PyReply::Messages(read.thread_messages(thread, last as usize))
             }
-            PyRequest::Join { topic, agent } => {
+            PyRequest::Join { thread, agent } => {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
-                write.join(UnixMs::now(), topic, agent)?;
+                write.join(UnixMs::now(), thread, agent)?;
                 write.commit();
                 PyReply::Done
             }
-            PyRequest::Leave { topic, agent } => {
+            PyRequest::Leave { thread, agent } => {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
-                write.leave(UnixMs::now(), topic, agent)?;
+                write.leave(UnixMs::now(), thread, agent)?;
                 write.commit();
                 PyReply::Done
             }
-            PyRequest::ChangeTopic {
+            PyRequest::Reparent {
                 agent,
-                topic,
-                stream,
+                message,
+                parent,
+            } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.reparent(UnixMs::now(), message, parent)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Name {
+                agent,
+                thread,
                 name,
-                resolved,
             } => {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
-                let stream = write.stream(UnixMs::now(), stream)?;
-                write.change_topic(UnixMs::now(), topic, stream, name, resolved)?;
+                write.name(UnixMs::now(), thread, name)?;
                 write.commit();
                 PyReply::Done
             }
-            PyRequest::Move {
-                agent,
-                messages,
-                to,
-            } => {
-                self.own_agent(workset, agent)?;
-                let mut write = self.db.write().await;
-                let to = match to {
-                    crate::ipc::workset::PyMoveTo::Topic(topic) => MoveTo::Topic(topic),
-                    crate::ipc::workset::PyMoveTo::NewTopic { stream, name } => MoveTo::NewTopic {
-                        stream: write.stream(UnixMs::now(), stream)?,
-                        name,
-                    },
-                };
-                let topic = write.move_messages(
-                    UnixMs::now(),
-                    messages,
-                    to,
-                    Address::Agent(agent),
-                    None,
-                )?;
-                write.commit();
-                PyReply::Seq(topic.0)
-            }
-            PyRequest::Topic(topic) => {
-                let read = self.db.read();
-                PyReply::Topic(read.topic(topic).map(|head| {
-                    let stream = match &head.place {
-                        Place::Stream { stream, .. } => {
-                            Some(read.stream_name(*stream).expect("a topic's stream exists"))
-                        }
-                        Place::Direct => None,
-                    };
-                    (head, stream)
-                }))
-            }
+            PyRequest::Thread(thread) => PyReply::Thread(self.db.read().thread(thread)),
             PyRequest::Inbox { agent, after } => {
                 self.own_agent(workset, agent)?;
                 PyReply::Messages(self.inbox(agent, after).await)

@@ -44,7 +44,7 @@ def on_turn_end(agent, outcome) -> None:
     it has to say it sends itself."""
     parent = agent.props.get("parent")
     if outcome["reason"] == "failed" and parent is not None:
-        chat.post(agent.id, chat.direct(agent.id, parent), f"Agent hit an error and stopped: {outcome['error']}")
+        chat.mail(agent.id, parent, f"Agent hit an error and stopped: {outcome['error']}")
 
 
 async def deliver(agent) -> None:
@@ -52,7 +52,7 @@ async def deliver(agent) -> None:
     newest message a request carried, since what the process had waiting died
     with it. A failure retries after the last message it handed: what the agent
     has waiting is in no row yet, and must not be handed twice. An agent started
-    from a message first joins its topic and is handed that message. A policy
+    from a message first joins its thread and is handed that message. A policy
     with other rules replaces this whole function, and may reuse `hand` and
     `render`."""
     after = None
@@ -75,35 +75,31 @@ async def deliver(agent) -> None:
 
 
 async def hand(agent, record: dict) -> None:
-    """Hand one message to the agent. It first joins the message's topic if
+    """Hand one message to the agent. It first joins the message's thread if
     the message is its origin, or if the user wrote it and mentions it. A
     mention by an agent only reaches it."""
     origin = record["id"] == chat.origin_message(agent.props)
     by_user = record["sender"] == chat.USER and any(address == agent.id for address, _ in record["mentions"])
-    if chat.topic(record["topic"])["stream"] is not None and (origin or by_user):
-        chat.join(record["topic"], agent.id)
+    if origin or by_user:
+        chat.join(chat.thread_of(record), agent.id)
     role = "user" if record["sender"] == chat.USER else "tool"
-    await asyncio.to_thread(agent.input, render(record, agent.id), role=role, message=record["id"])
+    await asyncio.to_thread(agent.input, render(record), role=role, message=record["id"])
 
 
-def render(record: dict, reader: str) -> str:
-    """A message as `reader` reads it: where it is first, so the model knows
-    where to answer. A message between two agents has no topic; it is
-    answered with `agents.message`."""
-    head = chat.topic(record["topic"])
+def render(record: dict) -> str:
+    """A message as an agent reads it: where it is first, so the model knows
+    where to answer."""
+    head = chat.thread(chat.thread_of(record))
     sender = record["sender"]
-    if head["stream"] is None:
-        return f"[message from {prompt.label(sender)}]\n{record['text']}"
-    where = tools.where(record["topic"], head, reader)
     who = "the user" if sender == chat.USER else prompt.label(sender)
-    return f"{where} Message from {who}:\n{record['text']}"
+    return f"{tools.where(head)} Message from {who}:\n{record['text']}"
 
 
 def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer", origin: str | None = None) -> str:
     """Create an agent the user manages; returns its id. With `repo`, clone
     it at `rev` into the workset as the directory its URL names, and work
     there; otherwise work in `cwd`, or the workset's root. With `origin`,
-    `chat:<message id>`, the agent joins that message's topic and starts
+    `chat:<message id>`, the agent joins that message's thread and starts
     from it."""
     if preset not in ("engineer", "advisor"):
         raise ValueError(f'preset is "engineer" or "advisor", not {preset!r}')

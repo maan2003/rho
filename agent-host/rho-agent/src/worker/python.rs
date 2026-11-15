@@ -16,8 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, TopicId,
-    WorksetId,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, WorksetId,
 };
 use tokio::sync::oneshot;
 
@@ -25,7 +24,7 @@ use crate::inference::PromptCacheKey;
 use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::ipc::protocol::Control;
 use crate::ipc::transport::{Port, Sender};
-use crate::ipc::workset::{Message, PyMoveTo, PyReply, PyRequest, encode};
+use crate::ipc::workset::{Message, PyReply, PyRequest, encode};
 use crate::record::{AgentSpec, Runtime};
 use crate::worker::permissions::{self, PERMISSIONS, Permissions};
 use crate::worker::slack::{self, Routes};
@@ -370,12 +369,11 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(start_topic, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(change_topic, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(move_messages, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(direct, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(reparent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(name, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_address, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_accept, &module)?)?;
@@ -383,7 +381,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(external_contacts, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(read, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(topic, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(thread, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(inbox, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(current_agent, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(slack_who_hears, &module)?)?;
@@ -759,13 +757,14 @@ fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPa
     Ok(vec![ContentPart::Text { text }])
 }
 
-/// Post `text` in `topic`; `mentions` are `(address, kind)` pairs.
+/// Post `text` under `parent`, or as a root; `mentions` are `(address,
+/// kind)` pairs.
 #[pyfunction]
-#[pyo3(signature = (sender, topic, text, *, mentions = None))]
+#[pyo3(signature = (sender, parent, text, *, mentions = None))]
 fn post(
     py: Python<'_>,
     sender: &str,
-    topic: u64,
+    parent: Option<u64>,
     text: String,
     mentions: Option<Vec<(String, String)>>,
 ) -> PyResult<u64> {
@@ -774,7 +773,7 @@ fn post(
     let content = message_content(text, &mentions)?;
     let request = PyRequest::Post {
         sender,
-        topic: TopicId(ChatSeq(topic)),
+        parent: parent.map(|seq| MessageId(ChatSeq(seq))),
         mentions,
         content,
     };
@@ -784,31 +783,18 @@ fn post(
     }
 }
 
+/// Mail `text` from `sender` to another agent of this host, as it is: the
+/// caller writes the whole text, and the other agent holds it once this
+/// returns.
 #[pyfunction]
-#[pyo3(signature = (sender, stream, name, text, *, mentions = None))]
-fn start_topic(
-    py: Python<'_>,
-    sender: &str,
-    stream: String,
-    name: String,
-    text: String,
-    mentions: Option<Vec<(String, String)>>,
-) -> PyResult<(u64, u64)> {
-    let sender = agent_id(sender)?;
-    let mentions = self::mentions(mentions)?;
-    let content = message_content(text, &mentions)?;
-    let request = PyRequest::StartTopic {
-        sender,
-        stream,
-        name,
-        mentions,
-        content,
+fn mail(py: Python<'_>, sender: &str, to: &str, text: String) -> PyResult<()> {
+    let request = PyRequest::Mail {
+        sender: agent_id(sender)?,
+        to: agent_id(to)?,
+        text,
     };
     match PyHost::block(py, request)? {
-        PyReply::Messages(messages) => match &messages[..] {
-            [first] => Ok((first.topic.0.0, first.id.0.0)),
-            _ => Err(unexpected()),
-        },
+        PyReply::Done => Ok(()),
         _ => Err(unexpected()),
     }
 }
@@ -818,19 +804,6 @@ fn start_topic(
 fn resolve_agent(py: Python<'_>, prefix: &str) -> PyResult<String> {
     match PyHost::block(py, PyRequest::ResolveAgent(prefix.to_owned()))? {
         PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
-        _ => Err(unexpected()),
-    }
-}
-
-/// The direct conversation of `sender` and `other`, started if needed.
-#[pyfunction]
-fn direct(py: Python<'_>, sender: &str, other: &str) -> PyResult<u64> {
-    let request = PyRequest::Direct {
-        sender: agent_id(sender)?,
-        other: agent_id(other)?,
-    };
-    match PyHost::block(py, request)? {
-        PyReply::Seq(seq) => Ok(seq.0),
         _ => Err(unexpected()),
     }
 }
@@ -909,11 +882,11 @@ fn message(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
     }
 }
 
-/// A conversation's `last` newest messages, oldest first.
+/// A thread's `last` newest messages, oldest first; the roots for None.
 #[pyfunction]
-fn read(py: Python<'_>, topic: u64, last: u64) -> PyResult<Py<PyAny>> {
+fn read(py: Python<'_>, thread: Option<u64>, last: u64) -> PyResult<Py<PyAny>> {
     let request = PyRequest::Read {
-        topic: TopicId(ChatSeq(topic)),
+        thread: thread.map(|seq| MessageId(ChatSeq(seq))),
         last,
     };
     match PyHost::block(py, request)? {
@@ -929,9 +902,9 @@ fn read(py: Python<'_>, topic: u64, last: u64) -> PyResult<Py<PyAny>> {
 }
 
 #[pyfunction]
-fn join(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
+fn join(py: Python<'_>, thread: u64, agent: &str) -> PyResult<()> {
     let request = PyRequest::Join {
-        topic: TopicId(ChatSeq(topic)),
+        thread: MessageId(ChatSeq(thread)),
         agent: agent_id(agent)?,
     };
     match PyHost::block(py, request)? {
@@ -941,9 +914,9 @@ fn join(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn leave(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
+fn leave(py: Python<'_>, thread: u64, agent: &str) -> PyResult<()> {
     let request = PyRequest::Leave {
-        topic: TopicId(ChatSeq(topic)),
+        thread: MessageId(ChatSeq(thread)),
         agent: agent_id(agent)?,
     };
     match PyHost::block(py, request)? {
@@ -952,23 +925,28 @@ fn leave(py: Python<'_>, topic: u64, agent: &str) -> PyResult<()> {
     }
 }
 
-/// Gives a topic its whole head, for `agent`: the stream of that name,
-/// created if new, its name, and whether it is resolved.
+/// Puts a message and its thread under `parent`, or among the roots, for
+/// `agent`.
 #[pyfunction]
-fn change_topic(
-    py: Python<'_>,
-    agent: &str,
-    topic: u64,
-    stream: String,
-    name: String,
-    resolved: bool,
-) -> PyResult<()> {
-    let request = PyRequest::ChangeTopic {
+fn reparent(py: Python<'_>, agent: &str, message: u64, parent: Option<u64>) -> PyResult<()> {
+    let request = PyRequest::Reparent {
         agent: agent_id(agent)?,
-        topic: TopicId(ChatSeq(topic)),
-        stream,
+        message: MessageId(ChatSeq(message)),
+        parent: parent.map(|seq| MessageId(ChatSeq(seq))),
+    };
+    match PyHost::block(py, request)? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// Names a thread for `agent`; empty takes the name back.
+#[pyfunction]
+fn name(py: Python<'_>, agent: &str, thread: u64, name: String) -> PyResult<()> {
+    let request = PyRequest::Name {
+        agent: agent_id(agent)?,
+        thread: MessageId(ChatSeq(thread)),
         name,
-        resolved,
     };
     match PyHost::block(py, request)? {
         PyReply::Done => Ok(()),
@@ -976,60 +954,26 @@ fn change_topic(
     }
 }
 
-/// Moves messages for `agent` to topic `to`, or to a new topic named
-/// `name` in `stream`; returns the topic they are in.
+/// The thread under a message: its name, its path from the root, and its
+/// members; None for no message.
 #[pyfunction]
-#[pyo3(signature = (agent, messages, to=None, *, stream=None, name=None))]
-fn move_messages(
-    py: Python<'_>,
-    agent: &str,
-    messages: Vec<u64>,
-    to: Option<u64>,
-    stream: Option<String>,
-    name: Option<String>,
-) -> PyResult<u64> {
-    let to = match (to, stream, name) {
-        (Some(topic), None, None) => PyMoveTo::Topic(TopicId(ChatSeq(topic))),
-        (None, Some(stream), Some(name)) => PyMoveTo::NewTopic { stream, name },
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "move to a topic id, or to a new topic with stream= and name=",
-            ));
-        }
-    };
-    let request = PyRequest::Move {
-        agent: agent_id(agent)?,
-        messages: messages
-            .into_iter()
-            .map(|id| MessageId(ChatSeq(id)))
-            .collect(),
-        to,
-    };
-    match PyHost::block(py, request)? {
-        PyReply::Seq(topic) => Ok(topic.0),
-        _ => Err(unexpected()),
-    }
-}
-
-/// A conversation: its stream's name and its name for a topic, None for
-/// both in a direct conversation, and its members; None for no topic.
-#[pyfunction]
-fn topic(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
-    match PyHost::block(py, PyRequest::Topic(TopicId(ChatSeq(id))))? {
-        PyReply::Topic(None) => Ok(None),
-        PyReply::Topic(Some((head, stream))) => {
+fn thread(py: Python<'_>, id: u64) -> PyResult<Option<Py<PyAny>>> {
+    match PyHost::block(py, PyRequest::Thread(MessageId(ChatSeq(id))))? {
+        PyReply::Thread(None) => Ok(None),
+        PyReply::Thread(Some(head)) => {
             let out = PyDict::new(py);
             out.set_item("id", id)?;
-            let (name, resolved) = match head.place {
-                crate::store::Place::Stream { name, resolved, .. } => (Some(name), resolved),
-                crate::store::Place::Direct => (None, false),
-            };
-            out.set_item("name", name)?;
-            out.set_item("resolved", resolved)?;
-            out.set_item("stream", stream)?;
+            out.set_item("name", head.name)?;
+            out.set_item(
+                "path",
+                head.path
+                    .iter()
+                    .map(|(id, name)| (id.0.0, name.clone()))
+                    .collect::<Vec<_>>(),
+            )?;
             out.set_item(
                 "agents",
-                head.agents
+                head.members
                     .iter()
                     .map(|agent| agent.encoded().to_string())
                     .collect::<Vec<_>>(),
@@ -1047,7 +991,7 @@ fn message_to_py<'py>(
     let out = PyDict::new(py);
     out.set_item("id", message.id.0.0)?;
     out.set_item("at", message.at.0)?;
-    out.set_item("topic", message.topic.0.0)?;
+    out.set_item("parent", message.parent.map(|parent| parent.0.0))?;
     out.set_item("sender", address_text(message.from))?;
     let mentions = message
         .mentions

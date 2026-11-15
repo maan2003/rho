@@ -54,8 +54,8 @@ pub enum Live {
 /// A message an agent is still writing, as far as its code shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Draft {
-    /// The topic its post names, when the code names it as a number.
-    pub topic: Option<rho_agent_types::TopicId>,
+    /// The thread its post names, when the code names it as a number.
+    pub thread: Option<rho_agent_types::MessageId>,
     pub text: String,
 }
 

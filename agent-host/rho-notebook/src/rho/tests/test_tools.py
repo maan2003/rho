@@ -58,20 +58,18 @@ class Tools(WorksetCase):
         work = tempfile.mkdtemp()
         printed, reply = run(lambda: ns["agents"].spawn_new_engineer(task_name="fix-it", prompt="Fix it.", workdir=work))
         [child] = [id for id in self.state.agents if id != self.root]
-        [topic] = self.state.topics
         self.assertEqual(self.state.agents[child], {
             "runtime": native("terra", "xhigh"),
             "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
         })
-        # The brief goes in their direct conversation.
-        self.assertEqual(self.state.topics[topic], {"id": topic, "name": None, "stream": None, "resolved": False, "agents": sorted([self.root, child])})
-        [brief] = self.state.messages
-        self.assertEqual((brief["topic"], brief["sender"], brief["text"], brief["mentions"]), (topic, self.root, "Fix it.", []))
+        # The brief goes by mail, outside the chat.
+        self.assertEqual(self.state.mail, [(self.root, child, f"[message from eng-{self.root}]\nFix it.")])
+        self.assertEqual(self.state.messages, [])
         self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as messages from it. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
-        # The child gets its brief through delivery.
-        wait_for(lambda: any(a == child for a, *_ in self.state.inputs), "the brief")
+        # The child holds its brief.
+        self.assertEqual([a for a, *_ in self.state.inputs], [child])
         with self.assertRaisesRegex(ValueError, "absolute"):
             ns["agents"].spawn_new_engineer(task_name="x", prompt="p", workdir="relative")
         with self.assertRaisesRegex(ValueError, "not a directory"):
@@ -103,42 +101,45 @@ class Tools(WorksetCase):
         ns, _ = self.notebook(self.root)
         _, reply = run(lambda: ns["agents"].spawn_new_advisor("Is this right?"))
         [adv] = [id for id in self.state.agents if id != self.root]
-        [topic] = self.state.topics
         self.assertEqual(self.state.agents[adv], {
             "runtime": native("sol", "xhigh"),
             "props": {"name": "advisor", "preset": "advisor", "parent": self.root, "cwd": self.tmp},
         })
-        self.assertEqual(self.state.topics[topic]["agents"], sorted([self.root, adv]))
+        self.assertEqual([to for _, to, _ in self.state.mail], [adv])
         self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive as a message from it.")
 
     def test_spawn_user_owned_engineer(self):
         ns, _ = self.notebook(self.root)
-        with self.assertRaisesRegex(ValueError, "pass stream="):
+        with self.assertRaisesRegex(ValueError, "pass thread="):
             ns["agents"].spawn_user_owned_engineer(task_name="side", prompt="Do the side thing.")
-        # The spawner was started from a message in stream "ops".
-        _, origin = fake_rho.start_user_topic("ops", "Work", "Work.")
+        # The spawner was started from a thread in the stream `ops`.
+        ops = fake_rho.post_user(None, "ops")
+        origin = fake_rho.post_user(ops, "Work.")
         props = self.state.agents[self.root]["props"]
         props["origin"] = f"chat:{origin}"
         _, reply = run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="side", prompt="Do the side thing."))
         [owned] = [id for id in self.state.agents if id != self.root]
         brief = self.state.messages[-1]
-        self.assertEqual(self.state.topics[brief["topic"]]["stream"], "ops")
-        self.assertEqual(self.state.topics[brief["topic"]]["name"], "side")
-        self.assertEqual((brief["sender"], brief["text"]), (self.root, "Do the side thing."))
+        # The brief starts a thread of its own beside the spawner's, named
+        # for the task.
+        self.assertEqual((brief["parent"], brief["sender"], brief["text"]), (ops, self.root, "Do the side thing."))
+        self.assertEqual(self.state.names[brief["id"]], "side")
         self.assertEqual(self.state.agents[owned]["props"], {
             "name": "side", "preset": "engineer", "started_by": self.root, "cwd": self.tmp, "origin": f"chat:{brief['id']}",
         })
         # The user learns of it by a mention that makes no card.
         self.assertEqual(brief["mentions"], [("user", "fyi")])
         self.assertIn("It reports to the user, not to you.", reply)
-        # It joins the brief's topic and starts from the brief; the spawner
+        # It joins the brief's thread and starts from the brief; the spawner
         # does not join.
         wait_for(lambda: any(a == owned for a, *_ in self.state.inputs), "the brief")
         self.assertEqual([m for a, _, _, m in self.state.inputs if a == owned], [brief["id"]])
-        self.assertEqual(self.state.topics[brief["topic"]]["agents"], [owned])
-        # A stream given wins.
-        run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="other", prompt="Other.", stream="side"))
-        self.assertEqual(self.state.topics[self.state.messages[-1]["topic"]]["stream"], "side")
+        self.assertEqual(self.state.members, {(brief["id"], owned): True})
+        # A thread given wins.
+        run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="other", prompt="Other.", thread=brief["id"]))
+        self.assertEqual(self.state.messages[-1]["parent"], brief["id"])
+        with self.assertRaisesRegex(ValueError, "no thread #999"):
+            ns["agents"].spawn_user_owned_engineer(task_name="other", prompt="Other.", thread=999)
         # Its starter may not interrupt it; its own child may.
         with self.assertRaisesRegex(ValueError, "managed by the user"):
             ns["agents"].cancel(agent_id=f"eng-{owned}")
@@ -173,62 +174,76 @@ class Tools(WorksetCase):
             ns["agents"].spawn_new_engineer(task_name="deeper", prompt="p")
         self.assertEqual(len(self.state.agents), before)
 
-    def test_a_post_goes_in_the_topic_it_names_and_reaches_whom_it_mentions(self):
+    def test_a_post_goes_in_the_thread_it_names_and_reaches_whom_it_mentions(self):
         ns, _ = self.notebook(self.root)
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        first, _ = fake_rho.start_user_topic("rho", "Do it", "Do it.", [self.root])
-        other, _ = fake_rho.start_user_topic("rho", "Else", "Something else.", [self.root])
+        rho_ = fake_rho.post_user(None, "rho")
+        first = fake_rho.post_user(rho_, "Do it.", [self.root])
+        other = fake_rho.post_user(rho_, "Something else.", [self.root])
         printed, reply = run(lambda: ns["chat"].post(first, "On it."))
         self.assertEqual((printed, reply), (f"Posted in #{first}.\n", f"Posted in #{first}."))
         printed, reply = run(lambda: ns["chat"].post(first, "Done.", mention="user", kind="result"))
         self.assertEqual((printed, reply), ("", ""))
         run(lambda: ns["chat"].post(other, "Also done.", mention=["user", f"eng-{child}"], kind="ask"))
-        posted = [(m["topic"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
+        posted = [(m["parent"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
         self.assertEqual(posted, [
             (first, "On it.", []),
             (first, "Done.", [("user", "result")]),
             (other, "Also done.", [("user", "ask"), (child, "ask")]),
         ])
-        # A mention reaches an agent outside the topic; posting joins no one.
+        # A mention reaches an agent outside the thread; posting joins no one.
         self.assertEqual([m["_to"] for m in self.state.messages if m["sender"] == self.root], [set(), set(), {child}])
-        self.assertEqual(self.state.topics[first]["agents"], [])
+        self.assertEqual(self.state.members, {})
 
     def test_chat_rules(self):
         ns, _ = self.notebook(self.root)
-        topic, _ = fake_rho.start_user_topic("rho", "Do it", "Do it.", [self.root])
+        rho_ = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(rho_, "Do it.", [self.root])
         chat = ns["chat"]
         with self.assertRaisesRegex(ValueError, "needs kind"):
-            chat.post(topic, "Done.", mention="user")
+            chat.post(thread, "Done.", mention="user")
         with self.assertRaisesRegex(ValueError, "needs kind"):
-            chat.post(topic, "Done.", mention="user", kind="status")
+            chat.post(thread, "Done.", mention="user", kind="status")
         with self.assertRaisesRegex(ValueError, "goes with a mention"):
-            chat.post(topic, "Done.", kind="result")
+            chat.post(thread, "Done.", kind="result")
         with self.assertRaisesRegex(ValueError, "yourself"):
-            chat.post(topic, "hi", mention=f"eng-{self.root}", kind="fyi")
-        with self.assertRaisesRegex(ValueError, "no topic 99"):
+            chat.post(thread, "hi", mention=f"eng-{self.root}", kind="fyi")
+        with self.assertRaisesRegex(ValueError, "no thread #99"):
             chat.post(99, "hi")
         with self.assertRaisesRegex(ValueError, "needs text"):
-            chat.post(topic, " ")
+            chat.post(thread, " ")
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         cns, _ = self.notebook(child)
         with self.assertRaisesRegex(ValueError, f"parent agent eng-{self.root}"):
-            cns["chat"].post(topic, "Hi.", mention="user", kind="fyi")
-        self.assertEqual(len(self.state.messages), 1, "nothing refused was posted")
-        printed, started = run(lambda: chat.start("ops", "side", "Look.", mention=f"eng-{child}", kind="ask"))
-        self.assertEqual(printed, f"Started topic #{started}.\n")
-        # Its starter joins it; the mentioned child does not.
-        self.assertEqual(self.state.topics[started], {"id": started, "name": "side", "stream": "ops", "resolved": False, "agents": [self.root]})
-        self.assertEqual(self.state.messages[-1]["_to"], {child})
-        # Agents message each other outside the user's chat, in a direct
-        # conversation of their own, any agent on the host.
+            cns["chat"].post(thread, "Hi.", mention="user", kind="fyi")
+        self.assertEqual(len(self.state.messages), 2, "nothing refused was posted")
+        # A new subject in a stream that is new: the root is made, the
+        # thread goes under it, and its starter joins it; the mentioned
+        # child does not.
+        printed, started = run(lambda: chat.start("ops", "Look.", mention=f"eng-{child}", kind="ask"))
+        self.assertEqual(printed, f"Started #{started}.\n")
+        ops = self.state.messages[-2]
+        self.assertEqual((ops["parent"], ops["sender"], ops["text"]), (None, self.root, "ops"))
+        self.assertEqual(self.state.messages[-1], {"id": started, "at": 0, "parent": ops["id"], "sender": self.root, "mentions": [(child, "ask")], "text": "Look.", "_to": {child}})
+        # (The user's mention joined the root to `thread` meanwhile.)
+        self.assertEqual(self.state.members, {(thread, self.root): True, (started, self.root): True})
+        # The same stream again is the same root.
+        _, again = run(lambda: chat.start(" ops ", "More."))
+        self.assertEqual(self.state.messages[-1]["parent"], ops["id"])
+        self.assertEqual(fake_rho.thread(again)["path"], [(ops["id"], "ops"), (again, "More.")])
+        # Agents message each other outside the user's chat, by mail, any
+        # agent on the host.
         printed, _ = run(lambda: ns["agents"].message(agent_id=f"eng-{child}", message="Psst."))
         self.assertEqual(printed, f"Sent to eng-{child}.\n")
         run(lambda: cns["agents"].message(agent_id=self.root, message="Yes?"))
-        conversation, yes = self.state.messages[-1]["topic"], self.state.messages[-1]["id"]
-        self.assertIsNone(self.state.topics[conversation]["stream"])
-        self.assertEqual([m["topic"] for m in self.state.messages[-2:]], [conversation, conversation])
-        with self.assertRaisesRegex(ValueError, "no one joins"):
-            chat.join(conversation)
+        self.assertEqual(self.state.mail, [
+            (self.root, child, f"[message from eng-{self.root}]\nPsst."),
+            (child, self.root, f"[message from eng-{child}]\nYes?"),
+        ])
+        self.assertEqual([(a, t, r, m) for a, t, r, m in self.state.inputs if m is None], [
+            (child, f"[message from eng-{self.root}]\nPsst.", "tool", None),
+            (self.root, f"[message from eng-{child}]\nYes?", "tool", None),
+        ])
         with self.assertRaisesRegex(ValueError, "yourself"):
             ns["agents"].message(agent_id=self.root, message="hi")
         with self.assertRaisesRegex(ValueError, "no agent nobody on this host"):
@@ -240,17 +255,18 @@ class Tools(WorksetCase):
             ns["agents"].message(agent_id="eng-farth", message="Which?")
         printed, _ = run(lambda: ns["agents"].message(agent_id="eng-farthes", message="From another workset."))
         self.assertEqual(printed, "Sent to farthest.\n")
-        self.assertEqual(self.state.topics[self.state.messages[-1]["topic"]]["agents"], sorted([self.root, "farthest"]))
+        self.assertEqual(self.state.mail[-1][1], "farthest")
+        self.assertEqual(len(self.state.messages), 5, "mail is not chat")
 
-        self.assertFalse(hasattr(chat, "direct"), "chat is the user's")
+        self.assertFalse(hasattr(chat, "mail"), "chat is the user's")
         # Join and read.
         printed, _ = run(lambda: cns["chat"].join(started))
         self.assertEqual(printed, f"Joined #{started}.\n")
-        self.assertEqual(self.state.topics[started]["agents"], [self.root, child])
-        printed, _ = run(lambda: cns["chat"].read(conversation, last=1))
-        self.assertEqual(printed, f"[#{conversation} direct with eng-{self.root}]\n#{yes} eng-{child}: Yes?\n")
-        printed, _ = run(lambda: chat.read(topic))
-        self.assertEqual(printed, f"[#{topic} rho › Do it]\n#{topic + 1} user: Do it.\n")
+        self.assertEqual(fake_rho.thread(started)["agents"], [self.root, child])
+        printed, _ = run(lambda: chat.read(thread))
+        self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{thread} user: Do it.\n")
+        printed, _ = run(lambda: chat.read(rho_))
+        self.assertEqual(printed, f"[#{rho_} rho]\n#{rho_} user: rho\n#{thread} user: Do it.\n")
 
     def test_an_agent_on_another_host_is_reached_only_once_its_host_is_approved_and_it_is_accepted(self):
         ns, _ = self.notebook(self.root)
@@ -325,58 +341,64 @@ class Tools(WorksetCase):
     def test_leave_and_read_by_any_id(self):
         ns, _ = self.notebook(self.root)
         chat = ns["chat"]
-        topic, first = fake_rho.start_user_topic("rho", "Do it", "Do it.")
-        ids = [fake_rho.post_user(topic, f"m{i}") for i in range(5)]
-        run(lambda: chat.join(topic))
-        printed, _ = run(lambda: chat.leave(topic))
-        self.assertEqual(printed, f"Left #{topic}.\n")
-        self.assertEqual(self.state.topics[topic]["agents"], [])
-        # A message id shows the messages around it, marked.
+        rho_ = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(rho_, "Do it.")
+        ids = [fake_rho.post_user(thread, f"m{i}") for i in range(5)]
+        run(lambda: chat.join(thread))
+        printed, _ = run(lambda: chat.leave(thread))
+        self.assertEqual(printed, f"Left #{thread}.\n")
+        self.assertEqual(fake_rho.thread(thread)["agents"], [])
+        # A thread shows its message and the newest under it.
+        printed, _ = run(lambda: chat.read(thread, last=2))
+        self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{thread} user: Do it.\n#{ids[3]} user: m3\n#{ids[4]} user: m4\n")
+        # A message with nothing under it shows the messages around it in
+        # its thread, marked.
         printed, _ = run(lambda: chat.read(ids[2], last=3))
-        self.assertEqual(printed, f"[#{topic} rho › Do it]\n#{ids[1]} user: m1\n→ #{ids[2]} user: m2\n#{ids[3]} user: m3\n")
-        # At the start of a topic the window does not run off its end.
-        printed, _ = run(lambda: chat.read(first, last=3))
-        self.assertEqual(printed.splitlines()[1:], [f"→ #{first} user: Do it.", f"#{ids[0]} user: m0", f"#{ids[1]} user: m1"])
-        # The user moved one away and resolved the old topic.
-        other, _ = fake_rho.start_user_topic("ops", "Aside", "Aside.")
-        fake_rho.move_messages("user", [ids[4]], other)
-        fake_rho.change_topic("user", topic, "rho", "Done it", True)
+        self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{ids[1]} user: m1\n→ #{ids[2]} user: m2\n#{ids[3]} user: m3\n")
+        # At the start of a thread the window does not run off its end.
+        printed, _ = run(lambda: chat.read(ids[0], last=3))
+        self.assertEqual(printed.splitlines()[1:], [f"#{thread} user: Do it.", f"→ #{ids[0]} user: m0", f"#{ids[1]} user: m1"])
+        # The user moved one away, under another stream's thread, and named
+        # the old thread.
+        ops = fake_rho.post_user(None, "ops")
+        aside = fake_rho.post_user(ops, "Aside.")
+        fake_rho.reparent("user", ids[4], aside)
+        fake_rho.name("user", thread, "Done it")
         printed, _ = run(lambda: chat.read(ids[4], last=1))
-        self.assertEqual(printed, f"[#{other} ops › Aside]\n→ #{ids[4]} user: m4\n")
-        printed, _ = run(lambda: chat.read(topic, last=1))
-        self.assertEqual(printed, f"[#{topic} rho › ✔ Done it]\n#{ids[3]} user: m3\n")
-        with self.assertRaisesRegex(ValueError, "names no topic or message"):
+        self.assertEqual(printed, f"[#{aside} ops › Aside.]\n→ #{ids[4]} user: m4\n")
+        printed, _ = run(lambda: chat.read(thread, last=1))
+        self.assertEqual(printed, f"[#{thread} rho › Done it]\n#{thread} user: Do it.\n#{ids[3]} user: m3\n")
+        with self.assertRaisesRegex(ValueError, "names no message"):
             chat.read(999)
 
-    def test_an_agent_resolves_renames_and_moves_only_in_its_topics(self):
+    def test_an_agent_names_and_moves_only_in_its_threads(self):
         ns, _ = self.notebook(self.root)
         chat = ns["chat"]
-        topic, first = fake_rho.start_user_topic("rho", "Do it", "Do it.")
-        ids = [fake_rho.post_user(topic, f"m{i}") for i in range(3)]
+        rho_ = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(rho_, "Do it.")
+        ids = [fake_rho.post_user(thread, f"m{i}") for i in range(3)]
+        ops = fake_rho.post_user(None, "ops")
         with self.assertRaisesRegex(ValueError, "join it first"):
-            chat.resolve(topic)
-        run(lambda: chat.join(topic))
-        run(lambda: chat.rename(topic, "Did it", stream="ops"))
-        run(lambda: chat.resolve(topic))
-        self.assertEqual(
-            {k: self.state.topics[topic][k] for k in ("stream", "name", "resolved")},
-            {"stream": "ops", "name": "Did it", "resolved": True},
-        )
-        # A rename keeps the resolved mark and the stream it does not name.
-        run(lambda: chat.rename(topic, "Done"))
-        self.assertEqual(
-            {k: self.state.topics[topic][k] for k in ("stream", "name", "resolved")},
-            {"stream": "ops", "name": "Done", "resolved": True},
-        )
-        printed, aside = run(lambda: chat.move([ids[1], ids[2]], stream="rho", name="Aside"))
-        self.assertEqual(printed, f"Moved 2 message(s) to #{aside}.\n")
-        self.assertEqual([m["topic"] for m in self.state.messages if m["id"] in ids], [topic, aside, aside])
-        self.assertEqual(self.state.topics[aside]["name"], "Aside")
-        # The agent is not in the new topic, so it moves nothing out of it.
+            chat.name(thread, "Did it")
         with self.assertRaisesRegex(ValueError, "join it first"):
-            chat.move(ids[1], topic)
-        with self.assertRaisesRegex(ValueError, "stream= and name="):
-            chat.move(ids[0], stream="rho")
+            chat.move(ids[1], ops)
+        run(lambda: chat.join(thread))
+        printed, _ = run(lambda: chat.name(thread, "Did it"))
+        self.assertEqual(printed, f"Named #{thread}.\n")
+        self.assertEqual(fake_rho.thread(thread)["name"], "Did it")
+        # A move takes the message and what hangs under it.
+        under = fake_rho.post_user(ids[1], "under m1")
+        printed, _ = run(lambda: chat.move(ids[1], ops))
+        self.assertEqual(printed, f"Moved #{ids[1]} to #{ops}.\n")
+        self.assertEqual([m["parent"] for m in self.state.messages if m["id"] in ids], [thread, ops, thread])
+        self.assertEqual(fake_rho.thread(under)["path"], [(ops, "ops"), (ids[1], "m1"), (under, "under m1")])
+        # The agent is not in `ops`, so it moves nothing out of it.
+        with self.assertRaisesRegex(ValueError, "join it first"):
+            chat.move(ids[1], thread)
+        with self.assertRaisesRegex(ValueError, "no message #999"):
+            chat.move(999, thread)
+        with self.assertRaisesRegex(ValueError, "no thread #999"):
+            chat.move(ids[0], 999)
 
     def test_skills_load_keeps_only_skills_that_ask_and_compaction_rereads_them(self):
         ns, _ = self.notebook(self.root)
@@ -414,17 +436,16 @@ class Tools(WorksetCase):
         self.assertFalse(skills.keeps_after_compaction("rho-keep-after-compaction: true\n"))
         self.assertTrue(skills.keeps_after_compaction("\ufeff---\r\nmetadata:\r\n  rho-keep-after-compaction: true\r\n---  \r\nBody."))
 
-    def test_a_failed_child_tells_its_parent_in_their_direct_conversation(self):
+    def test_a_failed_child_tells_its_parent_by_mail(self):
         ns, _ = self.notebook(self.root)
         run(lambda: ns["agents"].spawn_new_engineer(task_name="fix-it", prompt="Fix it."))
         [child] = [id for id in self.state.agents if id != self.root]
-        [topic] = self.state.topics
         rho._hook("on_turn_end", child, {"reason": "end_turn", "error": None}, timeout=5)
         rho._hook("on_turn_end", self.root, {"reason": "failed", "error": "boom"}, timeout=5)
-        self.assertEqual(len(self.state.messages), 1)
+        self.assertEqual(len(self.state.mail), 1)
         rho._hook("on_turn_end", child, {"reason": "failed", "error": "quota"}, timeout=5)
-        self.assertEqual([(m["topic"], m["sender"], m["text"]) for m in self.state.messages[1:]],
-                         [(topic, child, "Agent hit an error and stopped: quota")])
+        self.assertEqual(self.state.mail[1:], [(child, self.root, f"[message from eng-{child}]\nAgent hit an error and stopped: quota")])
+        self.assertEqual(self.state.messages, [])
 
 
 async def _await(reply):

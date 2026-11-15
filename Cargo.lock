@@ -13799,6 +13799,7 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-agents-client",
+ "rho-chat",
  "rho-claude",
  "rho-claude-usage",
  "rho-db",
@@ -13962,6 +13963,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-chat"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rho-agent-types",
+ "rho-rpc",
+ "senax-encoder",
+]
+
+[[package]]
 name = "rho-ci"
 version = "0.1.0"
 dependencies = [
@@ -14024,6 +14035,7 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-agents-client",
+ "rho-chat",
  "rho-claude",
  "rho-db",
  "rho-desktop-client",
@@ -14540,6 +14552,7 @@ dependencies = [
  "reqwest 0.13.5",
  "rho-agent-types",
  "rho-agents-client",
+ "rho-chat",
  "rho-db",
  "rho-fake-model",
  "rho-gui",

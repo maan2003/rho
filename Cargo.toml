@@ -45,6 +45,7 @@ members = [
   "crates/rho-agents-view",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
+  "crates/rho-chat",
   "crates/rho-db",
   "crates/rho-dealer",
   "crates/rho-desktop-client",
@@ -133,6 +134,7 @@ rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-agent-hosts = { path = "crates/rho-agent-hosts" }
 rho-agent-types = { path = "crates/rho-agent-types" }
 rho-agents-client = { path = "crates/rho-agents-client" }
+rho-chat = { path = "crates/rho-chat" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }

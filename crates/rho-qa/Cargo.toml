@@ -23,6 +23,7 @@ redb.workspace = true
 reqwest.workspace = true
 rho-agent-types.workspace = true
 rho-agents-client.workspace = true
+rho-chat.workspace = true
 rho-fake-model.workspace = true
 rustls.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }

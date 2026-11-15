@@ -19,6 +19,7 @@ rho-agent.workspace = true
 rho-agent-types.workspace = true
 rho-rpc.workspace = true
 rho-agents-client.workspace = true
+rho-chat.workspace = true
 rho-desktop-client.workspace = true
 rho-ledger.workspace = true
 rho-files.workspace = true

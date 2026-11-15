@@ -190,9 +190,11 @@ pub enum Protocol {
     Workspace,
     /// Append-only sealed byte logs; the old Ledger protocol is retired.
     LedgerLog,
-    /// Worksets, the agent directory and chat (`rho-agents-client`,
+    /// Worksets and the agent directory (`rho-agents-client`,
     /// `protocol::worksets`). Replaces `Agents`.
     Worksets,
+    /// The host's chat: its log, and what the user says in it (`rho-chat`).
+    Chat,
 }
 
 /// The first frame on every stream: which protocol it speaks, and that

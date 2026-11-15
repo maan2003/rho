@@ -51,11 +51,24 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "7cfd7d03";
-/// Temporary (`temp-migration`): the format before GCCP acceptances were
-/// keyed by endpoint bytes, which
-/// [`crate::store::gccp::key_contacts_by_endpoint`] moves from.
-const PREVIOUS_AGENT_DB_FORMAT: &str = "9a6cf67f";
+const CURRENT_AGENT_DB_FORMAT: &str = "e41b7c2a";
+/// Temporary (`temp-migration`): the hops a store takes to the current
+/// format, one build at a time, each from a savepoint `rho debug rollback`
+/// can put it back to. Oldest first.
+const MIGRATIONS: &[(&str, &str, fn(&mut WriteTxn))] = &[
+    // GCCP acceptances keyed by endpoint bytes.
+    (
+        "9a6cf67f",
+        "7cfd7d03",
+        crate::store::gccp::key_contacts_by_endpoint,
+    ),
+    // Chat became a forest of messages.
+    (
+        "7cfd7d03",
+        "e41b7c2a",
+        crate::store::chat::legacy::migrate_topics_to_forest,
+    ),
+];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -391,22 +404,23 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         );
     }
     drop(read);
-    if stored.as_deref() == Some(PREVIOUS_AGENT_DB_FORMAT) {
+    let mut stored = stored;
+    for (from, to, migrate) in MIGRATIONS {
+        if stored.as_deref() != Some(from) {
+            continue;
+        }
         // Temporary (`temp-migration`): `rho debug rollback` puts the store
         // back from this savepoint.
-        let hop = format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}");
+        let hop = format!("{from}->{to}");
         db.persistent_savepoint(|write, id| {
             write.open_table(RECOVERY).insert(hop, id);
         })
         .await;
         let mut write = db.write().await;
-        crate::store::gccp::key_contacts_by_endpoint(&mut write);
-        write
-            .open_table(FORMAT)
-            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
-        write.init_agent_tables();
+        migrate(&mut write);
+        write.open_table(FORMAT).insert((), to.to_string());
         write.commit();
-        return;
+        stored = Some(to.to_string());
     }
     let mut write = db.write().await;
     write.init_agent_tables();
@@ -555,7 +569,7 @@ mod tests {
         let mut write = db.write().await;
         write
             .open_table(FORMAT)
-            .insert((), PREVIOUS_AGENT_DB_FORMAT.to_owned());
+            .insert((), "9a6cf67f".to_owned());
         rho_iroh_auth::gccp_hosts::init(&mut write);
         rho_iroh_auth::gccp_hosts::approve(&mut write, &tau.0, "dpc-tau".into());
         let mut old = write.open_table(HEX_CONTACTS);
@@ -604,16 +618,19 @@ mod tests {
         prepare(&db).await;
         assert_eq!(state(), moved);
 
+        // Each hop rolls back on its own, newest first.
         let hop = rollback(&db).await.unwrap();
+        assert_eq!(hop, "7cfd7d03->e41b7c2a");
         assert_eq!(
-            hop,
-            format!("{PREVIOUS_AGENT_DB_FORMAT}->{CURRENT_AGENT_DB_FORMAT}")
+            db.read().open_table(FORMAT).get(()).unwrap().value(),
+            "7cfd7d03"
         );
+        let hop = rollback(&db).await.unwrap();
+        assert_eq!(hop, "9a6cf67f->7cfd7d03");
         let read = db.read();
-        assert_eq!(
-            read.open_table(FORMAT).get(()).unwrap().value(),
-            PREVIOUS_AGENT_DB_FORMAT
-        );
+        assert_eq!(read.open_table(FORMAT).get(()).unwrap().value(), "9a6cf67f");
         assert_eq!(read.open_table(HEX_CONTACTS).iter().count(), 2);
+        drop(read);
+        assert!(rollback(&db).await.is_err());
     }
 }

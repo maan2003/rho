@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
-use rho_agent_types::{AgentId, ContentPart, Message, TopicId};
+use rho_agent_types::{AgentId, ContentPart, Message, MessageId};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
     ContextChannel, ProviderEvent, Sideband, SidebandConfig, TIMELINE, TranscriptState,
@@ -29,7 +29,7 @@ use crate::Services;
 /// The live model's instructions, adapted from the ChatGPT app's voice
 /// prompt. The thread's startup context is appended.
 const INSTRUCTIONS: &str = include_str!("realtime/voice.md");
-/// How many of the topic's newest messages the startup context reads.
+/// How many of the thread's newest messages the startup context reads.
 const CONTEXT_MESSAGES: usize = 200;
 const MAX_SDP_BYTES: usize = 256 * 1024;
 const SIGNALING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -42,7 +42,7 @@ pub(crate) async fn serve<R, W>(
     mut writer: W,
     offer_sdp: String,
     agent_id: AgentId,
-    topic: TopicId,
+    thread: MessageId,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -63,7 +63,7 @@ where
     };
     tracing::info!(target: TIMELINE, agent = ?agent_id, "voice requested");
     let opened = async {
-        let instructions = instructions(&services, agent_id, topic)?;
+        let instructions = instructions(&services, agent_id, thread)?;
         let auth = services.inference.auth().await?;
         let credential = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
@@ -117,7 +117,7 @@ where
 
     write_frame(&mut writer, &RealtimeServerFrame::SidebandReady).await?;
 
-    // Replies are what the agent posts in the topic from here on, and a
+    // Replies are what the agent posts in the thread from here on, and a
     // stop.
     let mut feed = rho_agent::store::feed(services.pool.db());
     let mut cursor = services.pool.db().read().chat_head();
@@ -151,7 +151,7 @@ where
                             records
                                 .iter()
                                 .filter_map(Message::from_record)
-                                .filter(|message| message.topic == topic)
+                                .filter(|message| message.parent == Some(thread))
                                 .filter_map(|message| thread::reply(&message, agent_id)),
                         );
                     }
@@ -177,7 +177,7 @@ where
                             .pool
                             .post_user(
                                 uuid::Uuid::new_v4().as_u64_pair().0,
-                                topic,
+                                Some(thread),
                                 Vec::new(),
                                 vec![ContentPart::Text { text: message }],
                             )
@@ -238,22 +238,26 @@ where
     result
 }
 
-/// The live model's instructions with the topic's latest turns appended.
-fn instructions(services: &Services, agent_id: AgentId, topic: TopicId) -> anyhow::Result<String> {
+/// The live model's instructions with the thread's latest turns appended.
+fn instructions(
+    services: &Services,
+    agent_id: AgentId,
+    thread: MessageId,
+) -> anyhow::Result<String> {
     let read = services.pool.db().read();
     anyhow::ensure!(
         read.agent(agent_id).is_some(),
         "voice is attached to an agent this host does not have"
     );
     let head = read
-        .topic(topic)
-        .context("voice is attached to a topic this host does not have")?;
+        .thread(thread)
+        .context("voice is attached to a thread this host does not have")?;
     anyhow::ensure!(
-        head.agents.contains(&agent_id),
-        "voice talks to an agent of its topic"
+        head.members.contains(&agent_id),
+        "voice talks to an agent of its thread"
     );
     let said = read
-        .topic_messages(topic, CONTEXT_MESSAGES)
+        .thread_messages(Some(thread), CONTEXT_MESSAGES)
         .iter()
         .filter_map(|message| thread::Said::of(message, agent_id))
         .collect::<Vec<_>>();

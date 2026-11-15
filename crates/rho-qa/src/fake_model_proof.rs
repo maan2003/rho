@@ -14,12 +14,11 @@ use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role,
-    TopicId, WorksetId, WorksetKind, Wpos,
+    WorksetId, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
-use rho_agents_client::protocol::worksets::{
-    ClientFrame, CreateWorkset, LogEvent, Post, ServerFrame, StartTopic,
-};
+use rho_agents_client::protocol::worksets::{ClientFrame, CreateWorkset, LogEvent, ServerFrame};
+use rho_chat::protocol::Post;
 use rho_agents_client::snippets;
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_rpc::protocol::client::Client;
@@ -185,7 +184,6 @@ async fn run_async(args: Args) -> Result<()> {
         client.chat_head == ChatSeq::ZERO,
         "fresh isolated agent host chat was not empty"
     );
-    let stream = client.create_stream("qa").await?;
     println!(
         "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
         tree_commit,
@@ -194,11 +192,7 @@ async fn run_async(args: Args) -> Result<()> {
         args.scenario.as_str(),
         args.seed
     );
-    client
-        .send(&ClientFrame::FollowChat {
-            since: ChatSeq::ZERO,
-        })
-        .await?;
+    client.follow_chat(ChatSeq::ZERO).await?;
 
     let repo = Utf8PathBuf::try_from(workspace).context("workspace path is not UTF-8")?;
     let runtime = snippets::Runtime::parse("").map_err(anyhow::Error::msg)?;
@@ -244,7 +238,8 @@ async fn run_async(args: Args) -> Result<()> {
 
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
     let mut last_seq = ChatSeq::ZERO;
-    let mut user_topics: HashMap<AgentId, TopicId> = HashMap::new();
+    // Each agent's thread: the root its brief started.
+    let mut user_threads: HashMap<AgentId, MessageId> = HashMap::new();
     let quiesce_deadline = deadline
         + if matches!(
             args.scenario,
@@ -316,10 +311,9 @@ async fn run_async(args: Args) -> Result<()> {
                 ensure!(error.is_none(), "workset creation code failed: {error:?}");
                 let agent = agent.context("the creation code created no agent")?;
                 agents.insert(agent);
-                client.start_topic(StartTopic {
+                client.post(Post {
                     client_id: client_id(),
-                    stream,
-                    name: format!("QA agent {briefed}"),
+                    parent: None,
                     mentions: vec![agent],
                     content: prompt(briefed, 0),
                 });
@@ -359,18 +353,18 @@ async fn run_async(args: Args) -> Result<()> {
                 {
                     let cycle = cycles.entry(agent_id).or_default();
                     *cycle += 1;
-                    let topic = *user_topics
+                    let thread = *user_threads
                         .get(&agent_id)
-                        .context("an agent awaits the user before its topic arrived")?;
+                        .context("an agent awaits the user before its thread arrived")?;
                     client.post(Post {
                         client_id: client_id(),
-                        topic,
+                        parent: Some(thread),
                         mentions: vec![agent_id],
                         content: prompt(0, *cycle),
                     });
                 }
             }
-            Incoming::Session(ServerFrame::Chat { records }) => {
+            Incoming::Chat(records) => {
                 for record in records {
                     ensure!(
                         record.seq > last_seq,
@@ -380,29 +374,19 @@ async fn run_async(args: Args) -> Result<()> {
                     );
                     last_seq = record.seq;
                     match record.event {
-                        ChatEvent::StreamCreated { .. } | ChatEvent::Joined { .. } => {}
-                        ChatEvent::Left { .. }
-                        | ChatEvent::TopicChanged { .. }
-                        | ChatEvent::Moved { .. } => {
-                            bail!("nobody leaves, changes or moves in this proof")
-                        }
-                        ChatEvent::TopicStarted {
-                            by: Address::User, ..
-                        } => {}
-                        ChatEvent::TopicStarted { by, .. } => {
-                            bail!("fake agent {by:?} started a topic")
-                        }
-                        ChatEvent::DirectStarted { members } => {
-                            bail!("fake agents {members:?} talked directly")
+                        ChatEvent::Joined { .. } | ChatEvent::Named { .. } => {}
+                        ChatEvent::Left { .. } | ChatEvent::Reparented { .. } => {
+                            bail!("nobody leaves or moves in this proof")
                         }
                         ChatEvent::Posted {
-                            topic,
+                            parent,
                             from: Address::User,
                             mentions,
                             ..
                         } => {
-                            // Each brief mentions its one agent, and that
-                            // agent's topic is the one the first brief opened.
+                            // Each brief mentions its one agent and starts
+                            // that agent's thread; every later prompt goes
+                            // in it.
                             let [
                                 Mention {
                                     to: Address::Agent(agent),
@@ -412,28 +396,29 @@ async fn run_async(args: Args) -> Result<()> {
                             else {
                                 bail!("the proof posted with mentions {mentions:?}");
                             };
-                            let known = *user_topics.entry(agent).or_insert(topic);
+                            let thread = parent.unwrap_or(MessageId(record.seq));
+                            let known = *user_threads.entry(agent).or_insert(thread);
                             ensure!(
-                                known == topic,
-                                "agent {} got a second topic",
+                                known == thread,
+                                "agent {} got a second thread",
                                 agent.encoded()
                             );
                             posted.insert(MessageId(record.seq));
                         }
                         ChatEvent::Posted {
-                            topic,
+                            parent,
                             from: Address::Agent(agent),
                             mentions,
                             content,
                         } => {
-                            // Each agent answers in the topic its brief came
-                            // in.
+                            // Each agent answers in the thread its brief
+                            // started.
                             ensure!(
-                                user_topics.get(&agent) == Some(&topic),
-                                "agent {} answered in topic {:?}, not {:?}",
+                                parent.is_some() && user_threads.get(&agent) == parent.as_ref(),
+                                "agent {} answered under {:?}, not {:?}",
                                 agent.encoded(),
-                                topic,
-                                user_topics.get(&agent)
+                                parent,
+                                user_threads.get(&agent)
                             );
                             ensure!(
                                 mentions

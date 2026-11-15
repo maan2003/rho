@@ -275,12 +275,9 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     let client_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
-    let name = prompt.lines().next().unwrap_or("Evaluation").to_owned();
-    let stream = pool.create_stream("eval".to_owned()).await?;
-    pool.start_user_topic(
+    pool.post_user(
         client_id,
-        stream,
-        name,
+        None,
         vec![id],
         vec![ContentPart::Text { text: prompt }],
     )
@@ -512,7 +509,7 @@ impl Watch<'_> {
                     emit(json!({"type":"message", "agent":agent, "text":text}))?;
                 } else {
                     emit(
-                        json!({"type":"message", "agent":agent, "topic":message.topic.0.0, "text":text}),
+                        json!({"type":"message", "agent":agent, "parent":message.parent.map(|parent| parent.0.0), "text":text}),
                     )?;
                 }
                 Ok(None)
