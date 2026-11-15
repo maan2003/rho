@@ -8,28 +8,20 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_types::{Address, AgentId, Mention};
-use rho_agents_client::chat::Membership;
+use rho_agent_types::AgentId;
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
 
-/// Two projections of the same canonical blocks. Hidden blocks keep their
-/// indices so detail requests, lazy history, and cursor anchors still agree.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum TranscriptView {
-    #[default]
-    Conversation,
-    Activity,
-}
+/// The one projection of an agent's blocks: everything it read and did,
+/// in order. Hidden blocks keep their indices so detail requests, lazy
+/// history, and cursor anchors still agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptView;
 
 impl TranscriptView {
     pub(crate) fn visible(self, block: &UiBlock) -> bool {
-        let belongs = match self {
-            Self::Conversation => !matches!(block, UiBlock::Tool(_) | UiBlock::Reasoning { .. }),
-            Self::Activity => matches!(block, UiBlock::Tool(_) | UiBlock::Notice { .. }),
-        };
-        belongs && block_visible(block)
+        block_visible(block)
     }
 
     pub(crate) fn render(
@@ -126,8 +118,7 @@ impl RenderedBlock {
 
 pub fn block_kind(block: &UiBlock) -> BlockKind {
     match block {
-        UiBlock::UserMessage { .. } => BlockKind::User,
-        UiBlock::MessageSent { .. } => BlockKind::Response { working: false },
+        UiBlock::UserMessage { .. } | UiBlock::Delivered { .. } => BlockKind::User,
         UiBlock::AssistantMessage { phase, .. } => BlockKind::Response {
             working: *phase != Some(UiMessagePhase::FinalAnswer),
         },
@@ -135,15 +126,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         | UiBlock::MessageDraft { .. }
         | UiBlock::Tool(_)
         | UiBlock::Notice { .. } => BlockKind::Response { working: true },
-        UiBlock::QueuedMessage { .. }
-        | UiBlock::Unsent { .. }
-        | UiBlock::Status { .. }
-        | UiBlock::Member { .. } => BlockKind::QueuedUser,
-        UiBlock::AgentMessage { .. } => BlockKind::User,
-        UiBlock::ChatMessage { from, .. } => match from {
-            Address::User => BlockKind::User,
-            Address::Agent(_) => BlockKind::Response { working: false },
-        },
+        UiBlock::Status { .. } => BlockKind::QueuedUser,
     }
 }
 
@@ -158,39 +141,11 @@ pub fn block_visible(block: &UiBlock) -> bool {
         UiBlock::Tool(_) => true,
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
-        | UiBlock::MessageSent { text, .. }
         | UiBlock::MessageDraft { text, .. }
         | UiBlock::Notice { text }
-        | UiBlock::AgentMessage { text, .. }
-        | UiBlock::QueuedMessage { text, .. }
-        | UiBlock::Unsent { text }
         | UiBlock::Status { text }
-        | UiBlock::ChatMessage { text, .. } => !text.is_empty(),
-        UiBlock::Member { .. } => true,
+        | UiBlock::Delivered { text, .. } => !text.is_empty(),
     }
-}
-
-/// Who a chat message is from and whom it mentions, as its header line
-/// says it: `eng-x @eng-y`. Empty for the user's own message, whose text
-/// already says whom it mentions.
-pub fn chat_header(
-    from: Address,
-    mentions: &[Mention],
-    named: bool,
-    agent_label: &impl Fn(AgentId) -> String,
-) -> String {
-    let mut parts = Vec::new();
-    if let (true, Address::Agent(sender)) = (named, from) {
-        parts.push(agent_label(sender));
-    }
-    // A mention of the user and its kind are for the dealer; a mention of
-    // an agent says who else reads it. The user typed theirs in the text.
-    for mention in mentions.iter().filter(|_| from != Address::User) {
-        if let Address::Agent(agent) = mention.to {
-            parts.push(format!("@{}", agent_label(agent)));
-        }
-    }
-    parts.join(" ")
 }
 
 /// Separator inserted before a block, given the previous visible block's kind.
@@ -309,6 +264,16 @@ pub fn render_block_with_agent_labels(
             // is not markdown and gets a plain buffer of its own.
             spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
         }
+        // A chat message handed to the agent reads as the user's words do:
+        // it is what the model was given, shown as it was typed.
+        UiBlock::Delivered { text, .. } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            gutter_span = Some(spans.len());
+            spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+        }
         UiBlock::AssistantMessage { text, .. } => {
             if text.is_empty() {
                 return invisible(kind);
@@ -354,24 +319,6 @@ pub fn render_block_with_agent_labels(
                 table_padding,
             };
         }
-        UiBlock::MessageSent { to, text } => {
-            if text.is_empty() {
-                return invisible(kind);
-            }
-            spans.extend(separator(prev, kind));
-            if let Some(to) = to {
-                spans.push(Span::new(
-                    format!("to {}\n", agent_label(*to)),
-                    StyleClass::AgentLabel,
-                ));
-            }
-            markdown = true;
-            let mut text = text.clone();
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            spans.push(Span::new(text, StyleClass::Default));
-        }
         UiBlock::Reasoning { .. } => return invisible(kind),
         // What an agent is still writing, where its post will land: who,
         // and that it is not posted yet.
@@ -407,108 +354,6 @@ pub fn render_block_with_agent_labels(
                 text.push('\n');
             }
             spans.push(Span::new(text, StyleClass::SystemInfo));
-        }
-        UiBlock::AgentMessage { sender, text } => {
-            if text.is_empty() {
-                return invisible(kind);
-            }
-            spans.extend(separator(prev, kind));
-            spans.push(Span::new(
-                format!("from {}\n", agent_label(*sender)),
-                StyleClass::AgentLabel,
-            ));
-            gutter_span = Some(spans.len());
-            spans.push(Span::new(format!("{text}\n\n"), StyleClass::AgentMessage));
-        }
-        UiBlock::QueuedMessage { text, sender } => {
-            if text.is_empty() {
-                return invisible(kind);
-            }
-            spans.extend(separator(prev, kind));
-            if let Some(sender) = sender {
-                spans.push(Span::new(
-                    format!("from {}\n", agent_label(*sender)),
-                    StyleClass::AgentLabel,
-                ));
-            }
-            gutter_span = Some(spans.len());
-            spans.push(Span::new(
-                text.clone(),
-                if sender.is_some() {
-                    StyleClass::AgentMessage
-                } else {
-                    StyleClass::UserMessage
-                },
-            ));
-            inlay = Some(InlaySpec {
-                span_index: spans.len(),
-                content: InlayContent::Label(" (queued)"),
-            });
-            spans.push(Span::new("", StyleClass::SystemInfo));
-            spans.push(Span::new("\n\n", StyleClass::Default));
-        }
-        UiBlock::Unsent { text } => {
-            if text.is_empty() {
-                return invisible(kind);
-            }
-            spans.extend(separator(prev, kind));
-            gutter_span = Some(spans.len());
-            spans.push(Span::new(text.clone(), StyleClass::UserMessage));
-            inlay = Some(InlaySpec {
-                span_index: spans.len(),
-                content: InlayContent::Label(" (unsent)"),
-            });
-            spans.push(Span::new("", StyleClass::SystemInfo));
-            spans.push(Span::new("\n\n", StyleClass::Default));
-        }
-        UiBlock::ChatMessage {
-            from,
-            mentions,
-            text,
-            named,
-            ..
-        } => {
-            if text.is_empty() {
-                return invisible(kind);
-            }
-            spans.extend(separator(prev, kind));
-            // A named message starts another agent's run: a blank line
-            // parts it from the run above, as a new turn would.
-            if *named && matches!(prev, Some(BlockKind::Response { .. })) {
-                spans.push(Span::new("\n", StyleClass::Default));
-            }
-            let header = chat_header(*from, mentions, *named, agent_label);
-            if !header.is_empty() {
-                spans.push(Span::new(format!("{header}\n"), StyleClass::AgentLabel));
-            }
-            match from {
-                // The user's own words, as they were typed.
-                Address::User => {
-                    gutter_span = Some(spans.len());
-                    spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
-                }
-                Address::Agent(_) => {
-                    markdown = true;
-                    let mut text = text.clone();
-                    if !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    spans.push(Span::new(text, StyleClass::Default));
-                }
-            }
-        }
-        // A line apart, like a status: who reads the topic from here.
-        UiBlock::Member { agent, change } => {
-            spans.extend(separator(prev, kind));
-            let verb = match change {
-                Membership::Joined => "joined",
-                Membership::Left => "left",
-            };
-            spans.push(Span::new(
-                format!("{} {verb}", agent_label(*agent)),
-                StyleClass::SystemInfo,
-            ));
-            spans.push(Span::new("\n\n", StyleClass::Default));
         }
         UiBlock::Status { text } => {
             if text.is_empty() {
@@ -864,98 +709,9 @@ fn json_text_field(arguments: &str, key: &str, format: ArgumentsFormat) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{MentionKind, UnixMs};
+    use rho_agent_types::UnixMs;
 
     use super::*;
-
-    /// A topic's message names its sender only when told to, and names
-    /// the agents it mentions; a mention of the user and every kind say
-    /// nothing here, and the user's own mentions are already in its text.
-    /// A named message after another agent's run starts with a blank line.
-    #[test]
-    fn a_chat_message_names_its_sender_and_mentions() {
-        let a = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let b = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let label = |agent: AgentId| if agent == a { "Ann" } else { "Bob" }.to_owned();
-        let after = |prev, from, mentions: Vec<Mention>, named| {
-            text_of(
-                &render_block_with_agent_labels(
-                    &UiBlock::ChatMessage {
-                        id: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
-                        from,
-                        mentions,
-                        text: "words".into(),
-                        named,
-                    },
-                    prev,
-                    0,
-                    &label,
-                )
-                .spans,
-            )
-        };
-        let rendered = |from, mentions, named| after(None, from, mentions, named);
-        let mention = |to, kind| Mention { to, kind };
-        let both = vec![
-            mention(Address::User, MentionKind::Ask),
-            mention(Address::Agent(b), MentionKind::Fyi),
-        ];
-        assert_eq!(rendered(Address::User, Vec::new(), false), "words\n\n");
-        assert_eq!(
-            rendered(Address::Agent(a), both.clone(), true),
-            "Ann @Bob\nwords\n"
-        );
-        assert_eq!(rendered(Address::Agent(a), both, false), "@Bob\nwords\n");
-        assert_eq!(
-            rendered(
-                Address::Agent(a),
-                vec![mention(Address::User, MentionKind::Result)],
-                false
-            ),
-            "words\n",
-            "a result for the user is the dealer's"
-        );
-        assert_eq!(
-            rendered(
-                Address::User,
-                vec![mention(Address::Agent(b), MentionKind::Ask)],
-                false
-            ),
-            "words\n\n",
-            "the user typed the mention into the text"
-        );
-        let response = Some(BlockKind::Response { working: false });
-        assert_eq!(
-            after(response, Address::Agent(b), Vec::new(), true),
-            "\nBob\nwords\n"
-        );
-        assert_eq!(
-            after(response, Address::Agent(a), Vec::new(), false),
-            "words\n",
-            "a run goes on without a gap"
-        );
-        assert_eq!(
-            after(Some(BlockKind::User), Address::Agent(b), Vec::new(), true),
-            "Bob\nwords\n",
-            "the user's message already ends with a blank line"
-        );
-        let member = |prev, change| {
-            text_of(
-                &render_block_with_agent_labels(
-                    &UiBlock::Member { agent: b, change },
-                    prev,
-                    0,
-                    &label,
-                )
-                .spans,
-            )
-        };
-        assert_eq!(member(response, Membership::Joined), "\nBob joined\n\n");
-        assert_eq!(
-            member(Some(BlockKind::User), Membership::Left),
-            "Bob left\n\n"
-        );
-    }
 
     fn tool(status: UiToolStatus) -> UiTool {
         UiTool {
@@ -1192,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn host_draft_shows_in_conversation_while_activity_keeps_the_source() {
+    fn a_host_draft_and_its_source_both_show() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
         exec.arguments = "chat.post(2, 'Hello')".into();
@@ -1203,18 +959,16 @@ mod tests {
             text: "Hello".into(),
         };
         let label = |agent: AgentId| if agent == writer { "Ann" } else { "Bob" }.to_owned();
-        assert!(!TranscriptView::Conversation.visible(&source));
-        assert!(TranscriptView::Activity.visible(&source));
-        assert!(TranscriptView::Conversation.visible(&draft));
-        assert!(!TranscriptView::Activity.visible(&draft));
-        let conversation = TranscriptView::Conversation.render(&draft, None, 0, &label);
-        assert_eq!(text_of(&conversation.spans), "Ann · writing…\nHello\n");
-        assert!(conversation.markdown);
-        assert_eq!(conversation.spans[0].class, StyleClass::AgentLabel);
-        assert_eq!(conversation.spans[1].class, StyleClass::Default);
-        let activity = TranscriptView::Activity.render(&source, None, 0, &label);
-        assert!(text_of(&activity.spans).contains("chat.post(2, 'Hello')"));
-        assert!(!text_of(&activity.spans).contains("writing"));
+        assert!(TranscriptView.visible(&source));
+        assert!(TranscriptView.visible(&draft));
+        let drafted = TranscriptView.render(&draft, None, 0, &label);
+        assert_eq!(text_of(&drafted.spans), "Ann · writing…\nHello\n");
+        assert!(drafted.markdown);
+        assert_eq!(drafted.spans[0].class, StyleClass::AgentLabel);
+        assert_eq!(drafted.spans[1].class, StyleClass::Default);
+        let sourced = TranscriptView.render(&source, None, 0, &label);
+        assert!(text_of(&sourced.spans).contains("chat.post(2, 'Hello')"));
+        assert!(!text_of(&sourced.spans).contains("writing"));
     }
 
     #[test]
@@ -1224,12 +978,6 @@ mod tests {
         let mut spans = Vec::new();
         assert_eq!(push_tool_spans(&mut spans, &reported, 10_000), None);
         assert_eq!(text_of(&spans), "$ echo ok reported\n");
-        let sent = UiBlock::MessageSent {
-            to: None,
-            text: "still working".into(),
-        };
-        assert_eq!(block_kind(&sent), BlockKind::Response { working: false });
-        assert!(block_visible(&sent));
     }
 
     #[test]
@@ -1293,62 +1041,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn queued_messages_do_not_open_turns_until_delivered() {
-        let sender = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        for sender in [None, Some(sender)] {
-            assert_eq!(
-                block_kind(&UiBlock::QueuedMessage {
-                    text: "waiting".into(),
-                    sender
-                }),
-                BlockKind::QueuedUser,
-            );
-            let queued = render_block_with_agent_labels(
-                &UiBlock::QueuedMessage {
-                    text: "waiting".into(),
-                    sender,
-                },
-                None,
-                0,
-                &|_| "peer".into(),
-            );
-            assert_eq!(
-                queued.inlay.unwrap().content,
-                InlayContent::Label(" (queued)")
-            );
-            assert!(queued.spans.iter().any(|span| span.text == "waiting"
-                && span.class
-                    == if sender.is_some() {
-                        StyleClass::AgentMessage
-                    } else {
-                        StyleClass::UserMessage
-                    }));
-            let delivered = match sender {
-                Some(sender) => UiBlock::AgentMessage {
-                    sender,
-                    text: "waiting".into(),
-                },
-                None => UiBlock::UserMessage {
-                    text: "waiting".into(),
-                },
-            };
-            assert_eq!(block_kind(&delivered), BlockKind::User);
-            assert!(
-                render_block_with_agent_labels(&delivered, None, 0, &|_| "peer".into())
-                    .inlay
-                    .is_none()
-            );
-        }
-    }
-
     /// Composition is lazy, so visibility is answered from the block
     /// rather than from spans that may never be rendered. The two answers
     /// are the same answer, for every kind of block there is.
     #[test]
     fn block_visibility_agrees_with_rendering() {
-        let sender =
-            AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).expect("an agent");
         let blocks = [
             UiBlock::UserMessage {
                 text: "said".to_owned(),
@@ -1374,21 +1071,13 @@ mod tests {
             UiBlock::Notice {
                 text: String::new(),
             },
-            UiBlock::AgentMessage {
-                sender,
-                text: "from another".to_owned(),
+            UiBlock::Delivered {
+                message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
+                text: "handed".to_owned(),
             },
-            UiBlock::AgentMessage {
-                sender,
+            UiBlock::Delivered {
+                message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
                 text: String::new(),
-            },
-            UiBlock::QueuedMessage {
-                text: "queued".to_owned(),
-                sender: None,
-            },
-            UiBlock::QueuedMessage {
-                text: String::new(),
-                sender: None,
             },
         ];
         for block in blocks {

@@ -8,18 +8,23 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
 ] }
 collections = { path = "../../vendor/zed/crates/collections" }
+futures.workspace = true
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agent-types.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
+rho-chat = { workspace = true, features = ["ui"] }
+rho-frame.workspace = true
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
 settings = { path = "../../vendor/zed/crates/settings" }

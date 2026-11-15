@@ -149,11 +149,13 @@ impl Frame {
                 }
             }
         });
-        let hosts_task = cx.spawn(async move |this, cx| {
+        let hosts_task = cx.spawn_in(window, async move |this, cx| {
             let mut events = host_events;
             while let Some(HostEvent { host, event }) = events.next().await {
                 if this
-                    .update(cx, |this, cx| this.host_event(host, event, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.host_event(host, event, window, cx)
+                    })
                     .is_err()
                 {
                     break;

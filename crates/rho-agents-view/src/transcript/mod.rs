@@ -785,7 +785,6 @@ impl TranscriptModel {
         }
         if index != first_changed
             && (!matches!(incremental, IncrementalUpdate::MessageDraft { .. })
-                || self.view != TranscriptView::Conversation
                 || self.records[first_changed..index]
                     .iter()
                     .any(|record| record.visible))
@@ -929,8 +928,8 @@ impl TranscriptModel {
         self.visible.truncate(first_changed);
         for block in &state.blocks[first_changed..] {
             self.visible.push(self.view.visible(block));
-            for agent in block.agents() {
-                self.agent_labels.insert(agent, agent_label(agent));
+            if let UiBlock::MessageDraft { from, .. } = &**block {
+                self.agent_labels.insert(*from, agent_label(*from));
             }
             self.blocks.push(block.clone());
         }
@@ -2247,18 +2246,16 @@ mod tests {
                 text: "please investigate".into(),
             }),
             call("print('checking')"),
-            Arc::new(UiBlock::MessageSent {
-                to: None,
+            Arc::new(UiBlock::AssistantMessage {
                 text: "I found the cause".into(),
+                phase: None,
             }),
             Arc::new(UiBlock::Notice {
                 text: "connection lost".into(),
             }),
         ];
-        for (view, mask) in [
-            (TranscriptView::Conversation, vec![true, false, true, true]),
-            (TranscriptView::Activity, vec![false, true, false, true]),
-        ] {
+        {
+            let (view, mask) = (TranscriptView, vec![true, true, true, true]);
             let visible: Vec<_> = blocks.iter().map(|block| view.visible(block)).collect();
             assert_eq!(visible, mask);
             let chunks = render_chunks(view, &blocks, &visible, 0..blocks.len(), 0, &|_| {
@@ -2274,18 +2271,9 @@ mod tests {
             );
             let text: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
             assert!(text.contains("connection lost"), "{text}");
-            assert_eq!(
-                text.contains("please investigate"),
-                view == TranscriptView::Conversation
-            );
-            assert_eq!(
-                text.contains("I found the cause"),
-                view == TranscriptView::Conversation
-            );
-            assert_eq!(
-                text.contains("print('checking') reported"),
-                view == TranscriptView::Activity
-            );
+            assert!(text.contains("please investigate"), "{text}");
+            assert!(text.contains("I found the cause"), "{text}");
+            assert!(text.contains("print('checking') reported"), "{text}");
             assert!(
                 !text.contains("not downloaded"),
                 "do not start rendering output bodies"
@@ -2294,31 +2282,19 @@ mod tests {
     }
 
     #[test]
-    fn lazy_history_counts_only_rows_visible_in_its_view() {
-        let message = Arc::new(UiBlock::MessageSent {
-            to: None,
+    fn lazy_history_counts_visible_rows() {
+        let message = Arc::new(UiBlock::AssistantMessage {
             text: "older message".into(),
+            phase: None,
         });
         let source = call(&"print('noise')\n".repeat(100));
         let label = |_| String::new();
+        // The source alone fills the row budget, so the message beyond it
+        // stays uncomposed from either end.
         let blocks = vec![message.clone(), source.clone()];
-        assert_eq!(
-            tail_start(TranscriptView::Conversation, &blocks, 2, 5, 0, &label),
-            0
-        );
-        assert_eq!(
-            tail_start(TranscriptView::Activity, &blocks, 2, 5, 0, &label),
-            1
-        );
+        assert_eq!(tail_start(TranscriptView, &blocks, 2, 5, 0, &label), 1);
         let blocks = vec![source, message];
-        assert_eq!(
-            head_end(TranscriptView::Conversation, &blocks, 0, 2, 5, 0, &label),
-            2
-        );
-        assert_eq!(
-            head_end(TranscriptView::Activity, &blocks, 0, 2, 5, 0, &label),
-            1
-        );
+        assert_eq!(head_end(TranscriptView, &blocks, 0, 2, 5, 0, &label), 1);
     }
 
     #[test]

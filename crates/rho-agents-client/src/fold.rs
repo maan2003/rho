@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use rho_agent_types::{AgentId, Place, UnixMs, WorksetKind, Wpos, props};
+use rho_agent_types::{AgentId, ChatSeq, MessageId, Place, UnixMs, WorksetKind, Wpos, props};
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
@@ -49,6 +49,13 @@ impl AgentIdentity {
     /// none: the prop is Python's to write, and the GUI does not trust it.
     pub fn parent(&self) -> Option<AgentId> {
         AgentId::from_encoded(self.prop(props::PARENT)?).ok()
+    }
+
+    /// The chat message the agent was started from, when policy kept it as
+    /// `origin`: the thread it works in, and the first thing it read.
+    pub fn origin(&self) -> Option<MessageId> {
+        let id = self.prop(props::ORIGIN)?.strip_prefix("chat:")?;
+        Some(MessageId(ChatSeq(id.parse().ok()?)))
     }
 
     /// Whether the user manages the agent: one no other agent made.

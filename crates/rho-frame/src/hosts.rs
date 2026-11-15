@@ -5,7 +5,11 @@
 //! the ledger rides along. What is attached is written down, so the next
 //! start attaches the same hosts.
 
-use rho_agent_hosts::connection::ConnEvent;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use gpui::Window;
+use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostId, HostSpec};
 use rho_window::style::StyleClass;
@@ -102,6 +106,7 @@ impl Frame {
         &mut self,
         host: HostId,
         event: ConnEvent,
+        window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
         let name = self.hosts.host_label(host);
@@ -111,7 +116,7 @@ impl Frame {
             }
             ConnEvent::Many(events) => {
                 for event in events {
-                    self.host_event(host, event, cx);
+                    self.host_event(host, event, window, cx);
                 }
                 return;
             }
@@ -137,14 +142,35 @@ impl Frame {
             ConnEvent::GitTransportApproval {
                 prompt, response, ..
             } => {
-                // The approval prompt is the agents system's to port; until
-                // then the host is told no, and the log says so.
-                self.log(
-                    format!("{name}: git transport asked `{prompt}`; refused"),
-                    StyleClass::SystemImportant,
+                // The host's git transport wants the user's key for a push
+                // or a fetch: the user says yes in the minibuffer, and
+                // anything else, including escape, is no.
+                let response = Rc::new(RefCell::new(Some(response)));
+                let answer = |decision: GitApprovalDecision| {
+                    let response = response.clone();
+                    move || {
+                        if let Some(response) = response.borrow_mut().take() {
+                            let _ = response.send(decision);
+                        }
+                    }
+                };
+                let allow = answer(GitApprovalDecision::Allow);
+                let deny = answer(GitApprovalDecision::Deny);
+                let deny_on_cancel = answer(GitApprovalDecision::Deny);
+                self.open_prompt_cancellable(
+                    format!("{name}: git asks `{prompt}` · allow? (y/n):"),
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(move |_, input, _, _| {
+                        if input.trim().eq_ignore_ascii_case("y") {
+                            allow()
+                        } else {
+                            deny()
+                        }
+                    }),
+                    Some(Rc::new(move |_, _, _| deny_on_cancel())),
+                    window,
                     cx,
                 );
-                let _ = response.send(rho_agent_hosts::connection::GitApprovalDecision::Deny);
             }
             ConnEvent::GitTransportDone { .. } => {}
         }

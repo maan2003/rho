@@ -207,7 +207,28 @@ impl ThreadView {
         if at_end {
             self.cursor_to_end(cx);
         }
+        // A draft the system sent on the user's behalf (`send and start`)
+        // leaves the composer: its words are in the thread now.
+        let draft_gone = self
+            .system
+            .read(cx)
+            .draft(self.thread.machine_seed, Some(self.thread.message))
+            .is_empty();
+        if draft_gone && !self.composer.read(cx).text(cx).is_empty() {
+            self.clear_composer(cx);
+        }
         cx.notify();
+    }
+
+    /// Empties the composer without a window: the edit goes to its buffer.
+    fn clear_composer(&self, cx: &mut Context<Self>) {
+        let Some(buffer) = self.composer.read(cx).buffer().read(cx).as_singleton() else {
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, "")], None, cx);
+        });
     }
 
     fn cursor_row(&self, cx: &App) -> u32 {
@@ -451,29 +472,21 @@ impl Surface for ThreadView {
         })
     }
 
-    /// The thread itself, unless the cursor is on a message with replies:
-    /// then the thread under that message, which is what the eye is on.
+    /// The message under the point, as the thread it anchors: any message
+    /// is what an agent starts from or a name goes on. The thread itself
+    /// from its head, the composer, or nothing in particular.
     fn subject(&self, cx: &App) -> Subject {
         if self.focused == Focused::Composer {
             return Subject::Own;
         }
         match self.transcript.line_meta(self.cursor_row(cx), cx) {
-            Some(Meta::Message(id)) => {
-                let system = self.system.read(cx);
-                let has_replies = system
-                    .chat(self.thread.machine_seed)
-                    .is_some_and(|chat| !chat.children(Some(*id)).is_empty());
-                match has_replies {
-                    true => Subject::Address(
-                        ThreadId {
-                            machine_seed: self.thread.machine_seed,
-                            message: *id,
-                        }
-                        .address(),
-                    ),
-                    false => Subject::Own,
+            Some(Meta::Message(id)) if *id != self.thread.message => Subject::Address(
+                ThreadId {
+                    machine_seed: self.thread.machine_seed,
+                    message: *id,
                 }
-            }
+                .address(),
+            ),
             _ => Subject::Own,
         }
     }

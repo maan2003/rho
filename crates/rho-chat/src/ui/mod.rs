@@ -72,6 +72,10 @@ struct Slot {
     machine_seed: Option<u64>,
 }
 
+/// Whether an agent of the host with this database seed still exists;
+/// the agents system answers, the chat only asks.
+pub type Alive = Rc<dyn Fn(u64, AgentId, &App) -> bool>;
+
 pub struct ChatSystem {
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
@@ -83,7 +87,7 @@ pub struct ChatSystem {
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host; the agents system knows.
-    alive: Rc<dyn Fn(u64, AgentId) -> bool>,
+    alive: Alive,
     _pump: Task<()>,
 }
 
@@ -126,14 +130,14 @@ impl ChatSystem {
             chats,
             events,
             frame,
-            alive: Rc::new(|_, _| true),
+            alive: Rc::new(|_, _, _| true),
             _pump: pump,
         }
     }
 
     /// Tells the chat which agents still exist, for the cards: a thread
     /// whose agents are all gone raises none.
-    pub fn set_alive(&mut self, alive: Rc<dyn Fn(u64, AgentId) -> bool>) {
+    pub fn set_alive(&mut self, alive: Alive) {
         self.alive = alive;
     }
 
@@ -253,6 +257,22 @@ impl ChatSystem {
         id
     }
 
+    /// Posts what the user has written under `parent` and clears the
+    /// draft; the composer follows. `None` when nothing is written.
+    pub fn send_draft(
+        &mut self,
+        machine_seed: u64,
+        parent: Option<MessageId>,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let text = self.draft(machine_seed, parent).trim().to_owned();
+        if text.is_empty() {
+            return None;
+        }
+        self.set_draft(machine_seed, parent, String::new());
+        Some(self.post(machine_seed, parent, text, Vec::new(), cx))
+    }
+
     fn link_for(&self, machine_seed: u64) -> Option<Link> {
         self.hosts
             .values()
@@ -323,7 +343,7 @@ impl ChatSystem {
         .detach();
     }
 
-    fn thread_of(&self, address: &Address) -> Option<ThreadId> {
+    pub fn thread_of(&self, address: &Address) -> Option<ThreadId> {
         (address.kind() == ThreadId::KIND)
             .then(|| ThreadId::parse(address.rest()))
             .flatten()
@@ -357,11 +377,12 @@ impl ChatSystem {
     fn with_host<R>(
         &self,
         machine_seed: u64,
+        cx: &App,
         read: impl FnOnce(&cards::Host<'_>) -> R,
     ) -> Option<R> {
         let chat = self.chats.get(&machine_seed)?;
         let name = self.host_name(machine_seed);
-        let alive = |agent: AgentId| (self.alive)(machine_seed, agent);
+        let alive = |agent: AgentId| (self.alive)(machine_seed, agent, cx);
         let host = cards::Host {
             machine_seed,
             chat,
@@ -541,14 +562,14 @@ impl System for ChatSystem {
         marks: &Marks,
         now: Timestamp,
         mut trace: Option<&mut Trace>,
-        _cx: &App,
+        cx: &App,
     ) -> Vec<Claim> {
         let mut claims = Vec::new();
         let mut seeds: Vec<u64> = self.chats.keys().copied().collect();
         seeds.sort_unstable();
         for seed in seeds {
             claims.extend(
-                self.with_host(seed, |host| {
+                self.with_host(seed, cx, |host| {
                     cards::claims(host, marks, now, trace.as_deref_mut())
                 })
                 .unwrap_or_default(),
@@ -557,9 +578,9 @@ impl System for ChatSystem {
         claims
     }
 
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
         let thread = self.thread_of(address)?;
-        self.with_host(thread.machine_seed, |host| {
+        self.with_host(thread.machine_seed, cx, |host| {
             cards::name(host, thread.message)
         })?
     }

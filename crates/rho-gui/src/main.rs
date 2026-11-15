@@ -142,6 +142,10 @@ fn run() -> Result<()> {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
     rho_agent_hosts::fido::init(db.clone());
+    if let Err(error) = rho_agents_client::cache::init(db.clone()) {
+        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the agent host");
+    }
+    rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
     let link = args.link.clone();
 
@@ -189,8 +193,21 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let chat = cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame, cx));
-                let systems = vec![AnySystem::new(chat)];
+                let chat =
+                    cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
+                let agents =
+                    cx.new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame, cx));
+                // The chat ranks a thread by the agents still in it; the
+                // agents system knows which still exist.
+                let alive = agents.downgrade();
+                chat.update(cx, |chat, _| {
+                    chat.set_alive(Rc::new(move |seed, agent, cx| {
+                        alive
+                            .upgrade()
+                            .is_none_or(|agents| agents.read(cx).alive(seed, agent))
+                    }))
+                });
+                let systems = vec![AnySystem::new(chat), AnySystem::new(agents)];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {
                     Frame::new(

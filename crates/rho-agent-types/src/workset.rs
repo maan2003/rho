@@ -60,6 +60,8 @@ pub mod props {
     pub const TITLE: &str = "title";
     /// The encoded id of the agent this one answers to.
     pub const PARENT: &str = "parent";
+    /// The chat message the agent was started from, as `chat:<seq>`.
+    pub const ORIGIN: &str = "origin";
     /// The directory a label shows.
     pub const CWD: &str = "cwd";
 }
