@@ -141,7 +141,9 @@ mod tests {
                 client_id: 7,
                 parent: None,
                 mentions: vec![agent],
-                content: vec![ContentPart::Text { text: "root".into() }],
+                content: vec![ContentPart::Text {
+                    text: "root".into(),
+                }],
             }
             .into(),
         ));

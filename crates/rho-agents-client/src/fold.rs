@@ -1,17 +1,15 @@
-//! The fold: what a client makes of the directory, chat messages, and the
-//! workset rows it reads.
+//! The fold: what a client makes of the directory and the workset rows it
+//! reads.
 //!
-//! The host sends facts: the chat log, the directory's whole entries, and a
-//! workset's rows when a transcript is open. Everything a rail or a
-//! transcript shows is folded from them here, on the client, so the wire
-//! carries facts and never conclusions.
+//! The host sends facts: the directory's whole entries, and a workset's
+//! rows when a transcript is open. Everything a rail or a transcript shows
+//! is folded from them here, on the client, so the wire carries facts and
+//! never conclusions. Chat is not here: a row names the message an input
+//! handed over, and the chat store says what it is.
 
-use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use rho_agent_types::{
-    Address, AgentId, Message, MessageId, Place, UnixMs, WorksetKind, Wpos, props,
-};
+use rho_agent_types::{AgentId, Place, UnixMs, WorksetKind, Wpos, props};
 
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
@@ -20,7 +18,7 @@ use crate::protocol::worksets::{AgentEntry, LogEvent};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// What an agent is: its directory entry and the kind of workset it is
-/// in. Never what has happened to it; that is the [`Digest`].
+/// in. Never what has happened to it.
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct AgentIdentity {
     pub entry: AgentEntry,
@@ -96,7 +94,7 @@ impl AgentIdentity {
 
 impl AgentIdentity {
     /// An agent of an isolated workset with these props, on the default
-    /// runtime: what a test that folds messages into an agent starts from.
+    /// runtime: what a test of the directory starts from.
     pub fn for_test(agent: AgentId, props: rho_agent_types::Props, created_at: UnixMs) -> Self {
         Self {
             entry: AgentEntry {
@@ -119,47 +117,17 @@ impl AgentIdentity {
 /// prefix reads it.
 pub const PRESET: &str = "preset";
 
-/// What the rails read of an agent, folded from the messages it posted or
-/// received. Only messages count: whether it is running does not.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Digest {
-    pub last_active: UnixMs,
-    pub last_user_message_at: UnixMs,
-    pub last_user_message_text: String,
-}
-
-impl Digest {
-    /// Folds one message the agent posted or received. The chat fold hands
-    /// each message over once ([`crate::chat::HostChat::tell`]).
-    pub fn tell(&mut self, message: &Message) {
-        self.last_active = self.last_active.max(message.at);
-        if message.from == Address::User {
-            self.last_user_message_at = message.at;
-            self.last_user_message_text = one_line(&text(message));
-        }
-    }
-}
-
-fn text(message: &Message) -> String {
-    rho_agent_types::transcript::text_content(&message.content)
-}
-
 /// One agent as the client holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MirroredAgent {
     pub host: HostId,
     pub identity: AgentIdentity,
-    pub digest: Digest,
 }
 
 impl MirroredAgent {
-    /// An agent the directory named, before any of its messages.
+    /// An agent the directory named.
     pub fn new(host: HostId, identity: AgentIdentity) -> Self {
-        Self {
-            host,
-            identity,
-            digest: Digest::default(),
-        }
+        Self { host, identity }
     }
 
     pub fn agent_id(&self) -> AgentId {
@@ -172,66 +140,11 @@ impl MirroredAgent {
     }
 }
 
-/// The first line, whitespace folded: the words a person remembers.
-pub fn one_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// One thing a transcript is folded from: a row of the agent's workset log
-/// that is about it, or a message it posted or received.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TranscriptRow {
-    Log(Wpos, LogEvent),
-    Message(Message),
-}
-
-impl TranscriptRow {
-    pub fn at(&self) -> UnixMs {
-        match self {
-            Self::Log(_, event) => event.at(),
-            Self::Message(message) => message.at,
-        }
-    }
-}
-
-/// An agent's workset rows and its messages as one transcript, in time order:
-/// each is in its own order already, and the two meet where their clocks
-/// say. Rows about other agents are left out.
-pub fn interleave(
-    agent: AgentId,
-    rows: impl IntoIterator<Item = (Wpos, LogEvent)>,
-    messages: impl IntoIterator<Item = Message>,
-) -> Vec<TranscriptRow> {
-    let mut rows = rows
-        .into_iter()
-        .filter(|(_, event)| event.agent() == Some(agent))
-        .map(|(pos, event)| TranscriptRow::Log(pos, event))
-        .peekable();
-    let mut messages = messages.into_iter().map(TranscriptRow::Message).peekable();
-    let mut merged = Vec::new();
-    loop {
-        let next = match (rows.peek(), messages.peek()) {
-            (Some(row), Some(message)) if message.at() < row.at() => messages.next(),
-            (Some(_), _) => rows.next(),
-            (None, _) => messages.next(),
-        };
-        match next {
-            Some(row) => merged.push(row),
-            None => return merged,
-        }
-    }
-}
-
 /// The transcript of one agent, oldest first. Nothing here is invented: a
 /// call is its name and its line, a reply is what was said, and an input
 /// waits as queued until a request carries it.
-pub fn transcript(agent: AgentId, rows: &[TranscriptRow]) -> UiAgentState {
+/// Rows about other agents are left out.
+pub fn transcript(agent: AgentId, rows: &[(Wpos, LogEvent)]) -> UiAgentState {
     TranscriptFold::new(agent, rows).state()
 }
 
@@ -242,27 +155,17 @@ pub struct TranscriptFold {
     agent: AgentId,
     /// One past the newest row folded.
     next: Wpos,
-    /// The newest message folded.
-    message_newest: Option<MessageId>,
     /// Shared with every state handed out, so a row costs the blocks it
     /// adds or changes and a state is a list of pointers.
     blocks: Vec<Arc<UiBlock>>,
     /// The row each block came from, so a rewind drops exactly what was
-    /// told after it. `None` for a message, which no rewind takes back.
+    /// told after it. `None` for a delivered message, which no rewind takes
+    /// back.
     told_at: Vec<Option<Wpos>>,
     /// Blocks before this one came before the last request that answered.
     unanswered: usize,
     /// Compactions no request has carried yet; drawn after the blocks.
     queue: Vec<(Wpos, UiBlock)>,
-    /// Messages the agent received that no input has handed it yet; drawn
-    /// last.
-    inbox: Vec<(MessageId, UiBlock)>,
-    /// Messages an input has handed over, so a message heard after its
-    /// input is not shown waiting.
-    handed: BTreeSet<MessageId>,
-    /// Who wrote each message the agent received, for the input that
-    /// hands it over.
-    senders: HashMap<MessageId, Address>,
     /// The agent stopped on an error and nobody has written since.
     errored: bool,
     /// What the last reply said the context holds, and where it said it.
@@ -288,26 +191,22 @@ pub struct FoldDelta {
 }
 
 impl TranscriptFold {
-    pub fn new(agent: AgentId, rows: &[TranscriptRow]) -> Self {
+    pub fn new(agent: AgentId, rows: &[(Wpos, LogEvent)]) -> Self {
         let mut fold = Self {
             agent,
             next: Wpos::ZERO,
-            message_newest: None,
             blocks: Vec::new(),
             told_at: Vec::new(),
             unanswered: 0,
             queue: Vec::new(),
-            inbox: Vec::new(),
-            handed: BTreeSet::new(),
-            senders: HashMap::new(),
             errored: false,
             context_used: None,
             usage: AgentUsageBucket::default(),
             usage_model: String::new(),
             dirty_from: None,
         };
-        for row in rows {
-            fold.tell(row);
+        for (pos, event) in rows {
+            fold.tell(*pos, event);
         }
         fold
     }
@@ -325,7 +224,7 @@ impl TranscriptFold {
         self.dirty_from = Some(self.dirty_from.map_or(at, |held| held.min(at)));
     }
 
-    /// The end of the queue, where the inbox starts.
+    /// The end of the queue.
     fn queue_end(&self) -> usize {
         self.blocks.len() + self.queue.len()
     }
@@ -333,14 +232,11 @@ impl TranscriptFold {
     fn waiting(&self) -> impl Iterator<Item = Arc<UiBlock>> + '_ {
         self.queue
             .iter()
-            .map(|(_, queued)| queued)
-            .chain(self.inbox.iter().map(|(_, waiting)| waiting))
-            .map(|block| Arc::new(block.clone()))
+            .map(|(_, queued)| Arc::new(queued.clone()))
     }
 
     /// The composed transcript from one index on: the folded blocks, then
-    /// the compactions no request has carried yet, then messages not yet
-    /// handed over.
+    /// the compactions no request has carried yet.
     fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
         if from < self.blocks.len() {
             self.blocks[from..]
@@ -418,55 +314,16 @@ impl TranscriptFold {
         compaction
     }
 
-    /// Folds one row. Rows and messages already held are skipped, as are rows
-    /// about another agent, so a repeated page is harmless; returns
-    /// whether anything was new.
-    pub fn tell(&mut self, row: &TranscriptRow) -> bool {
-        match row {
-            TranscriptRow::Log(pos, event) => {
-                if *pos < self.next || event.agent() != Some(self.agent) {
-                    return false;
-                }
-                self.next = pos.next();
-                self.tell_row(*pos, event);
-            }
-            TranscriptRow::Message(message) => {
-                if self.message_newest >= Some(message.id) {
-                    return false;
-                }
-                self.message_newest = Some(message.id);
-                self.tell_message(message);
-            }
+    /// Folds one row. Rows already held are skipped, as are rows about
+    /// another agent, so a repeated page is harmless; returns whether
+    /// anything was new.
+    pub fn tell(&mut self, pos: Wpos, event: &LogEvent) -> bool {
+        if pos < self.next || event.agent() != Some(self.agent) {
+            return false;
         }
+        self.next = pos.next();
+        self.tell_row(pos, event);
         true
-    }
-
-    /// A message the agent posted, or one it received: the model hands a
-    /// transcript only those.
-    fn tell_message(&mut self, message: &Message) {
-        if message.from == Address::Agent(self.agent) {
-            self.push(
-                None,
-                UiBlock::MessageSent {
-                    to: None,
-                    text: text(message),
-                },
-            );
-            return;
-        }
-        self.senders.insert(message.id, message.from);
-        if self.handed.contains(&message.id) {
-            return;
-        }
-        self.errored = false;
-        self.touch(self.queue_end() + self.inbox.len());
-        self.inbox.push((
-            message.id,
-            UiBlock::QueuedMessage {
-                text: text(message),
-                sender: sender(message.from),
-            },
-        ));
     }
 
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
@@ -491,30 +348,24 @@ impl TranscriptFold {
                     self.errored = false;
                 }
                 for input in inputs {
-                    let block = match input.message {
-                        Some(id) => {
-                            self.handed.insert(id);
-                            // The message as its sender wrote it; the row's
-                            // text is what the policy made of it for the model.
-                            match self.inbox.iter().position(|(waiting, _)| *waiting == id) {
-                                Some(index) => {
-                                    self.touch(self.queue_end() + index);
-                                    self.inbox.remove(index).1
-                                }
-                                None => UiBlock::QueuedMessage {
-                                    text: input.text.clone(),
-                                    sender: self.senders.get(&id).copied().and_then(sender),
-                                },
-                            }
-                        }
+                    match input.message {
+                        // A message is still a message: a rewind of the
+                        // turn it started does not unsay what was written.
+                        Some(message) => self.push(
+                            None,
+                            UiBlock::Delivered {
+                                message,
+                                text: input.text.clone(),
+                            },
+                        ),
                         // No message: what the policy has to tell the agent.
-                        None => UiBlock::Notice {
-                            text: input.text.clone(),
-                        },
-                    };
-                    // A message is still a message: a rewind of the turn it
-                    // started does not unsay what was written.
-                    self.push(input.message.is_none().then_some(pos), delivered(block));
+                        None => self.push(
+                            Some(pos),
+                            UiBlock::Notice {
+                                text: input.text.clone(),
+                            },
+                        ),
+                    }
                 }
                 let requested = self.deliver_queue(pos);
                 // A requested compaction already shows as its request.
@@ -628,7 +479,8 @@ impl TranscriptFold {
                 }
             }
             // A rewind is told rather than unwritten, so the reader is the
-            // one that hides what it undid. Messages stay: they were sent.
+            // one that hides what it undid. Delivered messages stay: they
+            // were sent.
             LogEvent::Rewound { to, .. } => {
                 self.touch(0);
                 self.unanswered = 0;
@@ -677,27 +529,10 @@ impl TranscriptFold {
     }
 }
 
-fn sender(from: Address) -> Option<AgentId> {
-    match from {
-        Address::User => None,
-        Address::Agent(agent) => Some(agent),
-    }
-}
-
-fn delivered(queued: UiBlock) -> UiBlock {
-    match queued {
-        UiBlock::QueuedMessage {
-            text,
-            sender: Some(sender),
-            ..
-        } => UiBlock::AgentMessage { sender, text },
-        UiBlock::QueuedMessage { text, .. } => UiBlock::UserMessage { text },
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::MessageId;
+
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
     use crate::protocol::worksets::InputView;
@@ -720,7 +555,7 @@ mod tests {
             &events
                 .into_iter()
                 .enumerate()
-                .map(|(pos, event)| TranscriptRow::Log(Wpos(pos as u64), event))
+                .map(|(pos, event)| (Wpos(pos as u64), event))
                 .collect::<Vec<_>>(),
         )
     }
@@ -762,33 +597,6 @@ mod tests {
         }
     }
 
-    fn message(id: u64, from: Address, at: u64) -> Message {
-        Message {
-            id: MessageId(rho_agent_types::ChatSeq(id)),
-            at: UnixMs(at),
-            topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(1)),
-            from,
-            mentions: Vec::new(),
-            content: vec![rho_agent_types::ContentPart::Text {
-                text: format!("message {id}"),
-            }],
-        }
-    }
-
-    fn to_user(id: u64, kind: rho_agent_types::MentionKind, at: u64) -> Message {
-        Message {
-            mentions: vec![rho_agent_types::Mention {
-                to: Address::User,
-                kind,
-            }],
-            ..message(id, Address::Agent(me()), at)
-        }
-    }
-
-    fn from_user(id: u64, at: u64) -> Message {
-        message(id, Address::User, at)
-    }
-
     fn only_tool(state: &UiAgentState) -> &UiTool {
         state
             .blocks
@@ -821,9 +629,9 @@ mod tests {
         let mut fold = TranscriptFold::new(
             me(),
             &[
-                TranscriptRow::Log(Wpos(0), input("question", None, 1)),
-                TranscriptRow::Log(Wpos(1), sent_row(2)),
-                TranscriptRow::Log(Wpos(2), replied(items.clone(), None, Some(73), 19)),
+                (Wpos(0), input("question", None, 1)),
+                (Wpos(1), sent_row(2)),
+                (Wpos(2), replied(items.clone(), None, Some(73), 19)),
             ],
         );
         for (index, item) in items.iter().enumerate() {
@@ -836,14 +644,14 @@ mod tests {
                 (actual, expected) => assert_eq!(actual, &expected),
             }
         }
-        fold.tell(&TranscriptRow::Log(
+        fold.tell(
             Wpos(3),
-            LogEvent::Rewound {
+            &LogEvent::Rewound {
                 agent: me(),
                 to: Wpos(2),
                 at: UnixMs(20),
             },
-        ));
+        );
         assert_eq!(fold.blocks.len(), 1);
     }
 
@@ -854,7 +662,7 @@ mod tests {
         let mut fold = TranscriptFold::new(me(), &[]);
         let mut pos = 0u64;
         let mut tell = |fold: &mut TranscriptFold, event: LogEvent| {
-            fold.tell(&TranscriptRow::Log(Wpos(pos), event));
+            fold.tell(Wpos(pos), &event);
             pos += 1;
         };
         for nth in 0..64 {
@@ -947,7 +755,8 @@ mod tests {
         assert_eq!(state.blocks.len(), 3);
         assert_eq!(
             *state.blocks[0],
-            UiBlock::UserMessage {
+            UiBlock::Delivered {
+                message: MessageId(rho_agent_types::ChatSeq(1)),
                 text: "have a look".to_owned()
             }
         );
@@ -1000,7 +809,7 @@ mod tests {
         let mut pos = 0;
         let mut fold = TranscriptFold::new(me(), &[]);
         let mut tell = |fold: &mut TranscriptFold, event: LogEvent| {
-            fold.tell(&TranscriptRow::Log(Wpos(pos), event));
+            fold.tell(Wpos(pos), &event);
             pos += 1;
         };
         tell(&mut fold, replied(vec![call("admitted")], None, None, 1));
@@ -1049,7 +858,7 @@ mod tests {
             answering,
         ];
         for (pos, event) in rows.into_iter().enumerate() {
-            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+            fold.tell(Wpos(pos as u64), &event);
         }
         let timings = |fold: &TranscriptFold| -> Vec<(String, rho_agent_types::ExecTiming)> {
             fold.state()
@@ -1068,14 +877,14 @@ mod tests {
                 ("two".to_owned(), timing),
             ]
         );
-        fold.tell(&TranscriptRow::Log(
+        fold.tell(
             Wpos(3),
-            LogEvent::Rewound {
+            &LogEvent::Rewound {
                 agent: me(),
                 to: Wpos(1),
                 at: UnixMs(5),
             },
-        ));
+        );
         assert_eq!(timings(&fold), [("one".to_owned(), Default::default())]);
     }
 
@@ -1100,88 +909,19 @@ mod tests {
             replied(vec![call("after")], None, None, 8),
         ];
         for (pos, event) in rows.into_iter().enumerate() {
-            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+            fold.tell(Wpos(pos as u64), &event);
         }
         assert_eq!(tool_statuses(&fold), [Reported, Running]);
-        fold.tell(&TranscriptRow::Log(Wpos(8), request_answering(true, 9)));
+        fold.tell(Wpos(8), &request_answering(true, 9));
         assert_eq!(tool_statuses(&fold), [Reported, Reported]);
     }
 
-    /// An input may be heard before the message it hands over: the message
-    /// then never waits.
-    #[test]
-    fn a_message_heard_after_its_input_does_not_wait() {
-        let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Log(Wpos(0), input("hello", Some(9), 2)));
-        fold.tell(&TranscriptRow::Message(from_user(9, 1)));
-        let state = fold.state();
-        assert_eq!(state.blocks.len(), 1);
-        assert!(
-            !fold.tell(&TranscriptRow::Message(from_user(9, 1))),
-            "a replay"
-        );
-    }
-
-    /// A rewind takes back rows, not messages: what was posted was sent.
-    #[test]
-    fn a_rewind_hides_rows_but_not_messages() {
-        let rows = interleave(
-            me(),
-            [
-                (
-                    Wpos(0),
-                    LogEvent::ClaudeMessage {
-                        agent: me(),
-                        speaker: Speaker::User,
-                        text: "first".into(),
-                        at: UnixMs(1),
-                    },
-                ),
-                (
-                    Wpos(1),
-                    LogEvent::ClaudeMessage {
-                        agent: me(),
-                        speaker: Speaker::Assistant,
-                        text: "second".into(),
-                        at: UnixMs(2),
-                    },
-                ),
-                (
-                    Wpos(2),
-                    LogEvent::Rewound {
-                        agent: me(),
-                        to: Wpos(1),
-                        at: UnixMs(4),
-                    },
-                ),
-            ],
-            [to_user(7, rho_agent_types::MentionKind::Result, 3)],
-        );
-        assert!(
-            matches!(rows[2], TranscriptRow::Message(_)),
-            "merged by time"
-        );
-        let state = transcript(me(), &rows);
-        assert_eq!(
-            state.blocks,
-            vec![
-                Arc::new(UiBlock::UserMessage {
-                    text: "first".to_owned()
-                }),
-                Arc::new(UiBlock::MessageSent {
-                    to: None,
-                    text: "message 7".to_owned()
-                }),
-            ]
-        );
-    }
-
-    /// The user's message an input handed over stays when the turn it
-    /// started is rewound; the input's own notice and the reply go.
+    /// The message an input handed over stays, under the id the chat
+    /// knows it by, when the turn it started is rewound; the policy's
+    /// notice and the reply go.
     #[test]
     fn a_rewind_keeps_the_messages_its_inputs_handed_over() {
         let mut fold = TranscriptFold::new(me(), &[]);
-        fold.tell(&TranscriptRow::Message(from_user(1, 1)));
         let rows = [
             input("Message from the user:\nmessage 1", Some(1), 2),
             sent_row(3),
@@ -1203,12 +943,13 @@ mod tests {
             },
         ];
         for (pos, event) in rows.into_iter().enumerate() {
-            fold.tell(&TranscriptRow::Log(Wpos(pos as u64), event));
+            fold.tell(Wpos(pos as u64), &event);
         }
         assert_eq!(
             fold.state().blocks,
-            vec![Arc::new(UiBlock::UserMessage {
-                text: "message 1".to_owned()
+            vec![Arc::new(UiBlock::Delivered {
+                message: MessageId(rho_agent_types::ChatSeq(1)),
+                text: "Message from the user:\nmessage 1".to_owned()
             })]
         );
     }
@@ -1294,18 +1035,6 @@ mod tests {
                 }),
             ]
         );
-    }
-
-    /// What the user last wrote to the agent is what the rails find it
-    /// by; what the agent posts moves only when it was last active.
-    #[test]
-    fn a_digest_keeps_what_the_user_last_wrote() {
-        let mut digest = Digest::default();
-        digest.tell(&from_user(1, 1));
-        digest.tell(&to_user(2, rho_agent_types::MentionKind::Ask, 5));
-        assert_eq!(digest.last_user_message_text, "message 1");
-        assert_eq!(digest.last_user_message_at, UnixMs(1));
-        assert_eq!(digest.last_active, UnixMs(5));
     }
 
     #[test]

@@ -2,12 +2,10 @@
 //! thread, and [`AgentsClient`], the window's handle on it.
 //!
 //! The main thread draws. Everything between a host's agents session and
-//! what is drawn happens here: the chat log is folded into each host's
-//! topics and each agent's digest,
-//! the directory into what each agent is, the rows of the open
-//! transcripts' agents are read and handed up, and all of it is written
-//! to the copy. A reconnect's catch-up is many pages, and the main thread
-//! hears one message for the whole of it.
+//! what is drawn happens here: the directory is folded into what each
+//! agent is, the rows of the open transcripts' agents are read and handed
+//! up, and all of it is written to the copy. Chat is not here: it has a
+//! session and a store of its own.
 //!
 //! The connection itself stays where it is, on the shared tokio runtime:
 //! the socket was never the cost, and the workspace-file, terminal, shell
@@ -18,11 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_hosts::HostStream;
-use rho_agent_types::{AgentId, ChatRecord, ChatSeq, Message, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{AgentId, WorksetId, WorksetKind, Wpos};
 
 use crate::HostId;
-use crate::chat::{HostChat, Told};
-use crate::fold::{AgentIdentity, Digest, MirroredAgent, TranscriptRow};
+use crate::fold::{AgentIdentity, MirroredAgent};
 use crate::protocol::transcript::{Live, RuntimeState};
 use crate::protocol::worksets::{
     AgentEntry, AgentLogPage, ClientFrame, LogEvent, LogNext, ServerFrame, WorksetEntry,
@@ -31,34 +28,29 @@ use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream, ReadId};
 
 /// What the main thread hears from the model.
 pub enum ModelMsg {
-    /// Every agent and the whole chat this client holds for a host, from
-    /// the disk copy or after the copy started over, and the database the
-    /// host's ids count in. What the main thread had for the host is gone;
-    /// this is what there is instead.
+    /// Every agent this client holds for a host, from the disk copy or
+    /// after the copy started over, and the database the host's ids count
+    /// in. What the main thread had for the host is gone; this is what
+    /// there is instead.
     Loaded {
         machine_seed: u64,
         agents: Vec<MirroredAgent>,
-        chat: HostChat,
     },
-    /// Agents the directory or their messages moved, as they now stand.
-    /// One message per frame once caught up, and one for a whole catch-up.
+    /// Agents the directory moved, as they now stand: one message per
+    /// frame.
     Changed { agents: Vec<MirroredAgent> },
-    /// Streams and topics that moved, as they now stand; caught up as
-    /// `Changed` is.
-    Chat { moved: HostChat },
     /// Agents gone from their host's directory, and their copy with them.
     Deleted { agents: BTreeSet<AgentId> },
-    /// Rows and messages of an agent the main thread follows, for the fold
-    /// behind its transcript, once its workset's log is read: what came
-    /// before is [`ModelMsg::Read`].
+    /// Rows of an agent the main thread follows, for the fold behind its
+    /// transcript, once its workset's log is read: what came before is
+    /// [`ModelMsg::Read`].
     Rows {
         agent_id: AgentId,
-        rows: Vec<TranscriptRow>,
+        rows: Vec<(Wpos, LogEvent)>,
     },
-    /// A followed agent's workset log is read to its end and on disk, with
-    /// its messages. The transcript is the disk copy now, in time order;
-    /// told as rows, the log's past would land after messages newer than
-    /// it.
+    /// A followed agent's workset log is read to its end and on disk. The
+    /// transcript is the disk copy now ([`AgentsClient::read_transcript`]);
+    /// the read's pages are not handed up one by one.
     Read { agent_id: AgentId },
     /// What an agent's runtime is doing, for every agent.
     Runtime {
@@ -144,27 +136,11 @@ struct HostModel {
     /// The stream is open: `Hello` came and nothing has closed it.
     open: bool,
     machine_seed: u64,
-    /// The newest chat event held.
-    chat_held: ChatSeq,
-    /// The newest chat event on the host when the stream opened. Until
-    /// `chat_held` reaches it the main thread hears nothing of the digests
-    /// or the topics: a catch-up is not news, it is arrears.
-    chat_head: ChatSeq,
-    /// The host's chat, folded.
-    chat: HostChat,
-    /// Agents moved since the main thread last heard. Empty except during
-    /// a catch-up.
+    /// Agents moved by the frame being ingested, for the one `Changed`
+    /// it ends with.
     pending: BTreeSet<AgentId>,
-    /// Streams and topics moved since the main thread last heard.
-    pending_chat: HostChat,
-    /// The main thread has heard that the chat caught up since the stream
-    /// opened. It hears so once even when nothing moved: an empty catch-up
-    /// still says the chat it holds is the host's whole chat.
-    chat_told: bool,
     /// The kind of each workset of the directory.
     kinds: BTreeMap<WorksetId, WorksetKind>,
-    /// Messages of agents the directory has not named (yet).
-    strays: BTreeMap<AgentId, Digest>,
     /// The followed agents of this host, and where each stands.
     agents: BTreeMap<AgentId, AgentRows>,
     /// The worksets the host pushes rows of, each from where its follow
@@ -182,14 +158,8 @@ impl HostModel {
             hello_pending: false,
             open: false,
             machine_seed: 0,
-            chat_held: ChatSeq::ZERO,
-            chat_head: ChatSeq::ZERO,
-            chat: HostChat::default(),
             pending: BTreeSet::new(),
-            pending_chat: HostChat::default(),
-            chat_told: false,
             kinds: BTreeMap::new(),
-            strays: BTreeMap::new(),
             agents: BTreeMap::new(),
             worksets: BTreeMap::new(),
             next_read: 0,
@@ -250,7 +220,7 @@ fn read_ended(host: HostId, agent_id: AgentId) -> Vec<ModelEvent> {
 /// The fold of every agent, the cursors, and who is followed.
 pub struct Model {
     hosts: HashMap<HostId, HostModel>,
-    /// The directory, with each agent's digest.
+    /// The directory.
     agents: BTreeMap<AgentId, MirroredAgent>,
     followed: BTreeSet<AgentId>,
     /// The disk copy, read once: hosts are attached one at a time and each
@@ -288,7 +258,7 @@ impl Model {
                 Vec::new()
             }
             ModelCommand::DetachHost(host) => {
-                // The disk copy keeps the host's chat: a host detached is
+                // The disk copy keeps the host's agents: a host detached is
                 // not a host disowned, and the copy is what a later attach
                 // starts from.
                 self.hosts.remove(&host);
@@ -307,21 +277,18 @@ impl Model {
     }
 
     /// A host the workspace attached, with what the last session left of
-    /// it: the cursor `FollowChat` will send, its chat, and the agents
-    /// already folded.
+    /// it: the database its copy counts in, and its agents.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
         let stored = self.stored.get_or_insert_with(|| {
             crate::cache::flush();
             crate::cache::load()
         });
-        let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) else {
+        let Some(held) = stored.hosts.iter().find(|held| held.name == name) else {
             self.hosts.insert(host, slot);
             return Vec::new();
         };
-        slot.machine_seed = cursor.machine_seed;
-        slot.chat_held = cursor.chat;
-        slot.chat_head = cursor.chat;
+        slot.machine_seed = held.machine_seed;
         let mut agents = BTreeMap::new();
         for loaded in &stored.agents {
             if loaded.host != name {
@@ -334,28 +301,6 @@ impl Model {
                 MirroredAgent::new(host, loaded.identity.clone()),
             );
         }
-        // The chat is read back and folded again, a topic at a time, and
-        // the digests with it.
-        for record in crate::cache::read_chat(&name) {
-            if let Told::Topic {
-                message: Some((message, parties)),
-                ..
-            }
-            | Told::Direct {
-                message: Some((message, parties)),
-                ..
-            } = slot.chat.tell(&record)
-            {
-                for agent_id in parties {
-                    let digest = match agents.get_mut(&agent_id) {
-                        Some(agent) => &mut agent.digest,
-                        None => slot.strays.entry(agent_id).or_default(),
-                    };
-                    digest.tell(&message);
-                }
-            }
-        }
-        let chat = slot.chat.clone();
         let machine_seed = slot.machine_seed;
         self.hosts.insert(host, slot);
         self.agents.extend(agents.clone());
@@ -364,7 +309,6 @@ impl Model {
             msg: ModelMsg::Loaded {
                 machine_seed,
                 agents: agents.into_values().collect(),
-                chat,
             },
         }]
     }
@@ -379,10 +323,9 @@ impl Model {
             AgentFrame::Server(frame) => match frame {
                 ServerFrame::Hello {
                     machine_seed,
-                    chat_head,
                     agent_counter,
                 } => {
-                    let mut out = self.hello(host, machine_seed, chat_head);
+                    let mut out = self.hello(host, machine_seed);
                     out.push(ModelEvent {
                         host,
                         msg: ModelMsg::Host {
@@ -405,7 +348,6 @@ impl Model {
                     out.extend(self.announce(host));
                     out
                 }
-                ServerFrame::Chat { records } => self.chat(host, records),
                 // Rows are told by agent: the workset is only how they came.
                 ServerFrame::Rows { workset: _, rows } => self.rows(host, rows),
                 ServerFrame::Live { agent_id, live } => {
@@ -486,25 +428,18 @@ impl Model {
         read_ended(host, agent)
     }
 
-    /// An agents stream that has opened: how far the host's chat runs, and
-    /// whether it is the database this copy counts in. Asks for the rest.
-    fn hello(&mut self, host: HostId, machine_seed: u64, chat_head: ChatSeq) -> Vec<ModelEvent> {
+    /// An agents stream that has opened, and whether it is the database
+    /// this copy counts in. Asks for the followed agents' rows.
+    fn hello(&mut self, host: HostId, machine_seed: u64) -> Vec<ModelEvent> {
         let slot = self.hosts.get_mut(&host).expect("the host is here");
-        slot.chat_head = chat_head;
         slot.open = true;
-        slot.chat_told = false;
-        // A host whose database is not the one this client copied, or
-        // whose chat log is shorter than the copy: the copy starts over.
-        let started_over = slot.machine_seed != machine_seed || slot.chat_held > chat_head;
+        // A host whose database is not the one this client copied: the
+        // copy starts over.
+        let started_over = slot.machine_seed != machine_seed;
         let mut out = Vec::new();
         if started_over {
             slot.machine_seed = machine_seed;
-            slot.chat_held = ChatSeq::ZERO;
-            slot.chat = HostChat::default();
-            slot.pending.clear();
-            slot.pending_chat = HostChat::default();
             slot.kinds.clear();
-            slot.strays.clear();
             crate::cache::reset_host(&slot.name);
             // The reads below start from what the copy holds: nothing, once
             // the reset is written.
@@ -515,7 +450,6 @@ impl Model {
                 msg: ModelMsg::Loaded {
                     machine_seed,
                     agents: Vec::new(),
-                    chat: HostChat::default(),
                 },
             });
         }
@@ -523,10 +457,8 @@ impl Model {
         crate::cache::write_host(&slot.name, machine_seed);
         tracing::debug!(
             host = slot.name,
-            since = slot.chat_held.0,
-            head = chat_head.0,
             started_over,
-            "following the host's chat"
+            "the host's agents stream opened"
         );
         if slot.commands.is_some() {
             self.follow(host);
@@ -536,16 +468,11 @@ impl Model {
         out
     }
 
-    /// Everything a new stream is told: the chat since the cursor, and the
-    /// followed agents read again from where the copy stands. The new
-    /// stream follows no workset until a read ends.
+    /// Everything a new stream is told: the followed agents read again from
+    /// where the copy stands. The new stream follows no workset until a
+    /// read ends.
     fn follow(&mut self, host: HostId) {
         let slot = self.hosts.get_mut(&host).expect("the host is here");
-        if let Some(commands) = &slot.commands {
-            commands.send(ClientFrame::FollowChat {
-                since: slot.chat_held,
-            });
-        }
         slot.worksets.clear();
         let agents = slot.agents.keys().copied().collect::<Vec<_>>();
         for agent in agents {
@@ -655,7 +582,6 @@ impl Model {
             self.agents.remove(agent_id);
             self.followed.remove(agent_id);
             slot.pending.remove(agent_id);
-            slot.strays.remove(agent_id);
         }
         crate::cache::forget_agents(departed.iter().copied().collect());
         // A later attach must not reuse the startup copy of a departed
@@ -683,15 +609,8 @@ impl Model {
             Some(held) if held.identity == identity => return Vec::new(),
             Some(held) => held.identity = identity,
             None => {
-                let digest = slot.strays.remove(&agent_id).unwrap_or_default();
-                self.agents.insert(
-                    agent_id,
-                    MirroredAgent {
-                        host,
-                        identity,
-                        digest,
-                    },
-                );
+                self.agents
+                    .insert(agent_id, MirroredAgent::new(host, identity));
             }
         }
         self.store(&[agent_id]);
@@ -718,101 +637,6 @@ impl Model {
                 })
                 .collect(),
         );
-    }
-
-    /// A run of the host's chat log: folded into its topics and into the
-    /// digests of the agents each message is from or reaches, handed to the
-    /// transcripts that follow them, and written.
-    fn chat(&mut self, host: HostId, records: Vec<ChatRecord>) -> Vec<ModelEvent> {
-        let Some(through) = records.iter().map(|record| record.seq).max() else {
-            return Vec::new();
-        };
-        let slot = self.hosts.get_mut(&host).expect("the host is here");
-        let mut rows: BTreeMap<AgentId, Vec<TranscriptRow>> = BTreeMap::new();
-        let mut delivered: Vec<(AgentId, Message)> = Vec::new();
-        let mut moved = false;
-        for record in &records {
-            match slot.chat.tell(record) {
-                Told::Nothing => {}
-                Told::Stream(stream) => {
-                    slot.pending_chat
-                        .streams
-                        .insert(stream, slot.chat.streams[&stream].clone());
-                }
-                Told::Topic { topic, message } => {
-                    slot.pending_chat
-                        .topics
-                        .insert(topic, slot.chat.topics[&topic].clone());
-                    let Some((message, parties)) = message else {
-                        continue;
-                    };
-                    for agent_id in parties {
-                        delivered.push((agent_id, message.clone()));
-                    }
-                }
-                Told::Direct { direct, message } => {
-                    slot.pending_chat
-                        .directs
-                        .insert(direct, slot.chat.directs[&direct].clone());
-                    let Some((message, parties)) = message else {
-                        continue;
-                    };
-                    for agent_id in parties {
-                        delivered.push((agent_id, message.clone()));
-                    }
-                }
-                Told::Moved { topics, .. } => {
-                    moved = true;
-                    for topic in topics {
-                        slot.pending_chat
-                            .topics
-                            .insert(topic, slot.chat.topics[&topic].clone());
-                    }
-                }
-            }
-        }
-        for (agent_id, message) in &delivered {
-            let named = self.agents.contains_key(agent_id);
-            match self.agents.get_mut(agent_id) {
-                Some(agent) => agent.digest.tell(message),
-                None => slot.strays.entry(*agent_id).or_default().tell(message),
-            }
-            if named {
-                slot.pending.insert(*agent_id);
-            }
-            // An agent whose log is being read hears its messages with the
-            // read's end.
-            let read_pending = matches!(slot.agents.get(agent_id), Some(AgentRows::Reading { .. }));
-            if self.followed.contains(agent_id) && !read_pending {
-                rows.entry(*agent_id)
-                    .or_default()
-                    .push(TranscriptRow::Message(message.clone()));
-            }
-        }
-        slot.chat_held = slot.chat_held.max(through);
-        crate::cache::write_chat(
-            &slot.name,
-            slot.chat_held,
-            records,
-            delivered
-                .iter()
-                .map(|(agent_id, message)| (*agent_id, message.id))
-                .collect(),
-        );
-        // The workspace reads a moved topic back from the copy: the move
-        // is there before it hears of it.
-        if moved {
-            crate::cache::flush();
-        }
-        let mut out = rows
-            .into_iter()
-            .map(|(agent_id, rows)| ModelEvent {
-                host,
-                msg: ModelMsg::Rows { agent_id, rows },
-            })
-            .collect::<Vec<_>>();
-        out.extend(self.announce(host));
-        out
     }
 
     /// Rows a followed workset's follow pushed: those of the followed
@@ -842,45 +666,26 @@ impl Model {
                 crate::cache::write_rows(agent_id, rows.clone());
                 ModelEvent {
                     host,
-                    msg: ModelMsg::Rows {
-                        agent_id,
-                        rows: rows
-                            .into_iter()
-                            .map(|(pos, event)| TranscriptRow::Log(pos, event))
-                            .collect(),
-                    },
+                    msg: ModelMsg::Rows { agent_id, rows },
                 }
             })
             .collect()
     }
 
-    /// The agents and topics moved, once the host's chat has caught up
-    /// with its head.
+    /// The agents the frame moved, in one message.
     fn announce(&mut self, host: HostId) -> Vec<ModelEvent> {
         let slot = self.hosts.get_mut(&host).expect("the host is here");
-        if slot.chat_held < slot.chat_head {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        let moved = std::mem::take(&mut slot.pending_chat);
-        if moved != HostChat::default() || !slot.chat_told {
-            slot.chat_told = true;
-            out.push(ModelEvent {
-                host,
-                msg: ModelMsg::Chat { moved },
-            });
-        }
         let agents = std::mem::take(&mut slot.pending)
             .into_iter()
             .filter_map(|agent_id| self.agents.get(&agent_id).cloned())
             .collect::<Vec<_>>();
-        if !agents.is_empty() {
-            out.push(ModelEvent {
-                host,
-                msg: ModelMsg::Changed { agents },
-            });
+        if agents.is_empty() {
+            return Vec::new();
         }
-        out
+        vec![ModelEvent {
+            host,
+            msg: ModelMsg::Changed { agents },
+        }]
     }
 }
 
@@ -961,24 +766,12 @@ impl AgentsClient {
         self.command(ModelCommand::Follow(agents));
     }
 
-    /// The messages the disk copy holds of a topic of the host named,
+    /// Everything the disk copy holds of an agent's transcript: its rows,
     /// oldest first. The copy may trail what was just heard by a queued
     /// write; this waits for it.
-    pub fn read_topic(&self, host: &str, topic: rho_agent_types::TopicId) -> Vec<Message> {
+    pub fn read_transcript(&self, agent_id: AgentId) -> Vec<(Wpos, LogEvent)> {
         crate::cache::flush();
-        crate::cache::read_topic(host, topic)
-    }
-
-    /// Everything the disk copy holds of an agent's transcript: its rows
-    /// and the messages it posted or received, in time order. The copy may
-    /// trail what was just heard by a queued write; this waits for it.
-    pub fn read_transcript(&self, agent_id: AgentId) -> Vec<TranscriptRow> {
-        crate::cache::flush();
-        crate::fold::interleave(
-            agent_id,
-            crate::cache::read_rows(agent_id),
-            crate::cache::read_agent_messages(agent_id),
-        )
+        crate::cache::read_rows(agent_id)
     }
 
     fn command(&self, command: ModelCommand) {
@@ -1008,9 +801,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{
-        Address, ChatEvent, ContentPart, Mention, MentionKind, StreamId, TopicId, UnixMs,
-    };
+    use rho_agent_types::UnixMs;
 
     use super::*;
     use crate::protocol::transcript::RuntimeKind;
@@ -1041,10 +832,9 @@ mod tests {
         }
     }
 
-    fn hello(chat_head: u64) -> AgentFrame {
+    fn hello() -> AgentFrame {
         ServerFrame::Hello {
             machine_seed: 7,
-            chat_head: ChatSeq(chat_head),
             agent_counter: 3,
         }
         .into()
@@ -1066,86 +856,6 @@ mod tests {
                 .collect(),
         }
         .into()
-    }
-
-    fn record(seq: u64, event: ChatEvent) -> ChatRecord {
-        ChatRecord {
-            seq: ChatSeq(seq),
-            at: UnixMs(seq),
-            event,
-        }
-    }
-
-    /// The stream at 1, a topic at 2, and `member` joining it at 3.
-    fn topic_with(member: AgentId) -> Vec<ChatRecord> {
-        vec![
-            record(1, ChatEvent::StreamCreated { name: "rho".into() }),
-            record(
-                2,
-                ChatEvent::TopicStarted {
-                    stream: StreamId(ChatSeq(1)),
-                    name: "the topic".into(),
-                    by: Address::User,
-                },
-            ),
-            record(
-                3,
-                ChatEvent::Joined {
-                    topic: TOPIC,
-                    agent: member,
-                },
-            ),
-        ]
-    }
-
-    const TOPIC: TopicId = TopicId(ChatSeq(2));
-
-    fn posted(seq: u64, from: Address, mentions: Vec<Mention>) -> ChatRecord {
-        record(
-            seq,
-            ChatEvent::Posted {
-                topic: TOPIC,
-                from,
-                mentions,
-                content: vec![ContentPart::Text {
-                    text: format!("message {seq}"),
-                }],
-            },
-        )
-    }
-
-    fn asks(seq: u64, agent_id: AgentId) -> ChatRecord {
-        posted(
-            seq,
-            Address::Agent(agent_id),
-            vec![Mention {
-                to: Address::User,
-                kind: MentionKind::Ask,
-            }],
-        )
-    }
-
-    fn chat(records: Vec<ChatRecord>) -> AgentFrame {
-        ServerFrame::Chat { records }.into()
-    }
-
-    /// The kinds of the topic's mentions of the user, oldest first.
-    fn mentions(model: &Model) -> Vec<MentionKind> {
-        model.hosts[&HOST].chat.topics[&TOPIC]
-            .mentions
-            .iter()
-            .map(|mention| mention.kind)
-            .collect()
-    }
-
-    fn topics_moved(events: &[ModelEvent]) -> Vec<TopicId> {
-        events
-            .iter()
-            .flat_map(|event| match &event.msg {
-                ModelMsg::Chat { moved } => moved.topics.keys().copied().collect(),
-                _ => Vec::new(),
-            })
-            .collect()
     }
 
     fn changed(events: &[ModelEvent]) -> Vec<AgentId> {
@@ -1181,81 +891,12 @@ mod tests {
         said
     }
 
-    /// A catch-up that moved nothing still says the chat caught up, once
-    /// a stream: what the client holds is then the host's whole chat.
-    #[test]
-    fn a_catch_up_says_once_that_the_chat_is_whole_even_when_nothing_moved() {
-        let told = |events: &[ModelEvent]| {
-            events
-                .iter()
-                .filter(|event| matches!(event.msg, ModelMsg::Chat { .. }))
-                .count()
-        };
-        let mut model = model();
-        model.ingest(HOST, hello(3));
-        model.ingest(HOST, chat(topic_with(agent(1))));
-        // Again, with the copy at the head: nothing moves.
-        model.ingest(HOST, hello(3));
-        let out = model.ingest(HOST, directory(&[(agent(1), workset(1))]));
-        assert_eq!(told(&out), 1, "the directory finds the chat whole");
-        assert_eq!(topics_moved(&out), Vec::<TopicId>::new());
-        let again = model.ingest(HOST, directory(&[(agent(1), workset(1))]));
-        assert_eq!(told(&again), 0, "and says so once");
-    }
-
-    #[test]
-    fn a_catch_up_says_nothing_until_the_chat_reaches_the_head() {
-        let mut model = model();
-        model.ingest(HOST, hello(5));
-        assert!(
-            changed(&model.ingest(
-                HOST,
-                directory(&[(agent(1), workset(1)), (agent(2), workset(2))])
-            ))
-            .is_empty(),
-            "the directory waits for the chat it is read with"
-        );
-        let mut page = topic_with(agent(1));
-        page.push(asks(4, agent(1)));
-        let out = model.ingest(HOST, chat(page));
-        assert!(changed(&out).is_empty() && topics_moved(&out).is_empty());
-        let last = model.ingest(HOST, chat(vec![asks(5, agent(2))]));
-        assert_eq!(
-            changed(&last),
-            vec![agent(1), agent(2)],
-            "the page that reaches the head names every agent the catch-up moved"
-        );
-        assert_eq!(topics_moved(&last), [TOPIC], "and every topic");
-        assert_eq!(mentions(&model), [MentionKind::Ask, MentionKind::Ask]);
-        assert!(
-            !model.hosts[&HOST].chat.topics[&TOPIC].is_member(agent(2)),
-            "posting does not join the topic"
-        );
-    }
-
-    /// Messages heard before the directory names their agent are kept for
-    /// it.
-    #[test]
-    fn messages_before_the_directory_wait_for_their_agent() {
-        let mut model = model();
-        model.ingest(HOST, hello(0));
-        let mut page = topic_with(agent(1));
-        page.push(posted(4, Address::User, Vec::new()));
-        model.ingest(HOST, chat(page));
-        let out = model.ingest(HOST, ServerFrame::Agent(entry(agent(1), workset(1))).into());
-        assert_eq!(changed(&out), [agent(1)]);
-        assert_eq!(
-            model.agents[&agent(1)].digest.last_user_message_text,
-            "message 4"
-        );
-    }
-
     /// The directory is whole: an agent it no longer names is gone, and so
     /// is its workset's, and nothing live of it is heard after.
     #[test]
     fn the_directory_names_every_agent_there_is() {
         let mut model = model();
-        model.ingest(HOST, hello(0));
+        model.ingest(HOST, hello());
         model.ingest(
             HOST,
             directory(&[(agent(1), workset(1)), (agent(2), workset(2))]),
@@ -1308,17 +949,9 @@ mod tests {
     fn handed(out: &[ModelEvent]) -> Vec<(AgentId, Option<Vec<u64>>)> {
         out.iter()
             .filter_map(|event| match &event.msg {
-                ModelMsg::Rows { agent_id, rows } => Some((
-                    *agent_id,
-                    Some(
-                        rows.iter()
-                            .filter_map(|row| match row {
-                                TranscriptRow::Log(pos, _) => Some(pos.0),
-                                TranscriptRow::Message(_) => None,
-                            })
-                            .collect(),
-                    ),
-                )),
+                ModelMsg::Rows { agent_id, rows } => {
+                    Some((*agent_id, Some(rows.iter().map(|(pos, _)| pos.0).collect())))
+                }
                 ModelMsg::Read { agent_id } => Some((*agent_id, None)),
                 _ => None,
             })
@@ -1348,8 +981,7 @@ mod tests {
 
     /// Following an agent reads its own log to the end, then asks the host
     /// to push its workset from where the read ended; the read's end hands
-    /// the transcript, and rows go up after it for the followed agent only,
-    /// with its messages.
+    /// the transcript, and rows go up after it for the followed agent only.
     #[test]
     fn a_followed_agent_is_read_then_followed() {
         let mut model = model();
@@ -1358,14 +990,8 @@ mod tests {
             host: HOST,
             commands,
         });
-        model.ingest(HOST, hello(0));
-        assert_eq!(
-            said(&stream),
-            [
-                "FollowChat { since: ChatSeq(0) }",
-                "FollowWorksets { from: [] }"
-            ]
-        );
+        model.ingest(HOST, hello());
+        assert_eq!(said(&stream), ["FollowWorksets { from: [] }"]);
         model.ingest(
             HOST,
             directory(&[(agent(1), workset(1)), (agent(2), workset(1))]),
@@ -1380,8 +1006,8 @@ mod tests {
             ]
         );
 
-        // The log's past and the messages heard meanwhile go to disk, not
-        // up: told as rows, the past would land after the newer messages.
+        // The log's past goes to disk, not up: the read's end hands it
+        // whole.
         let out = model.ingest(
             HOST,
             page(
@@ -1392,14 +1018,6 @@ mod tests {
             ),
         );
         assert_eq!(handed(&out), []);
-        let mut records = topic_with(agent(1));
-        records.push(asks(4, agent(1)));
-        let out = model.ingest(HOST, chat(records));
-        assert_eq!(
-            handed(&out),
-            [],
-            "a message of an agent being read waits for the read"
-        );
         assert!(said(&stream).is_empty(), "the follow waits for the read");
         let out = model.ingest(
             HOST,
@@ -1435,26 +1053,11 @@ mod tests {
             ]),
         );
         assert_eq!(handed(&out), [(agent(1), Some(vec![8]))]);
-        // Agent 2 is not in the topic: its post reaches agent 1, and
-        // agent 1's own post is its own.
-        let out = model.ingest(HOST, chat(vec![asks(5, agent(2)), asks(6, agent(1))]));
-        let ids = |rows: &[TranscriptRow]| {
-            rows.iter()
-                .map(|row| match row {
-                    TranscriptRow::Message(message) => message.id.0.0,
-                    TranscriptRow::Log(..) => 0,
-                })
-                .collect::<Vec<_>>()
-        };
-        assert!(matches!(&out[0].msg, ModelMsg::Rows { agent_id, rows }
-            if *agent_id == agent(1) && ids(rows) == [5, 6]));
-
         // A new stream reads again, and follows nothing until the read ends.
-        model.ingest(HOST, hello(6));
+        model.ingest(HOST, hello());
         assert_eq!(
             said(&stream),
             [
-                "FollowChat { since: ChatSeq(6) }".to_owned(),
                 format!("ReadLog {} 0 #1", agent(1).encoded()),
                 "FollowWorksets { from: [] }".to_owned(),
             ]
@@ -1482,7 +1085,7 @@ mod tests {
             host: HOST,
             commands,
         });
-        model.ingest(HOST, hello(0));
+        model.ingest(HOST, hello());
         model.ingest(
             HOST,
             directory(&[(agent(1), workset(1)), (agent(2), workset(1))]),
@@ -1550,42 +1153,74 @@ mod tests {
         );
     }
 
-    /// A reconnect that replays events already held moves nothing.
+    /// The directory says every agent it names in one message; saying the
+    /// same again moves nothing, and a workset changing kind moves the
+    /// agents in it.
     #[test]
-    fn a_replayed_page_moves_nothing() {
+    fn the_directory_says_what_moved_once() {
         let mut model = model();
-        model.ingest(HOST, hello(0));
+        model.ingest(HOST, hello());
+        let out = model.ingest(
+            HOST,
+            directory(&[(agent(1), workset(1)), (agent(2), workset(2))]),
+        );
+        assert_eq!(changed(&out), [agent(1), agent(2)]);
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event.msg, ModelMsg::Changed { .. }))
+                .count(),
+            1
+        );
+        let again = model.ingest(
+            HOST,
+            directory(&[(agent(1), workset(1)), (agent(2), workset(2))]),
+        );
+        assert!(changed(&again).is_empty());
+        let out = model.ingest(
+            HOST,
+            ServerFrame::Workset(WorksetEntry {
+                workset: workset(2),
+                kind: WorksetKind::Host {
+                    cwd: "/home".into(),
+                },
+                created_at: UnixMs(1),
+            })
+            .into(),
+        );
+        assert_eq!(changed(&out), [agent(2)]);
+        assert_eq!(
+            model.agents[&agent(2)].identity.place().workset,
+            None,
+            "the agent is in a host workset now"
+        );
+    }
+
+    /// A host on the database the copy counts in keeps it: a reconnect
+    /// is not a start over.
+    #[test]
+    fn the_same_database_keeps_the_copy() {
+        let mut model = model();
+        model.ingest(HOST, hello());
         model.ingest(HOST, directory(&[(agent(1), workset(1))]));
-        let mut page = topic_with(agent(1));
-        page.extend([
-            asks(4, agent(1)),
-            posted(5, Address::User, Vec::new()),
-            posted(
-                6,
-                Address::Agent(agent(1)),
-                vec![Mention {
-                    to: Address::User,
-                    kind: MentionKind::Result,
-                }],
-            ),
-        ]);
-        model.ingest(HOST, chat(page.clone()));
-        let again = model.ingest(HOST, chat(page));
-        assert!(changed(&again).is_empty() && topics_moved(&again).is_empty());
-        assert_eq!(mentions(&model), [MentionKind::Ask, MentionKind::Result]);
+        let out = model.ingest(HOST, hello());
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event.msg, ModelMsg::Loaded { .. })),
+            "nothing is loaded again"
+        );
+        assert!(model.agents.contains_key(&agent(1)));
     }
 
     /// A host on another database starts the copy over.
     #[test]
     fn another_database_starts_over() {
         let mut model = model();
-        model.ingest(HOST, hello(0));
+        model.ingest(HOST, hello());
         model.ingest(HOST, directory(&[(agent(1), workset(1))]));
         let out = model.ingest(
             HOST,
             ServerFrame::Hello {
                 machine_seed: 8,
-                chat_head: ChatSeq(0),
                 agent_counter: 0,
             }
             .into(),

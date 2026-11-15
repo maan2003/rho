@@ -3,8 +3,7 @@
 //! Find is one prompt over every source, so the scoring and the prompt are
 //! not this crate's; what is, is which names an agent answers to. The
 //! reader looks for what they remember, which is rarely the title the
-//! agent ended up with: they remember the label, or the thing they last
-//! asked for. Every one of those names finds it.
+//! agent ended up with: they remember the label too, and either finds it.
 
 use rho_agent_types::AgentId;
 
@@ -23,12 +22,10 @@ pub struct AgentHit {
     /// What to show: the title the tree has for it, or the agent's own
     /// name where the tree has none.
     pub title: String,
-    /// Names the query matches but the row never shows: the agent's label,
-    /// and the last thing the user said to it when that is not the title
-    /// already.
+    /// Names the query matches but the row never shows: the agent's label.
     pub aka: Vec<String>,
-    /// Unix milliseconds of the last use, for ranking equal matches. Zero
-    /// where nothing records a use.
+    /// Unix milliseconds of the last use, for ranking equal matches: when
+    /// it was made or last touched. Zero where nothing records a use.
     pub recency: i64,
 }
 
@@ -36,16 +33,10 @@ pub struct AgentHit {
 /// tree has no title, and the agent's own name stands in.
 pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> AgentHit {
     let title = title.unwrap_or_else(|| registry.agent_human_name(agent_id));
-    let mut aka = vec![registry.agent_id_label(agent_id)];
-    if let Some(said) = registry.agent_last_user_message(agent_id)
-        && said != title
-    {
-        aka.push(said.to_owned());
-    }
     AgentHit {
         agent_id,
         title,
-        aka,
+        aka: vec![registry.agent_id_label(agent_id)],
         recency: registry
             .agent_last_active(agent_id)
             .map(|active| active.0 as i64)
@@ -56,9 +47,7 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 #[cfg(test)]
 mod tests {
     use rho_agent_hosts::HostId;
-    use rho_agent_types::{
-        Address, AgentIdDomain, ChatSeq, ContentPart, Message, MessageId, TopicId, UnixMs,
-    };
+    use rho_agent_types::{AgentIdDomain, UnixMs, props};
 
     use super::*;
     use crate::{AgentIdentity, MirroredAgent};
@@ -67,67 +56,27 @@ mod tests {
         AgentId::from_counter(1, &AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn message(id: u64, from: Address, text: &str) -> Message {
-        Message {
-            id: MessageId(ChatSeq(id)),
-            at: UnixMs(id),
-            topic: TopicId(ChatSeq(1)),
-            from,
-            mentions: Vec::new(),
-            content: vec![ContentPart::Text { text: text.into() }],
-        }
-    }
-
-    fn said(id: u64, text: &str) -> Message {
-        message(id, Address::User, text)
-    }
-
-    /// The agent as the model thread hands it up: its directory entry, its
-    /// messages folded into its digest.
-    fn told(registry: &mut AgentMap, messages: Vec<Message>) {
+    /// The agent as the model thread hands it up: its directory entry,
+    /// made at 7, with these props.
+    fn told(registry: &mut AgentMap, props: rho_agent_types::Props) {
         let host = HostId::default();
         registry.set_host_data(host, 0, 1);
-        let identity = AgentIdentity::for_test(agent(), Default::default(), UnixMs(1));
-        let mut mirrored = MirroredAgent::new(host, identity);
-        for message in &messages {
-            mirrored.digest.tell(message);
-        }
-        registry.told(vec![mirrored]);
+        let identity = AgentIdentity::for_test(agent(), props, UnixMs(7));
+        registry.told(vec![MirroredAgent::new(host, identity)]);
     }
 
-    /// What the reader remembers is what they last asked for, so that is a
-    /// name the agent answers to even though no row shows it.
+    /// The row shows the tree's title; the label is a name it answers to
+    /// that no row shows, and it ranks by when it was made.
     #[test]
-    fn an_agent_answers_to_what_was_last_said_to_it() {
+    fn an_agent_answers_to_its_label() {
         let mut registry = AgentMap::default();
-        told(
-            &mut registry,
-            vec![
-                said(2, "fix the flaky mirror test"),
-                message(3, Address::Agent(agent()), "fixed"),
-            ],
-        );
-
+        told(&mut registry, Default::default());
         let hit = hit(&registry, agent(), Some("mirror".to_owned()));
         assert_eq!(hit.title, "mirror");
-        assert_eq!(
-            hit.aka,
-            vec![
-                registry.agent_id_label(agent()),
-                "fix the flaky mirror test".to_owned()
-            ],
-            "the label and the last thing said both find it"
-        );
-        assert_eq!(hit.recency, 3);
-    }
-
-    /// The same name twice is not two names.
-    #[test]
-    fn a_title_is_not_repeated_as_an_alias() {
-        let mut registry = AgentMap::default();
-        told(&mut registry, vec![said(2, "mirror test")]);
-        let hit = hit(&registry, agent(), Some("mirror test".to_owned()));
-        assert_eq!(hit.aka, vec![registry.agent_id_label(agent())]);
+        let label = registry.agent_id_label(agent());
+        assert!(label.starts_with("eng-"), "{label}");
+        assert_eq!(hit.aka, vec![label]);
+        assert_eq!(hit.recency, 7);
     }
 
     /// A tree with no title for an agent falls back to the agent's own
@@ -135,8 +84,12 @@ mod tests {
     #[test]
     fn an_untitled_agent_is_shown_by_its_own_name() {
         let mut registry = AgentMap::default();
-        told(&mut registry, vec![said(2, "write the note")]);
-        let hit = hit(&registry, agent(), None);
-        assert_eq!(hit.title, "write the note");
+        told(
+            &mut registry,
+            [(props::NAME.to_owned(), "write the note".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(hit(&registry, agent(), None).title, "write the note");
     }
 }

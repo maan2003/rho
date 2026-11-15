@@ -13885,7 +13885,6 @@ dependencies = [
  "camino",
  "futures",
  "prefix-id",
- "rand 0.10.3",
  "redb",
  "rho-agent-hosts",
  "rho-agent-types",
@@ -13966,10 +13965,20 @@ dependencies = [
 name = "rho-chat"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
+ "futures",
+ "rand 0.10.3",
+ "redb",
+ "rho-agent-hosts",
  "rho-agent-types",
+ "rho-chat",
+ "rho-db",
  "rho-rpc",
  "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

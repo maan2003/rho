@@ -1,13 +1,13 @@
 //! The agents, as the client holds them.
 //!
-//! An agent is its directory entry and the fold of the messages it posted
-//! and received; a host's chat is the fold of its chat log; a transcript is
-//! the fold of an agent's workset rows and its messages, with the host's
-//! live tail on its end. This crate owns every step of that: the host frames
-//! that carry it, the fold on its own thread ([`model`]) and the disk copy
-//! ([`cache`]). What crosses out is agents as they now stand; nothing above
-//! needs to know there is a fold underneath. Nothing here draws: the
-//! screens are `rho-agents-view`'s.
+//! An agent is its directory entry; a transcript is the fold of an agent's
+//! workset rows, with the host's live tail on its end. This crate owns
+//! every step of that: the host frames that carry it, the fold on its own
+//! thread ([`model`]) and the disk copy ([`cache`]). What crosses out is
+//! agents as they now stand; nothing above needs to know there is a fold
+//! underneath. Chat is not here: it is `rho-chat`'s, and a transcript names
+//! the messages it was handed by id. Nothing here draws: the screens are
+//! `rho-agents-view`'s.
 //!
 //! [`protocol`] is what a client and a host say about agents; the host uses
 //! it alone, without the `client` feature.
@@ -17,20 +17,15 @@ pub mod protocol;
 #[cfg(feature = "client")]
 pub mod cache;
 #[cfg(feature = "client")]
-pub mod chat;
-#[cfg(feature = "client")]
 pub mod create;
 #[cfg(feature = "client")]
 pub mod find;
 #[cfg(feature = "client")]
 pub mod fold;
 #[cfg(feature = "client")]
-#[cfg(feature = "client")]
 pub mod map;
 #[cfg(feature = "client")]
 pub mod model;
-#[cfg(feature = "client")]
-pub mod outbox;
 #[cfg(feature = "client")]
 pub mod quota;
 #[cfg(feature = "client")]
@@ -49,15 +44,11 @@ pub mod stream;
 pub mod usage;
 
 #[cfg(feature = "client")]
-pub use chat::{ChatMap, HostChat, HostTopic, Topic};
-#[cfg(feature = "client")]
 pub use create::{Creation, Start, StartBase, StartFieldMode};
 #[cfg(feature = "client")]
 pub use find::AgentHit;
 #[cfg(feature = "client")]
-pub use fold::{
-    AgentIdentity, Digest, MirroredAgent, TranscriptFold, TranscriptRow, one_line, transcript,
-};
+pub use fold::{AgentIdentity, MirroredAgent, TranscriptFold, transcript};
 #[cfg(feature = "client")]
 pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};
 #[cfg(feature = "client")]

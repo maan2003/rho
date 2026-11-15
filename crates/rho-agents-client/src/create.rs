@@ -64,7 +64,7 @@ pub enum Creation {
 
 impl Start {
     /// The call that starts it, from the message `origin` links: the
-    /// policy joins the agent to that message's topic and hands it the
+    /// policy joins the agent to that message's thread and hands it the
     /// message as its first input.
     pub fn creation(
         &self,
