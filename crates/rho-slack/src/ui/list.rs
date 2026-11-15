@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Window, div};
+use gpui::{App, Context, Entity, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
 use text::Anchor;
@@ -235,7 +235,7 @@ impl ListView {
     }
 
     /// The conversation the cursor is on: what `enter` opens.
-    pub fn cursor_source(&self, cx: &mut Context<Self>) -> Option<Source> {
+    pub fn cursor_source(&self, cx: &App) -> Option<Source> {
         let row = self.cursor_row(cx);
         self.id_at(row).map(Source::Conversation)
     }
@@ -270,7 +270,7 @@ impl ListView {
     /// over the listing on the path an arriving message takes. The answer
     /// is the same either way -- the dimension asked for is a buffer point
     /// in both -- so only the resync is given up.
-    fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
+    fn cursor_row(&self, cx: &App) -> usize {
         let head = self.editor.read(cx).selections.newest_anchor().head();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         head.to_point(&snapshot).row as usize

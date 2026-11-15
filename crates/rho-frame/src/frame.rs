@@ -26,7 +26,8 @@ use crate::keys;
 use crate::log::MessageLog;
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
-    CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
+    CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
+    bottom_strip,
 };
 use crate::surface::{AnySurface, Subject};
 use crate::system::{AnySystem, Found};
@@ -851,6 +852,25 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_prompt_watching(prompt, complete, None, on_submit, on_cancel, window, cx);
+    }
+
+    /// A prompt that narrows what is behind it as the reader types:
+    /// `on_change` hears every edit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
+    )]
+    pub fn open_prompt_watching(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: CandidateSource,
+        on_change: Option<ChangeHandler>,
+        on_submit: SubmitHandler,
+        on_cancel: Option<CancelHandler>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = prompt.into();
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
@@ -864,7 +884,7 @@ impl Frame {
             prompt,
             &text_style,
             complete,
-            None,
+            on_change,
             on_submit,
             on_cancel,
             window,
@@ -876,6 +896,13 @@ impl Frame {
         // closes would confuse.
         self.echo = None;
         cx.notify();
+    }
+
+    /// The prompt that is open, for its asker to say more about it: that
+    /// what is typed is a secret, or that a candidate completes the whole
+    /// input.
+    pub fn minibuffer_mut(&mut self) -> Option<&mut Minibuffer> {
+        self.minibuffer.as_mut()
     }
 
     pub(crate) fn refresh_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {

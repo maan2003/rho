@@ -141,6 +141,13 @@ pub trait System: Sized + 'static {
     /// afterwards, through [`crate::FrameLink::read`].
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, _cx: &mut Context<Self>) {}
 
+    /// Whether this system holds a mute of the address itself, where the
+    /// user can lift it too: the ledger then only settles it, so a mute
+    /// lifted there is lifted here.
+    fn mutes_itself(&self, _address: &Address) -> bool {
+        false
+    }
+
     /// The user said this about one of the system's addresses; what the
     /// system does about it outside the ledger, and how to take that back.
     fn said(
@@ -178,6 +185,7 @@ trait SystemHandle {
     fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
+    fn mutes_itself(&self, address: &Address, cx: &App) -> bool;
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal>;
 }
 
@@ -240,6 +248,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.update(cx, |system, cx| system.marks_moved(touched, cx))
+    }
+
+    fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
+        self.read(cx).mutes_itself(address)
     }
 
     fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
@@ -314,6 +326,10 @@ impl AnySystem {
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.0.marks_moved(touched, cx)
+    }
+
+    pub fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
+        self.0.mutes_itself(address, cx)
     }
 
     pub fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {

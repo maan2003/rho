@@ -10,6 +10,8 @@
 pub mod conversation;
 pub mod list;
 pub mod results;
+mod surface;
+pub mod system;
 mod text_layout;
 
 use std::ops::Range;
@@ -21,6 +23,8 @@ use language::Buffer;
 pub use list::ListView;
 use multi_buffer::MultiBuffer;
 pub use results::{Place, ResultsView, Target};
+pub use surface::SlackSurface;
+pub use system::SlackSystem;
 use text::Anchor;
 use theme::ActiveTheme as _;
 

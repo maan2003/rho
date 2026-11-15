@@ -41,7 +41,7 @@ pub use frame::{Frame, Point};
 pub use keys::normal_contexts;
 pub use link::FrameLink;
 pub use menu::{Row, Rows};
-pub use minibuffer::{CancelHandler, Candidate, CandidateSource, SubmitHandler};
+pub use minibuffer::{CancelHandler, Candidate, CandidateSource, ChangeHandler, SubmitHandler};
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, Subject, Surface};
 pub use system::{AnySystem, ChannelRow, Found, HomeRow, HomeSection, Reversal, System};

@@ -11,9 +11,17 @@ version.workspace = true
 
 [features]
 default = ["ui"]
+# The views, and the system that plugs them into the frame: Slack's
+# surfaces, its claims on the dealer, its rows for Home, `find` and the
+# root menu.
 ui = [
   "dep:bytes",
   "dep:chrono",
+  "dep:jiff",
+  "dep:rho-dealer",
+  "dep:rho-frame",
+  "dep:rho-journal",
+  "dep:rho-window",
   "dep:redb",
   "dep:rho-transcript",
   "dep:rho-db",
@@ -63,6 +71,11 @@ tracing.workspace = true
 url.workspace = true
 
 bytes = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
+rho-dealer = { workspace = true, optional = true }
+rho-frame = { workspace = true, optional = true }
+rho-journal = { workspace = true, optional = true }
+rho-window = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
 rho-transcript = { workspace = true, optional = true }
