@@ -22,7 +22,7 @@ use gpui::{App, AppContext as _, Context, Subscription, Task, Window};
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Found, Frame, FrameLink, HomeRow, HomeSection, Point, Row, System};
+use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, RoomRow, Row, System};
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -87,19 +87,18 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
-/// Home's private rooms: every note that is about nothing, the one last
-/// written first. Home is a glance; `find` reaches the rest.
-fn private_rooms(marks: &Marks) -> Vec<HomeRow> {
-    const CAP: usize = 8;
+/// The private rooms: every note that is about nothing, the one last
+/// written first.
+fn private_rooms(marks: &Marks) -> Vec<RoomRow> {
     marks
         .private_roots()
         .into_iter()
-        .take(CAP)
-        .map(|(address, _)| HomeRow {
+        .map(|(address, held)| RoomRow {
             address: address.clone(),
-            title: note_title(marks, address),
-            label: String::new(),
-            unread: false,
+            name: note_title(marks, address),
+            tag: "private".to_owned(),
+            waiting: String::new(),
+            at: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
         })
         .collect()
 }
@@ -260,11 +259,8 @@ impl System for NoteSystem {
         found(marks)
     }
 
-    fn home(&self, marks: &Marks, _cx: &App) -> Vec<HomeSection> {
-        vec![HomeSection {
-            title: "private".to_owned(),
-            rows: private_rooms(marks),
-        }]
+    fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
+        private_rooms(marks)
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {

@@ -12,7 +12,6 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 collections = { path = "../../vendor/zed/crates/collections" }
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
 futures.workspace = true

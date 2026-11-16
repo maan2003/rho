@@ -60,12 +60,6 @@ impl FrameLink {
         self.with(cx, move |frame, _, cx| frame.echo(&text, class, cx));
     }
 
-    /// A line in the message log, not the echo line.
-    pub fn log(&self, text: impl Into<String>, class: StyleClass, cx: &mut App) {
-        let text = text.into();
-        self.with(cx, move |frame, _, cx| frame.log(text, class, cx));
-    }
-
     pub fn menu(&self, rows: Rows, cx: &mut App) {
         self.with(cx, move |frame, window, cx| {
             frame.open_menu(rows, window, cx)

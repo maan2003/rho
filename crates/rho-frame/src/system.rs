@@ -2,9 +2,9 @@
 //!
 //! A system owns a few kinds of address and everything about them: the
 //! surfaces that open them, the rows a menu offers over them, what of
-//! them wants the user, what Home and `find` list, and the streams it
-//! keeps to each host. The frame holds systems as a list and asks each
-//! in turn; a system never names another.
+//! them wants the user, the rooms Home lists, what `find` finds, and the
+//! streams it keeps to each host. The frame holds systems as a list and asks
+//! each in turn; a system never names another.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -23,32 +23,21 @@ use crate::frame::Point;
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
-/// One line of a Home section: something to open.
+/// One room: a root the user can read, as the system that holds it lists
+/// it on Home. Home orders the rooms by attention: a room with a card in
+/// the hand goes by that card, the rest by what waits in them and when
+/// they last moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeRow {
-    pub address: Address,
-    pub title: String,
-    /// The words beside the title: how long ago, how many.
-    pub label: String,
-    pub unread: bool,
-}
-
-/// A section of Home a system adds under the dealer's cards.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HomeSection {
-    pub title: String,
-    pub rows: Vec<HomeRow>,
-}
-
-/// One channel in Home's list: a rho stream on a host, a Slack channel
-/// the user follows. One list, each tagged with where it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelRow {
+pub struct RoomRow {
     pub address: Address,
     pub name: String,
-    /// Where it is: a host's name, a Slack workspace.
+    /// Where it is: a host's name, a Slack workspace, `private`.
     pub tag: String,
-    pub unread: bool,
+    /// What waits in it, in the system's words (`3 unread · 2h`); empty
+    /// when nothing does.
+    pub waiting: String,
+    /// When it last moved, in unix milliseconds; zero when nothing says.
+    pub at: u64,
 }
 
 /// Something `find` can open.
@@ -122,13 +111,9 @@ pub trait System: Sized + 'static {
         Seen::Whole
     }
 
-    /// What this system lists on Home under the cards, given what the
-    /// user has said about its things.
-    fn home(&self, _marks: &Marks, _cx: &App) -> Vec<HomeSection> {
-        Vec::new()
-    }
-
-    fn channels(&self, _marks: &Marks, _cx: &App) -> Vec<ChannelRow> {
+    /// The rooms this system has, given what the user has said about its
+    /// things: every root they can read.
+    fn rooms(&self, _marks: &Marks, _cx: &App) -> Vec<RoomRow> {
         Vec::new()
     }
 
@@ -185,8 +170,7 @@ trait SystemHandle {
     ) -> Vec<Claim>;
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
-    fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection>;
-    fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow>;
+    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
     fn mutes_itself(&self, address: &Address, cx: &App) -> bool;
@@ -241,12 +225,8 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).seen(address, cx)
     }
 
-    fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection> {
-        self.read(cx).home(marks, cx)
-    }
-
-    fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow> {
-        self.read(cx).channels(marks, cx)
+    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
+        self.read(cx).rooms(marks, cx)
     }
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -320,12 +300,8 @@ impl AnySystem {
         self.0.seen(address, cx)
     }
 
-    pub fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection> {
-        self.0.home(marks, cx)
-    }
-
-    pub fn channels(&self, marks: &Marks, cx: &App) -> Vec<ChannelRow> {
-        self.0.channels(marks, cx)
+    pub fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
+        self.0.rooms(marks, cx)
     }
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {

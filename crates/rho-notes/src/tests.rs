@@ -175,7 +175,7 @@ fn home_lists_the_private_rooms_newest_written_first() {
     let newer = world.note("newer room");
     world.write(older, "older room, edited last", false);
     let rooms = private_rooms(&world.marks);
-    let titles: Vec<&str> = rooms.iter().map(|row| row.title.as_str()).collect();
+    let titles: Vec<&str> = rooms.iter().map(|row| row.name.as_str()).collect();
     assert_eq!(titles, ["older room, edited last", "newer room"]);
     assert_eq!(rooms[1].address, newer.address());
 }
