@@ -42,11 +42,12 @@ class Tools(WorksetCase):
         ns, cwd = self.notebook(self.root)
         self.assertEqual(cwd, os.path.realpath(self.tmp))
         self.assertEqual(sorted(ns), ["agents", "chat", "skills"])
-        self.assertTrue(hasattr(ns["agents"], "spawn_user_owned_engineer"))
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        ns, _ = self.notebook(child)
-        self.assertFalse(hasattr(ns["agents"], "spawn_user_owned_engineer"))
         self.assertTrue(hasattr(ns["agents"], "spawn_new_engineer"))
+        # An Engineer another started has the same tools.
+        started = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
+        ns, _ = self.notebook(started)
+        self.assertTrue(hasattr(ns["agents"], "spawn_new_engineer"))
+        self.assertFalse(hasattr(ns["agents"], "spawn_user_owned_engineer"))
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(advisor)
         self.assertEqual(sorted(ns), ["agents", "chat", "skills"])
@@ -60,12 +61,12 @@ class Tools(WorksetCase):
         [child] = [id for id in self.state.agents if id != self.root]
         self.assertEqual(self.state.agents[child], {
             "runtime": native("terra", "xhigh"),
-            "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
+            "props": {"name": "fix-it", "preset": "engineer", "parent": self.root, "cwd": work},
         })
         # The brief goes by mail, outside the chat.
         self.assertEqual(self.state.mail, [(self.root, child, f"[message from eng-{self.root}]\nFix it.")])
         self.assertEqual(self.state.messages, [])
-        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as messages from it. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
+        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now in {work}, and it answers whoever your brief named. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
         # The child holds its brief.
@@ -108,50 +109,22 @@ class Tools(WorksetCase):
         self.assertEqual([to for _, to, _ in self.state.mail], [adv])
         self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive as a message from it.")
 
-    def test_spawn_user_owned_engineer(self):
+    def test_an_engineer_another_started_may_reach_the_user_and_its_starter_may_interrupt_it(self):
         ns, _ = self.notebook(self.root)
-        with self.assertRaisesRegex(ValueError, "pass thread="):
-            ns["agents"].spawn_user_owned_engineer(task_name="side", prompt="Do the side thing.")
-        # The spawner was started from a thread in the stream `ops`.
-        ops = fake_rho.post_user(None, "ops")
-        origin = fake_rho.post_user(ops, "Work.")
-        props = self.state.agents[self.root]["props"]
-        props["origin"] = f"chat:{origin}"
-        _, reply = run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="side", prompt="Do the side thing."))
-        [owned] = [id for id in self.state.agents if id != self.root]
-        brief = self.state.messages[-1]
-        # The brief starts a thread of its own beside the spawner's, named
-        # for the task.
-        self.assertEqual((brief["parent"], brief["sender"], brief["text"]), (ops, self.root, "Do the side thing."))
-        self.assertEqual(self.state.names[brief["id"]], "side")
-        self.assertEqual(self.state.agents[owned]["props"], {
-            "name": "side", "preset": "engineer", "started_by": self.root, "cwd": self.tmp, "origin": f"chat:{brief['id']}",
-        })
-        # The user learns of it by a mention that makes no card.
-        self.assertEqual(brief["mentions"], [("user", "fyi")])
-        self.assertIn("It reports to the user, not to you.", reply)
-        # It joins the brief's thread and starts from the brief; the spawner
-        # does not join.
-        wait_for(lambda: any(a == owned for a, *_ in self.state.inputs), "the brief")
-        self.assertEqual([m for a, _, _, m in self.state.inputs if a == owned], [brief["id"]])
-        self.assertEqual(self.state.members, {(brief["id"], owned): True})
-        # A thread given wins.
-        run(lambda: ns["agents"].spawn_user_owned_engineer(task_name="other", prompt="Other.", thread=brief["id"]))
-        self.assertEqual(self.state.messages[-1]["parent"], brief["id"])
-        with self.assertRaisesRegex(ValueError, "no thread #999"):
-            ns["agents"].spawn_user_owned_engineer(task_name="other", prompt="Other.", thread=999)
-        # Its starter may not interrupt it; its own child may.
-        with self.assertRaisesRegex(ValueError, "managed by the user"):
-            ns["agents"].cancel(agent_id=f"eng-{owned}")
-        grandchild = add_agent(self.state, native(), preset="child", parent=owned, cwd=self.tmp)
-        gns, _ = self.notebook(grandchild)
-        _, reply = run(lambda: gns["agents"].cancel(agent_id=owned))
-        self.assertEqual(self.state.calls[-1], ("cancel", (owned,)))
-        self.assertEqual(reply, f"Engineer eng-{owned} interrupted. It remains available for follow-up messages.")
+        run(lambda: ns["agents"].spawn_new_engineer(task_name="side", prompt="Open a thread for the user."))
+        [started] = [id for id in self.state.agents if id != self.root]
+        sns, _ = self.notebook(started)
+        # Its brief may hand it the user: it opens a thread and mentions them.
+        _, thread = run(lambda: sns["chat"].start("ops", "Side work starts.", mention="user", kind="fyi"))
+        self.assertEqual(self.state.messages[-1]["mentions"], [("user", "fyi")])
+        self.assertEqual(self.state.messages[-1]["id"], thread)
+        # The Engineer that started it still manages it.
+        run(lambda: ns["agents"].cancel(agent_id=f"eng-{started}"))
+        self.assertEqual(self.state.calls[-1], ("cancel", (started,)))
 
     def test_cancel_rules(self):
         ns, _ = self.notebook(self.root)
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        child = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
         adv = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         with self.assertRaisesRegex(ValueError, "not an Engineer"):
             ns["agents"].cancel(agent_id=adv)
@@ -163,8 +136,8 @@ class Tools(WorksetCase):
         self.assertEqual(self.state.calls[-1], ("cancel", (child,)))
 
     def test_spawn_depth_is_limited(self):
-        a = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        b = add_agent(self.state, native(), preset="child", parent=a, cwd=self.tmp)
+        a = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
+        b = add_agent(self.state, native(), preset="engineer", parent=a, cwd=self.tmp)
         ns, _ = self.notebook(b)
         run(lambda: ns["agents"].spawn_new_engineer(task_name="deep", prompt="p"))
         c = next(id for id, spec in self.state.agents.items() if spec["props"].get("name") == "deep")
@@ -176,7 +149,7 @@ class Tools(WorksetCase):
 
     def test_a_post_goes_in_the_thread_it_names_and_reaches_whom_it_mentions(self):
         ns, _ = self.notebook(self.root)
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        child = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
         rho_ = fake_rho.post_user(None, "rho")
         first = fake_rho.post_user(rho_, "Do it.", [self.root])
         other = fake_rho.post_user(rho_, "Something else.", [self.root])
@@ -212,10 +185,12 @@ class Tools(WorksetCase):
             chat.post(99, "hi")
         with self.assertRaisesRegex(ValueError, "needs text"):
             chat.post(thread, " ")
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        child = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
         cns, _ = self.notebook(child)
+        advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
+        ans, _ = self.notebook(advisor)
         with self.assertRaisesRegex(ValueError, f"parent agent eng-{self.root}"):
-            cns["chat"].post(thread, "Hi.", mention="user", kind="fyi")
+            ans["chat"].post(thread, "Hi.", mention="user", kind="fyi")
         self.assertEqual(len(self.state.messages), 2, "nothing refused was posted")
         # A new subject in a stream that is new: the root is made, the
         # thread goes under it, and its starter joins it; the mentioned
@@ -324,7 +299,7 @@ class Tools(WorksetCase):
 
         # Another agent has accepted nothing, and an Advisor talks to no
         # other host. `agents.message` stays inside this host.
-        child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        child = add_agent(self.state, native(), preset="engineer", parent=self.root, cwd=self.tmp)
         theirs_too, _ = self.notebook(child)
         self.assertEqual(run(theirs_too["agents"].external.contacts)[0], "You have accepted no address.\n")
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)

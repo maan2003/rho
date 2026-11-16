@@ -41,6 +41,8 @@ def _main(init_path, ready) -> None:
     asyncio.set_event_loop(_loop)
     _thread = threading.get_ident()
     default.install()
+    for id in _rho.agents():
+        agents.upgrade(agents.Agent(id))
     if init_path is not None and os.path.exists(init_path):
         with open(init_path, encoding="utf-8") as file:
             source = file.read()

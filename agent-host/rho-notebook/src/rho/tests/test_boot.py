@@ -63,6 +63,22 @@ class Eval(WorksetCase):
         self.assertIs(workset.namespace["rho"], rho)
 
 
+class Upgrade(WorksetCase):
+    def seed(self, state):
+        self.root = add_agent(state, native(), preset="engineer", cwd="/")
+        self.child = add_agent(state, native(), preset="child", parent=self.root, cwd="/")
+        self.owned = add_agent(state, native(), preset="engineer", started_by=self.root, cwd="/", origin="chat:7")
+        self.advisor = add_agent(state, native(), preset="advisor", parent=self.root, cwd="/")
+
+    def test_boot_makes_every_stored_engineer_one_kind_started_by_its_parent(self):
+        props = {id: spec["props"] for id, spec in self.state.agents.items()}
+        self.assertEqual(props[self.child], {"preset": "engineer", "parent": self.root, "cwd": "/"})
+        self.assertEqual(props[self.owned], {"preset": "engineer", "parent": self.root, "cwd": "/", "origin": "chat:7"})
+        # Agents already current stay as they were.
+        self.assertEqual(props[self.root], {"preset": "engineer", "cwd": "/"})
+        self.assertEqual(props[self.advisor], {"preset": "advisor", "parent": self.root, "cwd": "/"})
+
+
 class Hooks(WorksetCase):
     def seed(self, state):
         self.id = add_agent(state, native(), preset="engineer", cwd="/")
