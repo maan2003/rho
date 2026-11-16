@@ -2,7 +2,7 @@
 //!
 //! [`DesktopSystem`] owns the `desktop` kind. It keeps each host's
 //! desktops stream, so it knows every desktop the host's worksets run
-//! whether or not one is in view; `find` and the root menu list them. A
+//! whether or not one is in view; `find` and the palette list them. A
 //! [`DesktopAddress`] opens a [`DesktopSurface`], which dials the live
 //! view; only an iroh host carries one.
 
@@ -18,7 +18,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Task, Window, div};
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_dealer::Address;
-use rho_frame::keys::{Close, RootMenu};
+use rho_frame::keys::{Close, Palette, VerdictMenu};
 use rho_frame::{AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, Surface, System};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -383,8 +383,9 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         // Every key on a live desktop goes to it; the menu is on a chord
         // its applications do not see.
-        KeyBinding::new("ctrl-shift-;", RootMenu, Some("RhoDesktop")),
-        KeyBinding::new("space", RootMenu, Some("RhoDesktopNote")),
+        KeyBinding::new("ctrl-shift-;", Palette, Some("RhoDesktop")),
+        KeyBinding::new(":", Palette, Some("RhoDesktopNote")),
+        KeyBinding::new("space", VerdictMenu, Some("RhoDesktopNote")),
         KeyBinding::new("q", Close, Some("RhoDesktopNote")),
     ]);
 }

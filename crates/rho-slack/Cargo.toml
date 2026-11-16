@@ -13,7 +13,7 @@ version.workspace = true
 default = ["ui"]
 # The views, and the system that plugs them into the frame: Slack's
 # surfaces, its claims on the dealer, its rows for Home, `find` and the
-# root menu.
+# palette.
 ui = [
   "dep:bytes",
   "dep:chrono",

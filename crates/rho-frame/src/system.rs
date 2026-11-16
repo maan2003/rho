@@ -91,7 +91,7 @@ pub trait System: Sized + 'static {
 
     fn detached(&mut self, _host: HostId, _cx: &mut Context<Self>) {}
 
-    /// Rows for the root menu, given what is in view.
+    /// Rows for the palette, given what is in view.
     fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
     }

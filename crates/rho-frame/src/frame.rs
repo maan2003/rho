@@ -22,7 +22,6 @@ use theme::ActiveTheme as _;
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::home::{HomeTarget, HomeView};
-use crate::keys;
 use crate::log::MessageLog;
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
@@ -33,6 +32,7 @@ use crate::phone::{Layout, Phone};
 use crate::surface::{AnySurface, Subject};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
+use crate::{keys, palette};
 
 /// The kind of the frame's own surfaces: Home and the message log.
 pub const FRAME_KIND: &str = "frame";
@@ -553,9 +553,52 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// `space`: the frame's rows, the surface's, and every system's for
-    /// what is in view.
-    pub(crate) fn root_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `:`: every command by name, found by a fuzzy query, with the keys
+    /// that reach it through the menus as a hint. A command that is a
+    /// menu opens it as a transient.
+    pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = Rc::new(palette::flatten(&self.commands(window, cx)));
+        let complete = {
+            let entries = entries.clone();
+            Rc::new(move |_: &Frame, input: &str, _: &App| {
+                let mut found: Vec<(u32, usize)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| {
+                        palette::score(input, &entry.label).map(|score| (score, index))
+                    })
+                    .collect();
+                found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                found
+                    .into_iter()
+                    .map(|(_, index)| Candidate {
+                        value: entries[index].label.clone(),
+                        description: entries[index].keys.clone(),
+                    })
+                    .collect()
+            })
+        };
+        let submit = Rc::new(
+            move |frame: &mut Frame,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Frame>| {
+                let Some(entry) = entries.iter().find(|entry| entry.label == input.trim()) else {
+                    frame.echo(&format!("no command {input:?}"), StyleClass::SystemInfo, cx);
+                    return;
+                };
+                match &entry.pick {
+                    Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
+                    Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
+                }
+            },
+        );
+        self.open_prompt("command:", complete, submit, window, cx);
+    }
+
+    /// The frame's rows, the surface's, and every system's for what is in
+    /// view: what the palette lists.
+    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Rows {
         let point = self.point(cx);
         let mut rows = Rows::new("rho");
         rows.push(Row::run("h", "home", |frame, window, cx| {
@@ -576,7 +619,7 @@ impl Frame {
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
         }
-        self.open_menu(rows, window, cx);
+        rows
     }
 
     fn hosts_menu(&self) -> Rows {
@@ -642,7 +685,7 @@ impl Frame {
         rows
     }
 
-    /// `tab`: the verdicts, over whatever card is in view. With no card
+    /// `space`: the verdicts, over whatever card is in view. With no card
     /// it goes Home, and from Home it is the way back.
     pub(crate) fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
@@ -1215,9 +1258,7 @@ impl Render for Frame {
                 this.close_current(window, cx);
                 this.pull_card(window, cx);
             }))
-            .on_action(
-                cx.listener(|this, _: &keys::RootMenu, window, cx| this.root_menu(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
                     this.verdict_menu(window, cx)

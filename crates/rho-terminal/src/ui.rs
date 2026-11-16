@@ -17,7 +17,7 @@ use gpui::{
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_dealer::Address;
-use rho_frame::keys::{Close, RootMenu, VerdictMenu};
+use rho_frame::keys::{Close, Home, Palette, VerdictMenu};
 use rho_frame::{
     AnySurface, Candidate, CandidateSource, Found, FrameLink, Marks, Point, Row, Surface, System,
 };
@@ -538,7 +538,7 @@ impl Render for TerminalSurface {
             State::Failed(error) => format!("term {}: {error}", self.terminal),
         };
         // The placeholder takes the keys of a terminal in normal mode, so
-        // `q` closes it and `space` is the menu.
+        // `q` closes it and `:` is the palette.
         div()
             .size_full()
             .key_context("RhoTerminalNormal")
@@ -556,7 +556,7 @@ fn bind_keys(cx: &mut App) {
         // own chords are ones shells do not see. `ctrl-\ ctrl-n` is vim's
         // terminal escape; `ctrl-shift-n` the discoverable one.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-;", RootMenu, Some("RhoTerminal")),
+        KeyBinding::new("ctrl-shift-;", Palette, Some("RhoTerminal")),
         KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
         // The frame walks history on ctrl-j and ctrl-k; in a shell they are
@@ -584,8 +584,9 @@ fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
-        KeyBinding::new("space", RootMenu, Some("RhoTerminalNormal")),
-        KeyBinding::new("tab", VerdictMenu, Some("RhoTerminalNormal")),
+        KeyBinding::new(":", Palette, Some("RhoTerminalNormal")),
+        KeyBinding::new("space", VerdictMenu, Some("RhoTerminalNormal")),
+        KeyBinding::new("tab", Home, Some("RhoTerminalNormal")),
         KeyBinding::new("q", Close, Some("RhoTerminalNormal")),
     ]);
 }

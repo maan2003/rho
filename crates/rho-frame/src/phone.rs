@@ -227,7 +227,7 @@ enum Button {
     Mute,
     Snooze,
     Todo,
-    /// The whole verdict menu, as `tab` opens it.
+    /// The whole verdict menu, as `space` opens it.
     Verdicts,
     Send,
     Cancel,
@@ -607,7 +607,7 @@ impl Frame {
         match button {
             Button::Back => self.back(window, cx),
             Button::Home => self.toggle_home(window, cx),
-            Button::Menu => self.root_menu(window, cx),
+            Button::Menu => self.palette(window, cx),
             Button::Open => self.open_row(window, cx),
             Button::Done => {
                 if let Some(target) = &target {

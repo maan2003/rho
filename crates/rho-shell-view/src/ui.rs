@@ -2,7 +2,7 @@
 //!
 //! [`ShellSystem`] owns the `shell` kind: an agent has one host-owned
 //! shell, and its [`ShellAddress`] opens a [`ShellSurface`] over it,
-//! starting the shell when none runs. The root menu offers the running
+//! starting the shell when none runs. The palette offers the running
 //! shells and closes the one in view; `find` lists the shells open here.
 
 use std::collections::HashMap;
