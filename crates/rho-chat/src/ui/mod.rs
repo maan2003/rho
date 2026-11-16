@@ -242,17 +242,20 @@ impl ChatSystem {
     }
 
     /// What this device kept under the host's database seed, before the
-    /// endpoint named its log, moves to the endpoint: unsent messages,
-    /// drafts, and what the user said about its threads in the ledger
-    /// (`temp-migration`). Nothing to move after the first hello.
+    /// endpoint named its log, moves to the endpoint (`temp-migration`):
+    /// unsent messages and drafts once, from the cache rows the seed
+    /// keyed; and what the user said about its threads in the ledger,
+    /// on every hello, of each thread nothing is said of yet under the
+    /// endpoint. The ledger moves on its own: a device that kept no
+    /// cache rows under the seed (one that wrote topics, before rho2)
+    /// still said things of them.
     fn adopt_seed(&mut self, machine_seed: u64, endpoint: EndpointId, cx: &mut Context<Self>) {
-        if !self.cache.adopt_seed(machine_seed, endpoint) {
-            return;
-        }
-        let (outbox, drafts) = self.cache.load_host(endpoint);
-        self.outbox.adopt(endpoint, outbox);
-        for (parent, text) in drafts {
-            self.drafts.insert((endpoint, parent), text);
+        if self.cache.adopt_seed(machine_seed, endpoint) {
+            let (outbox, drafts) = self.cache.load_host(endpoint);
+            self.outbox.adopt(endpoint, outbox);
+            for (parent, text) in drafts {
+                self.drafts.insert((endpoint, parent), text);
+            }
         }
         let seeded = format!("{}:{machine_seed:016x}/", ThreadId::KIND);
         self.frame.update(cx, move |frame, _, cx| {
