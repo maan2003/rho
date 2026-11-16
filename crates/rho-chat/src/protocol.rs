@@ -85,13 +85,8 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// The first frame: the newest event on the host, and the host's iroh
     /// identity, which names its log and its threads wherever a copy is
-    /// held. `machine_seed` named them before and nothing reads it now; it
-    /// goes with the next protocol epoch.
-    Hello {
-        head: ChatSeq,
-        host: EndpointId,
-        machine_seed: u64,
-    },
+    /// held.
+    Hello { head: ChatSeq, host: EndpointId },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Chat { records: Vec<ChatRecord> },
@@ -120,7 +115,6 @@ mod tests {
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
-            machine_seed: 7,
         });
         round_trips(ServerFrame::Chat {
             records: vec![

@@ -73,9 +73,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/50";
+pub const IROH_ALPN: &[u8] = b"rho/ui/51";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP38";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP39";
 
 /// The agent host's runtime directory on this machine: where it meets its
 /// local peers (the IPC rendezvous in `ipc/`, its endpoint id in

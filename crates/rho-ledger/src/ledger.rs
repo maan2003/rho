@@ -12,13 +12,18 @@ use crate::{seal, store};
 const SELF: TableDefinition<(), Sen<SelfRecord>> = TableDefinition::new("ledger_self_v1");
 const READ: TableDefinition<[u8; 16], u64> = TableDefinition::new("ledger_read_v2");
 const UNSENT: TableDefinition<u64, Sen<Envelope>> = TableDefinition::new("ledger_unsent_v2");
-// What older builds kept. Every device has converted it; drop it once.
-const RETIRED: [&str; 5] = [
+// What older builds kept, and the note slots that notes synced through
+// before they were facts in the log. Every device has converted it; drop
+// it once.
+const RETIRED: [&str; 8] = [
     "ledger_merged_v1",
     "ledger_own_v1",
     "ledger_seen_v1",
     "ledger_pending_v1",
     "ledger_segments_v1",
+    "ledger_notes_v1",
+    "ledger_note_hosts_v1",
+    "ledger_note_seen_v1",
 ];
 const KEY_CONTEXT: &str = "rho 2026-09-24 ledger";
 
@@ -95,7 +100,6 @@ impl Ledger {
             write.delete_table(table);
         }
         store::open(&mut write);
-        crate::notes::open(&mut write);
         write.open_table(READ);
         write.open_table(UNSENT);
         let mut table = write.open_table(SELF);
@@ -116,9 +120,6 @@ impl Ledger {
         drop(table);
         write.commit();
         Self { db }
-    }
-    pub(crate) fn db(&self) -> &RhoDb {
-        &self.db
     }
     fn me(&self) -> SelfRecord {
         self.db
@@ -241,7 +242,6 @@ impl Ledger {
             append_sealed(&mut write, secret, &envelope);
             write.open_table(UNSENT).remove(index);
         }
-        crate::notes::seal_held(&mut write, secret);
         write.commit();
         let mut received = Received::default();
         for log in self.lengths().keys() {

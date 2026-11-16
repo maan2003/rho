@@ -15,7 +15,6 @@ use rho_dealer::facts::{Device, Entry, EntryId, Fact, Seen};
 use rho_dealer::{Address, Marks, Skips, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Channel, Item, Ledger, Secret};
-use senax_encoder::Decode;
 
 use crate::frame::Frame;
 use crate::system::Reversal;
@@ -102,9 +101,8 @@ impl Attention {
         let device = Device(ledger.device().0);
         let mut marks = Marks::default();
         marks.apply(read_entries(&ledger.items(Channel::Facts)));
-        let slot_notes = ledger.notes();
-        let (streams, events) = LedgerStreams::new(ledger, Box::new(|_, _| false));
-        let mut attention = Self {
+        let (streams, events) = LedgerStreams::new(ledger);
+        let attention = Self {
             streams,
             device,
             marks,
@@ -112,37 +110,7 @@ impl Attention {
             undo: Vec::new(),
             next_undo: 0,
         };
-        attention.adopt_slot_notes(&slot_notes);
         (attention, events)
-    }
-
-    /// Temp migration: notes used to sync as one sealed blob per note in a
-    /// slot on each host, and now are `Wrote` facts in the log. Each note
-    /// this device still holds only as a slot blob is said once as a fact.
-    /// Two devices that both do this say the same text under the same id,
-    /// which comes to one note. Goes with the slot tables and the `Put` and
-    /// `Slot` frames once every device has run this.
-    fn adopt_slot_notes(&mut self, blobs: &[Vec<u8>]) {
-        let writes: Vec<Write> = blobs
-            .iter()
-            .filter_map(|plain| SlotNote::decode(plain))
-            .filter(|rev| !rev.deleted && !rev.body.trim().is_empty())
-            .filter(|rev| self.marks.get(&Address::note(rev.note)).body.is_none())
-            .map(|rev| {
-                Write::Fact(Fact::Wrote {
-                    note: rev.note,
-                    text: rev.body,
-                    created: rev.created,
-                })
-            })
-            .collect();
-        if !writes.is_empty() {
-            tracing::info!(
-                notes = writes.len(),
-                "notes move from slots into the ledger log"
-            );
-            self.say(writes);
-        }
     }
 
     /// Keeps a verdict for `shift-u`, numbered after every one before it.
@@ -235,9 +203,6 @@ impl Attention {
                 items.retain(|item| matches!(item.channel, Channel::Facts));
                 (self.marks.apply(read_entries(&items)), Vec::new())
             }
-            // Slot notes are what older builds put; what they hold has moved
-            // into the log, so nothing arrives this way any more.
-            LedgerEvent::Note(_) => Default::default(),
             LedgerEvent::Unreadable { device } => (
                 BTreeSet::new(),
                 vec![format!(
@@ -285,23 +250,4 @@ fn read_entries(items: &[Item]) -> Vec<Entry> {
         .iter()
         .filter_map(|item| Entry::decode(&item.bytes))
         .collect()
-}
-
-/// A note as the slot form held it, read only by the temp migration.
-#[derive(Decode)]
-struct SlotNote {
-    note: uuid::Uuid,
-    #[allow(dead_code)]
-    device: Device,
-    #[allow(dead_code)]
-    at: jiff::Zoned,
-    created: jiff::Timestamp,
-    body: String,
-    deleted: bool,
-}
-
-impl SlotNote {
-    fn decode(mut bytes: &[u8]) -> Option<Self> {
-        senax_encoder::decode(&mut bytes).ok()
-    }
 }
