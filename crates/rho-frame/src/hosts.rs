@@ -30,13 +30,14 @@ impl Frame {
         let ledger = self.attention.stream();
         let runtime = gpui_tokio::Tokio::handle(cx);
         let name = spec.name.clone();
+        let endpoint = spec.target.endpoint();
         let host = self.hosts.attach(
             spec.name.clone(),
             spec.target,
             |host, link| {
                 let mut opened = vec![ledger];
                 for system in &systems {
-                    opened.extend(system.streams(host, &name, &link, cx));
+                    opened.extend(system.streams(host, &name, endpoint, &link, cx));
                 }
                 opened
             },

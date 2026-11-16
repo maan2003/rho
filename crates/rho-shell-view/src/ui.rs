@@ -17,7 +17,8 @@ use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_dealer::Address;
 use rho_frame::keys::Close;
 use rho_frame::{
-    AnySurface, Candidate, CandidateSource, Found, FrameLink, Marks, Point, Row, Surface, System,
+    AnySurface, Candidate, CandidateSource, EndpointId, Found, FrameLink, Marks, Point, Row,
+    Surface, System,
 };
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -252,6 +253,7 @@ impl System for ShellSystem {
         &mut self,
         host: HostId,
         name: &str,
+        _endpoint: Option<EndpointId>,
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {

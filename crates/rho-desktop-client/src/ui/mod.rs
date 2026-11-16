@@ -19,7 +19,9 @@ use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Task, Windo
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_dealer::Address;
 use rho_frame::keys::{Close, Palette, VerdictMenu};
-use rho_frame::{AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, Surface, System};
+use rho_frame::{
+    AnySurface, Candidate, EndpointId, Found, FrameLink, Marks, Point, Row, Surface, System,
+};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 pub use view::DesktopView;
@@ -219,6 +221,7 @@ impl System for DesktopSystem {
         &mut self,
         host: HostId,
         name: &str,
+        _endpoint: Option<EndpointId>,
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
