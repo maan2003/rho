@@ -64,15 +64,7 @@ def team(agent_id: str, props: dict) -> str:
             "and end your turn when blocked on a reply.\n"
         )
     if parent is not None:
-        # Who an Engineer answers is the brief's to say, not a kind of agent:
-        # the one that started it may want a report, a thread opened for the
-        # user, or a Slack thread answered.
-        ownership = (
-            f"Your brief, the first message from {label(parent)}, says what you own and whom you "
-            "answer: report to it with agents.message, or work with the user or the people in "
-            f"the threads it names. When the brief does not say, report to {label(parent)}. Ask "
-            "it for context you need the same way."
-        )
+        ownership = f"Your first message from {label(parent)} is your brief."
     else:
         ownership = "You were started directly and own the user's technical outcome."
     return f"""{identity}

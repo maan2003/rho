@@ -357,8 +357,8 @@ class Agents(Messages):
         props = {"name": task_name, "preset": "engineer", "parent": me.id, "cwd": cwd}
         child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
-            f'Spawned agent {label(child.id)} for task "{task_name}". It is working now in {cwd}, '
-            "and it answers whoever your brief named. Follow up with "
+            f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
+            f"results will arrive as messages from it. It works in {cwd}. Follow up with "
             f"agents.message(agent_id={label(child.id)!r}, message=text)."
         )
 

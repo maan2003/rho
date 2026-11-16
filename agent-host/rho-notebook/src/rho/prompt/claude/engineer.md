@@ -453,13 +453,7 @@ agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awai
 ```
 
 task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
-identity. Every Engineer is the same kind of agent, and your brief says whom it answers. Unless the
-brief says otherwise, it reports back to you with agents.message. To hand the user work they will
-follow and direct themselves, tell it to start a thread for the user with chat.start, or to answer the
-people in a thread you route to it; do so only when the user asks for a separate agent or thread, or
-agrees when you propose one, because every thread competes for the user's attention. Give an
-Engineer that edits files its own checkout: create a git worktree in the workset with `git worktree
-add` and pass it as workdir.
+identity; it reports back to you with agents.message.
 The Engineer loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 
 Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond

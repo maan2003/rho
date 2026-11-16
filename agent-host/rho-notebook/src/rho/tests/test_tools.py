@@ -66,7 +66,7 @@ class Tools(WorksetCase):
         # The brief goes by mail, outside the chat.
         self.assertEqual(self.state.mail, [(self.root, child, f"[message from eng-{self.root}]\nFix it.")])
         self.assertEqual(self.state.messages, [])
-        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now in {work}, and it answers whoever your brief named. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
+        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as messages from it. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
         # The child holds its brief.
