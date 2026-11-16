@@ -24,8 +24,11 @@ rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agent-types.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-chat = { workspace = true, features = ["ui"] }
+rho-desktop-client = { workspace = true, features = ["ui"] }
 rho-frame.workspace = true
 rho-rpc.workspace = true
+rho-shell-view = { workspace = true, features = ["ui"] }
+rho-terminal = { workspace = true, features = ["ui"] }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
 settings = { path = "../../vendor/zed/crates/settings" }

@@ -27,10 +27,9 @@ client = [
   "dep:tokio",
 ]
 
-# The shells as the frame shows them: the `shell` system and its surface.
+# The shells as the frame shows them: the surface and its keys.
 ui = [
   "client",
-  "dep:rho-dealer",
   "dep:rho-frame",
 ]
 
@@ -47,7 +46,6 @@ language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-terminal = { workspace = true, features = ["client"], optional = true }
-rho-dealer = { workspace = true, optional = true }
 rho-frame = { workspace = true, optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }
