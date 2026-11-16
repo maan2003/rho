@@ -2,10 +2,10 @@
 //! in time order.
 //!
 //! Attention facts are kept per node for [`crate::facts::Facts`] to read.
-//! Filing facts settle on the last one said: a label's name and parent,
-//! whether a node carries a label, what it is called and what it is about.
-//! A note is its newest revision. A retracted entry counts for nothing,
-//! whenever the retract arrives.
+//! What a node is called and what it is about settle on the last one
+//! said. A note is its newest revision. A retracted entry counts for
+//! nothing, whenever the retract arrives. The label facts older builds
+//! wrote are about no node ([`Fact::node`]), so nothing here reads them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -15,44 +15,32 @@ use crate::address::Address;
 use crate::facts::{Entry, EntryId, Fact, Facts};
 
 /// Everything the user said about one node. Which fields mean anything
-/// depends on the node: a note has a body, a label a parent.
+/// depends on the node: only a note has a body.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeMarks {
     /// Its attention facts, oldest first, none retracted.
     pub facts: Vec<Entry>,
-    pub labels: BTreeSet<uuid::Uuid>,
-    /// What the user calls it, over what its source calls it; a label's
-    /// own name.
+    /// What the user calls it, over what its source calls it.
     pub name: Option<String>,
     /// A note's text; its first line is its title.
     pub body: Option<String>,
     /// When the note's newest revision was written.
     pub written_ms: Option<i64>,
     pub created_ms: Option<i64>,
-    /// A note or a label the user deleted.
+    /// A note the user deleted.
     pub deleted: bool,
     /// What a note is about.
     pub about: Option<Address>,
-    /// The label a label sits under.
-    pub parent: Option<uuid::Uuid>,
-    /// The repository work under a label happens in.
-    pub repository: Option<String>,
-    /// The agent host work under a label runs on, by its identity.
-    pub host: Option<String>,
 }
 
 static EMPTY: NodeMarks = NodeMarks {
     facts: Vec::new(),
-    labels: BTreeSet::new(),
     name: None,
     body: None,
     written_ms: None,
     created_ms: None,
     deleted: false,
     about: None,
-    parent: None,
-    repository: None,
-    host: None,
 };
 
 impl NodeMarks {
@@ -61,19 +49,14 @@ impl NodeMarks {
     }
 
     /// What was said here, said again of `node`: the attention facts in
-    /// order, then the labels, name and subject. A note's body and a
-    /// label's own facts are not about a node and stay.
+    /// order, then the name and subject. A note's body is not about a node
+    /// and stays.
     pub fn restated_as(&self, node: &Address) -> Vec<Fact> {
         let mut facts: Vec<Fact> = self
             .facts
             .iter()
             .filter_map(|entry| entry.fact.retarget(node.clone()))
             .collect();
-        facts.extend(self.labels.iter().map(|label| Fact::Labeled {
-            node: node.clone(),
-            label: *label,
-            present: true,
-        }));
         if self.name.is_some() {
             facts.push(Fact::Named {
                 node: node.clone(),
@@ -97,17 +80,6 @@ impl NodeMarks {
             .unwrap_or("")
             .trim()
     }
-}
-
-/// Nodes the user put away together.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pile {
-    /// The name the user gave it; `None` for everything snoozed.
-    pub name: Option<String>,
-    pub nodes: Vec<Address>,
-    /// When the first of an unnamed pile comes back by itself. A named pile
-    /// comes back only when opened.
-    pub back: Option<Timestamp>,
 }
 
 /// Every entry this device holds, folded by node.
@@ -186,23 +158,6 @@ impl Marks {
                 | Fact::Mute { .. }
                 | Fact::Unmute { .. }
                 | Fact::Read { .. } => marks.facts.push(entry.clone()),
-                Fact::Label { name, parent, .. } => {
-                    marks.name = Some(name.clone());
-                    marks.parent = *parent;
-                    marks.deleted = false;
-                    marks
-                        .created_ms
-                        .get_or_insert(entry.at.timestamp().as_millisecond());
-                }
-                Fact::Unlabel { .. } => marks.deleted = true,
-                Fact::Repository { url, .. } => marks.repository = url.clone(),
-                Fact::Host { host, .. } => marks.host = host.clone(),
-                Fact::Labeled { label, present, .. } => {
-                    match present {
-                        true => marks.labels.insert(*label),
-                        false => marks.labels.remove(label),
-                    };
-                }
                 Fact::Named { name, .. } => marks.name = name.clone(),
                 Fact::About { about, .. } => marks.about = about.clone(),
                 Fact::Wrote { text, created, .. } => {
@@ -212,7 +167,12 @@ impl Marks {
                     marks.deleted = false;
                 }
                 Fact::Deleted { .. } => marks.deleted = true,
-                Fact::Retract { .. } => {}
+                Fact::Label { .. }
+                | Fact::Unlabel { .. }
+                | Fact::Repository { .. }
+                | Fact::Host { .. }
+                | Fact::Labeled { .. }
+                | Fact::Retract { .. } => {}
             }
         }
         if marks == NodeMarks::default() {
@@ -265,140 +225,6 @@ impl Marks {
         roots.sort_by_key(|(_, marks)| std::cmp::Reverse(marks.written_ms));
         roots
     }
-
-    /// What the user put away and can open: each named pile with its nodes,
-    /// oldest first, and last the unnamed one, whatever is snoozed past
-    /// `now`, soonest back first.
-    pub fn piles(&self, now: Timestamp) -> Vec<Pile> {
-        let mut named: BTreeMap<&str, Vec<(Timestamp, &Address)>> = BTreeMap::new();
-        let mut snoozed = Vec::new();
-        for (node, marks) in &self.nodes {
-            let facts = marks.facts();
-            if marks.deleted || facts.muted() {
-                continue;
-            }
-            if let Some((pile, at)) = facts.pile() {
-                named.entry(pile).or_default().push((at.timestamp(), node));
-            } else if let Some(snooze) = facts.snooze().filter(|snooze| snooze.until > now) {
-                snoozed.push((snooze.until, node));
-            }
-        }
-        let pile = |name: Option<&str>, mut nodes: Vec<(Timestamp, &Address)>| {
-            nodes.sort();
-            Pile {
-                name: name.map(str::to_owned),
-                back: name.is_none().then(|| nodes[0].0),
-                nodes: nodes.into_iter().map(|(_, node)| node.clone()).collect(),
-            }
-        };
-        let mut piles: Vec<Pile> = named
-            .into_iter()
-            .map(|(name, nodes)| pile(Some(name), nodes))
-            .collect();
-        if !snoozed.is_empty() {
-            piles.push(pile(None, snoozed));
-        }
-        piles
-    }
-
-    /// Every label that is not deleted, with its full path.
-    pub fn labels(&self) -> Vec<(uuid::Uuid, String)> {
-        let mut labels: Vec<_> = self
-            .nodes
-            .iter()
-            .filter_map(|(node, marks)| {
-                let id = node.as_label()?;
-                (!marks.deleted && marks.name.is_some()).then(|| (id, self.label_path(id)))
-            })
-            .collect();
-        labels.sort_by(|a, b| a.1.cmp(&b.1));
-        labels
-    }
-
-    /// A label's name with the names of the labels above it, `rho/agent`.
-    pub fn label_path(&self, label: uuid::Uuid) -> String {
-        let mut names = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut at = Some(label);
-        while let Some(id) = at {
-            if !seen.insert(id) {
-                break;
-            }
-            let marks = self.get(&Address::label(id));
-            names.push(marks.name.clone().unwrap_or_default());
-            at = marks.parent;
-        }
-        names.reverse();
-        names.join("/")
-    }
-
-    /// The live label at `path`, if there is one.
-    pub fn label_at(&self, path: &str) -> Option<uuid::Uuid> {
-        self.labels()
-            .into_iter()
-            .find(|(_, held)| held == path)
-            .map(|(id, _)| id)
-    }
-
-    /// The live labels directly under `label`, or at the top for `None`.
-    pub fn sublabels(&self, label: Option<uuid::Uuid>) -> Vec<uuid::Uuid> {
-        self.labels()
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| self.get(&Address::label(*id)).parent == label)
-            .collect()
-    }
-
-    /// Every node carrying `label`, except deleted notes.
-    pub fn labeled(&self, label: uuid::Uuid) -> Vec<Address> {
-        let mut nodes: Vec<_> = self
-            .nodes
-            .iter()
-            .filter(|(_, marks)| marks.labels.contains(&label) && !marks.deleted)
-            .map(|(node, _)| node.clone())
-            .collect();
-        nodes.sort();
-        nodes
-    }
-
-    /// The repository work on a node happens in: the first its labels
-    /// name, looking up through each label's parents.
-    pub fn repository_of(&self, node: &Address) -> Option<String> {
-        self.inherited(node, |marks| marks.repository.clone())
-    }
-
-    /// The host work under `node` runs on: its own label's, else the
-    /// nearest one above, as with the repository.
-    pub fn host_of(&self, node: &Address) -> Option<String> {
-        self.inherited(node, |marks| marks.host.clone())
-    }
-
-    fn inherited(
-        &self,
-        node: &Address,
-        read: impl Fn(&NodeMarks) -> Option<String>,
-    ) -> Option<String> {
-        let mut labels: Vec<uuid::Uuid> = match node.as_label() {
-            Some(id) => vec![id],
-            None => self.get(node).labels.iter().copied().collect(),
-        };
-        let mut seen = BTreeSet::new();
-        while !labels.is_empty() {
-            let mut above = Vec::new();
-            for id in labels {
-                if !seen.insert(id) {
-                    continue;
-                }
-                let marks = self.get(&Address::label(id));
-                if let Some(value) = read(marks) {
-                    return Some(value);
-                }
-                above.extend(marks.parent);
-            }
-            labels = above;
-        }
-        None
-    }
 }
 
 #[cfg(test)]
@@ -431,13 +257,11 @@ mod tests {
     }
 
     /// Everything said of a node comes out again about another: the
-    /// attention facts as they were, each label still on it, and the name.
-    /// A label taken off again is not restated.
+    /// attention facts as they were and the name. A label an older build
+    /// put on it is not restated.
     #[test]
     fn a_nodes_marks_are_restated_as_another_node() {
         let mut marks = Marks::default();
-        let gui = uuid::Uuid::new_v4();
-        let old = uuid::Uuid::new_v4();
         let moved = Address::new("thread", "yyyy/41");
         marks.apply([
             said(
@@ -453,31 +277,13 @@ mod tests {
                 1,
                 Fact::Labeled {
                     node: agent(),
-                    label: gui,
+                    label: uuid::Uuid::new_v4(),
                     present: true,
                 },
             ),
             said(
-                LAPTOP,
+                PHONE,
                 2,
-                Fact::Labeled {
-                    node: agent(),
-                    label: old,
-                    present: true,
-                },
-            ),
-            said(
-                PHONE,
-                3,
-                Fact::Labeled {
-                    node: agent(),
-                    label: old,
-                    present: false,
-                },
-            ),
-            said(
-                PHONE,
-                4,
                 Fact::Named {
                     node: agent(),
                     name: Some("eng".into()),
@@ -491,11 +297,6 @@ mod tests {
                     node: moved.clone(),
                     until: Until::In(SignedDuration::from_hours(1)),
                 },
-                Fact::Labeled {
-                    node: moved.clone(),
-                    label: gui,
-                    present: true,
-                },
                 Fact::Named {
                     node: moved.clone(),
                     name: Some("eng".into()),
@@ -506,56 +307,78 @@ mod tests {
     }
 
     #[test]
-    fn filing_settles_on_the_last_thing_said_from_any_device() {
+    fn a_name_settles_on_the_last_thing_said_from_any_device() {
         let mut marks = Marks::default();
-        let rho = uuid::Uuid::new_v4();
-        let gui = uuid::Uuid::new_v4();
-        let entries = [
+        let named = |device, minute, name: &str| {
             said(
-                LAPTOP,
-                0,
-                Fact::Label {
-                    label: rho,
-                    name: "rho".into(),
-                    parent: None,
-                },
-            ),
-            said(
-                PHONE,
-                1,
-                Fact::Label {
-                    label: gui,
-                    name: "gui".into(),
-                    parent: Some(rho),
-                },
-            ),
-            said(
-                LAPTOP,
-                2,
-                Fact::Labeled {
-                    node: agent(),
-                    label: gui,
-                    present: true,
-                },
-            ),
-            said(
-                PHONE,
-                3,
+                device,
+                minute,
                 Fact::Named {
                     node: agent(),
-                    name: Some("fixer".into()),
+                    name: Some(name.into()),
                 },
-            ),
-        ];
+            )
+        };
+        let entries = [named(LAPTOP, 0, "eng"), named(PHONE, 1, "fixer")];
         // Arriving in any order, and twice, comes to the same.
         let mut backwards = entries.to_vec();
         backwards.reverse();
         marks.apply(backwards);
         let touched = marks.apply(entries);
         assert!(touched.is_empty(), "entries already held move nothing");
-        assert_eq!(marks.label_path(gui), "rho/gui");
-        assert_eq!(marks.labeled(gui), vec![agent()]);
         assert_eq!(marks.get(&agent()).name.as_deref(), Some("fixer"));
+    }
+
+    /// The label facts older builds wrote still decode, and come to
+    /// nothing: no node, no move.
+    #[test]
+    fn old_label_facts_come_to_nothing() {
+        let mut marks = Marks::default();
+        let label = uuid::Uuid::new_v4();
+        let entries = [
+            said(
+                LAPTOP,
+                0,
+                Fact::Label {
+                    label,
+                    name: "rho".into(),
+                    parent: None,
+                },
+            ),
+            said(
+                LAPTOP,
+                1,
+                Fact::Repository {
+                    label,
+                    url: Some("https://example.com/rho".into()),
+                },
+            ),
+            said(
+                LAPTOP,
+                2,
+                Fact::Host {
+                    label,
+                    host: Some("local:/run/rho".into()),
+                },
+            ),
+            said(
+                PHONE,
+                3,
+                Fact::Labeled {
+                    node: agent(),
+                    label,
+                    present: true,
+                },
+            ),
+            said(PHONE, 4, Fact::Unlabel { label }),
+        ];
+        let read: Vec<Entry> = entries
+            .iter()
+            .map(|entry| Entry::decode(&entry.encode()).expect("an old label fact decodes"))
+            .collect();
+        assert!(marks.apply(read).is_empty());
+        assert_eq!(marks.nodes().count(), 0);
+        assert!(!marks.is_empty(), "the entries are still held");
     }
 
     #[test]

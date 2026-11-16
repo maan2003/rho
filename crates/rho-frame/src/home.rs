@@ -1,5 +1,5 @@
-//! Home: what is next, what is unread, where things are, and what the user
-//! put away, read at a glance.
+//! Home: what is next, what is unread and where things are, read at a
+//! glance.
 //!
 //! Nothing here scores anything. The cards are the dealer's, in the
 //! dealer's order, wearing the words the deal bar uses; the sections under
@@ -29,17 +29,6 @@ const HOME_KEY_BASE: usize = usize::MAX / 3;
 /// groom is an inbox.
 pub const HOME_CAP: usize = 5;
 
-/// One pile the user put cards on: Enter deals from it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PileRow {
-    /// `None` for everything snoozed, shown as `later`.
-    pub name: Option<String>,
-    pub count: usize,
-    /// When the first of it comes back by itself, in words; empty for a
-    /// named pile, which comes back only when opened.
-    pub back: String,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HomeRows {
     /// The top of the hand: a preview, not the queue.
@@ -48,8 +37,6 @@ pub struct HomeRows {
     pub sections: Vec<HomeSection>,
     /// Every channel across the systems, with where it is.
     pub channels: Vec<ChannelRow>,
-    /// Every pile, all of them: a pile nobody sees is where cards go to die.
-    pub piles: Vec<PileRow>,
 }
 
 impl HomeRows {
@@ -57,7 +44,6 @@ impl HomeRows {
         self.next.is_empty()
             && self.sections.iter().all(|section| section.rows.is_empty())
             && self.channels.is_empty()
-            && self.piles.is_empty()
     }
 }
 
@@ -65,8 +51,6 @@ impl HomeRows {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HomeTarget {
     Address(Address),
-    /// A pile, dealt from on Enter; `None` is everything snoozed.
-    Pile(Option<String>),
     /// A section heading or the empty line: nothing to open.
     None,
 }
@@ -78,7 +62,6 @@ enum HomeKey {
     Card(Address),
     Row(String, Address),
     Channel(Address),
-    Pile(Option<String>),
     Empty,
 }
 
@@ -313,30 +296,6 @@ impl HomeView {
                     Item::new(HomeKey::Channel(row.address.clone()), text)
                         .with_styles(styles)
                         .with_lines(vec![HomeTarget::Address(row.address.clone())]),
-                );
-            }
-        }
-        if !self.rows.piles.is_empty() {
-            items.push(section("piles"));
-            let column = column_of(
-                self.rows
-                    .piles
-                    .iter()
-                    .map(|row| row.name.clone().unwrap_or_else(|| "later".to_owned()))
-                    .collect(),
-            );
-            for row in &self.rows.piles {
-                let name = row.name.clone().unwrap_or_else(|| "later".to_owned());
-                let count = row.count.to_string();
-                let (text, styles) = columns(&[
-                    (name.as_str(), HomeClass::Title, column),
-                    (count.as_str(), HomeClass::Label, 3),
-                    (row.back.as_str(), HomeClass::Muted, 0),
-                ]);
-                items.push(
-                    Item::new(HomeKey::Pile(row.name.clone()), text)
-                        .with_styles(styles)
-                        .with_lines(vec![HomeTarget::Pile(row.name.clone())]),
                 );
             }
         }

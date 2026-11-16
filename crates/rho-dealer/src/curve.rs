@@ -32,9 +32,6 @@ pub const AGENT_FINISHED_GONE_DAYS: f64 = 3.0;
 pub const CHANNEL_TRAFFIC_HEAD_START: f64 = 0.1;
 pub const CHANNEL_TRAFFIC_GONE_DAYS: f64 = 1.0;
 pub const CHANNEL_ANSWERED_GONE_DAYS: f64 = 0.5;
-/// A todo sits low and rises slowly, and never fades: it stays until done.
-pub const TODO_HEAD_START: f64 = 0.0;
-pub const TODO_SLOPE_PER_DAY: f64 = 0.1;
 /// How many days before a deadline it starts to press, when the user did
 /// not say.
 pub const DEADLINE_LEAD_DAYS: u32 = 3;
@@ -83,8 +80,6 @@ pub enum Curve {
         since: Timestamp,
         gone_days: f64,
     },
-    /// On the user's plate since `since`: low, rising slowly, never gone.
-    Plate { since: Timestamp },
     /// Due at `by`: shows `lead_days` before, rises to it, and jumps over
     /// everything once it has passed.
     Deadline { by: Timestamp, lead_days: u32 },
@@ -103,8 +98,6 @@ impl Curve {
             } => {
                 head_start - (head_start - DEAL_QUEUE_FLOOR) * days(since, now).max(0.0) / gone_days
             }
-            Self::Plate { since } if now < since => f64::NEG_INFINITY,
-            Self::Plate { since } => TODO_HEAD_START + TODO_SLOPE_PER_DAY * days(since, now),
             Self::Deadline { by, lead_days } => {
                 let late = days(by, now);
                 let lead = f64::from(lead_days.max(1));
@@ -118,13 +111,12 @@ impl Curve {
     }
 
     /// The words for where the curve stands: `reason` with its `{age}`
-    /// filled in, or the curve's own words for a todo or a deadline.
+    /// filled in, or the curve's own words for a deadline.
     pub fn label(&self, reason: &str, now: Timestamp) -> String {
         match *self {
             Self::Waiting { since, .. } | Self::Fading { since, .. } => {
                 reason.replace("{age}", &age_label(days(since, now)))
             }
-            Self::Plate { since } => format!("todo · {}", age_label(days(since, now))),
             Self::Deadline { by, .. } => match days(by, now) {
                 late if late > 0.0 => format!("deadline · {}d late", late.floor() as u64),
                 late => format!("deadline · {}d", (-late).ceil() as u64),
@@ -132,12 +124,11 @@ impl Curve {
         }
     }
 
-    /// The moments at which this curve jumps rather than slides: a todo
-    /// arriving, a deadline coming into view or passing.
+    /// The moments at which this curve jumps rather than slides: a
+    /// deadline coming into view or passing.
     pub(crate) fn steps(&self) -> Vec<Timestamp> {
         match *self {
             Self::Waiting { .. } | Self::Fading { .. } => Vec::new(),
-            Self::Plate { since } => vec![since],
             Self::Deadline { by, lead_days } => vec![
                 by - SignedDuration::from_hours(24 * i64::from(lead_days.max(1))),
                 by,
@@ -218,16 +209,6 @@ mod tests {
             since: noon(),
         };
         assert!(room(0.0, CHANNEL_TRAFFIC_GONE_DAYS).priority(noon()) < thread.priority(noon()));
-    }
-
-    #[test]
-    fn a_todo_waits_for_its_start_and_then_climbs_slowly_for_good() {
-        let todo = Curve::Plate { since: noon() };
-        assert_eq!(todo.priority(ago(0.1)), f64::NEG_INFINITY);
-        assert_eq!(todo.priority(noon()), TODO_HEAD_START);
-        let month = noon() + SignedDuration::from_hours(24 * 30);
-        assert!((todo.priority(month) - (TODO_HEAD_START + 3.0)).abs() < 1e-9);
-        assert_eq!(todo.label("", month), "todo · 30.0d");
     }
 
     #[test]

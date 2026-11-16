@@ -57,19 +57,14 @@ pub enum Verdict {
     Mute,
     /// Out of the way until then.
     Snooze(Until),
-    /// Handled here, and on the user's plate until done: from `start`, or
-    /// from now.
-    Todo { start: Option<Until> },
-    /// Out of the way on the named pile, until the user opens it.
-    Pile(String),
 }
 
 impl Verdict {
     pub fn journal(&self) -> rho_journal::DealerVerdict {
         match self {
-            Self::Done | Self::Todo { .. } => rho_journal::DealerVerdict::Done,
+            Self::Done => rho_journal::DealerVerdict::Done,
             Self::Mute => rho_journal::DealerVerdict::Mute,
-            Self::Snooze(_) | Self::Pile(_) => rho_journal::DealerVerdict::Defer,
+            Self::Snooze(_) => rho_journal::DealerVerdict::Defer,
         }
     }
 }
@@ -90,21 +85,12 @@ pub struct Undo {
     pub reversals: Vec<Reversal>,
 }
 
-/// The pile a pull deals from instead of the hand, and what this sitting
-/// already passed over in it.
-pub struct OpenPile {
-    /// `None` for everything snoozed.
-    pub name: Option<String>,
-    pub passed: std::collections::HashSet<Address>,
-}
-
 pub struct Attention {
     streams: Arc<LedgerStreams>,
     /// This device, as its entries name it.
     device: Device,
     pub marks: Marks,
     pub skips: Skips,
-    pub open_pile: Option<OpenPile>,
     undo: Vec<Undo>,
     next_undo: u64,
 }
@@ -123,7 +109,6 @@ impl Attention {
             device,
             marks,
             skips: Skips::default(),
-            open_pile: None,
             undo: Vec::new(),
             next_undo: 0,
         };
@@ -280,8 +265,6 @@ impl Attention {
             Verdict::Done => Fact::Settled { node, seen },
             Verdict::Mute => Fact::Mute { node },
             Verdict::Snooze(until) => Fact::Snooze { node, until },
-            Verdict::Todo { start } => Fact::Todo { node, start, seen },
-            Verdict::Pile(pile) => Fact::Piled { node, pile },
         }
     }
 }
@@ -289,7 +272,7 @@ impl Attention {
 impl Frame {
     /// What the user said, as this device holds it: every fact, and each
     /// note's newest revision ([`Marks::note`]). A system whose things are
-    /// the user's own (notes, labels) reads them here and says new ones
+    /// the user's own (notes) reads them here and says new ones
     /// through [`Frame::write_marks`]; a note's revision carries only text
     /// the user typed.
     pub fn marks(&self) -> &Marks {
@@ -321,12 +304,4 @@ impl SlotNote {
     fn decode(mut bytes: &[u8]) -> Option<Self> {
         senax_encoder::decode(&mut bytes).ok()
     }
-}
-
-/// A label path split into its names, with empty ones dropped.
-pub fn path_names(path: &str) -> Vec<&str> {
-    path.split('/')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .collect()
 }

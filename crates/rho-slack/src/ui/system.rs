@@ -628,19 +628,19 @@ pub struct Said {
     muted: bool,
 }
 
-/// What a verdict on `unit` does in Slack. Done, mute and todo mean the
-/// user is through with what is there: rho's cursor moves to its newest
-/// message, and the outbox tells Slack, so every other client reads it as
-/// read (S5). A mute is Slack's own too, a conversation muted or a thread
-/// unfollowed there, so it holds wherever they read Slack (S6). A snooze
-/// or a pile is only rho's.
+/// What a verdict on `unit` does in Slack. Done and mute mean the user is
+/// through with what is there: rho's cursor moves to its newest message,
+/// and the outbox tells Slack, so every other client reads it as read. A
+/// mute is Slack's own too, a conversation muted or a thread unfollowed
+/// there, so it holds wherever they read Slack (S6). A snooze is only
+/// rho's.
 pub fn say(
     session: &mut Session,
     unit: &Unit,
     verdict: &Verdict,
     cx: &mut Context<Session>,
 ) -> Option<Said> {
-    if matches!(verdict, Verdict::Snooze(_) | Verdict::Pile(_)) {
+    if matches!(verdict, Verdict::Snooze(_)) {
         return None;
     }
     let newest = session.model().unit(unit).map(|facts| facts.newest.clone());
