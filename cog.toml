@@ -1,0 +1,31 @@
+# Tag prefix (v0.1.0, v0.1.1, …)
+tag_prefix = "v"
+
+# Root-level hooks run automatically on `cog bump`.
+pre_bump_hooks = [
+    "cargo set-version {{version}}",
+    "cargo update --workspace",
+    "git add Cargo.toml",
+]
+post_bump_hooks = []
+
+[changelog]
+path = "CHANGELOG.md"
+template = "remote"
+remote = "github.com"
+repository = "iroh-ipc-transport"
+owner = "legra-ai"
+authors = [{ username = "jgeluk", signature = "Jacobus Geluk" }]
+
+[commit_types]
+feat = { changelog_title = "Features" }
+fix = { changelog_title = "Bug Fixes" }
+docs = { changelog_title = "Documentation" }
+style = { changelog_title = "Styling", omit_from_changelog = true }
+refactor = { changelog_title = "Code Refactoring" }
+perf = { changelog_title = "Performance Improvements" }
+test = { changelog_title = "Tests", omit_from_changelog = true }
+build = { changelog_title = "Build System" }
+ci = { changelog_title = "Continuous Integration", omit_from_changelog = true }
+chore = { changelog_title = "Miscellaneous Chores", omit_from_changelog = true }
+revert = { changelog_title = "Reverts" }

@@ -1,0 +1,12 @@
+name: Conventional Commits
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+permissions:
+  pull-requests: read
+jobs:
+  title:
+    name: Conventional Commit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: legra-ai/github-actions/.github/actions/conventional-commit@7161b3b0fb80eb36ff9d92faccfced2a8001fe40
