@@ -143,6 +143,14 @@ class Chat:
         print(f"Started #{thread}.")
         return thread
 
+    def roots(self):
+        """The roots of the chat, the streams, oldest first, each with its id."""
+        lines = [
+            f"#{record['id']} {_label_text(rho_chat.thread(record['id'])['name'])}"
+            for record in rho_chat.read(None, 1 << 31)
+        ]
+        return report("\n".join(lines) if lines else "No threads yet.")
+
     def join(self, thread):
         """Receive every later message of `thread` and the threads under it."""
         self._thread(thread)

@@ -6,6 +6,7 @@
 //! about worksets, agents and chat; the pool holds only what runs.
 
 mod gccp;
+mod naming;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -893,6 +894,7 @@ impl AgentPool {
         let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
         self.wake_receivers(id, None);
+        self.consider_naming(id);
         Ok(id)
     }
 
@@ -1230,6 +1232,7 @@ impl AgentPool {
                 let id = write.post(UnixMs::now(), parent, message, None)?;
                 write.commit();
                 self.wake_receivers(id, Some(workset));
+                self.consider_naming(id);
                 PyReply::Seq(id.0)
             }
             PyRequest::Mail { sender, to, text } => {

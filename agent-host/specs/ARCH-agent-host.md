@@ -109,7 +109,9 @@ rule of it.
 A move is a parent change (`Reparented`) and the subtree follows; a message
 is read in the thread it is in now, so `#41` always leads to it. `Named` is
 the only thread metadata: without a name the GUI shows the first line of
-the thread's message. Nothing resolves a thread: an agent says done with a
+the thread's message. The host names a thread under a root once, when its
+second message arrives and nothing has named it, from a model's reading of
+those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
 `result` mention, and the user says so in the ledger, which is theirs
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.

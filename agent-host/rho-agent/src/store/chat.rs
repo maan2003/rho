@@ -255,6 +255,10 @@ pub trait ChatWrite {
     /// Names a thread; empty takes the name back. A name it has logs
     /// nothing.
     fn name(&mut self, at: UnixMs, thread: MessageId, name: String) -> anyhow::Result<()>;
+    /// Names a thread nothing has named: an existing name wins, whoever
+    /// gave it. Whether the thread was named now.
+    fn name_unnamed(&mut self, at: UnixMs, thread: MessageId, name: String)
+    -> anyhow::Result<bool>;
     /// Replays one event into the indexes: what [`ChatWrite::post`] and the
     /// others do after they append. The migration rebuilds the indexes
     /// with it.
@@ -438,6 +442,20 @@ impl ChatWrite for WriteTxn {
         let seq = append(self, at, event.clone());
         self.index_chat_event(seq, &event);
         Ok(())
+    }
+
+    fn name_unnamed(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        name: String,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(is_message(self, thread), "no message {}", thread.0.0);
+        if self.open_table(NAMES).get(thread.0.0).is_some() || name.trim().is_empty() {
+            return Ok(false);
+        }
+        self.name(at, thread, name)?;
+        Ok(true)
     }
 
     fn index_chat_event(&mut self, seq: ChatSeq, event: &ChatEvent) {

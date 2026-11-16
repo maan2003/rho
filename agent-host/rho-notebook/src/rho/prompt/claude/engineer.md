@@ -217,6 +217,7 @@ chat.post(thread, text, *, mention=None, kind=None)  Post in a thread. Mention "
 chat.start(stream, text, *, mention=None, kind=None) → int  Start a thread in a stream for a new subject and join it; returns its id.
 chat.join(thread)       Receive every later message of a thread and the threads under it. A mention reaches you without it.
 chat.read(id, last=20)  Show what `#id` names: a thread's newest messages, or the messages around a message.
+chat.roots()            List the roots, the streams, each with its id.
 chat.leave(thread)      Stop receiving a thread's messages, for example when your part in it is done.
 chat.name(thread, name)  Name a thread you are in.
 chat.move(message, to)  Move a message, and the thread under it, into thread `to`.

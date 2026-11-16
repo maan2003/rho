@@ -542,6 +542,23 @@ async fn chat_moves_subtrees_and_names_threads() {
     );
     write.name(UnixMs(10), aside, "An aside".into()).unwrap();
     write.name(UnixMs(11), aside, String::new()).unwrap();
+    // The host's own naming yields to a name a thread has, and to nothing.
+    assert!(
+        !write
+            .name_unnamed(UnixMs(12), work, "Other".into())
+            .unwrap()
+    );
+    assert!(!write.name_unnamed(UnixMs(12), aside, "  ".into()).unwrap());
+    assert!(
+        write
+            .name_unnamed(UnixMs(12), aside, "Set aside".into())
+            .unwrap()
+    );
+    assert!(
+        !write
+            .name_unnamed(UnixMs(12), aside, "Again".into())
+            .unwrap()
+    );
     assert!(
         write
             .name(UnixMs(11), MessageId(ChatSeq(999)), "x".into())
@@ -571,10 +588,10 @@ async fn chat_moves_subtrees_and_names_threads() {
         vec![(ops, "ops".to_owned()), (work, "Fixed it".to_owned())]
     );
     assert_eq!(thread.members, [a]);
-    assert_eq!(read.thread(aside).unwrap().name, "an aside");
+    assert_eq!(read.thread(aside).unwrap().name, "Set aside");
     assert_eq!(
         read.thread(aside).unwrap().path,
-        vec![(kept, "one".to_owned()), (aside, "an aside".to_owned())]
+        vec![(kept, "one".to_owned()), (aside, "Set aside".to_owned())]
     );
     // `a` heard what came while it was a member; the moves delivered
     // nothing.
@@ -588,7 +605,7 @@ async fn chat_moves_subtrees_and_names_threads() {
         .iter()
         .filter(|record| matches!(record.event, ChatEvent::Named { .. }))
         .count();
-    assert_eq!((moves, names), (2, 3));
+    assert_eq!((moves, names), (2, 4));
 }
 
 /// Temporary (`temp-migration`): the old log of streams, topics and direct

@@ -371,6 +371,17 @@ class Tools(WorksetCase):
         with self.assertRaisesRegex(ValueError, "names no message"):
             chat.read(999)
 
+    def test_roots_lists_the_streams(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        printed, _ = run(lambda: chat.roots())
+        self.assertEqual(printed, "No threads yet.\n")
+        rho_ = fake_rho.post_user(None, "rho")
+        ops = fake_rho.post_user(None, "ops")
+        fake_rho.name("user", ops, "Operations")
+        printed, _ = run(lambda: chat.roots())
+        self.assertEqual(printed, f"#{rho_} rho\n#{ops} Operations\n")
+
     def test_an_agent_names_and_moves_only_in_its_threads(self):
         ns, _ = self.notebook(self.root)
         chat = ns["chat"]

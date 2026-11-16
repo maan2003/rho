@@ -178,8 +178,10 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   is removed, the chat `Hello` carries the seed too, and the first hello
   moves the chat cache rows and re-says the ledger facts under the new
   address (`Frame::restate`).
-- The host makes no naming attempt: a thread is named by the user or by
-  an agent (`rho.chat.name`), else by the first line of its message.
+- The host names a thread under a root once: when its second message
+  arrives and nothing named it, a model reads those two messages and the
+  host logs a `Named`. A name from the user or an agent (`rho.chat.name`)
+  wins, before or after. Without any, the first line of its message serves.
 - Starting an agent goes through the agents system's rows on a thread
   surface: `a start agent here` from the message under the point,
   `S send and start agent` from a draft; where (`new on`, `here`, `join`)
