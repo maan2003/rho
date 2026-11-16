@@ -38,15 +38,24 @@ pub type CredentialsProvider =
 pub struct WebSearchTools {
     credentials: CredentialsProvider,
     session_id: Arc<str>,
+    /// The ChatGPT model the search runs as. The endpoint rejects a request
+    /// without a model it knows, and the caller's agent may not be a ChatGPT
+    /// model at all.
+    model: Arc<str>,
     client: reqwest::Client,
     search_url: Arc<str>,
 }
 
 impl WebSearchTools {
-    pub fn new(credentials: CredentialsProvider, session_id: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        credentials: CredentialsProvider,
+        session_id: impl Into<Arc<str>>,
+        model: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             credentials,
             session_id: session_id.into(),
+            model: model.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
@@ -67,7 +76,7 @@ impl WebSearchTools {
             .map_err(|error| format!("obtaining ChatGPT OAuth credentials: {error:#}"))?;
         let request = SearchRequest {
             id: self.session_id.to_string(),
-            model: context.model.to_string(),
+            model: self.model.to_string(),
             reasoning: None,
             input: recent_input(&context.input).map(SearchInput::Items),
             commands: Some(commands),
@@ -327,18 +336,12 @@ mod tests {
                 })
             })
         });
-        let mut tools = WebSearchTools::new(credentials, "agent-session");
+        let mut tools = WebSearchTools::new(credentials, "agent-session", "gpt-test");
         tools.search_url = url.into();
         for _ in 0..2 {
             assert_eq!(
                 tools
-                    .run(
-                        WebRequest::default(),
-                        ToolExecutionContext {
-                            model: "gpt-test".into(),
-                            ..Default::default()
-                        }
-                    )
+                    .run(WebRequest::default(), ToolExecutionContext::default())
                     .await
                     .unwrap(),
                 "search result"
@@ -362,7 +365,7 @@ mod tests {
         install_tls_provider();
         let credentials: CredentialsProvider =
             Arc::new(|| Box::pin(async { Err(anyhow::anyhow!("no account available")) }));
-        let mut tools = WebSearchTools::new(credentials, "agent-session");
+        let mut tools = WebSearchTools::new(credentials, "agent-session", "gpt-test");
         tools.search_url = "http://127.0.0.1:9/search".into();
         assert_eq!(
             tools
