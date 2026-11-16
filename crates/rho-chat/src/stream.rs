@@ -114,7 +114,6 @@ impl HostStream for ChatStream {
                 let ServerFrame::Hello {
                     head,
                     host: endpoint,
-                    ..
                 } = read_frame(&mut socket).await?
                 else {
                     anyhow::bail!("the chat session did not open with its hello");

@@ -201,8 +201,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the host the same way. There is no Unix stream socket and no `--iroh`.
 - A host is named by its iroh endpoint key, which both sessions' `Hello`
   carry: `ThreadId { host: EndpointId, message }`. `machine_seed` stays
-  only as the domain agent ids are encoded in; the chat `Hello` still
-  carries it unread until the next protocol epoch.
+  only as the domain agent ids are encoded in, which the agents session's
+  `Host` frame carries.
 - The host names a thread under a root once: when its second message
   arrives and nothing named it, a model reads those two messages and the
   host logs a `Named`. A name from the user or an agent (`rho.chat.name`)
@@ -217,10 +217,10 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the point, `send and start agent` from a draft; where (`new on`,
   `here`, `join`) and the runtime are transients.
 - The phone is a layout of the same frame, chosen by window width.
-- Notes are `Wrote` facts in the log since 2026-11-16; a device that
-  still holds slot blobs says each once as a fact on start, a temp
-  migration in `rho_frame::attention`. The slot tables and the `Put`
-  and `Slot` frames stay until every device has run it. A thread shows
+- Notes are `Wrote` facts in the log since 2026-11-16. The slot blobs
+  they synced as before, their tables and the `Put` and `Slot` frames
+  are gone (epoch 51); a device that held slot blobs said each once as
+  a fact when it first ran a build of that day. A thread shows
   the notes about each of its messages under it as the user's private
   replies, `reply privately` makes one, and Home lists the notes about
   nothing as private rooms. `new note` makes one about nothing, with no

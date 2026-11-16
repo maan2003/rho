@@ -14297,9 +14297,7 @@ name = "rho-ledger-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
  "futures",
- "rand 0.10.3",
  "redb",
  "rho-agent-hosts",
  "rho-db",

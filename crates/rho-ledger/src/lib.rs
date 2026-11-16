@@ -4,8 +4,6 @@
 
 #[cfg(feature = "client")]
 mod ledger;
-#[cfg(feature = "client")]
-pub mod notes;
 pub mod protocol;
 #[cfg(feature = "client")]
 mod seal;

@@ -40,8 +40,10 @@ to the host being replaced and may not speak to the deployer's host.
   usually re-executes the host you run on in place: it finishes requests in
   flight, then swaps its binary, and your workset keeps running commands and
   Python state. Your workset keeps its old worker code until it restarts.
-  A protocol change needs a full restart instead: it kills every workset,
-  with its running commands and Python state, and wakes no one by itself.
+  A GUI protocol epoch bump (`IROH_ALPN`) still re-executes in place. Only
+  a break in the workset protocol, between the host and its workers, needs
+  a full restart: it kills every workset, with its running commands and
+  Python state, and wakes no one by itself.
 - The deployer's reply wakes you: either the rev now running, or that it
   rolled back and why, with the log lines it judged by. After a rollback, the
   fix is yours; land it and ask again.
