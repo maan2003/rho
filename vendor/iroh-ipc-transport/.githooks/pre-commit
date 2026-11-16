@@ -1,0 +1,10 @@
+#!/bin/sh
+# Formatting and linting use the repository-pinned toolchains.
+if ! sh scripts/fmt.sh --check; then
+    printf 'Format check failed. Run: sh scripts/fmt.sh\n' >&2
+    exit 1
+fi
+if ! cargo clippy --locked --lib --tests -- -D warnings; then
+    printf 'Clippy check failed.\n' >&2
+    exit 1
+fi
