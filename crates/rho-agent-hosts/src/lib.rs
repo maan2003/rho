@@ -91,6 +91,19 @@ impl AttachTarget {
         }
     }
 
+    /// The host's identity before it answers: what it published, for a
+    /// local one, and `None` when no host has run there yet.
+    pub fn endpoint(&self) -> Option<rho_agent_types::EndpointId> {
+        let endpoint = match self {
+            Self::Local { runtime_dir } => {
+                let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime_dir)).ok()?;
+                rho_rpc::local_host(&paths).ok()?
+            }
+            Self::Iroh { endpoint_id, .. } => *endpoint_id,
+        };
+        Some(rho_agent_types::EndpointId(*endpoint.as_bytes()))
+    }
+
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
         match self {

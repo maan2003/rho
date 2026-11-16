@@ -181,7 +181,7 @@ impl Surface for UsageSurface {
 
     /// The other pictures over the same window, and this picture over the
     /// other one. Model cost is `k` here rather than the usage menu's `c`,
-    /// which the root menu gives to a new channel.
+    /// which the chat system's rows give to a new channel.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let here = self.chart;
         let open = |key: &'static str, chart| super::open_row(self.system.clone(), key, chart);

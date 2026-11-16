@@ -101,7 +101,6 @@ async fn sender_rejects_foreign_and_malformed_addresses() {
     dir.close().await;
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn bind_failure_preserves_an_unrelated_filesystem_entry() {
     let dir = common::TestDir::new().await;

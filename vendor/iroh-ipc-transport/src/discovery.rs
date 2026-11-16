@@ -1,8 +1,6 @@
 //! Filesystem rendezvous, with leases instead of socket liveness probes.
 
 use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,7 +9,6 @@ use iroh_base::CustomAddr;
 use tokio::io::AsyncReadExt;
 
 use crate::IPC_TRANSPORT_ID;
-use crate::directory_access::DirectoryAccess;
 use crate::locking::Lock;
 
 /// Local rendezvous directory shared by cooperating processes.
@@ -23,29 +20,13 @@ use crate::locking::Lock;
 #[derive(Debug, Clone)]
 pub struct LocalDiscovery {
     root: PathBuf,
-    access: DirectoryAccess,
 }
 
 impl LocalDiscovery {
     /// Choose a rendezvous directory private to the current user. If missing,
     /// it is created on first use with mode `0700`, independent of the umask.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_access(root, DirectoryAccess::Owner)
-    }
-
-    /// Choose a rendezvous directory shared by every local user. If missing,
-    /// it is created on first use with mode `01777` (world-writable, sticky),
-    /// independent of the umask, so peers running as different users can
-    /// rendezvous. An existing directory keeps whatever mode it has.
-    pub fn shared(root: impl Into<PathBuf>) -> Self {
-        Self::with_access(root, DirectoryAccess::Shared)
-    }
-
-    fn with_access(root: impl Into<PathBuf>, access: DirectoryAccess) -> Self {
-        Self {
-            root: root.into(),
-            access,
-        }
+        Self { root: root.into() }
     }
 
     /// The rendezvous directory.
@@ -82,7 +63,6 @@ impl LocalDiscovery {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
                 Ok(lock) => {
-                    #[cfg(target_os = "linux")]
                     remove_if_present(&self.socket_path(id)).await?;
                     remove_if_present(&self.record_path(id)).await?;
                     drop(lock);
@@ -150,13 +130,12 @@ impl LocalDiscovery {
     /// at most 107 bytes, and the full 64-character id leaves too few for
     /// the directory. The record and lease, which are looked up by id, keep
     /// the whole of it.
-    #[cfg(target_os = "linux")]
     pub(crate) fn socket_path(&self, id: EndpointId) -> PathBuf {
         self.root.join(format!("{:.16}.sock", id.to_string()))
     }
 
     pub(crate) async fn guard(&self) -> io::Result<Lock> {
-        self.access.ensure(&self.root).await?;
+        crate::directory_access::ensure_private(&self.root).await?;
         let path = self.root.join(".ipc.lock");
         // This single persistent lock serializes pathname creation/removal, so
         // nobody can acquire a lease on an unlinked inode. It is never removed.
@@ -180,7 +159,6 @@ pub(crate) struct Lease {
     discovery: LocalDiscovery,
     id: EndpointId,
     lock: Lock,
-    #[cfg(target_os = "linux")]
     socket: Option<PathBuf>,
 }
 
@@ -196,7 +174,6 @@ impl Lease {
                     error
                 }
             })?;
-        #[cfg(target_os = "linux")]
         {
             // Only a valid record written by this transport grants ownership
             // of a stale socket pathname. Never delete an unrelated entry.
@@ -221,36 +198,30 @@ impl Lease {
             discovery,
             id,
             lock,
-            #[cfg(target_os = "linux")]
             socket: None,
         })
     }
 
     pub(crate) async fn publish(&mut self, addr: &CustomAddr) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
         {
             self.socket = crate::backend::Backend::path(addr);
         }
-        // Windows file locks exclude reads from other handles. Keep the locked
-        // lease empty and store the readable address in a separate regular
-        // file.
+        // The lease stays empty and locked; the address is a regular file
+        // beside it that anyone resolving reads.
         let path = self.discovery.record_path(self.id);
         tokio::fs::write(&path, addr.data()).await?;
-        #[cfg(unix)]
-        {
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).await?;
-        }
+        crate::directory_access::make_private(&path).await?;
         Ok(())
     }
 
     pub(crate) async fn release(self) -> io::Result<()> {
         let _guard = self.discovery.guard().await?;
-        #[cfg(target_os = "linux")]
         if let Some(path) = &self.socket {
             remove_if_present(path).await?;
         }
-        // Close before unlink on Windows, where an open handle can forbid
-        // deletion. The directory guard excludes all new binders/resolvers.
+        // Close before unlink, as the upstream did for Windows, where an open
+        // handle can forbid deletion. The directory guard excludes all new
+        // binders/resolvers.
         let record = self.discovery.record_path(self.id);
         drop(self.lock);
         remove_if_present(&record).await?;

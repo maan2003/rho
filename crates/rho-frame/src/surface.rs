@@ -36,7 +36,7 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         Subject::Own
     }
 
-    /// The surface's own rows for the root menu, for what is in view.
+    /// The surface's own rows for the palette, for what is in view.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
     }

@@ -14213,6 +14213,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "rho-agent-hosts",
+ "rho-agent-types",
  "rho-db",
  "rho-dealer",
  "rho-journal",

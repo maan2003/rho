@@ -485,6 +485,7 @@ impl System for ChatSystem {
         &mut self,
         host: HostId,
         name: &str,
+        endpoint: Option<EndpointId>,
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
@@ -493,7 +494,7 @@ impl System for ChatSystem {
             Slot {
                 name: name.to_owned(),
                 link: link.clone(),
-                endpoint: None,
+                endpoint,
             },
         );
         vec![Arc::new(ChatStream::new(

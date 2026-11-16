@@ -575,6 +575,7 @@ impl System for AgentsSystem {
         &mut self,
         host: HostId,
         name: &str,
+        _endpoint: Option<EndpointId>,
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {

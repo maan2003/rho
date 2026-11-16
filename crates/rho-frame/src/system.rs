@@ -13,6 +13,7 @@ use std::sync::Arc;
 use gpui::{App, Context, Entity, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
+use rho_agent_types::EndpointId;
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
@@ -78,11 +79,13 @@ pub trait System: Sized + 'static {
     ) -> Option<AnySurface>;
 
     /// The streams this system keeps to a host, opened on every connect.
-    /// `name` is what the user calls the host.
+    /// `name` is what the user calls the host, `endpoint` its identity as
+    /// far as the client knows before the host answers.
     fn streams(
         &mut self,
         _host: HostId,
         _name: &str,
+        _endpoint: Option<EndpointId>,
         _link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
@@ -91,7 +94,7 @@ pub trait System: Sized + 'static {
 
     fn detached(&mut self, _host: HostId, _cx: &mut Context<Self>) {}
 
-    /// Rows for the root menu, given what is in view.
+    /// Rows for the palette, given what is in view.
     fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
     }
@@ -167,6 +170,7 @@ trait SystemHandle {
         &self,
         host: HostId,
         name: &str,
+        endpoint: Option<EndpointId>,
         link: &Link,
         cx: &mut App,
     ) -> Vec<Arc<dyn HostStream>>;
@@ -202,10 +206,13 @@ impl<S: System> SystemHandle for Entity<S> {
         &self,
         host: HostId,
         name: &str,
+        endpoint: Option<EndpointId>,
         link: &Link,
         cx: &mut App,
     ) -> Vec<Arc<dyn HostStream>> {
-        self.update(cx, |system, cx| system.streams(host, name, link, cx))
+        self.update(cx, |system, cx| {
+            system.streams(host, name, endpoint, link, cx)
+        })
     }
 
     fn detached(&self, host: HostId, cx: &mut App) {
@@ -280,10 +287,11 @@ impl AnySystem {
         &self,
         host: HostId,
         name: &str,
+        endpoint: Option<EndpointId>,
         link: &Link,
         cx: &mut App,
     ) -> Vec<Arc<dyn HostStream>> {
-        self.0.streams(host, name, link, cx)
+        self.0.streams(host, name, endpoint, link, cx)
     }
 
     pub fn detached(&self, host: HostId, cx: &mut App) {

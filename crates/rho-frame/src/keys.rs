@@ -17,10 +17,12 @@ actions!(
         Close,
         /// Closes the surface in view and deals the next card.
         CloseAndDeal,
-        /// `space`: every command, one level down at most.
-        RootMenu,
-        /// `tab`: the verdicts over the card in view; `tab` again is Home.
+        /// `:`: every command by name.
+        Palette,
+        /// `space`: the verdicts over the card in view; `space` again is
+        /// Home.
         VerdictMenu,
+        /// `tab`: Home, and from Home the way back.
         Home,
         OpenRow,
         FindAddress,
@@ -59,8 +61,9 @@ pub fn bind(cx: &mut App) {
     }
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
         bindings.extend([
-            KeyBinding::new("space", RootMenu, Some(&context)),
-            KeyBinding::new("tab", VerdictMenu, Some(&context)),
+            KeyBinding::new(":", Palette, Some(&context)),
+            KeyBinding::new("space", VerdictMenu, Some(&context)),
+            KeyBinding::new("tab", Home, Some(&context)),
             KeyBinding::new("q", Close, Some(&context)),
         ]);
     }

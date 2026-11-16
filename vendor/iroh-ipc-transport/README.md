@@ -1,5 +1,9 @@
 # iroh-ipc-transport
 
+> rho's copy: Linux only, every file private to the user (`0700` directory,
+> `0600` sockets, records and leases), and `LocalDiscovery::sweep`. The
+> upstream text below describes the original.
+
 [![Crates.io](https://img.shields.io/crates/v/iroh-ipc-transport.svg)](https://crates.io/crates/iroh-ipc-transport)
 [![Documentation](https://docs.rs/iroh-ipc-transport/badge.svg)](https://docs.rs/iroh-ipc-transport)
 [![CI](https://github.com/legra-ai/iroh-ipc-transport/actions/workflows/ci.yml/badge.svg)](https://github.com/legra-ai/iroh-ipc-transport/actions/workflows/ci.yml)

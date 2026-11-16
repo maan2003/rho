@@ -9,7 +9,7 @@
 //! A page takes every key, so the frame's normal-mode keys cannot reach
 //! the frame from one. Its chords can (`ctrl-k`, `ctrl-j`, `ctrl-shift-f`,
 //! `ctrl-shift-backspace`), and two more are bound here: `ctrl-shift-escape`
-//! goes Home and `ctrl-shift-space` is the root menu.
+//! goes Home and `ctrl-shift-space` is the palette.
 
 mod pages;
 
@@ -254,13 +254,13 @@ impl Surface for PageView {
 
 fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
-    use rho_frame::keys::{Home, RootMenu};
+    use rho_frame::keys::{Home, Palette};
     // Under the frame's own context, so the frame's handlers hear them;
     // a page takes every key that no binding names.
     let context = format!("{} > RhoBrowser", rho_frame::KEY_CONTEXT);
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-escape", Home, Some(&context)),
-        KeyBinding::new("ctrl-shift-space", RootMenu, Some(&context)),
+        KeyBinding::new("ctrl-shift-space", Palette, Some(&context)),
     ]);
 }
 

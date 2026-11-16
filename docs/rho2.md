@@ -182,8 +182,13 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   arrives and nothing named it, a model reads those two messages and the
   host logs a `Named`. A name from the user or an agent (`rho.chat.name`)
   wins, before or after. Without any, the first line of its message serves.
+- Keys: `space` is the verdict transient over the card in view, and
+  again it is Home; `tab` is Home; `:` is the palette, every row of the
+  frame, the surface and the systems by name, fuzzy, with the keys it has
+  in the menus as a hint. Transients stay only where the list is the
+  information: the verdicts, the snooze times, and where an agent starts.
 - Starting an agent goes through the agents system's rows on a thread
-  surface: `a start agent here` from the message under the point,
-  `S send and start agent` from a draft; where (`new on`, `here`, `join`)
-  and the runtime are transients.
+  surface, from the palette: `start agent here` from the message under
+  the point, `send and start agent` from a draft; where (`new on`,
+  `here`, `join`) and the runtime are transients.
 - The phone is a layout of the same frame, chosen by window width.

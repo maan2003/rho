@@ -1,10 +1,9 @@
-//! Linux Unix datagrams. This module is never compiled on macOS.
+//! Linux Unix datagrams.
 
 use std::ffi::OsStr;
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll};
 
@@ -37,7 +36,7 @@ impl Backend {
         .await
         .map_err(io::Error::other)??;
         let socket = UnixDatagram::from_std(socket)?;
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).await?;
+        crate::directory_access::make_private(&path).await?;
         let sock = socket2::SockRef::from(&socket);
         // OS limits may clamp these hints; correctness relies on readiness,
         // bounded batch draining and QUIC congestion control, not buffer size.
