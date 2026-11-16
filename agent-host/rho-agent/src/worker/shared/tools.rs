@@ -17,7 +17,7 @@ use rho_tool_shell::ShellTools;
 use rho_web_search::{WebRequest, WebSearchTools};
 
 use super::outbox::Outbox;
-use crate::inference::Inference;
+use crate::inference::{Inference, InferenceModel};
 use crate::ipc::protocol::SharedCall;
 use crate::papercut::PapercutArgs;
 use crate::worker::host_client::HostClient;
@@ -71,6 +71,7 @@ pub(crate) fn host_tools(
                         })
                     },
                     agent_id.encoded().to_owned(),
+                    InferenceModel::Gpt61Sol.as_str(),
                 ),
             },
         ));
