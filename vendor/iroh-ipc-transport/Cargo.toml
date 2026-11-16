@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 # The custom-transport API is gated behind iroh's `unstable-custom-transports`
 # feature — experimental and may shift between iroh releases; pinned tightly.
-iroh = { version = "1.3.0", features = ["unstable-custom-transports"] }
+iroh = { version = "1.3.0", default-features = false, features = ["unstable-custom-transports"] }
 socket2 = "0.6"
 iroh-base = "1.3.0"
 n0-watcher = "1.0"
@@ -28,5 +28,3 @@ tracing = "0.1"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "fs", "process"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[build-dependencies]
-rhusky = "0.0.6"

@@ -46,7 +46,8 @@ async fn competing_bind_preserves_live_owner_and_close_releases_identity() {
     assert_eq!(owner.bind().unwrap_err().kind(), io::ErrorKind::AddrInUse);
     owner.close().await.unwrap();
     assert_eq!(discovery.resolve(id).await.unwrap(), None);
-    // Retaining the old iroh sender cannot retain a live OS resource after close.
+    // Retaining the old iroh sender cannot retain a live OS resource after
+    // close.
     let _sender = endpoint.create_sender();
     let replacement = IpcTransport::prepare(discovery.clone(), id).await.unwrap();
     assert!(discovery.resolve(id).await.unwrap().is_some());
@@ -105,7 +106,7 @@ async fn sender_rejects_foreign_and_malformed_addresses() {
 async fn bind_failure_preserves_an_unrelated_filesystem_entry() {
     let dir = common::TestDir::new().await;
     let id = SecretKey::generate().public();
-    let path = dir.path().join(format!("{id}.sock"));
+    let path = dir.path().join(format!("{:.16}.sock", id.to_string()));
     tokio::fs::write(&path, b"unrelated file").await.unwrap();
     assert!(
         IpcTransport::prepare(LocalDiscovery::new(dir.path()), id)

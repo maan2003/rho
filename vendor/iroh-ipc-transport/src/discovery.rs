@@ -53,6 +53,47 @@ impl LocalDiscovery {
         &self.root
     }
 
+    /// Remove the records of owners that are gone: a lease nobody holds,
+    /// and the record and socket beside it. Returns how many were removed.
+    /// A crash leaves such records; the next owner of the same identity
+    /// reclaims its own, and this reclaims everyone's.
+    pub async fn sweep(&self) -> io::Result<usize> {
+        if !tokio::fs::try_exists(&self.root).await? {
+            return Ok(0);
+        }
+        let _guard = self.guard().await?;
+        let mut entries = tokio::fs::read_dir(&self.root).await?;
+        let mut removed = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("lease") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<EndpointId>().ok())
+            else {
+                continue;
+            };
+            match Lock::open(&path, false).await {
+                // Held: its owner lives.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+                Ok(lock) => {
+                    #[cfg(target_os = "linux")]
+                    remove_if_present(&self.socket_path(id)).await?;
+                    remove_if_present(&self.record_path(id)).await?;
+                    drop(lock);
+                    remove_if_present(&path).await?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Select a local-only dial target for a live co-located peer.
     /// Targets without a local lease retain their supplied addresses.
     ///
@@ -83,7 +124,8 @@ impl LocalDiscovery {
             Err(error) => return Err(error),
         }
         let mut file = tokio::fs::File::open(path).await?;
-        // bounded: a transport address is at most 512 bytes, plus one overflow byte.
+        // bounded: a transport address is at most 512 bytes, plus one overflow
+        // byte.
         let mut bytes = Vec::with_capacity(513);
         (&mut file).take(513).read_to_end(&mut bytes).await?;
         let addr = CustomAddr::from_parts(IPC_TRANSPORT_ID, &bytes);
@@ -104,9 +146,13 @@ impl LocalDiscovery {
         self.root.join(format!("{id}.lease"))
     }
 
+    /// The socket carries only a prefix of the id: an AF_UNIX pathname is
+    /// at most 107 bytes, and the full 64-character id leaves too few for
+    /// the directory. The record and lease, which are looked up by id, keep
+    /// the whole of it.
     #[cfg(target_os = "linux")]
     pub(crate) fn socket_path(&self, id: EndpointId) -> PathBuf {
-        self.root.join(format!("{id}.sock"))
+        self.root.join(format!("{:.16}.sock", id.to_string()))
     }
 
     pub(crate) async fn guard(&self) -> io::Result<Lock> {
@@ -156,7 +202,8 @@ impl Lease {
             // of a stale socket pathname. Never delete an unrelated entry.
             match tokio::fs::File::open(discovery.record_path(id)).await {
                 Ok(file) => {
-                    // bounded: only a complete transport address can authorize cleanup.
+                    // bounded: only a complete transport address can authorize
+                    // cleanup.
                     let mut bytes = Vec::with_capacity(513);
                     file.take(513).read_to_end(&mut bytes).await?;
                     let old = CustomAddr::from_parts(IPC_TRANSPORT_ID, &bytes);
@@ -185,7 +232,8 @@ impl Lease {
             self.socket = crate::backend::Backend::path(addr);
         }
         // Windows file locks exclude reads from other handles. Keep the locked
-        // lease empty and store the readable address in a separate regular file.
+        // lease empty and store the readable address in a separate regular
+        // file.
         let path = self.discovery.record_path(self.id);
         tokio::fs::write(&path, addr.data()).await?;
         #[cfg(unix)]
