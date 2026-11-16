@@ -43,12 +43,12 @@ impl PrefixIdDomain for AgentIdDomain {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentRole {
-    Engineer { intelligence: EngineerIntelligence },
+    Agent { intelligence: AgentIntelligence },
     Advisor { intelligence: AdvisorIntelligence },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum EngineerIntelligence {
+pub enum AgentIntelligence {
     Mini,
     Medium,
     High,
@@ -65,35 +65,36 @@ pub enum AdvisorIntelligence {
 
 impl Default for AgentRole {
     fn default() -> Self {
-        Self::Engineer {
-            intelligence: EngineerIntelligence::Medium,
+        Self::Agent {
+            intelligence: AgentIntelligence::Medium,
         }
     }
 }
 
 impl AgentRole {
-    pub fn is_engineer(self) -> bool {
-        matches!(self, Self::Engineer { .. })
+    pub fn is_agent(self) -> bool {
+        matches!(self, Self::Agent { .. })
     }
 
     pub fn handle_prefix(self) -> &'static str {
         match self {
-            Self::Engineer { .. } => "eng",
+            Self::Agent { .. } => "ag",
             Self::Advisor { .. } => "adv",
         }
     }
 
-    /// The agent's full id behind its role's prefix ("eng-…"), as agents
+    /// The agent's full id behind its role's prefix ("ag-…"), as agents
     /// see it in `$RHO_AGENT_ID`.
     pub fn full_handle(self, agent_id: AgentId) -> String {
         format!("{}-{}", self.handle_prefix(), agent_id.encoded())
     }
 }
 
-/// The agent a full handle ("eng-…") names. A bare full id parses too.
+/// The agent a full handle ("ag-…") names. A bare full id parses too, and
+/// so does "eng-…", the agent prefix before agents were one kind.
 pub fn parse_full_handle(text: &str) -> Option<AgentId> {
     let id = match text.split_once('-') {
-        Some(("eng" | "adv", id)) => id,
+        Some(("ag" | "eng" | "adv", id)) => id,
         Some(_) => return None,
         None => text,
     };

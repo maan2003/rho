@@ -43,8 +43,8 @@ def claude(model: str, effort: str) -> dict:
     return {"kind": "claude", "model": model, "effort": effort}
 
 
-def engineer_runtime(spawner: dict) -> dict:
-    """What an Engineer another one starts runs on: a Claude spawner's get
+def agent_runtime(spawner: dict) -> dict:
+    """What an agent another one starts runs on: a Claude spawner's get
     Opus, a Terra spawner's Terra, and the rest Sol."""
     if spawner["kind"] == "claude":
         return claude("opus", "medium")
@@ -54,7 +54,7 @@ def engineer_runtime(spawner: dict) -> dict:
 
 
 def advisor_runtime(asker: dict) -> dict:
-    """What an Advisor runs on, from the runtime of the Engineer asking. An
+    """What an Advisor runs on, from the runtime of the agent asking. An
     auto workset holds Claude agents only, so its Advisors are Fable."""
     if workset.permissions() == "auto":
         return claude("fable", "xhigh")
@@ -66,13 +66,15 @@ def advisor_runtime(asker: dict) -> dict:
 
 
 def resolve(handle: str) -> str:
-    """The agent id a handle names: "eng-<id>", "adv-<id>" or the bare id,
+    """The agent id a handle names: "ag-<id>", "adv-<id>" or the bare id,
     where <id> may be any prefix of the id that names one agent of the
-    host. A role prefix must match the agent's role."""
+    host. A role prefix must match the agent's role. "eng-", the agent
+    prefix before agents were one kind, still reads as "ag-"."""
     handle = handle.strip()
     role, dash, raw = handle.partition("-")
-    if not (dash and role in ("eng", "adv")):
-        role, raw = None, handle
+    role = {"ag": "ag", "eng": "ag", "adv": "adv"}.get(role) if dash else None
+    if role is None:
+        raw = handle
     try:
         agent = _rho.resolve_agent(raw)
     except RuntimeError as error:
@@ -348,14 +350,14 @@ class Agents(Messages):
         rho_chat.mail(self._agent, agent.id, prompt)
         return agent
 
-    def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
-        """Start an Engineer on `prompt`, in `workdir` or your directory."""
+    def spawn_new_agent(self, *, task_name, prompt, workdir=None):
+        """Start an agent on `prompt`, in `workdir` or your directory."""
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
-        props = {"name": task_name, "preset": "engineer", "parent": me.id, "cwd": cwd}
-        child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
+        props = {"name": task_name, "preset": "agent", "parent": me.id, "cwd": cwd}
+        child = self._spawn(agent_runtime(me.runtime), props, str(prompt))
         return report(
             f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
             f"results will arrive as messages from it. It works in {cwd}. Follow up with "
@@ -376,19 +378,19 @@ class Agents(Messages):
         )
 
     def cancel(self, *, agent_id):
-        """Interrupt an Engineer's current turn."""
+        """Interrupt an agent's current turn."""
         target = resolve(str(agent_id))
         known = _rho.agents()
         if target not in known:
             raise ValueError(f"no agent with id {agent_id} in this workset")
         props = known[target]["props"]
         if props.get("preset") == "advisor":
-            raise ValueError("target is not an Engineer")
+            raise ValueError("an Advisor cannot be interrupted")
         if target == self._agent:
             raise ValueError("cannot interrupt yourself")
         _rho.cancel(target)
         return report(
-            f"Engineer {label(target)} interrupted. It remains available for follow-up messages."
+            f"Agent {label(target)} interrupted. It remains available for follow-up messages."
         )
 
 
@@ -424,7 +426,7 @@ def exports(agent) -> dict:
     agents of this host; they start none and talk to no other host."""
     preset = agent.props["preset"]
     tools = {"chat": Chat(agent.id), "skills": Skills(agent.id)}
-    if preset == "engineer":
+    if preset == "agent":
         tools["agents"] = Agents(agent.id)
     else:
         tools["agents"] = Messages(agent.id)

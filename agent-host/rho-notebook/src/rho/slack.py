@@ -144,7 +144,7 @@ def route_messages(hand) -> None:
 
 def route(agent_id: str, channel: str | None = None, thread_ts: str | None = None, mode: str | None = None) -> None:
     """Route the workspace, a channel, or with `thread_ts` one thread of the
-    channel, to the agent `agent_id` names ("eng-<id>", "adv-<id>" or the
+    channel, to the agent `agent_id` names ("ag-<id>", "adv-<id>" or the
     bare id), replacing its route. A workspace or channel route hears
     mentions and what its `mode` adds ("mentions" without one); a thread
     route hears its whole thread and takes no mode."""
@@ -157,7 +157,7 @@ def unroute(channel: str | None = None, thread_ts: str | None = None) -> None:
 
 
 def owner(channel: str | None = None, thread_ts: str | None = None) -> str | None:
-    """The agent id, as agents name it ("eng-<id>"), of the most specific
+    """The agent id, as agents name it ("ag-<id>"), of the most specific
     route that covers the thread, the channel, or the workspace."""
     agent = _rho.slack_owner(channel, thread_ts)
     return None if agent is None else label(agent)

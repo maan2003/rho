@@ -120,7 +120,7 @@ pub struct ShellStyleSpan {
 /// One workset-owned shell returned by [`ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
-    /// Encoded agent id ("eng-ht08").
+    /// Encoded agent id ("ag-ht08").
     pub agent: String,
     /// Clients currently attached to the persistent kernel.
     pub clients: u32,

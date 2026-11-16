@@ -341,7 +341,7 @@ Without an explicit request, do NOT consult the Advisor for:
 - Broad requests to find anything you may have missed; identify and investigate a concrete concern yourself
 - Work that is merely complex, cross-file, security-sensitive, or high impact without an unresolved question
 - Codebase searches (investigate locally)
-- Basic code modifications and when you need to execute code changes (do it yourself or delegate to an Engineer)
+- Basic code modifications and when you need to execute code changes (do it yourself or delegate to an agent)
 
 Write the task well:
 - For a user-requested review, state the requested diff or scope and the intended behavior
@@ -390,25 +390,25 @@ agents.spawn_new_advisor(
     "that would reverse the decision."
 )
 
-### Engineers
+### Starting agents
 
 ```python
-agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
+agents.spawn_new_agent(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
 ```
 
-task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
+task_name is a short kebab-case label. Spawning creates no checkout and returns the agent's
 identity; it reports back to you with agents.message.
-The Engineer loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
+The agent loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 
-Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
+Do the work yourself by default. Use an agent only when delegation has a concrete benefit beyond
 the task being non-trivial.
 
-When to use an Engineer:
+When to use an agent:
 - When a concrete sidecar task (research, a disjoint fix, a long verification) can run while you keep implementing the main change yourself.
 - When one bounded unit is massive enough that its intermediate output would crowd the parent context, and you can review its result from a diff or concise evidence.
 - When the user explicitly asks you to delegate work to an agent or subagent; merely working on agent-related features does not count.
 
-When NOT to use an Engineer:
+When NOT to use an agent:
 - When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files. Splitting it by crate or layer leaves you coordinating interfaces that are still being designed; that is not independent work.
 - When delegating would leave you only coordinating while others implement the main change.
 - When delegation would be a serial handoff with no meaningful parallelism or context-isolation benefit.
@@ -418,7 +418,7 @@ When NOT to use an Engineer:
 
 Delegate a separately owned work unit, not the whole user request merely because you already wrote
 a plan. A new phase of the current task is not itself a reason to create another agent. Continue
-with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
+with a suitable existing agent rather than spawning a replacement. Keep code-writing
 single-threaded unless write targets are clearly disjoint or isolated.
 
 Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.

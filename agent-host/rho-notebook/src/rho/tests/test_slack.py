@@ -218,37 +218,37 @@ class Posting(SlackCase):
 
 
 class Naming(SlackCase):
-    """Agents name each other "eng-<id>"; the routes keep bare ids."""
+    """Agents name each other "ag-<id>"; the routes keep bare ids."""
 
     def seed(self, state):
         self.main = add_agent(state, claude(), cwd="/")
         state.elsewhere.add("zzelsewhere")
 
     def test_a_route_takes_an_agent_id_as_agents_write_it_also_a_short_one(self):
-        slack.route(f"eng-{self.main}", "C1")
+        slack.route(f"ag-{self.main}", "C1")
         slack.route(self.main, "C1", thread_ts="1.0")
-        slack.route(f"eng-{self.main[:4]}", "C2")
+        slack.route(f"ag-{self.main[:4]}", "C2")
         routed = [args for name, args in self.state.calls if name == "slack_route"]
         self.assertEqual(routed, [(self.main, "C1", None, None), (self.main, "C1", "1.0", None), (self.main, "C2", None, None)])
 
     def test_a_route_names_an_agent_of_the_workset(self):
         with self.assertRaises(KeyError):
-            slack.route("eng-zzelsewhere")
+            slack.route("ag-zzelsewhere")
         with self.assertRaises(ValueError):
-            slack.route("eng-nobody")
+            slack.route("ag-nobody")
         with self.assertRaises(ValueError):
             slack.route(f"adv-{self.main}")
 
     def test_routes_name_agents_as_agents_write_them(self):
         self.assertIsNone(slack.owner("C1"))
         self.state.slack_owner = self.main
-        self.assertEqual(slack.owner("C1"), f"eng-{self.main}")
+        self.assertEqual(slack.owner("C1"), f"ag-{self.main}")
         self.state.slack_table = {
             "workspace": {"agent": self.main, "mode": "mentions"},
             "channels": {"C1": {"agent": self.main, "mode": "all"}},
             "threads": {("C1", "1.0"): self.main},
         }
-        label = f"eng-{self.main}"
+        label = f"ag-{self.main}"
         self.assertEqual(
             slack.routes(),
             {

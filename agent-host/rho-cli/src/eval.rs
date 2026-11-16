@@ -25,7 +25,7 @@ pub(crate) struct EvalArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.1 Sol,
+    /// Agent runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.1 Sol,
     /// high-eng GPT-6 Astra; opus-eng and fable-eng run Claude Code and
     /// need --claude-accounts. Every runtime works in the Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]

@@ -33,12 +33,12 @@ def render(template: str, team: str, context: str) -> str:
 
 def label(agent_id: str) -> str:
     """How models and the GUI name an agent: its id behind "adv-" for an
-    Advisor and "eng-" otherwise. An agent of another workset has no known
+    Advisor and "ag-" otherwise. An agent of another workset has no known
     role, so it is its bare id."""
     spec = _rho.agents().get(agent_id)
     if spec is None:
         return agent_id
-    prefix = "adv" if spec["props"].get("preset") == "advisor" else "eng"
+    prefix = "adv" if spec["props"].get("preset") == "advisor" else "ag"
     return f"{prefix}-{agent_id}"
 
 

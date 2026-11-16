@@ -95,14 +95,14 @@ def render(record: dict) -> str:
     return f"{tools.where(head)} Message from {who}:\n{record['text']}"
 
 
-def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer", origin: str | None = None) -> str:
+def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "agent", origin: str | None = None) -> str:
     """Create an agent the user manages; returns its id. With `repo`, clone
     it at `rev` into the workset as the directory its URL names, and work
     there; otherwise work in `cwd`, or the workset's root. With `origin`,
     `chat:<message id>`, the agent joins that message's thread and starts
     from it."""
-    if preset not in ("engineer", "advisor"):
-        raise ValueError(f'preset is "engineer" or "advisor", not {preset!r}')
+    if preset not in ("agent", "advisor"):
+        raise ValueError(f'preset is "agent" or "advisor", not {preset!r}')
     props = {"preset": preset}
     if origin is not None:
         props[chat.ORIGIN] = origin
