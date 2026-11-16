@@ -38,19 +38,6 @@ pub struct InferenceQuotaSummary {
     pub reset_at_unix: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceQuotaPoint {
-    pub observed_at: UnixMs,
-    pub remaining_percent: u8,
-    pub reset_at_unix: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceQuotaSeries {
-    pub auth_namespace: String,
-    pub points: Vec<InferenceQuotaPoint>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct SelectedAuth {
     pub(crate) auth: InferenceAuth,
@@ -280,10 +267,6 @@ impl AccountManager {
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<InferenceState> {
         self.public.subscribe()
-    }
-
-    pub(crate) fn history(&self, since: UnixMs) -> Vec<InferenceQuotaSeries> {
-        history(&self.db, since)
     }
 
     pub(crate) fn spawn_poller(self: &std::sync::Arc<Self>) {
@@ -580,30 +563,6 @@ async fn append_quota(db: &RhoDb, record: &QuotaRecord) {
     write.commit();
 }
 
-fn history(db: &RhoDb, since: UnixMs) -> Vec<InferenceQuotaSeries> {
-    let mut groups = BTreeMap::<String, Vec<InferenceQuotaPoint>>::new();
-    for record in records(db) {
-        if record.observed_at_ms < since.0 {
-            continue;
-        }
-        groups
-            .entry(record.auth_namespace)
-            .or_default()
-            .push(InferenceQuotaPoint {
-                observed_at: UnixMs(record.observed_at_ms),
-                remaining_percent: 100u8.saturating_sub(record.weekly_used_percent),
-                reset_at_unix: record.weekly_reset_at_unix,
-            });
-    }
-    groups
-        .into_iter()
-        .map(|(auth_namespace, points)| InferenceQuotaSeries {
-            auth_namespace,
-            points,
-        })
-        .collect()
-}
-
 fn summaries(records: &[QuotaRecord]) -> Vec<InferenceQuotaSummary> {
     let now = UnixMs::now().0;
     let mut groups = BTreeMap::<String, Vec<&QuotaRecord>>::new();
@@ -780,7 +739,6 @@ mod tests {
         );
         assert_eq!(state.public_state().quotas[0].remaining_percent, 75);
         assert_eq!(records(&db)[0].routing_used_percent, 25);
-        assert_eq!(history(&db, UnixMs(0))[0].points[0].remaining_percent, 75);
     }
 
     #[tokio::test]

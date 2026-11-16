@@ -7,8 +7,8 @@
 //! and ranks here. Two addresses are the same thing when their text is.
 //! No address contains `|`, which ends an address in a ledger key.
 //!
-//! Notes and labels are the dealer's own kinds: the one kind of node rho
-//! mints rather than finds.
+//! A note is the dealer's own kind: the one kind of node rho mints rather
+//! than finds.
 
 use std::fmt;
 
@@ -49,7 +49,6 @@ const LEGACY_KINDS: [(&str, &str); 1] = [("topic", "thread")];
 
 impl Address {
     pub const NOTE: &'static str = "note";
-    pub const LABEL: &'static str = "label";
 
     /// `kind:rest`. The kind is a word: not empty, no `:`; neither part
     /// holds `|`.
@@ -101,25 +100,15 @@ impl Address {
         Self::new(Self::NOTE, id.simple())
     }
 
-    pub fn label(id: uuid::Uuid) -> Self {
-        Self::new(Self::LABEL, id.simple())
-    }
-
     pub fn as_note(&self) -> Option<uuid::Uuid> {
         (self.kind() == Self::NOTE)
             .then(|| uuid::Uuid::try_parse(self.rest()).ok())
             .flatten()
     }
 
-    pub fn as_label(&self) -> Option<uuid::Uuid> {
-        (self.kind() == Self::LABEL)
-            .then(|| uuid::Uuid::try_parse(self.rest()).ok())
-            .flatten()
-    }
-
     /// Made by rho rather than found in a source.
     pub fn is_minted(&self) -> bool {
-        matches!(self.kind(), Self::NOTE | Self::LABEL)
+        self.kind() == Self::NOTE
     }
 }
 

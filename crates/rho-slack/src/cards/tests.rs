@@ -180,15 +180,6 @@ impl World {
         });
     }
 
-    fn todo(&mut self, address: &Address) {
-        let seen = self.seen(address);
-        self.tell(Fact::Todo {
-            node: address.clone(),
-            start: None,
-            seen,
-        });
-    }
-
     fn snooze(&mut self, address: &Address, by: SignedDuration) {
         self.tell(Fact::Snooze {
             node: address.clone(),
@@ -332,15 +323,6 @@ fn s3_s4_done_on_another_device_holds_until_a_newer_message() {
         "D1 · unread in @u1 · needs reply · 0m",
         "counting from the new message"
     );
-}
-
-#[test]
-fn s5_a_todo_on_a_thread_outlasts_reading_it() {
-    let mut w = world();
-    let thread = w.thread(&["U1", "U2", "U3"]);
-    w.read(&thread);
-    w.todo(&thread);
-    assert_eq!(w.hand(), "thread · todo · 0m");
 }
 
 #[test]

@@ -122,9 +122,9 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   same old note say the same id.
 - This replaces notes as a screen of their own, labels, `notes for
   this`, and piles.
-- Reminders are not a new thing: a `Deadline` or `Todo` fact on any
-  address (a thread, a Slack thread, a note, a page). The text lives
-  where the address lives; a bare reminder is a note with a deadline.
+- Reminders are not a new thing: a `Deadline` fact on any address (a
+  thread, a Slack thread, a note, a page). The text lives where the
+  address lives; a bare reminder is a note with a deadline.
 - Timers: nothing stores one. The dealer derives what is due from facts
   and the clock, and the GUI wakes at `next_change`. An agent's own
   timers stay in the harness.
@@ -137,8 +137,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - One address scheme for every thing in every system (`thread`,
   `slack`, `pr`, `note`, `agent`, `page`, `file`), as `NodeId` starts to
   do. The shell opens an address; the system that owns the kind builds
-  the surface. No closed `SurfaceKey` enum. Cards, links, search hits and
-  labels all carry an address, so one `open` serves them all.
+  the surface. No closed `SurfaceKey` enum. Cards, links and search hits
+  all carry an address, so one `open` serves them all.
 - A system plugs in five things: surfaces for its addresses, menu rows
   as data, card sources for the dealer, completion providers, search
   providers. One crate per system with a `ui` feature, like `rho-slack`
@@ -186,11 +186,11 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
   `rows`); `rho-gui` lists the systems. A system reaches the frame only
   through `FrameLink`.
-- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`, `page:<uuid>`,
-  `note:<uuid>`, `label:<uuid>`, `term:<host>/<agent>/<n>`,
+- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`,
+  `note:<uuid>`, `term:<host>/<agent>/<n>`,
   `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
-  `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate
-  owns are Linked Specs beside their crates.
+  `slack:<ws>/...`. The forms that no one crate owns are Linked Specs
+  beside their crates.
 - iroh is the one transport. A host always binds its endpoint; a peer on
   the same machine reaches it over the IPC transport
   (`vendor/iroh-ipc-transport`): a Unix datagram socket as a native iroh
@@ -226,6 +226,24 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   and `Slot` frames stay until every device has run it. A thread shows
   the notes about each of its messages under it as the user's private
   replies, `reply privately` makes one, and Home lists the notes about
-  nothing as private rooms. The rest of the rooms decision is not built
-  yet: a note still opens as its own surface, and labels and piles
-  remain.
+  nothing as private rooms. `new note` makes one about nothing, with no
+  prompt. A note still opens as its own surface.
+- The verdicts are done, mute and snooze; the dealer still ranks a
+  `Deadline`, though no verdict says one yet. Labels, piles and todos
+  are gone from the GUI, the dealer and the fold; their facts stay
+  in `rho_dealer::facts::Fact` so old logs decode. An old `Piled` reads
+  as `Settled` said then, having seen nothing: it takes back the snooze
+  and deadline before it. An old `Todo` reads as `Read`: it counts as
+  seen and takes nothing back. The label facts (`Label`, `Unlabel`,
+  `Repository`, `Host`, `Labeled`) are about no node and read as
+  nothing.
+- The usage screen and the page system went on 2026-11-16. With them went
+  the agents protocol's quota and usage calls (`QuotaUsage`,
+  `QuotaHistory`, `GlobalUsage`, `AgentCostDistribution`), the `Auth` and
+  `QuotaUsage` pushes and `SetAuthAccountEnabled`, which only the charts
+  used: wire epoch 50. The host no longer probes Claude quota
+  (`rho-claude-usage`) or keeps quota observations; its own ChatGPT
+  quota tracking for routing stays in `rho-inference`. The browser
+  crates (`rho-browser`, `rho-browser-wayland`, the extension) are gone;
+  `a79f5090` is the last commit that has them, for when the browser
+  comes back under chat.

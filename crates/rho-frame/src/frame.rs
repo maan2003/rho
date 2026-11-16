@@ -725,22 +725,7 @@ impl Frame {
                 frame.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx)
             }),
         ));
-        rows.push(Row::counted(
-            "t",
-            "todo (count: days from)",
-            on(|frame, target, count, window, cx| frame.todo(target, count, window, cx)),
-        ));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
-        rows.push(Row::counted(
-            "p",
-            "pile",
-            on(|frame, target, _, window, cx| frame.prompt_pile(target.clone(), window, cx)),
-        ));
-        rows.push(Row::counted(
-            "f",
-            "file under a label",
-            on(|frame, target, _, window, cx| frame.prompt_file(target.clone(), window, cx)),
-        ));
         rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
             frame.undo_verdict(window, cx)
         }));
@@ -754,83 +739,6 @@ impl Frame {
         match self.home_in_view() {
             true => self.back(window, cx),
             false => self.open_home(window, cx),
-        }
-    }
-
-    /// `p`: the card goes on a pile the user names, a new one or one they
-    /// already have, and stays there until they open it from Home.
-    fn prompt_pile(&mut self, target: Address, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = Rc::new(|frame: &Frame, input: &str, _: &App| {
-            let typed = input.trim();
-            let needle = typed.to_lowercase();
-            let mut candidates: Vec<Candidate> = frame
-                .attention
-                .marks
-                .piles(jiff::Timestamp::now())
-                .into_iter()
-                .filter_map(|pile| {
-                    let name = pile.name?;
-                    name.to_lowercase().contains(&needle).then(|| Candidate {
-                        value: name,
-                        description: format!("{} cards", pile.nodes.len()),
-                    })
-                })
-                .collect();
-            if !typed.is_empty() && candidates.iter().all(|candidate| candidate.value != typed) {
-                candidates.push(Candidate {
-                    value: typed.to_owned(),
-                    description: "new pile".to_owned(),
-                });
-            }
-            candidates
-        });
-        self.open_prompt(
-            "pile:",
-            complete,
-            Rc::new(move |frame, input, window, cx| {
-                let name = input.trim().to_owned();
-                if name.is_empty() {
-                    frame.echo("pile: no name", StyleClass::SystemInfo, cx);
-                    return;
-                }
-                frame.verdict(
-                    &target,
-                    Verdict::Pile(name.clone()),
-                    format!("piled on {name}"),
-                    window,
-                    cx,
-                );
-            }),
-            window,
-            cx,
-        );
-    }
-
-    /// `f`: the card under a label, by path; a path nobody made yet is made.
-    fn prompt_file(&mut self, target: Address, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = Rc::new(|frame: &Frame, input: &str, _: &App| {
-            let needle = input.trim().to_lowercase();
-            frame
-                .attention
-                .marks
-                .labels()
-                .into_iter()
-                .filter(|(_, path)| path.to_lowercase().contains(&needle))
-                .map(|(_, path)| Candidate {
-                    value: path,
-                    description: "label".to_owned(),
-                })
-                .collect()
-        });
-        self.open_prompt(
-            "file under:",
-            complete,
-            Rc::new(move |frame, input, _, cx| frame.toggle_label(&target, &input, cx)),
-            window,
-            cx,
-        );
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
         }
     }
 
@@ -1029,7 +937,6 @@ impl Frame {
     pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home.read(cx).cursor_target(cx) {
             HomeTarget::Address(address) => self.open(address, window, cx),
-            HomeTarget::Pile(name) => self.open_pile(name, window, cx),
             HomeTarget::None => {}
         }
     }

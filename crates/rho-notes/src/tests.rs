@@ -30,24 +30,6 @@ impl World {
         }]);
     }
 
-    fn label(&mut self, name: &str, parent: Option<LabelId>) -> LabelId {
-        let label = LabelId(uuid::Uuid::new_v4());
-        self.say(Fact::Label {
-            label: label.0,
-            name: name.to_owned(),
-            parent: parent.map(|parent| parent.0),
-        });
-        label
-    }
-
-    fn file(&mut self, node: &Address, label: LabelId) {
-        self.say(Fact::Labeled {
-            node: node.clone(),
-            label: label.0,
-            present: true,
-        });
-    }
-
     fn note(&mut self, body: &str) -> NoteId {
         let note = NoteId(uuid::Uuid::new_v4());
         self.write(note, body, false);
@@ -90,13 +72,12 @@ fn a_note_has_one_address() {
         )),
         None
     );
-    // A label's id is no note.
-    assert_eq!(NoteId::from_address(&Address::label(id)), None);
+    // A label an older build minted under the same id is no note.
     assert_eq!(
-        Thing::from_address(&Address::label(id)),
-        Some(Thing::Label(LabelId(id)))
+        NoteId::from_address(&Address::new("label", id.simple())),
+        None
     );
-    assert_eq!(Thing::from_address(&thread(1)), None);
+    assert_eq!(NoteId::from_address(&thread(1)), None);
 }
 
 #[test]
@@ -104,16 +85,13 @@ fn only_a_text_that_moved_is_written() {
     let mut world = World::default();
     let note = world.note("milk\neggs");
     let marks = &world.marks;
-    assert!(matches!(
-        write_for(marks, Thing::Note(note), "milk\neggs".into()),
-        Ok(None)
-    ));
-    match write_for(marks, Thing::Note(note), "milk\neggs\nbread".into()) {
-        Ok(Some(Write::Note {
+    assert!(write_for(marks, note, "milk\neggs".into()).is_none());
+    match write_for(marks, note, "milk\neggs\nbread".into()) {
+        Some(Write::Note {
             note: id,
             body: Some(body),
             deleted: None,
-        })) => {
+        }) => {
             assert_eq!(id, note.0);
             assert_eq!(body, "milk\neggs\nbread");
         }
@@ -121,74 +99,7 @@ fn only_a_text_that_moved_is_written() {
     }
     // A note nobody wrote yet, left empty, says nothing.
     let fresh = NoteId(uuid::Uuid::new_v4());
-    assert!(matches!(
-        write_for(marks, Thing::Note(fresh), String::new()),
-        Ok(None)
-    ));
-}
-
-#[test]
-fn a_label_is_renamed_by_its_first_line_and_keeps_its_place() {
-    let mut world = World::default();
-    let rho = world.label("rho", None);
-    let gui = world.label("gui", Some(rho));
-    let marks = &world.marks;
-    match write_for(marks, Thing::Label(gui), "  desk \nignored".into()) {
-        Ok(Some(Write::Fact(Fact::Label {
-            label,
-            name,
-            parent,
-        }))) => {
-            assert_eq!(label, gui.0);
-            assert_eq!(name, "desk");
-            assert_eq!(parent, Some(rho.0));
-        }
-        other => panic!("not a rename: {other:?}"),
-    }
-    assert!(write_for(marks, Thing::Label(gui), "a/b".into()).is_err());
-    assert!(write_for(marks, Thing::Label(gui), "  \n".into()).is_err());
-    // The same name with a second line is no rename.
-    assert!(matches!(
-        write_for(marks, Thing::Label(gui), "gui\nmore".into()),
-        Ok(None)
-    ));
-}
-
-#[test]
-fn a_label_lists_its_labels_then_what_carries_it_by_title() {
-    let mut world = World::default();
-    let rho = world.label("rho", None);
-    let gui = world.label("gui", Some(rho));
-    let zebra = world.note("Zebra crossing");
-    let apple = world.note("apple pie");
-    let gone = world.note("gone");
-    let untitled = NoteId(uuid::Uuid::new_v4());
-    for note in [zebra, apple, gone, untitled] {
-        world.file(&note.address(), rho);
-    }
-    world.write(gone, "gone", true);
-    world.file(&thread(7), rho);
-    world.file(&thread(8), rho);
-    let name = |address: &Address| (*address == thread(7)).then(|| "Middle thread".to_owned());
-    let lines: Vec<String> = label_rows(&world.marks, rho, &name)
-        .into_iter()
-        .map(|row| row.line)
-        .collect();
-    let unnamed = format!("  ◦ {}", thread(8).key());
-    let eight = thread(8);
-    let mut carried = vec![
-        ("apple pie", "  * apple pie".to_owned()),
-        ("middle thread", "  ◦ Middle thread".to_owned()),
-        ("untitled note", "  * untitled note".to_owned()),
-        ("zebra crossing", "  * Zebra crossing".to_owned()),
-        (eight.key(), unnamed),
-    ];
-    carried.sort();
-    let mut expected = vec!["  # gui".to_owned()];
-    expected.extend(carried.into_iter().map(|(_, line)| line));
-    assert_eq!(lines, expected);
-    let rows = label_rows(&world.marks, rho, &name);
-    assert_eq!(rows[0].address, gui.address());
+    assert!(write_for(marks, fresh, String::new()).is_none());
 }
 
 /// The notes about a thing are its private replies, oldest first; a
@@ -219,106 +130,35 @@ fn notes_about_a_thing_are_its_private_replies() {
     assert_eq!(replies(&world, 7), [later.address()]);
 }
 
+/// A reply says what it is about and nothing else; a new note says
+/// nothing at all, so once typed into it is a private room.
 #[test]
-fn a_new_note_takes_its_place_from_where_it_was_made() {
-    let mut world = World::default();
-    let rho = world.label("rho", None);
-    let desk = world.label("desk", None);
-    world.file(&thread(7), rho);
-    world.file(&thread(7), desk);
+fn a_new_note_is_about_where_it_was_made_or_nothing() {
     let note = NoteId(uuid::Uuid::new_v4());
-    let facts = |writes: Vec<Write>| -> Vec<Fact> {
-        writes
-            .into_iter()
-            .map(|write| match write {
-                Write::Fact(fact) => fact,
-                note => panic!("a new note writes no text: {note:?}"),
-            })
-            .collect()
-    };
-    assert!(new_note_marks(&world.marks, note, None).is_empty());
-    assert_eq!(
-        facts(new_note_marks(&world.marks, note, Some(&rho.address()))),
-        vec![Fact::Labeled {
-            node: note.address(),
-            label: rho.0,
-            present: true
-        }]
-    );
-    let mut from_thread = facts(new_note_marks(&world.marks, note, Some(&thread(7))));
-    assert_eq!(
-        from_thread.remove(0),
-        Fact::About {
-            node: note.address(),
-            about: Some(thread(7))
-        }
-    );
-    let mut labels: Vec<uuid::Uuid> = from_thread
-        .into_iter()
-        .map(|fact| match fact {
-            Fact::Labeled { label, node, .. } if node == note.address() => label,
-            fact => panic!("not a filing: {fact:?}"),
-        })
-        .collect();
-    labels.sort();
-    let mut expected = vec![rho.0, desk.0];
-    expected.sort();
-    assert_eq!(labels, expected);
+    assert!(new_note_marks(note, None).is_empty());
+    match new_note_marks(note, Some(&thread(7))).as_slice() {
+        [Write::Fact(fact)] => assert_eq!(
+            *fact,
+            Fact::About {
+                node: note.address(),
+                about: Some(thread(7)),
+            }
+        ),
+        other => panic!("not one subject: {other:?}"),
+    }
 }
 
 #[test]
-fn find_lists_live_notes_and_labels() {
+fn find_lists_live_notes() {
     let mut world = World::default();
-    let rho = world.label("rho", None);
-    let gui = world.label("gui", Some(rho));
-    let filed = world.note("filed");
-    world.file(&filed.address(), gui);
+    let kept = world.note("kept");
     let gone = world.note("gone");
     world.write(gone, "gone", true);
-    let mut found: Vec<(String, String, Address)> = found(&world.marks)
+    let found: Vec<(String, String, Address)> = found(&world.marks)
         .into_iter()
         .map(|found| (found.title, found.description, found.address))
         .collect();
-    found.sort();
-    assert_eq!(
-        found,
-        vec![
-            ("filed".into(), "note · rho/gui".into(), filed.address()),
-            ("rho".into(), "label".into(), rho.address()),
-            ("rho/gui".into(), "label".into(), gui.address()),
-        ]
-    );
-}
-
-#[test]
-fn a_new_note_goes_here_first_then_where_here_is_filed_and_root_last() {
-    let mut world = World::default();
-    let alpha = world.label("alpha", None);
-    let zulu = world.label("zulu", None);
-    world.file(&thread(7), zulu);
-    let paths = |here: Option<&Address>| -> Vec<(String, Option<Address>)> {
-        areas(&world.marks, here)
-            .into_iter()
-            .map(|area| (area.path, area.target))
-            .collect()
-    };
-    assert_eq!(
-        paths(Some(&thread(7))),
-        vec![
-            ("here".into(), Some(thread(7))),
-            ("zulu".into(), Some(zulu.address())),
-            ("alpha".into(), Some(alpha.address())),
-            ("root".into(), None),
-        ]
-    );
-    assert_eq!(
-        paths(None),
-        vec![
-            ("alpha".into(), Some(alpha.address())),
-            ("zulu".into(), Some(zulu.address())),
-            ("root".into(), None),
-        ]
-    );
+    assert_eq!(found, vec![("kept".into(), "note".into(), kept.address())]);
 }
 
 /// Home lists the notes about nothing as private rooms, the one last

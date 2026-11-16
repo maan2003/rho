@@ -73,9 +73,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/49";
+pub const IROH_ALPN: &[u8] = b"rho/ui/50";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP37";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP38";
 
 /// The agent host's runtime directory on this machine: where it meets its
 /// local peers (the IPC rendezvous in `ipc/`, its endpoint id in
@@ -145,10 +145,6 @@ impl RuntimePaths {
 
     pub fn notion_socket(&self) -> std::path::PathBuf {
         self.directory.join("notion.sock")
-    }
-
-    pub fn browser_socket(&self) -> std::path::PathBuf {
-        self.directory.join("rho-browser.sock")
     }
 
     pub fn host_lock(&self) -> std::path::PathBuf {
@@ -582,10 +578,6 @@ mod tests {
         assert_eq!(paths.endpoint_file(), paths.directory().join("endpoint"));
         assert_eq!(paths.octo_socket(), paths.directory().join("octo.sock"));
         assert_eq!(
-            paths.browser_socket(),
-            paths.directory().join("rho-browser.sock")
-        );
-        assert_eq!(
             paths.host_lock(),
             paths.directory().join(".rho-agent-host.lock")
         );
@@ -624,7 +616,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP36\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP37\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 

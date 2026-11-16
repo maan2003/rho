@@ -4,7 +4,7 @@
 use jiff::{SignedDuration, Zoned};
 use rho_dealer::Until;
 
-/// The units a snooze or a todo's start is counted in.
+/// The units a snooze is counted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnoozeUnit {
     Minutes,

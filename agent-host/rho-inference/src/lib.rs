@@ -12,9 +12,7 @@ pub use wiring::worker_main;
 mod responses;
 mod step;
 
-pub use accounts::{
-    InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState, SelectedAuth,
-};
+pub use accounts::{InferenceQuotaSummary, InferenceState, SelectedAuth};
 pub use auth_cli::{AuthArgs, run_auth_cli};
 pub use inference::{Accounts, Inference, InferenceConfig};
 pub(crate) use inference::{PolicyCall, PolicyReply, PolicyRequest};

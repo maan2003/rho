@@ -133,8 +133,8 @@ pub trait System: Sized + 'static {
     }
 
     /// Everything the system has that `find` lists by title, given what
-    /// the user has said about its things; notes and labels live in the
-    /// marks alone. Asked with the frame busy, so the marks are handed in.
+    /// the user has said about its things; notes live in the marks
+    /// alone. Asked with the frame busy, so the marks are handed in.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         Vec::new()
     }

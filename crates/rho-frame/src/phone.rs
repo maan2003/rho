@@ -226,7 +226,6 @@ enum Button {
     Done,
     Mute,
     Snooze,
-    Todo,
     /// The whole verdict menu, as `space` opens it.
     Verdicts,
     Send,
@@ -244,7 +243,6 @@ impl Button {
             Self::Done => "rho-phone-done",
             Self::Mute => "rho-phone-mute",
             Self::Snooze => "rho-phone-snooze",
-            Self::Todo => "rho-phone-todo",
             Self::Verdicts => "rho-phone-verdicts",
             Self::Send => "rho-phone-send",
             Self::Cancel => "rho-phone-cancel",
@@ -261,7 +259,6 @@ impl Button {
             Self::Done => ("✓", "done"),
             Self::Mute => ("×", "mute"),
             Self::Snooze => ("◷", "snooze"),
-            Self::Todo => ("○", "todo"),
             Self::Verdicts => ("⋯", "more"),
             Self::Send => ("↑", "send"),
             Self::Cancel => ("×", "cancel"),
@@ -300,13 +297,7 @@ fn buttons(state: BarState) -> Vec<Button> {
                 buttons.push(Button::Open);
             }
             if state.card {
-                buttons.extend([
-                    Button::Done,
-                    Button::Mute,
-                    Button::Snooze,
-                    Button::Todo,
-                    Button::Verdicts,
-                ]);
+                buttons.extend([Button::Done, Button::Mute, Button::Snooze, Button::Verdicts]);
             }
         }
         false => {
@@ -621,12 +612,6 @@ impl Frame {
                     self.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx);
                 }
             }
-            Button::Todo => {
-                if let Some(target) = &target {
-                    record_verdict(PhoneVerdict::Todo);
-                    self.todo(target, None, window, cx);
-                }
-            }
             // How long is a question, the one the snooze menu asks.
             Button::Snooze => {
                 if let Some(target) = &target {
@@ -870,9 +855,9 @@ mod tests {
         };
         assert_eq!(
             buttons(home),
-            [Back, Menu, Open, Done, Mute, Snooze, Todo, Verdicts]
+            [Back, Menu, Open, Done, Mute, Snooze, Verdicts]
         );
-        // A pile opens but takes no verdict; a heading takes neither.
+        // A row may open but take no verdict; a heading takes neither.
         assert_eq!(
             buttons(BarState {
                 card: false,
