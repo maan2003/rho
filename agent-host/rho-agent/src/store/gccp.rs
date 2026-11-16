@@ -95,43 +95,6 @@ impl GccpRead for ReadTxn {
     }
 }
 
-/// Temporary (`temp-migration`): the acceptances as format 9a6cf67f kept
-/// them, `(agent, "<64 hex digits>/<local id>")`.
-const HEX_CONTACTS: TableDefinition<(AgentId, String), String> =
-    TableDefinition::new("gccp_contacts");
-
-/// Temporary (`temp-migration`): moves each acceptance from [`HEX_CONTACTS`]
-/// to [`CONTACTS`], and drops the old table.
-pub(crate) fn key_contacts_by_endpoint(write: &mut WriteTxn) {
-    let rows: Vec<((AgentId, String), String)> = write
-        .open_table(HEX_CONTACTS)
-        .iter()
-        .map(|(key, name)| (key.value(), name.value()))
-        .collect();
-    for ((agent, address), name) in rows {
-        let peer = hex_address(&address).expect("format 9a6cf67f kept addresses in hex");
-        write.open_table(CONTACTS).insert(key(agent, &peer), name);
-    }
-    write.delete_table("gccp_contacts");
-}
-
-/// Temporary (`temp-migration`).
-fn hex_address(text: &str) -> Option<PeerAddress> {
-    let (hex, local) = text.split_once('/')?;
-    let hex = hex.as_bytes();
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut endpoint = [0; 32];
-    for (byte, pair) in endpoint.iter_mut().zip(hex.chunks(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(PeerAddress {
-        endpoint: EndpointId(endpoint),
-        local: local.parse().ok()?,
-    })
-}
-
 fn key(agent: AgentId, peer: &PeerAddress) -> (AgentId, [u8; 32], String) {
     (agent, peer.endpoint.0, peer.local.to_string())
 }

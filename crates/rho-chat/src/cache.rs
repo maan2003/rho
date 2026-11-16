@@ -29,112 +29,6 @@ const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new
 /// and the parent's id (zero for a root). Sending moves it to the outbox.
 const DRAFTS: TableDefinition<(Host, u64), &str> = TableDefinition::new("chat3_draft");
 
-/// The same tables while a host's database seed named its log
-/// (`temp-migration`). A host's rows move to the tables above on its first
-/// hello, which says both names; the log and cursor are a copy and are
-/// dropped instead, the session having asked for the log from the start.
-mod seeded {
-    use super::*;
-
-    pub const LOG: TableDefinition<(u64, u64), Sen<ChatRecord>> = TableDefinition::new("chat2_log");
-    pub const CURSOR: TableDefinition<u64, u64> = TableDefinition::new("chat2_cursor");
-    pub const OUTBOX: TableDefinition<(u64, u64), Sen<Outgoing>> =
-        TableDefinition::new("chat2_outbox");
-    pub const DRAFTS: TableDefinition<(u64, u64), &str> = TableDefinition::new("chat2_draft");
-}
-
-/// The tables the topic-shaped client kept the user's own words in. Every
-/// other topic table was a copy and is dropped by `rho-agents-client`;
-/// these two are converted on the first open and dropped then.
-///
-/// A topic's id is its first message's id, and the host's migration kept
-/// every seq, so a topic is now the root message under the same number:
-/// a draft or an unsent message "in topic T" is one under parent `T`.
-mod legacy {
-    use rho_agent_types::{AgentId, ChatSeq, ContentPart, MessageId, UnixMs};
-    use rho_db::Sen;
-    use senax_encoder::{Decode, Encode};
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-    pub struct StreamId(pub ChatSeq);
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-    pub struct TopicId(pub ChatSeq);
-
-    pub const OUTBOX: redb::TableDefinition<(u64, u64), Sen<Outgoing>> =
-        redb::TableDefinition::new("gui_chat_outbox_v1");
-    pub const DRAFTS: redb::TableDefinition<(u64, u64), &str> =
-        redb::TableDefinition::new("gui_topic_draft_v1");
-
-    /// Named as the old crate named them, so redb opens the tables.
-    #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-    pub enum Destination {
-        Topic(TopicId),
-        NewTopic { stream: StreamId, name: String },
-        AfterStart(u64),
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-    pub struct Outgoing {
-        pub at: UnixMs,
-        pub content: Vec<ContentPart>,
-        pub mentions: Vec<AgentId>,
-        pub to: Destination,
-    }
-
-    impl Outgoing {
-        /// Where it goes now. A message that was to follow another into a
-        /// topic the host had not made yet has nothing to follow: it is
-        /// posted as a root, which is where the topic would have been.
-        pub fn convert(self) -> super::Outgoing {
-            let parent = match self.to {
-                Destination::Topic(topic) => Some(MessageId(ChatSeq(topic.0.0))),
-                Destination::NewTopic { .. } | Destination::AfterStart(_) => None,
-            };
-            super::Outgoing {
-                at: self.at,
-                parent,
-                mentions: self.mentions,
-                content: self.content,
-            }
-        }
-    }
-}
-
-/// Moves the user's words out of the topic-shaped tables, once.
-fn convert_legacy(write: &mut rho_db::WriteTxn) {
-    let unsent: Vec<((u64, u64), legacy::Outgoing)> = write
-        .try_open_table(legacy::OUTBOX)
-        .map(|old| {
-            old.iter()
-                .map(|(key, value)| (key.value(), value.value().into_owned()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !unsent.is_empty() {
-        let mut outbox = write.open_table(seeded::OUTBOX);
-        for (key, outgoing) in unsent {
-            outbox.insert(key, SenValue::borrowed(&outgoing.convert()));
-        }
-    }
-    write.delete_table(legacy::OUTBOX.name());
-    let drafts: Vec<((u64, u64), String)> = write
-        .try_open_table(legacy::DRAFTS)
-        .map(|old| {
-            old.iter()
-                .map(|(key, value)| (key.value(), value.value().to_owned()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !drafts.is_empty() {
-        let mut table = write.open_table(seeded::DRAFTS);
-        for (key, text) in drafts {
-            table.insert(key, text.as_str());
-        }
-    }
-    write.delete_table(legacy::DRAFTS.name());
-}
-
 /// What the copy holds when a client starts.
 #[derive(Debug, Default, PartialEq)]
 pub struct Loaded {
@@ -155,12 +49,6 @@ enum Write {
     Reset(Host),
     Outbox(Host, Kept),
     Draft(Host, Option<MessageId>, String),
-    /// The host's rows under its seed move to its endpoint
-    /// (`temp-migration`).
-    Adopt {
-        machine_seed: u64,
-        host: Host,
-    },
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -198,11 +86,6 @@ impl Cache {
             open_or_rebuild(&mut write, CURSOR);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
-            open_or_rebuild(&mut write, seeded::LOG);
-            open_or_rebuild(&mut write, seeded::CURSOR);
-            write.open_table(seeded::OUTBOX);
-            write.open_table(seeded::DRAFTS);
-            convert_legacy(&mut write);
             write.commit();
         });
         let (sender, receiver) = mpsc::channel();
@@ -279,34 +162,6 @@ impl Cache {
         (outbox, drafts)
     }
 
-    /// Whether anything was kept under the host's seed; if so, it is under
-    /// the endpoint once this returns (`temp-migration`).
-    pub fn adopt_seed(&self, machine_seed: u64, host: EndpointId) -> bool {
-        let known = {
-            let read = self.db.read();
-            read.open_table(seeded::CURSOR).get(machine_seed).is_some()
-                || read
-                    .open_table(seeded::OUTBOX)
-                    .range((machine_seed, 0)..=(machine_seed, u64::MAX))
-                    .next()
-                    .is_some()
-                || read
-                    .open_table(seeded::DRAFTS)
-                    .range((machine_seed, 0)..=(machine_seed, u64::MAX))
-                    .next()
-                    .is_some()
-        };
-        if !known {
-            return false;
-        }
-        self.send(Write::Adopt {
-            machine_seed,
-            host: host.0,
-        });
-        self.flush();
-        true
-    }
-
     pub fn write_records(&self, host: EndpointId, records: Vec<ChatRecord>) {
         self.send(Write::Records {
             host: host.0,
@@ -348,59 +203,6 @@ impl Drop for Cache {
             let _ = writer.join();
         }
     }
-}
-
-/// Moves one host's unsent messages and drafts from under its seed to
-/// under its endpoint, and drops the copy of its log kept under the seed
-/// (`temp-migration`).
-fn adopt(transaction: &mut rho_db::WriteTxn, machine_seed: u64, host: Host) {
-    let range = (machine_seed, 0)..=(machine_seed, u64::MAX);
-    let unsent: Vec<(u64, Outgoing)> = transaction
-        .open_table(seeded::OUTBOX)
-        .range(range.clone())
-        .map(|(key, value)| (key.value().1, value.value().into_owned()))
-        .collect();
-    let drafts: Vec<(u64, String)> = transaction
-        .open_table(seeded::DRAFTS)
-        .range(range.clone())
-        .map(|(key, value)| (key.value().1, value.value().to_owned()))
-        .collect();
-    let log: Vec<u64> = transaction
-        .open_table(seeded::LOG)
-        .range(range)
-        .map(|(key, _)| key.value().1)
-        .collect();
-    {
-        let mut outbox = transaction.open_table(OUTBOX);
-        for (id, outgoing) in &unsent {
-            outbox.insert((host, *id), SenValue::borrowed(outgoing));
-        }
-    }
-    {
-        let mut old = transaction.open_table(seeded::OUTBOX);
-        for (id, _) in &unsent {
-            old.remove((machine_seed, *id));
-        }
-    }
-    {
-        let mut table = transaction.open_table(DRAFTS);
-        for (parent, text) in &drafts {
-            table.insert((host, *parent), text.as_str());
-        }
-    }
-    {
-        let mut old = transaction.open_table(seeded::DRAFTS);
-        for (parent, _) in &drafts {
-            old.remove((machine_seed, *parent));
-        }
-    }
-    {
-        let mut old = transaction.open_table(seeded::LOG);
-        for seq in log {
-            old.remove((machine_seed, seq));
-        }
-    }
-    transaction.open_table(seeded::CURSOR).remove(machine_seed);
 }
 
 fn parent_key(parent: Option<MessageId>) -> u64 {
@@ -485,7 +287,6 @@ fn apply(
                 drafts.insert(key, text.as_str());
             }
         }
-        Write::Adopt { machine_seed, host } => adopt(transaction, machine_seed, host),
         Write::Flush(done) => flushed.push(done),
     }
 }
@@ -568,160 +369,5 @@ mod tests {
         // nothing is dropped.
         let cache = Cache::open_on(db).unwrap();
         assert_eq!(cache.read_log(H2).len(), 1);
-    }
-
-    /// What was kept under a host's seed moves under its endpoint once:
-    /// the unsent messages and drafts come across, the log copy is
-    /// dropped, and another seed's rows stay where they are.
-    #[test]
-    fn a_seeds_rows_are_adopted_by_its_endpoint_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::client::open(dir.path()).unwrap();
-        let outgoing = Outgoing {
-            at: UnixMs(5),
-            parent: None,
-            mentions: Vec::new(),
-            content: vec![ContentPart::Text { text: "hi".into() }],
-        };
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut write = db.write().await;
-                for seed in [5, 6] {
-                    write
-                        .open_table(seeded::LOG)
-                        .insert((seed, 1), SenValue::borrowed(&record(1)));
-                    write.open_table(seeded::CURSOR).insert(seed, 1);
-                    write
-                        .open_table(seeded::OUTBOX)
-                        .insert((seed, 9), SenValue::borrowed(&outgoing));
-                    write
-                        .open_table(seeded::DRAFTS)
-                        .insert((seed, 1), "under one");
-                }
-                write.commit();
-            });
-
-        let cache = Cache::open_on(db.clone()).unwrap();
-        assert_eq!(cache.load(), Loaded::default());
-        assert!(!cache.adopt_seed(7, H2));
-        assert!(cache.adopt_seed(5, H1));
-        assert!(!cache.adopt_seed(5, H1));
-        let loaded = cache.load();
-        assert_eq!(loaded.cursors, []);
-        assert_eq!(loaded.outbox, [(H1, 9, outgoing.clone())]);
-        assert_eq!(
-            loaded.drafts,
-            [(H1, Some(MessageId(ChatSeq(1))), "under one".to_owned())]
-        );
-        assert!(cache.read_log(H1).is_empty());
-        drop(cache);
-        let read = db.read();
-        assert!(
-            read.open_table(seeded::LOG)
-                .range((5, 0)..=(5, u64::MAX))
-                .next()
-                .is_none()
-        );
-        assert!(read.open_table(seeded::CURSOR).get(5).is_none());
-        assert!(read.open_table(seeded::CURSOR).get(6).is_some());
-        assert_eq!(
-            read.open_table(seeded::OUTBOX)
-                .range((6, 0)..=(6, u64::MAX))
-                .count(),
-            1
-        );
-        assert_eq!(
-            read.open_table(seeded::DRAFTS)
-                .range((6, 0)..=(6, u64::MAX))
-                .count(),
-            1
-        );
-    }
-
-    /// The topic client's unsent messages and drafts come across: a topic
-    /// becomes the root message under its number, a topic yet to start
-    /// becomes a root post, and the old tables are gone afterwards. They
-    /// wait under the host's seed until its endpoint adopts them.
-    #[test]
-    fn the_topic_clients_words_are_converted_once() {
-        use legacy::{StreamId, TopicId};
-        use rho_agent_types::AgentId;
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::client::open(dir.path()).unwrap();
-        let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
-        let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut write = db.write().await;
-                let mut outbox = write.open_table(legacy::OUTBOX);
-                outbox.insert(
-                    (1, 10),
-                    SenValue::borrowed(&legacy::Outgoing {
-                        at: UnixMs(1),
-                        content: text("in topic 4"),
-                        mentions: vec![agent],
-                        to: legacy::Destination::Topic(TopicId(ChatSeq(4))),
-                    }),
-                );
-                outbox.insert(
-                    (1, 11),
-                    SenValue::borrowed(&legacy::Outgoing {
-                        at: UnixMs(2),
-                        content: text("a new topic"),
-                        mentions: Vec::new(),
-                        to: legacy::Destination::NewTopic {
-                            stream: StreamId(ChatSeq(1)),
-                            name: "x".into(),
-                        },
-                    }),
-                );
-                drop(outbox);
-                write
-                    .open_table(legacy::DRAFTS)
-                    .insert((1, 4), "half a reply");
-                write.commit();
-            });
-
-        let cache = Cache::open_on(db.clone()).unwrap();
-        assert!(cache.load().outbox.is_empty());
-        assert!(cache.adopt_seed(1, H1));
-        let loaded = cache.load();
-        assert_eq!(
-            loaded.outbox,
-            [
-                (
-                    H1,
-                    10,
-                    Outgoing {
-                        at: UnixMs(1),
-                        parent: Some(MessageId(ChatSeq(4))),
-                        mentions: vec![agent],
-                        content: text("in topic 4"),
-                    }
-                ),
-                (
-                    H1,
-                    11,
-                    Outgoing {
-                        at: UnixMs(2),
-                        parent: None,
-                        mentions: Vec::new(),
-                        content: text("a new topic"),
-                    }
-                ),
-            ]
-        );
-        assert_eq!(
-            loaded.drafts,
-            [(H1, Some(MessageId(ChatSeq(4))), "half a reply".to_owned())]
-        );
-        drop(cache);
-        let read = db.read();
-        assert!(!read.has_table(legacy::OUTBOX.name()));
-        assert!(!read.has_table(legacy::DRAFTS.name()));
     }
 }

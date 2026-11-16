@@ -65,15 +65,6 @@ impl Outbox {
         }
     }
 
-    /// Takes in what was kept under another name for the host
-    /// (`temp-migration`).
-    pub fn adopt(&mut self, endpoint: EndpointId, kept: Vec<(u64, Outgoing)>) {
-        for (id, outgoing) in kept {
-            self.waiting.push((endpoint, id, outgoing));
-        }
-        self.waiting.sort_by_key(|(_, _, outgoing)| outgoing.at);
-    }
-
     /// Keeps a message the user wrote to the host on `endpoint`.
     /// Answers its client id and what the disk copy must keep.
     pub fn push(
