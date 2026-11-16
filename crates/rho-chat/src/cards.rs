@@ -771,11 +771,11 @@ mod tests {
     fn a_thread_with_only_the_users_dates_is_named_by_the_chat() {
         let mut w = world();
         let a = w.agent("a");
-        w.tell(Fact::Todo {
+        w.tell(Fact::Deadline {
             node: w.address(a),
-            start: None,
-            seen: Seen::Whole,
+            by: Until::In(SignedDuration::from_hours(1)),
+            lead_days: 1,
         });
-        assert_eq!(w.hand(), "rho › a · todo · 0m");
+        assert_eq!(w.hand(), "rho › a · deadline · 1d");
     }
 }

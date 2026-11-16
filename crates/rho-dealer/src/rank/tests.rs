@@ -288,12 +288,15 @@ impl World {
         self.say(address, Said::Done);
     }
 
-    fn todo(&mut self, address: &Address, start: Option<Until>) {
-        self.tell(Fact::Todo {
-            node: address.clone(),
-            start,
-            seen: self.seen(address),
-        });
+    /// A deadline `hours` from now, pressing from a day before.
+    fn due_in(&mut self, address: &Address, hours: i64) {
+        self.say(
+            address,
+            Said::Deadline {
+                by: Until::In(self::hours(hours)),
+                lead_days: 1,
+            },
+        );
     }
 
     fn write_note(&mut self, address: &Address, body: &str, deleted: bool) {
@@ -497,13 +500,6 @@ fn note(w: &mut World, name: &str) -> Address {
     address
 }
 
-fn pile(w: &mut World, address: &Address, pile: &str) {
-    w.tell(Fact::Piled {
-        node: address.clone(),
-        pile: pile.into(),
-    });
-}
-
 // Snoozes
 
 #[test]
@@ -616,125 +612,58 @@ fn z7_a_snoozed_room_holds_what_is_under_it() {
     assert!(w.priority(&thread).is_some());
 }
 
-// Piles
+// What older builds wrote
 
+/// An old pile is done said when it was piled, having seen nothing: it
+/// takes back the snooze and the deadline before it, and holds nothing
+/// back itself.
 #[test]
-fn p1_a_card_on_a_pile_stays_there_whatever_its_source_says() {
+fn p1_an_old_pile_clears_what_came_before_and_holds_nothing() {
     let mut w = world();
     let d = w.dm("D1", "u1");
-    let a = w.agent("a");
-    w.asks(&a);
-    pile(&mut w, &d, "ask ada");
-    pile(&mut w, &a, "ask ada");
-    w.pass(mins(1));
-    w.post(&d, false);
-    w.writes_to(&a);
-    w.works(&a);
-    w.pass(mins(5));
-    w.asks(&a);
-    w.pass(SignedDuration::from_hours(24 * 30));
+    let n = note(&mut w, "n");
+    w.snooze(&d, hours(3));
+    w.due_in(&n, 2);
+    for address in [&d, &n] {
+        w.tell(Fact::Piled {
+            node: address.clone(),
+            pile: "friday".into(),
+        });
+    }
     assert_eq!(
         w.hand(),
-        "",
-        "a reply within the hour does not come through"
+        "D1 · unread in @u1 · needs reply · 0m",
+        "the snooze is gone and the pile saw nothing"
     );
-    let (_, trace) = w.traced();
-    assert_eq!(trace.nodes[&d].outcome, "no card: on the pile ask ada");
+    w.pass(hours(3));
+    assert_eq!(w.priority(&n), None, "the deadline is gone");
 }
 
+/// An old todo is a read: what it saw is handled, it deals no card of its
+/// own, and the snooze before it holds.
 #[test]
-fn p2_a_todo_done_or_a_snooze_takes_the_card_off_its_pile() {
+fn t1_an_old_todo_reads_as_a_read() {
     let mut w = world();
-    let n = note(&mut w, "n");
-    w.todo(&n, None);
-    pile(&mut w, &n, "friday");
+    let a = w.agent("a");
+    w.asks(&a);
+    let d = w.dm("D1", "u1");
+    w.snooze(&d, hours(1));
+    for address in [&a, &d] {
+        let seen = w.seen(address);
+        w.tell(Fact::Todo {
+            node: address.clone(),
+            start: None,
+            seen,
+        });
+    }
     assert_eq!(w.hand(), "");
-    w.snooze(&n, hours(1));
-    assert_eq!(
-        w.marks.get(&n).facts().pile(),
-        None,
-        "the snooze replaced it"
-    );
-    w.pass(hours(2));
-    assert_eq!(w.hand(), "n · todo · 2.0h", "back as the todo it was");
-
-    let d = w.dm("D2", "u2");
-    pile(&mut w, &d, "friday");
-    w.done(&d);
-    assert_eq!(w.marks.get(&d).facts().pile(), None);
+    w.pass(hours(24 * 30));
+    assert_eq!(w.hand(), "", "nothing on a plate rises");
+    w.asks(&a);
+    assert_eq!(w.hand(), "a · asks · 0m", "a newer ask still deals");
 }
 
-#[test]
-fn p3_the_piles_are_named_oldest_first_and_then_everything_snoozed() {
-    let mut w = world();
-    let a = w.dm("D1", "u1");
-    let b = w.dm("D2", "u2");
-    let c = w.dm("D3", "u3");
-    let later = w.dm("D4", "u4");
-    let sooner = w.dm("D5", "u5");
-    let over = w.dm("D6", "u6");
-    let muted = w.dm("D7", "u7");
-    pile(&mut w, &b, "on laptop");
-    w.pass(mins(1));
-    pile(&mut w, &a, "on laptop");
-    pile(&mut w, &c, "ask ada");
-    pile(&mut w, &muted, "ask ada");
-    w.say(&muted, Said::Mute);
-    w.snooze(&later, hours(3));
-    w.snooze(&sooner, hours(2));
-    w.snooze(&over, mins(1));
-    w.pass(mins(2));
-    let now = w.now.timestamp();
-    let piles = w.marks.piles(now);
-    let shown: Vec<(Option<&str>, Vec<&Address>)> = piles
-        .iter()
-        .map(|pile| (pile.name.as_deref(), pile.nodes.iter().collect()))
-        .collect();
-    assert_eq!(
-        shown,
-        vec![
-            (Some("ask ada"), vec![&c]),
-            (Some("on laptop"), vec![&b, &a]),
-            (None, vec![&sooner, &later]),
-        ]
-    );
-    assert_eq!(
-        piles[0].back, None,
-        "a named pile comes back only when opened"
-    );
-    let sooner_until = w.marks.get(&sooner).facts().snooze().unwrap().until;
-    assert_eq!(piles[2].back, Some(sooner_until));
-    assert!(sooner_until < w.marks.get(&later).facts().snooze().unwrap().until);
-}
-
-// Todos and deadlines
-
-#[test]
-fn t1_a_todo_stays_on_the_plate_rising_slowly_until_done() {
-    let mut w = world();
-    let n = note(&mut w, "n");
-    w.todo(&n, None);
-    assert_eq!(w.hand(), "n · todo · 0m");
-    assert!(w.priority(&n).unwrap() < LAMP_THRESHOLD);
-    w.pass(hours(24 * 60));
-    assert_eq!(w.hand(), "n · todo · 60.0d");
-    w.done(&n);
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn t2_a_todo_with_a_start_waits_for_it() {
-    let mut w = world();
-    let n = note(&mut w, "n");
-    w.todo(&n, Some(Until::Day(jiff::civil::date(2026, 8, 25))));
-    assert_eq!(w.hand(), "");
-    assert_eq!(
-        w.deal().next_change,
-        Some("2026-08-25T00:00:00Z".parse().unwrap())
-    );
-    w.pass(hours(39));
-    assert_eq!(w.hand(), "n · todo · 0m");
-}
+// Deadlines
 
 #[test]
 fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
@@ -756,43 +685,11 @@ fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
 }
 
 #[test]
-fn t4_a_todo_on_a_thread_stays_whatever_its_source_says() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.todo(&a, None);
-    assert_eq!(w.hand(), "a · todo · 0m");
-    w.writes_to(&a);
-    w.works(&a);
-    assert_eq!(w.hand(), "a · todo · 0m");
-    // Named by the source, since no claim names it.
-    assert_eq!(w.deal().cards[0].title, "a");
-}
-
-#[test]
-fn t5_writing_to_a_thread_keeps_its_todo() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    w.todo(&a, None);
-    w.writes_to(&a);
-    w.finishes(&a);
-    assert!(w.marks.get(&a).facts().todo().is_some());
-}
-
-#[test]
-fn t6_done_or_mute_takes_back_the_todo_the_deadline_and_the_snooze() {
+fn t6_done_or_mute_takes_back_the_deadline_and_the_snooze() {
     for take_back in [Said::Done, Said::Mute] {
         let mut w = world();
         let n = note(&mut w, "n");
-        w.todo(&n, None);
-        w.say(
-            &n,
-            Said::Deadline {
-                by: Until::In(hours(1)),
-                lead_days: 1,
-            },
-        );
+        w.due_in(&n, 1);
         w.snooze(&n, hours(1));
         w.say(&n, take_back);
         w.pass(hours(48));
@@ -807,38 +704,19 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
     let mut w = world();
     note(&mut w, "plain");
     let gone = note(&mut w, "gone");
-    w.todo(&gone, None);
+    w.due_in(&gone, 1);
     w.write_note(&gone, "gone", true);
     assert_eq!(w.hand(), "");
 }
 
 #[test]
-fn a_note_and_a_label_name_themselves_and_file_under_their_labels() {
+fn a_note_names_itself_by_its_first_line() {
     let mut w = world();
     let n = note(&mut w, "buy milk\nand eggs");
-    let label = uuid::Uuid::new_v4();
-    w.tell(Fact::Label {
-        label,
-        name: "home".into(),
-        parent: None,
-    });
-    w.tell(Fact::Labeled {
-        node: n.clone(),
-        label,
-        present: true,
-    });
-    w.todo(&n, None);
-    w.todo(&Address::label(label), None);
+    w.due_in(&n, 1);
     let hand = w.deal();
-    let card = |address: &Address| {
-        hand.cards
-            .iter()
-            .find(|card| &card.address == address)
-            .unwrap()
-            .clone()
-    };
-    assert_eq!(card(&n).heading(), "home › buy milk");
-    assert_eq!(card(&Address::label(label)).heading(), "home");
+    assert_eq!(hand.cards[0].address, n);
+    assert_eq!(hand.cards[0].heading(), "buy milk");
 }
 
 // Every history
@@ -940,7 +818,6 @@ enum Step {
     Snooze(usize, i64),
     Done(usize),
     Mute(usize),
-    Todo(usize, Option<i64>),
     SkipTop,
 }
 
@@ -957,8 +834,6 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
         ((0usize..5), (1i64..600)).prop_map(|(node, mins)| Step::Snooze(node, mins)),
         (0usize..5).prop_map(Step::Done),
         (0usize..5).prop_map(Step::Mute),
-        ((0usize..5), proptest::option::of(0i64..3))
-            .prop_map(|(node, days)| Step::Todo(node, days)),
         Just(Step::SkipTop),
     ]
 }
@@ -993,7 +868,6 @@ proptest::proptest! {
                 Step::Snooze(i, minutes) => w.snooze(&all[i], mins(minutes)),
                 Step::Done(i) => w.done(&all[i]),
                 Step::Mute(i) => w.say(&all[i], Said::Mute),
-                Step::Todo(i, days) => w.todo(&all[i], days.map(|days| Until::In(hours(24 * days)))),
                 Step::SkipTop => {
                     if let Some(card) = w.deal().cards.first().cloned() {
                         w.skips.skip(card.address, card.cursor, w.now.timestamp());

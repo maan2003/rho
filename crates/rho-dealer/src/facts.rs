@@ -83,8 +83,10 @@ pub enum Fact {
         node: Address,
         until: Until,
     },
-    /// On the user's plate until settled: from `start`, or from when it was
-    /// said. Handles what the user had seen, and takes back a snooze.
+    /// Was a todo: on the user's plate until settled. No build writes it
+    /// any more, as todos went with the rooms (docs/rho2.md); it stays so
+    /// old entries decode. One still in a log reads as [`Fact::Read`]: it
+    /// counts as seen and takes nothing back.
     Todo {
         node: Address,
         start: Option<Until>,
@@ -96,8 +98,8 @@ pub enum Fact {
         by: Until,
         lead_days: u32,
     },
-    /// Done, having seen this far: takes back the node's todo, deadline
-    /// and snooze.
+    /// Done, having seen this far: takes back the node's deadline and
+    /// snooze.
     Settled {
         node: Address,
         seen: Seen,
@@ -111,21 +113,27 @@ pub enum Fact {
         node: Address,
     },
 
-    /// Makes a label, or renames or moves it.
+    /// Made, renamed or moved a label. Labels went with the rooms
+    /// (docs/rho2.md): no build writes this or the other label facts
+    /// (`Unlabel`, `Repository`, `Host`, `Labeled`) any more, and nothing
+    /// reads them. They stay so old entries decode.
     Label {
         label: uuid::Uuid,
         name: String,
         parent: Option<uuid::Uuid>,
     },
-    /// Deletes a label.
+    /// Deleted a label. Written by no build, read by none.
     Unlabel {
         label: uuid::Uuid,
     },
-    /// Where work under a label happens.
+    /// Where work under a label happened. Written by no build, read by
+    /// none.
     Repository {
         label: uuid::Uuid,
         url: Option<String>,
     },
+    /// Put a label on a node or took it off. Written by no build, read by
+    /// none.
     Labeled {
         node: Address,
         label: uuid::Uuid,
@@ -146,16 +154,19 @@ pub enum Fact {
     Retract {
         of: EntryId,
     },
-    /// Put away on a pile the user named, until they open it: nothing from
-    /// the source brings it back. Last, as a later variant: entries decode
-    /// by variant order.
+    /// Was put away on a pile the user named. No build writes it any
+    /// more, as piles went with the rooms (docs/rho2.md); it stays so old
+    /// entries decode. One still in a log reads as [`Fact::Settled`] said
+    /// at the same instant: the user put the node away, so it takes back
+    /// the deadline and snooze before it. It carries no [`Seen`], so it
+    /// moves nobody's cursor. Later than `Retract`, as entries decode by
+    /// variant order.
     Piled {
         node: Address,
         pile: String,
     },
-    /// Which agent host work under a label runs on: the host's identity
-    /// (an iroh endpoint id, or `local:<runtime dir>`), the same on every
-    /// device. Later still than `Piled`, for the same reason.
+    /// Which agent host work under a label ran on. Written by no build,
+    /// read by none. Later still than `Piled`, for the same reason.
     Host {
         label: uuid::Uuid,
         host: Option<String>,
@@ -183,7 +194,8 @@ pub enum Fact {
 }
 
 impl Fact {
-    /// The node the fact is about; `None` for a retract.
+    /// The node the fact is about; `None` for a retract, and for the label
+    /// facts, which nothing reads.
     pub fn node(&self) -> Option<Address> {
         match self {
             Self::Snooze { node, .. }
@@ -193,16 +205,16 @@ impl Fact {
             | Self::Settled { node, .. }
             | Self::Mute { node }
             | Self::Unmute { node }
-            | Self::Labeled { node, .. }
             | Self::Named { node, .. }
             | Self::About { node, .. }
             | Self::Read { node, .. } => Some(node.clone()),
             Self::Wrote { note, .. } | Self::Deleted { note } => Some(Address::note(*note)),
-            Self::Label { label, .. }
-            | Self::Unlabel { label }
-            | Self::Repository { label, .. }
-            | Self::Host { label, .. } => Some(Address::label(*label)),
-            Self::Retract { .. } => None,
+            Self::Label { .. }
+            | Self::Unlabel { .. }
+            | Self::Repository { .. }
+            | Self::Host { .. }
+            | Self::Labeled { .. }
+            | Self::Retract { .. } => None,
         }
     }
 
@@ -221,11 +233,6 @@ impl Fact {
             Self::Settled { seen, .. } => Self::Settled { node, seen },
             Self::Mute { .. } => Self::Mute { node },
             Self::Unmute { .. } => Self::Unmute { node },
-            Self::Labeled { label, present, .. } => Self::Labeled {
-                node,
-                label,
-                present,
-            },
             Self::Named { name, .. } => Self::Named { node, name },
             Self::About { about, .. } => Self::About { node, about },
             Self::Read { seen, .. } => Self::Read { node, seen },
@@ -233,6 +240,7 @@ impl Fact {
             | Self::Unlabel { .. }
             | Self::Repository { .. }
             | Self::Host { .. }
+            | Self::Labeled { .. }
             | Self::Wrote { .. }
             | Self::Deleted { .. }
             | Self::Retract { .. } => return None,
@@ -249,7 +257,7 @@ pub enum Seen {
     Agent(u64),
     /// A Slack unit, through this message.
     Slack(String),
-    /// A note or a label: there is nothing more to see.
+    /// A note: there is nothing more to see.
     Whole,
     /// A chat topic, through this message. Last: entries decode by variant
     /// order.
@@ -261,13 +269,6 @@ pub enum Seen {
 pub struct Snooze {
     pub set: Zoned,
     pub until: Timestamp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Todo {
-    pub set: Zoned,
-    /// When it comes onto the plate.
-    pub start: Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,16 +284,24 @@ pub struct Deadline {
 pub struct Facts<'a>(pub &'a [Entry]);
 
 impl<'a> Facts<'a> {
-    /// The entries since the last one that takes everything back.
+    /// The entries since the last one that takes everything back: done, an
+    /// old pile, which reads as done, or a mute.
     fn since_cleared(self) -> &'a [Entry] {
         let from = self
             .0
             .iter()
-            .rposition(|entry| matches!(entry.fact, Fact::Settled { .. } | Fact::Mute { .. }))
+            .rposition(|entry| {
+                matches!(
+                    entry.fact,
+                    Fact::Settled { .. } | Fact::Piled { .. } | Fact::Mute { .. }
+                )
+            })
             .map_or(0, |at| at + 1);
         &self.0[from..]
     }
 
+    /// How far the user had seen, by every fact that says: done, and an
+    /// old todo or read.
     fn seen(self) -> impl Iterator<Item = &'a Seen> {
         self.0.iter().filter_map(|entry| match &entry.fact {
             Fact::Settled { seen, .. } | Fact::Todo { seen, .. } | Fact::Read { seen, .. } => {
@@ -335,51 +344,17 @@ impl<'a> Facts<'a> {
             .unwrap_or(false)
     }
 
-    /// The last snooze or pile, unless something since took it back: a
-    /// todo, done, a mute, or the other one said after it.
-    fn put_away_last(self) -> Option<&'a Entry> {
-        let live = self.since_cleared();
-        let from = live
-            .iter()
-            .rposition(|entry| matches!(entry.fact, Fact::Todo { .. }))
-            .map_or(0, |at| at + 1);
-        live[from..]
-            .iter()
-            .rev()
-            .find(|entry| matches!(entry.fact, Fact::Snooze { .. } | Fact::Piled { .. }))
-    }
-
-    /// The last snooze, unless something since took it back. It may be
-    /// over already: a snooze that ended still says when the node came
+    /// The last snooze, unless done or a mute since took it back. It may
+    /// be over already: a snooze that ended still says when the node came
     /// back.
     pub fn snooze(self) -> Option<Snooze> {
-        let entry = self.put_away_last()?;
-        match &entry.fact {
-            Fact::Snooze { until, .. } => Some(Snooze {
-                set: entry.at.clone(),
-                until: until.resolve(&entry.at),
-            }),
-            _ => None,
-        }
-    }
-
-    /// The pile the node is on, and when it was put there.
-    pub fn pile(self) -> Option<(&'a str, &'a Zoned)> {
-        let entry = self.put_away_last()?;
-        match &entry.fact {
-            Fact::Piled { pile, .. } => Some((pile.as_str(), &entry.at)),
-            _ => None,
-        }
-    }
-
-    pub fn todo(self) -> Option<Todo> {
         self.since_cleared()
             .iter()
             .rev()
             .find_map(|entry| match &entry.fact {
-                Fact::Todo { start, .. } => Some(Todo {
+                Fact::Snooze { until, .. } => Some(Snooze {
                     set: entry.at.clone(),
-                    start: start.map_or(entry.at.timestamp(), |start| start.resolve(&entry.at)),
+                    until: until.resolve(&entry.at),
                 }),
                 _ => None,
             })
@@ -397,13 +372,6 @@ impl<'a> Facts<'a> {
                 }),
                 _ => None,
             })
-    }
-
-    /// Muted, snoozed past `now`, or on a pile: the user put it away.
-    pub fn put_away(self, now: Timestamp) -> bool {
-        self.muted()
-            || self.snooze().is_some_and(|snooze| snooze.until > now)
-            || self.pile().is_some()
     }
 
     /// How many times the user has snoozed the node, ever.
@@ -481,38 +449,93 @@ mod tests {
         assert_eq!(Facts(&entries).seen_topic(), Some(812));
     }
 
+    fn snooze(minute: i64) -> Entry {
+        entry(
+            minute,
+            Fact::Snooze {
+                node: agent(),
+                until: Until::In(jiff::SignedDuration::from_hours(1)),
+            },
+        )
+    }
+
+    fn deadline(minute: i64) -> Entry {
+        entry(
+            minute,
+            Fact::Deadline {
+                node: agent(),
+                by: Until::Day(jiff::civil::date(2027, 1, 16)),
+                lead_days: 3,
+            },
+        )
+    }
+
     #[test]
-    fn settled_takes_back_the_todo_and_the_snooze_before_it() {
-        let node = agent();
+    fn settled_takes_back_the_deadline_and_the_snooze_before_it() {
         let entries = [
-            entry(
-                0,
-                Fact::Todo {
-                    node: node.clone(),
-                    start: None,
-                    seen: Seen::Topic(3),
-                },
-            ),
-            entry(
-                1,
-                Fact::Snooze {
-                    node: node.clone(),
-                    until: Until::In(jiff::SignedDuration::from_hours(1)),
-                },
-            ),
+            deadline(0),
+            snooze(1),
             entry(
                 2,
                 Fact::Settled {
-                    node,
+                    node: agent(),
                     seen: Seen::Topic(4),
                 },
             ),
         ];
         let facts = Facts(&entries);
-        assert_eq!(facts.todo(), None);
+        assert_eq!(facts.deadline(), None);
         assert_eq!(facts.snooze(), None);
         assert_eq!(facts.snoozes(), 1, "every snooze is kept");
         assert_eq!(facts.seen_topic(), Some(4));
+    }
+
+    /// An old pile is done said when it was piled: what came before it is
+    /// taken back, what came after stands, and it says nothing seen.
+    #[test]
+    fn an_old_pile_reads_as_done_said_then() {
+        let piled = entry(
+            2,
+            Fact::Piled {
+                node: agent(),
+                pile: "friday".into(),
+            },
+        );
+        let before = [deadline(0), snooze(1), piled.clone()];
+        let facts = Facts(&before);
+        assert_eq!(facts.deadline(), None);
+        assert_eq!(facts.snooze(), None);
+        assert_eq!(facts.seen_topic(), None, "a pile saw nothing");
+        assert!(!facts.muted());
+
+        let after = [piled, snooze(3)];
+        assert_eq!(
+            Facts(&after).snooze().map(|snooze| snooze.set),
+            Some(at(3)),
+            "a snooze said after the pile holds"
+        );
+    }
+
+    /// An old todo is a read: it counts as seen, and takes back neither the
+    /// snooze before it, which a todo used to, nor anything else.
+    #[test]
+    fn an_old_todo_reads_as_read() {
+        let entries = [
+            deadline(0),
+            snooze(1),
+            entry(
+                2,
+                Fact::Todo {
+                    node: agent(),
+                    start: None,
+                    seen: Seen::Topic(7),
+                },
+            ),
+        ];
+        let facts = Facts(&entries);
+        assert_eq!(facts.seen_topic(), Some(7));
+        assert_eq!(facts.snooze().map(|snooze| snooze.set), Some(at(1)));
+        assert!(facts.deadline().is_some());
     }
 
     #[test]

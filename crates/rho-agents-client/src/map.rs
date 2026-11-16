@@ -63,14 +63,13 @@ struct HostSnapshot {
 }
 
 /// The user's own filing of an agent, which lives on the desk and never on
-/// the wire: whether they muted it, the labels they placed it under, and
-/// the name they gave it after it was running.
+/// the wire: whether they muted it, and the name they gave it after it was
+/// running.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFiling {
     /// The user's mute, which is the desk saying the agent's node is
     /// muted. There is no second way to put an agent away.
     pub muted: bool,
-    pub labels: Vec<String>,
     /// `Property::Name` on the agent's own cell. `None` is an agent the
     /// user has not named, which reads as whatever the runtime titled it.
     pub name: Option<String>,
@@ -101,8 +100,8 @@ pub struct AgentMap {
     runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
     /// The mirror: what every agent is.
     mirror: BTreeMap<AgentId, MirroredAgent>,
-    /// The user's filing, from the store: muted agents, their labels,
-    /// and what the user called them.
+    /// The user's filing, from the store: muted agents, and what the user
+    /// called them.
     filing: BTreeMap<AgentId, AgentFiling>,
     /// Where each agent is currently filed in the `children` and
     /// `tag_agents` indexes. An index has to be told what to remove as well
@@ -244,7 +243,7 @@ impl AgentMap {
     }
 
     /// The user's filing of the agents named, from the store: muted, and
-    /// the labels they put on them. Nothing on the wire carries either.
+    /// what they called them. Nothing on the wire carries either.
     ///
     /// The desk files them all at once, so they are taken all at once: one
     /// rebuild for the lot. Filed one by one, a first desk sync of n agents
@@ -571,11 +570,6 @@ impl AgentMap {
             .get(&agent_id)
             .is_some_and(|filing| filing.muted)
     }
-    fn agent_labels(&self, agent_id: AgentId) -> &[String] {
-        self.filing
-            .get(&agent_id)
-            .map_or(&[][..], |filing| filing.labels.as_slice())
-    }
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_types::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }
@@ -612,19 +606,6 @@ impl AgentMap {
         self.agent_display_name(agent_id)
             .filter(|n| !n.trim().is_empty())
             .map_or_else(|| id.clone(), |n| format!("{n} ({id})"))
-    }
-    /// Where the user filed the agent, after its name. The labels are the
-    /// ones this map already holds for it — the desk's filing, fed in by
-    /// `set_agent_filings` — so a name costs a lookup and a join, and a
-    /// frame that draws k agents pays for k of them and nothing else.
-    ///
-    /// An agent filed nowhere reads exactly as it did before: a name with
-    /// no labels has nothing to say about placement.
-    pub fn agent_name_with_labels(&self, agent_id: AgentId, name: String) -> String {
-        match self.agent_labels(agent_id) {
-            labels if !labels.is_empty() => format!("{name} · {}", labels.join(" › ")),
-            _ => name,
-        }
     }
     pub fn agent_human_name(&self, agent_id: AgentId) -> String {
         let Some(identity) = self.agent_identity(agent_id) else {
@@ -819,7 +800,7 @@ mod tests {
                 (
                     *agent_id,
                     AgentFiling {
-                        labels: vec!["rho/agent".to_owned()],
+                        muted: true,
                         ..AgentFiling::default()
                     },
                 )

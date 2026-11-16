@@ -4,7 +4,7 @@
 //! [`rank`] is the whole algorithm. A source hands it [`Claim`]s: for each
 //! thing of its own that wants the user, where that stands in time and how
 //! it presses. The dealer adds the user's own dates from their facts,
-//! holds back what they snoozed, muted or piled, and works each card out
+//! holds back what they snoozed or muted, and works each card out
 //! from scratch; nothing it decides is kept between calls. What a source
 //! must claim for each of its cases is that source's own test; the cases
 //! the dealer itself must meet are in `cases.md`, and each has a test
@@ -154,7 +154,7 @@ pub struct Sources<'a> {
     pub marks: &'a Marks,
     pub skips: &'a Skips,
     /// Names for the addresses only the user's own dates bring up, which
-    /// no claim named. Notes and labels name themselves.
+    /// no claim named. Notes name themselves.
     pub names: Namer<'a>,
 }
 
@@ -269,16 +269,9 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         }
     }
 
-    // The user's own dates (T1–T6, N2), on any address.
+    // The user's own dates (T3, T6, N2), on any address.
     for (address, held) in marks.nodes() {
-        let facts = held.facts();
-        if let Some(todo) = facts.todo() {
-            parts.entry(address.clone()).or_default().push(Part::dated(
-                Curve::Plate { since: todo.start },
-                format!("todo {}", todo.set.timestamp().as_millisecond()),
-            ));
-        }
-        if let Some(deadline) = facts.deadline() {
+        if let Some(deadline) = held.facts().deadline() {
             parts.entry(address.clone()).or_default().push(Part::dated(
                 Curve::Deadline {
                     by: deadline.by,
@@ -323,12 +316,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
             if let Some(trace) = trace.as_deref_mut() {
                 let why = if held.deleted { "deleted" } else { "muted" };
                 trace.outcome(&address, format!("no card: {why}"));
-            }
-            continue;
-        }
-        if let Some((pile, _)) = held.facts().pile() {
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&address, format!("no card: on the pile {pile}"));
             }
             continue;
         }
@@ -466,31 +453,16 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
 }
 
 /// What an address only the user's dates brought up is called: a note by
-/// its first line, a label by its path, anything else as its system says,
-/// filed under its labels.
+/// its first line, anything else as its system says.
 fn name(sources: &Sources<'_>, address: &Address) -> (String, String) {
-    let marks = sources.marks;
-    let title = if address.as_note().is_some() {
-        match marks.get(address).title() {
+    if address.as_note().is_some() {
+        let title = match sources.marks.get(address).title() {
             "" => "untitled note".to_owned(),
             title => title.to_owned(),
-        }
-    } else if let Some(label) = address.as_label() {
-        marks.label_path(label)
-    } else if let Some((title, context)) = (sources.names)(address) {
-        return (title, context);
-    } else {
-        address.key().to_owned()
-    };
-    let context = marks
-        .get(address)
-        .labels
-        .iter()
-        .filter(|label| !marks.get(&Address::label(**label)).deleted)
-        .map(|label| marks.label_path(*label))
-        .collect::<Vec<_>>()
-        .join(", ");
-    (title, context)
+        };
+        return (title, String::new());
+    }
+    (sources.names)(address).unwrap_or_else(|| (address.key().to_owned(), String::new()))
 }
 
 #[cfg(test)]

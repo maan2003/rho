@@ -155,7 +155,7 @@ mod tests {
     }
 
     /// The keys rho has written facts under since Slack units were nodes:
-    /// they must read back as the same units, or every snooze and todo on
+    /// they must read back as the same units, or every snooze and done on
     /// a Slack thread is lost.
     #[test]
     fn a_unit_reads_back_from_the_key_its_facts_are_under() {
