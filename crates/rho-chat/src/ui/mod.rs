@@ -22,9 +22,7 @@ use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, Messag
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
-use rho_frame::{
-    AnySurface, Candidate, ChannelRow, Found, FrameLink, HomeRow, HomeSection, Point, Row, System,
-};
+use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, RoomRow, Row, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
@@ -316,7 +314,7 @@ impl ChatSystem {
                 Err(error) => {
                     this.outbox.failed(endpoint);
                     this.frame
-                        .log(format!("chat: {error:#}"), StyleClass::SystemImportant, cx);
+                        .echo(format!("chat: {error:#}"), StyleClass::SystemImportant, cx);
                 }
             });
         })
@@ -616,63 +614,34 @@ impl System for ChatSystem {
             .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
     }
 
-    fn home(&self, marks: &Marks, _cx: &App) -> Vec<HomeSection> {
-        /// Home is a glance; the rest is in the channels.
-        const CAP: usize = 12;
+    /// Every root on every host, a room each: how many of its threads hold
+    /// something unread, and when it last moved.
+    fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
         let now = Timestamp::now();
-        let mut rows: Vec<(u64, HomeRow)> = Vec::new();
-        for (seed, chat) in &self.chats {
-            for root in chat.roots() {
-                for id in chat.children(Some(*root)) {
-                    let thread = ThreadId {
-                        host: *seed,
-                        message: *id,
-                    };
-                    let unread = self.unread_in(chat, thread, marks);
-                    if unread == 0 {
-                        continue;
-                    }
-                    let (_, at) = chat
-                        .newest_in(*id)
-                        .unwrap_or((*id, rho_agent_types::UnixMs(0)));
-                    rows.push((
-                        at.0,
-                        HomeRow {
-                            address: thread.address(),
-                            title: chat.name(*id).unwrap_or_default(),
-                            label: format!("{unread} new · {}", ago(at.0, now)),
-                            unread: true,
-                        },
-                    ));
-                }
-            }
-        }
-        rows.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-        let rows = rows.into_iter().take(CAP).map(|(_, row)| row).collect();
-        vec![HomeSection {
-            title: "unread".to_owned(),
-            rows,
-        }]
-    }
-
-    fn channels(&self, marks: &Marks, _cx: &App) -> Vec<ChannelRow> {
         let mut rows = Vec::new();
         for (seed, name) in self.hosts() {
             let Some(chat) = self.chats.get(&seed) else {
                 continue;
             };
             for root in chat.roots() {
-                let unread = chat.children(Some(*root)).iter().any(|id| {
-                    self.unread_in(
-                        chat,
-                        ThreadId {
-                            host: seed,
-                            message: *id,
-                        },
-                        marks,
-                    ) > 0
-                });
-                rows.push(ChannelRow {
+                let unread = chat
+                    .children(Some(*root))
+                    .iter()
+                    .filter(|id| {
+                        self.unread_in(
+                            chat,
+                            ThreadId {
+                                host: seed,
+                                message: **id,
+                            },
+                            marks,
+                        ) > 0
+                    })
+                    .count();
+                let (_, at) = chat
+                    .newest_in(*root)
+                    .unwrap_or((*root, rho_agent_types::UnixMs(0)));
+                rows.push(RoomRow {
                     address: ThreadId {
                         host: seed,
                         message: *root,
@@ -680,7 +649,11 @@ impl System for ChatSystem {
                     .address(),
                     name: chat.name(*root).unwrap_or_default(),
                     tag: name.clone(),
-                    unread,
+                    waiting: match unread {
+                        0 => String::new(),
+                        n => format!("{n} unread · {}", ago(at.0, now)),
+                    },
+                    at: at.0,
                 });
             }
         }

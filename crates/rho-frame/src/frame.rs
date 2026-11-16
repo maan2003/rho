@@ -22,7 +22,6 @@ use theme::ActiveTheme as _;
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::home::{HomeTarget, HomeView};
-use crate::log::MessageLog;
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
     CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
@@ -34,7 +33,7 @@ use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
 use crate::{keys, palette};
 
-/// The kind of the frame's own surfaces: Home and the message log.
+/// The kind of the frame's own surface: Home.
 pub const FRAME_KIND: &str = "frame";
 
 /// Where the reader is: the surface in view, and what the point in it is
@@ -59,7 +58,6 @@ pub struct Frame {
     history: History<Address, ()>,
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) home: Entity<HomeView>,
-    log: Entity<MessageLog>,
     pub(crate) minibuffer: Option<Minibuffer>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
@@ -94,7 +92,6 @@ impl Frame {
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
         let home = cx.new(|cx| HomeView::new(window, cx));
-        let log = cx.new(|cx| MessageLog::new(window, cx));
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
@@ -104,7 +101,6 @@ impl Frame {
         let home_address = Self::home_address();
         let mut surfaces = HashMap::new();
         surfaces.insert(home_address.clone(), AnySurface::new(home.clone()));
-        surfaces.insert(Self::log_address(), AnySurface::new(log.clone()));
         // A menu owns its keys before gpui resolves bindings: vim binds `g`
         // as a prefix, and an ordinary key handler would not see a menu's
         // one-stroke `g` until another key arrived.
@@ -122,7 +118,6 @@ impl Frame {
             history: History::new(home_address, ()),
             surfaces,
             home,
-            log,
             minibuffer: None,
             menu: None,
             menu_focus: cx.focus_handle(),
@@ -181,14 +176,10 @@ impl Frame {
         Address::new(FRAME_KIND, "home")
     }
 
-    pub fn log_address() -> Address {
-        Address::new(FRAME_KIND, "log")
-    }
-
     fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
         let (touched, said) = self.attention.ledger_event(event);
         for line in said {
-            self.log(line, StyleClass::SystemInfo, cx);
+            self.echo(&line, StyleClass::SystemInfo, cx);
         }
         self.marks_moved(touched, cx);
     }
@@ -288,12 +279,8 @@ impl Frame {
         self.open(Self::home_address(), window, cx);
     }
 
-    pub fn open_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open(Self::log_address(), window, cx);
-    }
-
     /// Closes `address`: its surface goes, and no walk reaches it again.
-    /// Home and the log only step out of view.
+    /// Home only steps out of view.
     pub fn close(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_address() == address;
         if address.kind() != FRAME_KIND {
@@ -367,12 +354,12 @@ impl Frame {
         self.surfaces.get(address)
     }
 
-    // ---- echo and log ----
+    // ---- echo ----
 
-    /// One line on the status line for a few seconds, and in the log for
-    /// good.
+    /// One line on the status line for a few seconds, and in the process
+    /// log for good.
     pub fn echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
-        self.log(text.to_owned(), class, cx);
+        tracing::info!(%text, "echo");
         let dismiss = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ECHO_FOR).await;
             let _ = this.update(cx, |this, cx| {
@@ -382,10 +369,6 @@ impl Frame {
         });
         self.echo = Some(Echo::new(text, class, dismiss));
         cx.notify();
-    }
-
-    pub fn log(&mut self, text: String, class: StyleClass, cx: &mut Context<Self>) {
-        self.log.update(cx, |log, cx| log.append(text, class, cx));
     }
 
     // ---- overlays: menus and the minibuffer ----
@@ -608,9 +591,6 @@ impl Frame {
         let mut rows = Rows::new("rho");
         rows.push(Row::run("h", "home", |frame, window, cx| {
             frame.open_home(window, cx)
-        }));
-        rows.push(Row::run("m", "messages", |frame, window, cx| {
-            frame.open_log(window, cx)
         }));
         rows.push(Row::run("f", "find", |frame, window, cx| {
             frame.find(window, cx)

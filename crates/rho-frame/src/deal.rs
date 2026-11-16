@@ -18,7 +18,7 @@ use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
 use crate::frame::Frame;
-use crate::home::{HOME_CAP, HomeRows};
+use crate::home::room_lines;
 use crate::when::{SnoozeUnit, snooze_target};
 
 /// The lamp and the chime, as last evaluated.
@@ -159,6 +159,7 @@ impl Frame {
             priority: f64::NEG_INFINITY,
             cursor: String::new(),
             skipped: false,
+            room: None,
         }
     }
 
@@ -436,18 +437,12 @@ impl Frame {
     /// Home is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated and never on a timer.
     fn refresh_home(&mut self, hand: &Hand, cx: &mut Context<Self>) {
-        let mut sections = Vec::new();
-        let mut channels = Vec::new();
+        let mut rooms = Vec::new();
         for system in &self.systems {
-            sections.extend(system.home(&self.attention.marks, cx));
-            channels.extend(system.channels(&self.attention.marks, cx));
+            rooms.extend(system.rooms(&self.attention.marks, cx));
         }
-        let rows = HomeRows {
-            next: hand.cards.iter().take(HOME_CAP).cloned().collect(),
-            sections,
-            channels,
-        };
-        self.home.update(cx, |home, cx| home.set_rows(rows, cx));
+        let lines = room_lines(rooms, hand);
+        self.home.update(cx, |home, cx| home.set_rooms(lines, cx));
     }
 }
 

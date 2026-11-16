@@ -179,13 +179,21 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 ## As built
 
 - The shell is `crates/rho-frame`. `Frame` is the window: one surface at
-  a time from a history of addresses, Home, the message log, the
-  minibuffer, the bottom transient, the hosts and the ledger. A system
-  implements `System` (`kinds`, `open`, `streams`, `rows`, `claims`,
-  `name`, `seen`, `home`, `channels`, `find`, `said`, `marks_moved`,
-  `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
-  `rows`); `rho-gui` lists the systems. A system reaches the frame only
-  through `FrameLink`.
+  a time from a history of addresses, Home, the minibuffer, the bottom
+  transient, the hosts and the ledger. A system implements `System`
+  (`kinds`, `open`, `streams`, `rows`, `claims`, `name`, `seen`, `rooms`,
+  `find`, `said`, `marks_moved`, `mutes_itself`) and builds `Surface`s
+  (`title`, `editor`, `subject`, `rows`); `rho-gui` lists the systems. A
+  system reaches the frame only through `FrameLink`.
+- Home is the list of rooms, since 2026-11-16: every root on every host,
+  the Slack conversations the user starred or Slack is asking them
+  about, and the notes about nothing, one row each with where it is and
+  what waits in it. A room with a card in the dealer's hand goes first,
+  in the hand's order, wearing the card's words; then the rooms with
+  something unread, newest first; then the rest. The cards' preview and
+  the per-system sections are gone from Home; `space` still deals. The
+  message log screen went the same day: what rho says is the echo line
+  and the process log.
 - Address kinds: `thread:<endpoint>/<id>`, `agent:<id>` with its
   terminals, shell and desktops as parts under it (`agent:<id>/term/<n>`,
   `agent:<id>/shell`, `agent:<id>/desktop/<name>`), `note:<uuid>`,

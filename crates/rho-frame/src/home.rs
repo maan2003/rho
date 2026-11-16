@@ -1,11 +1,14 @@
-//! Home: what is next, what is unread and where things are, read at a
-//! glance.
+//! Home: the rooms, the one that wants the user most first.
 //!
-//! Nothing here scores anything. The cards are the dealer's, in the
-//! dealer's order, wearing the words the deal bar uses; the sections under
-//! them are the systems'. The surface is one keyed transcript: a row is
-//! an item keyed by what it stands for, so a change edits that row and
-//! leaves the cursor, the scroll, and every other row alone.
+//! A room is a root the user can read: a host's channel, a Slack
+//! conversation they follow, a note about nothing. Each system lists its
+//! own ([`System::rooms`](crate::system::System::rooms)); nothing here
+//! scores anything. A room with a card in the dealer's hand goes by that
+//! card, in the hand's order, wearing the card's words; the rest go by
+//! what waits in them, then by when they last moved. The surface is one
+//! keyed transcript: a row is an item keyed by its room, so a change
+//! edits that row and leaves the cursor, the scroll, and every other row
+//! alone.
 
 use std::ops::Range;
 
@@ -14,60 +17,94 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_dealer::{Address, Card};
+use rho_dealer::Address;
+use rho_dealer::rank::Hand;
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
 use crate::surface::{Subject, Surface};
-use crate::system::{ChannelRow, HomeSection};
+use crate::system::RoomRow;
 
 /// Home's own highlight-key space, clear of the transcript's semantic slots
 /// at zero and Slack's at the top. Buckets grow upwards from here.
 const HOME_KEY_BASE: usize = usize::MAX / 3;
 
-/// How many cards Home shows. Hard: Home is a glance, and a list you can
-/// groom is an inbox.
-pub const HOME_CAP: usize = 5;
+/// The most of a room's name a row shows. A note's name is its first
+/// line, which can run on; the row is one line, and the width it is cut
+/// to is measured on an average glyph, so a long name could still wrap.
+const NAME_CAP: usize = 60;
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct HomeRows {
-    /// The top of the hand: a preview, not the queue.
-    pub next: Vec<Card>,
-    /// What the systems list under the cards: unread threads, say.
-    pub sections: Vec<HomeSection>,
-    /// Every channel across the systems, with where it is.
-    pub channels: Vec<ChannelRow>,
+/// One room as Home shows it: ordered, with the words beside its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomLine {
+    pub address: Address,
+    pub name: String,
+    pub tag: String,
+    /// The card's words when the dealer holds one in the room, the
+    /// system's otherwise.
+    pub label: String,
+    /// A card in the hand is in it: its words are the dealer's.
+    pub dealt: bool,
 }
 
-impl HomeRows {
-    pub fn is_empty(&self) -> bool {
-        self.next.is_empty()
-            && self.sections.iter().all(|section| section.rows.is_empty())
-            && self.channels.is_empty()
-    }
+/// The rooms in Home's order: a room with a card in `hand` by its first
+/// card, in the hand's order; then the rooms something waits in, newest
+/// first; then the rest, newest first.
+pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
+    let mut lines: Vec<(Option<usize>, bool, u64, RoomLine)> = rooms
+        .into_iter()
+        .map(|room| {
+            let card = hand.cards.iter().enumerate().find(|(_, card)| {
+                card.address == room.address || card.room.as_ref() == Some(&room.address)
+            });
+            let (label, dealt) = match card {
+                Some((_, card)) => (card.label.clone(), true),
+                None => (room.waiting.clone(), false),
+            };
+            (
+                card.map(|(index, _)| index),
+                room.waiting.is_empty(),
+                u64::MAX - room.at,
+                RoomLine {
+                    address: room.address,
+                    name: room.name,
+                    tag: room.tag,
+                    label,
+                    dealt,
+                },
+            )
+        })
+        .collect();
+    lines.sort_by(|a, b| {
+        // A card first, the earlier in the hand the sooner; no card last.
+        let by_card = match (a.0, b.0) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_card.then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+    });
+    lines.into_iter().map(|(_, _, _, line)| line).collect()
 }
 
 /// What a Home row opens when the cursor is on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HomeTarget {
     Address(Address),
-    /// A section heading or the empty line: nothing to open.
+    /// The empty line: nothing to open.
     None,
 }
 
 /// One item of the transcript.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum HomeKey {
-    Section(String),
-    Card(Address),
-    Row(String, Address),
-    Channel(Address),
+    Room(Address),
     Empty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HomeClass {
-    Section,
     Title,
     Label,
     Muted,
@@ -76,14 +113,13 @@ enum HomeClass {
 impl HomeClass {
     fn slot(self) -> usize {
         match self {
-            Self::Section => 0,
-            Self::Title => 1,
-            Self::Label => 2,
-            Self::Muted => 3,
+            Self::Title => 0,
+            Self::Label => 1,
+            Self::Muted => 2,
         }
     }
 
-    const COUNT: usize = 4;
+    const COUNT: usize = 3;
 }
 
 impl rho_transcript::Style for HomeClass {
@@ -94,9 +130,6 @@ impl rho_transcript::Style for HomeClass {
     fn highlight_style(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
         let color = match self {
-            // The sections are chrome, not content: they name the line and
-            // then get out of the way.
-            Self::Section => colors.text_muted,
             Self::Title => colors.text,
             Self::Label => cx.theme().status().warning,
             Self::Muted => colors.text_muted,
@@ -113,9 +146,9 @@ impl rho_transcript::Style for HomeClass {
 pub struct HomeView {
     transcript: Transcript<HomeKey, HomeClass, HomeTarget>,
     editor: Entity<Editor>,
-    rows: HomeRows,
+    rooms: Vec<RoomLine>,
     /// How many characters fit on one row, as the window last measured it;
-    /// a card's title is cut to leave its row one line.
+    /// a room's name is cut to leave its row one line.
     width: usize,
 }
 
@@ -157,7 +190,7 @@ impl HomeView {
         let mut view = Self {
             transcript: Transcript::new(buffer),
             editor,
-            rows: HomeRows::default(),
+            rooms: Vec::new(),
             width,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -169,7 +202,7 @@ impl HomeView {
     }
 
     /// What the cursor is on. The row under the cursor is the one Enter
-    /// opens; a heading offers nothing.
+    /// opens.
     pub fn cursor_target(&self, cx: &App) -> HomeTarget {
         self.transcript
             .line_meta(self.cursor_row(cx), cx)
@@ -188,15 +221,15 @@ impl HomeView {
             .row
     }
 
-    pub fn set_rows(&mut self, rows: HomeRows, cx: &mut Context<Self>) {
-        if rows == self.rows {
+    pub fn set_rooms(&mut self, rooms: Vec<RoomLine>, cx: &mut Context<Self>) {
+        if rooms == self.rooms {
             return;
         }
-        self.rows = rows;
+        self.rooms = rooms;
         let items = self.items();
         self.transcript.reconcile(items, cx);
         // A reader who has not moved is put on the first row, so the very
-        // first Enter opens rather than landing on a heading.
+        // first Enter opens.
         if self.cursor_target(cx) == HomeTarget::None {
             self.focus_first_row(cx);
         }
@@ -223,83 +256,44 @@ impl HomeView {
         });
     }
 
-    /// The rows as transcript items. Titles are padded to a common column
-    /// per section so the state words line up and the eye reads down them.
+    /// The rooms as transcript items. Names are padded to a common column
+    /// so the words beside them line up and the eye reads down them.
     fn items(&self) -> Vec<Item<HomeKey, HomeClass, HomeTarget>> {
-        let mut items = Vec::new();
-        if self.rows.is_empty() {
+        if self.rooms.is_empty() {
             return vec![
-                line(HomeKey::Empty, "nothing needs attention", HomeClass::Muted)
+                line(HomeKey::Empty, "no rooms yet", HomeClass::Muted)
                     .with_lines(vec![HomeTarget::None]),
             ];
         }
-        if !self.rows.next.is_empty() {
-            items.push(section("next"));
-            let column = column_of(self.rows.next.iter().map(|card| card.heading()).collect());
-            for card in &self.rows.next {
-                items.push(card_line(card, column, self.width));
-            }
-        }
-        for section_rows in &self.rows.sections {
-            if section_rows.rows.is_empty() {
-                continue;
-            }
-            items.push(section(&section_rows.title));
-            let column = column_of(
-                section_rows
-                    .rows
-                    .iter()
-                    .map(|row| row.title.clone())
-                    .collect(),
-            );
-            for row in &section_rows.rows {
-                let label = match row.unread {
-                    true if row.label.is_empty() => "unread".to_owned(),
-                    true => format!("unread · {}", row.label),
-                    false => row.label.clone(),
+        let column = column_of(self.rooms.iter().map(|room| room.name.clone()).collect());
+        self.rooms
+            .iter()
+            .map(|room| {
+                let label = match (room.label.is_empty(), room.tag.is_empty()) {
+                    (true, _) => room.tag.clone(),
+                    (false, true) => room.label.clone(),
+                    (false, false) => format!("{} · {}", room.label, room.tag),
                 };
-                let room = self.width.saturating_sub(4 + label.chars().count());
-                let title = cut(&row.title, room);
+                let class = match room.dealt {
+                    true => HomeClass::Label,
+                    false => HomeClass::Muted,
+                };
+                // The lead, the gap before the words and the words are
+                // what the row keeps; the name has the rest.
+                let room_for_name = self
+                    .width
+                    .saturating_sub(4 + label.chars().count())
+                    .min(NAME_CAP);
+                let name = cut(&room.name, room_for_name);
                 let (text, styles) = columns(&[
-                    (title.as_str(), HomeClass::Title, column.min(room)),
-                    (label.as_str(), HomeClass::Muted, 0),
+                    (name.as_str(), HomeClass::Title, column.min(room_for_name)),
+                    (label.as_str(), class, 0),
                 ]);
-                items.push(
-                    Item::new(
-                        HomeKey::Row(section_rows.title.clone(), row.address.clone()),
-                        text,
-                    )
+                Item::new(HomeKey::Room(room.address.clone()), text)
                     .with_styles(styles)
-                    .with_lines(vec![HomeTarget::Address(row.address.clone())]),
-                );
-            }
-        }
-        if !self.rows.channels.is_empty() {
-            items.push(section("channels"));
-            let column = column_of(
-                self.rows
-                    .channels
-                    .iter()
-                    .map(|row| row.name.clone())
-                    .collect(),
-            );
-            for row in &self.rows.channels {
-                let label = match row.unread {
-                    true => format!("{} · unread", row.tag),
-                    false => row.tag.clone(),
-                };
-                let (text, styles) = columns(&[
-                    (row.name.as_str(), HomeClass::Title, column),
-                    (label.as_str(), HomeClass::Muted, 0),
-                ]);
-                items.push(
-                    Item::new(HomeKey::Channel(row.address.clone()), text)
-                        .with_styles(styles)
-                        .with_lines(vec![HomeTarget::Address(row.address.clone())]),
-                );
-            }
-        }
-        items
+                    .with_lines(vec![HomeTarget::Address(room.address.clone())])
+            })
+            .collect()
     }
 }
 
@@ -350,44 +344,20 @@ fn row_width(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> usiz
     (columns as usize).saturating_sub(2)
 }
 
-fn column_of(titles: Vec<String>) -> usize {
-    /// Past this a title is left to run into its own state words rather
-    /// than pushing every row on the screen sideways.
+fn column_of(names: Vec<String>) -> usize {
+    /// Past this a name is left to run into its own words rather than
+    /// pushing every row on the screen sideways.
     const CAP: usize = 40;
-    titles
+    names
         .iter()
-        .map(|title| title.chars().count())
+        .map(|name| name.chars().count())
         .max()
         .unwrap_or(0)
         .min(CAP)
 }
 
-fn section(name: &str) -> Item<HomeKey, HomeClass, HomeTarget> {
-    line(HomeKey::Section(name.to_owned()), name, HomeClass::Section)
-        .with_lines(vec![HomeTarget::None])
-}
-
 fn line(key: HomeKey, text: &str, class: HomeClass) -> Item<HomeKey, HomeClass, HomeTarget> {
     Item::new(key, text.to_owned()).with_styles(vec![(class, 0..text.len())])
-}
-
-fn card_line(card: &Card, column: usize, width: usize) -> Item<HomeKey, HomeClass, HomeTarget> {
-    let label = match (card.skipped, card.label.is_empty()) {
-        (false, _) => card.label.clone(),
-        (true, true) => "skipped".to_owned(),
-        (true, false) => format!("{} · skipped", card.label),
-    };
-    // The lead, the gap before the label and the label are what the row
-    // keeps; the title has the rest.
-    let room = width.saturating_sub(4 + label.chars().count());
-    let title = cut(&card.heading(), room);
-    let (text, styles) = columns(&[
-        (title.as_str(), HomeClass::Title, column.min(room)),
-        (label.as_str(), HomeClass::Label, 0),
-    ]);
-    Item::new(HomeKey::Card(card.address.clone()), text)
-        .with_styles(styles)
-        .with_lines(vec![HomeTarget::Address(card.address.clone())])
 }
 
 /// Lays out one row: two leading spaces, then each cell padded to its
@@ -414,7 +384,7 @@ fn columns(cells: &[(&str, HomeClass, usize)]) -> (String, Vec<(HomeClass, Range
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // One measure per frame, and a relayout only when it changes: a
-        // narrower window cuts the titles shorter.
+        // narrower window cuts the names shorter.
         let width = row_width(&self.editor, window, cx);
         if width != self.width {
             self.width = width;
@@ -431,6 +401,8 @@ impl Render for HomeView {
 
 #[cfg(test)]
 mod tests {
+    use rho_dealer::Card;
+
     use super::*;
 
     #[test]
@@ -440,5 +412,67 @@ mod tests {
         assert_eq!(styles[1].1, 8..9);
         assert_eq!(cut("abcdef", 4), "abc…");
         assert_eq!(cut("abc", 4), "abc");
+    }
+
+    fn room(name: &str, waiting: &str, at: u64) -> RoomRow {
+        RoomRow {
+            address: Address::new("thread", name),
+            name: name.to_owned(),
+            tag: "local".to_owned(),
+            waiting: waiting.to_owned(),
+            at,
+        }
+    }
+
+    fn card(address: &str, room: Option<&str>, label: &str) -> Card {
+        Card {
+            address: Address::new("thread", address),
+            title: String::new(),
+            context: String::new(),
+            label: label.to_owned(),
+            priority: 1.0,
+            cursor: String::new(),
+            skipped: false,
+            room: room.map(|room| Address::new("thread", room)),
+        }
+    }
+
+    /// The hand's order first, by the card in a room or the room itself;
+    /// then what waits, newest first; then the rest, newest first. A
+    /// dealt room wears its first card's words, the others their own.
+    #[test]
+    fn rooms_go_by_the_hand_then_by_what_waits_then_by_age() {
+        let hand = Hand {
+            cards: vec![
+                card("c/7", Some("c"), "asks · 5m"),
+                card("a", None, "needs reply · 1h"),
+                card("c/9", Some("c"), "result · 2h ago"),
+            ],
+            next_change: None,
+        };
+        let rooms = vec![
+            room("quiet-old", "", 10),
+            room("b", "2 unread · 3m", 50),
+            room("a", "", 20),
+            room("quiet-new", "", 40),
+            room("c", "1 unread", 30),
+            room("d", "mention", 60),
+        ];
+        let lines = room_lines(rooms, &hand);
+        let names: Vec<(&str, &str, bool)> = lines
+            .iter()
+            .map(|line| (line.name.as_str(), line.label.as_str(), line.dealt))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("c", "asks · 5m", true),
+                ("a", "needs reply · 1h", true),
+                ("d", "mention", false),
+                ("b", "2 unread · 3m", false),
+                ("quiet-new", "", false),
+                ("quiet-old", "", false),
+            ]
+        );
     }
 }

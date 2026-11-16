@@ -122,8 +122,8 @@ impl Frame {
                 return;
             }
             ConnEvent::ServerError(message) => {
-                self.log(
-                    format!("{name}: {message}"),
+                self.echo(
+                    &format!("{name}: {message}"),
                     StyleClass::SystemImportant,
                     cx,
                 );
@@ -132,8 +132,8 @@ impl Frame {
                 self.hosts.set_status(host, HostStatus::Recovering(elapsed));
             }
             ConnEvent::Disconnected(reason) => {
-                self.log(
-                    format!("{name}: disconnected · {reason}"),
+                self.echo(
+                    &format!("{name}: disconnected · {reason}"),
                     StyleClass::Disconnect,
                     cx,
                 );

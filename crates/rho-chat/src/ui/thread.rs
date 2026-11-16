@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
@@ -230,7 +231,7 @@ impl ThreadView {
         let list = is_root(self.system.read(cx), self.thread);
         let at_end = {
             let last = self.transcript.buffer().read(cx).max_point().row;
-            self.cursor_row(cx) + 1 >= last
+            self.cursor_row(cx) >= last
         };
         let items = items(self.system.read(cx), self.thread, cx);
         self.transcript.reconcile(items, cx);
@@ -290,13 +291,13 @@ impl ThreadView {
     }
 
     fn cursor_to_end(&mut self, cx: &mut Context<Self>) {
-        let last = self.transcript.buffer().read(cx).max_point();
-        let row = last.row.saturating_sub(1);
+        let row = self.transcript.buffer().read(cx).max_point().row;
         self.log.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             editor.selections.change_with(&snapshot, |selections| {
                 selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
             });
+            editor.request_autoscroll(Autoscroll::fit(), cx);
             cx.notify();
         });
     }
@@ -399,7 +400,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         items.extend(rows);
         gap_item(&mut items);
         items.extend(pending_items(system, host, thread.message, &mut gap_item));
-        return items;
+        return without_trailing_gap(items);
     }
     for id in chat.children(Some(thread.message)) {
         let Some(message) = chat.message(*id) else {
@@ -427,6 +428,18 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         gap_item(&mut items);
     }
     items.extend(pending_items(system, host, thread.message, &mut gap_item));
+    without_trailing_gap(items)
+}
+
+/// A gap stands between rows, never after the last: a row with nothing on
+/// it is nowhere for the cursor to be.
+fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key, Class, Meta>> {
+    if items
+        .last()
+        .is_some_and(|item| matches!(item.key, Key::Gap(_)))
+    {
+        items.pop();
+    }
     items
 }
 
@@ -734,7 +747,7 @@ impl Surface for ThreadView {
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
-        vec![Row::run("s", "send", move |_, window, cx| {
+        vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
             this.update(cx, |view, cx| view.send(&SendMessage, window, cx));
         })]
     }

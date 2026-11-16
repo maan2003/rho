@@ -10,6 +10,7 @@
 //! `find`'s are made here. The token and the session stay in this
 //! process: no agent host ever sees Slack.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use anyhow::Context as _;
@@ -20,8 +21,8 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::attention::{Verdict, Write};
 use rho_frame::{
-    AnySurface, Candidate, ChannelRow, Found, Frame, FrameLink, HomeRow, HomeSection, Point,
-    Reversal, Row, Rows, Subject, System,
+    AnySurface, Candidate, Found, Frame, FrameLink, Point, Reversal, RoomRow, Row, Rows, Subject,
+    System,
 };
 use rho_window::style::StyleClass;
 
@@ -472,64 +473,10 @@ impl System for SlackSystem {
         }
     }
 
-    /// What Slack is asking the reader about, newest first, short of what
-    /// they said they are done with: the unread threads, conversations
-    /// and mentions at a glance.
-    fn home(&self, marks: &Marks, cx: &App) -> Vec<HomeSection> {
-        /// Home is a glance; the rest is in activity.
-        const CAP: usize = 12;
-        let Some(session) = &self.session else {
-            return Vec::new();
-        };
-        let session = session.read(cx);
-        let model = session.model();
-        let now = Timestamp::now();
-        let mut rows: Vec<(f64, HomeRow)> = model
-            .asking()
-            .filter_map(|(unit, _)| {
-                let facts = model.unit(unit)?;
-                let address = cards::address(model, unit);
-                let done = marks
-                    .get(&address)
-                    .facts()
-                    .seen_slack()
-                    .is_some_and(|seen| {
-                        rho_dealer::facts::slack_ts_order(&facts.newest.0, seen).is_le()
-                    });
-                if done {
-                    return None;
-                }
-                let (title, context) = cards::name(model, session.mirror(), unit);
-                let title = match context.is_empty() {
-                    true => title,
-                    false => format!("{context} › {title}"),
-                };
-                let at = facts.newest.epoch_seconds();
-                Some((
-                    at,
-                    HomeRow {
-                        address,
-                        title,
-                        label: ago(facts.newest.millis(), now),
-                        unread: true,
-                    },
-                ))
-            })
-            .collect();
-        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let rows: Vec<HomeRow> = rows.into_iter().take(CAP).map(|(_, row)| row).collect();
-        if rows.is_empty() {
-            return Vec::new();
-        }
-        vec![HomeSection {
-            title: "slack".to_owned(),
-            rows,
-        }]
-    }
-
-    /// The conversations the user starred: the Slack channels they follow
-    /// from Home, tagged with the workspace.
-    fn channels(&self, _marks: &Marks, cx: &App) -> Vec<ChannelRow> {
+    /// The conversations the user follows from Home, the starred ones,
+    /// and any other Slack is asking them about: a room each, tagged with
+    /// the workspace.
+    fn rooms(&self, _marks: &Marks, cx: &App) -> Vec<RoomRow> {
         let Some(session) = &self.session else {
             return Vec::new();
         };
@@ -540,20 +487,32 @@ impl System for SlackSystem {
         };
         let workspace = model.workspace();
         let favorites = mirror.favorites(&workspace.0);
-        let mut rows: Vec<ChannelRow> = session
+        let asking: HashSet<&ChannelId> = model.asking().map(|(unit, _)| &unit.channel).collect();
+        let now = Timestamp::now();
+        session
             .rows()
             .into_iter()
-            .filter(|row| favorites.contains(&row.id))
-            .map(|row| ChannelRow {
-                address: SlackAddress::Unit(workspace.clone(), Unit::conversation(&row.id))
-                    .address(),
-                name: row.label,
-                unread: row.unread && !row.muted,
-                tag: workspace.0.clone(),
+            .filter(|row| favorites.contains(&row.id) || asking.contains(&row.id))
+            .map(|row| {
+                let at = row
+                    .latest
+                    .as_ref()
+                    .map_or(0, |ts| ts.millis().max(0) as u64);
+                let waiting = match (row.unread && !row.muted, row.unread_count) {
+                    (false, _) => String::new(),
+                    (true, 0) => format!("unread · {}", ago(at as i64, now)),
+                    (true, n) => format!("{n} unread · {}", ago(at as i64, now)),
+                };
+                RoomRow {
+                    address: SlackAddress::Unit(workspace.clone(), Unit::conversation(&row.id))
+                        .address(),
+                    name: row.label,
+                    tag: workspace.0.clone(),
+                    waiting,
+                    at,
+                }
             })
-            .collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        rows
+            .collect()
     }
 
     /// Every conversation the user is in, and every thread rho tracks.

@@ -417,30 +417,55 @@ where
 
     /// The one place the buffer is edited: replaces the items in `range`
     /// with `items` in a single edit covering exactly their text.
+    ///
+    /// Items are lines joined by newlines: each item's text ends in one
+    /// and the buffer leaves out the last, so no empty line trails the
+    /// transcript for a cursor to land on. An item's range is its text
+    /// short of that newline. The edit's neighbours are anchored afresh
+    /// after it: an empty item's two anchors sit on one offset, which is
+    /// where an edit beside it lands, and they would part.
     fn splice(&mut self, range: Range<usize>, items: Vec<Item<K, C, M>>, cx: &mut App) {
         let items = items.into_iter().map(Item::normalized).collect::<Vec<_>>();
+        let count = self.items.len();
         let snapshot = self.buffer.read(cx).snapshot();
-        let start = match self.items.get(range.start) {
-            Some(item) => item.range.start.to_offset(&snapshot),
-            None => snapshot.len(),
+        let body_start = |index: usize| self.items[index].range.start.to_offset(&snapshot);
+        let before = range.start.checked_sub(1).map(body_start);
+        let start = match range.start < count {
+            true => body_start(range.start),
+            false => snapshot.len(),
         };
-        let end = match range
-            .end
-            .checked_sub(1)
-            .and_then(|last| self.items.get(last))
-        {
-            Some(item) if !range.is_empty() => item.range.end.to_offset(&snapshot),
-            _ => start,
+        // Through the newline after the last item removed, which is where
+        // the next one starts.
+        let end = match (range.is_empty(), range.end < count) {
+            (true, _) => start,
+            (false, true) => body_start(range.end),
+            (false, false) => snapshot.len(),
         };
         drop(snapshot);
 
-        let text = items
+        let mut text = items
             .iter()
             .map(|item| item.text.as_str())
             .collect::<String>();
-        if !(text.is_empty() && start == end) {
+        let mut edit_start = start;
+        let mut lead = 0;
+        if range.end == count {
+            // The run reaches the end: its last item has no newline, and
+            // the item before it loses its own when nothing follows any
+            // more, or gains one when something is appended after it.
+            text.pop();
+            if range.start > 0 {
+                if items.is_empty() {
+                    edit_start = start - 1;
+                } else if range.start == count {
+                    text.insert(0, '\n');
+                    lead = 1;
+                }
+            }
+        }
+        if !(text.is_empty() && edit_start == end) {
             self.buffer.update(cx, |buffer, cx| {
-                buffer.edit([(start..end, text)], None, cx);
+                buffer.edit([(edit_start..end, text.as_str())], None, cx);
             });
         }
 
@@ -463,37 +488,41 @@ where
         }
 
         let snapshot = self.buffer.read(cx).snapshot();
-        let mut offset = start;
+        let mut offset = edit_start + lead;
         let mut fresh = Vec::with_capacity(items.len());
         for (item, bucket) in items.into_iter().zip(buckets.iter().copied()) {
             let item_start = offset;
+            let body_end = item_start + item.text.len() - 1;
             offset += item.text.len();
             // Right bias on the start, left on the end, so a neighbouring
-            // insert never bleeds into a style.
+            // insert never bleeds into a style. An empty span paints
+            // nothing and is left out: its two anchors would part.
             let anchor = |spans: &[(C, Range<usize>)]| {
                 spans
                     .iter()
-                    .map(|(class, span)| {
-                        let start = (item_start + span.start).min(offset);
-                        let end = (item_start + span.end).min(offset);
-                        (
-                            *class,
-                            snapshot.anchor_after(start)..snapshot.anchor_before(end),
-                        )
+                    .filter_map(|(class, span)| {
+                        let start = (item_start + span.start).min(body_end);
+                        let end = (item_start + span.end).min(body_end);
+                        (start < end).then(|| {
+                            (
+                                *class,
+                                snapshot.anchor_after(start)..snapshot.anchor_before(end),
+                            )
+                        })
                     })
                     .collect::<Vec<_>>()
             };
             let anchored = anchor(&item.styles);
             let anchored_backgrounds = anchor(&item.backgrounds);
-            let anchored_gutter = item.gutter.clone().map(|span| {
-                let start = (item_start + span.start).min(offset);
-                let end = (item_start + span.end).min(offset);
-                snapshot.anchor_after(start)..snapshot.anchor_before(end)
+            let anchored_gutter = item.gutter.clone().and_then(|span| {
+                let start = (item_start + span.start).min(body_end);
+                let end = (item_start + span.end).min(body_end);
+                (start < end).then(|| snapshot.anchor_after(start)..snapshot.anchor_before(end))
             });
             fresh.push(Record {
                 key: item.key,
                 text: item.text,
-                range: snapshot.anchor_after(item_start)..snapshot.anchor_before(offset),
+                range: body(&snapshot, item_start, body_end),
                 styles: item.styles,
                 backgrounds: item.backgrounds,
                 anchored,
@@ -504,6 +533,14 @@ where
                 anchored_gutter,
                 bucket,
             });
+        }
+        let after = (range.end < count).then_some(edit_start + text.len());
+        if let Some(start) = before {
+            let record = &mut self.items[range.start - 1];
+            record.range = body(&snapshot, start, start + record.text.len() - 1);
+        }
+        if let (Some(start), Some(record)) = (after, self.items.get_mut(range.start)) {
+            record.range = body(&snapshot, start, start + record.text.len() - 1);
         }
         drop(snapshot);
         let inserted = fresh.len();
@@ -828,6 +865,12 @@ where
         self.mark_gutter(Vec::new(), 0..self.items.len(), cx);
         self.place_blocks(&[], 0..self.items.len(), cx);
     }
+}
+
+/// An item's range: its text from `start`, short of its newline at
+/// `end`.
+fn body(snapshot: &text::BufferSnapshot, start: usize, end: usize) -> Range<Anchor> {
+    snapshot.anchor_after(start)..snapshot.anchor_before(end)
 }
 
 impl<K, C, M> Record<K, C, M>

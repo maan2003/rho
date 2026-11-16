@@ -102,7 +102,7 @@ fn a_prepended_run_edits_only_the_front(cx: &mut TestAppContext) {
     assert_eq!(edited, vec![0..0], "a prepend is one edit at offset 0");
     cx.update(|cx| {
         let snapshot = buffer.read(cx).snapshot();
-        assert_eq!(snapshot.text(), "first\nsecond\nthird\n");
+        assert_eq!(snapshot.text(), "first\nsecond\nthird");
         let offset = anchor.to_offset(&snapshot);
         assert!(
             snapshot.text()[offset..].starts_with("third"),
@@ -127,10 +127,10 @@ fn an_appended_item_edits_only_the_end(cx: &mut TestAppContext) {
         sheet.insert_before(None, vec![item("c", "third\n")], cx);
     });
 
-    assert_eq!(edited, vec![13..13], "an append is one edit at the end");
+    assert_eq!(edited, vec![12..12], "an append is one edit at the end");
     cx.update(|cx| {
         let snapshot = buffer.read(cx).snapshot();
-        assert_eq!(snapshot.text(), "first\nsecond\nthird\n");
+        assert_eq!(snapshot.text(), "first\nsecond\nthird");
         assert_eq!(anchor.to_offset(&snapshot), 0);
     });
 }
@@ -162,7 +162,13 @@ fn replacing_an_item_edits_only_its_range_and_its_bucket(cx: &mut TestAppContext
         sheet.replace(&target, item("m5", "message 5 (edited)\n"), cx);
     });
 
-    assert_eq!(edited, vec![start..end], "only that item's range is edited");
+    // Its text and the newline after it, which is the range it is
+    // joined to the next by.
+    assert_eq!(
+        edited,
+        vec![start..end + 1],
+        "only that item's range is edited"
+    );
     assert_eq!(
         sheet.last_painted_buckets(),
         &[0],
@@ -215,7 +221,7 @@ fn removing_an_item_leaves_its_neighbours_anchored(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         let snapshot = buffer.read(cx).snapshot();
-        assert_eq!(snapshot.text(), "first\nthird\n");
+        assert_eq!(snapshot.text(), "first\nthird");
         assert_eq!(before.start.to_offset(&snapshot), 0);
         let offset = after.to_offset(&snapshot);
         assert!(

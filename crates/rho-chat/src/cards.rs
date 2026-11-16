@@ -203,6 +203,18 @@ pub fn claims(
         let mut claim = Claim::new(address, curve, reason, cursor.0.0.to_string());
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host, thread);
+        // The room the thread is in: a snooze on it holds the thread too,
+        // and Home ranks the room by the thread's card.
+        let root = chat.root_of(thread);
+        if root != thread {
+            claim.under = Some(
+                ThreadId {
+                    host: host.endpoint,
+                    message: root,
+                }
+                .address(),
+            );
+        }
         if let Some(wrote) = user_wrote {
             let spoke = unix(wrote.at.0);
             claim.bonus = curve::recency_bonus(spoke, now);

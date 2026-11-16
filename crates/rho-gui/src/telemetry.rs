@@ -329,12 +329,12 @@ impl TelemetrySystem {
         cx.spawn(async move |_, cx| {
             let result = upload.await;
             cx.update(|cx| match result {
-                Ok(path) => frame.log(
+                Ok(path) => frame.echo(
                     format!("performance report stored on {name} at {path}"),
                     StyleClass::SystemInfo,
                     cx,
                 ),
-                Err(error) => frame.log(
+                Err(error) => frame.echo(
                     format!("performance report upload to {name} failed: {error:#}"),
                     StyleClass::StatusError,
                     cx,
