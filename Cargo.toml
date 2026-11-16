@@ -1,6 +1,5 @@
 [workspace]
 exclude = [
-  "crates/rho-qa",
   "vendor/brush",
   "vendor/devenv",
   "vendor/libvpx-rs",

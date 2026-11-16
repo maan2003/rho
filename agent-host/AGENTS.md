@@ -36,7 +36,6 @@ exhaustion is obvious and likely.
 
 - Linked Specs exist for the `rho-agent` runtime loop in
   `rho-agent/specs/`.
-- The end-to-end check is the fake-model proof: build the binaries, then
-  `unshare --user --map-root-user --net sh -c 'ip link set lo up &&
-  target/debug/rho-qa fake-model-proof --seconds 15 --bin-dir
-  target/debug'`.
+- The end-to-end checks are the `rho-agent-host` integration tests
+  (`tests/iroh_pairing.rs`, `tests/terminal_stream.rs`, `tests/reexec.rs`),
+  which run the built `target/debug/rho-agent-host`: build it first.

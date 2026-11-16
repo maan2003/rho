@@ -28,8 +28,8 @@ pub const DEFAULT_ACCOUNT: &str = "default";
 /// else in this crate reads `$HOME` or `$CLAUDE_CONFIG_DIR`. A library that
 /// resolves the home directory itself puts every caller on the user's live
 /// configuration whether it meant to be there or not: that is how an agent host
-/// pointed at a rig's state directory, but started by hand rather than by
-/// `rho-qa rig up`, read the user's own `~/.claude/projects` and rebuilt
+/// pointed at a disposable state directory, but started by hand with the
+/// user's environment, read the user's own `~/.claude/projects` and rebuilt
 /// agent rows from the user's transcripts.
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct ClaudePaths {
