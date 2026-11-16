@@ -7,19 +7,19 @@
 //! in the ledger, said once and synced; `shift-u` takes the last one
 //! back, including what a system did about it outside the ledger.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use gpui::{Context, Window};
 use jiff::{Timestamp, Zoned};
-use rho_dealer::facts::{Fact, Seen};
+use rho_dealer::facts::Seen;
 use rho_dealer::marks::NodeMarks;
 use rho_dealer::rank::{Hand, Sources, Trace};
-use rho_dealer::{Address, Card, Claim, Until};
+use rho_dealer::{Address, Card, Claim};
 use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
 use crate::frame::Frame;
-use crate::home::{HOME_CAP, HomeRows, PileRow};
+use crate::home::{HOME_CAP, HomeRows};
 use crate::when::{SnoozeUnit, snooze_target};
 
 /// The lamp and the chime, as last evaluated.
@@ -135,13 +135,8 @@ impl Frame {
         {
             return card;
         }
-        let marks = &self.attention.marks;
-        // A label is called by its path; a note by its first line.
-        let title = match address.as_label() {
-            Some(label) => marks.label_path(label),
-            None => marks.get(address).title().to_owned(),
-        };
-        let (title, context) = match title.as_str() {
+        // A note is called by its first line.
+        let (title, context) = match self.attention.marks.get(address).title() {
             "" => self
                 .name_of(address, cx)
                 .unwrap_or_else(|| (address.key().to_owned(), String::new())),
@@ -328,10 +323,6 @@ impl Frame {
                 skip_until: Some((now + rho_dealer::curve::SKIP_HOLD).to_string()),
             });
         }
-        if self.attention.open_pile.is_some() {
-            self.pull_from_pile(in_view, window, cx);
-            return;
-        }
         let Some(card) = self.hand(cx).top(in_view.as_ref()).cloned() else {
             // Empty lands on Home: there is nothing to deal, so the glance
             // is the answer.
@@ -340,46 +331,6 @@ impl Frame {
         };
         self.journal_deal(Some(&card.address), cx);
         self.open_card(card, window, cx);
-    }
-
-    /// Deals from the open pile: the next card on it this sitting has not
-    /// passed. Off the end, the pile closes and Home is the answer.
-    fn pull_from_pile(
-        &mut self,
-        in_view: Option<Address>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let piles = self.attention.marks.piles(Timestamp::now());
-        let Some(open) = self.attention.open_pile.as_mut() else {
-            return;
-        };
-        open.passed.extend(in_view);
-        let name = open.name.clone().unwrap_or_else(|| "later".to_owned());
-        let next = piles
-            .into_iter()
-            .find(|pile| pile.name == open.name)
-            .map(|pile| pile.nodes)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|address| !open.passed.contains(address));
-        let Some(address) = next else {
-            self.attention.open_pile = None;
-            self.echo(&format!("{name}: nothing more"), StyleClass::SystemInfo, cx);
-            self.open_home(window, cx);
-            return;
-        };
-        let card = self.card_for(&address, cx);
-        self.open_card(card, window, cx);
-    }
-
-    /// Enter on a pile row: the pile is dealt from until it runs out.
-    pub fn open_pile(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.attention.open_pile = Some(crate::attention::OpenPile {
-            name,
-            passed: Default::default(),
-        });
-        self.pull_from_pile(None, window, cx);
     }
 
     fn open_card(&mut self, card: Card, window: &mut Window, cx: &mut Context<Self>) {
@@ -403,108 +354,6 @@ impl Frame {
     ) {
         let (until, said) = snooze_target(unit, count.map_or(1, i64::from), &Zoned::now());
         self.verdict(address, Verdict::Snooze(until), said, window, cx);
-    }
-
-    /// A todo from the verdict menu: on the plate now, or from `count`
-    /// days on.
-    pub fn todo(
-        &mut self,
-        address: &Address,
-        count: Option<u32>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let now = Zoned::now();
-        let (start, said) = match count {
-            None => (None, "todo".to_owned()),
-            Some(days) => {
-                let date = now
-                    .date()
-                    .checked_add(jiff::Span::new().days(i64::from(days)))
-                    .unwrap_or(now.date());
-                (
-                    Some(Until::Day(date)),
-                    format!("todo from {}", date.strftime("%a %-d %b")),
-                )
-            }
-        };
-        self.verdict(address, Verdict::Todo { start }, said, window, cx);
-    }
-
-    /// The label at `path`, made if nobody has made it yet, with every
-    /// label above it.
-    pub fn mint_label(&mut self, path: &str, cx: &mut Context<Self>) -> Option<uuid::Uuid> {
-        let names = crate::attention::path_names(path);
-        if names.is_empty() {
-            return None;
-        }
-        let mut parent: Option<uuid::Uuid> = None;
-        let mut writes = Vec::new();
-        let mut minted: HashMap<String, uuid::Uuid> = HashMap::new();
-        for depth in 0..names.len() {
-            let prefix = names[..=depth].join("/");
-            let found = self
-                .attention
-                .marks
-                .label_at(&prefix)
-                .or_else(|| minted.get(&prefix).copied());
-            let id = match found {
-                Some(id) => id,
-                None => {
-                    let id = uuid::Uuid::new_v4();
-                    writes.push(Write::Fact(Fact::Label {
-                        label: id,
-                        name: names[depth].to_owned(),
-                        parent,
-                    }));
-                    minted.insert(prefix, id);
-                    id
-                }
-            };
-            parent = Some(id);
-        }
-        self.write_marks(writes, cx);
-        parent
-    }
-
-    /// Puts the label at `path` on `address`, or takes it off when it is
-    /// already there. `shift-u` takes it back.
-    pub fn toggle_label(&mut self, address: &Address, path: &str, cx: &mut Context<Self>) {
-        let path = path.trim();
-        let existing = self.attention.marks.label_at(path);
-        let carried =
-            existing.is_some_and(|label| self.attention.marks.get(address).labels.contains(&label));
-        let label = match existing {
-            Some(label) => label,
-            None => match self.mint_label(path, cx) {
-                Some(label) => label,
-                None => {
-                    self.echo("file: no label", StyleClass::SystemInfo, cx);
-                    return;
-                }
-            },
-        };
-        let takeback = self.write_marks(
-            vec![Write::Fact(Fact::Labeled {
-                node: address.clone(),
-                label,
-                present: !carried,
-            })],
-            cx,
-        );
-        let title = self.card_for(address, cx).title;
-        let said = match carried {
-            true => format!("unfiled {title} from {path}"),
-            false => format!("filed {title} under {path}"),
-        };
-        self.attention.push_undo(Undo {
-            sequence: 0,
-            verb: said.clone(),
-            takeback,
-            card: None,
-            reversals: Vec::new(),
-        });
-        self.echo(&said, StyleClass::SystemInfo, cx);
     }
 
     /// Something a system did over many addresses at once, said as one
@@ -595,32 +444,16 @@ impl Frame {
     /// Home is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated and never on a timer.
     fn refresh_home(&mut self, hand: &Hand, cx: &mut Context<Self>) {
-        let now = Timestamp::now();
         let mut sections = Vec::new();
         let mut channels = Vec::new();
         for system in &self.systems {
             sections.extend(system.home(&self.attention.marks, cx));
             channels.extend(system.channels(&self.attention.marks, cx));
         }
-        let piles = self
-            .attention
-            .marks
-            .piles(now)
-            .into_iter()
-            .map(|pile| PileRow {
-                name: pile.name,
-                count: pile.nodes.len(),
-                back: pile
-                    .back
-                    .map(|back| back_words(back, now))
-                    .unwrap_or_default(),
-            })
-            .collect();
         let rows = HomeRows {
             next: hand.cards.iter().take(HOME_CAP).cloned().collect(),
             sections,
             channels,
-            piles,
         };
         self.home.update(cx, |home, cx| home.set_rows(rows, cx));
     }
@@ -646,18 +479,6 @@ pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
     }
 }
 
-/// When a snoozed pile comes back, in the deal bar's units.
-fn back_words(back: Timestamp, now: Timestamp) -> String {
-    let left = back.duration_since(now);
-    let minutes = left.as_mins();
-    match minutes {
-        ..=0 => "back now".to_owned(),
-        1..60 => format!("back in {minutes}m"),
-        60..1440 => format!("back in {}h", minutes / 60),
-        _ => format!("back in {}d", minutes / 1440),
-    }
-}
-
 pub(crate) fn journal_card(address: &Address) -> rho_journal::DealerCardIdentity {
     rho_journal::DealerCardIdentity {
         host: 0,
@@ -668,30 +489,7 @@ pub(crate) fn journal_card(address: &Address) -> rho_journal::DealerCardIdentity
 fn journal_kind(address: &Address) -> rho_journal::DealerCardKind {
     match address.kind() {
         "thread" => rho_journal::DealerCardKind::Thread,
-        "note" | "label" => rho_journal::DealerCardKind::Note,
+        "note" => rho_journal::DealerCardKind::Note,
         _ => rho_journal::DealerCardKind::Topic,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_pile_says_when_it_comes_back() {
-        let now = Timestamp::UNIX_EPOCH;
-        assert_eq!(back_words(now, now), "back now");
-        assert_eq!(
-            back_words(now + jiff::SignedDuration::from_mins(45), now),
-            "back in 45m"
-        );
-        assert_eq!(
-            back_words(now + jiff::SignedDuration::from_hours(5), now),
-            "back in 5h"
-        );
-        assert_eq!(
-            back_words(now + jiff::SignedDuration::from_hours(50), now),
-            "back in 2d"
-        );
     }
 }

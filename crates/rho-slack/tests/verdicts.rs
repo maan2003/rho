@@ -139,19 +139,6 @@ async fn done_reads_it_in_slack_and_the_undo_takes_it_back(cx: &mut TestAppConte
     assert_eq!(rig.attention(cx, &direct()), Some(Attention::DirectMessage));
 }
 
-/// S5: a todo is through with what is there too, in Slack as here; the
-/// todo itself is the ledger's to keep.
-#[gpui::test]
-async fn todo_reads_it_in_slack(cx: &mut TestAppContext) {
-    let rig = rig(cx).await;
-    rig.say(cx, &direct(), Verdict::Todo { start: None })
-        .expect("a todo moves Slack's cursor");
-    until(cx, "Slack's read mark", |_| {
-        rig.fake.last_read("D1").as_deref() == Some("1800000100.000000")
-    })
-    .await;
-}
-
 /// S6: a mute of a conversation is Slack's mute, so it holds in every
 /// client; the undo lifts it there.
 #[gpui::test]

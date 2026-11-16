@@ -5,10 +5,9 @@ What `rank` must make of a history. Each row is a scenario test in
 for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
-Home shows three sections: **next**, every card by priority until it fades
-below the floor, **recent**, the threads agents wrote in lately, unread
-ones marked, folded, and **piles**, what the
-user put away, which they open to be dealt from it.
+Home shows **next**, every card by priority until it fades below the
+floor, then the systems' sections. The user answers a card with done,
+mute, snooze or a deadline.
 
 ## Threads
 
@@ -49,24 +48,22 @@ channel.
 | Z5 | Snoozed, then the other side wrote | a direct message, or a thread of 3 people or fewer: a small bump per message when it comes back; nothing for other threads and agents |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
 
-## Piles
+## What older builds wrote
+
+Piles and todos went with the rooms (`docs/rho2.md`); their facts stay in
+the user's logs and still read.
 
 | # | History and facts | Card |
 |---|---|---|
-| P1 | Put on a named pile | nothing, whatever its source says, until the user opens the pile |
-| P2 | Then a todo, done, a mute, a snooze or another pile | off the pile; as that says |
-| P3 | The piles | named ones by name, each oldest first; then one unnamed pile of everything snoozed, soonest back first |
+| P1 | An old pile | done said then, having seen nothing: takes back the snooze and deadline before it, and holds nothing back |
+| T1 | An old todo | a read: what it saw is handled, it takes nothing back and deals no card of its own |
 
-## Todos and deadlines
+## Deadlines
 
 | # | History and facts | Card |
 |---|---|---|
-| T1 | Todo | low, never fades, rises slowly, stays until done |
-| T2 | Todo with a start date | nothing until then, then as T1 |
 | T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
-| T4 | Todo on a thread | as T1, whatever its agents are doing |
-| T5 | Todo on a thread, then the user writes in it | the todo stays; only done clears it |
-| T6 | Done or muted | takes back the todo, the deadline and the snooze |
+| T6 | Done or muted | takes back the deadline and the snooze |
 
 ## Slack
 
@@ -76,7 +73,6 @@ channel.
 | S2 | Unread channel traffic | starts at 0.1, gone within a day, or half a day once someone else answers |
 | S3 | Read anywhere, or replied | nothing |
 | S4 | A new message after that | a card again, counting from the new message |
-| S5 | Todo on a thread | read in Slack; then as T1 |
 | S6 | Muted in Slack | nothing |
 | S7 | A room snoozed | every thread in it holds too |
 
@@ -85,7 +81,7 @@ channel.
 | # | History and facts | Card |
 |---|---|---|
 | N1 | A plain note | no card |
-| N2 | Todo or deadline | as T1–T3 |
+| N2 | Deadline | as T3 |
 | N3 | Done or deleted | nothing |
 
 ## Every history
@@ -94,6 +90,6 @@ channel.
 |---|---|
 | X1 | One card per node |
 | X2 | A skip sends the card behind every card not skipped, for 30 minutes, in memory only; skipped cards come round longest-skipped first, so each is dealt once before any repeats. The node's source moving voids the skip. Every deal takes the top card at that moment |
-| X3 | The hand changes by itself only at `next_change`: a snooze ending, a todo starting, a deadline coming into view or passing, a skip running out |
+| X3 | The hand changes by itself only at `next_change`: a snooze ending, a deadline coming into view or passing, a skip running out |
 | X4 | "In 1h" is an hour on any clock; "tomorrow" starts at the user's own midnight |
 | X5 | Ranking with a warm cache is ranking from scratch |

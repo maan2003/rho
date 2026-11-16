@@ -14466,7 +14466,6 @@ dependencies = [
  "rho-dealer",
  "rho-frame",
  "rho-window",
- "text",
  "theme",
  "uuid",
 ]
