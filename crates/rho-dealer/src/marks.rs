@@ -1,10 +1,11 @@
 //! What each node comes to: the user's entries ([`crate::facts`]) folded
-//! in time order, and its note ([`crate::notes`]).
+//! in time order.
 //!
 //! Attention facts are kept per node for [`crate::facts::Facts`] to read.
 //! Filing facts settle on the last one said: a label's name and parent,
 //! whether a node carries a label, what it is called and what it is about.
-//! A retracted entry counts for nothing, whenever the retract arrives.
+//! A note is its newest revision. A retracted entry counts for nothing,
+//! whenever the retract arrives.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -12,7 +13,6 @@ use jiff::{SignedDuration, Timestamp, Zoned};
 
 use crate::address::Address;
 use crate::facts::{Entry, EntryId, Fact, Facts};
-use crate::notes::NoteRev;
 
 /// Everything the user said about one node. Which fields mean anything
 /// depends on the node: a note has a body, a label a parent.
@@ -26,6 +26,8 @@ pub struct NodeMarks {
     pub name: Option<String>,
     /// A note's text; its first line is its title.
     pub body: Option<String>,
+    /// When the note's newest revision was written.
+    pub written_ms: Option<i64>,
     pub created_ms: Option<i64>,
     /// A note or a label the user deleted.
     pub deleted: bool,
@@ -44,6 +46,7 @@ static EMPTY: NodeMarks = NodeMarks {
     labels: BTreeSet::new(),
     name: None,
     body: None,
+    written_ms: None,
     created_ms: None,
     deleted: false,
     about: None,
@@ -107,14 +110,12 @@ pub struct Pile {
     pub back: Option<Timestamp>,
 }
 
-/// Every entry and note revision this device holds, folded by node.
+/// Every entry this device holds, folded by node.
 #[derive(Default)]
 pub struct Marks {
     entries: BTreeMap<EntryId, Entry>,
     retracted: HashSet<EntryId>,
     by_node: HashMap<Address, BTreeSet<EntryId>>,
-    /// The newest revision of each note.
-    notes: HashMap<uuid::Uuid, NoteRev>,
     nodes: HashMap<Address, NodeMarks>,
     /// The newest instant any entry or revision here was said at.
     newest: Option<Timestamp>,
@@ -146,26 +147,6 @@ impl Marks {
                 }
             }
             self.entries.insert(id, entry);
-        }
-        for node in &touched {
-            self.refresh(node);
-        }
-        touched
-    }
-
-    /// Takes in note revisions, and says which notes moved.
-    pub fn apply_notes(&mut self, revs: impl IntoIterator<Item = NoteRev>) -> BTreeSet<Address> {
-        let mut touched = BTreeSet::new();
-        for rev in revs {
-            self.saw(rev.at.timestamp());
-            let newer = self
-                .notes
-                .get(&rev.note)
-                .is_none_or(|held| held.id() < rev.id());
-            if newer {
-                touched.insert(Address::note(rev.note));
-                self.notes.insert(rev.note, rev);
-            }
         }
         for node in &touched {
             self.refresh(node);
@@ -224,15 +205,15 @@ impl Marks {
                 }
                 Fact::Named { name, .. } => marks.name = name.clone(),
                 Fact::About { about, .. } => marks.about = about.clone(),
+                Fact::Wrote { text, created, .. } => {
+                    marks.body = Some(text.clone());
+                    marks.written_ms = Some(entry.at.timestamp().as_millisecond());
+                    marks.created_ms = Some(created.as_millisecond());
+                    marks.deleted = false;
+                }
+                Fact::Deleted { .. } => marks.deleted = true,
                 Fact::Retract { .. } => {}
             }
-        }
-        if let Some(id) = node.as_note()
-            && let Some(note) = self.notes.get(&id)
-        {
-            marks.body = Some(note.body.clone());
-            marks.created_ms = Some(note.created.as_millisecond());
-            marks.deleted = note.deleted;
         }
         if marks == NodeMarks::default() {
             self.nodes.remove(node);
@@ -250,26 +231,16 @@ impl Marks {
         self.nodes.iter()
     }
 
-    /// A note's newest revision.
-    /// Every note's newest revision, deleted ones too.
-    pub fn note_revs(&self) -> impl Iterator<Item = &NoteRev> {
-        self.notes.values()
-    }
-
-    pub fn note(&self, note: uuid::Uuid) -> Option<&NoteRev> {
-        self.notes.get(&note)
-    }
-
     /// Whether this device holds nothing at all yet.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.notes.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Every note that is not deleted.
+    /// Every note that has text and is not deleted.
     pub fn notes(&self) -> impl Iterator<Item = (&Address, &NodeMarks)> {
-        self.nodes
-            .iter()
-            .filter(|(node, marks)| node.as_note().is_some() && !marks.deleted)
+        self.nodes.iter().filter(|(node, marks)| {
+            node.as_note().is_some() && marks.body.is_some() && !marks.deleted
+        })
     }
 
     /// What the user put away and can open: each named pile with its nodes,
@@ -592,19 +563,60 @@ mod tests {
     }
 
     #[test]
-    fn a_note_is_its_newest_revision() {
+    fn a_note_is_its_newest_revision_from_any_device() {
         let mut marks = Marks::default();
         let id = uuid::Uuid::new_v4();
-        let rev = |device, minute, body: &str| NoteRev {
-            note: id,
-            device,
-            at: at(minute),
-            created: at(0).timestamp(),
-            body: body.into(),
-            deleted: false,
+        let wrote = |device, minute, text: &str| {
+            said(
+                device,
+                minute,
+                Fact::Wrote {
+                    note: id,
+                    text: text.into(),
+                    created: at(0).timestamp(),
+                },
+            )
         };
-        marks.apply_notes([rev(PHONE, 2, "buy milk"), rev(LAPTOP, 1, "buy")]);
-        assert_eq!(marks.get(&Address::note(id)).title(), "buy milk");
+        marks.apply([wrote(PHONE, 2, "buy milk"), wrote(LAPTOP, 1, "buy")]);
+        let note = marks.get(&Address::note(id));
+        assert_eq!(note.title(), "buy milk");
+        assert_eq!(note.created_ms, Some(at(0).timestamp().as_millisecond()));
+        assert_eq!(note.written_ms, Some(at(2).timestamp().as_millisecond()));
+        assert_eq!(marks.notes().count(), 1);
+    }
+
+    /// A deletion is a fact in order with the revisions: one said after the
+    /// newest revision removes the note, and a revision said after it, or
+    /// a retract of it, brings the note back.
+    #[test]
+    fn a_deleted_note_comes_back_with_a_later_revision_or_a_retract() {
+        let mut marks = Marks::default();
+        let id = uuid::Uuid::new_v4();
+        let wrote = |minute, text: &str| {
+            said(
+                LAPTOP,
+                minute,
+                Fact::Wrote {
+                    note: id,
+                    text: text.into(),
+                    created: at(0).timestamp(),
+                },
+            )
+        };
+        let deleted = said(PHONE, 2, Fact::Deleted { note: id });
+        marks.apply([wrote(1, "milk"), deleted.clone()]);
+        assert_eq!(marks.notes().count(), 0);
+        assert!(marks.get(&Address::note(id)).deleted);
+        marks.apply([wrote(3, "milk and eggs")]);
+        assert_eq!(marks.get(&Address::note(id)).title(), "milk and eggs");
+        assert!(!marks.get(&Address::note(id)).deleted);
+
+        let mut marks = Marks::default();
+        marks.apply([
+            wrote(1, "milk"),
+            deleted.clone(),
+            said(PHONE, 3, Fact::Retract { of: deleted.id() }),
+        ]);
         assert_eq!(marks.notes().count(), 1);
     }
 

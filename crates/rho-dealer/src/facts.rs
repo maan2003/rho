@@ -167,6 +167,19 @@ pub enum Fact {
         node: Address,
         seen: Seen,
     },
+    /// The user's own text as a message, written or revised: the newest
+    /// revision is the message. `created` is when it was first written,
+    /// the same on every revision. Later still than `Read`.
+    Wrote {
+        note: uuid::Uuid,
+        text: String,
+        created: Timestamp,
+    },
+    /// The message removed. A revision said after it brings it back, and
+    /// a retract of this entry too.
+    Deleted {
+        note: uuid::Uuid,
+    },
 }
 
 impl Fact {
@@ -184,6 +197,7 @@ impl Fact {
             | Self::Named { node, .. }
             | Self::About { node, .. }
             | Self::Read { node, .. } => Some(node.clone()),
+            Self::Wrote { note, .. } | Self::Deleted { note } => Some(Address::note(*note)),
             Self::Label { label, .. }
             | Self::Unlabel { label }
             | Self::Repository { label, .. }
@@ -219,6 +233,8 @@ impl Fact {
             | Self::Unlabel { .. }
             | Self::Repository { .. }
             | Self::Host { .. }
+            | Self::Wrote { .. }
+            | Self::Deleted { .. }
             | Self::Retract { .. } => return None,
         })
     }
