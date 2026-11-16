@@ -60,6 +60,7 @@ where
     let head = services.db.read().chat_head();
     let _ = outgoing_tx.send(ServerFrame::Hello {
         head,
+        host: services.endpoint,
         machine_seed: services.machine_seed,
     });
     let (follow_tx, follow_rx) = mpsc::unbounded_channel();

@@ -34,12 +34,12 @@ pub use fold::{HostChat, Thread, Told};
 pub struct AgentRef(pub rho_agent_types::AgentId);
 
 /// A thread wherever it is: the log of the host that keeps it, named by
-/// that host's machine seed, which is the same on every device, and the
-/// message the thread hangs under. Its text form, `thread:<seed>/<id>`,
-/// is what addresses and the user's facts say.
+/// that host's iroh identity, which is the same on every device, and the
+/// message the thread hangs under. Its text form,
+/// `thread:<endpoint>/<id>`, is what addresses and the user's facts say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId {
-    pub machine_seed: u64,
+    pub host: rho_agent_types::EndpointId,
     pub message: rho_agent_types::MessageId,
 }
 
@@ -48,15 +48,21 @@ impl ThreadId {
 
     /// The thread as text after `thread:`.
     pub fn key(&self) -> String {
-        format!("{:016x}/{}", self.machine_seed, self.message.0.0)
+        format!("{}/{}", self.host, self.message.0.0)
     }
 
     pub fn parse(rest: &str) -> Option<Self> {
-        let (seed, message) = rest.split_once('/')?;
+        let (host, message) = rest.split_once('/')?;
         Some(Self {
-            machine_seed: u64::from_str_radix(seed, 16).ok()?,
+            host: host.parse().ok()?,
             message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(message.parse().ok()?)),
         })
+    }
+
+    /// What the thread was called while the host's database seed named
+    /// its log (`temp-migration`): what older facts say.
+    pub fn seeded_key(machine_seed: u64, message: rho_agent_types::MessageId) -> String {
+        format!("{machine_seed:016x}/{}", message.0.0)
     }
 }
 
@@ -73,10 +79,13 @@ mod thread_id_tests {
     #[test]
     fn a_thread_id_reads_its_own_text() {
         let id = ThreadId {
-            machine_seed: 0xabc,
+            host: rho_agent_types::EndpointId([0; 32]),
             message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(41)),
         };
-        assert_eq!(id.to_string(), "thread:0000000000000abc/41");
+        assert_eq!(
+            id.to_string(),
+            "thread:yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/41"
+        );
         assert_eq!(ThreadId::parse(&id.key()), Some(id));
         assert_eq!(ThreadId::parse("abc"), None);
         assert_eq!(ThreadId::parse("zz/1"), None);

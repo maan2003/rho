@@ -188,7 +188,7 @@ impl Surface for AgentSurface {
                 .and_then(|message| {
                     let host = registry.host_of_agent(agent)?;
                     Some(ThreadId {
-                        machine_seed: registry.host_machine_seed(host),
+                        host: registry.host_endpoint(host)?,
                         message,
                     })
                 })

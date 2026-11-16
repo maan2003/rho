@@ -21,7 +21,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{AgentId, MessageId};
+use rho_agent_types::{AgentId, EndpointId, MessageId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
@@ -64,7 +64,7 @@ pub struct AgentsSystem {
     frame: FrameLink,
     /// Agents asked for with the user's message, by the id the chat gave
     /// the message: started once the host has logged it.
-    starting: HashMap<(u64, u64), start::Plan>,
+    starting: HashMap<(EndpointId, u64), start::Plan>,
     timer: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -92,12 +92,12 @@ impl AgentsSystem {
         });
         let delivered = cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| {
             if let ChatEvent::Delivered {
-                machine_seed,
+                endpoint,
                 client_id,
                 message,
             } = event
             {
-                this.delivered(*machine_seed, *client_id, *message, cx);
+                this.delivered(*endpoint, *client_id, *message, cx);
             }
         });
         Self {
@@ -122,14 +122,11 @@ impl AgentsSystem {
         &self.registry
     }
 
-    /// Whether `agent` of the host whose database seed is `machine_seed`
-    /// still exists: `true` for a host this client has not heard from,
-    /// since nothing says otherwise.
-    /// What the chat calls an agent of the host with `machine_seed`, and
+    /// What the chat calls an agent of the host with this identity, and
     /// `None` once the agent is gone. A host not attached keeps every
     /// agent of its threads, by id.
-    pub fn agent_label(&self, machine_seed: u64, agent: AgentId) -> Option<String> {
-        match self.host_of_seed(machine_seed) {
+    pub fn agent_label(&self, endpoint: EndpointId, agent: AgentId) -> Option<String> {
+        match self.host_of(endpoint) {
             Some(_) => self
                 .registry
                 .mirrored(agent)
@@ -138,11 +135,12 @@ impl AgentsSystem {
         }
     }
 
-    fn host_of_seed(&self, machine_seed: u64) -> Option<HostId> {
+    /// The attached host with this identity.
+    fn host_of(&self, endpoint: EndpointId) -> Option<HostId> {
         self.registry
             .hosts()
             .map(|(host, _)| host)
-            .find(|host| self.registry.host_machine_seed(*host) == machine_seed)
+            .find(|host| self.registry.host_endpoint(*host) == Some(endpoint))
     }
 
     fn agents_on(&self, host: HostId) -> Option<AgentsLink> {
@@ -209,10 +207,11 @@ impl AgentsSystem {
             }
             ModelMsg::Host {
                 machine_seed,
+                endpoint,
                 agent_counter,
             } => {
                 self.registry
-                    .set_host_data(host, machine_seed, agent_counter);
+                    .set_host_data(host, machine_seed, endpoint, agent_counter);
                 cx.notify();
             }
             ModelMsg::Auth { auth } => {
@@ -433,12 +432,12 @@ impl AgentsSystem {
     /// The host logged a message the user sent to start an agent with.
     fn delivered(
         &mut self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         client_id: u64,
         message: MessageId,
         cx: &mut Context<Self>,
     ) {
-        if let Some(plan) = self.starting.remove(&(machine_seed, client_id)) {
+        if let Some(plan) = self.starting.remove(&(endpoint, client_id)) {
             start::create(self, plan, message, cx);
         }
     }
@@ -601,7 +600,7 @@ impl System for AgentsSystem {
         let Some(thread) = self.thread_at(point, cx) else {
             return rows;
         };
-        if self.host_of_seed(thread.machine_seed).is_none() {
+        if self.host_of(thread.host).is_none() {
             return rows;
         }
         rows.push(Row::menu(
@@ -612,7 +611,7 @@ impl System for AgentsSystem {
         let draft = !self
             .chat
             .read(cx)
-            .draft(thread.machine_seed, Some(thread.message))
+            .draft(thread.host, Some(thread.message))
             .trim()
             .is_empty();
         if draft {

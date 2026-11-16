@@ -18,7 +18,7 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{Address as Party, AgentId, ContentPart, MessageId};
+use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
@@ -56,12 +56,12 @@ pub enum Event {
     /// The host logged a message the user wrote, under the id this client
     /// gave it when it was written.
     Delivered {
-        machine_seed: u64,
+        endpoint: EndpointId,
         client_id: u64,
         message: MessageId,
     },
     /// A host's forest changed.
-    Changed { machine_seed: u64 },
+    Changed { endpoint: EndpointId },
 }
 
 /// One attached host: what the user calls it, how to call it, and whose
@@ -69,21 +69,21 @@ pub enum Event {
 struct Slot {
     name: String,
     link: Link,
-    machine_seed: Option<u64>,
+    endpoint: Option<EndpointId>,
 }
 
-/// What to call an agent of the host with this database seed, and `None`
+/// What to call an agent of the host with this identity, and `None`
 /// once it is gone; the agents system answers, the chat only asks.
-pub type AgentLabel = Rc<dyn Fn(u64, AgentId, &App) -> Option<String>>;
+pub type AgentLabel = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<String>>;
 
 pub struct ChatSystem {
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
-    /// Each log's forest, by the seed of the host that keeps it.
-    chats: HashMap<u64, HostChat>,
+    /// Each log's forest, by the identity of the host that keeps it.
+    chats: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
-    drafts: HashMap<(u64, Option<MessageId>), String>,
+    drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, and its label; the agents
@@ -143,20 +143,20 @@ impl ChatSystem {
         self.agent_label = agent_label;
     }
 
-    /// The label of an agent of the host with `machine_seed`, `None` once
+    /// The label of an agent of the host with `endpoint`, `None` once
     /// it is gone.
-    pub fn agent_label(&self, machine_seed: u64, agent: AgentId, cx: &App) -> Option<String> {
-        (self.agent_label)(machine_seed, agent, cx)
+    pub fn agent_label(&self, endpoint: EndpointId, agent: AgentId, cx: &App) -> Option<String> {
+        (self.agent_label)(endpoint, agent, cx)
     }
 
-    pub fn chat(&self, machine_seed: u64) -> Option<&HostChat> {
-        self.chats.get(&machine_seed)
+    pub fn chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
+        self.chats.get(&endpoint)
     }
 
     /// The hosts whose logs are held, with their names: those attached
-    /// under the name the user gave them, the rest by seed.
-    pub fn hosts(&self) -> Vec<(u64, String)> {
-        let mut hosts: Vec<(u64, String)> = self
+    /// under the name the user gave them, the rest by identity.
+    pub fn hosts(&self) -> Vec<(EndpointId, String)> {
+        let mut hosts: Vec<(EndpointId, String)> = self
             .chats
             .keys()
             .map(|seed| (*seed, self.host_name(*seed)))
@@ -165,12 +165,12 @@ impl ChatSystem {
         hosts
     }
 
-    pub fn host_name(&self, machine_seed: u64) -> String {
+    pub fn host_name(&self, endpoint: EndpointId) -> String {
         self.hosts
             .values()
-            .find(|slot| slot.machine_seed == Some(machine_seed))
+            .find(|slot| slot.endpoint == Some(endpoint))
             .map(|slot| slot.name.clone())
-            .unwrap_or_else(|| format!("{machine_seed:016x}"))
+            .unwrap_or_else(|| format!("{endpoint}"))
     }
 
     /// Whether the window holds more than one host: when it does, a
@@ -179,69 +179,95 @@ impl ChatSystem {
         self.chats.len() > 1
     }
 
-    pub fn draft(&self, machine_seed: u64, parent: Option<MessageId>) -> &str {
+    pub fn draft(&self, endpoint: EndpointId, parent: Option<MessageId>) -> &str {
         self.drafts
-            .get(&(machine_seed, parent))
+            .get(&(endpoint, parent))
             .map_or("", String::as_str)
     }
 
-    pub fn set_draft(&mut self, machine_seed: u64, parent: Option<MessageId>, text: String) {
-        self.cache.write_draft(machine_seed, parent, text.clone());
+    pub fn set_draft(&mut self, endpoint: EndpointId, parent: Option<MessageId>, text: String) {
+        self.cache.write_draft(endpoint, parent, text.clone());
         match text.is_empty() {
-            true => self.drafts.remove(&(machine_seed, parent)),
-            false => self.drafts.insert((machine_seed, parent), text),
+            true => self.drafts.remove(&(endpoint, parent)),
+            false => self.drafts.insert((endpoint, parent), text),
         };
     }
 
     /// What the user wrote under `parent` that the host has not logged.
     pub fn waiting_under(
         &self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         parent: Option<MessageId>,
     ) -> Vec<&crate::outbox::Outgoing> {
-        self.outbox.waiting_under(machine_seed, parent)
+        self.outbox.waiting_under(endpoint, parent)
     }
 
     fn chat_event(&mut self, event: ChatEvent, cx: &mut Context<Self>) {
         match event {
             ChatEvent::Hello {
                 host,
+                endpoint,
                 machine_seed,
                 fresh,
                 ..
             } => {
                 if let Some(slot) = self.hosts.get_mut(&host) {
-                    slot.machine_seed = Some(machine_seed);
+                    slot.endpoint = Some(endpoint);
                 }
                 if fresh {
-                    self.cache.reset(machine_seed);
-                    self.chats.insert(machine_seed, HostChat::default());
+                    self.cache.reset(endpoint);
+                    self.chats.insert(endpoint, HostChat::default());
                 }
-                self.chats.entry(machine_seed).or_default();
-                self.send_unsent(machine_seed, cx);
-                self.changed(machine_seed, cx);
+                self.chats.entry(endpoint).or_default();
+                self.adopt_seed(machine_seed, endpoint, cx);
+                self.send_unsent(endpoint, cx);
+                self.changed(endpoint, cx);
             }
             ChatEvent::Records { host, records } => {
-                let Some(machine_seed) = self.hosts.get(&host).and_then(|slot| slot.machine_seed)
-                else {
+                let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) else {
                     return;
                 };
-                let chat = self.chats.entry(machine_seed).or_default();
+                let chat = self.chats.entry(endpoint).or_default();
                 for record in &records {
                     chat.tell(record);
                 }
                 if let Some(last) = records.last() {
-                    self.cursors.advance(machine_seed, last.seq);
+                    self.cursors.advance(endpoint, last.seq);
                 }
-                self.cache.write_records(machine_seed, records);
-                self.changed(machine_seed, cx);
+                self.cache.write_records(endpoint, records);
+                self.changed(endpoint, cx);
             }
             ChatEvent::Closed { .. } => {}
         }
     }
 
-    fn changed(&mut self, machine_seed: u64, cx: &mut Context<Self>) {
-        cx.emit(Event::Changed { machine_seed });
+    /// What this device kept under the host's database seed, before the
+    /// endpoint named its log, moves to the endpoint: unsent messages,
+    /// drafts, and what the user said about its threads in the ledger
+    /// (`temp-migration`). Nothing to move after the first hello.
+    fn adopt_seed(&mut self, machine_seed: u64, endpoint: EndpointId, cx: &mut Context<Self>) {
+        if !self.cache.adopt_seed(machine_seed, endpoint) {
+            return;
+        }
+        let (outbox, drafts) = self.cache.load_host(endpoint);
+        self.outbox.adopt(endpoint, outbox);
+        for (parent, text) in drafts {
+            self.drafts.insert((endpoint, parent), text);
+        }
+        let seeded = format!("{}:{machine_seed:016x}/", ThreadId::KIND);
+        self.frame.update(cx, move |frame, _, cx| {
+            frame.restate(
+                &|address: &Address| {
+                    let id = address.key().strip_prefix(&seeded)?;
+                    Some(Address::new(ThreadId::KIND, format!("{endpoint}/{id}")))
+                },
+                cx,
+            );
+        });
+    }
+
+    fn changed(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
+        cx.emit(Event::Changed { endpoint });
         cx.notify();
         self.frame.changed(cx);
     }
@@ -251,16 +277,16 @@ impl ChatSystem {
     /// [`Event::Delivered`] names once the host has it.
     pub fn post(
         &mut self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         parent: Option<MessageId>,
         text: String,
         mentions: Vec<AgentId>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let content = vec![ContentPart::Text { text }];
-        let (id, kept) = self.outbox.push(machine_seed, parent, mentions, content);
-        self.cache.write_outbox(machine_seed, kept);
-        self.send_unsent(machine_seed, cx);
+        let (id, kept) = self.outbox.push(endpoint, parent, mentions, content);
+        self.cache.write_outbox(endpoint, kept);
+        self.send_unsent(endpoint, cx);
         cx.notify();
         id
     }
@@ -269,33 +295,33 @@ impl ChatSystem {
     /// draft; the composer follows. `None` when nothing is written.
     pub fn send_draft(
         &mut self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         parent: Option<MessageId>,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
-        let text = self.draft(machine_seed, parent).trim().to_owned();
+        let text = self.draft(endpoint, parent).trim().to_owned();
         if text.is_empty() {
             return None;
         }
-        self.set_draft(machine_seed, parent, String::new());
-        Some(self.post(machine_seed, parent, text, Vec::new(), cx))
+        self.set_draft(endpoint, parent, String::new());
+        Some(self.post(endpoint, parent, text, Vec::new(), cx))
     }
 
-    fn link_for(&self, machine_seed: u64) -> Option<Link> {
+    fn link_for(&self, endpoint: EndpointId) -> Option<Link> {
         self.hosts
             .values()
-            .find(|slot| slot.machine_seed == Some(machine_seed))
+            .find(|slot| slot.endpoint == Some(endpoint))
             .map(|slot| slot.link.clone())
     }
 
     /// Posts the host's oldest unsent message, unless one is on its way.
     /// The rest go one by one as each is answered; a retry carries the
     /// same client id, so the host keeps one copy.
-    fn send_unsent(&mut self, machine_seed: u64, cx: &mut Context<Self>) {
-        let Some(link) = self.link_for(machine_seed) else {
+    fn send_unsent(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
+        let Some(link) = self.link_for(endpoint) else {
             return;
         };
-        let Some(post) = self.outbox.next(machine_seed) else {
+        let Some(post) = self.outbox.next(endpoint) else {
             return;
         };
         let reply = link.run(move |dialer| async move { crate::stream::call(&dialer, post).await });
@@ -303,19 +329,19 @@ impl ChatSystem {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
                 Ok(message) => {
-                    if let Some((client_id, _, kept)) = this.outbox.delivered(machine_seed) {
-                        this.cache.write_outbox(machine_seed, kept);
+                    if let Some((client_id, _, kept)) = this.outbox.delivered(endpoint) {
+                        this.cache.write_outbox(endpoint, kept);
                         cx.emit(Event::Delivered {
-                            machine_seed,
+                            endpoint,
                             client_id,
                             message,
                         });
                     }
                     cx.notify();
-                    this.send_unsent(machine_seed, cx);
+                    this.send_unsent(endpoint, cx);
                 }
                 Err(error) => {
-                    this.outbox.failed(machine_seed);
+                    this.outbox.failed(endpoint);
                     this.frame
                         .log(format!("chat: {error:#}"), StyleClass::SystemImportant, cx);
                 }
@@ -327,7 +353,7 @@ impl ChatSystem {
     /// One call to a host's chat; `done` hears the answer.
     pub fn call<C>(
         &self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         call: C,
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, anyhow::Result<C::Reply>, &mut Context<Self>) + 'static,
@@ -335,9 +361,9 @@ impl ChatSystem {
         C: rho_rpc::protocol::Call + Send + 'static,
         C::Reply: Send + 'static,
     {
-        let Some(link) = self.link_for(machine_seed) else {
+        let Some(link) = self.link_for(endpoint) else {
             self.frame.echo(
-                format!("{}: not connected", self.host_name(machine_seed)),
+                format!("{}: not connected", self.host_name(endpoint)),
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -384,15 +410,15 @@ impl ChatSystem {
 
     fn with_host<R>(
         &self,
-        machine_seed: u64,
+        endpoint: EndpointId,
         cx: &App,
         read: impl FnOnce(&cards::Host<'_>) -> R,
     ) -> Option<R> {
-        let chat = self.chats.get(&machine_seed)?;
-        let name = self.host_name(machine_seed);
-        let alive = |agent: AgentId| self.agent_label(machine_seed, agent, cx).is_some();
+        let chat = self.chats.get(&endpoint)?;
+        let name = self.host_name(endpoint);
+        let alive = |agent: AgentId| self.agent_label(endpoint, agent, cx).is_some();
         let host = cards::Host {
-            machine_seed,
+            endpoint,
             chat,
             name: self.many_hosts().then_some(name.as_str()),
             alive: &alive,
@@ -400,10 +426,10 @@ impl ChatSystem {
         Some(read(&host))
     }
 
-    /// Posts a root on `machine_seed`: a new channel.
+    /// Posts a root on `endpoint`: a new channel.
     fn prompt_new_root(
         this: Entity<Self>,
-        machine_seed: u64,
+        endpoint: EndpointId,
         frame: &mut rho_frame::Frame,
         window: &mut Window,
         cx: &mut Context<rho_frame::Frame>,
@@ -417,7 +443,7 @@ impl ChatSystem {
                     return;
                 }
                 this.update(cx, |chat, cx| {
-                    chat.post(machine_seed, None, text, Vec::new(), cx);
+                    chat.post(endpoint, None, text, Vec::new(), cx);
                 });
             }),
             window,
@@ -438,9 +464,7 @@ impl System for ChatSystem {
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
         let thread = self.thread_of(address)?;
-        self.chats
-            .get(&thread.machine_seed)?
-            .message(thread.message)?;
+        self.chats.get(&thread.host)?.message(thread.message)?;
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
@@ -458,7 +482,7 @@ impl System for ChatSystem {
             Slot {
                 name: name.to_owned(),
                 link: link.clone(),
-                machine_seed: None,
+                endpoint: None,
             },
         );
         vec![Arc::new(ChatStream::new(
@@ -522,7 +546,7 @@ impl System for ChatSystem {
         if let Some(thread) = point.subject.as_ref().and_then(|a| self.thread_of(a)) {
             let current = self
                 .chats
-                .get(&thread.machine_seed)
+                .get(&thread.host)
                 .and_then(|chat| chat.name(thread.message))
                 .unwrap_or_default();
             rows.push(Row::run(
@@ -538,7 +562,7 @@ impl System for ChatSystem {
                             let name = input.trim().to_owned();
                             this.update(cx, |chat, cx| {
                                 chat.call(
-                                    thread.machine_seed,
+                                    thread.host,
                                     Name {
                                         thread: thread.message,
                                         name,
@@ -573,7 +597,7 @@ impl System for ChatSystem {
         cx: &App,
     ) -> Vec<Claim> {
         let mut claims = Vec::new();
-        let mut seeds: Vec<u64> = self.chats.keys().copied().collect();
+        let mut seeds: Vec<EndpointId> = self.chats.keys().copied().collect();
         seeds.sort_unstable();
         for seed in seeds {
             claims.extend(
@@ -588,9 +612,7 @@ impl System for ChatSystem {
 
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
         let thread = self.thread_of(address)?;
-        self.with_host(thread.machine_seed, cx, |host| {
-            cards::name(host, thread.message)
-        })?
+        self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
     }
 
     fn seen(&self, address: &Address, _cx: &App) -> Seen {
@@ -598,7 +620,7 @@ impl System for ChatSystem {
             return Seen::Whole;
         };
         self.chats
-            .get(&thread.machine_seed)
+            .get(&thread.host)
             .and_then(|chat| chat.newest_in(thread.message))
             .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
     }
@@ -612,7 +634,7 @@ impl System for ChatSystem {
             for root in chat.roots() {
                 for id in chat.children(Some(*root)) {
                     let thread = ThreadId {
-                        machine_seed: *seed,
+                        host: *seed,
                         message: *id,
                     };
                     let unread = self.unread_in(chat, thread, marks);
@@ -653,7 +675,7 @@ impl System for ChatSystem {
                     self.unread_in(
                         chat,
                         ThreadId {
-                            machine_seed: seed,
+                            host: seed,
                             message: *id,
                         },
                         marks,
@@ -661,7 +683,7 @@ impl System for ChatSystem {
                 });
                 rows.push(ChannelRow {
                     address: ThreadId {
-                        machine_seed: seed,
+                        host: seed,
                         message: *root,
                     }
                     .address(),
@@ -690,7 +712,7 @@ impl System for ChatSystem {
                         .unwrap_or((id, rho_agent_types::UnixMs(0)));
                     found.push(Found {
                         address: ThreadId {
-                            machine_seed: seed,
+                            host: seed,
                             message: id,
                         }
                         .address(),

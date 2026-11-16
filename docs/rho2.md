@@ -159,14 +159,17 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
   `rows`); `rho-gui` lists the systems. A system reaches the frame only
   through `FrameLink`.
-- Address kinds: `thread:<seed>/<id>`, `agent:<id>`, `page:<uuid>`,
+- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`, `page:<uuid>`,
   `note:<uuid>`, `label:<uuid>`, `term:<host>/<agent>/<n>`,
   `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
   `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate
   owns are Linked Specs beside their crates.
-- A host is still named by its machine seed, which the chat session's
-  `Hello` carries: `ThreadId { machine_seed, message }`. The iroh
-  endpoint key as the host's name is not done.
+- A host is named by its iroh endpoint key, which both sessions' `Hello`
+  carry: `ThreadId { host: EndpointId, message }`. `machine_seed` stays
+  only as the domain agent ids are encoded in. Until the temp migration
+  is removed, the chat `Hello` carries the seed too, and the first hello
+  moves the chat cache rows and re-says the ledger facts under the new
+  address (`Frame::restate`).
 - The host makes no naming attempt: a thread is named by the user or by
   an agent (`rho.chat.name`), else by the first line of its message.
 - Starting an agent goes through the agents system's rows on a thread

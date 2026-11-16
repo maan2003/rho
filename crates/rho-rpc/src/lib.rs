@@ -259,6 +259,13 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+/// The host's iroh identity, made on first use and kept in its database:
+/// what names the host to its clients, whether or not it listens on it.
+#[cfg(feature = "server")]
+pub async fn server_endpoint_id(db: &rho_db::RhoDb) -> anyhow::Result<[u8; 32]> {
+    Ok(*load_or_create_server_secret(db).await?.public().as_bytes())
+}
+
 #[cfg(feature = "server")]
 async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh::SecretKey> {
     let mut write = db.write().await;

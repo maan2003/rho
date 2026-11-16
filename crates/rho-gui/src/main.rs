@@ -209,10 +209,10 @@ fn run() -> Result<()> {
                 // names them; the agents system knows both.
                 let labels = agents.downgrade();
                 chat.update(cx, |chat, _| {
-                    chat.set_agent_label(Rc::new(move |seed, agent, cx| {
+                    chat.set_agent_label(Rc::new(move |endpoint, agent, cx| {
                         labels.upgrade().map_or_else(
                             || Some(agent.encoded()),
-                            |agents| agents.read(cx).agent_label(seed, agent),
+                            |agents| agents.read(cx).agent_label(endpoint, agent),
                         )
                     }))
                 });

@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::HostId;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, EndpointId};
 
 use crate::fold::{AgentIdentity, MirroredAgent};
 use crate::now_ms;
@@ -57,6 +57,8 @@ pub enum AgentLife {
 struct HostSnapshot {
     name: String,
     machine_seed: u64,
+    /// The host's identity, once its agents stream has said hello.
+    endpoint: Option<EndpointId>,
     agent_counter: u64,
 }
 
@@ -173,15 +175,28 @@ impl AgentMap {
             .unwrap_or_default()
     }
 
+    /// The host's identity, which names it to the rest of the world; `None`
+    /// before its agents stream has said hello.
+    pub fn host_endpoint(&self, host: HostId) -> Option<EndpointId> {
+        self.hosts.get(&host).and_then(|h| h.endpoint)
+    }
+
     pub fn host_of_agent(&self, agent_id: AgentId) -> Option<HostId> {
         self.agent_hosts.get(&agent_id).copied()
     }
 
     /// What a host's agents stream says of it when it opens. The agents
     /// come by the directory, not here.
-    pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
+    pub fn set_host_data(
+        &mut self,
+        host: HostId,
+        machine_seed: u64,
+        endpoint: EndpointId,
+        agent_counter: u64,
+    ) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
+        snapshot.endpoint = Some(endpoint);
         snapshot.agent_counter = agent_counter;
     }
 
@@ -758,7 +773,7 @@ mod tests {
         // No host has said anything yet.
         assert!(map.agent_facts(agent(1)).runtime.is_none());
         // A connected host that says nothing of an agent says nothing.
-        map.set_host_data(host, 0, 1);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 1);
         assert!(map.agent_facts(agent(1)).runtime.is_none());
         map.set_runtime(
             agent(1),
@@ -781,7 +796,7 @@ mod tests {
     #[test]
     fn an_agent_is_the_users_unless_an_agent_made_it() {
         let mut registry = AgentMap::default();
-        registry.set_host_data(HostId::default(), 0, 3);
+        registry.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         registry.told(vec![named(1, None, 1), named(2, Some(agent(1)), 2)]);
 
         assert!(registry.owned_by_user(agent(1)));
@@ -821,7 +836,7 @@ mod tests {
     fn an_agent_is_active_from_when_it_was_made() {
         let host = HostId::default();
         let mut registry = AgentMap::default();
-        registry.set_host_data(host, 0, 1);
+        registry.set_host_data(host, 0, EndpointId([0; 32]), 1);
         assert_eq!(registry.told(vec![named(1, None, 5)]), [agent(1)]);
         assert_eq!(registry.host_of_agent(agent(1)), Some(host));
         assert_eq!(registry.agent_last_active(agent(1)), Some(UnixMs(5)));
@@ -842,7 +857,7 @@ mod tests {
     fn a_label_reads_the_preset() {
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.set_host_data(host, 0, 3);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 3);
         let mut advisor = named(2, None, 2);
         advisor
             .identity
@@ -865,7 +880,7 @@ mod tests {
     #[test]
     fn the_order_puts_the_newest_first_and_leaves_the_rest_where_they_were() {
         let mut map = AgentMap::default();
-        map.set_host_data(HostId::default(), 0, 3);
+        map.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         map.told(vec![named(1, None, 10)]);
         map.told(vec![named(2, None, 20)]);
         assert_eq!(map.next_agent(None, 1), Some(agent(2)));
@@ -886,7 +901,7 @@ mod tests {
     #[test]
     fn a_filed_agent_is_stepped_over_and_comes_back_in_place() {
         let mut map = AgentMap::default();
-        map.set_host_data(HostId::default(), 0, 3);
+        map.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         for (nth, at) in [(1, 10), (2, 20), (3, 30)] {
             map.told(vec![named(nth, None, at)]);
         }
@@ -910,7 +925,7 @@ mod tests {
     fn the_indexes_follow_what_changed() {
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.set_host_data(host, 0, 3);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 3);
         map.told(vec![
             named(1, None, 10),
             named(2, Some(agent(1)), 20),

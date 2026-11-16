@@ -104,13 +104,13 @@ pub(crate) fn rows(
     // Beside an agent of the thread, in its workset: the ones already
     // reading it first, then the rest of the host's.
     let registry = read.registry();
-    let Some(host) = read.host_of_seed(thread.machine_seed) else {
+    let Some(host) = read.host_of(thread.host) else {
         return rows;
     };
     let members = read
         .chat
         .read(cx)
-        .chat(thread.machine_seed)
+        .chat(thread.host)
         .map(|chat| chat.members_under(Some(thread.message)))
         .unwrap_or_default();
     let mut beside: Vec<_> = members
@@ -178,7 +178,7 @@ fn prompt_runtime(
             };
             let start = start.clone();
             system.update(cx, |system, cx| {
-                let Some(host) = system.host_of_seed(thread.machine_seed) else {
+                let Some(host) = system.host_of(thread.host) else {
                     system.frame.echo(
                         "the thread's host is not attached",
                         StyleClass::SystemInfo,
@@ -194,13 +194,13 @@ fn prompt_runtime(
                 match origin {
                     Origin::Message => create(system, plan, thread.message, cx),
                     Origin::Draft => {
-                        let seed = thread.machine_seed;
+                        let endpoint = thread.host;
                         let sent = system.chat.update(cx, |chat, cx| {
-                            chat.send_draft(seed, Some(thread.message), cx)
+                            chat.send_draft(endpoint, Some(thread.message), cx)
                         });
                         match sent {
                             Some(client_id) => {
-                                system.starting.insert((seed, client_id), plan);
+                                system.starting.insert((endpoint, client_id), plan);
                             }
                             None => system.frame.echo(
                                 "send and start: nothing written",

@@ -192,6 +192,7 @@ where
     let agent_counter = services.db.read().last_agent_counter();
     let _ = outgoing_tx.send(ServerFrame::Hello {
         machine_seed: services.machine_seed,
+        endpoint: services.endpoint,
         agent_counter,
     });
     let _ = outgoing_tx.send(directory(&services.db));

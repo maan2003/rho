@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use gpui::{Context, Window};
 use jiff::{Timestamp, Zoned};
 use rho_dealer::facts::{Fact, Seen};
+use rho_dealer::marks::NodeMarks;
 use rho_dealer::rank::{Hand, Sources, Trace};
 use rho_dealer::{Address, Card, Claim, Until};
 use rho_window::style::StyleClass;
@@ -173,6 +174,28 @@ impl Frame {
         let (takeback, touched) = self.attention.say(writes);
         self.marks_moved(touched, cx);
         takeback
+    }
+
+    /// Says again, of each node's new address, everything said of its old
+    /// one, when `renamed` gives a node a new address that nothing was
+    /// said of yet (`temp-migration`). The old address keeps its marks.
+    pub fn restate(
+        &mut self,
+        renamed: &dyn Fn(&Address) -> Option<Address>,
+        cx: &mut Context<Self>,
+    ) {
+        let marks = &self.attention.marks;
+        let mut writes = Vec::new();
+        for (node, held) in marks.nodes() {
+            let Some(new) = renamed(node) else {
+                continue;
+            };
+            if *marks.get(&new) != NodeMarks::default() {
+                continue;
+            }
+            writes.extend(held.restated_as(&new).into_iter().map(Write::Fact));
+        }
+        self.write_marks(writes, cx);
     }
 
     pub(crate) fn marks_moved(&mut self, touched: BTreeSet<Address>, cx: &mut Context<Self>) {

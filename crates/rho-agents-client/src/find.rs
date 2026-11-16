@@ -47,7 +47,7 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 #[cfg(test)]
 mod tests {
     use rho_agent_hosts::HostId;
-    use rho_agent_types::{AgentIdDomain, UnixMs, props};
+    use rho_agent_types::{AgentIdDomain, EndpointId, UnixMs, props};
 
     use super::*;
     use crate::{AgentIdentity, MirroredAgent};
@@ -60,7 +60,7 @@ mod tests {
     /// made at 7, with these props.
     fn told(registry: &mut AgentMap, props: rho_agent_types::Props) {
         let host = HostId::default();
-        registry.set_host_data(host, 0, 1);
+        registry.set_host_data(host, 0, EndpointId([0; 32]), 1);
         let identity = AgentIdentity::for_test(agent(), props, UnixMs(7));
         registry.told(vec![MirroredAgent::new(host, identity)]);
     }

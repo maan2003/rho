@@ -6,7 +6,9 @@
 //! worksets a client follows, and the live tails of the agents it looks at.
 //! Everything else is one call ([`Open::Request`]).
 
-use rho_agent_types::{AgentId, MessageId, Props, Role, UnixMs, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{
+    AgentId, EndpointId, MessageId, Props, Role, UnixMs, WorksetId, WorksetKind, Wpos,
+};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use super::transcript::{Item, Live, RuntimeKind, RuntimeState, Speaker, Usage};
@@ -144,6 +146,8 @@ pub enum ServerFrame {
     /// The first frame.
     Hello {
         machine_seed: u64,
+        /// The host's iroh identity, which names its threads.
+        endpoint: EndpointId,
         /// The last agent-id counter handed out, for short-prefix rendering.
         agent_counter: u64,
     },
@@ -362,6 +366,7 @@ mod tests {
         });
         round_trips(ServerFrame::Hello {
             machine_seed: 9,
+            endpoint: EndpointId([9; 32]),
             agent_counter: 3,
         });
         round_trips(ServerFrame::Rows {

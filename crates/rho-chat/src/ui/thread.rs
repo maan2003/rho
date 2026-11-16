@@ -155,9 +155,7 @@ impl ThreadView {
             editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             editor
         });
-        let draft = system
-            .draft(thread.machine_seed, Some(thread.message))
-            .to_owned();
+        let draft = system.draft(thread.host, Some(thread.message)).to_owned();
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 10, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
@@ -174,7 +172,7 @@ impl ThreadView {
                     let text = composer.read(cx).text(cx);
                     let thread = this.thread;
                     this.system.update(cx, |system, _| {
-                        system.set_draft(thread.machine_seed, Some(thread.message), text);
+                        system.set_draft(thread.host, Some(thread.message), text);
                     });
                 }
             }),
@@ -212,7 +210,7 @@ impl ThreadView {
         let draft_gone = self
             .system
             .read(cx)
-            .draft(self.thread.machine_seed, Some(self.thread.message))
+            .draft(self.thread.host, Some(self.thread.message))
             .is_empty();
         if draft_gone && !self.composer.read(cx).text(cx).is_empty() {
             self.clear_composer(cx);
@@ -257,8 +255,8 @@ impl ThreadView {
 
 /// The rows of `thread` as `system` holds it.
 fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class, Meta>> {
-    let seed = thread.machine_seed;
-    let Some(chat) = system.chat(seed) else {
+    let host = thread.host;
+    let Some(chat) = system.chat(host) else {
         return vec![line(
             Key::Gap(0),
             "this host's chat is not held here",
@@ -283,7 +281,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             .collect::<Vec<_>>()
             .join(" › ");
         let parent = ThreadId {
-            machine_seed: seed,
+            host,
             message: above[above.len() - 1].0,
         };
         items.push(
@@ -300,7 +298,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             .iter()
             .map(|agent| {
                 system
-                    .agent_label(seed, *agent, cx)
+                    .agent_label(host, *agent, cx)
                     .unwrap_or_else(|| agent.encoded())
             })
             .collect::<Vec<_>>()
@@ -343,7 +341,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         }
         gap_item(&mut items);
     }
-    for outgoing in system.waiting_under(seed, Some(thread.message)) {
+    for outgoing in system.waiting_under(host, Some(thread.message)) {
         let id = outgoing.at.0;
         let mut text = "you · sending…\n".to_owned();
         text.push_str(&body(&outgoing.content));
@@ -367,14 +365,8 @@ impl ThreadView {
         }
         let thread = self.thread;
         self.system.update(cx, |system, cx| {
-            system.post(
-                thread.machine_seed,
-                Some(thread.message),
-                text,
-                Vec::new(),
-                cx,
-            );
-            system.set_draft(thread.machine_seed, Some(thread.message), String::new());
+            system.post(thread.host, Some(thread.message), text, Vec::new(), cx);
+            system.set_draft(thread.host, Some(thread.message), String::new());
         });
         self.composer
             .update(cx, |composer, cx| composer.clear(window, cx));
@@ -397,13 +389,9 @@ impl ThreadView {
     /// Enter on a message opens the thread under it; on a crumb or a
     /// participant, that.
     fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
-        let seed = self.thread.machine_seed;
+        let host = self.thread.host;
         let address = match self.transcript.line_meta(self.cursor_row(cx), cx) {
-            Some(Meta::Message(id)) => ThreadId {
-                machine_seed: seed,
-                message: *id,
-            }
-            .address(),
+            Some(Meta::Message(id)) => ThreadId { host, message: *id }.address(),
             Some(Meta::Open(address)) => address.clone(),
             Some(Meta::None) | None => return,
         };
@@ -457,11 +445,11 @@ impl Surface for ThreadView {
     fn title(&self, cx: &App) -> String {
         let system = self.system.read(cx);
         let name = system
-            .chat(self.thread.machine_seed)
+            .chat(self.thread.host)
             .and_then(|chat| chat.name(self.thread.message))
             .unwrap_or_default();
         match system.hosts().len() > 1 {
-            true => format!("{} › {name}", system.host_name(self.thread.machine_seed)),
+            true => format!("{} › {name}", system.host_name(self.thread.host)),
             false => name,
         }
     }
@@ -483,7 +471,7 @@ impl Surface for ThreadView {
         match self.transcript.line_meta(self.cursor_row(cx), cx) {
             Some(Meta::Message(id)) if *id != self.thread.message => Subject::Address(
                 ThreadId {
-                    machine_seed: self.thread.machine_seed,
+                    host: self.thread.host,
                     message: *id,
                 }
                 .address(),

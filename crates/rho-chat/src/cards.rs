@@ -43,7 +43,9 @@
 //! Each row is a test here under its name.
 
 use jiff::Timestamp;
-use rho_agent_types::{Address as Party, AgentId, ChatSeq, MentionKind, Message, MessageId};
+use rho_agent_types::{
+    Address as Party, AgentId, ChatSeq, EndpointId, MentionKind, Message, MessageId,
+};
 use rho_dealer::curve::{self, Curve};
 use rho_dealer::rank::Trace;
 use rho_dealer::{Addressed, Claim, Marks};
@@ -77,7 +79,7 @@ impl Addressed for AgentRef {
 
 /// One host's chat as the dealer reads it.
 pub struct Host<'a> {
-    pub machine_seed: u64,
+    pub endpoint: EndpointId,
     pub chat: &'a HostChat,
     /// The host's name, said before a card's context when the window holds
     /// more than one host; `None` otherwise.
@@ -113,7 +115,7 @@ pub fn claims(
     let mut claims = Vec::new();
     for thread in threads {
         let address = ThreadId {
-            machine_seed: host.machine_seed,
+            host: host.endpoint,
             message: thread,
         }
         .address();
@@ -355,7 +357,7 @@ mod tests {
 
         fn address(&self, thread: MessageId) -> Address {
             ThreadId {
-                machine_seed: 0,
+                host: EndpointId([0; 32]),
                 message: thread,
             }
             .address()
@@ -454,7 +456,7 @@ mod tests {
         fn deal(&self) -> Hand {
             let alive = |agent: AgentId| !self.gone.contains(&agent);
             let host = Host {
-                machine_seed: 0,
+                endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: (self.hosts > 1).then_some("laptop"),
                 alive: &alive,

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_hosts::HostStream;
-use rho_agent_types::{AgentId, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{AgentId, EndpointId, WorksetId, WorksetKind, Wpos};
 
 use crate::HostId;
 use crate::fold::{AgentIdentity, MirroredAgent};
@@ -64,6 +64,8 @@ pub enum ModelMsg {
     /// each time the host's agents stream opens, after anything it resets.
     Host {
         machine_seed: u64,
+        /// The host's identity, which names it to the rest of the world.
+        endpoint: EndpointId,
         agent_counter: u64,
     },
     /// Which provider accounts the host's agents may run on.
@@ -323,6 +325,7 @@ impl Model {
             AgentFrame::Server(frame) => match frame {
                 ServerFrame::Hello {
                     machine_seed,
+                    endpoint,
                     agent_counter,
                 } => {
                     let mut out = self.hello(host, machine_seed);
@@ -330,6 +333,7 @@ impl Model {
                         host,
                         msg: ModelMsg::Host {
                             machine_seed,
+                            endpoint,
                             agent_counter,
                         },
                     });
@@ -835,6 +839,7 @@ mod tests {
     fn hello() -> AgentFrame {
         ServerFrame::Hello {
             machine_seed: 7,
+            endpoint: EndpointId([7; 32]),
             agent_counter: 3,
         }
         .into()
@@ -1221,6 +1226,7 @@ mod tests {
             HOST,
             ServerFrame::Hello {
                 machine_seed: 8,
+                endpoint: EndpointId([8; 32]),
                 agent_counter: 0,
             }
             .into(),

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_hosts::{Dialer, HostId, HostStream};
-use rho_agent_types::{ChatRecord, ChatSeq};
+use rho_agent_types::{ChatRecord, ChatSeq, EndpointId};
 use rho_rpc::protocol::{Call, read_frame, write_frame, write_open};
 
 use crate::protocol::{ClientFrame, Open, ServerFrame};
@@ -24,6 +24,10 @@ pub enum ChatEvent {
     /// dropped: the records that follow start from the beginning.
     Hello {
         host: HostId,
+        /// Whose log: the host's iroh identity.
+        endpoint: EndpointId,
+        /// What named the log before the endpoint did; what a copy kept
+        /// under it moves to the endpoint (`temp-migration`).
         machine_seed: u64,
         head: ChatSeq,
         fresh: bool,
@@ -37,39 +41,39 @@ pub enum ChatEvent {
     Closed { host: HostId },
 }
 
-/// Where this client stands in each log, by the seed of the host that
+/// Where this client stands in each log, by the identity of the host that
 /// keeps it: what a session is asked to send from. Shared between the
 /// sessions, which read it on their hello, and whoever folds the records,
 /// who moves it. A log is named by its seed and not by the connection, so
 /// a host attached under a new name goes on from where its copy stands.
 #[derive(Clone, Default)]
-pub struct Cursors(Arc<Mutex<HashMap<u64, ChatSeq>>>);
+pub struct Cursors(Arc<Mutex<HashMap<EndpointId, ChatSeq>>>);
 
 impl Cursors {
-    pub fn new(held: impl IntoIterator<Item = (u64, ChatSeq)>) -> Self {
+    pub fn new(held: impl IntoIterator<Item = (EndpointId, ChatSeq)>) -> Self {
         Self(Arc::new(Mutex::new(held.into_iter().collect())))
     }
 
-    pub fn get(&self, machine_seed: u64) -> ChatSeq {
+    pub fn get(&self, host: EndpointId) -> ChatSeq {
         self.0
             .lock()
             .unwrap()
-            .get(&machine_seed)
+            .get(&host)
             .copied()
             .unwrap_or(ChatSeq::ZERO)
     }
 
     /// The newest record held of a log; a session asks for everything
     /// after it.
-    pub fn advance(&self, machine_seed: u64, to: ChatSeq) {
+    pub fn advance(&self, host: EndpointId, to: ChatSeq) {
         let mut held = self.0.lock().unwrap();
-        let at = held.entry(machine_seed).or_insert(ChatSeq::ZERO);
+        let at = held.entry(host).or_insert(ChatSeq::ZERO);
         *at = (*at).max(to);
     }
 
     /// Back to nothing: the host's log is not the one the copy holds.
-    pub fn reset(&self, machine_seed: u64) {
-        self.0.lock().unwrap().remove(&machine_seed);
+    pub fn reset(&self, host: EndpointId) {
+        self.0.lock().unwrap().remove(&host);
     }
 }
 
@@ -110,21 +114,26 @@ impl HostStream for ChatStream {
             let mut socket = dialer.open(None).await?;
             write_open(&mut socket, &Open::Session).await?;
             let result = async {
-                let ServerFrame::Hello { head, machine_seed } = read_frame(&mut socket).await?
+                let ServerFrame::Hello {
+                    head,
+                    host: endpoint,
+                    machine_seed,
+                } = read_frame(&mut socket).await?
                 else {
                     anyhow::bail!("the chat session did not open with its hello");
                 };
                 // A copy that stands past the host's head is of some other
                 // log (the host's database was replaced): it starts over.
-                let mut since = cursors.get(machine_seed);
+                let mut since = cursors.get(endpoint);
                 let fresh = since > head;
                 if fresh {
-                    cursors.reset(machine_seed);
+                    cursors.reset(endpoint);
                     since = ChatSeq::ZERO;
                 }
                 if events
                     .unbounded_send(ChatEvent::Hello {
                         host,
+                        endpoint,
                         machine_seed,
                         head,
                         fresh,

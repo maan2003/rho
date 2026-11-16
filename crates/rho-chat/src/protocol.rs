@@ -7,7 +7,7 @@
 //! [`rho_agent_types::ChatEvent`]: the vocabulary is the host's, this is
 //! only how it crosses the wire.
 
-use rho_agent_types::{AgentId, ChatRecord, ChatSeq, ContentPart, MessageId};
+use rho_agent_types::{AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -83,9 +83,15 @@ pub enum ClientFrame {
 /// What a host says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ServerFrame {
-    /// The first frame: the newest event on the host, and the host's
-    /// database seed, which names its log wherever a copy of it is held.
-    Hello { head: ChatSeq, machine_seed: u64 },
+    /// The first frame: the newest event on the host, and the host's iroh
+    /// identity, which names its log and its threads wherever a copy is
+    /// held. The database seed named them before; a client moves what it
+    /// kept under the seed to the endpoint (`temp-migration`).
+    Hello {
+        head: ChatSeq,
+        host: EndpointId,
+        machine_seed: u64,
+    },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Chat { records: Vec<ChatRecord> },
@@ -113,6 +119,7 @@ mod tests {
         round_trips(ClientFrame::Follow { since: ChatSeq(9) });
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
+            host: EndpointId([7; 32]),
             machine_seed: 7,
         });
         round_trips(ServerFrame::Chat {

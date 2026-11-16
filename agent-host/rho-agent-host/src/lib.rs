@@ -1199,6 +1199,9 @@ struct Services {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
+    /// The host's iroh identity: what names its log and its threads to
+    /// every client, listening or not.
+    endpoint: rho_agent_types::EndpointId,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
     /// Marked whenever a quota observation lands; every agents session
@@ -1229,6 +1232,7 @@ impl Services {
         platform_secrets: PlatformSecrets,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
+        let endpoint = rho_agent_types::EndpointId(rho_rpc::server_endpoint_id(&db).await?);
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let ledger = rho_ledger_server::LedgerServer::open(db.clone()).await;
         let registry = Self {
@@ -1239,6 +1243,7 @@ impl Services {
             visualizations,
             inference,
             machine_seed,
+            endpoint,
             platform_secrets,
             quota: tokio::sync::watch::channel(()).0,
             user_environment,
