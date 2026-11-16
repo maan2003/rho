@@ -594,6 +594,11 @@ impl Frame {
             },
         );
         self.open_prompt("command:", complete, submit, window, cx);
+        // A command's name is words (`new note`, `hosts › attach`), so the
+        // candidate replaces the whole input, not the last word.
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_complete_whole_input();
+        }
     }
 
     /// The frame's rows, the surface's, and every system's for what is in

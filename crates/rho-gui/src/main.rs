@@ -42,6 +42,11 @@ struct Args {
     #[arg(value_name = "LINK")]
     link: Option<String>,
 
+    /// Write a Dial9 CPU profile with GPUI's frame and editor spans on exit,
+    /// and the frames and editor stages as JSON beside it.
+    #[arg(long, value_name = "FILE")]
+    cpu_profile: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -156,10 +161,21 @@ fn run() -> Result<()> {
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
     let link = args.link.clone();
+    let mut profile = args
+        .cpu_profile
+        .clone()
+        .map(rho_gui::telemetry::Profile::start)
+        .transpose()?;
+    rho_gui::telemetry::enable(profile.is_none());
 
     gpui_platform::application()
         .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
+            // Windows draw on this thread.
+            let draw_tid = rho_profiling::current_tid();
+            if let Some(profile) = &profile {
+                profile.keep_collecting(cx);
+            }
             const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
             cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
                 gpui::UserIdleEvent::Idle => {
@@ -172,6 +188,12 @@ fn run() -> Result<()> {
                 }
             });
             cx.on_app_quit(move |_| {
+                if let Some(profile) = profile.take()
+                    && let Err(error) = profile.finish(draw_tid)
+                {
+                    eprintln!("rho-gui: failed to write the CPU profile: {error:#}");
+                }
+                rho_gui::telemetry::shutdown();
                 // Before the tokio runtime goes with the app: a host
                 // supervisor still waiting out a reconnect delay would be
                 // polled into the runtime's shutdown and panic there.
@@ -225,7 +247,9 @@ fn run() -> Result<()> {
                 let shells = cx.new(|cx| rho_shell_view::ui::ShellSystem::new(frame.clone(), cx));
                 let desktops =
                     cx.new(|cx| rho_desktop_client::ui::DesktopSystem::new(frame.clone(), cx));
-                let slack = cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame, cx));
+                let slack =
+                    cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame.clone(), cx));
+                let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
@@ -235,6 +259,7 @@ fn run() -> Result<()> {
                     AnySystem::new(shells),
                     AnySystem::new(desktops),
                     AnySystem::new(slack),
+                    AnySystem::new(telemetry),
                 ];
                 let chime = rho_gui::chime::Chime;
                 cx.new(|cx| {

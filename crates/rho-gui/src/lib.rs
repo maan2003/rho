@@ -9,6 +9,7 @@
 pub mod application;
 pub mod chime;
 pub mod rho_assets;
+pub mod telemetry;
 
 use gpui::App;
 

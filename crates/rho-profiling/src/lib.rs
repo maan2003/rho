@@ -10,8 +10,20 @@ use dial9_core::buffer::DiskBuffer;
 use dial9_core::clock::clock_monotonic_ns;
 use dial9_core::recorder::recorder;
 use dial9_core::recording::Recorder;
+use dial9_core::worker::processors::{GzipCompressor, WriteBackProcessor};
 use dial9_perf_self_profile::{CpuProfilingConfig, RecorderPerfExt as _};
 use dial9_trace_format::TraceEvent;
+
+const DEFAULT_FREQUENCY_HZ: u64 = 100;
+
+/// Where a trace's addresses become names.
+enum Symbols {
+    /// Dial9's own worker resolves them before each segment is written, so
+    /// the trace file reads on its own.
+    InProcess,
+    /// Segments keep raw addresses for a reader with the binary's symbols.
+    Offline,
+}
 
 pub struct CpuProfiler {
     path: PathBuf,
@@ -123,21 +135,35 @@ fn read_unsealed_segment(path: &Path) -> Option<Vec<u8>> {
 
 impl CpuProfiler {
     pub fn start(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        Self::start_at(path, DEFAULT_FREQUENCY_HZ)
+    }
+
+    /// [`start`](Self::start) sampling `frequency_hz` times a second: a
+    /// window's frames are milliseconds, so a GUI samples oftener than a
+    /// host whose work is seconds.
+    pub fn start_at(path: impl Into<PathBuf>, frequency_hz: u64) -> anyhow::Result<Self> {
         let path = absolute_path(path.into())?;
         let output_path = dial9_output_path(&path);
         remove_if_exists(&output_path)?;
         remove_if_exists(&dial9_raw_output_path(&path))?;
         let writer = DiskBuffer::single_file(&path)
             .with_context(|| format!("create Dial9 trace {}", path.display()))?;
-        Self::start_with_writer(path, output_path, writer)
+        Self::start_with_writer(path, output_path, writer, frequency_hz, Symbols::InProcess)
     }
 
     /// Starts a bounded profiler whose self-contained segments rotate by time,
     /// as `trace.N.bin` files in `directory`.
+    ///
+    /// Its segments keep raw addresses: this is the always-on profiler of a
+    /// GUI that may run on a phone, and in-process symbolization is a thread
+    /// that can cost more than the program it watches. A reader symbolizes
+    /// offline from the snapshot's `/proc/self/maps` and the build's debug
+    /// file.
     pub fn start_rolling(
         directory: impl Into<PathBuf>,
         rotation_period: Duration,
         max_total_size: u64,
+        frequency_hz: u64,
     ) -> anyhow::Result<Self> {
         let directory = absolute_path(directory.into())?;
         let writer = DiskBuffer::builder()
@@ -151,17 +177,27 @@ impl CpuProfiler {
             .trace_dir()
             .join(format!("{}.bin", writer.trace_stem()));
         let output_path = dial9_output_path(&path);
-        Self::start_with_writer(path, output_path, writer)
+        Self::start_with_writer(path, output_path, writer, frequency_hz, Symbols::Offline)
     }
 
     fn start_with_writer(
         path: PathBuf,
         output_path: PathBuf,
         writer: DiskBuffer,
+        frequency_hz: u64,
+        symbols: Symbols,
     ) -> anyhow::Result<Self> {
         let recorder = recorder(writer)
-            .with_cpu_profiling(CpuProfilingConfig::default().frequency_hz(100))
-            .build();
+            .with_cpu_profiling(CpuProfilingConfig::default().frequency_hz(frequency_hz));
+        let recorder = match symbols {
+            // Dial9's default pipeline: symbolize, gzip, write back.
+            Symbols::InProcess => recorder,
+            Symbols::Offline => recorder.processors(vec![
+                Box::new(GzipCompressor),
+                Box::new(WriteBackProcessor::default()),
+            ]),
+        };
+        let recorder = recorder.build();
         // Dial9 allows one recorder per process and hands any later one back
         // disabled rather than failing.
         anyhow::ensure!(
@@ -172,7 +208,7 @@ impl CpuProfiler {
         let start_monotonic_ns = clock_monotonic_ns();
         recorder.handle().record_event(RhoProfileSession {
             timestamp_ns: start_monotonic_ns,
-            frequency_hz: 100,
+            frequency_hz,
         });
         Ok(Self {
             path,
@@ -503,6 +539,7 @@ mod tests {
             directory.path(),
             std::time::Duration::from_millis(100),
             1024 * 1024,
+            100,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
