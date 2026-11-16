@@ -82,7 +82,7 @@ def resolve(handle: str) -> str:
     return agent
 
 def _spawner_of(props: dict) -> str | None:
-    return props.get("parent") or props.get("started_by")
+    return props.get("parent")
 
 
 class Chat:
@@ -106,7 +106,7 @@ class Chat:
         for handle in handles:
             if handle == rho_chat.USER:
                 props = rho_agents.Agent(self._agent).props
-                if props.get("preset") != "engineer":
+                if props.get("preset") == "advisor":
                     parent = props.get("parent")
                     raise ValueError(f"you report to your parent agent {label(parent)}; use agents.message(agent_id={label(parent)!r}, message=text)")
                 mentions.append((rho_chat.USER, kind))
@@ -354,7 +354,7 @@ class Agents(Messages):
             raise ValueError("prompt must not be empty")
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
-        props = {"name": task_name, "preset": "child", "parent": me.id, "cwd": cwd}
+        props = {"name": task_name, "preset": "engineer", "parent": me.id, "cwd": cwd}
         child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
             f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
@@ -386,59 +386,10 @@ class Agents(Messages):
             raise ValueError("target is not an Engineer")
         if target == self._agent:
             raise ValueError("cannot interrupt yourself")
-        # Only the user and the agents it spawned itself interrupt an agent
-        # the user manages: the Engineer that started it may still talk to
-        # it, but no longer manages it.
-        if props.get("started_by") and known[self._agent]["props"].get("parent") != target:
-            raise ValueError(f"{label(target)} is managed by the user; only the user can interrupt it")
         _rho.cancel(target)
         return report(
             f"Engineer {label(target)} interrupted. It remains available for follow-up messages."
         )
-
-
-class UserAgents(Agents):
-    """An Engineer the user manages may also start Engineers for the user."""
-
-    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None, thread=None):
-        """Start an Engineer the user manages; it reports to the user, not to
-        you. Its brief is the first message of a new thread named
-        `task_name`, in `thread`, or beside the thread you were started in,
-        and mentions the user."""
-        if not str(prompt).strip():
-            raise ValueError("prompt must not be empty")
-        me = self._me()
-        cwd = _workdir(workdir) or me.props["cwd"]
-        if thread is None:
-            thread = _origin_root(me.props)
-            if thread is None:
-                raise ValueError("you were not started from a thread; pass thread=")
-        elif rho_chat.thread(int(thread)) is None:
-            raise ValueError(f"no thread #{int(thread)}")
-        self._check_depth()
-        message = rho_chat.post(me.id, int(thread), str(prompt), [(rho_chat.USER, "fyi")])
-        rho_chat.name(me.id, message, str(task_name))
-        props = {
-            "name": task_name,
-            "preset": "engineer",
-            "started_by": me.id,
-            "cwd": cwd,
-            rho_chat.ORIGIN: rho_chat.origin(message),
-        }
-        agent = rho_agents.create(engineer_runtime(me.runtime), props)
-        return report(
-            f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}" in thread '
-            f"#{message}. It works in {cwd}. It reports to the user, not to you."
-        )
-
-
-def _origin_root(props):
-    """The root of the thread an agent was started from, if any."""
-    message = rho_chat.origin_message(props)
-    if message is None:
-        return None
-    head = rho_chat.thread(rho_chat.thread_of(rho_chat.message(message)))
-    return head["path"][0][0]
 
 
 def _workdir(workdir):
@@ -474,8 +425,6 @@ def exports(agent) -> dict:
     preset = agent.props["preset"]
     tools = {"chat": Chat(agent.id), "skills": Skills(agent.id)}
     if preset == "engineer":
-        tools["agents"] = UserAgents(agent.id)
-    elif preset == "child":
         tools["agents"] = Agents(agent.id)
     else:
         tools["agents"] = Messages(agent.id)

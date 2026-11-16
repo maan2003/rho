@@ -3,7 +3,7 @@
 import _rho
 
 #: The values the default policy gives the `preset` prop.
-PRESETS = ("engineer", "child", "advisor")
+PRESETS = ("engineer", "advisor")
 
 
 class Agent:
@@ -68,6 +68,20 @@ class Agent:
 
     def new_cache_key(self) -> None:
         _rho.new_cache_key(self.id)
+
+
+def upgrade(agent: Agent) -> None:
+    """Bring props stored before every Engineer was one kind up to date:
+    a `child` is an Engineer, and the agent that started a user-owned
+    Engineer, `started_by`, is its `parent`."""
+    props = dict(agent.props)
+    if props.get("preset") == "child":
+        props["preset"] = "engineer"
+    if "started_by" in props:
+        props.setdefault("parent", props.pop("started_by"))
+        props.pop("started_by", None)
+    if props != agent.props:
+        agent.set_props(props)
 
 
 def create(runtime: dict, props: dict) -> Agent:

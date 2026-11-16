@@ -454,7 +454,7 @@ agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awai
 
 task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
 identity; it reports back to you with agents.message.
-The child loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
+The Engineer loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 
 Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
 the task being non-trivial.
@@ -493,7 +493,7 @@ Interrupt an agent's current response with `agents.cancel`; the agent remains av
 agents.cancel(*, agent_id: str) -> Awaitable[str]
 ```
 
-{{user_owned_engineers}}## Briefing and integrating work
+## Briefing and integrating work
 
 Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
 why it matters, what you have learned or ruled out, and where to look first. Write outcome-first

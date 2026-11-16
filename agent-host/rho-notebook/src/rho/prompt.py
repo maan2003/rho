@@ -1,6 +1,5 @@
 """The default instructions: a whole document per role and model family,
-with the agent's team, the section only an agent the user manages gets, and
-its workspace and project guidance filled in."""
+with the agent's team and its workspace and project guidance filled in."""
 
 import functools
 import os
@@ -24,13 +23,11 @@ def template(family: str, name: str) -> str:
     return (_DIR / family / f"{name}.md").read_text(encoding="utf-8")
 
 
-def render(template: str, team: str, user_owned: str, context: str) -> str:
+def render(template: str, team: str, context: str) -> str:
     """Fill a template's slots. The context goes in last, so project
     guidance that happens to spell a slot stays as written."""
     return (
-        template.replace("{{team}}", team)
-        .replace("{{user_owned_engineers}}", user_owned)
-        .replace("{{context}}", context)
+        template.replace("{{team}}", team).replace("{{context}}", context)
     )
 
 
@@ -45,13 +42,6 @@ def label(agent_id: str) -> str:
     return f"{prefix}-{agent_id}"
 
 
-def started_by_note(by: str) -> str:
-    return (
-        f"Engineer {by} started you for the user; ask it with agents.message(agent_id={by!r}, message=text) if you "
-        "need more context."
-    )
-
-
 def team(agent_id: str, props: dict) -> str:
     """Who the agent is among the others, and how they talk."""
     me = label(agent_id)
@@ -59,33 +49,22 @@ def team(agent_id: str, props: dict) -> str:
     if parent is not None:
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
-            f"agent id is {me}; your parent agent is {label(parent)}.\n\nMessages from your "
-            "parent define your task. Report to your parent with "
-            f"agents.message(agent_id={label(parent)!r}, message=text)."
+            f"agent id is {me}; agent {label(parent)} started you."
         )
     else:
         identity = (
             "You are the primary agent in a team of agents collaborating to fulfill the "
             f"user's goals. Your agent id is {me}."
         )
-    preset = props["preset"]
-    if preset == "advisor":
+    if props["preset"] == "advisor":
         return (
             f"{identity}\n\n"
             "Complete your independent analysis and send it to your parent with "
             f"agents.message(agent_id={label(parent)!r}, message=text). Ask a known agent for context the same way, "
             "and end your turn when blocked on a reply.\n"
         )
-    started_by = props.get("started_by")
-    if preset == "child":
-        ownership = (
-            "You were spawned by another Engineer. Own the bounded assignment in the "
-            "parent message."
-        )
-    elif started_by is not None:
-        # An Engineer started for the user is the user's like any other; it
-        # only learns who holds the context behind its brief.
-        ownership = f"{started_by_note(label(started_by))} You own the user's technical outcome."
+    if parent is not None:
+        ownership = f"Your first message from {label(parent)} is your brief."
     else:
         ownership = "You were started directly and own the user's technical outcome."
     return f"""{identity}
@@ -228,10 +207,8 @@ def default_context(cwd: str) -> str:
 
 def instructions(agent) -> str:
     """The default instructions for `agent`, from its runtime and its
-    `preset`, `parent`, `started_by` and `cwd` props."""
+    `preset`, `parent` and `cwd` props."""
     spec = agent.spec
     props = spec["props"]
     family = FAMILIES[spec["runtime"]["kind"]]
-    preset = props["preset"]
-    user_owned = template(family, "user-owned-engineers") if preset == "engineer" else ""
-    return render(template(family, preset), team(agent.id, props), user_owned, default_context(props["cwd"]))
+    return render(template(family, props["preset"]), team(agent.id, props), default_context(props["cwd"]))
