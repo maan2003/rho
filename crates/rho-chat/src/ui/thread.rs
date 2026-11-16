@@ -378,7 +378,11 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             ]),
         );
     }
-    gap_item(&mut items);
+    // A root's list starts at its first thread: nothing stands above it
+    // to keep a gap from.
+    if !items.is_empty() {
+        gap_item(&mut items);
+    }
     if list {
         let rows = system.frame.read(cx, |frame, cx| {
             thread_rows(system, chat, host, thread.message, Some(frame.marks()), cx)
