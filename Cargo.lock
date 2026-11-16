@@ -14203,6 +14203,7 @@ name = "rho-frame"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "collections",
  "editor",
@@ -14220,6 +14221,7 @@ dependencies = [
  "rho-ledger",
  "rho-transcript",
  "rho-window",
+ "senax-encoder",
  "settings",
  "text",
  "theme",

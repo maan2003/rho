@@ -95,11 +95,33 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 
 ## The user log
 
-- The ledger as it is: facts (`Seen`, `Snooze`, `Todo`, `Deadline`,
-  `Mute`, labels) and notes (a revision per save, newest wins, the
-  machine never writes note text). No new channels.
+- The ledger as it is: one sealed append-only log per device, merged by
+  union in `(at, device)` order, hosts relay bytes they cannot read. It
+  holds facts (`Seen`, `Snooze`, `Deadline`, `Mute`) and the user's own
+  messages: a note is `Wrote { note, text, created }`, a revision per
+  save with the newest winning, and `Deleted`. The machine never writes
+  note text. Notes no longer sync as slot blobs of their own.
 - All of it sealed. Agents never see it. If an agent should know or act
   on something of yours, you post a message.
+
+### Private messages
+
+- A note is a private message: `note:<uuid>`, text in the log, and
+  `About { node, about }` is its parent, which may be any address. A
+  note with no parent is a private root, a room only your devices have;
+  a note about a host message is a private reply under it, shown inline
+  in the thread, dim and marked private.
+- A reply may narrow who reads, never widen: a private reply under a
+  public message is allowed, a public message is never under a private
+  one. To make a private message public, post a copy.
+- Host messages keep the host's dense ids: an agent sees `#41` on its
+  host, the GUI holds `ThreadId { host, message }`. The host log has an
+  orderer, so it needs no log per writer; private messages have none,
+  so each device writes its own log. Private ids are minted UUIDs, not
+  `device/seq`: no counter to keep, and two devices that convert the
+  same old note say the same id.
+- This replaces notes as a screen of their own, labels, `notes for
+  this`, and piles.
 - Reminders are not a new thing: a `Deadline` or `Todo` fact on any
   address (a thread, a Slack thread, a note, a page). The text lives
   where the address lives; a bare reminder is a note with a deadline.
@@ -136,8 +158,13 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   an agent's post or from the participants of a thread.
 - The phone is the same surfaces in the same stack, in a layout module,
   not a second workspace file.
-- Open: the exact surface list, pane rules, Slack, notes, reminders,
-  browser.
+- Rooms, decided 2026-11-16: the GUI is a list of rooms and a room. A
+  room is a root you can read, host or private, ordered by attention.
+  Labels, piles, `Todo`, the usage screen, the page system and the
+  message log screen go. Terminals, shells and desktops lose their
+  address kinds and hang under the agent, reached from a room's
+  participants.
+- Open: pane rules, Slack, reminders, the browser as a service.
 
 ## Decided against
 
@@ -193,3 +220,9 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the point, `send and start agent` from a draft; where (`new on`,
   `here`, `join`) and the runtime are transients.
 - The phone is a layout of the same frame, chosen by window width.
+- Notes are `Wrote` facts in the log since 2026-11-16; a device that
+  still holds slot blobs says each once as a fact on start, a temp
+  migration in `rho_frame::attention`. The slot tables and the `Put`
+  and `Slot` frames stay until every device has run it. The rooms
+  decision and private replies in threads are not built yet: notes
+  still open as their own surface.

@@ -1,8 +1,8 @@
 //! What the user said, and how it is kept.
 //!
 //! What the user says lives in the ledger, which syncs it sealed between
-//! their devices through the hosts: facts, every one kept, and notes, a
-//! revision per save. The dealer reads them with what every system claims
+//! their devices through the hosts: facts, every one kept, a note's text
+//! among them. The dealer reads them with what every system claims
 //! into the hand Home shows and a pull deals from. A verdict is a fact the
 //! user said; a system may do something of its own about it too (Slack
 //! moves its cursor), and hands back how to undo that.
@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use rho_dealer::facts::{Device, Entry, EntryId, Fact, Seen};
-use rho_dealer::notes::NoteRev;
 use rho_dealer::{Address, Marks, Skips, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Channel, Item, Ledger, Secret};
+use senax_encoder::Decode;
 
 use crate::frame::Frame;
 use crate::system::Reversal;
@@ -37,24 +37,14 @@ impl From<Fact> for Write {
     }
 }
 
-/// What takes one write back: a retract of the entry, or a note's
-/// revision before it, said again.
+/// What takes one write back: a retract of its entry. For a note's
+/// revision, the revision before it shows again.
 #[derive(Clone, Debug)]
-pub enum Takeback {
-    Retract(EntryId),
-    Note(NoteRev),
-}
+pub struct Takeback(pub EntryId);
 
 impl Takeback {
     pub fn write(self) -> Write {
-        match self {
-            Self::Retract(of) => Write::Fact(Fact::Retract { of }),
-            Self::Note(rev) => Write::Note {
-                note: rev.note,
-                body: Some(rev.body),
-                deleted: Some(rev.deleted),
-            },
-        }
+        Write::Fact(Fact::Retract { of: self.0 })
     }
 }
 
@@ -126,25 +116,48 @@ impl Attention {
         let device = Device(ledger.device().0);
         let mut marks = Marks::default();
         marks.apply(read_entries(&ledger.items(Channel::Facts)));
-        marks.apply_notes(
-            ledger
-                .notes()
-                .iter()
-                .filter_map(|plain| NoteRev::decode(plain)),
-        );
-        let (streams, events) = LedgerStreams::new(ledger, Box::new(keep_theirs));
-        (
-            Self {
-                streams,
-                device,
-                marks,
-                skips: Skips::default(),
-                open_pile: None,
-                undo: Vec::new(),
-                next_undo: 0,
-            },
-            events,
-        )
+        let slot_notes = ledger.notes();
+        let (streams, events) = LedgerStreams::new(ledger, Box::new(|_, _| false));
+        let mut attention = Self {
+            streams,
+            device,
+            marks,
+            skips: Skips::default(),
+            open_pile: None,
+            undo: Vec::new(),
+            next_undo: 0,
+        };
+        attention.adopt_slot_notes(&slot_notes);
+        (attention, events)
+    }
+
+    /// Temp migration: notes used to sync as one sealed blob per note in a
+    /// slot on each host, and now are `Wrote` facts in the log. Each note
+    /// this device still holds only as a slot blob is said once as a fact.
+    /// Two devices that both do this say the same text under the same id,
+    /// which comes to one note. Goes with the slot tables and the `Put` and
+    /// `Slot` frames once every device has run this.
+    fn adopt_slot_notes(&mut self, blobs: &[Vec<u8>]) {
+        let writes: Vec<Write> = blobs
+            .iter()
+            .filter_map(|plain| SlotNote::decode(plain))
+            .filter(|rev| !rev.deleted && !rev.body.trim().is_empty())
+            .filter(|rev| self.marks.get(&Address::note(rev.note)).body.is_none())
+            .map(|rev| {
+                Write::Fact(Fact::Wrote {
+                    note: rev.note,
+                    text: rev.body,
+                    created: rev.created,
+                })
+            })
+            .collect();
+        if !writes.is_empty() {
+            tracing::info!(
+                notes = writes.len(),
+                "notes move from slots into the ledger log"
+            );
+            self.say(writes);
+        }
     }
 
     /// Keeps a verdict for `shift-u`, numbered after every one before it.
@@ -180,57 +193,50 @@ impl Attention {
         let mut takeback = Vec::new();
         let mut touched = BTreeSet::new();
         let mut entries = Vec::new();
-        let mut notes = Vec::new();
         for write in writes {
-            let at = self.marks.next_at(&now);
-            match write {
-                Write::Fact(fact) => {
-                    let entry = Entry {
-                        device: self.device,
-                        at,
-                        fact,
-                    };
-                    takeback.push(Takeback::Retract(entry.id()));
-                    touched.extend(self.marks.apply([entry.clone()]));
-                    entries.push(entry.encode());
-                }
+            let facts = match write {
+                Write::Fact(fact) => vec![fact],
                 Write::Note {
                     note,
                     body,
                     deleted,
                 } => {
-                    let held = self.marks.note(note).cloned();
-                    let rev = NoteRev {
-                        note,
-                        device: self.device,
-                        created: held.as_ref().map_or(at.timestamp(), |held| held.created),
-                        body: body
-                            .or_else(|| held.as_ref().map(|held| held.body.clone()))
-                            .unwrap_or_default(),
-                        deleted: deleted
-                            .or_else(|| held.as_ref().map(|held| held.deleted))
-                            .unwrap_or(false),
-                        at,
-                    };
-                    // A note that did not exist before is taken back by
-                    // deleting it.
-                    takeback.push(Takeback::Note(held.unwrap_or_else(|| NoteRev {
-                        deleted: true,
-                        ..rev.clone()
-                    })));
-                    touched.extend(self.marks.apply_notes([rev.clone()]));
-                    notes.push(rev);
+                    let held = self.marks.get(&Address::note(note));
+                    let created = held.created_ms.map_or(now.timestamp(), |ms| {
+                        jiff::Timestamp::from_millisecond(ms).expect("a created instant read back")
+                    });
+                    // A note brought back is its text said again.
+                    let restored = deleted == Some(false) && held.deleted && body.is_none();
+                    let text =
+                        body.or_else(|| restored.then(|| held.body.clone().unwrap_or_default()));
+                    let mut facts = Vec::new();
+                    if let Some(text) = text {
+                        facts.push(Fact::Wrote {
+                            note,
+                            text,
+                            created,
+                        });
+                    }
+                    if deleted == Some(true) {
+                        facts.push(Fact::Deleted { note });
+                    }
+                    facts
                 }
+            };
+            for fact in facts {
+                let entry = Entry {
+                    device: self.device,
+                    at: self.marks.next_at(&now),
+                    fact,
+                };
+                takeback.push(Takeback(entry.id()));
+                touched.extend(self.marks.apply([entry.clone()]));
+                entries.push(entry.encode());
             }
         }
         futures::executor::block_on(async {
             if !entries.is_empty() {
                 self.streams.append(Channel::Facts, entries).await;
-            }
-            for rev in notes {
-                self.streams
-                    .put_note(*rev.note.as_bytes(), rev.encode())
-                    .await;
             }
         });
         takeback.reverse();
@@ -244,39 +250,9 @@ impl Attention {
                 items.retain(|item| matches!(item.channel, Channel::Facts));
                 (self.marks.apply(read_entries(&items)), Vec::new())
             }
-            LedgerEvent::Note(arrived) => {
-                let Some(theirs) = NoteRev::decode(&arrived.plain) else {
-                    return Default::default();
-                };
-                let lost = arrived
-                    .replaced
-                    .as_deref()
-                    .and_then(NoteRev::decode)
-                    .filter(|mine| {
-                        arrived.replaced_unsent
-                            && !mine.deleted
-                            && mine.body != theirs.body
-                            && !mine.body.trim().is_empty()
-                    });
-                let mut touched = self.marks.apply_notes([theirs]);
-                let mut said = Vec::new();
-                if let Some(mine) = lost {
-                    // Written here while another device wrote it too: theirs
-                    // is newer, and what was written here stays, as its own
-                    // note.
-                    let title = self.marks.get(&Address::note(mine.note)).title().to_owned();
-                    let (_, kept) = self.say(vec![Write::Note {
-                        note: uuid::Uuid::new_v4(),
-                        body: Some(mine.body),
-                        deleted: Some(false),
-                    }]);
-                    touched.extend(kept);
-                    said.push(format!(
-                        "notes: `{title}` changed on another device too; what was written here is kept as a new note"
-                    ));
-                }
-                (touched, said)
-            }
+            // Slot notes are what older builds put; what they hold has moved
+            // into the log, so nothing arrives this way any more.
+            LedgerEvent::Note(_) => Default::default(),
             LedgerEvent::Unreadable { device } => (
                 BTreeSet::new(),
                 vec![format!(
@@ -328,11 +304,22 @@ fn read_entries(items: &[Item]) -> Vec<Entry> {
         .collect()
 }
 
-/// Their revision replaces this device's only if it is newer.
-fn keep_theirs(theirs: &[u8], mine: &[u8]) -> bool {
-    match (NoteRev::decode(theirs), NoteRev::decode(mine)) {
-        (Some(theirs), Some(mine)) => theirs.id() > mine.id(),
-        (theirs, _) => theirs.is_some(),
+/// A note as the slot form held it, read only by the temp migration.
+#[derive(Decode)]
+struct SlotNote {
+    note: uuid::Uuid,
+    #[allow(dead_code)]
+    device: Device,
+    #[allow(dead_code)]
+    at: jiff::Zoned,
+    created: jiff::Timestamp,
+    body: String,
+    deleted: bool,
+}
+
+impl SlotNote {
+    fn decode(mut bytes: &[u8]) -> Option<Self> {
+        senax_encoder::decode(&mut bytes).ok()
     }
 }
 

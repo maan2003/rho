@@ -15,7 +15,6 @@ use jiff::{SignedDuration, Timestamp, Zoned};
 use super::*;
 use crate::curve::*;
 use crate::facts::{Device, Entry, Fact, Seen};
-use crate::notes::NoteRev;
 use crate::until::Until;
 
 /// What the user says in these scenarios, about the address it is said to.
@@ -299,16 +298,15 @@ impl World {
 
     fn write_note(&mut self, address: &Address, body: &str, deleted: bool) {
         let note = address.as_note().expect("a note");
-        let at = self.marks.next_at(&self.now);
-        self.now = at.clone();
-        self.marks.apply_notes([NoteRev {
+        let created = self.now.timestamp();
+        self.tell(Fact::Wrote {
             note,
-            device: Device([0; 16]),
-            created: at.timestamp(),
-            at,
-            body: body.into(),
-            deleted,
-        }]);
+            text: body.into(),
+            created,
+        });
+        if deleted {
+            self.tell(Fact::Deleted { note });
+        }
     }
 
     // The deal

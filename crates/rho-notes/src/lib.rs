@@ -268,12 +268,7 @@ fn found(marks: &Marks) -> Vec<Found> {
                 .filter(|label| !marks.get(&Address::label(**label)).deleted)
                 .map(|label| marks.label_path(*label))
                 .collect::<Vec<_>>();
-            let recency = address
-                .as_note()
-                .and_then(|note| marks.note(note))
-                .map_or(held.created_ms.unwrap_or(0), |rev| {
-                    rev.at.timestamp().as_millisecond()
-                });
+            let recency = held.written_ms.or(held.created_ms).unwrap_or(0);
             Found {
                 address: address.clone(),
                 title: note_title(marks, address),

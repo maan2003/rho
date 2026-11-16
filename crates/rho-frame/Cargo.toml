@@ -33,6 +33,8 @@ text = { path = "../../vendor/zed/crates/text" }
 settings = { path = "../../vendor/zed/crates/settings" }
 theme = { path = "../../vendor/zed/crates/theme" }
 tokio = { workspace = true, features = ["rt"] }
+bytes.workspace = true
+senax-encoder.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }

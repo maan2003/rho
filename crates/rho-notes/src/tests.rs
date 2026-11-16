@@ -1,7 +1,6 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use rho_dealer::facts::{Device, Entry};
-use rho_dealer::notes::NoteRev;
 
 use super::*;
 
@@ -56,15 +55,18 @@ impl World {
     }
 
     fn write(&mut self, note: NoteId, body: &str, deleted: bool) {
-        let at = self.at();
-        self.marks.apply_notes([NoteRev {
+        let created = self.marks.get(&note.address()).created_ms.map_or_else(
+            || self.at().timestamp(),
+            |ms| Timestamp::from_millisecond(ms).unwrap(),
+        );
+        self.say(Fact::Wrote {
             note: note.0,
-            device: LAPTOP,
-            created: at.timestamp(),
-            at,
-            body: body.to_owned(),
-            deleted,
-        }]);
+            text: body.to_owned(),
+            created,
+        });
+        if deleted {
+            self.say(Fact::Deleted { note: note.0 });
+        }
     }
 }
 
