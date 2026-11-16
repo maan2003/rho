@@ -1,9 +1,10 @@
-//! Portable local datagrams as a native iroh QUIC path.
+//! Local datagrams as a native iroh QUIC path.
 //!
-//! macOS uses IPv4 loopback UDP, Linux uses Unix datagrams, and Windows uses
-//! local message-mode named pipes. Callers use the same [`LocalDiscovery`] and
-//! [`IpcTransport`] API on every platform. QUIC provides authentication, stream
-//! multiplexing, reliability and congestion control on each backend.
+//! rho's copy of `iroh-ipc-transport`, cut to what rho runs on: Linux Unix
+//! datagrams, in a directory private to the user, with every file in it
+//! private too. The upstream macOS and Windows backends and the shared
+//! directory mode are gone. QUIC provides authentication, stream
+//! multiplexing, reliability and congestion control over the socket.
 //!
 //! Prepare the transport asynchronously, add it to the iroh builder, and install
 //! [`PreferIpcTransport`]. Resolve co-located peers through [`LocalDiscovery`].
@@ -14,8 +15,8 @@
 
 #![deny(missing_docs)]
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-compile_error!("iroh-ipc-transport supports macOS, Linux, and Windows");
+#[cfg(not(target_os = "linux"))]
+compile_error!("rho's iroh-ipc-transport is Linux only");
 
 mod backend;
 mod directory_access;
@@ -30,5 +31,5 @@ pub use discovery::LocalDiscovery;
 pub use selector::PreferIpcTransport;
 pub use transport::IpcTransport;
 
-/// Custom transport identifier shared by the platform backends.
+/// Custom transport identifier of the IPC path.
 pub const IPC_TRANSPORT_ID: u64 = 0x69_70_63_5f_74_72_00_00;

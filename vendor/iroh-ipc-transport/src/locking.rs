@@ -4,7 +4,6 @@
 //! involved: process death releases the OS lock even after an unclean shutdown.
 
 use std::io;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -26,11 +25,10 @@ impl Lock {
                 .await
             {
                 Ok(file) => {
-                    #[cfg(unix)]
-                    {
-                        file.set_permissions(std::fs::Permissions::from_mode(0o666))
-                            .await?;
-                    }
+                    file.set_permissions(std::fs::Permissions::from_mode(
+                        crate::directory_access::PRIVATE,
+                    ))
+                    .await?;
                     file
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
