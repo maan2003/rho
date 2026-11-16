@@ -186,11 +186,11 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
   `rows`); `rho-gui` lists the systems. A system reaches the frame only
   through `FrameLink`.
-- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`, `page:<uuid>`,
+- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`,
   `note:<uuid>`, `label:<uuid>`, `term:<host>/<agent>/<n>`,
   `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
-  `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate
-  owns are Linked Specs beside their crates.
+  `slack:<ws>/...`. The forms that no one crate owns are Linked Specs
+  beside their crates.
 - iroh is the one transport. A host always binds its endpoint; a peer on
   the same machine reaches it over the IPC transport
   (`vendor/iroh-ipc-transport`): a Unix datagram socket as a native iroh
@@ -229,3 +229,13 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   nothing as private rooms. The rest of the rooms decision is not built
   yet: a note still opens as its own surface, and labels and piles
   remain.
+- The usage screen and the page system went on 2026-11-16. With them went
+  the agents protocol's quota and usage calls (`QuotaUsage`,
+  `QuotaHistory`, `GlobalUsage`, `AgentCostDistribution`), the `Auth` and
+  `QuotaUsage` pushes and `SetAuthAccountEnabled`, which only the charts
+  used: wire epoch 50. The host no longer probes Claude quota
+  (`rho-claude-usage`) or keeps quota observations; its own ChatGPT
+  quota tracking for routing stays in `rho-inference`. The browser
+  crates (`rho-browser`, `rho-browser-wayland`, the extension) are gone;
+  `a79f5090` is the last commit that has them, for when the browser
+  comes back under chat.

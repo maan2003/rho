@@ -19,8 +19,7 @@ use rho_agents_client::protocol::worksets::{
     WorksetEntry,
 };
 use rho_agents_client::protocol::{
-    AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
-    QuotaUsage, RecordVisualization, SetAuthAccountEnabled, SetClaudeAccount, Visualization,
+    ClaudeAccountList, ClaudeAccounts, RecordVisualization, SetClaudeAccount, Visualization,
     VisualizationContent,
 };
 use rho_db::RhoDb;
@@ -29,7 +28,7 @@ use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::{NEXT_CONNECTION_ID, Services, usage};
+use crate::{NEXT_CONNECTION_ID, Services};
 
 /// Serves one agents stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -153,9 +152,6 @@ impl Drop for Attached {
 /// cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
-/// How often a session hears the quota when nothing has moved it.
-const QUOTA_REFRESH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
 /// What a client asks the session's follower for.
 enum Follow {
     Worksets(Vec<(WorksetId, Wpos)>),
@@ -164,7 +160,7 @@ enum Follow {
 
 /// A client's session: `Hello`, the directory, then whatever the client
 /// follows (some worksets' rows, the live tails of the agents it looks
-/// at) as it lands, beside the auth state and the quota. A stream of
+/// at) as it lands. A stream of
 /// its own, so a catch-up queues behind nothing and holds nothing up.
 async fn serve_session<R, W>(
     services: Arc<Services>,
@@ -196,52 +192,6 @@ where
         agent_counter,
     });
     let _ = outgoing_tx.send(directory(&services.db));
-    // Which accounts agents run on: now, and whenever the inference state
-    // moves.
-    let auth_task = {
-        let services = Arc::clone(&services);
-        let outgoing_tx = outgoing_tx.clone();
-        let mut state = services.inference.subscribe();
-        tokio::spawn(async move {
-            loop {
-                let _ = state.borrow_and_update();
-                let auth = services.auth_state();
-                if outgoing_tx.send(ServerFrame::Auth { auth }).is_err() {
-                    break;
-                }
-                if state.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-    };
-    // Now, whenever an observation moves it, and every so often besides:
-    // burn and resets move with time alone.
-    let quota_task = {
-        let services = Arc::clone(&services);
-        let outgoing_tx = outgoing_tx.clone();
-        let mut changed = services.quota.subscribe();
-        tokio::spawn(async move {
-            let mut refresh = tokio::time::interval(QUOTA_REFRESH);
-            loop {
-                tokio::select! {
-                    _ = refresh.tick() => {}
-                    result = changed.changed() => {
-                        if result.is_err() {
-                            break;
-                        }
-                    }
-                }
-                let summaries = usage::quota_summaries(&services.db, &services.inference);
-                if outgoing_tx
-                    .send(ServerFrame::QuotaUsage { summaries })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    };
     let (follow_tx, follow_rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(
         Arc::clone(&services),
@@ -281,8 +231,6 @@ where
         }
     };
     follower.abort();
-    auth_task.abort();
-    quota_task.abort();
     services
         .pool
         .set_live_wants(stream_id, HashSet::new())
@@ -606,17 +554,6 @@ where
             })
             .await
         }
-        Request::SetAuthAccountEnabled(call) => {
-            respond(
-                writer,
-                call,
-                |SetAuthAccountEnabled { name, enabled }| async move {
-                    services.set_auth_account_enabled(&name, enabled).await;
-                    Ok(())
-                },
-            )
-            .await
-        }
         Request::Visualization(call) => {
             respond(writer, call, |Visualization { id }| async move {
                 let visualization = services
@@ -636,36 +573,6 @@ where
                 call,
                 |RecordVisualization { mime_type, content }| {
                     services.visualizations.record(mime_type, content)
-                },
-            )
-            .await
-        }
-        Request::QuotaUsage(call) => {
-            respond(writer, call, |QuotaUsage| async {
-                Ok(usage::quota_summaries(&services.db, &services.inference))
-            })
-            .await
-        }
-        Request::QuotaHistory(call) => {
-            respond(writer, call, |QuotaHistory| async {
-                Ok(usage::quota_history(&services.db, &services.inference))
-            })
-            .await
-        }
-        Request::GlobalUsage(call) => {
-            respond(writer, call, |GlobalUsage { since_ms }| async move {
-                services.pool.flush_agent_usage(None).await;
-                Ok(usage::global_usage(&services.db, since_ms))
-            })
-            .await
-        }
-        Request::AgentCostDistribution(call) => {
-            respond(
-                writer,
-                call,
-                |AgentCostDistribution { since_ms }| async move {
-                    services.pool.flush_agent_usage(None).await;
-                    usage::agent_costs(&services.db, since_ms)
                 },
             )
             .await

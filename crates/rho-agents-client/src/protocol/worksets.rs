@@ -50,14 +50,9 @@ rho_rpc::calls! {
         Visualization(super::Visualization) -> super::VisualizationContent, priority None;
         /// Answered with the recorded visualization's id.
         RecordVisualization(super::RecordVisualization) -> String;
-        QuotaUsage(super::QuotaUsage) -> Vec<super::QuotaSummary>;
-        QuotaHistory(super::QuotaHistory) -> Vec<super::QuotaSeries>;
-        GlobalUsage(super::GlobalUsage) -> Vec<super::AgentUsageSeries>;
-        AgentCostDistribution(super::AgentCostDistribution) -> Vec<super::AgentCostSeries>;
         ClaudeAccounts(super::ClaudeAccounts) -> super::ClaudeAccountList;
         /// Answered with the accounts as they stand after the switch.
         SetClaudeAccount(super::SetClaudeAccount) -> super::ClaudeAccountList;
-        SetAuthAccountEnabled(super::SetAuthAccountEnabled) -> ();
     }
 }
 
@@ -151,10 +146,6 @@ pub enum ServerFrame {
         /// The last agent-id counter handed out, for short-prefix rendering.
         agent_counter: u64,
     },
-    /// Which provider accounts agents may run on: after `Hello`, and on change.
-    Auth {
-        auth: super::AuthState,
-    },
     /// Every workset and agent, after `Hello`. Later changes are
     /// [`ServerFrame::Workset`] and [`ServerFrame::Agent`].
     Directory {
@@ -184,9 +175,6 @@ pub enum ServerFrame {
     Status {
         agent_id: AgentId,
         state: RuntimeState,
-    },
-    QuotaUsage {
-        summaries: Vec<super::QuotaSummary>,
     },
 }
 

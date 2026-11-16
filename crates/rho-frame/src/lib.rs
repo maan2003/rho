@@ -13,7 +13,7 @@
 //! same history and the same surfaces.
 //!
 //! Everything the user looks at belongs to a [`System`]: chat, Slack,
-//! agents, notes, files, the browser. A system plugs in under address
+//! agents, notes, files. A system plugs in under address
 //! kinds ([`rho_dealer::Address`]): it opens a surface for an address,
 //! offers menu rows for what is in view, claims the user's attention for
 //! the things of its own that want it, lists what it has for Home and for

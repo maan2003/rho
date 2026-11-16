@@ -7,7 +7,7 @@ use rho_db::RhoDb;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
+use crate::accounts::{self, AccountManager, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
 use crate::responses::{DialRoute, InferenceAuth, QuotaUpdate, RouteSelection, RouteSelector};
 
@@ -226,9 +226,6 @@ impl Accounts {
     }
     pub fn subscribe(&self) -> watch::Receiver<InferenceState> {
         self.0.accounts.subscribe()
-    }
-    pub fn quota_history(&self, since: UnixMs) -> Vec<InferenceQuotaSeries> {
-        self.0.accounts.history(since)
     }
     pub fn route_probe_history(&self, since: UnixMs) -> Vec<crate::responses::InferenceRouteProbe> {
         self.0.routes.history(since)

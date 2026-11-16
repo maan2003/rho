@@ -201,7 +201,7 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==stopped,"video work survived unsubscribe");
         let (send,recv)=connection.open_bi().await?;
         let mut rpc=rho_rpc::Stream::new(recv,send);
-        rho_rpc::protocol::call(&mut rpc,agents::QuotaUsage).await.context("RPC failed after detach")?;
+        rho_rpc::protocol::call(&mut rpc,agents::ClaudeAccounts).await.context("RPC failed after detach")?;
         uni.abort(); bi.abort();
         client.close().await;
         // A second named desktop is advertised, then excluded after a crash

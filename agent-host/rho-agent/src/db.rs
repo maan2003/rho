@@ -1,14 +1,13 @@
 //! The agent host's redb tables beside the workset store ([`crate::store`]):
-//! id counters, the machine seed, usage and quota, the Claude account, and
+//! id counters, the machine seed, usage, the Claude account, and
 //! the format stamp with its migration savepoints.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use redb::TableDefinition;
 use redb_derive::{Key, Value as RedbValue};
 use rho_agent_types::{AgentId, AgentIdDomain, UnixMs};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use senax_encoder::{Decode, Encode};
 
 use crate::log::{AgentUsageBucket, AgentUsageModel};
 use crate::record::Runtime;
@@ -23,11 +22,6 @@ pub(crate) const FORMAT: TableDefinition<(), String> = TableDefinition::new("for
 /// The redb savepoint taken before a migration, by the hop it guards
 /// (`from->to`), so `rho debug rollback` can put the store back.
 const RECOVERY: TableDefinition<String, u64> = TableDefinition::new("recovery_savepoints");
-/// Model, namespace presence, namespace text, per-namespace sequence.
-const QUOTA_OBSERVATIONS: TableDefinition<
-    (QuotaModel, u8, String, u64),
-    Sen<QuotaObservationRecord>,
-> = TableDefinition::new("quota_observations_by_model_namespace_sequence");
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct AgentUsageKey {
     agent_id: AgentId,
@@ -71,49 +65,12 @@ const MIGRATIONS: &[Migration] = &[
         crate::store::chat::legacy::migrate_topics_to_forest,
     ),
 ];
-const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
 
 impl CounterKey {
     pub const LAST_AGENT_ID: Self = Self(1);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
-pub struct QuotaModel(u8);
-
-impl QuotaModel {
-    pub const GPT: Self = Self(1);
-    pub const FABLE: Self = Self(2);
-    pub const OPUS: Self = Self(3);
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::GPT => "gpt",
-            Self::FABLE => "fable",
-            Self::OPUS => "opus",
-            _ => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum QuotaProvider {
-    ChatGpt,
-    Claude,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct QuotaObservationRecord {
-    pub provider: QuotaProvider,
-    pub model: QuotaModel,
-    /// The host-local OAuth namespace for ChatGPT observations. Claude and
-    /// legacy observations are unscoped.
-    pub auth_namespace: Option<String>,
-    pub observed_at: UnixMs,
-    pub used_percent: u8,
-    pub reset_at_unix: Option<i64>,
 }
 
 fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: &AgentUsageBucket) {
@@ -131,17 +88,6 @@ fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: 
         });
     merged.add(bucket);
     table.insert(key, SenValue::borrowed(&merged));
-}
-
-fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservationRecord) -> bool {
-    old.provider == new.provider
-        && old.model == new.model
-        && old.used_percent == new.used_percent
-        && match (old.reset_at_unix, new.reset_at_unix) {
-            (Some(old), Some(new)) => old.abs_diff(new) <= QUOTA_RESET_JITTER_SECONDS,
-            (None, None) => true,
-            _ => false,
-        }
 }
 
 /// What a runtime's usage is billed as.
@@ -165,7 +111,6 @@ pub trait AgentReadTxnExt {
     /// This database's machine seed: the [`AgentIdDomain`] of its ids.
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
-    fn quota_observations(&self, model: QuotaModel, since: UnixMs) -> Vec<QuotaObservationRecord>;
     fn agent_usage(&self, agent_id: AgentId, since: UnixMs) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
     fn global_agent_usage(&self, since: UnixMs) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
@@ -176,8 +121,6 @@ pub trait AgentReadTxnExt {
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
     fn alloc_agent_id(&mut self) -> AgentId;
-    /// Whether the observation was new enough to keep.
-    fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
     fn set_claude_account(&mut self, account: &str);
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket);
     /// Forget an agent's usage, with its workset. Global totals stay.
@@ -197,31 +140,6 @@ impl AgentReadTxnExt for ReadTxn {
             .get(CounterKey::LAST_AGENT_ID)
             .map(|counter| counter.value())
             .unwrap_or(0)
-    }
-
-    fn quota_observations(&self, model: QuotaModel, since: UnixMs) -> Vec<QuotaObservationRecord> {
-        let table = self.open_table(QUOTA_OBSERVATIONS);
-        let mut before = BTreeMap::<Option<String>, QuotaObservationRecord>::new();
-        let mut observations = Vec::new();
-        for (_, value) in table
-            .range((model, 0, String::new(), 0)..)
-            .take_while(|(key, _)| key.value().0 == model)
-        {
-            let observation = value.value().into_owned();
-            if observation.observed_at < since {
-                let old = before
-                    .entry(observation.auth_namespace.clone())
-                    .or_insert_with(|| observation.clone());
-                if observation.observed_at >= old.observed_at {
-                    *old = observation;
-                }
-            } else {
-                observations.push(observation);
-            }
-        }
-        observations.extend(before.into_values());
-        observations.sort_by_key(|observation| observation.observed_at);
-        observations
     }
 
     fn agent_usage(&self, agent_id: AgentId, since: UnixMs) -> Vec<AgentUsageBucket> {
@@ -274,7 +192,6 @@ impl AgentWriteTxnExt for WriteTxn {
         assert_agent_db_format(self);
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
-        self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
         self.open_table(GLOBAL_AGENT_USAGE);
@@ -295,38 +212,6 @@ impl AgentWriteTxnExt for WriteTxn {
     fn set_claude_account(&mut self, account: &str) {
         self.open_table(CLAUDE_ACCOUNT)
             .insert((), account.to_owned());
-    }
-
-    fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
-        let namespace = observation.auth_namespace.clone().unwrap_or_default();
-        let present = u8::from(observation.auth_namespace.is_some());
-        let start = (observation.model, present, namespace.clone(), 0);
-        let end = (observation.model, present, namespace.clone(), u64::MAX);
-        let mut table = self.open_table(QUOTA_OBSERVATIONS);
-        let records = table.range(start..=end);
-        let mut next_sequence = 0;
-        let mut latest_by_time = None;
-        for (key, value) in records {
-            next_sequence = key.value().3 + 1;
-            let sample: QuotaObservationRecord = value.value().into_owned();
-            if latest_by_time
-                .as_ref()
-                .is_none_or(|old: &QuotaObservationRecord| sample.observed_at >= old.observed_at)
-            {
-                latest_by_time = Some(sample);
-            }
-        }
-        if latest_by_time
-            .as_ref()
-            .is_some_and(|old| quota_observation_unchanged(old, &observation))
-        {
-            return false;
-        }
-        table.insert(
-            &(observation.model, present, namespace, next_sequence),
-            SenValue::borrowed(&observation),
-        );
-        true
     }
 
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket) {
