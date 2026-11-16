@@ -288,23 +288,6 @@ impl HostChat {
         found
     }
 
-    /// The messages that mention the user in a thread or under it, oldest
-    /// first.
-    pub fn mentions_of_user_in(&self, thread: MessageId) -> Vec<&Message> {
-        let mut found = Vec::new();
-        let mut stack = vec![thread];
-        while let Some(at) = stack.pop() {
-            if let Some(message) = self.messages.get(&at)
-                && message.mentions(Address::User).is_some()
-            {
-                found.push(message);
-            }
-            stack.extend(self.children(Some(at)).iter().copied());
-        }
-        found.sort_unstable_by_key(|message| message.id);
-        found
-    }
-
     /// The root whose name is `name`, if there is one.
     pub fn root_named(&self, name: &str) -> Option<MessageId> {
         let wanted = one_line(name);
@@ -318,7 +301,7 @@ impl HostChat {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ContentPart, Mention, MentionKind};
+    use rho_agent_types::{AgentIdDomain, ContentPart};
 
     use super::*;
 
@@ -519,37 +502,5 @@ mod tests {
             Told::Nothing,
             "a root stays a root"
         );
-    }
-
-    #[test]
-    fn mentions_of_the_user_are_found_under_a_thread() {
-        let a = agent(1);
-        let mut chat = HostChat::default();
-        chat.tell(&posted(1, None, Address::User, "rho"));
-        chat.tell(&posted(2, Some(1), Address::User, "Fix it"));
-        chat.tell(&record(
-            3,
-            ChatEvent::Posted {
-                parent: Some(id(2)),
-                from: Address::Agent(a),
-                mentions: vec![Mention {
-                    to: Address::User,
-                    kind: MentionKind::Ask,
-                }],
-                content: vec![ContentPart::Text {
-                    text: "which?".into(),
-                }],
-            },
-        ));
-        chat.tell(&posted(4, Some(3), Address::Agent(a), "aside"));
-        assert_eq!(
-            chat.mentions_of_user_in(id(2))
-                .iter()
-                .map(|m| m.id)
-                .collect::<Vec<_>>(),
-            [id(3)]
-        );
-        assert_eq!(chat.mentions_of_user_in(id(1)).len(), 1);
-        assert!(chat.mentions_of_user_in(id(4)).is_empty());
     }
 }

@@ -42,6 +42,8 @@
 //!
 //! Each row is a test here under its name.
 
+use std::collections::BTreeMap;
+
 use jiff::Timestamp;
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, EndpointId, MentionKind, Message, MessageId,
@@ -100,20 +102,34 @@ pub fn claims(
     mut trace: Option<&mut Trace>,
 ) -> Vec<Claim> {
     let chat = host.chat;
-    // Each thread once, by its first mention of the user.
-    let mut threads: Vec<MessageId> = Vec::new();
+    // One walk over the chat, not one per thread: every thread's mentions
+    // of the user in log order, and the newest message the user wrote in
+    // it. Ranking happens on every change, and a host's chat is long.
+    let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
     for message in chat.messages() {
-        if message.mentions(Party::User).is_none() {
+        let mentioned = message.mentions(Party::User).is_some();
+        let from_user = message.from == Party::User;
+        if !mentioned && !from_user {
             continue;
         }
-        let thread = chat.thread_of(message.id);
-        if !threads.contains(&thread) {
-            threads.push(thread);
+        let thread = threads.entry(chat.thread_of(message.id)).or_default();
+        if mentioned {
+            thread.mentions.push(message);
+        }
+        if from_user
+            && thread
+                .user_wrote
+                .is_none_or(|newest| message.id > newest.id)
+        {
+            thread.user_wrote = Some(message);
         }
     }
-    threads.sort_unstable();
     let mut claims = Vec::new();
-    for thread in threads {
+    for (thread, messages) in threads {
+        // A thread nobody mentioned the user in is only the user's own.
+        if messages.mentions.is_empty() {
+            continue;
+        }
         let address = ThreadId {
             host: host.endpoint,
             message: thread,
@@ -130,12 +146,12 @@ pub fn claims(
         let facts = marks.get(&address).facts();
         // A mention is handled once the user is done with the thread
         // through it, or wrote after it.
-        let user_wrote = newest_from_user(chat, thread);
+        let user_wrote = messages.user_wrote;
         let seen = facts
             .seen_topic()
             .map(|seen| MessageId(ChatSeq(seen)))
             .max(user_wrote.map(|message| message.id));
-        let mentions = chat.mentions_of_user_in(thread);
+        let mentions = messages.mentions;
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
                 &address,
@@ -223,19 +239,11 @@ fn context(host: &Host<'_>, thread: MessageId) -> String {
 }
 
 /// The user's newest message in a thread or under it.
-fn newest_from_user(chat: &HostChat, thread: MessageId) -> Option<&Message> {
-    let mut newest: Option<&Message> = None;
-    let mut stack = vec![thread];
-    while let Some(at) = stack.pop() {
-        if let Some(message) = chat.message(at)
-            && message.from == Party::User
-            && newest.is_none_or(|newest| message.id > newest.id)
-        {
-            newest = Some(message);
-        }
-        stack.extend(chat.children(Some(at)).iter().copied());
-    }
-    newest
+/// What one thread holds that a card is made of, in log order.
+#[derive(Default)]
+struct ThreadMessages<'a> {
+    mentions: Vec<&'a Message>,
+    user_wrote: Option<&'a Message>,
 }
 
 #[cfg(test)]
@@ -495,6 +503,35 @@ mod tests {
                 .find(|card| card.address == address)
                 .map(|card| card.priority)
         }
+    }
+
+    /// A card is a thread's: a mention in the root message itself is the
+    /// root's card, and a mention in a thread under it is that thread's,
+    /// never counted twice.
+    #[test]
+    fn a_mention_in_the_root_itself_is_the_roots_card_alone() {
+        let mut w = world();
+        let agent = AgentId::from_counter(99, &AgentIdDomain(0)).unwrap();
+        let root = w.post(
+            None,
+            Party::Agent(agent),
+            vec![Mention {
+                to: Party::User,
+                kind: MentionKind::Ask,
+            }],
+            "root asks",
+        );
+        let a = w.agent("a");
+        let ask = w.asks(a);
+        let cards = w.deal().cards;
+        let cursor = |thread: MessageId| {
+            cards
+                .iter()
+                .find(|card| card.address == w.address(thread))
+                .map(|card| card.cursor.clone())
+        };
+        assert_eq!(cursor(root).as_deref(), Some(root.0.0.to_string().as_str()));
+        assert_eq!(cursor(a).as_deref(), Some(ask.0.0.to_string().as_str()));
     }
 
     #[test]
