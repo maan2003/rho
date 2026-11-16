@@ -243,6 +243,29 @@ impl Marks {
         })
     }
 
+    /// The user's private replies under `node`: the notes about it, oldest
+    /// first. A note made and not yet typed into has no text and is not
+    /// a reply yet.
+    pub fn replies_to(&self, node: &Address) -> Vec<(&Address, &NodeMarks)> {
+        let mut replies: Vec<_> = self
+            .notes()
+            .filter(|(_, marks)| marks.about.as_ref() == Some(node))
+            .collect();
+        replies.sort_by_key(|(_, marks)| marks.created_ms);
+        replies
+    }
+
+    /// The user's private rooms: the notes about nothing, newest written
+    /// first.
+    pub fn private_roots(&self) -> Vec<(&Address, &NodeMarks)> {
+        let mut roots: Vec<_> = self
+            .notes()
+            .filter(|(_, marks)| marks.about.is_none())
+            .collect();
+        roots.sort_by_key(|(_, marks)| std::cmp::Reverse(marks.written_ms));
+        roots
+    }
+
     /// What the user put away and can open: each named pile with its nodes,
     /// oldest first, and last the unnamed one, whatever is snoozed past
     /// `now`, soonest back first.
@@ -618,6 +641,64 @@ mod tests {
             said(PHONE, 3, Fact::Retract { of: deleted.id() }),
         ]);
         assert_eq!(marks.notes().count(), 1);
+    }
+
+    /// A note about a message is a private reply under it, in the order
+    /// the notes were made, whatever order they were last written in. A
+    /// deleted one, and one with no text yet, are not replies.
+    #[test]
+    fn notes_about_a_message_are_its_private_replies_oldest_first() {
+        let mut marks = Marks::default();
+        let (first, second, empty, gone) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let about = |minute, note| {
+            said(
+                LAPTOP,
+                minute,
+                Fact::About {
+                    node: Address::note(note),
+                    about: Some(agent()),
+                },
+            )
+        };
+        let wrote = |minute, note, text: &str, created| {
+            said(
+                PHONE,
+                minute,
+                Fact::Wrote {
+                    note,
+                    text: text.into(),
+                    created: at(created).timestamp(),
+                },
+            )
+        };
+        marks.apply([
+            about(0, first),
+            about(1, second),
+            about(2, empty),
+            about(3, gone),
+            wrote(9, first, "first, edited last", 0),
+            wrote(5, second, "second", 1),
+            wrote(6, gone, "gone", 3),
+            said(PHONE, 7, Fact::Deleted { note: gone }),
+        ]);
+        let replies: Vec<&str> = marks
+            .replies_to(&agent())
+            .into_iter()
+            .map(|(_, marks)| marks.title())
+            .collect();
+        assert_eq!(replies, ["first, edited last", "second"]);
+        assert!(marks.replies_to(&Address::note(first)).is_empty());
+        let roots: Vec<&Address> = marks
+            .private_roots()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        assert!(roots.is_empty(), "a reply is not a room");
     }
 
     #[test]
