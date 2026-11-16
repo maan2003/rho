@@ -11,16 +11,17 @@ use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Window, div,
 };
+use jiff::Timestamp;
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_agent_types::{Address as Party, ContentPart, MessageId};
-use rho_dealer::{Address, Addressed as _};
+use rho_agent_types::{Address as Party, ContentPart, EndpointId, MessageId};
+use rho_dealer::{Address, Addressed as _, Marks};
 use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, FocusComposer, FocusLog, OpenRow, SendMessage, when};
-use crate::{AgentRef, ThreadId};
+use super::{ChatSystem, FocusComposer, FocusLog, OpenRow, SendMessage, ago, when};
+use crate::{AgentRef, HostChat, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
 const KEY_BASE: usize = usize::MAX / 5;
@@ -33,6 +34,8 @@ enum Key {
     Message(MessageId),
     /// The replies under a message, folded.
     Fold(MessageId),
+    /// A thread under a root, on one line.
+    Thread(MessageId),
     Participants,
     Pending(u64),
     Gap(u32),
@@ -46,10 +49,16 @@ enum Class {
     Fold,
     Pending,
     Participants,
+    /// A thread's name in a root's list.
+    Name,
+    /// A name with something unread under it, and the count.
+    Unread,
+    /// Unread mentions of the user.
+    Mention,
 }
 
 impl Class {
-    const COUNT: usize = 6;
+    const COUNT: usize = 9;
 
     fn slot(self) -> usize {
         match self {
@@ -59,6 +68,9 @@ impl Class {
             Self::Fold => 3,
             Self::Pending => 4,
             Self::Participants => 5,
+            Self::Name => 6,
+            Self::Unread => 7,
+            Self::Mention => 8,
         }
     }
 }
@@ -75,6 +87,9 @@ impl rho_transcript::Style for Class {
             Self::From => (colors.text_accent, Some(gpui::FontWeight::BOLD)),
             Self::Fold => (cx.theme().status().info, None),
             Self::Participants => (colors.text_muted, None),
+            Self::Name => (colors.text, None),
+            Self::Unread => (colors.text, Some(gpui::FontWeight::BOLD)),
+            Self::Mention => (cx.theme().status().warning, Some(gpui::FontWeight::BOLD)),
         };
         HighlightStyle {
             color: Some(color.into()),
@@ -189,20 +204,29 @@ impl ThreadView {
         view.transcript.attach(&view.log.clone(), cx);
         let items = items(system, thread, cx);
         view.transcript.reconcile(items, cx);
-        view.cursor_to_end(cx);
+        if is_root(system, thread) {
+            // The list reads from the top. What is unread in it comes from
+            // the ledger, which is the frame's and is leased while it opens
+            // this: the first rows go without it, and the next draw has it.
+            view.cursor_to_first_thread(cx);
+            cx.defer_in(window, |this, _, cx| this.refresh(cx));
+        } else {
+            view.cursor_to_end(cx);
+        }
         view
     }
 
     /// The rows as they stand, reconciled into the buffer. A reader at the
     /// end stays at the end as messages arrive.
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let list = is_root(self.system.read(cx), self.thread);
         let at_end = {
             let last = self.transcript.buffer().read(cx).max_point().row;
             self.cursor_row(cx) + 1 >= last
         };
         let items = items(self.system.read(cx), self.thread, cx);
         self.transcript.reconcile(items, cx);
-        if at_end {
+        if at_end && !list {
             self.cursor_to_end(cx);
         }
         // A draft the system sent on the user's behalf (`send and start`)
@@ -238,6 +262,23 @@ impl ThreadView {
             .head()
             .to_point(&snapshot)
             .row
+    }
+
+    /// The first thread of a root's list, if it has one.
+    fn cursor_to_first_thread(&mut self, cx: &mut Context<Self>) {
+        let rows = self.transcript.buffer().read(cx).max_point().row;
+        let Some(row) = (0..=rows)
+            .find(|row| matches!(self.transcript.line_meta(*row, cx), Some(Meta::Message(_))))
+        else {
+            return;
+        };
+        self.log.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.change_with(&snapshot, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+            });
+            cx.notify();
+        });
     }
 
     fn cursor_to_end(&mut self, cx: &mut Context<Self>) {
@@ -288,7 +329,10 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             line(Key::Crumb, &text, Class::Crumb).with_lines(vec![Meta::Open(parent.address())]),
         );
     }
-    if let Some(message) = chat.message(thread.message) {
+    let list = is_root(system, thread);
+    if let Some(message) = chat.message(thread.message)
+        && !list
+    {
         items.push(message_item(message, Meta::None));
     }
     if !head.members.is_empty() {
@@ -317,6 +361,24 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         );
     }
     gap_item(&mut items);
+    if list {
+        let rows = system.frame.read(cx, |frame, cx| {
+            thread_rows(system, chat, host, thread.message, Some(frame.marks()), cx)
+        });
+        let rows =
+            rows.unwrap_or_else(|| thread_rows(system, chat, host, thread.message, None, cx));
+        if rows.is_empty() {
+            items.push(line(
+                Key::Gap(u32::MAX),
+                "no threads yet · the composer starts one",
+                Class::Crumb,
+            ));
+        }
+        items.extend(rows);
+        gap_item(&mut items);
+        items.extend(pending_items(system, host, thread.message, &mut gap_item));
+        return items;
+    }
     for id in chat.children(Some(thread.message)) {
         let Some(message) = chat.message(*id) else {
             continue;
@@ -341,7 +403,28 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         }
         gap_item(&mut items);
     }
-    for outgoing in system.waiting_under(host, Some(thread.message)) {
+    items.extend(pending_items(system, host, thread.message, &mut gap_item));
+    items
+}
+
+/// Whether `thread` is a root: a stream, whose surface lists the threads
+/// under it rather than reading them.
+fn is_root(system: &ChatSystem, thread: ThreadId) -> bool {
+    system
+        .chat(thread.host)
+        .and_then(|chat| chat.message(thread.message))
+        .is_some_and(|message| message.parent.is_none())
+}
+
+/// The user's messages into `parent` that no host has logged yet.
+fn pending_items(
+    system: &ChatSystem,
+    host: EndpointId,
+    parent: MessageId,
+    gap_item: &mut impl FnMut(&mut Vec<Item<Key, Class, Meta>>),
+) -> Vec<Item<Key, Class, Meta>> {
+    let mut items = Vec::new();
+    for outgoing in system.waiting_under(host, Some(parent)) {
         let id = outgoing.at.0;
         let mut text = "you · sending…\n".to_owned();
         text.push_str(&body(&outgoing.content));
@@ -355,6 +438,116 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         gap_item(&mut items);
     }
     items
+}
+
+/// A root's threads, one line each, the way the Slack list shows
+/// conversations: the name and what waits in it, with the unread ones
+/// first, a mention of the user before a plain unread, and each group
+/// newest first. The words are in the thread; the list is for choosing one.
+/// Without `marks` nothing is known to be unread.
+fn thread_rows(
+    system: &ChatSystem,
+    chat: &HostChat,
+    host: EndpointId,
+    root: MessageId,
+    marks: Option<&Marks>,
+    cx: &App,
+) -> Vec<Item<Key, Class, Meta>> {
+    struct Line {
+        id: MessageId,
+        at: u64,
+        mentions: usize,
+        unread: usize,
+        text: String,
+        styles: Vec<(Class, Range<usize>)>,
+    }
+    let now = Timestamp::now();
+    let mut lines = Vec::new();
+    for id in chat.children(Some(root)) {
+        let Some(message) = chat.message(*id) else {
+            continue;
+        };
+        let thread = ThreadId { host, message: *id };
+        let unread = marks.map_or_else(Vec::new, |marks| system.unread_ids_in(chat, thread, marks));
+        let mentions = unread
+            .iter()
+            .filter(|id| {
+                chat.message(**id)
+                    .is_some_and(|message| message.mentions(Party::User).is_some())
+            })
+            .count();
+        let (_, at) = chat.newest_in(*id).unwrap_or((*id, message.at));
+        let mut text = chat.name(*id).unwrap_or_default();
+        let name_class = match unread.is_empty() {
+            true => Class::Name,
+            false => Class::Unread,
+        };
+        let mut styles = vec![(name_class, 0..text.len())];
+        let mut waiting: Vec<(String, Class)> = Vec::new();
+        if mentions > 0 {
+            waiting.push((format!("@{mentions}"), Class::Mention));
+        }
+        if !unread.is_empty() {
+            waiting.push((format!("{} new", unread.len()), Class::Unread));
+        }
+        let replies = chat.children(Some(*id)).len();
+        if replies > 0 {
+            let word = match replies {
+                1 => "reply",
+                _ => "replies",
+            };
+            waiting.push((format!("{replies} {word}"), Class::Time));
+        }
+        let agents = chat.members_under(Some(*id));
+        if !agents.is_empty() {
+            let mut names: Vec<String> = agents
+                .iter()
+                .take(2)
+                .map(|agent| {
+                    system
+                        .agent_label(host, *agent, cx)
+                        .unwrap_or_else(|| agent.encoded())
+                })
+                .collect();
+            if agents.len() > 2 {
+                names.push(format!("+{}", agents.len() - 2));
+            }
+            waiting.push((names.join(", "), Class::Participants));
+        }
+        waiting.push((ago(at.0, now), Class::Time));
+        for (index, (word, class)) in waiting.into_iter().enumerate() {
+            text.push_str(match index {
+                0 => "  ",
+                _ => " · ",
+            });
+            let start = text.len();
+            text.push_str(&word);
+            styles.push((class, start..text.len()));
+        }
+        lines.push(Line {
+            id: *id,
+            at: at.0,
+            mentions,
+            unread: unread.len(),
+            text,
+            styles,
+        });
+    }
+    lines.sort_by_key(|line| {
+        (
+            std::cmp::Reverse(line.mentions > 0),
+            std::cmp::Reverse(line.unread > 0),
+            std::cmp::Reverse(line.at),
+        )
+    });
+    lines
+        .into_iter()
+        .map(|line| {
+            Item::new(Key::Thread(line.id), line.text)
+                .with_styles(line.styles)
+                .with_lines(vec![Meta::Message(line.id)])
+        })
+        .collect()
 }
 
 impl ThreadView {

@@ -9,7 +9,7 @@
 
 mod thread;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -386,9 +386,20 @@ impl ChatSystem {
     /// How many messages of others in a thread the user has not read:
     /// those past what they settled through or wrote after.
     fn unread_in(&self, chat: &HostChat, thread: ThreadId, marks: &Marks) -> usize {
+        self.unread_ids_in(chat, thread, marks).len()
+    }
+
+    /// The messages of others in a thread the user has not read, newest
+    /// first: those past what they settled through or wrote after.
+    pub(crate) fn unread_ids_in(
+        &self,
+        chat: &HostChat,
+        thread: ThreadId,
+        marks: &Marks,
+    ) -> Vec<MessageId> {
         let facts = marks.get(&thread.address()).facts();
         if facts.muted() {
-            return 0;
+            return Vec::new();
         }
         let seen = facts
             .seen_topic()
@@ -405,7 +416,7 @@ impl ChatSystem {
         chat.others_in(thread.message)
             .into_iter()
             .filter(|id| seen.is_none_or(|seen| *id > seen))
-            .count()
+            .collect()
     }
 
     fn with_host<R>(
@@ -613,6 +624,12 @@ impl System for ChatSystem {
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
         let thread = self.thread_of(address)?;
         self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+    }
+
+    /// What is unread moved: a root's list reads the marks on its next
+    /// draw, which this asks for.
+    fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
+        cx.notify();
     }
 
     fn seen(&self, address: &Address, _cx: &App) -> Seen {
