@@ -172,6 +172,15 @@ impl Link {
         opened
     }
 
+    /// Stores a GUI performance snapshot on the host, which answers where
+    /// it put it.
+    pub fn upload_gui_telemetry(
+        &self,
+        snapshot: Vec<u8>,
+    ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+        self.run(|dialer| dial_gui_telemetry(dialer, snapshot))
+    }
+
     /// Runs `work` against the host on the connection's runtime. The answer
     /// needs no particular executor; dropping it cancels the work. An
     /// in-process host's work runs in the answer itself, on whatever
@@ -214,13 +223,6 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Connection {
-    pub fn upload_gui_telemetry(
-        &self,
-        snapshot: Vec<u8>,
-    ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
-        self.link.run(|dialer| dial_gui_telemetry(dialer, snapshot))
-    }
-
     /// The way a client crate reaches this host.
     pub fn link(&self) -> Link {
         self.link.clone()
