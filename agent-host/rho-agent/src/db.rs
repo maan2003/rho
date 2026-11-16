@@ -48,23 +48,10 @@ const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude
 const CURRENT_AGENT_DB_FORMAT: &str = "e41b7c2a";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
-/// Temporary (`temp-migration`): the hops a store takes to the current
-/// format, one build at a time, each from a savepoint `rho debug rollback`
-/// can put it back to. Oldest first.
-const MIGRATIONS: &[Migration] = &[
-    // GCCP acceptances keyed by endpoint bytes.
-    (
-        "9a6cf67f",
-        "7cfd7d03",
-        crate::store::gccp::key_contacts_by_endpoint,
-    ),
-    // Chat became a forest of messages.
-    (
-        "7cfd7d03",
-        "e41b7c2a",
-        crate::store::chat::legacy::migrate_topics_to_forest,
-    ),
-];
+/// The hops a store takes to the current format, one build at a time,
+/// each from a savepoint `rho debug rollback` can put it back to. Oldest
+/// first. Empty: nothing has moved since `e41b7c2a`.
+const MIGRATIONS: &[Migration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -296,8 +283,7 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         if stored.as_deref() != Some(from) {
             continue;
         }
-        // Temporary (`temp-migration`): `rho debug rollback` puts the store
-        // back from this savepoint.
+        // `rho debug rollback` puts the store back from this savepoint.
         let hop = format!("{from}->{to}");
         db.persistent_savepoint(|write, id| {
             write.open_table(RECOVERY).insert(hop, id);
@@ -309,7 +295,24 @@ pub async fn prepare(db: &rho_db::RhoDb) {
         write.commit();
         stored = Some(to.to_string());
     }
+    // A savepoint for a hop this build no longer knows guards nothing:
+    // rolling back to it would leave a format this build cannot open, and
+    // while it stands it pins every page the migration freed.
+    let known = MIGRATIONS
+        .iter()
+        .map(|(from, to, _)| format!("{from}->{to}"))
+        .collect::<Vec<_>>();
     let mut write = db.write().await;
+    let stale = write
+        .open_table(RECOVERY)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value()))
+        .filter(|(hop, _)| !known.contains(hop))
+        .collect::<Vec<_>>();
+    for (hop, id) in stale {
+        write.delete_persistent_savepoint(id);
+        write.open_table(RECOVERY).remove(&hop);
+    }
     write.init_agent_tables();
     write.commit();
 }
@@ -431,91 +434,31 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .value()
 }
 
-/// Temporary (`temp-migration`).
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentId, AgentIdDomain, EndpointId, PeerAddress};
-
     use super::*;
-    use crate::store::GccpRead as _;
 
-    const HEX_CONTACTS: TableDefinition<(AgentId, String), String> =
-        TableDefinition::new("gccp_contacts");
-
-    /// `prepare` moves each acceptance from its hex key to its endpoint's
-    /// bytes once, and the rollback puts back the stamp and the old table.
+    /// A savepoint recorded for a hop this build does not know goes when
+    /// the store is prepared: nothing could roll back to it.
     #[tokio::test]
-    async fn gccp_acceptances_move_to_endpoint_keys_once_and_roll_back() {
+    async fn a_savepoint_for_a_forgotten_hop_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("db"));
-        let agent = |n| AgentId::from_counter(n, &AgentIdDomain(7)).unwrap();
-        let tau = EndpointId(std::array::from_fn(|n| 0xf0 ^ n as u8));
-        // As format 9a6cf67f wrote them: 64 hex digits, by hand.
-        let hex: String = tau.0.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert!(hex.starts_with("f0f1f2"), "{hex}");
         let mut write = db.write().await;
-        write.open_table(FORMAT).insert((), "9a6cf67f".to_owned());
-        rho_iroh_auth::gccp_hosts::init(&mut write);
-        rho_iroh_auth::gccp_hosts::approve(&mut write, &tau.0, "dpc-tau".into());
-        let mut old = write.open_table(HEX_CONTACTS);
-        old.insert(
-            (agent(1), format!("{hex}/coordinator-p65r")),
-            "tau".to_owned(),
-        );
-        old.insert((agent(2), format!("{hex}/x.y_z")), "tau for 2".to_owned());
-        drop(old);
+        write
+            .open_table(FORMAT)
+            .insert((), CURRENT_AGENT_DB_FORMAT.to_owned());
         write.commit();
-        let state = || {
-            let read = db.read();
-            let mut contacts: Vec<(AgentId, PeerAddress, String)> = read
-                .gccp_contacts()
-                .into_iter()
-                .map(|contact| (contact.agent, contact.peer, contact.name))
-                .collect();
-            contacts.sort_by_key(|contact| contact.0);
-            (
-                read.open_table(FORMAT).get(()).unwrap().value(),
-                read.has_table("gccp_contacts"),
-                contacts,
-            )
-        };
-        let address = |local: &str| PeerAddress {
-            endpoint: tau,
-            local: local.parse().unwrap(),
-        };
-        let moved = (
-            CURRENT_AGENT_DB_FORMAT.to_owned(),
-            false,
-            vec![
-                (agent(1), address("coordinator-p65r"), "tau".to_owned()),
-                (agent(2), address("x.y_z"), "tau for 2".to_owned()),
-            ],
-        );
+        db.persistent_savepoint(|write, id| {
+            write
+                .open_table(RECOVERY)
+                .insert("00000000->e41b7c2a".to_owned(), id);
+        })
+        .await;
+        assert_eq!(savepoints(&db).await.len(), 1);
 
         prepare(&db).await;
-        assert_eq!(state(), moved);
-        assert_eq!(
-            db.read()
-                .gccp_contact(agent(1), &address("coordinator-p65r"))
-                .as_deref(),
-            Some("tau")
-        );
-        prepare(&db).await;
-        assert_eq!(state(), moved);
-
-        // Each hop rolls back on its own, newest first.
-        let hop = rollback(&db).await.unwrap();
-        assert_eq!(hop, "7cfd7d03->e41b7c2a");
-        assert_eq!(
-            db.read().open_table(FORMAT).get(()).unwrap().value(),
-            "7cfd7d03"
-        );
-        let hop = rollback(&db).await.unwrap();
-        assert_eq!(hop, "9a6cf67f->7cfd7d03");
-        let read = db.read();
-        assert_eq!(read.open_table(FORMAT).get(()).unwrap().value(), "9a6cf67f");
-        assert_eq!(read.open_table(HEX_CONTACTS).iter().count(), 2);
-        drop(read);
+        assert!(savepoints(&db).await.is_empty());
         assert!(rollback(&db).await.is_err());
     }
 }

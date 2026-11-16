@@ -217,35 +217,6 @@ impl Fact {
             | Self::Retract { .. } => None,
         }
     }
-
-    /// The same fact said of `node` instead; `None` for a fact that is not
-    /// about a node.
-    pub fn retarget(&self, node: Address) -> Option<Self> {
-        Some(match self.clone() {
-            Self::Snooze { until, .. } => Self::Snooze { node, until },
-            Self::Piled { pile, .. } => Self::Piled { node, pile },
-            Self::Todo { start, seen, .. } => Self::Todo { node, start, seen },
-            Self::Deadline { by, lead_days, .. } => Self::Deadline {
-                node,
-                by,
-                lead_days,
-            },
-            Self::Settled { seen, .. } => Self::Settled { node, seen },
-            Self::Mute { .. } => Self::Mute { node },
-            Self::Unmute { .. } => Self::Unmute { node },
-            Self::Named { name, .. } => Self::Named { node, name },
-            Self::About { about, .. } => Self::About { node, about },
-            Self::Read { seen, .. } => Self::Read { node, seen },
-            Self::Label { .. }
-            | Self::Unlabel { .. }
-            | Self::Repository { .. }
-            | Self::Host { .. }
-            | Self::Labeled { .. }
-            | Self::Wrote { .. }
-            | Self::Deleted { .. }
-            | Self::Retract { .. } => return None,
-        })
-    }
 }
 
 /// How far the user had seen, in the source's own terms.

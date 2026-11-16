@@ -58,12 +58,6 @@ impl ThreadId {
             message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(message.parse().ok()?)),
         })
     }
-
-    /// What the thread was called while the host's database seed named
-    /// its log (`temp-migration`): what older facts say.
-    pub fn seeded_key(machine_seed: u64, message: rho_agent_types::MessageId) -> String {
-        format!("{machine_seed:016x}/{}", message.0.0)
-    }
 }
 
 impl std::fmt::Display for ThreadId {

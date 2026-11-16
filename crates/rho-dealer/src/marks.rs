@@ -48,30 +48,6 @@ impl NodeMarks {
         Facts(&self.facts)
     }
 
-    /// What was said here, said again of `node`: the attention facts in
-    /// order, then the name and subject. A note's body is not about a node
-    /// and stays.
-    pub fn restated_as(&self, node: &Address) -> Vec<Fact> {
-        let mut facts: Vec<Fact> = self
-            .facts
-            .iter()
-            .filter_map(|entry| entry.fact.retarget(node.clone()))
-            .collect();
-        if self.name.is_some() {
-            facts.push(Fact::Named {
-                node: node.clone(),
-                name: self.name.clone(),
-            });
-        }
-        if let Some(about) = &self.about {
-            facts.push(Fact::About {
-                node: node.clone(),
-                about: Some(about.clone()),
-            });
-        }
-        facts
-    }
-
     /// A note's title: the first line of its body.
     pub fn title(&self) -> &str {
         self.body
@@ -233,7 +209,6 @@ mod tests {
 
     use super::*;
     use crate::facts::Device;
-    use crate::until::Until;
 
     const LAPTOP: Device = Device([1; 16]);
     const PHONE: Device = Device([2; 16]);
@@ -254,56 +229,6 @@ mod tests {
             at: at(minute),
             fact,
         }
-    }
-
-    /// Everything said of a node comes out again about another: the
-    /// attention facts as they were and the name. A label an older build
-    /// put on it is not restated.
-    #[test]
-    fn a_nodes_marks_are_restated_as_another_node() {
-        let mut marks = Marks::default();
-        let moved = Address::new("thread", "yyyy/41");
-        marks.apply([
-            said(
-                LAPTOP,
-                0,
-                Fact::Snooze {
-                    node: agent(),
-                    until: Until::In(SignedDuration::from_hours(1)),
-                },
-            ),
-            said(
-                LAPTOP,
-                1,
-                Fact::Labeled {
-                    node: agent(),
-                    label: uuid::Uuid::new_v4(),
-                    present: true,
-                },
-            ),
-            said(
-                PHONE,
-                2,
-                Fact::Named {
-                    node: agent(),
-                    name: Some("eng".into()),
-                },
-            ),
-        ]);
-        assert_eq!(
-            marks.get(&agent()).restated_as(&moved),
-            [
-                Fact::Snooze {
-                    node: moved.clone(),
-                    until: Until::In(SignedDuration::from_hours(1)),
-                },
-                Fact::Named {
-                    node: moved.clone(),
-                    name: Some("eng".into()),
-                },
-            ]
-        );
-        assert!(marks.get(&moved).restated_as(&agent()).is_empty());
     }
 
     #[test]

@@ -85,8 +85,8 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// The first frame: the newest event on the host, and the host's iroh
     /// identity, which names its log and its threads wherever a copy is
-    /// held. The database seed named them before; a client moves what it
-    /// kept under the seed to the endpoint (`temp-migration`).
+    /// held. `machine_seed` named them before and nothing reads it now; it
+    /// goes with the next protocol epoch.
     Hello {
         head: ChatSeq,
         host: EndpointId,

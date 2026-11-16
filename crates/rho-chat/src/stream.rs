@@ -26,9 +26,6 @@ pub enum ChatEvent {
         host: HostId,
         /// Whose log: the host's iroh identity.
         endpoint: EndpointId,
-        /// What named the log before the endpoint did; what a copy kept
-        /// under it moves to the endpoint (`temp-migration`).
-        machine_seed: u64,
         head: ChatSeq,
         fresh: bool,
     },
@@ -117,7 +114,7 @@ impl HostStream for ChatStream {
                 let ServerFrame::Hello {
                     head,
                     host: endpoint,
-                    machine_seed,
+                    ..
                 } = read_frame(&mut socket).await?
                 else {
                     anyhow::bail!("the chat session did not open with its hello");
@@ -134,7 +131,6 @@ impl HostStream for ChatStream {
                     .unbounded_send(ChatEvent::Hello {
                         host,
                         endpoint,
-                        machine_seed,
                         head,
                         fresh,
                     })

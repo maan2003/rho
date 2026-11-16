@@ -201,11 +201,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the host the same way. There is no Unix stream socket and no `--iroh`.
 - A host is named by its iroh endpoint key, which both sessions' `Hello`
   carry: `ThreadId { host: EndpointId, message }`. `machine_seed` stays
-  only as the domain agent ids are encoded in. Until the temp migration
-  is removed, the chat `Hello` carries the seed too: the first hello
-  moves the chat cache rows, and every hello re-says the ledger facts of
-  a thread nothing is said of yet under the new address
-  (`Frame::restate`).
+  only as the domain agent ids are encoded in; the chat `Hello` still
+  carries it unread until the next protocol epoch.
 - The host names a thread under a root once: when its second message
   arrives and nothing named it, a model reads those two messages and the
   host logs a `Named`. A name from the user or an agent (`rho.chat.name`)
