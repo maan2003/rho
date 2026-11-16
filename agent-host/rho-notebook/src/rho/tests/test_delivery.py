@@ -16,7 +16,7 @@ def from_agent(sender, text):
 
 class Delivery(WorksetCase):
     def seed(self, state):
-        self.a = add_agent(state, native(), preset="engineer", cwd="/")
+        self.a = add_agent(state, native(), preset="agent", cwd="/")
         self.b = add_agent(state, native(), preset="child", parent=self.a, cwd="/")
         # Root 1, the stream `rho`. The user's thread 2 mentions `a`, which
         # joined it, and goes on with 3 and 4.
@@ -42,7 +42,7 @@ class Delivery(WorksetCase):
         ])
         wait_for(lambda: self.inputs(self.b), "delivery to b")
         self.assertEqual(self.inputs(self.b), [
-            (f"{header(2, 'rho', 'Fix it')} Message from eng-{self.a}:\nb, look", "tool", 5),
+            (f"{header(2, 'rho', 'Fix it')} Message from ag-{self.a}:\nb, look", "tool", 5),
         ])
 
     def test_a_thread_name_stays_one_line_that_cannot_close_its_header(self):
@@ -97,8 +97,8 @@ class Delivery(WorksetCase):
         )
         self.assertIsNone(error)
         new = output.strip()
-        self.assertEqual(self.inputs(new), [(from_agent(f"eng-{self.a}", "go"), "tool", None)])
-        self.assertEqual(self.state.mail, [(self.a, new, from_agent(f"eng-{self.a}", "go"))])
+        self.assertEqual(self.inputs(new), [(from_agent(f"ag-{self.a}", "go"), "tool", None)])
+        self.assertEqual(self.state.mail, [(self.a, new, from_agent(f"ag-{self.a}", "go"))])
         self.assertEqual(len(self.state.messages), 5, "mail is not chat")
 
     def test_an_agent_started_from_a_message_joins_its_thread_and_starts_from_it(self):
@@ -108,7 +108,7 @@ class Delivery(WorksetCase):
         output, error = rho._eval(f"print(new_agent(cwd='/', runtime={native()!r}, origin='chat:{origin}'))")
         self.assertIsNone(error)
         new = output.strip()
-        self.assertEqual(self.state.agents[new]["props"], {"preset": "engineer", "origin": f"chat:{origin}", "cwd": "/"})
+        self.assertEqual(self.state.agents[new]["props"], {"preset": "agent", "origin": f"chat:{origin}", "cwd": "/"})
         wait_for(lambda: self.inputs(new), "the origin message")
         later = fake_rho.post_user(origin, "and then this")
         wait_for(lambda: len(self.inputs(new)) == 2, "a later message of the thread")
@@ -198,7 +198,7 @@ rho.hooks.deliver = deliver
 """
 
     def seed(self, state):
-        self.a = add_agent(state, native(), preset="engineer", cwd="/")
+        self.a = add_agent(state, native(), preset="agent", cwd="/")
 
     def test_a_policy_delivers_its_own_way(self):
         ops = fake_rho.post_user(None, "ops")
@@ -215,7 +215,7 @@ class AutoWorkset(WorksetCase):
     init = "from rho import workset\nworkset.set_permissions(\"auto\")\n"
 
     def seed(self, state):
-        self.lead = add_agent(state, claude(), preset="engineer", cwd="/")
+        self.lead = add_agent(state, claude(), preset="agent", cwd="/")
         self.dead = add_agent(state, native(), preset="child", parent=self.lead, cwd="/")
         self.child = add_agent(state, claude(), preset="child", parent=self.lead, cwd="/")
         rho_ = fake_rho.post_user(None, "rho")

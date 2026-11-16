@@ -1199,7 +1199,8 @@ impl Services {
     }
 
     /// An agent named by its id or a unique prefix of it, with or without
-    /// a handle prefix (`eng-`) in front, which is presentation only.
+    /// a handle prefix (`ag-`, `eng-` or `adv-`) in front, which is
+    /// presentation only.
     fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
         let text = agent_id.trim();
         let raw = text.split_once('-').map_or(text, |(_, raw)| raw);

@@ -122,7 +122,7 @@ pub struct AgentMap {
     /// dashboard row every frame, so it must not scan the map per call.
     children: BTreeMap<AgentId, Vec<AgentId>>,
     /// Host → role prefix → the agents with that prefix, by encoded id.
-    /// What `@eng-b8os` is looked up in.
+    /// What `@ag-b8os` is looked up in.
     tag_agents: TagAgents,
     /// The order the user moves through, and each agent's place in it.
     order: BTreeMap<OrderKey, AgentId>,
@@ -505,18 +505,20 @@ impl AgentMap {
         let prefix = self
             .agent_identity(agent_id)
             .map(AgentIdentity::handle_prefix)
-            .unwrap_or("eng");
+            .unwrap_or("ag");
         let label = format!("{prefix}-{}", &agent_id.encoded()[..len]);
         match host.filter(|_| self.hosts.len() > 1) {
             Some(h) => format!("{}/{label}", self.host_name(h)),
             None => label,
         }
     }
-    /// Resolves a bare desk tag (`eng-x7y2`) to the unique matching agent on
+    /// Resolves a bare desk tag (`ag-x7y2`) to the unique matching agent on
     /// `host`. Prefixes written when the id space was smaller keep resolving
-    /// for as long as they stay unambiguous.
+    /// for as long as they stay unambiguous, and so do `eng-` tags, written
+    /// before agents were one kind.
     pub fn agent_by_tag(&self, host: HostId, label: &str) -> Option<AgentId> {
         let (role_prefix, encoded_prefix) = label.split_once('-')?;
+        let role_prefix = if role_prefix == "eng" { "ag" } else { role_prefix };
         let agents = self.tag_agents.get(&host)?.get(role_prefix)?;
         let start = agents.partition_point(|(encoded, _)| encoded.as_str() < encoded_prefix);
         let found = agents.get(start)?.1;
@@ -617,7 +619,7 @@ impl AgentMap {
         if identity.is_advisor() {
             "Advisor".into()
         } else {
-            "Engineer".into()
+            "Agent".into()
         }
     }
 
@@ -832,8 +834,8 @@ mod tests {
         assert_eq!(registry.agent_last_active(agent(1)), None);
     }
 
-    /// Labels read the preset: an advisor is `adv-`, anything else `eng-`,
-    /// and the label finds the agent again.
+    /// Labels read the preset: an advisor is `adv-`, anything else `ag-`,
+    /// and the label finds the agent again, also behind the old `eng-`.
     #[test]
     fn a_label_reads_the_preset() {
         let host = HostId::default();
@@ -847,9 +849,11 @@ mod tests {
             .props
             .insert(crate::fold::PRESET.into(), "advisor".into());
         map.told(vec![named(1, None, 1), advisor]);
-        let engineer = map.agent_id_label(agent(1));
+        let agent_label = map.agent_id_label(agent(1));
         let advisor = map.agent_id_label(agent(2));
-        assert!(engineer.starts_with("eng-"), "{engineer}");
+        assert!(agent_label.starts_with("ag-"), "{agent_label}");
+        let old_tag = agent_label.replacen("ag-", "eng-", 1);
+        assert_eq!(map.agent_by_tag(host, &old_tag), Some(agent(1)));
         assert!(advisor.starts_with("adv-"), "{advisor}");
         assert_eq!(map.agent_by_tag(host, &advisor), Some(agent(2)));
         assert_eq!(map.agent_human_name(agent(2)), "Advisor");

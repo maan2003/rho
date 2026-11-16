@@ -68,20 +68,22 @@ class Upgrade(WorksetCase):
         self.root = add_agent(state, native(), preset="engineer", cwd="/")
         self.child = add_agent(state, native(), preset="child", parent=self.root, cwd="/")
         self.owned = add_agent(state, native(), preset="engineer", started_by=self.root, cwd="/", origin="chat:7")
+        self.current = add_agent(state, native(), preset="agent", parent=self.root, cwd="/")
         self.advisor = add_agent(state, native(), preset="advisor", parent=self.root, cwd="/")
 
-    def test_boot_makes_every_stored_engineer_one_kind_started_by_its_parent(self):
+    def test_boot_makes_every_stored_engineer_an_agent_started_by_its_parent(self):
         props = {id: spec["props"] for id, spec in self.state.agents.items()}
-        self.assertEqual(props[self.child], {"preset": "engineer", "parent": self.root, "cwd": "/"})
-        self.assertEqual(props[self.owned], {"preset": "engineer", "parent": self.root, "cwd": "/", "origin": "chat:7"})
+        self.assertEqual(props[self.child], {"preset": "agent", "parent": self.root, "cwd": "/"})
+        self.assertEqual(props[self.owned], {"preset": "agent", "parent": self.root, "cwd": "/", "origin": "chat:7"})
+        self.assertEqual(props[self.root], {"preset": "agent", "cwd": "/"})
         # Agents already current stay as they were.
-        self.assertEqual(props[self.root], {"preset": "engineer", "cwd": "/"})
+        self.assertEqual(props[self.current], {"preset": "agent", "parent": self.root, "cwd": "/"})
         self.assertEqual(props[self.advisor], {"preset": "advisor", "parent": self.root, "cwd": "/"})
 
 
 class Hooks(WorksetCase):
     def seed(self, state):
-        self.id = add_agent(state, native(), preset="engineer", cwd="/")
+        self.id = add_agent(state, native(), preset="agent", cwd="/")
 
     def test_a_raising_hook_raises_in_the_caller_and_the_loop_lives_on(self):
         def broken(agent):
@@ -151,7 +153,7 @@ class Init(unittest.TestCase):
     def test_a_failing_init_reports_and_runs_nothing_more(self):
         ws = self.start(
             "import rho\nraise RuntimeError(\'bad init\')\n",
-            lambda state: add_agent(state, native(), preset="engineer", cwd="/"),
+            lambda state: add_agent(state, native(), preset="agent", cwd="/"),
         )
         [error] = ws.ready
         self.assertIn("init.py", error)

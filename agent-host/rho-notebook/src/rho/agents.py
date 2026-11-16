@@ -3,7 +3,7 @@
 import _rho
 
 #: The values the default policy gives the `preset` prop.
-PRESETS = ("engineer", "advisor")
+PRESETS = ("agent", "advisor")
 
 
 class Agent:
@@ -71,12 +71,12 @@ class Agent:
 
 
 def upgrade(agent: Agent) -> None:
-    """Bring props stored before every Engineer was one kind up to date:
-    a `child` is an Engineer, and the agent that started a user-owned
-    Engineer, `started_by`, is its `parent`."""
+    """Bring props stored before every agent but the Advisor was one kind
+    up to date: an `engineer` or a `child` is an `agent`, and the agent
+    that started a user-owned Engineer, `started_by`, is its `parent`."""
     props = dict(agent.props)
-    if props.get("preset") == "child":
-        props["preset"] = "engineer"
+    if props.get("preset") in ("engineer", "child"):
+        props["preset"] = "agent"
     if "started_by" in props:
         props.setdefault("parent", props.pop("started_by"))
         props.pop("started_by", None)

@@ -74,7 +74,7 @@ mod tests {
         let hit = hit(&registry, agent(), Some("mirror".to_owned()));
         assert_eq!(hit.title, "mirror");
         let label = registry.agent_id_label(agent());
-        assert!(label.starts_with("eng-"), "{label}");
+        assert!(label.starts_with("ag-"), "{label}");
         assert_eq!(hit.aka, vec![label]);
         assert_eq!(hit.recency, 7);
     }

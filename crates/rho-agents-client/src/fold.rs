@@ -63,12 +63,12 @@ impl AgentIdentity {
         self.parent().is_none()
     }
 
-    /// The prefix of the agent's label: `adv` for an advisor, `eng` for
+    /// The prefix of the agent's label: `adv` for an advisor, `ag` for
     /// everything else.
     pub fn handle_prefix(&self) -> &'static str {
         match self.prop(PRESET) {
             Some("advisor") => "adv",
-            _ => "eng",
+            _ => "ag",
         }
     }
 
@@ -1065,7 +1065,7 @@ mod tests {
         let bare = identity(&entry, WorksetKind::Isolated);
         assert_eq!(bare.name(), None);
         assert!(bare.user_facing(), "no agent made it");
-        assert_eq!(bare.handle_prefix(), "eng");
+        assert_eq!(bare.handle_prefix(), "ag");
         assert_eq!(bare.place().cwd, "/src");
         assert_eq!(bare.place().workset, Some(entry.workset));
 
