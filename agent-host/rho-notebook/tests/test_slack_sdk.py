@@ -79,7 +79,7 @@ class SlackSdkTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             fake = self.fake = FakeSlackServer(directory, replies, keep_alive)
             server = await asyncio.start_unix_server(fake.serve, fake.path)
-            with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+            with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                 async with server:
                     await body()
             return fake.requests

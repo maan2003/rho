@@ -58,7 +58,7 @@ def _client() -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
     client = _clients.get(loop)
     if client is None:
-        socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("notion.sock"))
+        socket = str(Path(os.environ["RHO_RUNTIME_DIR"]) / "notion.sock")
         client = _clients[loop] = httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=socket), base_url="http://notion", timeout=120
         )

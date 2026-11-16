@@ -58,7 +58,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_pr_update_routes_draft_separately_and_returns_refreshed_pr(self):
         from fastcore.all import UNSET
 
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             self.assertIn("draft", inspect.signature(api.pulls.update).parameters)
             request = AsyncMock()
@@ -112,7 +112,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.call_args.kwargs["json"], {"title": "Only metadata"})
 
     async def test_pr_update_validates_before_writes_and_stops_on_failure(self):
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             request = AsyncMock()
             api.transport.request = request
@@ -143,7 +143,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([c.args[0] for c in request.call_args_list], methods)
 
     async def test_pr_merge_methods_preserve_head_sha_and_merge_options(self):
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             request = AsyncMock(return_value={"merged": True})
             api.transport.request = request
@@ -165,7 +165,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(hasattr(api.pulls, name), name)
 
     async def test_expanded_collaboration_and_code_read_methods(self):
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             request = AsyncMock(return_value={"ok": True})
             api.transport.request = request
@@ -232,7 +232,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             video.write_bytes(b"\x00\x00\x00\x18ftypqt  \x00\xff")
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi("acme", "widget")
                         for path, overrides in (
@@ -274,7 +274,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             folder.mkdir()
             fifo = root / "pipe.png"
             os.mkfifo(fifo)
-            with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+            with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                 api = GhApi("acme", "widget")
                 request = AsyncMock()
                 api.transport.request = request
@@ -331,7 +331,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi()
                         for url, octo_path in (
@@ -383,7 +383,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
         from fastcore.all import UNSET
         from ghapi.core import _gh_override
 
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             no_owner = GhApi(repo="widget")
             request = AsyncMock(return_value={"number": 42})
@@ -439,7 +439,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_operation_keywords_and_mapping_fields_are_strict(self):
-        with patch.dict(os.environ, {"RHO_SOCKET_PATH": "/unused/rho.sock"}):
+        with patch.dict(os.environ, {"RHO_RUNTIME_DIR": "/unused"}):
             api = GhApi("acme", "widget")
             request = AsyncMock(return_value={"number": 42})
             api.transport.request = request
@@ -521,7 +521,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi("acme", "widget")
 
@@ -666,7 +666,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         limits = []
                         api = GhApi("acme", "widget", limit_cb=lambda remaining, quota: limits.append((remaining, quota)))
@@ -724,7 +724,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi("acme", "widget")
                         self.assertEqual(inspect.signature(api.pulls.list).parameters["sort"].default,
@@ -829,7 +829,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi("acme", "widget")
                         await api.pulls.update(17, title="New title", body="New description")
@@ -893,7 +893,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
 
             server = await asyncio.start_unix_server(serve, directory + "/octo.sock")
             try:
-                with patch.dict(os.environ, {"RHO_SOCKET_PATH": directory + "/rho.sock"}):
+                with patch.dict(os.environ, {"RHO_RUNTIME_DIR": directory}):
                     async with server:
                         api = GhApi("acme", "widget")
                         await api.pulls.list_files(17, per_page=20)

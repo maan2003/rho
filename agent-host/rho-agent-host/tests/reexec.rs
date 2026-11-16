@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let state_dir = tempfile::tempdir()?;
-    let socket_path = state_dir.path().join("rho.sock");
+    let runtime_dir = state_dir.path().join("runtime");
     // The rig's synthetic account: the fake model takes any token.
     let auth = state_dir.path().join("rho").join("auth.d");
     std::fs::create_dir_all(&auth)?;
@@ -53,8 +53,8 @@ fn main() -> anyhow::Result<()> {
     config.distribution.disconnect_bps = 0;
     let model = runtime.block_on(rho_fake_model::FakeModel::start(config))?;
     let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_rho-agent-host"))
-        .arg("--socket-path")
-        .arg(&socket_path)
+        .arg("--runtime-dir")
+        .arg(&runtime_dir)
         .arg("--claude-config-dir")
         .arg(state_dir.path().join("claude"))
         .args(["--openai-base-url", &model.openai_base_url()])
@@ -81,7 +81,7 @@ async fn work_outlives_reexec(
     state_dir: &std::path::Path,
     model: &rho_fake_model::FakeModel,
 ) -> anyhow::Result<()> {
-    let socket_path = &state_dir.join("rho.sock");
+    let paths = &rho_rpc::protocol::RuntimePaths::new(Some(state_dir.join("runtime")))?;
     let repo_temp = tempfile::tempdir()?;
     let repo_dir = repo_temp.path().join("repo");
     std::fs::create_dir(&repo_dir)?;
@@ -105,16 +105,16 @@ async fn work_outlives_reexec(
             .status()?;
         assert!(status.success());
     }
-    wait_for_socket(socket_path).await?;
+    wait_for_host(paths).await?;
     let agent_id = tokio::time::timeout(
         Duration::from_secs(60),
-        create_agent(socket_path, &repo_dir, None),
+        create_agent(paths, &repo_dir, None),
     )
     .await??;
 
     // State only the running shell holds: a variable, and a job that is
     // still sleeping when the agent host re-executes.
-    let mut stream = open_terminal(socket_path, agent_id, true).await?;
+    let mut stream = open_terminal(paths, agent_id, true).await?;
     // The terminal runs the user's login shell; speak bash whatever it is.
     write_frame(
         &mut stream,
@@ -138,7 +138,7 @@ async fn work_outlives_reexec(
 
     tokio::time::timeout(
         Duration::from_secs(60),
-        create_agent(socket_path, &repo_dir, Some("Run the rounds.")),
+        create_agent(paths, &repo_dir, Some("Run the rounds.")),
     )
     .await??;
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -166,11 +166,11 @@ async fn work_outlives_reexec(
         }
     })
     .await?;
-    wait_for_socket(socket_path).await?;
+    wait_for_host(paths).await?;
     let terminals = tokio::time::timeout(
         Duration::from_secs(30),
         rho_rpc::protocol::client::call(
-            socket_path,
+            paths,
             TerminalList {
                 agent: Some(agent_id.encoded()),
             },
@@ -182,7 +182,7 @@ async fn work_outlives_reexec(
 
     // The job finished on either side of the exec; the replayed screen or
     // what follows shows it.
-    let mut stream = open_terminal(socket_path, agent_id, false).await?;
+    let mut stream = open_terminal(paths, agent_id, false).await?;
     wait_for_line(&mut stream, "job-done").await?;
     write_frame(
         &mut stream,
@@ -216,7 +216,7 @@ async fn work_outlives_reexec(
     // host re-exec: discard this workset's live shell, preserve its saved
     // agent, and leave the other workset's process and files alone.
     rho_rpc::protocol::client::call(
-        socket_path,
+        paths,
         rho_agents_client::protocol::worksets::RestartWorkset { agent: agent_id },
     )
     .await?;
@@ -228,14 +228,14 @@ async fn work_outlives_reexec(
         "restart replaces only the selected workset process"
     );
     let terminals = rho_rpc::protocol::client::call(
-        socket_path,
+        paths,
         TerminalList {
             agent: Some(agent_id.encoded()),
         },
     )
     .await?;
     assert!(terminals.is_empty(), "restart ends live terminals");
-    let mut stream = open_terminal(socket_path, agent_id, true).await?;
+    let mut stream = open_terminal(paths, agent_id, true).await?;
     write_frame(
         &mut stream,
         &TermClientFrame::Input(b"exec bash --norc --noprofile\r".to_vec()),
@@ -269,10 +269,10 @@ fn rounds(dir: &std::path::Path) -> Option<usize> {
     None
 }
 
-async fn wait_for_socket(socket_path: &std::path::Path) -> anyhow::Result<()> {
+async fn wait_for_host(paths: &rho_rpc::protocol::RuntimePaths) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            match rho_rpc::connect_unix(socket_path).await {
+            match rho_rpc::protocol::client::connect(paths).await {
                 Ok(_) => return,
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
@@ -309,11 +309,11 @@ fn children(pid: u32) -> Vec<u32> {
 }
 
 async fn open_terminal(
-    socket_path: &std::path::Path,
+    paths: &rho_rpc::protocol::RuntimePaths,
     agent_id: AgentId,
     create: bool,
 ) -> anyhow::Result<rho_rpc::Stream> {
-    let mut stream = rho_rpc::connect_unix(socket_path).await?;
+    let mut stream = rho_rpc::protocol::client::connect(paths).await?;
     let open = term::Open::Terminal {
         agent: agent_id.encoded(),
         terminal_id: 7,
@@ -361,12 +361,12 @@ async fn wait_for_line(stream: &mut rho_rpc::Stream, needle: &str) -> anyhow::Re
 /// the default policy's `new_agent`, which prints its id. `message` is
 /// the user's first message to it, a new root thread.
 async fn create_agent(
-    socket_path: &std::path::Path,
+    paths: &rho_rpc::protocol::RuntimePaths,
     repo: &std::path::Path,
     message: Option<&str>,
 ) -> anyhow::Result<rho_agent_types::AgentId> {
     let created = rho_rpc::protocol::client::call(
-        socket_path,
+        paths,
         rho_agents_client::protocol::worksets::CreateWorkset {
             kind: rho_agent_types::WorksetKind::Isolated,
             code: format!(
@@ -384,7 +384,7 @@ async fn create_agent(
     let agent = rho_agent_types::AgentId::from_encoded(created.result.output.trim())?;
     if let Some(text) = message {
         rho_rpc::protocol::client::call(
-            socket_path,
+            paths,
             rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,

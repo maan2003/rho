@@ -1,9 +1,15 @@
-//! Compressed typed streams shared by Rho's Unix and iroh transports.
+//! Compressed typed streams over iroh, Rho's one transport.
 //!
 //! Every application direction is one long-lived zstd frame. Senax messages
 //! retain their bounded length prefix inside that compressed byte stream, so
 //! callers can switch to raw bytes after a typed handshake without changing
 //! compression layers.
+//!
+//! A peer on the same machine reaches the host over the IPC transport
+//! (`iroh-ipc-transport`): a Unix datagram socket as a native iroh path,
+//! found through the host's runtime directory ([`protocol::RuntimePaths`]).
+//! A connection that arrives on it is trusted as the user's own; every
+//! other one goes through the pairing exchange.
 //!
 //! [`protocol`] is what goes on those streams between a client and an agent
 //! host.
@@ -31,9 +37,6 @@ pub mod protocol;
 pub const ZSTD_WINDOW_LOG: u32 = 17;
 /// Fast, general-purpose compression for latency-sensitive application data.
 pub const ZSTD_LEVEL: i32 = 3;
-#[cfg(unix)]
-const UNIX_PREFACE: &[u8; 12] = b"RHO-STREAM-5";
-#[cfg(unix)]
 const PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(feature = "server")]
@@ -47,21 +50,102 @@ pub async fn bind_ephemeral_iroh_client() -> anyhow::Result<iroh::Endpoint> {
     bind_iroh_client(iroh::SecretKey::generate()).await
 }
 
-/// Binds a client endpoint with a caller-owned, stable identity.
+/// Binds a client endpoint with a caller-owned, stable identity. On a
+/// machine with a runtime directory it has the IPC transport too, so a host
+/// here is a socket away ([`connect_host`]).
 #[cfg(feature = "native-client")]
 pub async fn bind_iroh_client(secret: iroh::SecretKey) -> anyhow::Result<iroh::Endpoint> {
     install_crypto_provider()?;
-    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret.clone())
         .transport_config(
             iroh::endpoint::QuicTransportConfig::builder()
                 .max_concurrent_uni_streams(1024u32.into())
                 .qlog_from_env("rho-gui")
                 .build(),
-        )
-        .bind()
+        );
+    if let Some(directory) = client_ipc_dir() {
+        let transport = ipc_transport(directory, secret.public()).await?;
+        builder = builder
+            .add_custom_transport(std::sync::Arc::new(transport))
+            .path_selector(std::sync::Arc::new(iroh_ipc_transport::PreferIpcTransport));
+    }
+    builder.bind().await.context("bind iroh client endpoint")
+}
+
+/// Where this machine's clients keep their IPC sockets: beside the host's
+/// runtime directory, since the host sweeps only its own. `None` where the
+/// machine has no runtime directory; such a client reaches a host here
+/// over loopback like any other address.
+#[cfg(feature = "native-client")]
+fn client_ipc_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::runtime_dir()?.join("rho-client").join("ipc"))
+}
+
+/// Binds an IPC socket for `id` in `directory`, first clearing what peers
+/// that died left there.
+#[cfg(any(feature = "server", feature = "native-client"))]
+async fn ipc_transport(
+    directory: std::path::PathBuf,
+    id: iroh::EndpointId,
+) -> anyhow::Result<iroh_ipc_transport::IpcTransport> {
+    let discovery = iroh_ipc_transport::LocalDiscovery::new(&directory);
+    discovery
+        .sweep()
         .await
-        .context("bind iroh client endpoint")
+        .with_context(|| format!("sweep IPC records in {}", directory.display()))?;
+    iroh_ipc_transport::IpcTransport::prepare(discovery, id)
+        .await
+        .with_context(|| format!("bind IPC socket in {}", directory.display()))
+}
+
+/// The id of the host whose runtime directory this is, as it wrote it when
+/// it last bound. An error when no host has run there.
+#[cfg(feature = "native-client")]
+pub fn local_host(paths: &protocol::RuntimePaths) -> anyhow::Result<iroh::EndpointId> {
+    let file = paths.endpoint_file();
+    let text = std::fs::read_to_string(&file)
+        .with_context(|| format!("no agent host has run in {}", paths.directory().display()))?;
+    iroh::EndpointId::from_z32(text.trim())
+        .with_context(|| format!("{} does not hold an endpoint id", file.display()))
+}
+
+/// Connects to a host on the application ALPN. Through `local`, the host
+/// must be up on this machine: the connection goes over its IPC socket and
+/// nothing else, so the host trusts it as the user's own. Without it the
+/// host is dialed wherever it is, which is still the IPC socket when the
+/// host is in this machine's default runtime directory.
+#[cfg(feature = "native-client")]
+pub async fn connect_host(
+    endpoint: &iroh::Endpoint,
+    host: iroh::EndpointId,
+    alpn: &[u8],
+    local: Option<&protocol::RuntimePaths>,
+) -> anyhow::Result<iroh::endpoint::Connection> {
+    let target = match local {
+        Some(paths) => {
+            let discovery = iroh_ipc_transport::LocalDiscovery::new(paths.ipc_dir());
+            let addr = discovery
+                .resolve(host)
+                .await
+                .context("look the local agent host up")?
+                .with_context(|| {
+                    format!("no agent host runs in {}", paths.directory().display())
+                })?;
+            iroh::EndpointAddr::from_parts(host, [addr])
+        }
+        None => match protocol::RuntimePaths::from_env() {
+            Ok(paths) => iroh_ipc_transport::LocalDiscovery::new(paths.ipc_dir())
+                .resolve_target(iroh::EndpointAddr::new(host))
+                .await
+                .context("look the agent host up on this machine")?,
+            Err(_) => iroh::EndpointAddr::new(host),
+        },
+    };
+    endpoint
+        .connect(target, alpn)
+        .await
+        .context("connect to agent host over iroh")
 }
 
 /// Performs the mandatory raw, bounded authentication exchange before any
@@ -115,6 +199,8 @@ pub enum Accepted {
 #[cfg(feature = "server")]
 pub struct AuthenticatedIrohListener {
     endpoint: iroh::Endpoint,
+    /// The socket local peers reach the endpoint on; closed after it.
+    ipc: Option<iroh_ipc_transport::IpcTransport>,
     /// The application ALPN: the other one the endpoint serves is GCCP's.
     alpn: Vec<u8>,
     auth: rho_iroh_auth::IrohAuth,
@@ -128,16 +214,19 @@ pub struct AuthenticatedIrohListener {
 impl AuthenticatedIrohListener {
     /// Loads the persistent endpoint identity, configures the transport, and
     /// binds an authenticated listener for the supplied application ALPN,
-    /// and for `gccp_alpn`.
+    /// and for `gccp_alpn`. Local peers find it through `paths`: its IPC
+    /// socket is in there, and its id is written to the endpoint file.
     pub async fn bind(
         db: rho_db::RhoDb,
         alpn: impl Into<Vec<u8>>,
         gccp_alpn: impl Into<Vec<u8>>,
+        paths: &protocol::RuntimePaths,
     ) -> anyhow::Result<(Self, rho_iroh_auth::IrohAuth)> {
         let alpn = alpn.into();
         install_crypto_provider()?;
         let secret = load_or_create_server_secret(&db).await?;
         let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
+        let ipc = ipc_transport(paths.ipc_dir(), secret.public()).await?;
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(16u8.into())
             .qlog_from_env("rho-agent-host");
@@ -151,10 +240,17 @@ impl AuthenticatedIrohListener {
             .secret_key(secret)
             .transport_config(transport.build())
             .alpns(vec![alpn.clone(), gccp_alpn.into()])
+            .add_custom_transport(std::sync::Arc::new(ipc.clone()))
+            .path_selector(std::sync::Arc::new(iroh_ipc_transport::PreferIpcTransport))
             .bind()
             .await
             .context("bind authenticated iroh endpoint")?;
-        let listener = Self::new(endpoint, alpn, auth.clone(), 1024)?;
+        let file = paths.endpoint_file();
+        tokio::fs::write(&file, format!("{}\n", endpoint.id().to_z32()))
+            .await
+            .with_context(|| format!("write {}", file.display()))?;
+        let mut listener = Self::new(endpoint, alpn, auth.clone(), 1024)?;
+        listener.ipc = Some(ipc);
         Ok((listener, auth))
     }
 
@@ -174,6 +270,7 @@ impl AuthenticatedIrohListener {
         );
         Ok(Self {
             endpoint,
+            ipc: None,
             alpn,
             auth,
             enrollments: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
@@ -236,6 +333,11 @@ impl AuthenticatedIrohListener {
     pub async fn close(mut self) {
         self.endpoint.close().await;
         self.attempts.shutdown().await;
+        if let Some(ipc) = self.ipc.take()
+            && let Err(error) = ipc.close().await
+        {
+            eprintln!("rho-agent-host: IPC socket did not close cleanly: {error}");
+        }
     }
 }
 
@@ -303,6 +405,13 @@ async fn authenticate_incoming_iroh(
     enrollments: std::sync::Arc<tokio::sync::Semaphore>,
     approved_bi_streams: u32,
 ) -> anyhow::Result<Option<Accepted>> {
+    // Over the IPC socket, which only this user reaches: the user's own
+    // process, trusted as the Unix socket's callers were.
+    let local = matches!(
+        incoming.remote_addr(),
+        iroh::endpoint::IncomingAddr::Custom(addr)
+            if addr.id() == iroh_ipc_transport::IPC_TRANSPORT_ID
+    );
     let connection = incoming.await.context("accept iroh connection")?;
     // The handshake settles on an ALPN the endpoint serves, so any other
     // than the application's is GCCP's. A client is not a GCCP host: only
@@ -313,6 +422,9 @@ async fn authenticate_incoming_iroh(
         }
         connection.close(0u32.into(), b"");
         return Ok(None);
+    }
+    if local {
+        auth.trust_in_memory(connection.remote_id()).await;
     }
     let preapproved = auth.preapprove_endpoint(connection.remote_id()).await;
     let enrollment_permit = if preapproved.is_some() {
@@ -566,12 +678,10 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// A reusable way to open an application stream over any supported
-/// transport. Authentication and endpoint ownership remain with the caller.
+/// A reusable way to open an application stream to a host. Authentication
+/// and endpoint ownership remain with the caller.
 #[derive(Clone)]
 pub enum Dialer {
-    #[cfg(unix)]
-    Unix(std::path::PathBuf),
     Iroh {
         connection: iroh::endpoint::Connection,
         media: moq_tokio::shared_iroh::Mux,
@@ -585,8 +695,6 @@ pub enum Dialer {
 impl Dialer {
     pub async fn open(&self, priority: Option<i32>) -> anyhow::Result<Stream> {
         match self {
-            #[cfg(unix)]
-            Self::Unix(path) => connect_unix(path).await,
             Self::Iroh { connection, .. } => {
                 let (send, recv) = connection.open_bi().await.context("open iroh stream")?;
                 if let Some(priority) = priority {
@@ -610,46 +718,6 @@ impl Dialer {
 /// How much one direction of an in-process stream holds before its writer
 /// waits for the reader.
 const IN_PROCESS_BUFFER: usize = 1 << 20;
-
-/// Connects and version-negotiates a compressed Unix application stream.
-#[cfg(unix)]
-pub async fn connect_unix(path: impl AsRef<std::path::Path>) -> anyhow::Result<Stream> {
-    let path = path.as_ref();
-    let stream = tokio::net::UnixStream::connect(path)
-        .await
-        .with_context(|| format!("connect to {}", path.display()))?;
-    negotiate_unix(stream).await
-}
-
-/// Version-negotiates an already accepted Unix application stream.
-#[cfg(unix)]
-pub async fn accept_unix(stream: tokio::net::UnixStream) -> anyhow::Result<Stream> {
-    negotiate_unix(stream).await
-}
-
-#[cfg(unix)]
-async fn negotiate_unix(mut stream: tokio::net::UnixStream) -> anyhow::Result<Stream> {
-    tokio::time::timeout(PREFACE_TIMEOUT, async {
-        // Symmetric write-then-read avoids assigning protocol roles to socket
-        // halves while the tiny fixed preface cannot fill either send buffer.
-        stream
-            .write_all(UNIX_PREFACE)
-            .await
-            .context("write Unix stream preface")?;
-        stream.flush().await.context("flush Unix stream preface")?;
-        let mut peer = [0; UNIX_PREFACE.len()];
-        stream
-            .read_exact(&mut peer)
-            .await
-            .context("read Unix stream preface")?;
-        anyhow::ensure!(peer == *UNIX_PREFACE, "incompatible Rho stream protocol");
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("Unix stream preface timed out"))??;
-    let (reader, writer) = stream.into_split();
-    Ok(Stream::new(reader, writer))
-}
 
 /// Packs and writes one bounded, length-prefixed Senax frame. The returned
 /// length is the uncompressed payload length.

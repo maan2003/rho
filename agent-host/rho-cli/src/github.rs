@@ -7,19 +7,17 @@ use crate::{GithubArgs, GithubCommand, host_call};
 
 pub(crate) async fn run(args: GithubArgs) -> anyhow::Result<()> {
     match args.command {
-        GithubCommand::Init => init(args.socket_path).await,
+        GithubCommand::Init => init(args.runtime_dir).await,
     }
 }
 
-async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+async fn init(runtime_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let token = prompt_token("GitHub token (ghp_/github_pat_/...): ")?;
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(socket_path)?
-        .socket()
-        .to_owned();
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(runtime_dir)?;
     let call = PlatformSecretsSet {
         secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
     };
-    match host_call(&socket_path, call).await? {
+    match host_call(&paths, call).await? {
         PlatformStatus {
             running: true,
             detail,

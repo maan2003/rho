@@ -73,6 +73,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 moq-net.workspace = true
+rho-rpc = { workspace = true, features = ["server", "native-client"] }
 rho-fake-model.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 rho-shell.workspace = true

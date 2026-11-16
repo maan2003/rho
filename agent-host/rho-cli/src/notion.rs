@@ -5,13 +5,13 @@ use crate::{NotionArgs, NotionCommand, host_call};
 
 pub(crate) async fn run(args: NotionArgs) -> anyhow::Result<()> {
     match args.command {
-        NotionCommand::Init => init(args.socket_path).await,
-        NotionCommand::Root { page } => root(args.socket_path, page).await,
+        NotionCommand::Init => init(args.runtime_dir).await,
+        NotionCommand::Root { page } => root(args.runtime_dir, page).await,
     }
 }
 
 /// Signs this host in to Notion MCP as the user.
-async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+async fn init(runtime_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let client = notion_server::oauth::http_client();
     let endpoints = notion_server::Endpoints::notion();
     let pending = notion_server::oauth::begin(&client, &endpoints).await?;
@@ -26,7 +26,7 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let redirected = crate::github::prompt_token("Paste the address it shows: ")?;
     let grant = notion_server::oauth::finish(&client, &endpoints, pending, &redirected).await?;
     install(
-        socket_path,
+        runtime_dir,
         vec![
             (notion_server::CLIENT_ID.to_owned(), grant.client_id),
             (notion_server::REFRESH_TOKEN.to_owned(), grant.refresh_token),
@@ -39,26 +39,24 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 
 /// Names the page agents work under: they reach only it and the pages under
 /// it.
-async fn root(socket_path: Option<std::path::PathBuf>, page: String) -> anyhow::Result<()> {
+async fn root(runtime_dir: Option<std::path::PathBuf>, page: String) -> anyhow::Result<()> {
     anyhow::ensure!(
         notion_server::page_id(&page).is_some(),
         "not a Notion page URL or ID"
     );
     install(
-        socket_path,
+        runtime_dir,
         vec![(notion_server::ROOT_PAGE.to_owned(), page)],
     )
     .await
 }
 
 async fn install(
-    socket_path: Option<std::path::PathBuf>,
+    runtime_dir: Option<std::path::PathBuf>,
     secrets: Vec<(String, String)>,
 ) -> anyhow::Result<()> {
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(socket_path)?
-        .socket()
-        .to_owned();
-    match host_call(&socket_path, PlatformSecretsSet { secrets }).await? {
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(runtime_dir)?;
+    match host_call(&paths, PlatformSecretsSet { secrets }).await? {
         PlatformStatus {
             running: true,
             detail,

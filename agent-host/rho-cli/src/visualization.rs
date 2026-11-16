@@ -15,14 +15,12 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
         bail!("visualization is too large (maximum {MAX_VISUALIZATION_BYTES} bytes)");
     }
 
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
     let call = RecordVisualization {
         mime_type: SVG_MIME_TYPE.to_owned(),
         content,
     };
-    let id = host_call(&socket_path, call).await?;
+    let id = host_call(&paths, call).await?;
     println!("{id}");
     Ok(())
 }

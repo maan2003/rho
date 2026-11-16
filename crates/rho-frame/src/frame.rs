@@ -583,7 +583,7 @@ impl Frame {
         let mut rows = Rows::new("hosts");
         rows.push(Row::run("a", "attach", |frame, window, cx| {
             frame.open_prompt(
-                "attach host (name=unix:/path or name=iroh:...):",
+                "attach host (name=local[:dir] or name=iroh:...):",
                 Rc::new(|_, _, _| Vec::new()),
                 Rc::new(
                     |frame, input, _, cx| match HostSpec::parse(input.trim(), "rho") {

@@ -62,17 +62,15 @@ impl Remote {
 }
 
 async fn query_pat_available(host: &str) -> Result<bool> {
-    let socket = rho_rpc::protocol::RuntimePaths::from_env()?
-        .socket()
-        .to_owned();
+    let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
     rho_rpc::protocol::client::call(
-        &socket,
+        &paths,
         GitTransportPolicy {
             host: host.to_owned(),
         },
     )
     .await
-    .with_context(|| format!("ask the rho-agent-host at {}", socket.display()))
+    .with_context(|| format!("ask the rho-agent-host in {}", paths.directory().display()))
 }
 
 fn run_raw_remote_helper(remote_name: &str, mut remote: Remote) -> Result<()> {
@@ -195,12 +193,15 @@ fn parse_planned_refs(value: &str) -> Result<Vec<String>> {
 }
 
 async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
-    let socket = rho_rpc::protocol::RuntimePaths::from_env()?
-        .socket()
-        .to_owned();
-    let mut client = rho_rpc::protocol::client::Client::connect(&socket)
+    let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
+    let mut client = rho_rpc::protocol::client::Client::connect(&paths)
         .await
-        .with_context(|| format!("connect to rho-agent-host at {}", socket.display()))?;
+        .with_context(|| {
+            format!(
+                "connect to the rho-agent-host in {}",
+                paths.directory().display()
+            )
+        })?;
     client
         .open(&host::Open::GitTransport {
             request: request.clone(),

@@ -23,7 +23,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
     about = "Attach a native GUI to one or more running Rho agent hosts"
 )]
 struct Args {
-    /// Attach an agent host as `<name>=unix:<socket>` or
+    /// Attach an agent host as `<name>=local[:<runtime-dir>]` or
     /// `<name>=iroh:<endpoint-id>@<ssh-dest>`. Repeatable; the name labels
     /// the host's threads and agents once more than one is attached.
     /// Without it, the hosts attached when rho-gui last ran are attached

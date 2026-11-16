@@ -53,13 +53,13 @@ fn main() -> Result<()> {
         host.is_file(),
         "build rho-agent-host and rho-agent-worker first"
     );
-    let socket = temp.path().join("rho.sock");
+    let paths = rho_rpc::protocol::RuntimePaths::new(Some(temp.path().join("host")))?;
     let log = temp.path().join("agent-host.log");
     let out = std::fs::File::create(&log)?;
     let mut command = Command::new(&host);
     command
-        .args(["--iroh", "--socket-path"])
-        .arg(&socket)
+        .arg("--runtime-dir")
+        .arg(paths.directory())
         .arg("--claude-config-dir")
         .arg(temp.path().join("claude"))
         .arg("--extra-before-path")
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             let text=std::fs::read_to_string(&log)?;
             let endpoint=text.lines().find_map(|line|line.strip_prefix("rho-agent-host iroh endpoint: ")).map(str::to_owned);
             if let Some(endpoint)=endpoint
-                && let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
+                && let Ok(stream)=rho_rpc::protocol::client::connect(&paths).await { break (stream,endpoint); }
             ensure!(tokio::time::Instant::now()<deadline,"agent host startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
-        let agent=create_agent(&socket,&repo,None).await.context("agent creation failed")?;
+        let agent=create_agent(&paths,&repo,None).await.context("agent creation failed")?;
         let desktop_name = "preview".to_owned();
         let handle = rho_agent_types::AgentRole::default().full_handle(agent);
         let desktop_directory = runtime.join("rho-desktop/agents").join(&handle);
@@ -121,7 +121,7 @@ layout { background-color "#315b97"; }
         let endpoint:rho_agent_types::EndpointId=endpoint.parse().map_err(anyhow::Error::msg)?;
         let endpoint=iroh::EndpointId::from_bytes(&endpoint.0)?;
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
-        rho_rpc::protocol::client::call(&socket,host::IrohTrustInMemory {endpoint_id:rho_agent_types::EndpointId(*client.id().as_bytes()).to_string()}).await.context("trust")?;
+        rho_rpc::protocol::client::call(&paths,host::IrohTrustInMemory {endpoint_id:rho_agent_types::EndpointId(*client.id().as_bytes()).to_string()}).await.context("trust")?;
         let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_rpc::protocol::IROH_ALPN)).await??;
         ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id(),None).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());
@@ -235,7 +235,7 @@ layout { background-color "#315b97"; }
         }).await??;
         if let Some(path) = std::env::var_os("RHO_WAYLAND_TEST_PREVIEW") {
             std::fs::write(path, serde_json::to_vec(&serde_json::json!({
-                "endpoint":endpoint.to_string(),"agent":agent.encoded(),"socket":socket,"runtime":runtime
+                "endpoint":endpoint.to_string(),"agent":agent.encoded(),"runtime_dir":paths.directory(),"runtime":runtime
             }))?)?;
             tokio::signal::ctrl_c().await?;
         }
@@ -252,12 +252,12 @@ layout { background-color "#315b97"; }
 /// the default policy's `new_agent`, which prints its id. `message` is
 /// the user's first message to it, in a new topic.
 async fn create_agent(
-    socket_path: &std::path::Path,
+    paths: &rho_rpc::protocol::RuntimePaths,
     repo: &std::path::Path,
     message: Option<&str>,
 ) -> anyhow::Result<rho_agent_types::AgentId> {
     let created = rho_rpc::protocol::client::call(
-        socket_path,
+        paths,
         rho_agents_client::protocol::worksets::CreateWorkset {
             kind: rho_agent_types::WorksetKind::Isolated,
             code: format!(
@@ -275,7 +275,7 @@ async fn create_agent(
     let agent = rho_agent_types::AgentId::from_encoded(created.result.output.trim())?;
     if let Some(text) = message {
         rho_rpc::protocol::client::call(
-            socket_path,
+            paths,
             rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,

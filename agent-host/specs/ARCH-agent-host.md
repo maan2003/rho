@@ -123,7 +123,7 @@ reports by mail.
 An agent talks to an agent on another harness over GCCP
 ([docs/gccp.md](../../docs/gccp.md)). That is not chat: nothing of it is in the
 chat log and no client syncs it. An agent's address is the host's iroh endpoint
-id and the agent's id, so only a host that listens over iroh speaks GCCP. Trust
+id and the agent's id; every host listens over iroh, so every host speaks GCCP. Trust
 has two levels. The user approves a harness by its endpoint (`rho iroh approve
 --role gccp`). That approval is kept apart from the clients', and each lets an
 endpoint through on its own ALPN only, so a harness never gets what a client

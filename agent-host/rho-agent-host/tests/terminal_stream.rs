@@ -1,6 +1,6 @@
-//! End-to-end smoke test for terminal streams: a real agent host on a temp
-//! socket, an agent started on a clone of a temp git repository, a shell
-//! echoing through the dedicated stream, and a second attach after detach
+//! End-to-end smoke test for terminal streams: a real agent host in a temp
+//! runtime directory, an agent started on a clone of a temp git repository, a
+//! shell echoing through the dedicated stream, and a second attach after detach
 //! proving the terminal survived. Harness-free: the agent host's identity user
 //! namespace must precede every thread, including the test harness's.
 
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> anyhow::Result<()> {
-    let socket_path = state_dir.join("rho.sock");
+    let paths = rho_rpc::protocol::RuntimePaths::new(Some(state_dir.join("runtime")))?;
     // The agent starts on a clone of this repository. The clone takes its
     // name from the path, so it cannot be the dot-prefixed temporary
     // directory itself.
@@ -76,12 +76,11 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     }
 
     tokio::spawn(rho_agent_host::run(rho_agent_host::HostArgs {
-        socket_path: Some(socket_path.clone()),
+        runtime_dir: Some(paths.directory().to_owned()),
         // As with the state directory: the test's own, never the user's.
         claude_config_dir: Some(
             camino::Utf8PathBuf::from_path_buf(state_dir.join("claude")).unwrap(),
         ),
-        iroh: false,
         cpu_profile: None,
         openai_base_url: None,
         anthropic_base_url: None,
@@ -90,7 +89,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         handoff: None,
     }));
     loop {
-        match rho_rpc::connect_unix(&socket_path).await {
+        match rho_rpc::protocol::client::connect(&paths).await {
             Ok(_) => break,
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
@@ -99,17 +98,17 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     // Create an agent on a clone of the temp repository.
     let agent_id = tokio::time::timeout(
         Duration::from_secs(30),
-        create_agent(&socket_path, &repo_dir, None),
+        create_agent(&paths, &repo_dir, None),
     )
     .await??;
 
     // Attaching before anything was created must be refused.
-    let refused = open_terminal(&socket_path, agent_id, false).await;
+    let refused = open_terminal(&paths, agent_id, false).await;
     assert!(refused.is_err(), "attach without create must be refused");
 
     // Create + attach: run a command and watch its output (the needle appears
     // only after execution joins the quoted halves, in any shell).
-    let mut stream = open_terminal(&socket_path, agent_id, true).await?;
+    let mut stream = open_terminal(&paths, agent_id, true).await?;
     write_frame(
         &mut stream,
         &TermClientFrame::Input(b"echo \"e2\"\"e-done\"\r".to_vec()),
@@ -119,7 +118,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
 
     // The listing sees the running terminal.
     let list = rho_rpc::protocol::client::call(
-        &socket_path,
+        &paths,
         TerminalList {
             agent: Some(agent_id.encoded()),
         },
@@ -132,21 +131,21 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
 
     // Second attach after detach: the shell kept running, and the snapshot
     // replays the earlier output.
-    let mut stream = open_terminal(&socket_path, agent_id, false).await?;
+    let mut stream = open_terminal(&paths, agent_id, false).await?;
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // Creating the same id again must be refused.
-    let refused = open_terminal(&socket_path, agent_id, true).await;
+    let refused = open_terminal(&paths, agent_id, true).await;
     assert!(refused.is_err(), "duplicate create must be refused");
     Ok(())
 }
 
 async fn open_terminal(
-    socket_path: &std::path::Path,
+    paths: &rho_rpc::protocol::RuntimePaths,
     agent_id: AgentId,
     create: bool,
 ) -> anyhow::Result<rho_rpc::Stream> {
-    let mut stream = rho_rpc::connect_unix(socket_path).await?;
+    let mut stream = rho_rpc::protocol::client::connect(paths).await?;
     let open = term::Open::Terminal {
         agent: agent_id.encoded(),
         terminal_id: 7,
@@ -220,12 +219,12 @@ async fn wait_for_line(stream: &mut rho_rpc::Stream, needle: &str) -> anyhow::Re
 /// the default policy's `new_agent`, which prints its id. `message` is
 /// the user's first message to it, in a new topic.
 async fn create_agent(
-    socket_path: &std::path::Path,
+    paths: &rho_rpc::protocol::RuntimePaths,
     repo: &std::path::Path,
     message: Option<&str>,
 ) -> anyhow::Result<rho_agent_types::AgentId> {
     let created = rho_rpc::protocol::client::call(
-        socket_path,
+        paths,
         rho_agents_client::protocol::worksets::CreateWorkset {
             kind: rho_agent_types::WorksetKind::Isolated,
             code: format!(
@@ -243,7 +242,7 @@ async fn create_agent(
     let agent = rho_agent_types::AgentId::from_encoded(created.result.output.trim())?;
     if let Some(text) = message {
         rho_rpc::protocol::client::call(
-            socket_path,
+            paths,
             rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,

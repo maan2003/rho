@@ -97,13 +97,11 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
     }
 }
 
-/// Approves a pending iroh enrollment over the agent host's Unix socket, so
+/// Approves a pending iroh enrollment over the agent host's IPC socket, so
 /// trust decisions always come from a local user on the agent host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
-    let socket = &socket_path;
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
+    let socket = &paths;
     match args.command {
         IrohCommand::Approve {
             role: IrohRole::Client,
@@ -142,14 +140,12 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     Ok(())
 }
 
-/// What the user sees of GCCP, over the agent host's Unix socket: the hosts
+/// What the user sees of GCCP, over the agent host's IPC socket: the hosts
 /// approved with `rho iroh approve --role gccp`, and what agents accepted
 /// on them, which the user can take back.
 async fn run_gccp(args: GccpArgs) -> Result<()> {
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
-    let socket = &socket_path;
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
+    let socket = &paths;
     match args.command {
         GccpCommand::List => {
             let host::GccpState {
@@ -159,7 +155,7 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
             } = client::call(socket, host::GccpList).await?;
             match endpoint {
                 Some(endpoint) => println!("this host: {endpoint}"),
-                None => println!("this host has no iroh endpoint: start it with --iroh"),
+                None => println!("this host has no iroh endpoint yet"),
             }
             for host::GccpHost { endpoint, name } in hosts {
                 println!("approved host {endpoint}\t{name:?}");
@@ -189,22 +185,27 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
 
 /// One call of the agent host, starting the agent host if it is not running. A
 /// refusal is an error.
-pub(crate) async fn host_call<C: Call>(socket_path: &std::path::Path, call: C) -> Result<C::Reply> {
-    let mut agent_host = connect_or_start_host(socket_path).await?;
+pub(crate) async fn host_call<C: Call>(
+    paths: &rho_rpc::protocol::RuntimePaths,
+    call: C,
+) -> Result<C::Reply> {
+    let mut agent_host = connect_or_start_host(paths).await?;
     agent_host.open(&call.open()).await?;
     agent_host.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
-pub(crate) async fn connect_or_start_host(socket_path: &std::path::Path) -> Result<UiClient> {
-    if let Ok(client) = UiClient::connect(socket_path).await {
+pub(crate) async fn connect_or_start_host(
+    paths: &rho_rpc::protocol::RuntimePaths,
+) -> Result<UiClient> {
+    if let Ok(client) = UiClient::connect(paths).await {
         return Ok(client);
     }
 
     // The host is its own binary, installed beside this one.
     let host = std::env::current_exe()?.with_file_name("rho-agent-host");
     std::process::Command::new(host)
-        .arg("--socket-path")
-        .arg(socket_path)
+        .arg("--runtime-dir")
+        .arg(paths.directory())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -212,7 +213,7 @@ pub(crate) async fn connect_or_start_host(socket_path: &std::path::Path) -> Resu
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match UiClient::connect(socket_path).await {
+        match UiClient::connect(paths).await {
             Ok(client) => return Ok(client),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
@@ -286,8 +287,8 @@ enum CliCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct ClaudeAccountArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: ClaudeAccountCommand,
 }
@@ -308,14 +309,12 @@ pub(crate) enum ClaudeAccountCommand {
 /// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
     let list = match &args.command {
-        ClaudeAccountCommand::List => host_call(&socket_path, agents::ClaudeAccounts).await?,
+        ClaudeAccountCommand::List => host_call(&paths, agents::ClaudeAccounts).await?,
         ClaudeAccountCommand::Use { name } => {
             let call = agents::SetClaudeAccount { name: name.clone() };
-            host_call(&socket_path, call).await?
+            host_call(&paths, call).await?
         }
         ClaudeAccountCommand::Login { name } => {
             let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
@@ -337,8 +336,8 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct IrohArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: IrohCommand,
 }
@@ -375,8 +374,8 @@ pub(crate) enum IrohRole {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct GccpArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: GccpCommand,
 }
@@ -398,16 +397,16 @@ pub(crate) enum GccpCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct GithubArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: GithubCommand,
 }
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct SlackArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: SlackCommand,
 }
@@ -423,8 +422,8 @@ pub(crate) enum SlackCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct NotionArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: NotionCommand,
 }
@@ -443,8 +442,8 @@ pub(crate) enum NotionCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct RecordVisualizationArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Subcommand)]

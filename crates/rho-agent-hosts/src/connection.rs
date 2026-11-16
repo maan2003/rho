@@ -109,9 +109,9 @@ pub enum GitApprovalDecision {
     Done,
 }
 
-/// How to dial an extra workspace-file stream to the agent host: locally a
-/// second Unix connection, remotely another bi-stream on the already
-/// authenticated iroh connection. Set by the IO task once connected.
+/// How to dial another stream to the agent host: another bi-stream on the
+/// already authenticated iroh connection. Set by the IO task once
+/// connected.
 pub(crate) type ChannelDialer = rho_rpc::Dialer;
 
 /// One call of the machine on a stream of its own. A refusal is an error.
@@ -352,34 +352,22 @@ async fn run(
 ) -> anyhow::Result<()> {
     // Held for the whole connection: the endpoint is what the iroh
     // connection runs on.
-    let (health_connection, _endpoint, reached) = match target {
-        AttachTarget::Unix(socket_path) => {
-            // Reaching the socket is what being connected means here. Each
-            // stream dials it afresh; the one that reached it carries the
-            // Git provider.
-            let reached = rho_rpc::connect_unix(&socket_path)
-                .await
-                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-            *dialer.lock().unwrap() = Some(ChannelDialer::Unix(socket_path));
-            (None, None, Some(reached))
-        }
+    let (connection, _endpoint) = match target {
+        AttachTarget::Local { runtime_dir } => connect_local(&runtime_dir).await?,
         AttachTarget::Iroh {
             endpoint_id,
             access,
-        } => {
-            let (connection, endpoint) = connect_iroh(endpoint_id, &access, events).await?;
-            let media = rho_rpc::media::Mux::new(connection.clone());
-            let uni = media.clone();
-            tokio::spawn(async move { uni.receive_uni().await });
-            let bi = media.clone();
-            tokio::spawn(async move { bi.receive_bi().await });
-            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh {
-                connection: connection.clone(),
-                media,
-            });
-            (Some(connection), Some(endpoint), None)
-        }
+        } => connect_iroh(endpoint_id, &access, events).await?,
     };
+    let media = rho_rpc::media::Mux::new(connection.clone());
+    let uni = media.clone();
+    tokio::spawn(async move { uni.receive_uni().await });
+    let bi = media.clone();
+    tokio::spawn(async move { bi.receive_bi().await });
+    *dialer.lock().unwrap() = Some(ChannelDialer::Iroh {
+        connection: connection.clone(),
+        media,
+    });
     if events.unbounded_send(ConnEvent::Ready).is_err() {
         return Ok(());
     }
@@ -402,11 +390,11 @@ async fn run(
         stream_tasks.spawn(async move { (name, run.await) });
     }
     stream_tasks.spawn(
-        provide_git_transport(streams_dialer, reached, events.clone())
+        provide_git_transport(streams_dialer, events.clone())
             .map(|result| ("Git provider", result)),
     );
 
-    let health_task = health_connection.map(|connection| {
+    let health_task = {
         let events = events.clone();
         tokio::spawn(async move {
             const RECOVERY_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
@@ -438,14 +426,12 @@ async fn run(
                 }
             }
         })
-    });
+    };
 
     let ended = stream_tasks.join_next().await;
     abort_tasks(&mut stream_tasks).await;
-    if let Some(task) = health_task {
-        task.abort();
-        let _ = task.await;
-    }
+    health_task.abort();
+    let _ = health_task.await;
     Err(match ended {
         Some(Ok((name, Ok(())))) => anyhow::anyhow!("agent host {name} stream closed"),
         Some(Ok((name, Err(error)))) => error.context(format!("agent host {name} stream")),
@@ -456,17 +442,9 @@ async fn run(
 
 /// Carries SSH Git transport for the host's Git remote helpers, for as
 /// long as the connection lasts: this GUI holds the credentials. One
-/// transport runs at a time; each waits for its approval first. Runs on
-/// `reached` if the connection already has a stream to spare.
-async fn provide_git_transport(
-    dialer: ChannelDialer,
-    reached: Option<rho_rpc::Stream>,
-    events: EventSink,
-) -> anyhow::Result<()> {
-    let mut stream = match reached {
-        Some(stream) => stream,
-        None => dialer.open(Some(1)).await?,
-    };
+/// transport runs at a time; each waits for its approval first.
+async fn provide_git_transport(dialer: ChannelDialer, events: EventSink) -> anyhow::Result<()> {
+    let mut stream = dialer.open(Some(1)).await?;
     write_open(&mut stream, &HostOpen::GitProvider).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
     let requests = Arc::new(Mutex::new(
@@ -865,6 +843,22 @@ impl std::fmt::Display for EnrollmentPending {
 }
 impl std::error::Error for EnrollmentPending {}
 
+/// The host in `runtime_dir`, over its IPC socket: the way it knows this
+/// process is the user's own.
+async fn connect_local(
+    runtime_dir: &std::path::Path,
+) -> anyhow::Result<(iroh::endpoint::Connection, iroh::Endpoint)> {
+    let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime_dir))?;
+    let host = rho_rpc::local_host(&paths)?;
+    let endpoint = client_endpoint().await?;
+    let connection =
+        rho_rpc::connect_host(&endpoint, host, rho_rpc::protocol::IROH_ALPN, Some(&paths)).await?;
+    match rho_rpc::authenticate_iroh_client(&connection, endpoint.id(), None).await? {
+        rho_iroh_auth::ClientAuthResult::Approved => Ok((connection, endpoint)),
+        other => anyhow::bail!("the local agent host did not trust this process: {other:?}"),
+    }
+}
+
 async fn connect_iroh(
     host_id: iroh::EndpointId,
     access: &IrohAccess,
@@ -895,10 +889,8 @@ async fn connect_iroh(
         IrohAccess::Link { key } => Some(key),
         _ => None,
     };
-    let connection = endpoint
-        .connect(host_id, rho_rpc::protocol::IROH_ALPN)
-        .await
-        .context("connect to agent host over iroh")?;
+    let connection =
+        rho_rpc::connect_host(&endpoint, host_id, rho_rpc::protocol::IROH_ALPN, None).await?;
     match rho_rpc::authenticate_iroh_client(&connection, endpoint.id(), pairing).await? {
         rho_iroh_auth::ClientAuthResult::Approved => {}
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code)
@@ -990,7 +982,7 @@ mod shutdown_tests {
     /// shutting down panics in tokio's timer, which is what a real quit was
     /// doing on a worker thread.
     ///
-    /// The dial fails at once (nothing listens on the path), so the loop is
+    /// The dial fails at once (no host ever ran there), so the loop is
     /// in the delay within a few milliseconds; `close` has to bring it out
     /// well before the 500ms that delay would otherwise take.
     #[test]
@@ -1000,14 +992,14 @@ mod shutdown_tests {
             .build()
             .unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("nothing.sock");
+        let runtime_dir = directory.path().join("nothing");
 
         let events = EventSink {
             host: crate::HostId(0),
             events: Arc::new(Listening),
         };
         let supervisor = supervise(
-            crate::AttachTarget::Unix(socket),
+            crate::AttachTarget::Local { runtime_dir },
             events,
             Vec::new(),
             Arc::new(Mutex::new(None)),

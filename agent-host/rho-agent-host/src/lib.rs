@@ -17,7 +17,6 @@ use rho_agent_types::{AgentId, ContentPart};
 use rho_agents_client::protocol::AuthState;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
-use rho_rpc::protocol::server::{Server, ServerConnection};
 use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
@@ -323,7 +322,6 @@ fn lock_runtime_directory(
 
 struct RuntimeSockets {
     paths: rho_rpc::protocol::RuntimePaths,
-    server: Server,
     _lock: std::fs::File,
 }
 
@@ -388,17 +386,19 @@ fn spawn_notion_server(listener: tokio::net::UnixListener, secrets: PlatformSecr
     });
 }
 
+/// The runtime directory, locked, with the proxies agents use listening in
+/// it. The host itself listens over iroh; its IPC socket joins the
+/// directory when the endpoint binds.
 fn start_runtime_sockets(
-    socket_path: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<RuntimeSockets> {
-    let paths = rho_rpc::protocol::RuntimePaths::new(socket_path)?;
+    let paths = rho_rpc::protocol::RuntimePaths::new(runtime_dir)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
     let slack_socket = paths.slack_socket();
     let notion_socket = paths.notion_socket();
-    prepare_socket_path(paths.socket(), "rho-agent-host")?;
     prepare_socket_path(&octo_socket, "octo")?;
     prepare_socket_path(&slack_socket, "slack")?;
     prepare_socket_path(&notion_socket, "notion")?;
@@ -408,16 +408,10 @@ fn start_runtime_sockets(
         .with_context(|| format!("bind slack socket {}", slack_socket.display()))?;
     let notion_listener = tokio::net::UnixListener::bind(&notion_socket)
         .with_context(|| format!("bind notion socket {}", notion_socket.display()))?;
-    let listener = tokio::net::UnixListener::bind(paths.socket())
-        .with_context(|| format!("bind rho-agent-host socket {}", paths.socket().display()))?;
     spawn_octo_server(octo_listener, secrets.clone())?;
     spawn_slack_server(slack_listener, secrets.clone())?;
     spawn_notion_server(notion_listener, secrets);
-    Ok(RuntimeSockets {
-        paths,
-        server: Server::from_listener(listener),
-        _lock: lock,
-    })
+    Ok(RuntimeSockets { paths, _lock: lock })
 }
 
 pub use rho_fs_view::PathOverrides;
@@ -484,15 +478,16 @@ pub struct HostArgs {
     /// A predecessor's handoff; see [`take_handoff`].
     #[arg(skip)]
     pub handoff: Option<String>,
-    #[arg(long = "socket-path")]
-    pub socket_path: Option<PathBuf>,
-    /// Also listen for remote UI clients over iroh (relay-backed).
-    /// Remote clients must be enrolled once via
-    /// `rho iroh approve --role client <code>` on this machine. The same
-    /// endpoint gives agents their GCCP addresses, where agents of hosts
-    /// approved with `--role gccp` reach them.
-    #[arg(long = "iroh")]
-    pub iroh: bool,
+    /// Where local peers find this host and where the proxies agents use
+    /// listen; `$XDG_RUNTIME_DIR/rho` by default. The host listens over
+    /// iroh: a peer on this machine reaches it through the IPC socket here
+    /// and is trusted; a remote one is enrolled once with
+    /// `rho iroh approve --role client <code>` on this machine, or pairs
+    /// with the link `rho` prints. The same endpoint gives agents their
+    /// GCCP addresses, where agents of hosts approved with `--role gccp`
+    /// reach them.
+    #[arg(long = "runtime-dir")]
+    pub runtime_dir: Option<PathBuf>,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
@@ -589,7 +584,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         Some(fd) => PlatformSecrets::handed(fd)?,
         None => PlatformSecrets::from_fd_store(),
     };
-    let runtime = start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
+    let runtime = start_runtime_sockets(args.runtime_dir, platform_secrets.clone())?;
 
     // The agent host's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
@@ -621,8 +616,8 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let mut user_environment = login_environment()?;
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
-        rho_rpc::protocol::RuntimePaths::SOCKET_ENV.into(),
-        runtime.paths.socket().as_os_str().to_owned(),
+        rho_rpc::protocol::RuntimePaths::RUNTIME_DIR_ENV.into(),
+        runtime.paths.directory().as_os_str().to_owned(),
     ));
     // A login shell may carry GitHub credentials and gh configuration.
     // Agents use only Octo's host-held token.
@@ -694,24 +689,19 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     };
     phases.mark("worksets");
     run_devshell_daemon(&worksets);
-    let iroh = if args.iroh {
-        let (listener, auth) = rho_rpc::AuthenticatedIrohListener::bind(
-            db.clone(),
-            rho_rpc::protocol::IROH_ALPN,
-            gccp::ALPN,
-        )
-        .await?;
-        eprintln!(
-            "rho-agent-host iroh endpoint: {}",
-            rho_agent_types::EndpointId(*listener.endpoint_id().as_bytes())
-        );
-        phases.mark("iroh");
-        Some((listener, auth))
-    } else {
-        None
-    };
+    let (listener, iroh_auth) = rho_rpc::AuthenticatedIrohListener::bind(
+        db.clone(),
+        rho_rpc::protocol::IROH_ALPN,
+        gccp::ALPN,
+        &runtime.paths,
+    )
+    .await?;
+    eprintln!(
+        "rho-agent-host iroh endpoint: {}",
+        rho_agent_types::EndpointId(*listener.endpoint_id().as_bytes())
+    );
+    phases.mark("iroh");
 
-    let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
     // The user's policy, read by each workset process at its start
     // (ARCH-agent-host). Resolved here, like the state directory.
     let init = dirs::config_dir()
@@ -725,11 +715,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     )
     .await;
     // Before any workset runs: its agents' addresses are on this endpoint.
-    if let Some((listener, _)) = &iroh {
-        pool.set_endpoint(rho_agent_types::EndpointId(
-            *listener.endpoint_id().as_bytes(),
-        ));
-    }
+    pool.set_endpoint(rho_agent_types::EndpointId(
+        *listener.endpoint_id().as_bytes(),
+    ));
     if let Some(handoff) = handoff {
         pool.adopt(handoff.workers).await;
         phases.mark("adopt");
@@ -788,8 +776,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             (shutdown, task)
         }
     };
-    let iroh_enabled = iroh.is_some();
-    let mut iroh_listener = iroh.map(|(listener, _)| start_iroh(listener));
+    let mut iroh_listener = Some(start_iroh(listener));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut upgrade = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
@@ -807,11 +794,12 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             _ = upgrade.recv() => {
                 let error = reexec(&services, &mut iroh_listener).await;
                 eprintln!("rho-agent-host: re-exec failed, carrying on: {error:#}");
-                if iroh_enabled && iroh_listener.is_none() {
+                if iroh_listener.is_none() {
                     match rho_rpc::AuthenticatedIrohListener::bind(
                         services.db.clone(),
                         rho_rpc::protocol::IROH_ALPN,
                         gccp::ALPN,
+                        &runtime.paths,
                     )
                     .await
                     {
@@ -825,16 +813,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                 break;
             }
             () = services.stop.notified() => break,
-            connection = runtime.server.accept() => {
-                let connection = connection?;
-                let services = services.clone();
-                let iroh_auth = iroh_auth.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_connection(services, iroh_auth, connection).await {
-                        eprintln!("rho-agent-host connection error: {error:#}");
-                    }
-                });
-            }
         }
     }
     if let Some((shutdown, listener)) = iroh_listener.take() {
@@ -934,7 +912,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 async fn run_iroh_listener(
     services: Arc<Services>,
     mut listener: rho_rpc::AuthenticatedIrohListener,
-    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    iroh_auth: rho_iroh_auth::IrohAuth,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     // What agents send other harnesses leaves by this endpoint, so they see
@@ -1300,28 +1278,11 @@ impl Services {
     }
 }
 
-async fn serve_connection(
-    services: Arc<Services>,
-    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
-    connection: ServerConnection,
-) -> anyhow::Result<()> {
-    let stream = connection.into_stream();
-    let (mut reader, writer) = stream.into_split();
-    let open = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        read_frame::<_, Open>(&mut reader),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??;
-    serve_stream(services, iroh_auth, open, reader, writer).await
-}
-
-/// One stream over any framed byte stream (a Unix socket connection or an
-/// iroh bi-stream from an enrolled remote client), serving what its first
-/// frame opened.
+/// One stream over any framed byte stream (an iroh bi-stream from a peer
+/// the host trusts), serving what its first frame opened.
 async fn serve_stream<R, W>(
     services: Arc<Services>,
-    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    iroh_auth: rho_iroh_auth::IrohAuth,
     open: Open,
     reader: R,
     writer: W,
@@ -1529,16 +1490,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_socket_keeps_runtime_files_beside_it() {
+    async fn an_explicit_runtime_directory_holds_the_runtime_files() {
         let runtime = tempfile::tempdir().unwrap();
-        let sockets = start_runtime_sockets(
-            Some(runtime.path().join("qa/rho.sock")),
-            PlatformSecrets::default(),
-        )
-        .unwrap();
+        let sockets =
+            start_runtime_sockets(Some(runtime.path().join("qa")), PlatformSecrets::default())
+                .unwrap();
         let paths = &sockets.paths;
 
-        assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
         assert!(paths.slack_socket().exists());
         assert!(paths.notion_socket().exists());
@@ -1557,14 +1515,13 @@ mod tests {
     #[tokio::test]
     async fn second_host_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths =
-            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime.path())).unwrap();
         let first =
-            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+            start_runtime_sockets(Some(runtime.path().to_owned()), PlatformSecrets::default())
                 .unwrap();
 
         let error = match start_runtime_sockets(
-            Some(paths.socket().to_owned()),
+            Some(runtime.path().to_owned()),
             PlatformSecrets::default(),
         ) {
             Ok(_) => panic!("second agent host acquired the runtime directory"),
@@ -1586,16 +1543,13 @@ mod tests {
     #[tokio::test]
     async fn stale_socket_files_are_removed_and_rebound() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths =
-            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
-        drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
+        let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime.path())).unwrap();
         drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
 
         let sockets =
-            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+            start_runtime_sockets(Some(runtime.path().to_owned()), PlatformSecrets::default())
                 .unwrap();
 
-        assert!(std::os::unix::net::UnixStream::connect(paths.socket()).is_ok());
         assert!(std::os::unix::net::UnixStream::connect(paths.octo_socket()).is_ok());
         drop(sockets);
     }
@@ -1603,10 +1557,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths =
-            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime.path())).unwrap();
         let sockets =
-            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+            start_runtime_sockets(Some(runtime.path().to_owned()), PlatformSecrets::default())
                 .unwrap();
         let contender = std::fs::OpenOptions::new()
             .read(true)

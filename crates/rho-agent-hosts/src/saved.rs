@@ -32,8 +32,13 @@ struct SavedHost {
 /// rather than a file that will not open.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 enum SavedTarget {
+    /// A local host by its socket, from before the IPC transport: read as
+    /// the runtime directory the socket was in (`temp-migration`).
     Unix {
         path: String,
+    },
+    Local {
+        runtime_dir: String,
     },
     Iroh {
         endpoint_id: String,
@@ -48,8 +53,8 @@ enum SavedTarget {
 impl SavedHost {
     fn from_spec(spec: &HostSpec) -> Self {
         let target = match &spec.target {
-            AttachTarget::Unix(path) => SavedTarget::Unix {
-                path: path.to_string_lossy().into_owned(),
+            AttachTarget::Local { runtime_dir } => SavedTarget::Local {
+                runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             },
             AttachTarget::Iroh {
                 endpoint_id,
@@ -77,7 +82,15 @@ impl SavedHost {
 
     fn into_spec(self) -> Result<HostSpec, String> {
         let target = match self.target {
-            SavedTarget::Unix { path } => AttachTarget::Unix(std::path::PathBuf::from(path)),
+            SavedTarget::Unix { path } => AttachTarget::Local {
+                runtime_dir: std::path::Path::new(&path)
+                    .parent()
+                    .ok_or_else(|| format!("socket {path} has no directory"))?
+                    .to_owned(),
+            },
+            SavedTarget::Local { runtime_dir } => AttachTarget::Local {
+                runtime_dir: std::path::PathBuf::from(runtime_dir),
+            },
             SavedTarget::Iroh {
                 endpoint_id,
                 ssh_destination,
@@ -192,7 +205,7 @@ mod tests {
 
     fn describe(spec: &HostSpec) -> String {
         let target = match &spec.target {
-            AttachTarget::Unix(path) => format!("unix:{}", path.display()),
+            AttachTarget::Local { runtime_dir } => format!("local:{}", runtime_dir.display()),
             AttachTarget::Iroh {
                 endpoint_id,
                 access,
@@ -237,7 +250,9 @@ mod tests {
             },
             HostSpec {
                 name: "local".to_owned(),
-                target: AttachTarget::Unix("/run/user/1000/rho/rho.sock".into()),
+                target: AttachTarget::Local {
+                    runtime_dir: "/run/user/1000/rho".into(),
+                },
             },
         ];
         save(&db, &specs);
@@ -280,6 +295,31 @@ mod tests {
         assert_eq!(
             loaded.iter().map(describe).collect::<Vec<_>>(),
             [format!("m2sh=iroh:{endpoint_id} via security key")]
+        );
+    }
+
+    /// A host saved by its socket comes back as the directory the socket
+    /// was in (`temp-migration`).
+    #[test]
+    fn a_socket_row_is_read_as_its_runtime_directory() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(db_dir.path()).unwrap();
+        let old = SavedHosts {
+            hosts: vec![SavedHost {
+                name: "here".into(),
+                target: SavedTarget::Unix {
+                    path: "/run/user/1000/rho/rho.sock".into(),
+                },
+            }],
+        };
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            write.open_table(SAVED).insert((), SenValue::borrowed(&old));
+            write.commit();
+        });
+        assert_eq!(
+            load(&db).iter().map(describe).collect::<Vec<_>>(),
+            ["here=local:/run/user/1000/rho"]
         );
     }
 

@@ -19,7 +19,7 @@ use crate::{GitProviderClaim, Services, debug};
 /// Serves one host stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
     services: Arc<Services>,
-    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    iroh_auth: rho_iroh_auth::IrohAuth,
     open: Open,
     reader: R,
     mut writer: W,
@@ -30,9 +30,7 @@ where
 {
     match open {
         Open::GitProvider => serve_git_provider(services, reader, writer).await,
-        Open::Request(request) => {
-            serve_call(&services, iroh_auth.as_ref(), request, &mut writer).await
-        }
+        Open::Request(request) => serve_call(&services, &iroh_auth, request, &mut writer).await,
         Open::GitTransport { request } => {
             serve_git_transport_request(services, reader, writer, request).await
         }
@@ -155,14 +153,13 @@ where
 /// One call stream's call.
 async fn serve_call<W>(
     services: &Arc<Services>,
-    iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
+    iroh_auth: &rho_iroh_auth::IrohAuth,
     request: Request,
     writer: &mut W,
 ) -> anyhow::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let iroh = || iroh_auth.context("agent host is not listening over iroh (start it with --iroh)");
     match request {
         Request::GitTransportPolicy(call) => {
             respond(writer, call, |GitTransportPolicy { host }| async move {
@@ -216,7 +213,7 @@ where
         }
         Request::IrohApprove(call) => {
             respond(writer, call, |IrohApprove { code }| async move {
-                let auth = iroh()?;
+                let auth = iroh_auth;
                 let code = code
                     .parse::<rho_iroh_auth::EnrollmentCode>()
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -233,7 +230,7 @@ where
                 writer,
                 call,
                 |IrohTrustInMemory { endpoint_id }| async move {
-                    let auth = iroh()?;
+                    let auth = iroh_auth;
                     let endpoint_id = iroh_endpoint(&endpoint_id)?;
                     auth.trust_in_memory(endpoint_id).await;
                     Ok(())
@@ -243,7 +240,7 @@ where
         }
         Request::IrohPair(call) => {
             respond(writer, call, |IrohPair| async move {
-                let auth = iroh()?;
+                let auth = iroh_auth;
                 let link = rho_iroh_auth::PairingLink {
                     endpoint_id: auth.server_endpoint_id(),
                     key: auth.mint_pairing_key().await,
@@ -254,7 +251,7 @@ where
         }
         Request::IrohRevoke(call) => {
             respond(writer, call, |IrohRevoke { endpoint_id }| async move {
-                let auth = iroh()?;
+                let auth = iroh_auth;
                 let endpoint_id = iroh_endpoint(&endpoint_id)?;
                 // Whatever the endpoint was approved as.
                 let client = auth.revoke(endpoint_id).await;
@@ -293,8 +290,6 @@ where
         }
         Request::GccpApprove(call) => {
             respond(writer, call, |GccpApprove { endpoint, name }| async move {
-                // A host without an endpoint speaks no GCCP.
-                iroh()?;
                 services
                     .pool
                     .gccp_approve(gccp_endpoint(&endpoint)?, &name)

@@ -7649,6 +7649,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-ipc-transport"
+version = "1.1.1"
+dependencies = [
+ "fs2",
+ "iroh",
+ "iroh-base",
+ "n0-future",
+ "n0-watcher",
+ "noq-udp",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iroh-metrics"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14484,6 +14500,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "iroh",
+ "iroh-ipc-transport",
  "moq-tokio",
  "noq-proto",
  "redb",

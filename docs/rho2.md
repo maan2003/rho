@@ -164,6 +164,14 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
   `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate
   owns are Linked Specs beside their crates.
+- iroh is the one transport. A host always binds its endpoint; a peer on
+  the same machine reaches it over the IPC transport
+  (`vendor/iroh-ipc-transport`): a Unix datagram socket as a native iroh
+  path, found through the host's runtime directory (`--runtime-dir`,
+  `$XDG_RUNTIME_DIR/rho` by default). A connection that arrives on it is
+  trusted as the user's own; every other one pairs. The GUI attaches a
+  local host as `<name>=local[:<runtime-dir>]`; the `rho` CLI reaches
+  the host the same way. There is no Unix stream socket and no `--iroh`.
 - A host is named by its iroh endpoint key, which both sessions' `Hello`
   carry: `ThreadId { host: EndpointId, message }`. `machine_seed` stays
   only as the domain agent ids are encoded in. Until the temp migration

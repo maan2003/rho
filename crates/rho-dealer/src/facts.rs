@@ -154,7 +154,7 @@ pub enum Fact {
         pile: String,
     },
     /// Which agent host work under a label runs on: the host's identity
-    /// (an iroh endpoint id, or `unix:<socket>`), the same on every
+    /// (an iroh endpoint id, or `local:<runtime dir>`), the same on every
     /// device. Later still than `Piled`, for the same reason.
     Host {
         label: uuid::Uuid,
