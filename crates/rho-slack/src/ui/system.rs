@@ -1236,7 +1236,7 @@ fn mark_read_before(
                 .map(|(key, ts)| (Unit::thread(&key.channel, &key.thread_ts), ts.clone())),
         )
         .collect();
-    for card in frame.hand(cx).cards {
+    for card in frame.hand().cards.clone() {
         let Some(SlackAddress::Unit(workspace, unit)) = SlackAddress::from_address(&card.address)
         else {
             continue;

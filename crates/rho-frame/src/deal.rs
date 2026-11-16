@@ -30,6 +30,10 @@ pub(crate) struct Signals {
     initialized: bool,
     scheduled: bool,
     pub next_change: Option<Timestamp>,
+    /// The ranking as of the last change: what the status line, Home and
+    /// a verdict read. Ranking asks every system for its claims and walks
+    /// every host's chat, so it happens once per change, never per draw.
+    pub hand: Hand,
 }
 
 impl Frame {
@@ -70,10 +74,16 @@ impl Frame {
         read(&sources)
     }
 
-    /// The ranking as it stands.
-    pub fn hand(&self, cx: &gpui::App) -> Hand {
+    /// Ranks everything now. The result is kept as [`Signals::hand`] by
+    /// whoever asked, so the next reader needs no rank of its own.
+    fn rank(&self, cx: &gpui::App) -> Hand {
         let now = Zoned::now();
         self.with_sources(None, cx, |sources| rho_dealer::rank::rank(sources, &now))
+    }
+
+    /// The ranking as of the last change.
+    pub fn hand(&self) -> &Hand {
+        &self.signals.hand
     }
 
     /// The ranking with everything it weighed, into the journal.
@@ -128,12 +138,12 @@ impl Frame {
     /// what quiets it and a verdict on what is on screen still lands.
     pub fn card_for(&self, address: &Address, cx: &gpui::App) -> Card {
         if let Some(card) = self
-            .hand(cx)
+            .hand()
             .cards
-            .into_iter()
+            .iter()
             .find(|card| &card.address == address)
         {
-            return card;
+            return card.clone();
         }
         // A note is called by its first line.
         let (title, context) = match self.attention.marks.get(address).title() {
@@ -307,10 +317,11 @@ impl Frame {
         // still owed, it is just not what to look at next.
         if let Some(address) = &in_view
             && let Some(held) = self
-                .hand(cx)
+                .hand()
                 .cards
-                .into_iter()
+                .iter()
                 .find(|held| &held.address == address)
+                .cloned()
         {
             self.attention
                 .skips
@@ -323,7 +334,10 @@ impl Frame {
                 skip_until: Some((now + rho_dealer::curve::SKIP_HOLD).to_string()),
             });
         }
-        let Some(card) = self.hand(cx).top(in_view.as_ref()).cloned() else {
+        // A pull ranks afresh: the skip just said moves it on, and time
+        // has passed since the last change.
+        self.signals.hand = self.rank(cx);
+        let Some(card) = self.hand().top(in_view.as_ref()).cloned() else {
             // Empty lands on Home: there is nothing to deal, so the glance
             // is the answer.
             self.open_home(window, cx);
@@ -394,7 +408,7 @@ impl Frame {
     }
 
     fn evaluate_signals(&mut self, cx: &mut Context<Self>) {
-        let hand = self.hand(cx);
+        let hand = self.rank(cx);
         self.signals.next_change = hand.next_change;
         self.refresh_home(&hand, cx);
         // What the lamp is about is what is *not* in front of the reader:
@@ -406,6 +420,7 @@ impl Frame {
             .find(|card| Some(&card.address) != in_view.as_ref());
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| journal_card(&card.address));
+        self.signals.hand = hand;
         let lamp_on =
             max_priority.is_some_and(|priority| priority >= rho_dealer::curve::LAMP_THRESHOLD);
         if lamp_on != self.signals.lamp_on {
