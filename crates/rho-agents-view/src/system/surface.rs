@@ -133,52 +133,60 @@ impl Surface for AgentSurface {
             .map(|spec| format!("{}-{}", spec.model, spec.effort))
             .unwrap_or_default();
         let runtime_system = system.clone();
-        rows.push(Row::run("t", "set runtime…", move |frame, window, cx| {
-            let system = runtime_system.clone();
-            frame.open_prompt(
-                format!("runtime ({current}):"),
-                Rc::new(|_, needle, _| {
-                    RUNTIMES
-                        .iter()
-                        .filter(|runtime| runtime.contains(needle))
-                        .map(|runtime| Candidate {
-                            value: (*runtime).to_owned(),
-                            description: "runtime".to_owned(),
-                        })
-                        .collect()
-                }),
-                Rc::new(move |frame, input, _, cx| match Runtime::parse(&input) {
-                    Ok(runtime) => system.update(cx, |system, cx| {
-                        system.eval(agent, snippets::set_runtime(agent, &runtime), cx)
+        rows.push(Row::run(
+            "shift-r",
+            "set runtime…",
+            move |frame, window, cx| {
+                let system = runtime_system.clone();
+                frame.open_prompt(
+                    format!("runtime ({current}):"),
+                    Rc::new(|_, needle, _| {
+                        RUNTIMES
+                            .iter()
+                            .filter(|runtime| runtime.contains(needle))
+                            .map(|runtime| Candidate {
+                                value: (*runtime).to_owned(),
+                                description: "runtime".to_owned(),
+                            })
+                            .collect()
                     }),
-                    Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
-                }),
-                window,
-                cx,
-            );
-        }));
-        let cancel_system = system.clone();
-        rows.push(Row::run("x", "cancel the request", move |frame, _, cx| {
-            let system = cancel_system.read(cx);
-            let Some(agents) = system.agents_for(agent) else {
-                frame.echo(
-                    "the agent's host is not attached",
-                    StyleClass::SystemInfo,
+                    Rc::new(move |frame, input, _, cx| match Runtime::parse(&input) {
+                        Ok(runtime) => system.update(cx, |system, cx| {
+                            system.eval(agent, snippets::set_runtime(agent, &runtime), cx)
+                        }),
+                        Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
+                    }),
+                    window,
                     cx,
                 );
-                return;
-            };
-            let reply = agents.call(Cancel { agent });
-            let link = system.frame.clone();
-            cx.spawn(async move |_, cx| {
-                if let Err(error) = reply.await {
-                    cx.update(|cx| {
-                        link.echo(format!("{error:#}"), StyleClass::SystemImportant, cx)
-                    });
-                }
-            })
-            .detach();
-        }));
+            },
+        ));
+        let cancel_system = system.clone();
+        rows.push(Row::run(
+            "shift-c",
+            "cancel the request",
+            move |frame, _, cx| {
+                let system = cancel_system.read(cx);
+                let Some(agents) = system.agents_for(agent) else {
+                    frame.echo(
+                        "the agent's host is not attached",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                };
+                let reply = agents.call(Cancel { agent });
+                let link = system.frame.clone();
+                cx.spawn(async move |_, cx| {
+                    if let Err(error) = reply.await {
+                        cx.update(|cx| {
+                            link.echo(format!("{error:#}"), StyleClass::SystemImportant, cx)
+                        });
+                    }
+                })
+                .detach();
+            },
+        ));
         let origin = {
             let system = self.system.read(cx);
             let registry = system.registry();

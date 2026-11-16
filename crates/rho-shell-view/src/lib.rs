@@ -6,8 +6,8 @@
 //!
 //! [`protocol`] is what a client and a host say about shells; the host and
 //! the workset runtime use it alone, without the `client` feature. With
-//! `ui`, [`ui`] is the shells as the frame shows them: the `shell` system
-//! and its surface.
+//! `ui`, [`ui`] is the shells as the frame shows them: the surface and its
+//! keys.
 
 pub mod protocol;
 

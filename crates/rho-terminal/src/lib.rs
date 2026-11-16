@@ -21,8 +21,8 @@
 //!
 //! [`protocol`] is what a client and a host say about terminals; the host
 //! and the workset runtime use it alone, without the `client` feature.
-//! With `ui`, [`ui`] is the terminals as the frame shows them: the `term`
-//! system and its surface.
+//! With `ui`, [`ui`] is the terminals as the frame shows them: the surface
+//! and its keys.
 
 pub mod protocol;
 

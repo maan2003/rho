@@ -231,11 +231,6 @@ fn run() -> Result<()> {
                     }))
                 });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
-                let terminals =
-                    cx.new(|cx| rho_terminal::ui::TerminalSystem::new(frame.clone(), cx));
-                let shells = cx.new(|cx| rho_shell_view::ui::ShellSystem::new(frame.clone(), cx));
-                let desktops =
-                    cx.new(|cx| rho_desktop_client::ui::DesktopSystem::new(frame.clone(), cx));
                 let slack =
                     cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
@@ -243,9 +238,6 @@ fn run() -> Result<()> {
                     AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(notes),
-                    AnySystem::new(terminals),
-                    AnySystem::new(shells),
-                    AnySystem::new(desktops),
                     AnySystem::new(slack),
                     AnySystem::new(telemetry),
                 ];

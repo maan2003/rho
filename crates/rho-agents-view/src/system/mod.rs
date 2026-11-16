@@ -6,13 +6,21 @@
 //! transcripts it has open, and one [`AgentModel`] per opened agent; a
 //! surface observes its model. Starting an agent is a row on a thread
 //! surface: the message under the point is the agent's origin.
+//!
+//! An agent's terminals, its shell and its desktops hang under it
+//! ([`AgentAddress`]): the same system opens them, with the agent's host
+//! as their link, and offers the rows that start one from any surface of
+//! the agent.
 
+mod address;
 mod start;
 mod surface;
 
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 use std::sync::Arc;
 
+pub use address::{AgentAddress, Part};
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity, Window};
 use rho_agent_hosts::{HostId, HostStream, Link};
@@ -24,7 +32,14 @@ use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, now_ms};
 use rho_chat::ui::{ChatSystem, Event as ChatEvent};
 use rho_chat::{AgentRef, ThreadId};
-use rho_frame::{Address, Addressed as _, AnySurface, Found, FrameLink, Marks, Point, Row, System};
+use rho_desktop_client::protocol::DesktopSession;
+use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
+use rho_desktop_client::ui::DesktopSurface;
+use rho_frame::{
+    Address, Addressed as _, AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, System,
+};
+use rho_shell_view::ui::ShellSurface;
+use rho_terminal::ui::TerminalSurface;
 use rho_window::style::StyleClass;
 use surface::AgentSurface;
 
@@ -32,10 +47,6 @@ use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::transcript::{TranscriptFrame, Transcripts};
 
 const KINDS: &[&str] = &[AgentRef::KIND];
-
-fn agent_of(address: &Address) -> Option<AgentId> {
-    AgentRef::from_address(address).map(|agent| agent.0)
-}
 
 pub struct AgentsSystem {
     client: AgentsClient,
@@ -46,6 +57,9 @@ pub struct AgentsSystem {
     /// less transcript to follow.
     surfaces: HashMap<AgentId, WeakEntity<AgentSurface>>,
     links: HashMap<HostId, Link>,
+    /// Each host's desktops stream, and the desktops it last said it runs.
+    desktops: DesktopStreams,
+    sessions: HashMap<HostId, Vec<DesktopSession>>,
     chat: Entity<ChatSystem>,
     frame: FrameLink,
     /// Agents asked for with the user's message, by the id the chat gave
@@ -76,6 +90,21 @@ impl AgentsSystem {
                 }
             }
         });
+        let (desktops, mut desktop_events) = DesktopStreams::new();
+        let desktops_pump = cx.spawn(async move |this, cx| {
+            while let Some(DesktopsEvent { host, sessions }) = desktop_events.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.sessions.insert(host, sessions);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        rho_terminal::ui::bind_keys(cx);
+        rho_shell_view::ui::bind_keys(cx);
+        rho_desktop_client::ui::bind_keys(cx);
         let delivered = cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| {
             if let ChatEvent::Delivered {
                 endpoint,
@@ -93,11 +122,13 @@ impl AgentsSystem {
             models: HashMap::new(),
             surfaces: HashMap::new(),
             links: HashMap::new(),
+            desktops,
+            sessions: HashMap::new(),
             chat,
             frame,
             starting: HashMap::new(),
             timer: None,
-            _tasks: vec![pump],
+            _tasks: vec![pump, desktops_pump],
             _subscriptions: vec![delivered],
         }
     }
@@ -417,6 +448,185 @@ impl AgentsSystem {
         }
     }
 
+    /// What a surface under the agent dials with: its host's link, its
+    /// encoded id, and what to call it. `None` while the host is away.
+    fn workset_of(&self, agent: AgentId) -> Option<(&Link, String, String)> {
+        let link = self.links.get(&self.registry.host_of_agent(agent)?)?;
+        Some((
+            link,
+            agent.encoded(),
+            self.registry.agent_display_label(agent),
+        ))
+    }
+
+    fn open_transcript(
+        &mut self,
+        agent: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnySurface {
+        let model = self.loaded_model(agent, cx);
+        let system = cx.entity();
+        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, window, cx));
+        self.surfaces.insert(agent, surface.downgrade());
+        self._subscriptions
+            .push(cx.observe_release(&surface, move |this, _, cx| {
+                this.surfaces.remove(&agent);
+                this.note_open(cx);
+            }));
+        self.note_open(cx);
+        AnySurface::new(surface)
+    }
+
+    /// The desktops an agent's workset runs, as its host last said.
+    fn desktops_of(&self, agent: AgentId) -> Vec<String> {
+        let id = agent.encoded();
+        self.registry
+            .host_of_agent(agent)
+            .and_then(|host| self.sessions.get(&host))
+            .into_iter()
+            .flatten()
+            .filter(|session| session.agent == id)
+            .map(|session| session.name.clone())
+            .collect()
+    }
+
+    /// The rows of an agent's surfaces: its terminals, shell and desktops,
+    /// from the transcript or from any of them.
+    fn agent_rows(&self, here: AgentAddress, cx: &mut Context<Self>) -> Vec<Row> {
+        let agent = here.agent;
+        if self.workset_of(agent).is_none() {
+            return Vec::new();
+        }
+        let this = cx.entity();
+        let mut rows = Vec::new();
+        for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
+        {
+            let this = this.clone();
+            rows.push(Row::run(key, description, move |_, _, cx| {
+                this.update(cx, |this, cx| this.open_terminal(agent, new, cx));
+            }));
+        }
+        rows.push(Row::run("x", "shell", move |frame, window, cx| {
+            frame.open(AgentAddress::shell(agent).address(), window, cx);
+        }));
+        if here.part == Part::Shell {
+            let this = this.clone();
+            rows.push(Row::run("shift-x", "close shell", move |_, _, cx| {
+                this.update(cx, |this, cx| this.close_shell(agent, cx));
+            }));
+        }
+        if !self.desktops_of(agent).is_empty() {
+            rows.push(Row::run("d", "desktop…", move |_, _, cx| {
+                this.update(cx, |this, cx| this.open_desktop(agent, cx));
+            }));
+        }
+        rows
+    }
+
+    /// Opens a terminal of the agent: with `new` a fresh one, else the
+    /// first that runs, spawning one when none does.
+    fn open_terminal(&mut self, agent: AgentId, new: bool, cx: &mut Context<Self>) {
+        let Some((link, id, _)) = self.workset_of(agent) else {
+            return;
+        };
+        let running = rho_terminal::channel::list(link, Some(id));
+        cx.spawn(async move |this, cx| {
+            let running = running.await;
+            let _ = this.update(cx, |this, cx| match running {
+                Ok(running) => {
+                    let terminal = rho_terminal::ui::pick_terminal(&running, new);
+                    this.frame
+                        .open(AgentAddress::terminal(agent, terminal).address(), cx);
+                }
+                Err(error) => {
+                    this.frame
+                        .echo(format!("terminal: {error:#}"), StyleClass::SystemInfo, cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Stops the agent's shell on its host, and closes its surface once
+    /// the host has.
+    fn close_shell(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        let Some((link, id, _)) = self.workset_of(agent) else {
+            return;
+        };
+        let closed = rho_shell_view::channel::close(link, id);
+        cx.spawn(async move |this, cx| {
+            let closed = closed.await;
+            let _ = this.update(cx, |this, cx| match closed {
+                Ok(()) => {
+                    this.frame.echo("shell closed", StyleClass::SystemInfo, cx);
+                    this.frame.close(AgentAddress::shell(agent).address(), cx);
+                }
+                Err(error) => this.frame.echo(
+                    format!("close shell: {error:#}"),
+                    StyleClass::SystemInfo,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Opens the agent's one desktop, or asks which of its desktops.
+    fn open_desktop(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        let names = self.desktops_of(agent);
+        let addresses: Vec<(String, Address)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let address = AgentAddress::desktop(agent, name.clone())?.address();
+                Some((name, address))
+            })
+            .collect();
+        match addresses.as_slice() {
+            [] => self
+                .frame
+                .echo("the agent runs no desktop", StyleClass::SystemInfo, cx),
+            [(_, address)] => self.frame.open(address.clone(), cx),
+            _ => {
+                let candidates: Vec<Candidate> = addresses
+                    .iter()
+                    .map(|(name, _)| Candidate {
+                        value: name.clone(),
+                        description: "desktop".to_owned(),
+                    })
+                    .collect();
+                self.frame.with(cx, move |frame, window, cx| {
+                    frame.open_prompt(
+                        "desktop:",
+                        Rc::new(move |_, input, _| {
+                            let needle = input.trim().to_lowercase();
+                            candidates
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.value.to_lowercase().contains(&needle)
+                                })
+                                .cloned()
+                                .collect()
+                        }),
+                        Rc::new(move |frame, input, window, cx| {
+                            let input = input.trim();
+                            match addresses.iter().find(|(name, _)| name == input) {
+                                Some((_, address)) => frame.open(address.clone(), window, cx),
+                                None => frame.echo(
+                                    &format!("desktop: none called {input:?}"),
+                                    StyleClass::SystemInfo,
+                                    cx,
+                                ),
+                            }
+                        }),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
+    }
+
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
         let chat = self.chat.read(cx);
         point
@@ -438,19 +648,26 @@ impl System for AgentsSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
-        let agent = agent_of(address)?;
+        let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
         self.registry.mirrored(agent)?;
-        let model = self.loaded_model(agent, cx);
-        let system = cx.entity();
-        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, window, cx));
-        self.surfaces.insert(agent, surface.downgrade());
-        self._subscriptions
-            .push(cx.observe_release(&surface, move |this, _, cx| {
-                this.surfaces.remove(&agent);
-                this.note_open(cx);
-            }));
-        self.note_open(cx);
-        Some(AnySurface::new(surface))
+        let surface = match part {
+            Part::Transcript => return Some(self.open_transcript(agent, window, cx)),
+            Part::Terminal(terminal) => {
+                let (link, id, label) = self.workset_of(agent)?;
+                AnySurface::new(
+                    cx.new(|cx| TerminalSurface::new(link, id, label, terminal, window, cx)),
+                )
+            }
+            Part::Shell => {
+                let (link, id, label) = self.workset_of(agent)?;
+                AnySurface::new(cx.new(|cx| ShellSurface::new(link, id, label, window, cx)))
+            }
+            Part::Desktop(name) => {
+                let (link, id, label) = self.workset_of(agent)?;
+                AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
+            }
+        };
+        Some(surface)
     }
 
     fn streams(
@@ -464,18 +681,22 @@ impl System for AgentsSystem {
         self.links.insert(host, link.clone());
         self.registry.attach_host(host, name.to_owned());
         self.client.attach_host(host, name.to_owned());
-        vec![self.client.stream(host)]
+        vec![self.client.stream(host), self.desktops.stream(host)]
     }
 
     fn detached(&mut self, host: HostId, cx: &mut Context<Self>) {
         self.client.detach_host(host);
         self.links.remove(&host);
+        self.sessions.remove(&host);
         let departed = self.registry.detach_host(host);
         self.deleted(departed, cx);
     }
 
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
+        if let Some(here) = AgentAddress::from_address(&point.surface) {
+            return self.agent_rows(here, cx);
+        }
         let Some(thread) = self.thread_at(point, cx) else {
             return Vec::new();
         };
@@ -504,28 +725,39 @@ impl System for AgentsSystem {
     }
 
     fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
-        let agent = agent_of(address)?;
+        let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
         self.registry.mirrored(agent)?;
-        Some(self.label(agent))
+        let (label, host) = self.label(agent);
+        Some(match part {
+            Part::Transcript => (label, host),
+            part => (format!("{label} · {part}"), host),
+        })
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
-        self.registry
-            .known_agents()
-            .copied()
-            .map(|agent| {
-                let (title, host) = self.label(agent);
-                let facts = self.registry.agent_facts(agent);
-                Found {
-                    address: AgentRef(agent).address(),
-                    title,
-                    description: match facts.runtime.as_ref().map(surface::status_word) {
-                        Some(word) => format!("{host} · {word}"),
-                        None => host,
-                    },
-                    recency: self.registry.agent_last_active(agent).map_or(0, |at| at.0),
-                }
+        let agents = self.registry.known_agents().copied().map(|agent| {
+            let (title, host) = self.label(agent);
+            let facts = self.registry.agent_facts(agent);
+            Found {
+                address: AgentRef(agent).address(),
+                title,
+                description: match facts.runtime.as_ref().map(surface::status_word) {
+                    Some(word) => format!("{host} · {word}"),
+                    None => host,
+                },
+                recency: self.registry.agent_last_active(agent).map_or(0, |at| at.0),
+            }
+        });
+        let desktops = self.sessions.values().flatten().filter_map(|session| {
+            let agent = AgentId::from_encoded(&session.agent).ok()?;
+            let (title, host) = self.label(agent);
+            Some(Found {
+                address: AgentAddress::desktop(agent, session.name.clone())?.address(),
+                title: format!("{title} · desktop {}", session.name),
+                description: host,
+                recency: 0,
             })
-            .collect()
+        });
+        agents.chain(desktops).collect()
     }
 }

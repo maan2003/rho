@@ -163,7 +163,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   Labels, piles, `Todo`, the usage screen, the page system and the
   message log screen go. Terminals, shells and desktops lose their
   address kinds and hang under the agent, reached from a room's
-  participants.
+  participants (done: parts of the `agent:` address).
 - Open: pane rules, Slack, reminders, the browser as a service.
 
 ## Decided against
@@ -186,9 +186,9 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `mutes_itself`) and builds `Surface`s (`title`, `editor`, `subject`,
   `rows`); `rho-gui` lists the systems. A system reaches the frame only
   through `FrameLink`.
-- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>`,
-  `note:<uuid>`, `term:<host>/<agent>/<n>`,
-  `shell:<host>/<agent>`, `desktop:<host>/<agent>/<name>`,
+- Address kinds: `thread:<endpoint>/<id>`, `agent:<id>` with its
+  terminals, shell and desktops as parts under it (`agent:<id>/term/<n>`,
+  `agent:<id>/shell`, `agent:<id>/desktop/<name>`), `note:<uuid>`,
   `slack:<ws>/...`. The forms that no one crate owns are Linked Specs
   beside their crates.
 - iroh is the one transport. A host always binds its endpoint; a peer on

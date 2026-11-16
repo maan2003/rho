@@ -21,15 +21,13 @@ client = [
   "dep:tracing",
 ]
 
-# The desktops as the frame shows them: the `desktop` system, the list of
-# every host's desktops, and the live view of one.
+# The desktops as the frame shows them: the surface over the live view of
+# one, and its keys.
 ui = [
   "client",
   "dep:gpui",
   "dep:image",
-  "dep:rho-dealer",
   "dep:rho-frame",
-  "dep:rho-window",
   "dep:theme",
 ]
 
@@ -47,9 +45,7 @@ moq-net = { workspace = true, optional = true }
 rho-desktop-media = { workspace = true, features = ["decoder", "iroh"], optional = true }
 rho-desktop-proto = { workspace = true, optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
-rho-dealer = { workspace = true, optional = true }
 rho-frame = { workspace = true, optional = true }
-rho-window = { workspace = true, optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
