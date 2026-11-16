@@ -36,6 +36,9 @@ enum Key {
     Fold(MessageId),
     /// A thread under a root, on one line.
     Thread(MessageId),
+    /// The user's private reply under a message: a note about it, which
+    /// only their devices hold.
+    Private(Address),
     Participants,
     Pending(u64),
     Gap(u32),
@@ -55,10 +58,12 @@ enum Class {
     Unread,
     /// Unread mentions of the user.
     Mention,
+    /// A private reply: the user's own, seen by no agent.
+    Private,
 }
 
 impl Class {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn slot(self) -> usize {
         match self {
@@ -71,6 +76,7 @@ impl Class {
             Self::Name => 6,
             Self::Unread => 7,
             Self::Mention => 8,
+            Self::Private => 9,
         }
     }
 }
@@ -90,10 +96,12 @@ impl rho_transcript::Style for Class {
             Self::Name => (colors.text, None),
             Self::Unread => (colors.text, Some(gpui::FontWeight::BOLD)),
             Self::Mention => (cx.theme().status().warning, Some(gpui::FontWeight::BOLD)),
+            Self::Private => (colors.text_muted, None),
         };
         HighlightStyle {
             color: Some(color.into()),
             font_weight: weight,
+            font_style: matches!(self, Self::Private).then_some(gpui::FontStyle::Italic),
             ..HighlightStyle::default()
         }
     }
@@ -330,10 +338,20 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         );
     }
     let list = is_root(system, thread);
+    // The user's private replies, by the message each is under. Read
+    // once: the frame is leased while it opens this surface, and then the
+    // next draw has them.
+    let mut private = system
+        .frame
+        .read(cx, |frame, _| {
+            private_items(frame.marks(), chat, host, thread.message)
+        })
+        .unwrap_or_default();
     if let Some(message) = chat.message(thread.message)
         && !list
     {
         items.push(message_item(message, Meta::None));
+        items.extend(private.remove(&thread.message).unwrap_or_default());
     }
     if !head.members.is_empty() {
         // A gone agent keeps its place under its id: the thread was its.
@@ -384,6 +402,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
             continue;
         };
         items.push(message_item(message, Meta::Message(*id)));
+        items.extend(private.remove(id).unwrap_or_default());
         let replies = chat.children(Some(*id));
         if !replies.is_empty() {
             let (_, at) = chat.newest_in(*id).unwrap_or((*id, message.at));
@@ -405,6 +424,42 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     }
     items.extend(pending_items(system, host, thread.message, &mut gap_item));
     items
+}
+
+/// The user's private replies under the thread's head and under each
+/// message in it: the notes about each, as the user's own lines, marked
+/// so and dim. Enter opens the note to edit it.
+fn private_items(
+    marks: &Marks,
+    chat: &HostChat,
+    host: EndpointId,
+    head: MessageId,
+) -> std::collections::HashMap<MessageId, Vec<Item<Key, Class, Meta>>> {
+    let mut by_message = std::collections::HashMap::new();
+    for id in std::iter::once(&head).chain(chat.children(Some(head))) {
+        let address = ThreadId { host, message: *id }.address();
+        let replies: Vec<Item<Key, Class, Meta>> = marks
+            .replies_to(&address)
+            .into_iter()
+            .map(|(note, held)| {
+                let time = held
+                    .written_ms
+                    .map(|ms| when(ms.max(0) as u64))
+                    .unwrap_or_default();
+                let header = format!("🔒 you · {time}");
+                let body = held.body.as_deref().unwrap_or_default().trim_end();
+                let text = format!("{header}\n{body}");
+                let lines = text.lines().count().max(1);
+                Item::new(Key::Private(note.clone()), text)
+                    .with_styles(vec![(Class::Private, 0..header.len())])
+                    .with_lines(vec![Meta::Open(note.clone()); lines])
+            })
+            .collect();
+        if !replies.is_empty() {
+            by_message.insert(*id, replies);
+        }
+    }
+    by_message
 }
 
 /// Whether `thread` is a root: a stream, whose surface lists the threads

@@ -25,7 +25,9 @@ use gpui::{App, AppContext as _, Context, Subscription, Task, Window};
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Candidate, Found, Frame, FrameLink, Point, Row, System};
+use rho_frame::{
+    AnySurface, Candidate, Found, Frame, FrameLink, HomeRow, HomeSection, Point, Row, System,
+};
 use rho_window::style::StyleClass;
 pub use view::NoteView;
 
@@ -216,20 +218,6 @@ fn label_rows(
     rows
 }
 
-/// The note about `subject`, if the user wrote one.
-fn note_about(marks: &Marks, subject: &Address) -> Option<NoteId> {
-    let mut notes: Vec<(&Address, i64)> = marks
-        .notes()
-        .filter(|(_, held)| held.about.as_ref() == Some(subject))
-        .map(|(note, held)| (note, held.created_ms.unwrap_or(0)))
-        .collect();
-    // The oldest, so the same note answers every time.
-    notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-    notes
-        .first()
-        .and_then(|(note, _)| NoteId::from_address(note))
-}
-
 /// What a new note says about where it was made. Made on a label, it
 /// carries the label; made from anything else, it carries what that
 /// carries and says it is about it. No text: the note has none until the
@@ -255,6 +243,23 @@ fn new_note_marks(marks: &Marks, note: NoteId, area: Option<&Address>) -> Vec<Wr
     })];
     writes.extend(marks.get(area).labels.iter().map(|label| labeled(*label)));
     writes
+}
+
+/// Home's private rooms: every note that is about nothing, the one last
+/// written first. Home is a glance; `find` reaches the rest.
+fn private_rooms(marks: &Marks) -> Vec<HomeRow> {
+    const CAP: usize = 8;
+    marks
+        .private_roots()
+        .into_iter()
+        .take(CAP)
+        .map(|(address, _)| HomeRow {
+            address: address.clone(),
+            title: note_title(marks, address),
+            label: String::new(),
+            unread: false,
+        })
+        .collect()
 }
 
 /// Every note and label, for `find`.
@@ -422,16 +427,16 @@ fn write(frame: &mut Frame, thing: Thing, text: String, cx: &mut Context<Frame>)
     }
 }
 
-/// `notes for this`: the note about what the point is on, made the first
-/// time. On a note it is that note.
-fn notes_for(subject: &Address, frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
-    let note = match Thing::from_address(subject) {
-        Some(Thing::Note(note)) => note,
-        _ => match note_about(frame.marks(), subject) {
-            Some(note) => note,
-            None => new_note(frame, Some(subject), cx),
-        },
-    };
+/// `reply privately`: a new note about what the point is on, which the
+/// thread shows under it as the user's own line. On a note it is a note
+/// under that note.
+fn reply_privately(
+    subject: &Address,
+    frame: &mut Frame,
+    window: &mut Window,
+    cx: &mut Context<Frame>,
+) {
+    let note = new_note(frame, Some(subject), cx);
     frame.open(note.address(), window, cx);
 }
 
@@ -553,9 +558,11 @@ impl System for NoteSystem {
     fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
         if let Some(subject) = point.subject.clone() {
-            rows.push(Row::run("n", "notes for this", move |frame, window, cx| {
-                notes_for(&subject, frame, window, cx)
-            }));
+            rows.push(Row::run(
+                "n",
+                "reply privately",
+                move |frame, window, cx| reply_privately(&subject, frame, window, cx),
+            ));
         }
         let here = point.subject.clone();
         rows.push(Row::run("w", "new note", move |frame, window, cx| {
@@ -573,6 +580,13 @@ impl System for NoteSystem {
 
     fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
         found(marks)
+    }
+
+    fn home(&self, marks: &Marks, _cx: &App) -> Vec<HomeSection> {
+        vec![HomeSection {
+            title: "private".to_owned(),
+            rows: private_rooms(marks),
+        }]
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {

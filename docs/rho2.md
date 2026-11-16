@@ -223,6 +223,9 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - Notes are `Wrote` facts in the log since 2026-11-16; a device that
   still holds slot blobs says each once as a fact on start, a temp
   migration in `rho_frame::attention`. The slot tables and the `Put`
-  and `Slot` frames stay until every device has run it. The rooms
-  decision and private replies in threads are not built yet: notes
-  still open as their own surface.
+  and `Slot` frames stay until every device has run it. A thread shows
+  the notes about each of its messages under it as the user's private
+  replies, `reply privately` makes one, and Home lists the notes about
+  nothing as private rooms. The rest of the rooms decision is not built
+  yet: a note still opens as its own surface, and labels and piles
+  remain.

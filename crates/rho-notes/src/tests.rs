@@ -191,23 +191,32 @@ fn a_label_lists_its_labels_then_what_carries_it_by_title() {
     assert_eq!(rows[0].address, gui.address());
 }
 
+/// The notes about a thing are its private replies, oldest first; a
+/// deleted one is not.
 #[test]
-fn notes_for_a_thing_are_the_one_about_it() {
+fn notes_about_a_thing_are_its_private_replies() {
     let mut world = World::default();
     let first = world.note("about seven");
     let other = world.note("about eight");
-    world.say(Fact::About {
-        node: first.address(),
-        about: Some(thread(7)),
-    });
-    world.say(Fact::About {
-        node: other.address(),
-        about: Some(thread(8)),
-    });
-    assert_eq!(note_about(&world.marks, &thread(7)), Some(first));
-    assert_eq!(note_about(&world.marks, &thread(9)), None);
+    let later = world.note("about seven, later");
+    for (note, thread) in [(first, 7), (other, 8), (later, 7)] {
+        world.say(Fact::About {
+            node: note.address(),
+            about: Some(self::thread(thread)),
+        });
+    }
+    let replies = |world: &World, n| -> Vec<Address> {
+        world
+            .marks
+            .replies_to(&thread(n))
+            .into_iter()
+            .map(|(address, _)| address.clone())
+            .collect()
+    };
+    assert_eq!(replies(&world, 7), [first.address(), later.address()]);
+    assert_eq!(replies(&world, 9), []);
     world.write(first, "about seven", true);
-    assert_eq!(note_about(&world.marks, &thread(7)), None);
+    assert_eq!(replies(&world, 7), [later.address()]);
 }
 
 #[test]
@@ -310,4 +319,23 @@ fn a_new_note_goes_here_first_then_where_here_is_filed_and_root_last() {
             ("root".into(), None),
         ]
     );
+}
+
+/// Home lists the notes about nothing as private rooms, the one last
+/// written first; a reply under something is not a room.
+#[test]
+fn home_lists_the_private_rooms_newest_written_first() {
+    let mut world = World::default();
+    let older = world.note("older room");
+    let reply = world.note("a reply");
+    world.say(Fact::About {
+        node: reply.address(),
+        about: Some(thread(7)),
+    });
+    let newer = world.note("newer room");
+    world.write(older, "older room, edited last", false);
+    let rooms = private_rooms(&world.marks);
+    let titles: Vec<&str> = rooms.iter().map(|row| row.title.as_str()).collect();
+    assert_eq!(titles, ["older room, edited last", "newer room"]);
+    assert_eq!(rooms[1].address, newer.address());
 }
