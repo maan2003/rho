@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use jiff::{SignedDuration, Timestamp, Zoned};
 
+use crate::address::Address;
 use crate::facts::{Entry, EntryId, Fact, Facts};
-use crate::node::NodeId;
 use crate::notes::NoteRev;
 
 /// Everything the user said about one node. Which fields mean anything
@@ -30,7 +30,7 @@ pub struct NodeMarks {
     /// A note or a label the user deleted.
     pub deleted: bool,
     /// What a note is about.
-    pub about: Option<NodeId>,
+    pub about: Option<Address>,
     /// The label a label sits under.
     pub parent: Option<uuid::Uuid>,
     /// The repository work under a label happens in.
@@ -57,6 +57,35 @@ impl NodeMarks {
         Facts(&self.facts)
     }
 
+    /// What was said here, said again of `node`: the attention facts in
+    /// order, then the labels, name and subject. A note's body and a
+    /// label's own facts are not about a node and stay.
+    pub fn restated_as(&self, node: &Address) -> Vec<Fact> {
+        let mut facts: Vec<Fact> = self
+            .facts
+            .iter()
+            .filter_map(|entry| entry.fact.retarget(node.clone()))
+            .collect();
+        facts.extend(self.labels.iter().map(|label| Fact::Labeled {
+            node: node.clone(),
+            label: *label,
+            present: true,
+        }));
+        if self.name.is_some() {
+            facts.push(Fact::Named {
+                node: node.clone(),
+                name: self.name.clone(),
+            });
+        }
+        if let Some(about) = &self.about {
+            facts.push(Fact::About {
+                node: node.clone(),
+                about: Some(about.clone()),
+            });
+        }
+        facts
+    }
+
     /// A note's title: the first line of its body.
     pub fn title(&self) -> &str {
         self.body
@@ -72,7 +101,7 @@ impl NodeMarks {
 pub struct Pile {
     /// The name the user gave it; `None` for everything snoozed.
     pub name: Option<String>,
-    pub nodes: Vec<NodeId>,
+    pub nodes: Vec<Address>,
     /// When the first of an unnamed pile comes back by itself. A named pile
     /// comes back only when opened.
     pub back: Option<Timestamp>,
@@ -83,10 +112,10 @@ pub struct Pile {
 pub struct Marks {
     entries: BTreeMap<EntryId, Entry>,
     retracted: HashSet<EntryId>,
-    by_node: HashMap<NodeId, BTreeSet<EntryId>>,
+    by_node: HashMap<Address, BTreeSet<EntryId>>,
     /// The newest revision of each note.
     notes: HashMap<uuid::Uuid, NoteRev>,
-    nodes: HashMap<NodeId, NodeMarks>,
+    nodes: HashMap<Address, NodeMarks>,
     /// The newest instant any entry or revision here was said at.
     newest: Option<Timestamp>,
 }
@@ -94,7 +123,7 @@ pub struct Marks {
 impl Marks {
     /// Takes in entries from any device, in any order and any number of
     /// times, and says which nodes moved.
-    pub fn apply(&mut self, entries: impl IntoIterator<Item = Entry>) -> BTreeSet<NodeId> {
+    pub fn apply(&mut self, entries: impl IntoIterator<Item = Entry>) -> BTreeSet<Address> {
         let mut touched = BTreeSet::new();
         for entry in entries {
             let id = entry.id();
@@ -125,7 +154,7 @@ impl Marks {
     }
 
     /// Takes in note revisions, and says which notes moved.
-    pub fn apply_notes(&mut self, revs: impl IntoIterator<Item = NoteRev>) -> BTreeSet<NodeId> {
+    pub fn apply_notes(&mut self, revs: impl IntoIterator<Item = NoteRev>) -> BTreeSet<Address> {
         let mut touched = BTreeSet::new();
         for rev in revs {
             self.saw(rev.at.timestamp());
@@ -134,7 +163,7 @@ impl Marks {
                 .get(&rev.note)
                 .is_none_or(|held| held.id() < rev.id());
             if newer {
-                touched.insert(NodeId::Note(rev.note));
+                touched.insert(Address::note(rev.note));
                 self.notes.insert(rev.note, rev);
             }
         }
@@ -159,7 +188,7 @@ impl Marks {
         }
     }
 
-    fn refresh(&mut self, node: &NodeId) {
+    fn refresh(&mut self, node: &Address) {
         let mut marks = NodeMarks::default();
         let ids = self.by_node.get(node);
         for id in ids.into_iter().flatten() {
@@ -198,8 +227,8 @@ impl Marks {
                 Fact::Retract { .. } => {}
             }
         }
-        if let NodeId::Note(id) = node
-            && let Some(note) = self.notes.get(id)
+        if let Some(id) = node.as_note()
+            && let Some(note) = self.notes.get(&id)
         {
             marks.body = Some(note.body.clone());
             marks.created_ms = Some(note.created.as_millisecond());
@@ -213,11 +242,11 @@ impl Marks {
     }
 
     /// What was said about a node; nothing, for a node never marked.
-    pub fn get(&self, node: &NodeId) -> &NodeMarks {
+    pub fn get(&self, node: &Address) -> &NodeMarks {
         self.nodes.get(node).unwrap_or(&EMPTY)
     }
 
-    pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &NodeMarks)> {
+    pub fn nodes(&self) -> impl Iterator<Item = (&Address, &NodeMarks)> {
         self.nodes.iter()
     }
 
@@ -237,17 +266,17 @@ impl Marks {
     }
 
     /// Every note that is not deleted.
-    pub fn notes(&self) -> impl Iterator<Item = (&NodeId, &NodeMarks)> {
+    pub fn notes(&self) -> impl Iterator<Item = (&Address, &NodeMarks)> {
         self.nodes
             .iter()
-            .filter(|(node, marks)| matches!(node, NodeId::Note(_)) && !marks.deleted)
+            .filter(|(node, marks)| node.as_note().is_some() && !marks.deleted)
     }
 
     /// What the user put away and can open: each named pile with its nodes,
     /// oldest first, and last the unnamed one, whatever is snoozed past
     /// `now`, soonest back first.
     pub fn piles(&self, now: Timestamp) -> Vec<Pile> {
-        let mut named: BTreeMap<&str, Vec<(Timestamp, &NodeId)>> = BTreeMap::new();
+        let mut named: BTreeMap<&str, Vec<(Timestamp, &Address)>> = BTreeMap::new();
         let mut snoozed = Vec::new();
         for (node, marks) in &self.nodes {
             let facts = marks.facts();
@@ -260,7 +289,7 @@ impl Marks {
                 snoozed.push((snooze.until, node));
             }
         }
-        let pile = |name: Option<&str>, mut nodes: Vec<(Timestamp, &NodeId)>| {
+        let pile = |name: Option<&str>, mut nodes: Vec<(Timestamp, &Address)>| {
             nodes.sort();
             Pile {
                 name: name.map(str::to_owned),
@@ -283,11 +312,9 @@ impl Marks {
         let mut labels: Vec<_> = self
             .nodes
             .iter()
-            .filter_map(|(node, marks)| match node {
-                NodeId::Label(id) if !marks.deleted && marks.name.is_some() => {
-                    Some((*id, self.label_path(*id)))
-                }
-                _ => None,
+            .filter_map(|(node, marks)| {
+                let id = node.as_label()?;
+                (!marks.deleted && marks.name.is_some()).then(|| (id, self.label_path(id)))
             })
             .collect();
         labels.sort_by(|a, b| a.1.cmp(&b.1));
@@ -303,7 +330,7 @@ impl Marks {
             if !seen.insert(id) {
                 break;
             }
-            let marks = self.get(&NodeId::Label(id));
+            let marks = self.get(&Address::label(id));
             names.push(marks.name.clone().unwrap_or_default());
             at = marks.parent;
         }
@@ -324,12 +351,12 @@ impl Marks {
         self.labels()
             .into_iter()
             .map(|(id, _)| id)
-            .filter(|id| self.get(&NodeId::Label(*id)).parent == label)
+            .filter(|id| self.get(&Address::label(*id)).parent == label)
             .collect()
     }
 
     /// Every node carrying `label`, except deleted notes.
-    pub fn labeled(&self, label: uuid::Uuid) -> Vec<NodeId> {
+    pub fn labeled(&self, label: uuid::Uuid) -> Vec<Address> {
         let mut nodes: Vec<_> = self
             .nodes
             .iter()
@@ -342,24 +369,24 @@ impl Marks {
 
     /// The repository work on a node happens in: the first its labels
     /// name, looking up through each label's parents.
-    pub fn repository_of(&self, node: &NodeId) -> Option<String> {
+    pub fn repository_of(&self, node: &Address) -> Option<String> {
         self.inherited(node, |marks| marks.repository.clone())
     }
 
     /// The host work under `node` runs on: its own label's, else the
     /// nearest one above, as with the repository.
-    pub fn host_of(&self, node: &NodeId) -> Option<String> {
+    pub fn host_of(&self, node: &Address) -> Option<String> {
         self.inherited(node, |marks| marks.host.clone())
     }
 
     fn inherited(
         &self,
-        node: &NodeId,
+        node: &Address,
         read: impl Fn(&NodeMarks) -> Option<String>,
     ) -> Option<String> {
-        let mut labels: Vec<uuid::Uuid> = match node {
-            NodeId::Label(id) => vec![*id],
-            _ => self.get(node).labels.iter().copied().collect(),
+        let mut labels: Vec<uuid::Uuid> = match node.as_label() {
+            Some(id) => vec![id],
+            None => self.get(node).labels.iter().copied().collect(),
         };
         let mut seen = BTreeSet::new();
         while !labels.is_empty() {
@@ -368,7 +395,7 @@ impl Marks {
                 if !seen.insert(id) {
                     continue;
                 }
-                let marks = self.get(&NodeId::Label(id));
+                let marks = self.get(&Address::label(id));
                 if let Some(value) = read(marks) {
                     return Some(value);
                 }
@@ -386,12 +413,13 @@ mod tests {
 
     use super::*;
     use crate::facts::Device;
+    use crate::until::Until;
 
     const LAPTOP: Device = Device([1; 16]);
     const PHONE: Device = Device([2; 16]);
 
-    fn agent() -> NodeId {
-        NodeId::Agent(rho_agent_types::AgentId::from_encoded("00jvj4xuk96p").unwrap())
+    fn agent() -> Address {
+        Address::new("agent", "00jvj4xuk96p")
     }
 
     fn at(minute: i64) -> Zoned {
@@ -406,6 +434,81 @@ mod tests {
             at: at(minute),
             fact,
         }
+    }
+
+    /// Everything said of a node comes out again about another: the
+    /// attention facts as they were, each label still on it, and the name.
+    /// A label taken off again is not restated.
+    #[test]
+    fn a_nodes_marks_are_restated_as_another_node() {
+        let mut marks = Marks::default();
+        let gui = uuid::Uuid::new_v4();
+        let old = uuid::Uuid::new_v4();
+        let moved = Address::new("thread", "yyyy/41");
+        marks.apply([
+            said(
+                LAPTOP,
+                0,
+                Fact::Snooze {
+                    node: agent(),
+                    until: Until::In(SignedDuration::from_hours(1)),
+                },
+            ),
+            said(
+                LAPTOP,
+                1,
+                Fact::Labeled {
+                    node: agent(),
+                    label: gui,
+                    present: true,
+                },
+            ),
+            said(
+                LAPTOP,
+                2,
+                Fact::Labeled {
+                    node: agent(),
+                    label: old,
+                    present: true,
+                },
+            ),
+            said(
+                PHONE,
+                3,
+                Fact::Labeled {
+                    node: agent(),
+                    label: old,
+                    present: false,
+                },
+            ),
+            said(
+                PHONE,
+                4,
+                Fact::Named {
+                    node: agent(),
+                    name: Some("eng".into()),
+                },
+            ),
+        ]);
+        assert_eq!(
+            marks.get(&agent()).restated_as(&moved),
+            [
+                Fact::Snooze {
+                    node: moved.clone(),
+                    until: Until::In(SignedDuration::from_hours(1)),
+                },
+                Fact::Labeled {
+                    node: moved.clone(),
+                    label: gui,
+                    present: true,
+                },
+                Fact::Named {
+                    node: moved.clone(),
+                    name: Some("eng".into()),
+                },
+            ]
+        );
+        assert!(marks.get(&moved).restated_as(&agent()).is_empty());
     }
 
     #[test]
@@ -501,7 +604,7 @@ mod tests {
             deleted: false,
         };
         marks.apply_notes([rev(PHONE, 2, "buy milk"), rev(LAPTOP, 1, "buy")]);
-        assert_eq!(marks.get(&NodeId::Note(id)).title(), "buy milk");
+        assert_eq!(marks.get(&Address::note(id)).title(), "buy milk");
         assert_eq!(marks.notes().count(), 1);
     }
 

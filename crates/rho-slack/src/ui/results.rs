@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, EventEmitter, MouseButton, MouseUpEvent, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, MouseButton, MouseUpEvent, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
 use text::{Anchor, Bias};
@@ -385,7 +385,7 @@ impl ResultsView {
     }
 
     /// The place the cursor is on: what `enter` opens.
-    pub fn cursor_target(&self, cx: &mut Context<Self>) -> Option<Target> {
+    pub fn cursor_target(&self, cx: &App) -> Option<Target> {
         // A buffer position, not a display one: see `ListView::cursor_row`.
         let head = self.editor.read(cx).selections.newest_anchor().head();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);

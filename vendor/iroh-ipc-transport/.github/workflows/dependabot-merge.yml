@@ -1,0 +1,25 @@
+name: Merge tested dependencies
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Trusted completed-CI handler; never checks out pull-request code.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: merger
+        with:
+          app-id: ${{ secrets.RELEASE_MERGER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_MERGER_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - uses: legra-ai/github-actions/.github/actions/merge-tested-dependabot@7161b3b0fb80eb36ff9d92faccfced2a8001fe40
+        with:
+          token: ${{ steps.merger.outputs.token }}
+          app-id: ${{ secrets.RELEASE_MERGER_APP_ID }}

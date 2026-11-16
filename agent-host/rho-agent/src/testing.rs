@@ -100,7 +100,7 @@ pub(crate) fn services_pair(
 }
 
 /// The policy every test notebook gets: fixed instructions, a `human`
-/// whose sends are messages in one topic of the agent's, mentioning the
+/// whose sends are messages in one thread of the agent's, mentioning the
 /// user unless they are a status, and a fixed text after a compaction.
 const TEST_POLICY: &str = r#"
 import _rho
@@ -109,15 +109,15 @@ from rho import hooks
 hooks.instructions = lambda agent: "You are a test agent."
 
 def on_notebook(agent, ns):
-    topic = []
+    thread = []
 
     class Human:
         def send(self, text, kind):
             mentions = [] if kind == "status" else [("user", kind)]
-            if topic:
-                _rho.post(agent.id, topic[0], text, mentions=mentions)
+            if thread:
+                _rho.post(agent.id, thread[0], text, mentions=mentions)
             else:
-                topic.append(_rho.start_topic(agent.id, "rho", "test", text, mentions=mentions)[0])
+                thread.append(_rho.post(agent.id, None, text, mentions=mentions))
     ns["human"] = Human()
 
 hooks.on_notebook = on_notebook
@@ -174,7 +174,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                     }
                     PyRequest::Post {
                         sender,
-                        topic,
+                        parent,
                         mentions,
                         content,
                     } => {
@@ -185,39 +185,10 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                             mentions,
                             content,
                         };
-                        match write.post(rho_agent_types::UnixMs::now(), topic, message, None) {
+                        match write.post(rho_agent_types::UnixMs::now(), parent, message, None) {
                             Ok(id) => {
                                 write.commit();
                                 PyReply::Seq(id.0)
-                            }
-                            Err(error) => PyReply::Error(format!("{error:#}")),
-                        }
-                    }
-                    PyRequest::StartTopic {
-                        sender,
-                        stream,
-                        name,
-                        mentions,
-                        content,
-                    } => {
-                        let db = db(sender)?;
-                        let mut write = db.write().await;
-                        let now = rho_agent_types::UnixMs::now();
-                        let first = NewMessage {
-                            from: rho_agent_types::Address::Agent(sender),
-                            mentions,
-                            content,
-                        };
-                        let started = write
-                            .stream(now, stream)
-                            .and_then(|stream| write.start_topic(now, stream, name, first, None));
-                        match started {
-                            Ok((topic, first)) => {
-                                write.commit();
-                                let message = crate::store::ChatRead::message(&db.read(), first)
-                                    .expect("just posted");
-                                debug_assert_eq!(message.topic, topic);
-                                PyReply::Messages(vec![message])
                             }
                             Err(error) => PyReply::Error(format!("{error:#}")),
                         }

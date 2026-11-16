@@ -1,6 +1,7 @@
 # ARCH-agent-host: Worksets, chat, and Python policy
 
-Approved in discussion with maan2003 on 2026-10-31. The runtimes inside a
+Approved in discussion with maan2003 on 2026-10-31; the chat as a forest on
+2026-11-15 ([docs/rho2.md](../../docs/rho2.md)). The runtimes inside a
 workset process are in [ARCH-rho-agent](../rho-agent/specs/ARCH-rho-agent.md).
 
 ## Shape
@@ -36,9 +37,10 @@ which model, how messages reach them, and workset setup.
   calls. A Claude agent sees its tool as
   `mcp__py__exec` there, because the server-side review skips a bare name
   that is not built in.
-- **GUI.** A chat client of several hosts, with the dealer, a directory of agents, and a viewer
-  of workset logs. It runs no Python: it sends code the user wrote, to create
-  a workset or to evaluate in one. It never builds that code from content it
+- **GUI.** A chat client of several hosts, with the dealer, and a viewer of
+  workset logs; an agent's transcript opens from a thread it is in, never
+  from a list. It runs no Python: it sends code the user wrote, to create a
+  workset or to evaluate in one. It never builds that code from content it
   displays.
 
 ## The workset log
@@ -75,37 +77,55 @@ worker's memory, and a crash loses them
 
 ## Chat
 
-Chat is how people and agents talk, shaped like Zulip: streams hold topics,
-and topics hold messages. Each host owns one append-only chat log, dense from
-1; a stream, topic or message is named by the sequence number of the event
-that made it. A fresh log is empty: there is no default stream, and whoever
-starts a topic names its stream, which is made on first use. A host's chat is
-its own: a GUI attached to several hosts shows each host's streams, and what
-agents of different hosts say to each other (below) is not chat. The log lives
-on the host because the GUI is often offline and chat crosses worksets, and it
-survives workset deletion.
+Chat is how people and agents talk: one forest of messages per host. Each
+host owns one append-only chat log, dense from 1, of five events: `Posted`
+(with an optional parent), `Reparented`, `Joined`, `Left` and `Named`. A
+message is named by the sequence number of the event that posted it, and
+the thread under `#41` is the message `41` with everything below it. A root
+message is what the GUI shows as a channel; a reply to it is what a topic
+was; replies nest without limit. A fresh log is empty, and a channel is a
+root the user posts. The store folds the log into a parent index, a
+children index, the membership and each agent's inbox in the commit of
+every append, so a thread is read as a range. A host's chat is its own: a
+GUI attached to several hosts shows each host's roots in one list, with the
+host as a tag, and what agents of different hosts say to each other (below)
+is not chat. The log lives on the host because the GUI is often offline and
+chat crosses worksets, and it survives workset deletion.
 
-Chat and agents are separate hierarchies. They meet only through a topic's
-members and through mentions. A message reaches its conversation's members and
-every agent it mentions, never its sender. A topic's members are the agents
-that joined it. Only Python joins agents to topics, so the host never
-joins anyone on its own. The default delivery (`rho.hooks.deliver`) joins an
-agent to the topic it was started from and to a topic where the user
-mentions it. A mention by an agent only reaches. A policy with other rules
-replaces the whole delivery, not one rule of it. Who receives a message is
-fixed when it is posted, so a later member reads older messages, not receives
-them. Two agents talk in their direct conversation, which is a conversation
-outside every stream. Its members are its two agents, only they post in it,
-and no one joins it. The two may be in different worksets of the host. The
-default tools name it `agents.message`, not chat: an agent reads a message in
-it as a message from the other agent, with no conversation id. Chat is the
-user's. The GUI neither lists direct conversations nor makes cards for them:
-each agent's own transcript shows what it sent and received.
+Chat and agents are separate hierarchies. They meet only through
+membership and through mentions. Membership is per thread and covers the
+subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
+an agent joined to a root receives the whole channel, like a bot, and a
+leave on a subthread cuts that branch. A message reaches every member of
+the thread it is posted in and every agent it mentions, never its sender;
+who receives it is fixed when it is posted and written to each receiver's
+inbox with it, so a later member reads older messages, not receives them.
+Only Python joins agents to threads (`rho.chat.join`), so the host never
+joins anyone on its own: the default delivery (`rho.hooks.deliver`) joins an
+agent to the thread it was started from and to a thread where the user
+mentions it. A policy with other rules replaces the whole delivery, not one
+rule of it.
+
+A move is a parent change (`Reparented`) and the subtree follows; a message
+is read in the thread it is in now, so `#41` always leads to it. `Named` is
+the only thread metadata: without a name the GUI shows the first line of
+the thread's message. The host names a thread under a root once, when its
+second message arrives and nothing has named it, from a model's reading of
+those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
+`result` mention, and the user says so in the ledger, which is theirs
+([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
+host's: it lives with the dealer's marks in the GUI's synced ledger.
+
+Agent-to-agent messaging is not chat. `agents.message` is mail: the host
+hands the text to the receiving agent as an input and keeps no log of it;
+the two transcripts are the record. The two agents may be in different
+worksets of the host. An Engineer's child or Advisor is briefed by mail and
+reports by mail.
 
 An agent talks to an agent on another harness over GCCP
 ([docs/gccp.md](../../docs/gccp.md)). That is not chat: nothing of it is in the
 chat log and no client syncs it. An agent's address is the host's iroh endpoint
-id and the agent's id, so only a host that listens over iroh speaks GCCP. Trust
+id and the agent's id; every host listens over iroh, so every host speaks GCCP. Trust
 has two levels. The user approves a harness by its endpoint (`rho iroh approve
 --role gccp`). That approval is kept apart from the clients', and each lets an
 endpoint through on its own ALPN only, so a harness never gets what a client
@@ -124,16 +144,6 @@ send again. The user sees approved harnesses and
 acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
 and `rho gccp remove`.
 
-An agent leaves a topic itself (`chat.leave`), or the user takes it out.
-The user, or an agent of the topic through Python, may rename a topic, move
-it to another stream, or resolve it when its work is done; each change logs
-the topic's whole head. They may also move messages to another topic, which
-may be new. The default tools let an agent edit only topics it is in. A move delivers nothing
-again, and a message is read in the topic it is in now, so `#41` always
-leads to it. A direct conversation is never renamed, moved or resolved, and
-its messages stay in it. What the user has read is the user's, not the
-host's: it lives with the dealer's marks in the GUI's synced desk.
-
 A mention carries a kind (`ask`, `result`, `fyi`); a mention of the user is
 the only way a message asks for the user's attention, so a message has no kind
 of its own. The user's mentions of agents are `ask`.
@@ -141,11 +151,10 @@ of its own. The user's mentions of agents are `ask`.
 The message comes first and the agent second. The GUI starts an agent from an
 existing message, and Python records that message as the agent's `origin` prop
 (`chat:<message id>`), not as a host field, so other origins such as Slack can
-follow. The default policy then joins the agent to the message's topic and
-hands it that message first. An Engineer's child or Advisor is briefed in their
-direct conversation with it, and reports there with `agents.message`.
+follow. The default policy then joins the agent to that message's thread and
+hands it that message first.
 
-Agents post with `rho.chat`, always naming the conversation. Policy Python
+Agents post with `rho.chat.post`, always naming the parent. Policy Python
 reads each agent's inbox and hands each message to the agent as an input that
 names it. The delivery position is derived from the `Request` rows that carried
 them, so the chat log keeps no cursors. Slack is not chat: agents reach it through the host's

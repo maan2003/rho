@@ -3,7 +3,7 @@
 //! The stream performs OAuth signaling and publishes client-local semantic
 //! context. Provider control events stay on the agent host's OpenAI sideband.
 
-use rho_agent_types::{AgentId, TopicId};
+use rho_agent_types::{AgentId, MessageId};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Opens a voice session with the client's SDP offer. Answered with
@@ -12,10 +12,10 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Open {
     pub offer_sdp: String,
-    /// The agent the user talks to, in `topic`: the session starts with
-    /// the topic's latest turns and posts every request in it.
+    /// The agent the user talks to, in `thread`: the session starts with
+    /// the thread's latest turns and posts every request in it.
     pub agent_id: AgentId,
-    pub topic: TopicId,
+    pub thread: MessageId,
 }
 
 impl rho_rpc::protocol::ProtocolOpen for Open {

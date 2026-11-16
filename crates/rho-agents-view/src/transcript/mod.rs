@@ -49,7 +49,7 @@ use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::render::{BlockKind, RenderedBlock, TranscriptView, block_kind};
+use crate::render::{self, BlockKind, RenderedBlock, block_kind, block_visible};
 use crate::visualization::Visualization;
 
 mod store;
@@ -57,7 +57,6 @@ mod store;
 pub use store::{FrameChange, TranscriptFrame, Transcripts};
 
 pub struct TranscriptModel {
-    view: TranscriptView,
     multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript excerpt omits its rendering
     /// sentinel, then crops every trailing separator when the turn closes.
@@ -213,13 +212,11 @@ enum DocumentTail {
 
 impl TranscriptModel {
     pub fn new(
-        view: TranscriptView,
         multi_buffer: Entity<MultiBuffer>,
         document_multi_buffer: Entity<MultiBuffer>,
         visualization_client: AgentsLink,
     ) -> Self {
         Self {
-            view,
             multi_buffer,
             document_multi_buffer,
             document_tail: None,
@@ -248,7 +245,6 @@ impl TranscriptModel {
     /// draws, and history above the opening tail is rendered when the
     /// reader asks for it.
     pub(crate) fn prepare_initial(
-        view: TranscriptView,
         state: UiAgentState,
         now_ms: u64,
         agent_labels: HashMap<AgentId, String>,
@@ -257,10 +253,9 @@ impl TranscriptModel {
         let visible = state
             .blocks
             .iter()
-            .map(|b| view.visible(b))
+            .map(|b| block_visible(b))
             .collect::<Vec<_>>();
         let first_block = tail_start(
-            view,
             &state.blocks,
             state.blocks.len(),
             OPENING_ROWS,
@@ -268,7 +263,6 @@ impl TranscriptModel {
             &label,
         );
         let chunks = render_chunks(
-            view,
             &state.blocks,
             &visible,
             first_block..state.blocks.len(),
@@ -474,7 +468,7 @@ impl TranscriptModel {
             .unwrap_or(&[])
             .iter()
             .map(|block| {
-                let block = self.view.render(block, prev_kind, now_ms, &label);
+                let block = render::render(block, prev_kind, now_ms, &label);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
@@ -785,7 +779,6 @@ impl TranscriptModel {
         }
         if index != first_changed
             && (!matches!(incremental, IncrementalUpdate::MessageDraft { .. })
-                || self.view != TranscriptView::Conversation
                 || self.records[first_changed..index]
                     .iter()
                     .any(|record| record.visible))
@@ -811,9 +804,7 @@ impl TranscriptModel {
         let Some(block) = self.blocks.get(block_index) else {
             return false;
         };
-        let rendered = self
-            .view
-            .render(block, prev_kind, now_ms, &|id| self.label(id));
+        let rendered = render::render(block, prev_kind, now_ms, &|id| self.label(id));
         let old_record = &self.records[index];
         if old_record.kind != rendered.kind || old_record.visible != rendered.visible() {
             return false;
@@ -928,9 +919,9 @@ impl TranscriptModel {
         self.blocks.truncate(first_changed);
         self.visible.truncate(first_changed);
         for block in &state.blocks[first_changed..] {
-            self.visible.push(self.view.visible(block));
-            for agent in block.agents() {
-                self.agent_labels.insert(agent, agent_label(agent));
+            self.visible.push(block_visible(block));
+            if let UiBlock::MessageDraft { from, .. } = &**block {
+                self.agent_labels.insert(*from, agent_label(*from));
             }
             self.blocks.push(block.clone());
         }
@@ -1018,15 +1009,7 @@ impl TranscriptModel {
         }
         let from = {
             let label = |id| self.label(id);
-            tail_start(
-                self.view,
-                &self.blocks,
-                self.uncomposed,
-                rows,
-                now_ms,
-                &label,
-            )
-            .max(self.head)
+            tail_start(&self.blocks, self.uncomposed, rows, now_ms, &label).max(self.head)
         };
         self.compose_range(from..self.uncomposed, FillEdge::Tail, now_ms, cx);
         self.has_uncomposed()
@@ -1052,7 +1035,6 @@ impl TranscriptModel {
         let end = {
             let label = |id| self.label(id);
             head_end(
-                self.view,
                 &self.blocks,
                 self.head,
                 self.uncomposed,
@@ -1077,14 +1059,7 @@ impl TranscriptModel {
     ) {
         let chunks = {
             let label = |id| self.label(id);
-            render_chunks(
-                self.view,
-                &self.blocks,
-                &self.visible,
-                range.clone(),
-                now_ms,
-                &label,
-            )
+            render_chunks(&self.blocks, &self.visible, range.clone(), now_ms, &label)
         };
         let mut gutters_changed = false;
         let (new_buffers, new_records) = Self::build_chunks(chunks, &mut gutters_changed, cx);
@@ -1638,7 +1613,6 @@ pub struct StorePoint {
 /// than one block. Rendering a block to count its rows is cheap beside
 /// laying it out, and what this bounds is what gets laid out.
 fn tail_start(
-    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     end: usize,
     rows: usize,
@@ -1649,7 +1623,7 @@ fn tail_start(
     let mut start = end;
     while start > 0 && counted < rows {
         start -= 1;
-        let rendered = view.render(&blocks[start], None, now_ms, label);
+        let rendered = render::render(&blocks[start], None, now_ms, label);
         counted += rendered
             .spans
             .iter()
@@ -1665,7 +1639,6 @@ fn tail_start(
 /// and as cheap: rendering a block to count its rows costs nothing beside
 /// laying it out.
 fn head_end(
-    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     start: usize,
     end: usize,
@@ -1676,7 +1649,7 @@ fn head_end(
     let mut counted = 0;
     let mut at = start;
     while at < end && counted < rows {
-        let rendered = view.render(&blocks[at], None, now_ms, label);
+        let rendered = render::render(&blocks[at], None, now_ms, label);
         counted += rendered
             .spans
             .iter()
@@ -1692,7 +1665,6 @@ fn head_end(
 /// with all of history above it, so composing that history later leaves
 /// every chunk's text exactly as it is.
 fn render_chunks(
-    view: TranscriptView,
     blocks: &[Arc<UiBlock>],
     visible: &[bool],
     range: Range<usize>,
@@ -1707,7 +1679,7 @@ fn render_chunks(
     let mut rows = 0;
     let mut fence_open = false;
     for index in range {
-        let rendered = view.render(&blocks[index], prev, now_ms, label);
+        let rendered = render::render(&blocks[index], prev, now_ms, label);
         if rendered.visible() {
             prev = Some(rendered.kind);
         }
@@ -2221,8 +2193,7 @@ mod tests {
     use rho_agents_client::protocol::transcript::ArgumentsFormat;
     use rho_agents_client::state::{UiBlock, UiTool, UiToolStatus};
 
-    use super::{head_end, render_chunks, rendered_text_edit, tail_start};
-    use crate::TranscriptView;
+    use super::{block_visible, head_end, render_chunks, rendered_text_edit, tail_start};
 
     fn call(source: &str) -> Arc<UiBlock> {
         Arc::new(UiBlock::Tool(UiTool {
@@ -2247,23 +2218,19 @@ mod tests {
                 text: "please investigate".into(),
             }),
             call("print('checking')"),
-            Arc::new(UiBlock::MessageSent {
-                to: None,
+            Arc::new(UiBlock::AssistantMessage {
                 text: "I found the cause".into(),
+                phase: None,
             }),
             Arc::new(UiBlock::Notice {
                 text: "connection lost".into(),
             }),
         ];
-        for (view, mask) in [
-            (TranscriptView::Conversation, vec![true, false, true, true]),
-            (TranscriptView::Activity, vec![false, true, false, true]),
-        ] {
-            let visible: Vec<_> = blocks.iter().map(|block| view.visible(block)).collect();
+        {
+            let mask = vec![true, true, true, true];
+            let visible: Vec<_> = blocks.iter().map(|block| block_visible(block)).collect();
             assert_eq!(visible, mask);
-            let chunks = render_chunks(view, &blocks, &visible, 0..blocks.len(), 0, &|_| {
-                String::new()
-            });
+            let chunks = render_chunks(&blocks, &visible, 0..blocks.len(), 0, &|_| String::new());
             assert_eq!(
                 chunks
                     .iter()
@@ -2274,18 +2241,9 @@ mod tests {
             );
             let text: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
             assert!(text.contains("connection lost"), "{text}");
-            assert_eq!(
-                text.contains("please investigate"),
-                view == TranscriptView::Conversation
-            );
-            assert_eq!(
-                text.contains("I found the cause"),
-                view == TranscriptView::Conversation
-            );
-            assert_eq!(
-                text.contains("print('checking') reported"),
-                view == TranscriptView::Activity
-            );
+            assert!(text.contains("please investigate"), "{text}");
+            assert!(text.contains("I found the cause"), "{text}");
+            assert!(text.contains("print('checking') reported"), "{text}");
             assert!(
                 !text.contains("not downloaded"),
                 "do not start rendering output bodies"
@@ -2294,31 +2252,19 @@ mod tests {
     }
 
     #[test]
-    fn lazy_history_counts_only_rows_visible_in_its_view() {
-        let message = Arc::new(UiBlock::MessageSent {
-            to: None,
+    fn lazy_history_counts_visible_rows() {
+        let message = Arc::new(UiBlock::AssistantMessage {
             text: "older message".into(),
+            phase: None,
         });
         let source = call(&"print('noise')\n".repeat(100));
         let label = |_| String::new();
+        // The source alone fills the row budget, so the message beyond it
+        // stays uncomposed from either end.
         let blocks = vec![message.clone(), source.clone()];
-        assert_eq!(
-            tail_start(TranscriptView::Conversation, &blocks, 2, 5, 0, &label),
-            0
-        );
-        assert_eq!(
-            tail_start(TranscriptView::Activity, &blocks, 2, 5, 0, &label),
-            1
-        );
+        assert_eq!(tail_start(&blocks, 2, 5, 0, &label), 1);
         let blocks = vec![source, message];
-        assert_eq!(
-            head_end(TranscriptView::Conversation, &blocks, 0, 2, 5, 0, &label),
-            2
-        );
-        assert_eq!(
-            head_end(TranscriptView::Activity, &blocks, 0, 2, 5, 0, &label),
-            1
-        );
+        assert_eq!(head_end(&blocks, 0, 2, 5, 0, &label), 1);
     }
 
     #[test]

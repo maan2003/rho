@@ -1,4 +1,4 @@
-//! Recover the literal prefix of a live Python `chat.post(topic, …,
+//! Recover the literal prefix of a live Python `chat.post(thread, …,
 //! mention="user", …)` call: the message to the user the model is writing.
 //! While the text streams its mention is not written yet, so any post is
 //! shown; a finished post that does not mention the user is not.
@@ -34,20 +34,20 @@ pub(crate) fn tool_preview(
         .ok()?;
     let text = preview(&mut parser, &source)?;
     Some(rho_agents_client::protocol::transcript::Draft {
-        topic: post_topic(&mut parser, &source),
+        thread: post_thread(&mut parser, &source),
         text,
     })
 }
 
-/// The topic the latest post names, when it names it as a number: where
+/// The thread the latest post names, when it names it as a number: where
 /// the draft will land.
-fn post_topic(parser: &mut Parser, source: &str) -> Option<rho_agent_types::TopicId> {
+fn post_thread(parser: &mut Parser, source: &str) -> Option<rho_agent_types::MessageId> {
     let tree = parser.parse(source, None)?;
     let at = last_send(tree.root_node(), source)? + SEND.len();
     let rest = source[at..].trim_start().strip_prefix('(')?;
     let (topic, _) = rest.split_once(',')?;
     let topic = topic.trim().parse().ok()?;
-    Some(rho_agent_types::TopicId(rho_agent_types::ChatSeq(topic)))
+    Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(topic)))
 }
 
 pub(crate) fn preview(parser: &mut Parser, source: &str) -> Option<String> {
@@ -525,18 +525,18 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_names_the_topic_its_post_names() {
-        use rho_agent_types::{ChatSeq, TopicId};
+    fn a_draft_names_the_thread_its_post_names() {
+        use rho_agent_types::{ChatSeq, MessageId};
         use rho_agents_client::protocol::transcript::ArgumentsFormat;
         let draft = |source: &str| tool_preview("exec", source, ArgumentsFormat::Text);
         let topic = |draft: Option<rho_agents_client::protocol::transcript::Draft>| {
-            draft.map(|draft| (draft.topic, draft.text))
+            draft.map(|draft| (draft.thread, draft.text))
         };
         assert_eq!(
             topic(draft(
                 "chat.post(7, 'old', mention='user', kind='fyi')\nchat.post( 41 , 'Hel"
             )),
-            Some((Some(TopicId(ChatSeq(41))), "Hel".to_owned()))
+            Some((Some(MessageId(ChatSeq(41))), "Hel".to_owned()))
         );
         assert_eq!(
             topic(draft("chat.post(topic, 'Hel")),

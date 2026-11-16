@@ -181,7 +181,7 @@ pub fn new_agent_in(
 }
 
 /// `origin=`: the chat message an agent starts from. Policy keeps it as
-/// the agent's `origin` prop, joins its topic, and hands it the message.
+/// the agent's `origin` prop, joins its thread, and hands it the message.
 fn origin_arg(origin: Option<MessageId>) -> String {
     origin.map_or_else(String::new, |message| {
         format!(", origin={}", py_str(&format!("chat:{}", message.0.0)))

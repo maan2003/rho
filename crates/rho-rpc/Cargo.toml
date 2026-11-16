@@ -8,10 +8,16 @@ version.workspace = true
 
 [features]
 default = []
-native-client = ["iroh/qlog", "iroh/tls-aws-lc-rs", "dep:rustls"]
+native-client = [
+  "iroh/qlog",
+  "iroh/tls-aws-lc-rs",
+  "dep:iroh-ipc-transport",
+  "dep:rustls",
+]
 server = [
   "iroh/qlog",
   "iroh/tls-aws-lc-rs",
+  "dep:iroh-ipc-transport",
   "dep:noq-proto",
   "dep:redb",
   "dep:rho-db",
@@ -24,6 +30,7 @@ anyhow.workspace = true
 async-compression.workspace = true
 bytes.workspace = true
 iroh.workspace = true
+iroh-ipc-transport = { workspace = true, optional = true }
 futures.workspace = true
 noq-proto = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }

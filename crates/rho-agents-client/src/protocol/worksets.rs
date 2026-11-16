@@ -1,14 +1,13 @@
 //! The agents protocol
 //! ([ARCH-agent-host](../../../../agent-host/specs/ARCH-agent-host.md)):
-//! worksets, the agent directory and chat.
+//! worksets and the agent directory. Chat is its own protocol (`rho-chat`).
 //!
-//! The session ([`Open::Session`]) carries the chat log, the directory, the
-//! rows of the worksets a client follows, and the live tails of the agents
-//! it looks at. Everything else is one call ([`Open::Request`]).
+//! The session ([`Open::Session`]) carries the directory, the rows of the
+//! worksets a client follows, and the live tails of the agents it looks at.
+//! Everything else is one call ([`Open::Request`]).
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, MessageId, Props, Role, StreamId, TopicId, UnixMs,
-    WorksetId, WorksetKind, Wpos,
+    AgentId, EndpointId, MessageId, Props, Role, UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -38,19 +37,6 @@ rho_rpc::calls! {
         CreateWorkset(CreateWorkset) -> CreatedWorkset;
         /// Code run in a workset's namespace; answered when it ends.
         Eval(Eval) -> EvalResult;
-        /// A message from the user. Logged once per `client_id`.
-        Post(Post) -> MessageId;
-        /// A topic the user starts with its first message. Logged once per
-        /// `client_id`.
-        StartTopic(StartTopic) -> TopicId;
-        CreateStream(CreateStream) -> StreamId;
-        /// The user takes an agent out of a topic.
-        Leave(Leave) -> ();
-        /// Renames a topic, moves it to another stream, or resolves it.
-        ChangeTopic(ChangeTopic) -> ();
-        /// Moves messages to a topic, which may be new; answered with the
-        /// topic they are in. Logged once per `client_id`.
-        MoveMessages(MoveMessages) -> TopicId;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
         Cancel(Cancel) -> ();
@@ -105,72 +91,6 @@ pub struct CreatedWorkset {
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Post {
-    /// The client's own random name for the message, so a resend after a
-    /// lost answer is logged once.
-    pub client_id: u64,
-    pub topic: TopicId,
-    /// Agents the message reaches whether or not they are members. It
-    /// does not make them members.
-    pub mentions: Vec<AgentId>,
-    pub content: Vec<ContentPart>,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct StartTopic {
-    /// As in [`Post`].
-    pub client_id: u64,
-    pub stream: StreamId,
-    pub name: String,
-    /// As in [`Post`].
-    pub mentions: Vec<AgentId>,
-    pub content: Vec<ContentPart>,
-}
-
-/// The stream of that name, created if the host has none. A stream's name
-/// is unique on its host, so a resend finds the one it made.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct CreateStream {
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Leave {
-    pub topic: TopicId,
-    pub agent: AgentId,
-}
-
-/// A topic as it is to be, whole. Not for a direct conversation.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct ChangeTopic {
-    pub topic: TopicId,
-    pub stream: StreamId,
-    pub name: String,
-    pub resolved: bool,
-}
-
-/// Messages of topics, in any order, to one topic. A direct conversation's
-/// messages stay where they are.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct MoveMessages {
-    /// As in [`Post`]: a resend after a lost answer starts no second topic.
-    pub client_id: u64,
-    pub messages: Vec<MessageId>,
-    pub to: MoveTo,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum MoveTo {
-    Topic(TopicId),
-    /// A topic started for them, with no members: its first message is the
-    /// oldest one moved.
-    NewTopic {
-        stream: StreamId,
-        name: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Cancel {
     pub agent: AgentId,
 }
@@ -211,10 +131,6 @@ pub enum LogNext {
 /// What a client says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
-    /// After [`ServerFrame::Hello`]: the newest chat event this client
-    /// holds (zero for none). The host sends every later one, then each new
-    /// one.
-    FollowChat { since: ChatSeq },
     /// The worksets whose rows this client wants pushed as they land, each
     /// from the position it holds. Replaces the set wholesale; a workset
     /// this stream already follows goes on from the rows it sent, so none
@@ -230,8 +146,8 @@ pub enum ServerFrame {
     /// The first frame.
     Hello {
         machine_seed: u64,
-        /// The newest chat event on the host.
-        chat_head: ChatSeq,
+        /// The host's iroh identity, which names its threads.
+        endpoint: EndpointId,
         /// The last agent-id counter handed out, for short-prefix rendering.
         agent_counter: u64,
     },
@@ -253,11 +169,6 @@ pub enum ServerFrame {
     },
     /// An agent was created or its spec changed: the whole entry.
     Agent(AgentEntry),
-    /// Chat events in log order: the answer to `FollowChat`, paged, then
-    /// each new one.
-    Chat {
-        records: Vec<ChatRecord>,
-    },
     /// Rows of a followed workset, in order, never repeated or skipped.
     Rows {
         workset: WorksetId,
@@ -430,7 +341,7 @@ impl LogEvent {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind};
+    use rho_agent_types::AgentIdDomain;
 
     use super::*;
 
@@ -440,60 +351,39 @@ mod tests {
         frame: T,
     ) {
         let bytes = senax_encoder::pack(&frame).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: T = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(frame, decoded);
+        let back: T = senax_encoder::unpack(&mut &bytes[..]).unwrap();
+        assert_eq!(back, frame);
     }
 
     #[test]
     fn frames_round_trip() {
-        let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
-        let workset: WorksetId = "0123456789ab".parse().unwrap();
-        round_trips(ClientFrame::FollowChat { since: ChatSeq(9) });
+        let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
         round_trips(ClientFrame::FollowWorksets {
-            from: vec![(workset, Wpos(3))],
+            from: vec![(WorksetId([1; 6]), Wpos(4))],
         });
-        round_trips(ServerFrame::Chat {
-            records: vec![ChatRecord {
-                seq: ChatSeq(4),
-                at: UnixMs(5),
-                event: ChatEvent::Posted {
-                    topic: TopicId(ChatSeq(2)),
-                    from: Address::Agent(agent_id),
-                    mentions: vec![Mention {
-                        to: Address::User,
-                        kind: MentionKind::Ask,
-                    }],
-                    content: vec![ContentPart::Text {
-                        text: "which branch?".into(),
-                    }],
-                },
-            }],
+        round_trips(ClientFrame::Focus {
+            agent_ids: vec![agent],
         });
-        round_trips(ServerFrame::Status {
-            agent_id,
-            state: RuntimeState {
-                inference: super::super::transcript::InferenceState::Failed {
-                    error: "quota".into(),
-                },
-                ..Default::default()
-            },
+        round_trips(ServerFrame::Hello {
+            machine_seed: 9,
+            endpoint: EndpointId([9; 32]),
+            agent_counter: 3,
         });
         round_trips(ServerFrame::Rows {
-            workset,
+            workset: WorksetId([1; 6]),
             rows: vec![(
-                Wpos(7),
+                Wpos(2),
                 LogEvent::Request {
-                    agent: agent_id,
+                    agent,
                     inputs: vec![InputView {
-                        message: Some(MessageId(ChatSeq(4))),
+                        message: Some(MessageId(rho_agent_types::ChatSeq(4))),
                         text: "hi".into(),
                         role: Role::User,
                     }],
                     answers: true,
                     compaction: false,
                     timing: None,
-                    at: UnixMs(8),
+                    at: UnixMs(7),
                 },
             )],
         });
@@ -501,64 +391,26 @@ mod tests {
 
     #[test]
     fn requests_round_trip() {
-        let agent = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
-        for request in [
-            Request::from(Post {
-                client_id: 7,
-                topic: TopicId(ChatSeq(2)),
-                mentions: vec![agent],
-                content: vec![ContentPart::Image {
-                    media_type: "image/gif".to_owned(),
-                    data: vec![1, 2, 3],
-                }],
-            }),
+        let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
+        round_trips(Open::Request(
             CreateWorkset {
-                kind: WorksetKind::Host {
-                    cwd: "/src/notes".into(),
-                },
+                kind: WorksetKind::Isolated,
                 code: "new_agent()".into(),
             }
             .into(),
-            StartTopic {
-                client_id: 8,
-                stream: StreamId(ChatSeq(1)),
-                name: "Fix the flaky test".into(),
-                mentions: Vec::new(),
-                content: vec![ContentPart::Text { text: "go".into() }],
-            }
-            .into(),
-            CreateStream { name: "rho".into() }.into(),
-            Leave {
-                topic: TopicId(ChatSeq(2)),
+        ));
+        round_trips(Open::Request(Cancel { agent }.into()));
+        round_trips(Open::Request(
+            AgentLog {
                 agent,
+                from: Wpos(0),
             }
             .into(),
-            ChangeTopic {
-                topic: TopicId(ChatSeq(2)),
-                stream: StreamId(ChatSeq(1)),
-                name: "Fixed the flaky test".into(),
-                resolved: true,
-            }
-            .into(),
-            MoveMessages {
-                client_id: 9,
-                messages: vec![MessageId(ChatSeq(5)), MessageId(ChatSeq(3))],
-                to: MoveTo::NewTopic {
-                    stream: StreamId(ChatSeq(1)),
-                    name: "aside".into(),
-                },
-            }
-            .into(),
-            Cancel { agent }.into(),
-            super::super::QuotaUsage.into(),
-            super::super::SetAuthAccountEnabled {
-                name: "work".to_owned(),
-                enabled: false,
-            }
-            .into(),
-        ] {
-            round_trips(Open::Request(request));
-        }
-        round_trips(rho_rpc::protocol::Answer::Done(MessageId(ChatSeq(3))));
+        ));
+        round_trips(rho_rpc::protocol::Answer::Done(EvalResult {
+            output: "x".into(),
+            error: None,
+            agent: Some(agent),
+        }));
     }
 }

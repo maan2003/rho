@@ -6,7 +6,38 @@ use std::collections::HashMap;
 
 use rho_agent_hosts::{HostId, Hosts};
 
+use crate::map::AgentMap;
 use crate::protocol::{AuthState, QuotaSeries, QuotaSummary};
+
+/// What a merge needs of the attached hosts: each one's id and the name
+/// the user gave it, in a stable order. The frame's [`Hosts`] and the
+/// agents' [`AgentMap`] both know it.
+pub trait HostNames {
+    fn names(&self) -> Vec<(HostId, String)>;
+}
+
+impl HostNames for Hosts {
+    fn names(&self) -> Vec<(HostId, String)> {
+        self.iter()
+            .map(|host| (host.id, host.name.clone()))
+            .collect()
+    }
+}
+
+impl HostNames for AgentMap {
+    fn names(&self) -> Vec<(HostId, String)> {
+        self.hosts()
+            .map(|(host, name)| (host, name.to_owned()))
+            .collect()
+    }
+}
+
+fn label_of(names: &[(HostId, String)], host: HostId) -> &str {
+    names
+        .iter()
+        .find(|(id, _)| *id == host)
+        .map_or("", |(_, name)| name.as_str())
+}
 
 #[derive(Default)]
 pub struct Quotas {
@@ -39,7 +70,13 @@ impl Quotas {
         self.history.remove(&host);
     }
 
-    pub fn merged_summaries(&self, hosts: &Hosts) -> Vec<QuotaSummary> {
+    /// Whether any host has answered for its quota history yet.
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    pub fn merged_summaries(&self, hosts: &impl HostNames) -> Vec<QuotaSummary> {
+        let names = hosts.names();
         let mut merged: Vec<QuotaSummary> = Vec::new();
         for (host, summaries) in &self.summaries {
             for summary in summaries {
@@ -58,9 +95,9 @@ impl Quotas {
                     continue;
                 };
                 let mut summary = summary.clone();
-                if hosts.len() > 1 {
+                if names.len() > 1 {
                     summary.auth_namespace =
-                        Some(format!("{}/{}", hosts.host_label(*host), namespace));
+                        Some(format!("{}/{}", label_of(&names, *host), namespace));
                 }
                 merged.push(summary);
             }
@@ -78,7 +115,8 @@ impl Quotas {
 
     /// ChatGPT history is one line per host/namespace. Claude history keeps
     /// the previous tightest-host merge because it has no named auth scope.
-    pub fn merged_history(&self, hosts: &Hosts) -> Vec<QuotaSeries> {
+    pub fn merged_history(&self, hosts: &impl HostNames) -> Vec<QuotaSeries> {
+        let names = hosts.names();
         let mut merged: Vec<QuotaSeries> = Vec::new();
         for (host, series_set) in &self.history {
             for series in series_set {
@@ -87,9 +125,9 @@ impl Quotas {
                         continue;
                     };
                     let mut series = series.clone();
-                    if hosts.len() > 1 {
+                    if names.len() > 1 {
                         series.auth_namespace =
-                            Some(format!("{}/{}", hosts.host_label(*host), namespace));
+                            Some(format!("{}/{}", label_of(&names, *host), namespace));
                     }
                     merged.push(series);
                     continue;
@@ -123,14 +161,15 @@ impl Quotas {
         merged
     }
 
-    pub fn active_namespaces(&self, hosts: &Hosts) -> Vec<String> {
-        let qualify = hosts.len() > 1;
-        hosts
+    pub fn active_namespaces(&self, hosts: &impl HostNames) -> Vec<String> {
+        let names = hosts.names();
+        let qualify = names.len() > 1;
+        names
             .iter()
-            .filter_map(|host| {
-                let namespace = self.auth.get(&host.id)?.active_namespace.as_ref()?;
+            .filter_map(|(host, name)| {
+                let namespace = self.auth.get(host)?.active_namespace.as_ref()?;
                 Some(if qualify {
-                    format!("{}/{}", host.name, namespace)
+                    format!("{name}/{namespace}")
                 } else {
                     namespace.clone()
                 })

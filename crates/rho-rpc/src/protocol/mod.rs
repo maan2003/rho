@@ -1,8 +1,8 @@
 //! How a client and an agent host talk over [`Stream`](crate::Stream)s:
 //! the opening every stream starts with ([`Open`]), one-shot calls
-//! ([`Call`]), bounded frames, the agent host's Unix socket ([`client`],
-//! [`server`]), and protocol logs. Each protocol's own words live with the
-//! crate that speaks them ([`Protocol`]).
+//! ([`Call`]), bounded frames, the agent host on this machine ([`client`],
+//! [`RuntimePaths`]), and protocol logs. Each protocol's own words live
+//! with the crate that speaks them ([`Protocol`]).
 
 use anyhow::{Context as _, bail};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
@@ -67,72 +67,72 @@ macro_rules! calls {
 }
 
 pub mod client;
-#[cfg(not(target_family = "wasm"))]
-pub mod server;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/48";
+pub const IROH_ALPN: &[u8] = b"rho/ui/49";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP37";
 
+/// The agent host's runtime directory on this machine: where it meets its
+/// local peers (the IPC rendezvous in `ipc/`, its endpoint id in
+/// `endpoint`) and where the proxies agents use listen. By default
+/// `$XDG_RUNTIME_DIR/rho`; a rig names its own.
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimePaths {
-    socket: std::path::PathBuf,
     directory: std::path::PathBuf,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl RuntimePaths {
-    pub const SOCKET_ENV: &'static str = "RHO_SOCKET_PATH";
+    pub const RUNTIME_DIR_ENV: &'static str = "RHO_RUNTIME_DIR";
 
-    pub fn new(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
-        let socket = match socket {
-            Some(socket) => {
-                let socket = socket.into();
-                if socket.is_absolute() {
-                    socket
+    pub fn new(directory: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        let directory = match directory {
+            Some(directory) => {
+                let directory = directory.into();
+                if directory.is_absolute() {
+                    directory
                 } else {
                     std::env::current_dir()
-                        .context("resolve current directory for relative socket path")?
-                        .join(socket)
+                        .context("resolve current directory for relative runtime directory")?
+                        .join(directory)
                 }
             }
-            None => {
-                let base = dirs::runtime_dir()
-                    .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
-                base.join("rho").join("rho.sock")
-            }
+            None => dirs::runtime_dir()
+                .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?
+                .join("rho"),
         };
-        let directory = socket
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_owned();
-        Ok(Self { socket, directory })
+        Ok(Self { directory })
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::new(std::env::var_os(Self::SOCKET_ENV).map(std::path::PathBuf::from))
+        Self::new(std::env::var_os(Self::RUNTIME_DIR_ENV).map(std::path::PathBuf::from))
     }
 
-    pub fn resolve(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
-        match socket {
-            Some(socket) => Self::new(Some(socket)),
+    pub fn resolve(directory: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        match directory {
+            Some(directory) => Self::new(Some(directory)),
             None => Self::from_env(),
         }
     }
 
-    pub fn socket(&self) -> &std::path::Path {
-        &self.socket
-    }
-
     pub fn directory(&self) -> &std::path::Path {
         &self.directory
+    }
+
+    /// Where the host and its local peers find each other's sockets.
+    pub fn ipc_dir(&self) -> std::path::PathBuf {
+        self.directory.join("ipc")
+    }
+
+    /// The host's iroh endpoint id, written when it binds.
+    pub fn endpoint_file(&self) -> std::path::PathBuf {
+        self.directory.join("endpoint")
     }
 
     pub fn octo_socket(&self) -> std::path::PathBuf {
@@ -154,14 +154,6 @@ impl RuntimePaths {
     pub fn host_lock(&self) -> std::path::PathBuf {
         self.directory.join(".rho-agent-host.lock")
     }
-}
-
-/// Fixed per-user agent host socket used by normal clients.
-#[cfg(not(target_family = "wasm"))]
-pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(RuntimePaths::new(None::<std::path::PathBuf>)?
-        .socket()
-        .to_owned())
 }
 
 /// Which protocol a stream speaks. Each protocol's messages belong to the
@@ -190,9 +182,11 @@ pub enum Protocol {
     Workspace,
     /// Append-only sealed byte logs; the old Ledger protocol is retired.
     LedgerLog,
-    /// Worksets, the agent directory and chat (`rho-agents-client`,
+    /// Worksets and the agent directory (`rho-agents-client`,
     /// `protocol::worksets`). Replaces `Agents`.
     Worksets,
+    /// The host's chat: its log, and what the user says in it (`rho-chat`).
+    Chat,
 }
 
 /// The first frame on every stream: which protocol it speaks, and that
@@ -581,10 +575,11 @@ mod tests {
 
     #[test]
     fn explicit_runtime_paths_share_an_absolute_directory() {
-        let paths = RuntimePaths::new(Some("qa/rho.sock")).unwrap();
+        let paths = RuntimePaths::new(Some("qa")).unwrap();
 
-        assert!(paths.socket().is_absolute());
-        assert_eq!(paths.socket().parent(), Some(paths.directory()));
+        assert!(paths.directory().is_absolute());
+        assert_eq!(paths.ipc_dir(), paths.directory().join("ipc"));
+        assert_eq!(paths.endpoint_file(), paths.directory().join("endpoint"));
         assert_eq!(paths.octo_socket(), paths.directory().join("octo.sock"));
         assert_eq!(
             paths.browser_socket(),

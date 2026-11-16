@@ -86,9 +86,10 @@ def _spawner_of(props: dict) -> str | None:
 
 
 class Chat:
-    """Posting in the host's chat. A message reaches the members of its
-    topic and the agents it mentions. Agents join a topic to follow it. The
-    user is reached by a mention; another agent, by `agents.message`."""
+    """Posting in the host's chat, a forest of messages. A message reaches
+    the members of its thread and of the threads above, and the agents it
+    mentions. Agents join a thread to follow it. The user is reached by a
+    mention; another agent, by `agents.message`."""
 
     def __init__(self, agent: str):
         self._agent = agent
@@ -116,96 +117,99 @@ class Chat:
             mentions.append((agent, kind))
         return mentions
 
-    def post(self, topic, text, *, mention=None, kind=None):
-        """Post `text` in `topic`, the id each message arrives with. To reach
+    def post(self, thread, text, *, mention=None, kind=None):
+        """Post `text` in `thread`, the id each message arrives with. To reach
         the user, mention "user" with a kind: "ask", "result" or "fyi"."""
         text = _text(text)
         mentions = self._mentions(mention, kind)
-        rho_chat.post(self._agent, int(topic), text, mentions)
+        self._thread(thread)
+        rho_chat.post(self._agent, int(thread), text, mentions)
         if any(address == rho_chat.USER for address, _ in mentions):
             return Reply("")
-        return report(f"Posted in #{int(topic)}.")
+        return report(f"Posted in #{int(thread)}.")
 
-    def start(self, stream, name, text, *, mention=None, kind=None):
-        """Start a topic named `name` in `stream`, with `text` as its first
-        message, for a new subject. You join it; others follow it when they
-        join or are mentioned. Returns its id."""
+    def start(self, stream, text, *, mention=None, kind=None):
+        """Start a thread for a new subject in `stream`, a root of the chat
+        made if it is new, with `text` as its first message, and join it.
+        Returns the thread's id."""
         text = _text(text)
         mentions = self._mentions(mention, kind)
-        topic, _ = rho_chat.start(self._agent, str(stream), str(name), text, mentions)
-        rho_chat.join(topic, self._agent)
-        print(f"Started topic #{topic}.")
-        return topic
+        stream = _text(stream)
+        root = rho_chat.root(stream)
+        if root is None:
+            root = rho_chat.post(self._agent, None, stream)
+        thread = rho_chat.post(self._agent, root, text, mentions)
+        rho_chat.join(thread, self._agent)
+        print(f"Started #{thread}.")
+        return thread
 
-    def join(self, topic):
-        """Receive every later message of `topic`."""
-        rho_chat.join(int(topic), self._agent)
-        return report(f"Joined #{int(topic)}.")
+    def roots(self):
+        """The roots of the chat, the streams, oldest first, each with its id."""
+        lines = [
+            f"#{record['id']} {_label_text(rho_chat.thread(record['id'])['name'])}"
+            for record in rho_chat.read(None, 1 << 31)
+        ]
+        return report("\n".join(lines) if lines else "No threads yet.")
 
-    def leave(self, topic):
-        """Stop receiving `topic`'s messages; a mention still reaches you."""
-        rho_chat.leave(int(topic), self._agent)
-        return report(f"Left #{int(topic)}.")
+    def join(self, thread):
+        """Receive every later message of `thread` and the threads under it."""
+        self._thread(thread)
+        rho_chat.join(int(thread), self._agent)
+        return report(f"Joined #{int(thread)}.")
 
-    def resolve(self, topic, resolved=True):
-        """Mark a topic you are in as done, or with `resolved=False` as open
-        again."""
-        self._member(topic)
-        rho_chat.change(self._agent, int(topic), resolved=bool(resolved))
-        return report(f"#{int(topic)} is {'resolved' if resolved else 'open'}.")
+    def leave(self, thread):
+        """Stop receiving `thread`'s messages; a mention still reaches you."""
+        self._thread(thread)
+        rho_chat.leave(int(thread), self._agent)
+        return report(f"Left #{int(thread)}.")
 
-    def rename(self, topic, name, *, stream=None):
-        """Give a topic you are in a new name, and with `stream` move it to
-        that stream."""
-        self._member(topic)
-        rho_chat.change(self._agent, int(topic), name=str(name), stream=None if stream is None else str(stream))
-        return report(f"Renamed #{int(topic)}.")
+    def name(self, thread, name):
+        """Give a thread you are in a name."""
+        self._member(thread)
+        rho_chat.name(self._agent, int(thread), str(name))
+        return report(f"Named #{int(thread)}.")
 
-    def move(self, messages, to=None, *, stream=None, name=None):
-        """Move messages of topics you are in to topic `to`, or to a new topic
-        `name` in `stream`. Returns the topic they are in now."""
-        ids = [int(id) for id in ([messages] if isinstance(messages, int) else messages)]
-        for id in ids:
-            record = rho_chat.message(id)
-            if record is None:
-                raise ValueError(f"no message #{id}")
-            self._member(record["topic"])
-        if (to is None) == (stream is None or name is None):
-            raise ValueError("move to a topic id, or to a new topic with stream= and name=")
-        if to is None:
-            topic = rho_chat.move(self._agent, ids, stream=str(stream), name=str(name))
-        else:
-            topic = rho_chat.move(self._agent, ids, int(to))
-        print(f"Moved {len(ids)} message(s) to #{topic}.")
-        return topic
+    def move(self, message, to):
+        """Move a message of a thread you are in, and the thread under it,
+        into thread `to`."""
+        record = rho_chat.message(int(message))
+        if record is None:
+            raise ValueError(f"no message #{int(message)}")
+        self._member(rho_chat.thread_of(record))
+        self._thread(to)
+        rho_chat.reparent(self._agent, int(message), int(to))
+        return report(f"Moved #{int(message)} to #{int(to)}.")
 
-    def _member(self, topic):
-        head = rho_chat.topic(int(topic))
+    def _thread(self, thread):
+        head = rho_chat.thread(int(thread))
         if head is None:
-            raise ValueError(f"no topic #{int(topic)}")
-        if head["stream"] is None:
-            raise ValueError("a direct conversation is not renamed, moved or resolved")
+            raise ValueError(f"no thread #{int(thread)}")
+        return head
+
+    def _member(self, thread):
+        head = self._thread(thread)
         if self._agent not in head["agents"]:
-            raise ValueError(f"you are not in #{int(topic)}: join it first")
+            raise ValueError(f"you are not in #{int(thread)}: join it first")
+        return head
 
     def read(self, id, last=20):
-        """Show what `#id` names: a topic's `last` newest messages, or a
+        """Show what `#id` names: a thread's `last` newest messages, or a
         message among the `last` around it."""
         id, last = int(id), int(last)
-        head = rho_chat.topic(id)
-        if head is not None:
-            topic, records = id, rho_chat.read(id, last)
+        head = rho_chat.thread(id)
+        if head is None:
+            raise ValueError(f"#{id} names no message")
+        under = rho_chat.read(id, last)
+        if under:
+            thread, records = id, [rho_chat.message(id), *under]
         else:
-            message = rho_chat.message(id)
-            if message is None:
-                raise ValueError(f"#{id} names no topic or message")
-            topic = message["topic"]
-            head = rho_chat.topic(topic)
-            records = _around(rho_chat.read(topic, 1 << 31), id, last)
-        lines = [where(topic, head, self._agent)]
+            thread = rho_chat.thread_of(rho_chat.message(id))
+            head = rho_chat.thread(thread)
+            records = _around([rho_chat.message(thread), *rho_chat.read(thread, 1 << 31)], id, last)
+        lines = [where(head)]
         for record in records:
             sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
-            mark = "→ " if record["id"] == id else ""
+            mark = "→ " if record["id"] == id and thread != id else ""
             lines.append(f"{mark}#{record['id']} {sender}: {record['text']}")
         return report("\n".join(lines))
 
@@ -227,20 +231,13 @@ def _around(records, id, last):
     return records[start : start + last]
 
 
-def where(topic, head, reader):
-    """The header of a conversation as `reader` sees it."""
-    if head["stream"] is None:
-        if reader not in head["agents"]:
-            a, b = (label(member) for member in head["agents"])
-            return f"[#{topic} direct of {a} and {b}]"
-        other = next(member for member in head["agents"] if member != reader)
-        return f"[#{topic} direct with {label(other)}]"
-    done = "✔ " if head["resolved"] else ""
-    return f"[#{topic} {_label_text(head['stream'])} › {done}{_label_text(head['name'])}]"
+def where(head):
+    """The header of a thread: its id and the names down to it."""
+    return f"[#{head['id']} {' › '.join(_label_text(name) for _, name in head['path'])}]"
 
 
 def _label_text(name):
-    """A stream or topic name as a header shows it. Agents can set names, and a
+    """A thread name as a header shows it. Agents can set names, and a
     header reaches the model in the user's own message, so a name stays one
     short line that cannot close the header."""
     text = " ".join(name.split()).replace("[", "(").replace("]", ")")
@@ -261,7 +258,7 @@ class Messages:
         other = resolve(str(agent_id))
         if other == self._agent:
             raise ValueError("cannot message yourself")
-        rho_chat.post(self._agent, rho_chat.direct(self._agent, other), text)
+        rho_chat.mail(self._agent, other, text)
         return report(f"Sent to {label(other)}.")
 
     def __repr__(self):
@@ -348,7 +345,7 @@ class Agents(Messages):
         the same way."""
         self._check_depth()
         agent = rho_agents.create(runtime, props)
-        rho_chat.post(self._agent, rho_chat.direct(self._agent, agent.id), prompt)
+        rho_chat.mail(self._agent, agent.id, prompt)
         return agent
 
     def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
@@ -403,19 +400,24 @@ class Agents(Messages):
 class UserAgents(Agents):
     """An Engineer the user manages may also start Engineers for the user."""
 
-    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None, stream=None):
+    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None, thread=None):
         """Start an Engineer the user manages; it reports to the user, not to
-        you. Its brief is the first message of a new topic in `stream`, or
-        the stream you were started in, and mentions the user."""
+        you. Its brief is the first message of a new thread named
+        `task_name`, in `thread`, or beside the thread you were started in,
+        and mentions the user."""
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         me = self._me()
         cwd = _workdir(workdir) or me.props["cwd"]
-        stream = stream or _origin_stream(me.props)
-        if stream is None:
-            raise ValueError("you were not started from a stream; pass stream=")
+        if thread is None:
+            thread = _origin_root(me.props)
+            if thread is None:
+                raise ValueError("you were not started from a thread; pass thread=")
+        elif rho_chat.thread(int(thread)) is None:
+            raise ValueError(f"no thread #{int(thread)}")
         self._check_depth()
-        topic, message = rho_chat.start(me.id, str(stream), str(task_name), str(prompt), [(rho_chat.USER, "fyi")])
+        message = rho_chat.post(me.id, int(thread), str(prompt), [(rho_chat.USER, "fyi")])
+        rho_chat.name(me.id, message, str(task_name))
         props = {
             "name": task_name,
             "preset": "engineer",
@@ -425,17 +427,18 @@ class UserAgents(Agents):
         }
         agent = rho_agents.create(engineer_runtime(me.runtime), props)
         return report(
-            f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}" in topic '
-            f"#{topic}. It works in {cwd}. It reports to the user, not to you."
+            f'Spawned user-owned Engineer {label(agent.id)} for task "{task_name}" in thread '
+            f"#{message}. It works in {cwd}. It reports to the user, not to you."
         )
 
 
-def _origin_stream(props):
-    """The stream of the topic an agent was started from, if any."""
+def _origin_root(props):
+    """The root of the thread an agent was started from, if any."""
     message = rho_chat.origin_message(props)
     if message is None:
         return None
-    return rho_chat.topic(rho_chat.message(message)["topic"])["stream"]
+    head = rho_chat.thread(rho_chat.thread_of(rho_chat.message(message)))
+    return head["path"][0][0]
 
 
 def _workdir(workdir):

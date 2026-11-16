@@ -113,7 +113,8 @@ pub(crate) fn paths(py: Python<'_>) -> PyResult<()> {
                      or install them at ../share/rho/python-site-packages",
                 )
             })?;
-            // A str: the import system skips the `pathlib.Path` a PathBuf becomes.
+            // A str: the import system skips the `pathlib.Path` a PathBuf
+            // becomes.
             sys_path.call_method1("insert", (0, site_packages.to_string_lossy()))?;
             sys_path.call_method1("insert", (0, ""))?;
             Ok(())

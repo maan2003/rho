@@ -117,7 +117,7 @@ class AsyncBaseClient:
     async def _request(self, *, http_verb, api_url, req_args) -> Dict[str, Any]:
         """Sends one request. `AsyncSlackResponse` pagination calls this for each page."""
         if self._http is None:
-            socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+            socket = str(Path(os.environ["RHO_RUNTIME_DIR"]) / "slack.sock")
             self._http = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=self.timeout)
         # httpx sets the content type; the host sets the token.
         headers = {

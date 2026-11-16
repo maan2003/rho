@@ -1,5 +1,5 @@
-//! The topic a voice session belongs to, in the shapes the Codex client
-//! gives the live model: the topic's latest turns as startup context, each
+//! The thread a voice session belongs to, in the shapes the Codex client
+//! gives the live model: the thread's latest turns as startup context, each
 //! spoken request as a `<realtime_delegation>` message to the agent, and
 //! each message the agent posts as a `[STATUS]` or `[COMPLETE]` reply.
 //!
@@ -28,7 +28,7 @@ pub(super) enum Said {
 }
 
 impl Said {
-    /// What a message of the topic says in the conversation between the
+    /// What a message of the thread says in the conversation between the
     /// user and `agent`, if it is a part of it.
     pub(super) fn of(message: &Message, agent: AgentId) -> Option<Self> {
         match message.from {
@@ -124,7 +124,7 @@ pub(crate) fn shown_to_reader(text: &str) -> Option<String> {
     Some(format!("{}🎤 {}", &text[..start], input.trim()))
 }
 
-/// What the live model is told of a message `agent` posted in the topic,
+/// What the live model is told of a message `agent` posted in the thread,
 /// on which channel, and whether it ends the request. Progress is a
 /// `[STATUS]` the model may keep to itself; a message that mentions the
 /// user with a result or a question is the `[COMPLETE]` answer.
@@ -220,9 +220,7 @@ fn escape_bounded(text: &str, retain: Retain) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{
-        AgentIdDomain, ChatSeq, ContentPart, Mention, MessageId, TopicId, UnixMs,
-    };
+    use rho_agent_types::{AgentIdDomain, ChatSeq, ContentPart, Mention, MessageId, UnixMs};
 
     use super::*;
 
@@ -234,7 +232,7 @@ mod tests {
         Message {
             id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
-            topic: TopicId(ChatSeq(2)),
+            parent: Some(MessageId(ChatSeq(2))),
             from,
             mentions,
             content: vec![ContentPart::Text {

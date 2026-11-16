@@ -519,7 +519,7 @@ pub(crate) mod agent_rows;
 pub mod chat;
 pub mod gccp;
 
-pub use chat::{ChatRead, ChatWrite, MoveTo, NewMessage, Place, TopicHead};
+pub use chat::{ChatRead, ChatWrite, NewMessage, ThreadHead};
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
 #[cfg(test)]
 mod tests;

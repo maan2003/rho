@@ -1,8 +1,8 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, StreamId,
-    TopicId, UnixMs, WorksetId, WorksetKind, Wpos,
+    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, UnixMs,
+    WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
 
@@ -297,8 +297,15 @@ fn received(read: &rho_db::ReadTxn, agent: AgentId, after: u64) -> Vec<u64> {
         .collect()
 }
 
+fn ids(messages: &[rho_agent_types::Message]) -> Vec<MessageId> {
+    messages.iter().map(|message| message.id).collect()
+}
+
+/// A message reaches the members of the thread it is posted in and of the
+/// threads above it, by the nearest record for each agent, and whom it
+/// mentions, never its sender. A resend under a client id is one message.
 #[tokio::test]
-async fn chat_delivers_to_members_and_the_mentioned_but_never_the_sender() {
+async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender() {
     let (_dir, db) = db().await;
     let ws = WorksetId([4; 6]);
     let (a, b, c) = (agent(1), agent(2), agent(3));
@@ -323,304 +330,529 @@ async fn chat_delivers_to_members_and_the_mentioned_but_never_the_sender() {
             )
             .unwrap();
     }
-    // A new store's chat is empty: the first stream is its first event,
-    // and asking for it by name again makes no second one.
-    let rho = write.stream(UnixMs(3), "rho".into()).unwrap();
-    assert_eq!(write.stream(UnixMs(3), " rho ".into()).unwrap(), rho);
-    assert_eq!(rho, StreamId(ChatSeq(1)));
-
-    // The user starts a topic; it has no members, and a resend under its
-    // client id is the same topic and logs nothing.
-    let (topic, first) = write
-        .start_topic(
-            UnixMs(3),
-            rho,
-            "Fix it".into(),
-            said(Address::User, "go"),
-            Some(77),
-        )
+    // A new store's chat is empty: the first root is its first event. A
+    // root reaches nobody but whom it mentions.
+    let rho = write
+        .post(UnixMs(3), None, said(Address::User, "rho"), None)
         .unwrap();
-    assert_eq!((topic, first), (TopicId(ChatSeq(2)), MessageId(ChatSeq(3))));
-    let again = write
-        .start_topic(
-            UnixMs(4),
-            rho,
-            "Fix it".into(),
-            said(Address::User, "go!"),
-            Some(77),
-        )
-        .unwrap();
-    assert_eq!(again, (topic, first));
-
-    // `a` joins after the first message, so it does not get it.
-    write.join(UnixMs(4), topic, a).unwrap();
-    // `b` is no member: posting reaches `a` and does not make `b` one.
-    let from_b = write
-        .post(UnixMs(5), topic, said(Address::Agent(b), "me too"), None)
-        .unwrap();
-    let from_user = write
-        .post(UnixMs(6), topic, said(Address::User, "both"), Some(78))
-        .unwrap();
-    assert_eq!(
-        write
-            .post(UnixMs(7), topic, said(Address::User, "resent"), Some(78))
-            .unwrap(),
-        from_user
-    );
-    // `a` mentions `c`: `c` gets that message only and is no member.
-    let mention_c = write
+    assert_eq!(rho, MessageId(ChatSeq(1)));
+    // The user starts work under the root; a resend under its client id
+    // is the same message and logs nothing.
+    let work = write
         .post(
-            UnixMs(8),
-            topic,
+            UnixMs(4),
+            Some(rho),
+            said(Address::User, "Fix it"),
+            Some(78),
+        )
+        .unwrap();
+    assert_eq!(work, MessageId(ChatSeq(2)));
+    let again = write
+        .post(
+            UnixMs(4),
+            Some(rho),
+            said(Address::User, "resent"),
+            Some(78),
+        )
+        .unwrap();
+    assert_eq!(again, work);
+    assert_eq!(db_head(&mut write), 2);
+    // `a` joins the root: it hears everything under it. `b` joins the work.
+    write.join(UnixMs(5), rho, a).unwrap();
+    write.join(UnixMs(5), work, b).unwrap();
+    // Joining again logs nothing.
+    write.join(UnixMs(5), work, b).unwrap();
+    assert_eq!(db_head(&mut write), 4);
+    let both = write
+        .post(UnixMs(6), Some(work), said(Address::User, "both"), None)
+        .unwrap();
+    // `b` replies: `a` hears it through the root, `b` is the sender.
+    let reply = write
+        .post(
+            UnixMs(7),
+            Some(work),
+            said(Address::Agent(b), "me too"),
+            None,
+        )
+        .unwrap();
+    // A subthread under `b`'s reply reaches both through their joins above.
+    let deeper = write
+        .post(UnixMs(8), Some(reply), said(Address::User, "deeper"), None)
+        .unwrap();
+    // `b` leaves the subthread: it hears nothing more there, `a` still does.
+    write.leave(UnixMs(9), reply, b).unwrap();
+    let after_leave = write
+        .post(UnixMs(10), Some(reply), said(Address::User, "b gone"), None)
+        .unwrap();
+    // But a mention reaches it, and reaches `c`, who is nowhere, without
+    // joining either.
+    let mention = write
+        .post(
+            UnixMs(11),
+            Some(reply),
             NewMessage {
                 mentions: vec![
                     Mention {
-                        to: Address::Agent(c),
+                        to: Address::Agent(b),
                         kind: MentionKind::Ask,
                     },
                     Mention {
-                        to: Address::User,
-                        kind: MentionKind::Result,
+                        to: Address::Agent(c),
+                        kind: MentionKind::Fyi,
                     },
                 ],
-                ..said(Address::Agent(a), "c, look")
+                ..said(Address::User, "b, c, look")
             },
             None,
         )
         .unwrap();
-    // Refused posts take no seq.
-    for (to, text) in [
-        (TopicId(ChatSeq(99)), "x"),
-        (topic, "  "),
-        (TopicId(first.0), "x"),
-    ] {
+    // Leaving where nothing made you a member logs nothing; where a join
+    // above did, it does.
+    let head = db_head(&mut write);
+    write.leave(UnixMs(12), work, c).unwrap();
+    assert_eq!(db_head(&mut write), head);
+    write.leave(UnixMs(12), work, a).unwrap();
+    assert_eq!(db_head(&mut write), head + 1);
+    let elsewhere = write
+        .post(
+            UnixMs(13),
+            Some(rho),
+            said(Address::User, "still the root"),
+            None,
+        )
+        .unwrap();
+    // Refused, and logs nothing: an empty message, a parent that is not.
+    for (parent, text) in [(Some(work), "  "), (Some(MessageId(ChatSeq(999))), "x")] {
         assert!(
             write
-                .post(UnixMs(9), to, said(Address::User, text), None)
+                .post(UnixMs(14), parent, said(Address::User, text), None)
                 .is_err()
         );
     }
-    // Joining twice logs once.
-    write.join(UnixMs(10), topic, a).unwrap();
-
-    // Two agents' direct conversation is one, whichever asks; only they
-    // post in it, and no one joins it.
-    let direct = write.direct(UnixMs(11), a, b).unwrap();
-    assert_eq!(write.direct(UnixMs(11), b, a).unwrap(), direct);
-    assert!(write.direct(UnixMs(11), a, a).is_err());
-    let in_direct = write
-        .post(UnixMs(12), direct, said(Address::Agent(a), "brief"), None)
-        .unwrap();
-    assert!(
-        write
-            .post(UnixMs(12), direct, said(Address::User, "hi"), None)
-            .is_err()
-    );
-    assert!(
-        write
-            .post(UnixMs(12), direct, said(Address::Agent(c), "hi"), None)
-            .is_err()
-    );
-    assert!(write.join(UnixMs(12), direct, c).is_err());
-
-    let after = write
-        .post(UnixMs(13), topic, said(Address::User, "all"), None)
-        .unwrap();
-    assert!(write.delete_workset(ws));
+    let seqs = db_head(&mut write);
     write.commit();
 
     let read = db.read();
-    let seq = |id: MessageId| id.0.0;
+    assert_eq!(read.chat_head(), ChatSeq(seqs));
     assert_eq!(
-        (
-            seq(from_b),
-            seq(from_user),
-            seq(mention_c),
-            direct.0.0,
-            seq(in_direct),
-            seq(after)
-        ),
-        (5, 6, 7, 8, 9, 10),
-        "dense, and the refused posts and repeats took none"
+        received(&read, a, 0),
+        [both, reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
     );
-    assert_eq!(received(&read, a, 0), vec![5, 6, 10]);
-    assert_eq!(received(&read, b, 0), vec![9]);
-    assert_eq!(received(&read, c, 0), vec![7]);
-    assert_eq!(received(&read, a, 5), vec![6, 10]);
-    assert_eq!(read.topic(topic).unwrap().agents, vec![a]);
-    assert_eq!(read.topic(direct).unwrap().place, chat::Place::Direct);
-    let events: Vec<_> = read.chat_since(ChatSeq::ZERO, 100);
-    assert_eq!(events.len(), 10);
-    assert!(matches!(&events[3].event, ChatEvent::Joined { agent, .. } if *agent == a));
-    assert!(matches!(&events[7].event, ChatEvent::DirectStarted { members } if *members == [a, b]));
-    // Chat outlives the workset.
-    let kept = read.message(mention_c).unwrap();
-    assert_eq!(kept.mentions(Address::User), Some(MentionKind::Result));
-    assert_eq!(kept.mentions(Address::Agent(b)), None);
+    assert_eq!(
+        received(&read, b, 0),
+        [both, deeper, mention].map(|id| id.0.0)
+    );
+    assert_eq!(received(&read, c, 0), [mention.0.0]);
+    assert_eq!(
+        received(&read, a, both.0.0),
+        [reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
+    );
+    // The tree as it stands.
+    assert_eq!(ids(&read.thread_messages(None, 10)), [rho]);
+    assert_eq!(ids(&read.thread_messages(Some(rho), 10)), [work, elsewhere]);
+    assert_eq!(ids(&read.thread_messages(Some(work), 1)), [reply]);
+    assert_eq!(
+        ids(&read.thread_messages(Some(reply), 10)),
+        [deeper, after_leave, mention]
+    );
+    assert_eq!(read.message(deeper).unwrap().parent, Some(reply));
+    // Members as a new message under each would see them: the root's `a`
+    // left the work, `b` left the reply.
+    assert_eq!(read.members_under(Some(rho)), [a]);
+    assert_eq!(read.members_under(Some(work)), [b]);
+    assert_eq!(read.members_under(Some(reply)), Vec::<AgentId>::new());
+    assert_eq!(read.members_under(None), Vec::<AgentId>::new());
+    let thread = read.thread(reply).unwrap();
+    assert_eq!(thread.name, "me too");
+    assert_eq!(
+        thread.path,
+        vec![
+            (rho, "rho".to_owned()),
+            (work, "Fix it".to_owned()),
+            (reply, "me too".to_owned())
+        ]
+    );
+    assert!(read.thread(MessageId(ChatSeq(999))).is_none());
     assert!(
-        read.message(MessageId(topic.0)).is_none(),
-        "a topic is not a message"
+        read.message(MessageId(ChatSeq(3))).is_none(),
+        "a join is not a message"
     );
-    assert!(read.workset(ws).is_none());
-    assert!(read.agent(a).is_none());
-    assert!(read.workset_rows(ws, Wpos::ZERO, 10).is_empty());
 }
 
-/// A leave stops what a topic delivers but not what mentions; a change is
-/// logged only when it changes something; a move takes messages out of
-/// their topics, delivers nothing again, and a resend under its client id
-/// starts no second topic.
+/// A move is a parent change: the subtree follows, nothing is delivered
+/// again, and a move to where a message is logs nothing, as does a name a
+/// thread has.
 #[tokio::test]
-async fn chat_leaves_changes_and_moves() {
+async fn chat_moves_subtrees_and_names_threads() {
     let (_dir, db) = db().await;
     let (a, b) = (agent(1), agent(2));
     let mut write = db.write().await;
-    let rho = write.stream(UnixMs(1), "rho".into()).unwrap();
-    let ops = write.stream(UnixMs(1), "ops".into()).unwrap();
-    let (topic, first) = write
-        .start_topic(
-            UnixMs(2),
-            rho,
-            "Fix it".into(),
-            said(Address::User, "go"),
-            None,
-        )
+    let rho = write
+        .post(UnixMs(1), None, said(Address::User, "rho"), None)
         .unwrap();
-    write.join(UnixMs(3), topic, a).unwrap();
+    let ops = write
+        .post(UnixMs(1), None, said(Address::User, "ops"), None)
+        .unwrap();
+    let work = write
+        .post(UnixMs(2), Some(rho), said(Address::User, "Fix it"), None)
+        .unwrap();
+    write.join(UnixMs(3), work, a).unwrap();
     let kept = write
-        .post(UnixMs(4), topic, said(Address::User, "one"), None)
+        .post(UnixMs(4), Some(work), said(Address::User, "one"), None)
         .unwrap();
-    write.leave(UnixMs(5), topic, a).unwrap();
-    // Leaving twice logs once.
-    write.leave(UnixMs(5), topic, a).unwrap();
-    let unheard = write
-        .post(UnixMs(6), topic, said(Address::User, "two"), None)
-        .unwrap();
-    let mention = write
+    let aside = write
         .post(
-            UnixMs(7),
-            topic,
-            NewMessage {
-                mentions: vec![Mention {
-                    to: Address::Agent(a),
-                    kind: MentionKind::Ask,
-                }],
-                ..said(Address::User, "a, look")
-            },
+            UnixMs(5),
+            Some(kept),
+            said(Address::Agent(b), "an aside"),
             None,
         )
         .unwrap();
-    write
-        .change_topic(UnixMs(8), topic, ops, " Fixed ".into(), true)
-        .unwrap();
-    let head = db_head(&mut write);
-    write
-        .change_topic(UnixMs(8), topic, ops, "Fixed".into(), true)
-        .unwrap();
+    // Refused, and logs nothing: under itself, under its own child, a
+    // message that is not.
+    let before = db_head(&mut write);
+    assert!(write.reparent(UnixMs(6), work, Some(work)).is_err());
+    assert!(write.reparent(UnixMs(6), work, Some(aside)).is_err());
+    assert!(
+        write
+            .reparent(UnixMs(6), MessageId(ChatSeq(999)), Some(ops))
+            .is_err()
+    );
+    assert!(
+        write
+            .reparent(UnixMs(6), kept, Some(MessageId(ChatSeq(999))))
+            .is_err()
+    );
+    assert_eq!(db_head(&mut write), before);
+    // Where it is: nothing.
+    write.reparent(UnixMs(6), work, Some(rho)).unwrap();
+    assert_eq!(db_head(&mut write), before);
+    // The work moves to ops; `kept` and `aside` go with it.
+    write.reparent(UnixMs(7), work, Some(ops)).unwrap();
+    // `kept` becomes a root of its own, taking `aside`.
+    write.reparent(UnixMs(8), kept, None).unwrap();
+    // Names: given, the same again, taken back.
+    write.name(UnixMs(9), work, "  Fixed   it ".into()).unwrap();
+    let named = db_head(&mut write);
+    write.name(UnixMs(9), work, "Fixed it".into()).unwrap();
     assert_eq!(
         db_head(&mut write),
-        head,
-        "a change to nothing logs nothing"
+        named,
+        "a name a thread has logs nothing"
+    );
+    write.name(UnixMs(10), aside, "An aside".into()).unwrap();
+    write.name(UnixMs(11), aside, String::new()).unwrap();
+    // The host's own naming yields to a name a thread has, and to nothing.
+    assert!(
+        !write
+            .name_unnamed(UnixMs(12), work, "Other".into())
+            .unwrap()
+    );
+    assert!(!write.name_unnamed(UnixMs(12), aside, "  ".into()).unwrap());
+    assert!(
+        write
+            .name_unnamed(UnixMs(12), aside, "Set aside".into())
+            .unwrap()
+    );
+    assert!(
+        !write
+            .name_unnamed(UnixMs(12), aside, "Again".into())
+            .unwrap()
     );
     assert!(
         write
-            .change_topic(UnixMs(8), topic, StreamId(ChatSeq(99)), "x".into(), false)
+            .name(UnixMs(11), MessageId(ChatSeq(999)), "x".into())
             .is_err()
     );
-    let direct = write.direct(UnixMs(9), a, b).unwrap();
-    let in_direct = write
-        .post(UnixMs(9), direct, said(Address::Agent(a), "psst"), None)
-        .unwrap();
-    assert!(write.leave(UnixMs(9), direct, a).is_err());
-    assert!(
-        write
-            .change_topic(UnixMs(9), direct, rho, "x".into(), false)
-            .is_err()
-    );
-    // Out of a direct conversation, or into one: refused, and logs nothing.
-    let before = db_head(&mut write);
-    for (messages, to) in [
-        (vec![in_direct], MoveTo::Topic(topic)),
-        (vec![kept], MoveTo::Topic(direct)),
-        (vec![MessageId(ChatSeq(999))], MoveTo::Topic(topic)),
-        (Vec::new(), MoveTo::Topic(topic)),
-    ] {
-        assert!(
-            write
-                .move_messages(UnixMs(10), messages, to, Address::User, None)
-                .is_err()
-        );
-    }
-    assert_eq!(db_head(&mut write), before);
-    // Two to a new topic, under a client id; the resend is the same.
-    let aside = write
-        .move_messages(
-            UnixMs(10),
-            vec![mention, unheard],
-            MoveTo::NewTopic {
-                stream: rho,
-                name: "aside".into(),
-            },
-            Address::User,
-            Some(5),
-        )
-        .unwrap();
-    assert_eq!(
-        write
-            .move_messages(
-                UnixMs(11),
-                vec![mention, unheard],
-                MoveTo::NewTopic {
-                    stream: rho,
-                    name: "aside".into(),
-                },
-                Address::User,
-                Some(5),
-            )
-            .unwrap(),
-        aside
-    );
-    // And one of them back where it was posted.
-    write
-        .move_messages(
-            UnixMs(12),
-            vec![unheard],
-            MoveTo::Topic(topic),
-            Address::User,
-            None,
-        )
-        .unwrap();
     write.commit();
 
     let read = db.read();
-    let ids = |topic| {
-        read.topic_messages(topic, 10)
-            .iter()
-            .map(|message| message.id)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(ids(topic), [first, kept, unheard]);
-    assert_eq!(ids(aside), [mention]);
-    assert_eq!(read.message(mention).unwrap().topic, aside);
-    assert_eq!(read.message(unheard).unwrap().topic, topic);
+    assert_eq!(ids(&read.thread_messages(None, 10)), [rho, ops, kept]);
     assert_eq!(
-        read.topic(topic).unwrap().place,
-        chat::Place::Stream {
-            stream: ops,
-            name: "Fixed".into(),
-            resolved: true
-        }
+        ids(&read.thread_messages(Some(rho), 10)),
+        Vec::<MessageId>::new()
     );
-    assert!(read.topic(topic).unwrap().agents.is_empty());
-    // `a` heard what came while it was a member, and the mention; the
-    // moves delivered nothing.
-    assert_eq!(received(&read, a, 0), vec![kept.0.0, mention.0.0]);
-    let moves = read
-        .chat_since(ChatSeq::ZERO, 100)
-        .into_iter()
-        .filter(|record| matches!(record.event, ChatEvent::Moved { .. }))
+    assert_eq!(ids(&read.thread_messages(Some(ops), 10)), [work]);
+    assert_eq!(
+        ids(&read.thread_messages(Some(work), 10)),
+        Vec::<MessageId>::new()
+    );
+    assert_eq!(ids(&read.thread_messages(Some(kept), 10)), [aside]);
+    assert_eq!(read.message(work).unwrap().parent, Some(ops));
+    assert_eq!(read.message(kept).unwrap().parent, None);
+    assert_eq!(read.message(aside).unwrap().parent, Some(kept));
+    let thread = read.thread(work).unwrap();
+    assert_eq!(thread.name, "Fixed it");
+    assert_eq!(
+        thread.path,
+        vec![(ops, "ops".to_owned()), (work, "Fixed it".to_owned())]
+    );
+    assert_eq!(thread.members, [a]);
+    assert_eq!(read.thread(aside).unwrap().name, "Set aside");
+    assert_eq!(
+        read.thread(aside).unwrap().path,
+        vec![(kept, "one".to_owned()), (aside, "Set aside".to_owned())]
+    );
+    // `a` heard what came while it was a member; the moves delivered
+    // nothing.
+    assert_eq!(received(&read, a, 0), vec![kept.0.0, aside.0.0]);
+    let events: Vec<_> = read.chat_since(ChatSeq::ZERO, 100);
+    let moves = events
+        .iter()
+        .filter(|record| matches!(record.event, ChatEvent::Reparented { .. }))
         .count();
-    assert_eq!(moves, 2, "the resend logged no second move");
+    let names = events
+        .iter()
+        .filter(|record| matches!(record.event, ChatEvent::Named { .. }))
+        .count();
+    assert_eq!((moves, names), (2, 4));
+}
+
+/// Temporary (`temp-migration`): the old log of streams, topics and direct
+/// conversations becomes the forest with every seq kept.
+#[test]
+fn chat_migration_keeps_every_seq() {
+    use super::chat::legacy::{
+        ChatEvent as OldEvent, ChatRecord as OldRecord, StreamId, TopicId, convert,
+    };
+    let (a, b) = (agent(1), agent(2));
+    let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
+    let at = UnixMs(1);
+    let old = vec![
+        OldRecord {
+            seq: ChatSeq(1),
+            at,
+            event: OldEvent::StreamCreated { name: "rho".into() },
+        },
+        OldRecord {
+            seq: ChatSeq(2),
+            at,
+            event: OldEvent::TopicStarted {
+                stream: StreamId(ChatSeq(1)),
+                name: "Fix it".into(),
+                by: Address::User,
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(3),
+            at,
+            event: OldEvent::Posted {
+                topic: TopicId(ChatSeq(2)),
+                from: Address::User,
+                mentions: vec![],
+                content: text("go"),
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(4),
+            at,
+            event: OldEvent::Joined {
+                topic: TopicId(ChatSeq(2)),
+                agent: a,
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(5),
+            at,
+            event: OldEvent::DirectStarted { members: [a, b] },
+        },
+        OldRecord {
+            seq: ChatSeq(6),
+            at,
+            event: OldEvent::Posted {
+                topic: TopicId(ChatSeq(5)),
+                from: Address::Agent(a),
+                mentions: vec![],
+                content: text("psst"),
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(7),
+            at,
+            event: OldEvent::StreamCreated { name: "ops".into() },
+        },
+        OldRecord {
+            seq: ChatSeq(8),
+            at,
+            event: OldEvent::TopicChanged {
+                topic: TopicId(ChatSeq(2)),
+                stream: StreamId(ChatSeq(7)),
+                name: "Fixed".into(),
+                resolved: true,
+            },
+        },
+        OldRecord {
+            seq: ChatSeq(9),
+            at,
+            event: OldEvent::Moved {
+                messages: vec![MessageId(ChatSeq(3)), MessageId(ChatSeq(6))],
+                to: TopicId(ChatSeq(2)),
+            },
+        },
+    ];
+    let records = convert(&old);
+    let events: Vec<(u64, ChatEvent)> = records
+        .into_iter()
+        .map(|record| (record.seq.0, record.event))
+        .collect();
+    let nothing = |seq: u64| ChatEvent::Named {
+        thread: MessageId(ChatSeq(seq)),
+        name: String::new(),
+    };
+    assert_eq!(
+        events,
+        vec![
+            (
+                1,
+                ChatEvent::Posted {
+                    parent: None,
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("rho")
+                }
+            ),
+            (
+                2,
+                ChatEvent::Posted {
+                    parent: Some(MessageId(ChatSeq(1))),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("Fix it")
+                }
+            ),
+            (
+                3,
+                ChatEvent::Posted {
+                    parent: Some(MessageId(ChatSeq(2))),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("go")
+                }
+            ),
+            (
+                4,
+                ChatEvent::Joined {
+                    thread: MessageId(ChatSeq(2)),
+                    agent: a
+                }
+            ),
+            (5, nothing(5)),
+            (6, nothing(6)),
+            (
+                7,
+                ChatEvent::Posted {
+                    parent: None,
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("ops")
+                }
+            ),
+            (
+                8,
+                ChatEvent::Named {
+                    thread: MessageId(ChatSeq(2)),
+                    name: "Fixed".into()
+                }
+            ),
+            (
+                9,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(3)),
+                    parent: Some(MessageId(ChatSeq(2)))
+                }
+            ),
+            // What no longer fits at its seq, after the last.
+            (
+                10,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(2)),
+                    parent: Some(MessageId(ChatSeq(7)))
+                }
+            ),
+            (
+                11,
+                ChatEvent::Reparented {
+                    message: MessageId(ChatSeq(6)),
+                    parent: Some(MessageId(ChatSeq(2)))
+                }
+            ),
+        ]
+    );
+}
+
+/// Temporary (`temp-migration`): the old table opens under its old record
+/// type, and the store it leaves reads as a forest.
+#[tokio::test]
+async fn chat_migration_rewrites_the_store() {
+    use super::chat::legacy::{
+        ChatEvent as OldEvent, ChatRecord as OldRecord, OLD_LOG, StreamId, TopicId,
+        migrate_topics_to_forest,
+    };
+    let (_dir, db) = db().await;
+    let a = agent(1);
+    let text = |text: &str| vec![ContentPart::Text { text: text.into() }];
+    let mut write = db.write().await;
+    {
+        let mut log = write.open_table(OLD_LOG);
+        for record in [
+            OldRecord {
+                seq: ChatSeq(1),
+                at: UnixMs(1),
+                event: OldEvent::StreamCreated { name: "rho".into() },
+            },
+            OldRecord {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+                event: OldEvent::TopicStarted {
+                    stream: StreamId(ChatSeq(1)),
+                    name: "Fix it".into(),
+                    by: Address::User,
+                },
+            },
+            OldRecord {
+                seq: ChatSeq(3),
+                at: UnixMs(3),
+                event: OldEvent::Joined {
+                    topic: TopicId(ChatSeq(2)),
+                    agent: a,
+                },
+            },
+            OldRecord {
+                seq: ChatSeq(4),
+                at: UnixMs(4),
+                event: OldEvent::Posted {
+                    topic: TopicId(ChatSeq(2)),
+                    from: Address::User,
+                    mentions: vec![],
+                    content: text("go"),
+                },
+            },
+        ] {
+            log.insert(record.seq.0, rho_db::SenValue::borrowed(&record));
+        }
+    }
+    migrate_topics_to_forest(&mut write);
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.chat_head(), ChatSeq(4));
+    let rho = MessageId(ChatSeq(1));
+    let work = MessageId(ChatSeq(2));
+    assert_eq!(ids(&read.thread_messages(None, 10)), [rho]);
+    assert_eq!(
+        ids(&read.thread_messages(Some(work), 10)),
+        [MessageId(ChatSeq(4))]
+    );
+    assert_eq!(read.thread(work).unwrap().members, [a]);
+    assert_eq!(received(&read, a, 0), [4]);
+    // The store goes on from the migrated log.
+    let mut write = db.write().await;
+    let next = write
+        .post(UnixMs(5), Some(work), said(Address::User, "on"), None)
+        .unwrap();
+    assert_eq!(next, MessageId(ChatSeq(5)));
+    write.commit();
+    assert_eq!(received(&db.read(), a, 0), [4, 5]);
 }
 
 fn db_head(write: &mut rho_db::WriteTxn) -> u64 {

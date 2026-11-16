@@ -6,7 +6,7 @@ use crate::{SlackArgs, SlackCommand, host_call};
 
 pub(crate) async fn run(args: SlackArgs) -> anyhow::Result<()> {
     match args.command {
-        SlackCommand::Init => init(args.socket_path).await,
+        SlackCommand::Init => init(args.runtime_dir).await,
         SlackCommand::Manifest => {
             print!("{MANIFEST}");
             Ok(())
@@ -17,7 +17,7 @@ pub(crate) async fn run(args: SlackArgs) -> anyhow::Result<()> {
 /// The Slack app manifest, with the steps to install it in its comments.
 const MANIFEST: &str = include_str!("../../slack-server/manifest.yaml");
 
-async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+async fn init(runtime_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     eprintln!(
         "This host needs its own Slack app: `rho slack manifest` prints it, with the steps to install it."
     );
@@ -31,16 +31,14 @@ async fn init(socket_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
         app.starts_with("xapp-"),
         "a Slack app-level token starts with xapp-"
     );
-    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(socket_path)?
-        .socket()
-        .to_owned();
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(runtime_dir)?;
     let call = PlatformSecretsSet {
         secrets: vec![
             ("SLACK_BOT_TOKEN".to_owned(), bot),
             ("SLACK_APP_TOKEN".to_owned(), app),
         ],
     };
-    match host_call(&socket_path, call).await? {
+    match host_call(&paths, call).await? {
         PlatformStatus {
             running: true,
             detail,

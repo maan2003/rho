@@ -1,6 +1,5 @@
 //! How a client draws an agent: the block list and status it folds from
-//! the workset rows, chat messages, and the live tail. Nothing here crosses the
-//! wire.
+//! the workset rows and the live tail. Nothing here crosses the wire.
 
 use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -32,6 +31,9 @@ pub struct UiAgentUsage {
     pub total: crate::protocol::AgentUsageBucket,
 }
 
+// Every block lives behind an `Arc` in a transcript, so a small block
+// pays the tool's size once per allocation, not per copy.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiBlock {
     UserMessage {
@@ -54,26 +56,11 @@ pub enum UiBlock {
     Notice {
         text: String,
     },
-    /// A message waiting in the agent's queue; becomes a `UserMessage` (or
-    /// `AgentMessage`) block at delivery. Always trails the transcript.
-    QueuedMessage {
-        text: String,
-        /// The sending agent; `None` for the user.
-        sender: Option<rho_agent_types::AgentId>,
-    },
-    /// A delivered message from another agent.
-    MessageSent {
-        to: Option<rho_agent_types::AgentId>,
-        text: String,
-    },
-    AgentMessage {
-        /// The sending agent.
-        sender: rho_agent_types::AgentId,
-        text: String,
-    },
-    /// A message the user wrote that no host has taken yet. Always last:
-    /// after the agent's own queue.
-    Unsent {
+    /// A chat message an input handed the agent. The text is what the
+    /// model read; the message itself, its sender and its words, is the
+    /// chat store's to resolve.
+    Delivered {
+        message: rho_agent_types::MessageId,
         text: String,
     },
     /// What the agent says it is doing, from its status line. Last of all,
@@ -81,48 +68,6 @@ pub enum UiBlock {
     Status {
         text: String,
     },
-    /// A message in a chat topic: who posted it and whom it mentions.
-    ChatMessage {
-        /// What starting an agent from it links to.
-        id: rho_agent_types::MessageId,
-        from: rho_agent_types::Address,
-        mentions: Vec<rho_agent_types::Mention>,
-        text: String,
-        /// Its sender's name heads it: an agent's message after another
-        /// agent's, the user's in between not counted, in a topic more
-        /// than one agent wrote in.
-        named: bool,
-    },
-    /// An agent joined or left a chat topic.
-    Member {
-        agent: rho_agent_types::AgentId,
-        change: crate::chat::Membership,
-    },
-}
-
-impl UiBlock {
-    /// The agents it names: whose label drawing it needs.
-    pub fn agents(&self) -> Vec<rho_agent_types::AgentId> {
-        match self {
-            UiBlock::AgentMessage { sender, .. }
-            | UiBlock::MessageSent {
-                to: Some(sender), ..
-            }
-            | UiBlock::QueuedMessage {
-                sender: Some(sender),
-                ..
-            } => vec![*sender],
-            UiBlock::Member { agent, .. } => vec![*agent],
-            UiBlock::ChatMessage { from, mentions, .. } => std::iter::once(*from)
-                .chain(mentions.iter().map(|mention| mention.to))
-                .filter_map(|address| match address {
-                    rho_agent_types::Address::Agent(agent) => Some(agent),
-                    rho_agent_types::Address::User => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

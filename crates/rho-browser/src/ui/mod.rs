@@ -1,0 +1,301 @@
+//! Pages as the frame shows them.
+//!
+//! [`PageSystem`] is the one entity behind every page surface: it owns the
+//! [`Browser`] (and so Chrome), the timers that close what nothing shows
+//! ([`pages`]), and the `page` address kind. A page surface is the page
+//! view itself; the system hears when one goes and starts that page's
+//! grace period. The browser stays in this process: no host knows a page.
+//!
+//! A page takes every key, so the frame's normal-mode keys cannot reach
+//! the frame from one. Its chords can (`ctrl-k`, `ctrl-j`, `ctrl-shift-f`,
+//! `ctrl-shift-backspace`), and two more are bound here: `ctrl-shift-escape`
+//! goes Home and `ctrl-shift-space` is the root menu.
+
+mod pages;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
+use rho_dealer::{Address, Addressed};
+use rho_frame::{AnySurface, Found, FrameLink, Marks, Point, Row, Rows, Subject, Surface};
+use rho_window::style::StyleClass;
+
+use self::pages::{GRACE, Pages};
+use crate::{
+    Browser, PageId, PageMetadataChanged, PageModel, PageView, live_page_name, live_pages,
+};
+
+/// `page:<uuid>`: the page id the extension minted, as it says it
+/// (`SPEC-page-addresses`).
+impl Addressed for PageId {
+    const KIND: &'static str = "page";
+
+    fn rest(&self) -> String {
+        self.0.hyphenated().to_string()
+    }
+
+    fn from_rest(rest: &str) -> Option<Self> {
+        let id = uuid::Uuid::try_parse(rest).ok()?;
+        // One page, one text: two addresses are the same thing only when
+        // their text is.
+        (id.hyphenated().to_string() == rest).then_some(Self(id))
+    }
+}
+
+pub struct PageSystem {
+    browser: Browser,
+    pages: Pages<gpui::Task<()>>,
+    frame: FrameLink,
+    /// The page model whose tab changes are heard, and the hearing.
+    watched: Option<(Entity<PageModel>, Subscription)>,
+}
+
+impl PageSystem {
+    /// The browser keeps its state under `state_dir`, the GUI's own state
+    /// directory, and talks to its extension over a socket there: one
+    /// GUI per state directory, which the browser's lock already says.
+    pub fn new(state_dir: PathBuf, frame: FrameLink, cx: &mut Context<Self>) -> Self {
+        bind_keys(cx);
+        let socket = state_dir.join("rho-browser.sock");
+        Self {
+            browser: Browser::new(state_dir, socket),
+            pages: Pages::default(),
+            frame,
+            watched: None,
+        }
+    }
+
+    /// Hears the tabs of `model`, the browser's page model, once per model:
+    /// a browser that died and was launched again has a new one.
+    fn watch(&mut self, model: &Entity<PageModel>, cx: &mut Context<Self>) {
+        if self
+            .watched
+            .as_ref()
+            .is_some_and(|(watched, _)| watched == model)
+        {
+            return;
+        }
+        let subscription = cx.subscribe(model, |this, _, _: &PageMetadataChanged, cx| {
+            this.tabs_moved(cx)
+        });
+        self.watched = Some((model.clone(), subscription));
+        self.tabs_moved(cx);
+    }
+
+    /// The browser's tabs changed: what nothing shows starts its grace
+    /// period, and a surface whose tab is gone goes with it.
+    fn tabs_moved(&mut self, cx: &mut Context<Self>) {
+        let live: HashSet<PageId> = live_pages().into_iter().map(|(id, _)| id).collect();
+        let moved = self.pages.live(live);
+        for page in moved.start {
+            self.start_grace(page, cx);
+        }
+        for page in moved.gone {
+            self.frame.close(page.address(), cx);
+        }
+        cx.notify();
+    }
+
+    fn start_grace(&mut self, page: PageId, cx: &mut Context<Self>) {
+        tracing::info!(page_id = %page, after = ?GRACE, "closing a page nothing shows");
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(GRACE).await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.pages.fired(page) {
+                    return;
+                }
+                tracing::info!(page_id = %page, "closing a page nothing showed for its grace period");
+                if let Some(close) = this.browser.close_page_if_running(page, cx) {
+                    close.detach_and_log_err(cx);
+                }
+            });
+        });
+        self.pages.closing(page, timer);
+    }
+
+    /// The surface over `page` went.
+    fn hidden(&mut self, page: PageId, cx: &mut Context<Self>) {
+        if self.pages.hide(page) {
+            self.start_grace(page, cx);
+        }
+    }
+
+    /// Opens a new tab at what the user typed and shows it.
+    fn open_url(&mut self, input: &str, cx: &mut Context<Self>) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+        let url = match input.contains("://") {
+            true => input.to_owned(),
+            false => format!("https://{input}"),
+        };
+        let create = self.browser.create_page(url, cx);
+        if let Ok(model) = self.browser.model(cx) {
+            self.watch(&model, cx);
+        }
+        cx.spawn(async move |this, cx| {
+            let record = create.await;
+            let _ = this.update(cx, |this, cx| match record {
+                Ok(record) => this.frame.open(record.id.address(), cx),
+                Err(error) => {
+                    tracing::error!(%error, "browser page creation failed");
+                    this.frame
+                        .echo(format!("browser: {error:#}"), StyleClass::SystemInfo, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Closes `page`'s tab now, and its surface with it.
+    fn close_now(&mut self, page: PageId, cx: &mut Context<Self>) {
+        if let Some(close) = self.browser.close_page_if_running(page, cx) {
+            close.detach_and_log_err(cx);
+        }
+        self.frame.close(page.address(), cx);
+    }
+
+    fn web_menu(&self, point: &Point, this: Entity<Self>) -> Rows {
+        let mut rows = Rows::new("browser");
+        let opener = this.clone();
+        rows.push(Row::run("o", "open url", move |frame, window, cx| {
+            let opener = opener.clone();
+            frame.open_prompt(
+                "open url:",
+                Rc::new(|_, _, _| Vec::new()),
+                Rc::new(move |_, input, _, cx| {
+                    opener.update(cx, |system, cx| system.open_url(&input, cx));
+                }),
+                window,
+                cx,
+            );
+        }));
+        if let Some(page) = point.subject.as_ref().and_then(PageId::from_address) {
+            rows.push(Row::run("x", "close this page", move |_, _, cx| {
+                this.update(cx, |system, cx| system.close_now(page, cx));
+            }));
+        }
+        rows
+    }
+}
+
+/// What a page is called: its title while the browser has it, or its
+/// host, or nothing better than "page" before the browser has said.
+fn title(page: PageId) -> String {
+    live_page_name(page).unwrap_or_else(|| "page".to_owned())
+}
+
+impl rho_frame::System for PageSystem {
+    fn kinds(&self) -> &'static [&'static str] {
+        &[PageId::KIND]
+    }
+
+    fn open(
+        &mut self,
+        address: &Address,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnySurface> {
+        let page = PageId::from_address(address)?;
+        let model = match self.browser.open_page(page, cx) {
+            Ok(model) => model,
+            Err(error) => {
+                tracing::error!(%error, "the browser does not start");
+                self.frame.log(
+                    format!("browser: {error:#}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+                return None;
+            }
+        };
+        self.watch(&model, cx);
+        let view = cx.new(|cx| PageView::new(model, page, cx));
+        cx.observe_release(&view, move |this, _, cx| this.hidden(page, cx))
+            .detach();
+        self.pages.show(page);
+        Some(AnySurface::new(view))
+    }
+
+    fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+        vec![Row::menu("b", "browser", self.web_menu(point, cx.entity()))]
+    }
+
+    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+        let page = PageId::from_address(address)?;
+        Some((title(page), "web".to_owned()))
+    }
+
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+        live_pages()
+            .into_iter()
+            .map(|(id, metadata)| Found {
+                address: id.address(),
+                title: title(id),
+                description: format!("web · {}", metadata.url),
+                recency: 0,
+            })
+            .collect()
+    }
+}
+
+impl Surface for PageView {
+    fn title(&self, _cx: &App) -> String {
+        title(self.page_id())
+    }
+
+    fn subject(&self, _cx: &App) -> Subject {
+        Subject::Own
+    }
+}
+
+fn bind_keys(cx: &mut App) {
+    use gpui::KeyBinding;
+    use rho_frame::keys::{Home, RootMenu};
+    // Under the frame's own context, so the frame's handlers hear them;
+    // a page takes every key that no binding names.
+    let context = format!("{} > RhoBrowser", rho_frame::KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-shift-escape", Home, Some(&context)),
+        KeyBinding::new("ctrl-shift-space", RootMenu, Some(&context)),
+    ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_address_is_the_extensions_id_in_one_spelling() {
+        let id = PageId(uuid::Uuid::parse_str("018fbe9a-4e55-7b7d-a57e-7f7f4f31d1cd").unwrap());
+        let address = id.address();
+        assert_eq!(address.key(), "page:018fbe9a-4e55-7b7d-a57e-7f7f4f31d1cd");
+        assert_eq!(
+            Address::parse(address.key())
+                .as_ref()
+                .and_then(PageId::from_address),
+            Some(id)
+        );
+        // Other spellings of the same UUID would be other addresses of the
+        // same page, so none of them reads.
+        for other in [
+            "web-018fbe9a-4e55-7b7d-a57e-7f7f4f31d1cd",
+            "018FBE9A-4E55-7B7D-A57E-7F7F4F31D1CD",
+            "018fbe9a4e557b7da57e7f7f4f31d1cd",
+            "{018fbe9a-4e55-7b7d-a57e-7f7f4f31d1cd}",
+        ] {
+            assert_eq!(
+                PageId::from_address(&Address::new("page", other)),
+                None,
+                "{other}"
+            );
+        }
+        assert_eq!(
+            PageId::from_address(&Address::new("thread", id.rest())),
+            None
+        );
+    }
+}

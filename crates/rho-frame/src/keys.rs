@@ -1,0 +1,84 @@
+//! The frame's own keys. A system binds its own under the same contexts.
+//!
+//! rho's modal editing is Helix on top of vim (`init_vim_mode`), so a key
+//! that means something in normal mode is bound for `vim_mode == normal`
+//! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
+
+use gpui::{App, KeyBinding, actions};
+
+actions!(
+    rho_frame,
+    [
+        /// Up through history.
+        Back,
+        /// Down through history, and from the newest entry the next card.
+        Forward,
+        /// Closes the surface in view.
+        Close,
+        /// Closes the surface in view and deals the next card.
+        CloseAndDeal,
+        /// `space`: every command, one level down at most.
+        RootMenu,
+        /// `tab`: the verdicts over the card in view; `tab` again is Home.
+        VerdictMenu,
+        Home,
+        OpenRow,
+        FindAddress,
+        UndoVerdict,
+        MinibufferConfirm,
+        MinibufferCancel,
+        MinibufferNext,
+        MinibufferPrevious,
+        MinibufferComplete,
+    ]
+);
+
+/// The contexts a normal-mode key of `surface` (a key context such as
+/// `RhoFrame` or `RhoHome`) is bound under, with `more` appended to each.
+pub fn normal_contexts(surface: &str, more: &str) -> [String; 2] {
+    ["normal", "helix_normal"].map(|mode| format!("{surface} > Editor && vim_mode == {mode}{more}"))
+}
+
+/// Binds the frame's keys. Bound at both `RhoFrame` and `RhoFrame > Editor`:
+/// the bundled keymaps bind some of these keys under plain `Editor`, and
+/// gpui prefers the deeper match, so a root-level binding would lose
+/// while typing.
+pub fn bind(cx: &mut App) {
+    let mut bindings = Vec::new();
+    for context in ["RhoFrame", "RhoFrame > Editor"] {
+        bindings.extend([
+            KeyBinding::new("ctrl-k", Back, Some(context)),
+            KeyBinding::new("f21", Back, Some(context)),
+            KeyBinding::new("ctrl-j", Forward, Some(context)),
+            KeyBinding::new("f20", Forward, Some(context)),
+            KeyBinding::new("ctrl-shift-backspace", Close, Some(context)),
+            KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
+            KeyBinding::new("f16", CloseAndDeal, Some(context)),
+            KeyBinding::new("ctrl-shift-f", FindAddress, Some(context)),
+        ]);
+    }
+    for context in normal_contexts("RhoFrame", " && !showing_completions") {
+        bindings.extend([
+            KeyBinding::new("space", RootMenu, Some(&context)),
+            KeyBinding::new("tab", VerdictMenu, Some(&context)),
+            KeyBinding::new("q", Close, Some(&context)),
+        ]);
+    }
+    for context in normal_contexts("RhoFrame", " && vim_operator == none") {
+        bindings.push(KeyBinding::new("shift-u", UndoVerdict, Some(&context)));
+    }
+    for context in normal_contexts("RhoHome", "") {
+        bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
+    }
+    bindings.extend([
+        KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("ctrl-n", MinibufferNext, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
+    ]);
+    cx.bind_keys(bindings);
+}

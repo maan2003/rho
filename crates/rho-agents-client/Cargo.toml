@@ -1,5 +1,5 @@
 # The agents as the client holds them: the fold, the disk copy and the host
-# session. Without the `client` feature it is the agents protocol alone, for
+# session. Chat is rho-chat's. Without the `client` feature it is the agents protocol alone, for
 # the host.
 [package]
 edition.workspace = true
@@ -14,7 +14,6 @@ client = [
   "dep:anyhow",
   "dep:futures",
   "dep:prefix-id",
-  "dep:rand",
   "dep:redb",
   "dep:rho-db",
   "dep:rho-agent-hosts",
@@ -32,7 +31,6 @@ senax-encoder.workspace = true
 anyhow = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 prefix-id = { workspace = true, default-features = false, features = ["redb"], optional = true }
-rand = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }

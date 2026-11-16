@@ -910,10 +910,6 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
 /// Exercise the agent-owned boundary through the same injected session API used
 /// in production. Provider wire replay is tested independently in
 /// rho-inference.
-
-/// Exercise the agent-owned boundary through the same injected session API used
-/// in production. Provider wire replay is tested independently in
-/// rho-inference.
 #[tokio::test]
 async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() {
     use crate::inference::{Continuation, Request};
@@ -1266,9 +1262,6 @@ async fn an_agent_holding_tool_text_is_not_retired() {
         .await;
     handle.retire().await.unwrap();
 }
-
-/// A loaded skill is shown when loaded, shown again as it reads then after
-/// a compaction, and not repeated on requests in between or after.
 
 /// Compacting an agent that ended its turn starts no turn: the cell that
 /// ended it goes to the model with the next input, after the compaction.

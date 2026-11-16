@@ -98,7 +98,7 @@ Another agent's message to you arrives in this format:
 <text>
 ```
 
-Answer it with `agents.message(agent_id="<agent id>", message=text)`. An agent's post in a topic arrives like any chat message, after its topic.
+Answer it with `agents.message(agent_id="<agent id>", message=text)`. An agent's post in a thread arrives like any chat message, after its thread.
 
 """
 

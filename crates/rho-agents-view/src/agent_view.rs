@@ -1,37 +1,25 @@
-//! One model per agent projection: conversation with a prompt draft, or
-//! read-only activity — the buffer role. Editors are the window role:
-//! each surface showing the agent builds its editor over the shared
-//! multibuffer via [`AgentModel::build_editor`], with its own cursor,
-//! scroll, and folds. The model reconciles every attached editor when
-//! content or chrome changes, so the model persists for the session while
-//! editors come and go with surfaces.
-//!
-//! Each projection keeps its own cursor and scroll. Conversation composes
-//! message buffers with the writable prompt; activity composes execution
-//! records.
+//! One model per agent: its transcript, the buffer role. Editors are the
+//! window role: each surface showing the agent builds its editor over the
+//! shared multibuffer via [`AgentModel::build_editor`], with its own
+//! cursor, scroll, and folds. The model reconciles every attached editor
+//! when content or chrome changes, so the model persists for the session
+//! while editors come and go with surfaces.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
-use collections::HashSet;
-use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
-use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
+use editor::{Editor, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
-use language::{Buffer, BufferEvent, Capability, InlayId, Point};
-use multi_buffer::{MultiBuffer, PathKey};
-use rho_agent_types::{AgentId, ContentPart};
+use gpui::{App, Context, Entity, Subscription, Task, WeakEntity, Window};
+use language::{Buffer, Capability};
+use multi_buffer::MultiBuffer;
+use rho_agent_types::AgentId;
 use rho_agents_client::now_ms;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::FrameSummary;
-use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
-use crate::TranscriptView;
 use crate::transcript::{FillEdge, StorePoint, TranscriptModel};
-
-const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
 /// How much history one composition step takes on, in buffer rows.
 ///
@@ -91,26 +79,12 @@ impl HistoryWant {
     }
 }
 
-pub struct PromptGutter;
-
 pub struct AgentModel {
-    view: TranscriptView,
     transcript: TranscriptModel,
-    prompt_buffer: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
-    /// The document multibuffer is the transcript cropped flush when the turn
-    /// is closed, without the prompt. The dashboard preview reads this.
+    /// The document multibuffer: the transcript cropped flush when the
+    /// turn is closed. Every editor over this model reads it.
     document_multi_buffer: Entity<MultiBuffer>,
-    /// The read-only editor over the document multibuffer, built lazily
-    /// for the dashboard preview and kept for the model's lifetime.
-    preview_editor: Option<Entity<Editor>>,
-    prompt_end: text::Anchor,
-    attachments: Vec<ContentPart>,
-    attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
-    /// What an editor over this transcript completes with. Handed in
-    /// rather than reached for: the screen knows there are completions,
-    /// not where they come from.
-    completions: Rc<dyn editor::CompletionProvider>,
     initial_load_started: bool,
     initial_load_ready: bool,
     initial_load: Option<Task<()>>,
@@ -127,10 +101,8 @@ pub struct AgentModel {
     /// Where the point was when an editor over this model last moved it,
     /// as a store position: what returning to the surface goes back to.
     remembered_point: Option<StorePoint>,
-    /// Full-multibuffer editors currently displaying this agent, weakly
-    /// held: surfaces own their editors; the model only reconciles whoever
-    /// is still alive. The preview editor lives apart — prompt chrome
-    /// must never reach it.
+    /// Editors currently displaying this agent, weakly held: surfaces own
+    /// their editors; the model only reconciles whoever is still alive.
     editors: Vec<WeakEntity<Editor>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -142,75 +114,26 @@ pub enum AgentModelEvent {
     Loaded,
     /// The history the reader asked for is composed; nothing is waiting.
     HistoryComposed,
-    /// The user changed what they are writing.
-    DraftEdited,
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
 
 impl AgentModel {
     pub fn new(
-        completions: Rc<dyn editor::CompletionProvider>,
         visualization_client: rho_agents_client::remote::AgentsLink,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_view(
-            TranscriptView::Conversation,
-            completions,
-            visualization_client,
-            cx,
-        )
-    }
-
-    pub fn with_view(
-        view: TranscriptView,
-        completions: Rc<dyn editor::CompletionProvider>,
-        visualization_client: rho_agents_client::remote::AgentsLink,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let prompt_buffer = cx.new(|cx| Buffer::local("", cx));
-        let prompt_end = prompt_buffer.read(cx).anchor_after(0);
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            if view == TranscriptView::Conversation {
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(u64::MAX),
-                    prompt_buffer.clone(),
-                    [Point::zero()..prompt_buffer.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-            }
-            multi_buffer
-        });
-
-        let subscriptions = vec![cx.subscribe(&prompt_buffer, |this, _, event, cx| {
-            if matches!(event, BufferEvent::Edited { .. }) {
-                this.update_prompt_chrome(cx);
-                if this.view == TranscriptView::Conversation {
-                    cx.emit(AgentModelEvent::DraftEdited);
-                }
-            }
-        })];
-
+        let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let transcript = TranscriptModel::new(
-            view,
             multi_buffer.clone(),
             document_multi_buffer.clone(),
             visualization_client,
         );
         Self {
-            view,
             transcript,
-            prompt_buffer,
             multi_buffer,
             document_multi_buffer,
-            preview_editor: None,
-            prompt_end,
-            attachments: Vec::new(),
-            attachment_blocks: Vec::new(),
-            completions,
             initial_load_started: false,
             initial_load_ready: false,
             initial_load: None,
@@ -221,12 +144,8 @@ impl AgentModel {
             pending_point: None,
             remembered_point: None,
             editors: Vec::new(),
-            _subscriptions: subscriptions,
+            _subscriptions: Vec::new(),
         }
-    }
-
-    pub fn view(&self) -> TranscriptView {
-        self.view
     }
 
     pub fn initial_load_started(&self) -> bool {
@@ -250,13 +169,10 @@ impl AgentModel {
             return;
         }
         self.initial_load_started = true;
-        let view = self.view;
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
-                .spawn(async move {
-                    TranscriptModel::prepare_initial(view, state, now_ms, agent_labels)
-                })
+                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, agent_labels) })
                 .await;
             let reservations = (0..prepared.buffer_count())
                 .map(|_| cx.reserve_entity::<Buffer>())
@@ -299,57 +215,10 @@ impl AgentModel {
         }));
     }
 
-    /// The read-only preview editor over the document multibuffer, built
-    /// on first use: no prompt, no banner, pinned to the latest content.
-    pub fn preview_editor(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<Editor> {
-        if let Some(editor) = &self.preview_editor {
-            return editor.clone();
-        }
-        let multi_buffer = self.document_multi_buffer.clone();
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::new(
-                EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: true,
-                    show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                },
-                multi_buffer,
-                None,
-                window,
-                cx,
-            );
-            rho_window::editor_config::configure_preview(&mut editor, window, cx);
-            editor.disable_bracket_colorization(cx);
-            editor.set_read_only(true);
-            editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
-            editor
-        });
-        self.transcript.attach(&editor, now_ms(), cx);
-        self.preview_editor = Some(editor.clone());
-        editor
-    }
-
-    /// Releases the dashboard-only editor while retaining the shared
-    /// transcript buffers. A later preview recreates it lazily.
-    pub fn clear_preview_editor(&mut self) {
-        self.preview_editor = None;
-    }
-
     /// Builds an editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        let completions = self.completions.clone();
-        let activity = self.view == TranscriptView::Activity;
-        let multi_buffer = if activity {
-            self.document_multi_buffer.clone()
-        } else {
-            self.multi_buffer.clone()
-        };
-        let prompt_id = self.prompt_buffer.read(cx).remote_id();
+        let multi_buffer = self.document_multi_buffer.clone();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -364,38 +233,14 @@ impl AgentModel {
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
-            editor.disable_header_for_buffer(prompt_id, cx);
-            if activity {
-                editor.set_read_only(true);
-                editor.set_autoscroll_pin(
-                    multi_buffer::Anchor::Max,
-                    AutoscrollStrategy::Bottom,
-                    cx,
-                );
-                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                    selections.select_anchor_ranges([
-                        multi_buffer::Anchor::Max..multi_buffer::Anchor::Max
-                    ]);
-                });
-            } else {
-                editor.set_completion_provider(Some(completions));
-            }
+            editor.set_read_only(true);
+            editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections
+                    .select_anchor_ranges([multi_buffer::Anchor::Max..multi_buffer::Anchor::Max])
+            });
             editor
         });
-
-        if let Some(draft_anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(self.prompt_end)
-        {
-            editor.update(cx, |editor, cx| {
-                editor.set_autoscroll_pin(draft_anchor, AutoscrollStrategy::Bottom, cx);
-                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                    selections.select_anchor_ranges([draft_anchor..draft_anchor]);
-                });
-            });
-        }
 
         self.transcript.attach(&editor, now_ms(), cx);
         // History is composed as the reader moves into it, and the point
@@ -409,17 +254,12 @@ impl AgentModel {
                     this.editor_scrolled(&editor.clone(), window, cx);
                 }
                 editor::EditorEvent::SelectionsChanged { local: true } => {
-                    // `None` when the point is in the prompt rather than
-                    // the transcript, which is where a reopened surface
-                    // should then start.
                     this.remembered_point = this.store_point(&editor.clone(), cx);
                 }
                 _ => {}
             },
         ));
         self.editors.push(editor.downgrade());
-        self.apply_prompt_chrome_to(&editor, cx);
-        self.refresh_attachment_blocks(cx);
         if let Some(point) = self.remembered_point {
             self.go_to_store_point(&editor, point, window, cx);
         }
@@ -696,181 +536,5 @@ impl AgentModel {
 
     pub fn has_timers(&self) -> bool {
         self.transcript.has_timers()
-    }
-
-    /// Takes the trimmed prompt draft, clearing it. Returns `None` when empty.
-    /// What the user is writing, as they wrote it.
-    pub fn prompt_text(&self, cx: &App) -> String {
-        self.prompt_buffer.read(cx).text()
-    }
-
-    /// Puts back what the user was writing when the view was last open.
-    pub fn set_prompt_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.prompt_buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, text)], None, cx);
-        });
-    }
-
-    pub fn take_prompt(&mut self, cx: &mut Context<Self>) -> Option<Vec<ContentPart>> {
-        if self.view == TranscriptView::Activity {
-            return None;
-        }
-        let buffer = self.prompt_buffer.read(cx);
-        let text = buffer
-            .text_for_range(0..buffer.len())
-            .collect::<String>()
-            .trim()
-            .to_owned();
-        if text.is_empty() && self.attachments.is_empty() {
-            return None;
-        }
-        self.prompt_buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, "")], None, cx);
-        });
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentPart::Text { text });
-        }
-        content.append(&mut self.attachments);
-        self.update_prompt_chrome(cx);
-        self.refresh_attachment_blocks(cx);
-        Some(content)
-    }
-
-    /// Whether the newest selection head sits in the editable prompt tail of
-    /// the transcript. The phone layout shows the keyboard only then.
-    pub fn selection_in_prompt(&self, editor: &Entity<Editor>, cx: &App) -> bool {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let Some(prompt_start) = snapshot.anchor_in_excerpt(self.prompt_end) else {
-            return false;
-        };
-        let head = editor.read(cx).selections.newest_anchor().head();
-        head.cmp(&prompt_start, &snapshot).is_ge()
-    }
-
-    /// Places this editor's cursor in the writable prompt tail. Transcript
-    /// previews can retain an older cursor when promoted from Deal mode; edit
-    /// commands must not start against the read-only conversation above it.
-    pub fn focus_prompt(
-        &self,
-        editor: &Entity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(prompt_end) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(self.prompt_end)
-        else {
-            return;
-        };
-        editor.update(cx, |editor, cx| {
-            editor.set_autoscroll_pin(prompt_end, AutoscrollStrategy::Bottom, cx);
-            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
-                selections.select_anchor_ranges([prompt_end..prompt_end]);
-            });
-        });
-        window.focus(&editor.focus_handle(cx), cx);
-    }
-
-    pub fn add_image(&mut self, media_type: String, data: Vec<u8>, cx: &mut Context<Self>) {
-        self.attachments
-            .push(ContentPart::Image { media_type, data });
-        self.update_prompt_chrome(cx);
-        self.refresh_attachment_blocks(cx);
-    }
-
-    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = !self.attachments.is_empty();
-        self.attachments.clear();
-        self.update_prompt_chrome(cx);
-        self.refresh_attachment_blocks(cx);
-        had
-    }
-
-    fn update_prompt_chrome(&mut self, cx: &mut Context<Self>) {
-        for editor in self.live_editors() {
-            self.apply_prompt_chrome_to(&editor, cx);
-        }
-        cx.notify();
-    }
-
-    fn refresh_attachment_blocks(&mut self, cx: &mut Context<Self>) {
-        for (editor, block_id) in self.attachment_blocks.drain(..) {
-            if let Some(editor) = editor.upgrade() {
-                editor.update(cx, |editor, cx| {
-                    editor.remove_blocks(
-                        std::iter::once(block_id).collect::<HashSet<_>>(),
-                        None,
-                        cx,
-                    );
-                });
-            }
-        }
-        if self.attachments.is_empty() {
-            return;
-        }
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(self.prompt_end)
-        else {
-            return;
-        };
-        let block = style::attachment_block(anchor, crate::attachment_labels(&self.attachments));
-        for editor in self.live_editors() {
-            let block = block.clone();
-            let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));
-            if let Some(block_id) = ids.into_iter().next() {
-                self.attachment_blocks.push((editor.downgrade(), block_id));
-            }
-        }
-    }
-
-    fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let buffer = self.prompt_buffer.read(cx);
-        let draft_empty = buffer.is_empty();
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let Some(prompt_start) =
-            snapshot.anchor_in_excerpt(self.prompt_buffer.read(cx).anchor_before(0))
-        else {
-            return;
-        };
-        let Some(prompt_end) = snapshot.anchor_in_excerpt(self.prompt_end) else {
-            return;
-        };
-
-        let mut inlays = Vec::new();
-        if draft_empty {
-            inlays.push(Inlay::custom(
-                PROMPT_PLACEHOLDER_INLAY_ID,
-                prompt_end,
-                "Write a message…",
-            ));
-        }
-        let draft_highlight = if draft_empty {
-            Vec::new()
-        } else {
-            vec![prompt_start..prompt_end]
-        };
-        let draft_style = StyleClass::UserMessage.resolve(cx);
-        editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)], inlays, cx);
-            editor.highlight_text(
-                HighlightKey::SyntaxTreeView(PROMPT_DRAFT_HIGHLIGHT_KEY),
-                draft_highlight,
-                draft_style,
-                cx,
-            );
-            editor.highlight_gutter::<PromptGutter>(
-                vec![prompt_start..prompt_end],
-                style::user_prompt_gutter_color,
-                cx,
-            );
-        });
     }
 }

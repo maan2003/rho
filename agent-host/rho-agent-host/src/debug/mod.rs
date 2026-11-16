@@ -59,18 +59,19 @@ enum DebugCommand {
     /// is compacted offline instead.
     Compact {
         #[arg(long)]
-        socket_path: Option<PathBuf>,
+        runtime_dir: Option<PathBuf>,
     },
     /// Permanently delete worksets: their logs, agents, Claude sessions and
     /// directories. Chat stays. Runs through the host, which stops their
-    /// processes first. Use --socket-path to select a host, not --db-path.
+    /// processes first. Use --runtime-dir to select a host, not --db-path.
     DeleteWorksets {
         /// Workset ids.
         #[arg(required = true)]
         worksets: Vec<String>,
-        /// Host socket; defaults to $RHO_SOCKET_PATH, then the user's host.
+        /// The host's runtime directory; defaults to $RHO_RUNTIME_DIR, then
+        /// the user's host.
         #[arg(long)]
-        socket_path: Option<PathBuf>,
+        runtime_dir: Option<PathBuf>,
     },
     /// Print bytes stored per table and pages allocated overall for the
     /// real database. Stop the agent host first.
@@ -92,46 +93,42 @@ enum DebugCommand {
         /// workset with its own `/src`.
         #[arg(long)]
         cwd: Option<camino::Utf8PathBuf>,
-        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
-        /// user's agent host.
-        #[arg(long = "socket-path")]
-        socket_path: Option<PathBuf>,
+        /// The agent host's runtime directory; defaults to `$RHO_RUNTIME_DIR`,
+        /// then the user's agent host.
+        #[arg(long = "runtime-dir")]
+        runtime_dir: Option<PathBuf>,
         /// Python run once in the new workset's namespace.
         code: String,
-        /// The user's first message, in a new topic of the stream `debug`,
-        /// mentioning the first agent `code` creates.
+        /// The user's first message, a new root thread mentioning the
+        /// first agent `code` creates.
         message: Option<String>,
     },
-    /// Post in a topic, as the user would, on a running agent host.
+    /// Post in a thread, as the user would, on a running agent host.
     Post {
-        /// The topic's id.
-        topic: u64,
-        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
-        /// user's agent host.
-        #[arg(long = "socket-path")]
-        socket_path: Option<PathBuf>,
+        /// The thread's id: the message it hangs under.
+        thread: u64,
+        /// The agent host's runtime directory; defaults to `$RHO_RUNTIME_DIR`,
+        /// then the user's agent host.
+        #[arg(long = "runtime-dir")]
+        runtime_dir: Option<PathBuf>,
         /// An agent the message reaches though it is not a member.
         #[arg(long)]
         mention: Vec<String>,
         text: String,
     },
-    /// Wake an agent with a message from the user, in a new topic of the
-    /// stream `debug` that mentions it, so it joins the topic and answers
-    /// there. Needs no topic id.
+    /// Wake an agent with a message from the user, a new root thread that
+    /// mentions it, so it joins the thread and answers there. Needs no
+    /// thread id.
     SendMessage {
         /// Full agent id, as in `$RHO_AGENT_ID`.
         agent: String,
-        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
-        /// user's agent host.
-        #[arg(long = "socket-path")]
-        socket_path: Option<PathBuf>,
+        /// The agent host's runtime directory; defaults to `$RHO_RUNTIME_DIR`,
+        /// then the user's agent host.
+        #[arg(long = "runtime-dir")]
+        runtime_dir: Option<PathBuf>,
         text: String,
     },
 }
-
-/// Where `rho debug create-workset` and `send-message` put the topic of
-/// their message.
-const DEBUG_STREAM: &str = "debug";
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     // Resolved once, here: the readers below are handed a path.
@@ -145,18 +142,18 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Rollback => rollback(args.db_path).await,
         DebugCommand::Savepoints => savepoints(args.db_path).await,
         DebugCommand::DropStaleSavepoints => drop_stale_savepoints(args.db_path).await,
-        DebugCommand::Compact { socket_path } => compact(args.db_path, socket_path).await,
+        DebugCommand::Compact { runtime_dir } => compact(args.db_path, runtime_dir).await,
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
         DebugCommand::DeleteWorksets {
             worksets,
-            socket_path,
+            runtime_dir,
         } => {
             anyhow::ensure!(
                 args.db_path.is_none(),
-                "deletion runs through the host; select it with --socket-path, not --db-path"
+                "deletion runs through the host; select it with --runtime-dir, not --db-path"
             );
-            delete_worksets(socket_path, &worksets).await
+            delete_worksets(runtime_dir, &worksets).await
         }
         DebugCommand::Context => print_report(args.db_path, &claude, DebugReport::Context).await,
         DebugCommand::Transcript { agent, max_chars } => {
@@ -168,7 +165,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         }
         DebugCommand::CreateWorkset {
             cwd,
-            socket_path,
+            runtime_dir,
             code,
             message,
         } => {
@@ -179,14 +176,14 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                 },
                 code,
             };
-            let socket = host_socket(socket_path)?;
-            let created = rho_rpc::protocol::client::call(socket.clone(), call).await?;
+            let paths = host_paths(runtime_dir)?;
+            let created = rho_rpc::protocol::client::call(&paths, call).await?;
             println!("workset {}", created.workset);
             if let Some(agent) = created.result.agent {
                 println!("agent {}", agent.encoded());
                 if let Some(text) = message {
-                    let topic = start_debug_topic(&socket, agent, text).await?;
-                    println!("topic {}", topic.0.0);
+                    let thread = start_debug_thread(&paths, agent, text).await?;
+                    println!("thread {}", thread.0.0);
                 }
             }
             print!("{}", created.result.output);
@@ -196,8 +193,8 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             Ok(())
         }
         DebugCommand::Post {
-            topic,
-            socket_path,
+            thread,
+            runtime_dir,
             mention,
             text,
         } => {
@@ -208,55 +205,48 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                         .with_context(|| format!("agent id {agent}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let call = rho_agents_client::protocol::worksets::Post {
+            let call = rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
-                topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(topic)),
+                parent: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(thread))),
                 mentions,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
             };
-            let id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            let id = rho_rpc::protocol::client::call(&host_paths(runtime_dir)?, call).await?;
             println!("message {}", id.0.0);
             Ok(())
         }
         DebugCommand::SendMessage {
             agent,
-            socket_path,
+            runtime_dir,
             text,
         } => {
             let agent = rho_agent_types::parse_full_handle(&agent)
                 .with_context(|| format!("agent id {agent}"))?;
-            let topic = start_debug_topic(&host_socket(socket_path)?, agent, text).await?;
-            println!("topic {}", topic.0.0);
+            let thread = start_debug_thread(&host_paths(runtime_dir)?, agent, text).await?;
+            println!("thread {}", thread.0.0);
             Ok(())
         }
     }
 }
 
-/// A topic of the user's in the stream `debug`, named by the first line of
-/// `text`, whose first message is `text` and mentions `agent`.
-async fn start_debug_topic(
-    socket: &Path,
+/// A root thread of the user's whose message is `text` and mentions
+/// `agent`.
+async fn start_debug_thread(
+    paths: &rho_rpc::protocol::RuntimePaths,
     agent: rho_agent_types::AgentId,
     text: String,
-) -> anyhow::Result<rho_agent_types::TopicId> {
-    let stream = rho_agents_client::protocol::worksets::CreateStream {
-        name: DEBUG_STREAM.to_owned(),
-    };
-    let stream = rho_rpc::protocol::client::call(socket, stream).await?;
-    let call = rho_agents_client::protocol::worksets::StartTopic {
+) -> anyhow::Result<rho_agent_types::MessageId> {
+    let call = rho_chat::protocol::Post {
         client_id: uuid::Uuid::new_v4().as_u64_pair().0,
-        stream,
-        name: text.lines().next().unwrap_or_default().to_owned(),
+        parent: None,
         mentions: vec![agent],
         content: vec![rho_agent_types::ContentPart::Text { text }],
     };
-    rho_rpc::protocol::client::call(socket, call).await
+    rho_rpc::protocol::client::call(paths, call).await
 }
 
-fn host_socket(socket_path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    Ok(rho_rpc::protocol::RuntimePaths::resolve(socket_path)?
-        .socket()
-        .to_owned())
+fn host_paths(runtime_dir: Option<PathBuf>) -> anyhow::Result<rho_rpc::protocol::RuntimePaths> {
+    rho_rpc::protocol::RuntimePaths::resolve(runtime_dir)
 }
 
 /// The agent host's lock, held for as long as the file lives, or `None` while
@@ -305,16 +295,19 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
     std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
     match copy_snapshot_from(&source, &paths.host_lock())? {
         Some(snapshot) => Ok(snapshot),
-        None => request_snapshot(paths.socket(), &source).await,
+        None => request_snapshot(&paths, &source).await,
     }
 }
 
 /// Ask the running agent host for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
-async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
-    let path = rho_rpc::protocol::client::call(socket, rho_agent_hosts::protocol::Snapshot)
+async fn request_snapshot(
+    paths: &rho_rpc::protocol::RuntimePaths,
+    source: &Path,
+) -> anyhow::Result<Snapshot> {
+    let path = rho_rpc::protocol::client::call(paths, rho_agent_hosts::protocol::Snapshot)
         .await
-        .context("the agent host holds the database, and its socket does not answer")?
+        .context("the agent host holds the database, and it does not answer")?
         .into_std_path_buf();
     let dir = path.parent().context("snapshot has no directory")?;
     Ok(Snapshot {
@@ -452,7 +445,7 @@ async fn print_report(
             match copy_snapshot_from(&source, &paths.host_lock())? {
                 Some(snapshot) => snapshot,
                 None => {
-                    let path = rho_rpc::protocol::client::call(paths.socket(), report)
+                    let path = rho_rpc::protocol::client::call(&paths, report)
                         .await
                         .context("ask the agent host, which holds the database, for the report")?
                         .into_std_path_buf();
@@ -747,7 +740,7 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         None => {
             let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
             let dropped = rho_rpc::protocol::client::call(
-                paths.socket(),
+                &paths,
                 rho_agent_hosts::protocol::ForgetSavepoints,
             )
             .await
@@ -763,13 +756,13 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn delete_worksets(socket_path: Option<PathBuf>, worksets: &[String]) -> anyhow::Result<()> {
+async fn delete_worksets(runtime_dir: Option<PathBuf>, worksets: &[String]) -> anyhow::Result<()> {
     let worksets = worksets
         .iter()
         .map(|id| id.parse().with_context(|| format!("workset id {id}")))
         .collect::<anyhow::Result<Vec<rho_agent_types::WorksetId>>>()?;
     rho_rpc::protocol::client::call(
-        host_socket(socket_path)?,
+        &host_paths(runtime_dir)?,
         rho_agents_client::protocol::worksets::DeleteWorksets {
             worksets: worksets.clone(),
         },
@@ -790,18 +783,18 @@ fn stats(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     RhoDb::print_stats(&path)
 }
 
-async fn compact(db_path: Option<PathBuf>, socket_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn compact(db_path: Option<PathBuf>, runtime_dir: Option<PathBuf>) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let (before, after) = match db_path {
         Some(path) => {
             anyhow::ensure!(
-                socket_path.is_none(),
-                "--db-path and --socket-path are mutually exclusive"
+                runtime_dir.is_none(),
+                "--db-path and --runtime-dir are mutually exclusive"
             );
             RhoDb::compact(path)?
         }
         None => rho_rpc::protocol::client::call(
-            host_socket(socket_path)?,
+            &host_paths(runtime_dir)?,
             rho_agent_hosts::protocol::CompactDatabase,
         )
         .await

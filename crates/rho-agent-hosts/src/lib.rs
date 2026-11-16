@@ -46,14 +46,17 @@ impl std::fmt::Display for HostId {
     }
 }
 
-/// How to reach the agent host. Deliberately holds no client-local paths: the
-/// socket may be forwarded from another machine, so this client's own cwd
-/// and home mean nothing to the agent host and must never leak into agent
-/// working directories.
+/// How to reach the agent host. Deliberately holds no client-local paths
+/// beyond a local host's runtime directory: this client's own cwd and home
+/// mean nothing to the agent host and must never leak into agent working
+/// directories.
 #[cfg(feature = "client")]
 #[derive(Clone)]
 pub enum AttachTarget {
-    Unix(std::path::PathBuf),
+    /// A host on this machine, by its runtime directory: its id is read
+    /// from there at each dial, and the connection goes over its IPC
+    /// socket, which is what has it trust this client.
+    Local { runtime_dir: std::path::PathBuf },
     Iroh {
         endpoint_id: iroh::EndpointId,
         access: IrohAccess,
@@ -61,8 +64,8 @@ pub enum AttachTarget {
 }
 
 /// Which machine a host is, the same however it is reached and on every
-/// client: its iroh endpoint id, or `unix:<socket>` for a local one. Its
-/// name is only what this client calls it.
+/// client: its iroh endpoint id, or `local:<runtime dir>` for a local one.
+/// Its name is only what this client calls it.
 #[cfg(feature = "client")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostKey(String);
@@ -83,7 +86,7 @@ impl HostKey {
 impl AttachTarget {
     pub fn key(&self) -> HostKey {
         match self {
-            Self::Unix(path) => HostKey(format!("unix:{}", path.display())),
+            Self::Local { runtime_dir } => HostKey(format!("local:{}", runtime_dir.display())),
             Self::Iroh { endpoint_id, .. } => HostKey(endpoint_id.to_string()),
         }
     }
@@ -91,7 +94,7 @@ impl AttachTarget {
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
         match self {
-            Self::Unix(path) => path.display().to_string(),
+            Self::Local { runtime_dir } => runtime_dir.display().to_string(),
             Self::Iroh {
                 access: IrohAccess::Ssh {
                     ssh_destination, ..
@@ -134,8 +137,8 @@ pub struct HostSpec {
 #[cfg(feature = "client")]
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
-    /// the attach prompt: `<name>=unix:<socket>`,
-    /// `<name>=iroh:<endpoint-id>[@<ssh-destination>]`, or
+    /// the attach prompt: `<name>=local[:<runtime-dir>]` for a host on this
+    /// machine, `<name>=iroh:<endpoint-id>[@<ssh-destination>]`, or
     /// `<name>=rho://…` for a pairing link.
     pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
         let text = text.trim();
@@ -158,15 +161,29 @@ impl HostSpec {
                 },
             });
         }
-        let (name, target) = text
-            .trim()
-            .split_once('=')
-            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>[@<ssh-dest>]")?;
+        let (name, target) = text.trim().split_once('=').ok_or(
+            "expected <name>=local[:<runtime-dir>] or <name>=iroh:<endpoint-id>[@<ssh-dest>]",
+        )?;
         if name.is_empty() {
             return Err("host name is empty".to_owned());
         }
+        let local = match target {
+            "local" => Some(None),
+            _ => target
+                .strip_prefix("local:")
+                .map(|directory| Some(std::path::PathBuf::from(directory))),
+        };
+        if let Some(directory) = local {
+            let runtime_dir = rho_rpc::protocol::RuntimePaths::new(directory)
+                .map_err(|error| error.to_string())?
+                .directory()
+                .to_owned();
+            return Ok(Self {
+                name: name.to_owned(),
+                target: AttachTarget::Local { runtime_dir },
+            });
+        }
         let target = match target.split_once(':') {
-            Some(("unix", path)) => AttachTarget::Unix(std::path::PathBuf::from(path)),
             Some(("iroh", rest)) => {
                 let (endpoint_id, access) = match rest.split_once('@') {
                     Some((id, destination)) => (
@@ -290,6 +307,10 @@ mod parse_tests {
         // The client names the host, never the link.
         assert!(HostSpec::parse(&format!("rho://{z32}?key={key}"), "rho").is_err());
         assert!(HostSpec::parse(&format!("=rho://{z32}?key={key}"), "rho").is_err());
+        let local = HostSpec::parse("here=local:/run/user/7/rho", "rho").unwrap();
+        assert!(
+            matches!(&local.target, AttachTarget::Local { runtime_dir } if runtime_dir == std::path::Path::new("/run/user/7/rho"))
+        );
         let ssh = HostSpec::parse(&format!("fern=iroh:{z32}@other-host"), "/opt/rho").unwrap();
         assert!(
             matches!(ssh.target, AttachTarget::Iroh { endpoint_id, access: IrohAccess::Ssh { ssh_destination, remote_rho } } if endpoint_id == id && ssh_destination == "other-host" && remote_rho == "/opt/rho")

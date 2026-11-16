@@ -17,8 +17,9 @@ libc.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
 rho-agent-types.workspace = true
-rho-rpc.workspace = true
+rho-rpc = { workspace = true, features = ["native-client"] }
 rho-agents-client.workspace = true
+rho-chat.workspace = true
 rho-desktop-client.workspace = true
 rho-ledger.workspace = true
 rho-files.workspace = true

@@ -1,5 +1,5 @@
-//! One host's agents session: the host's chat, directory, rows and live
-//! tails to the model, and the model's follows and the window's focus back
+//! One host's agents session: the host's directory, rows and live tails to
+//! the model, and the model's follows and the window's focus back
 //! to the host. The agent log pages a follow needs are read here too, on
 //! streams of their own, so everything the model hears of a host comes in
 //! one order.

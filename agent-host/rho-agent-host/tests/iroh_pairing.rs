@@ -30,17 +30,17 @@ async fn auth(
     rho_rpc::authenticate_iroh_client(&connection, client.id(), pairing).await
 }
 
-async fn start(temp: &Path) -> Result<(Child, std::path::PathBuf)> {
+async fn start(temp: &Path) -> Result<(Child, rho_rpc::protocol::RuntimePaths)> {
     let runtime = temp.join("runtime");
     std::fs::create_dir(&runtime)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
     let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
-    let socket = temp.join("rho.sock");
+    let paths = rho_rpc::protocol::RuntimePaths::new(Some(temp.join("host")))?;
     let child = Child(
         Command::new(bin.join("rho-agent-host"))
-            .args(["--iroh", "--socket-path"])
-            .arg(&socket)
+            .arg("--runtime-dir")
+            .arg(paths.directory())
             .arg("--claude-config-dir")
             .arg(temp.join("claude"))
             .env("XDG_STATE_HOME", temp.join("state"))
@@ -51,21 +51,21 @@ async fn start(temp: &Path) -> Result<(Child, std::path::PathBuf)> {
             .context("build rho-agent-host first")?,
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while rho_rpc::connect_unix(&socket).await.is_err() {
+    while rho_rpc::protocol::client::connect(&paths).await.is_err() {
         ensure!(
             tokio::time::Instant::now() < deadline,
             "agent host startup timed out"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok((child, socket))
+    Ok((child, paths))
 }
 
 #[tokio::test]
 async fn a_pairing_link_trusts_the_first_client_for_good_and_no_other() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (_host, socket) = start(temp.path()).await?;
-    let link: PairingLink = rho_rpc::protocol::client::call(&socket, host::IrohPair)
+    let (_host, paths) = start(temp.path()).await?;
+    let link: PairingLink = rho_rpc::protocol::client::call(&paths, host::IrohPair)
         .await?
         .parse()
         .map_err(anyhow::Error::msg)?;

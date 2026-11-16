@@ -148,7 +148,7 @@ class GhApi(OpenAPIClient):
         if repo: kwargs['repo'] = repo
         self.headers = {'Accept': 'application/vnd.github+json'}
         self.token, self.gh_host = None, GH_HOST
-        socket = Path(os.environ['RHO_SOCKET_PATH']).with_name('octo.sock')
+        socket = Path(os.environ['RHO_RUNTIME_DIR']) / 'octo.sock'
         transport = httpx2.AsyncHTTPTransport(uds=str(socket))
         client = httpx2.AsyncClient(transport=transport, follow_redirects=False, timeout=timeout)
         self.transport = GhTransport(debug=debug, limit_cb=limit_cb, timeout=timeout,

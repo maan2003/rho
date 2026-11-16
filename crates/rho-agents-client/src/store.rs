@@ -471,7 +471,7 @@ mod tests {
     use rho_agent_types::{AgentIdDomain, UnixMs, Wpos};
 
     use super::*;
-    use crate::fold::{TranscriptFold, TranscriptRow};
+    use crate::fold::TranscriptFold;
     use crate::protocol::transcript::ArgumentsFormat;
     use crate::protocol::worksets::LogEvent;
 
@@ -703,7 +703,7 @@ mod tests {
                 }],
             }),
             draft: Some(crate::protocol::transcript::Draft {
-                topic: None,
+                thread: None,
                 text: draft.into(),
             }),
         };
@@ -744,7 +744,7 @@ mod tests {
                 }],
             }),
             draft: draft.map(|text| crate::protocol::transcript::Draft {
-                topic: None,
+                thread: None,
                 text: text.to_owned(),
             }),
         };
@@ -775,16 +775,20 @@ mod tests {
         );
 
         let mut fold = TranscriptFold::new(agent(), &[]);
-        fold.tell(&TranscriptRow::Message(rho_agent_types::Message {
-            id: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
-            at: UnixMs(1),
-            topic: rho_agent_types::TopicId(rho_agent_types::ChatSeq(1)),
-            from: rho_agent_types::Address::Agent(agent()),
-            mentions: Vec::new(),
-            content: vec![rho_agent_types::ContentPart::Text {
-                text: "other cell".into(),
-            }],
-        }));
+        fold.tell(
+            Wpos(0),
+            &LogEvent::Replied {
+                agent: agent(),
+                items: vec![Item::Text {
+                    text: "other cell".into(),
+                    phase: None,
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(1),
+            },
+        );
         store.apply_fold_delta(agent(), fold.delta().unwrap());
         assert_eq!(
             text(&store),
@@ -798,7 +802,7 @@ mod tests {
             "host withdraws after the latest cell sends"
         );
         assert!(matches!(store.get(&agent()).unwrap().blocks[0].as_ref(),
-            UiBlock::MessageSent { text, .. } if text == "other cell"));
+            UiBlock::AssistantMessage { text, .. } if text == "other cell"));
     }
 
     #[test]
@@ -806,9 +810,9 @@ mod tests {
         let mut store = AgentStore::default();
         store.apply_live(agent(), snapshot("first", vec![call("one"), call("two")]));
         let mut fold = TranscriptFold::new(agent(), &[]);
-        fold.tell(&TranscriptRow::Log(
+        fold.tell(
             Wpos(0),
-            LogEvent::Replied {
+            &LogEvent::Replied {
                 agent: agent(),
                 items: vec![call("one")],
                 compacted: false,
@@ -816,7 +820,7 @@ mod tests {
                 context_used: None,
                 at: UnixMs(1),
             },
-        ));
+        );
         store.apply_fold_delta(agent(), fold.delta().unwrap());
         let ids: Vec<_> = store
             .get(&agent())

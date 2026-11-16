@@ -1,9 +1,11 @@
-"""The host's chat: streams of topics of messages, and direct
-conversations of two agents ([ARCH-agent-host]). Chat and agents meet only
-here: a message reaches the members of its conversation and the agents it
-mentions, never its sender. A topic's members are the agents that joined it.
-A direct conversation's members are its two agents, and only they post in
-it. The user is reached by a mention."""
+"""The host's chat: a forest of messages ([ARCH-agent-host]). Every message
+hangs under a parent message or is a root; the messages under a message
+are its thread, and a thread's id is its message's. Chat and agents meet
+only here: a message reaches the members of the thread it is posted in and
+of the threads above it, and the agents it mentions, never its sender. An
+agent joins or leaves a thread; the nearest record up the chain decides.
+The user is reached by a mention; another agent, by `mail`, which is not
+chat: the host hands it to the agent and keeps no log."""
 
 import _rho
 
@@ -16,69 +18,63 @@ KINDS = ("ask", "result", "fyi")
 ORIGIN = "origin"
 
 
-def post(sender: str, topic: int, text: str, mentions: list[tuple[str, str]] = ()) -> int:
-    """Post `text` in `topic`; returns the message id. `mentions` are
-    `(address, kind)` pairs."""
-    return _rho.post(sender, topic, text, mentions=list(mentions))
+def post(sender: str, parent: int | None, text: str, mentions: list[tuple[str, str]] = ()) -> int:
+    """Post `text` under `parent`, or as a root; returns the message id.
+    `mentions` are `(address, kind)` pairs."""
+    return _rho.post(sender, None if parent is None else int(parent), text, mentions=list(mentions))
 
 
-def start(sender: str, stream: str, name: str, text: str, mentions: list[tuple[str, str]] = ()) -> tuple[int, int]:
-    """Start a topic named `name` in the stream named `stream`, made if it is
-    new, with `text` as its first message; returns `(topic, message)`. No
-    one joins it."""
-    return _rho.start_topic(sender, stream, name, text, mentions=list(mentions))
+def mail(sender: str, to: str, text: str) -> None:
+    """Hand `text` to agent `to` as a message from `sender`, outside the
+    chat."""
+    from .prompt import label
+
+    _rho.mail(sender, to, f"[message from {label(sender)}]\n{text}")
 
 
-def direct(a: str, b: str) -> int:
-    """The direct conversation of agents `a` and `b`, started if new."""
-    return _rho.direct(a, b)
+def join(thread: int, agent: str) -> None:
+    _rho.join(int(thread), agent)
 
 
-def join(topic: int, agent: str) -> None:
-    _rho.join(topic, agent)
+def leave(thread: int, agent: str) -> None:
+    _rho.leave(int(thread), agent)
 
 
-def leave(topic: int, agent: str) -> None:
-    _rho.leave(topic, agent)
+def reparent(agent: str, message: int, parent: int | None) -> None:
+    """Put a message and its thread under `parent`, or among the roots,
+    for `agent`."""
+    _rho.reparent(agent, int(message), None if parent is None else int(parent))
 
 
-def change(agent: str, topic: int, *, stream: str | None = None, name: str | None = None, resolved: bool | None = None) -> None:
-    """Change a topic for `agent`: what is not given stays as it is."""
-    head = _rho.topic(topic)
-    if head is None:
-        raise ValueError(f"no topic {topic}")
-    if head["stream"] is None:
-        raise ValueError("a direct conversation is not renamed, moved or resolved")
-    _rho.change_topic(
-        agent,
-        topic,
-        head["stream"] if stream is None else stream,
-        head["name"] if name is None else name,
-        head["resolved"] if resolved is None else resolved,
-    )
+def name(agent: str, thread: int, name: str) -> None:
+    """Name a thread for `agent`; an empty name takes the name back."""
+    _rho.name(agent, int(thread), name)
 
 
-def move(agent: str, messages: list[int], to: int | None = None, *, stream: str | None = None, name: str | None = None) -> int:
-    """Move messages for `agent` to topic `to`, or to a new topic `name` in
-    `stream`; returns the topic they are in."""
-    if to is None:
-        return _rho.move_messages(agent, list(messages), stream=stream, name=name)
-    return _rho.move_messages(agent, list(messages), to)
-
-
-def topic(id: int) -> dict | None:
-    """The conversation's name, its stream's name, whether it is resolved,
-    and its members. Name and stream are None for a direct conversation."""
-    return _rho.topic(id)
+def thread(id: int) -> dict | None:
+    """The thread of message `id`: its name, the ids and names of the
+    threads above it and itself (`path`), and its members (`agents`)."""
+    return _rho.thread(int(id))
 
 
 def message(id: int) -> dict | None:
-    return _rho.message(id)
+    return _rho.message(int(id))
 
 
-def read(topic: int, last: int) -> list[dict]:
-    """The conversation's `last` newest messages, oldest first."""
-    return _rho.read(topic, last)
+def read(thread: int | None, last: int) -> list[dict]:
+    """The `last` newest messages under `thread`, oldest first; the roots
+    for `None`."""
+    return _rho.read(None if thread is None else int(thread), int(last))
+
+
+def root(name: str) -> int | None:
+    """The root whose name is `name`, if there is one."""
+    wanted = " ".join(name.split())
+    for record in reversed(read(None, 1 << 31)):
+        head = thread(record["id"])
+        if head is not None and " ".join(head["name"].split()) == wanted:
+            return record["id"]
+    return None
 
 
 def origin(id: int) -> str:
@@ -95,6 +91,16 @@ def origin_message(props: dict) -> int | None:
     if kind != "chat" or not colon or not id.isdigit():
         raise ValueError(f"origin is chat:<message id>, not {value!r}")
     return int(id)
+
+
+def thread_of(record: dict) -> int:
+    """The thread a message belongs to. A root is a stream, and a message
+    right under a root starts a thread of its own; anything deeper is a
+    reply in its parent's thread."""
+    parent = record["parent"]
+    if parent is None or message(parent)["parent"] is None:
+        return record["id"]
+    return parent
 
 
 async def inbox(agent: str, after: int) -> list[dict]:

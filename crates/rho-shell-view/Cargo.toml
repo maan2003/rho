@@ -27,6 +27,13 @@ client = [
   "dep:tokio",
 ]
 
+# The shells as the frame shows them: the `shell` system and its surface.
+ui = [
+  "client",
+  "dep:rho-dealer",
+  "dep:rho-frame",
+]
+
 [dependencies]
 bytes.workspace = true
 rho-rpc.workspace = true
@@ -40,6 +47,8 @@ language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-terminal = { workspace = true, features = ["client"], optional = true }
+rho-dealer = { workspace = true, optional = true }
+rho-frame = { workspace = true, optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
@@ -47,4 +56,4 @@ tokio = { workspace = true, features = ["sync", "io-util", "macros", "rt"], opti
 
 [dev-dependencies]
 # The tests exercise the client too.
-rho-shell-view = { path = ".", features = ["client"] }
+rho-shell-view = { path = ".", features = ["ui"] }

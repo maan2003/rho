@@ -2,7 +2,7 @@
 //! The host that runs here prints it; with none running, `rho` starts one
 //! for as long as it runs itself, and Ctrl-C stops both.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -11,22 +11,20 @@ use rho_rpc::protocol::client::{self, Client};
 
 #[derive(Clone, Default, clap::Args)]
 pub(crate) struct ShareArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
 }
 
 pub(crate) async fn run(args: ShareArgs) -> Result<()> {
-    let socket = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
-    if let Ok(mut probe) = Client::connect(&socket).await {
+    let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
+    if let Ok(mut probe) = Client::connect(&paths).await {
         let _ = probe.shutdown().await;
-        let link = client::call(&socket, host::IrohPair).await?;
+        let link = client::call(&paths, host::IrohPair).await?;
         print_link(&link);
         return Ok(());
     }
-    let mut child = start_host(&socket).await?;
-    let link = client::call(&socket, host::IrohPair).await?;
+    let mut child = start_host(&paths).await?;
+    let link = client::call(&paths, host::IrohPair).await?;
     print_link(&link);
     // Whatever stops this process stops the host it started: Ctrl-C, a
     // closed terminal, or a kill.
@@ -64,11 +62,11 @@ fn print_link(link: &str) {
     }
 }
 
-/// An agent host that listens over iroh, its output in a log beside its
-/// socket so that the terminal stays the link's.
-async fn start_host(socket: &Path) -> Result<tokio::process::Child> {
+/// An agent host, its output in a log in its runtime directory so that
+/// the terminal stays the link's.
+async fn start_host(paths: &rho_rpc::protocol::RuntimePaths) -> Result<tokio::process::Child> {
     let program = std::env::current_exe()?.with_file_name("rho-agent-host");
-    let log_path = socket.with_file_name("rho-agent-host.log");
+    let log_path = paths.directory().join("rho-agent-host.log");
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -76,9 +74,8 @@ async fn start_host(socket: &Path) -> Result<tokio::process::Child> {
         .with_context(|| format!("create {}", log_path.display()))?;
     let mut child = tokio::process::Command::new(&program);
     child
-        .arg("--socket-path")
-        .arg(socket)
-        .arg("--iroh")
+        .arg("--runtime-dir")
+        .arg(paths.directory())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -98,7 +95,7 @@ async fn start_host(socket: &Path) -> Result<tokio::process::Child> {
         .with_context(|| format!("start {}", program.display()))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        match Client::connect(socket).await {
+        match Client::connect(paths).await {
             Ok(mut probe) => {
                 let _ = probe.shutdown().await;
                 return Ok(child);

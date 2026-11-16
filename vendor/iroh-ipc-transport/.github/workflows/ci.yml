@@ -1,0 +1,17 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * *'
+permissions:
+  contents: read
+jobs:
+  ci:
+    uses: legra-ai/github-actions/.github/workflows/cargo-maintenance.yml@7161b3b0fb80eb36ff9d92faccfced2a8001fe40
+    with:
+      crate-name: iroh-ipc-transport
+      kind: library
+    secrets: inherit

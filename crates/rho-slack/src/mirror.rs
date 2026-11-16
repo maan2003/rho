@@ -697,6 +697,21 @@ impl Mirror {
         names
     }
 
+    /// The conversations the user starred in `workspace`.
+    pub fn favorites(&self, workspace: &str) -> Vec<ChannelId> {
+        let prefix = format!("{workspace}{SEPARATOR}");
+        let txn = self.db.read();
+        let table = txn.open_table(FAVORITES);
+        table
+            .range::<&str>(prefix.as_str()..)
+            .map_while(|(key, _)| {
+                key.value()
+                    .strip_prefix(prefix.as_str())
+                    .map(|channel| ChannelId(channel.to_owned()))
+            })
+            .collect()
+    }
+
     pub fn favorite(&self, workspace: &str, channel: &ChannelId) -> bool {
         self.db
             .read()

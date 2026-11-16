@@ -1,0 +1,38 @@
+# The frame: the one window, its history of surfaces, the minibuffer, the
+# menus, the keymap, the attached hosts and the ledger. Systems plug in
+# surfaces, menu rows, cards, channels and things to find, each under one
+# address scheme; the frame knows none of them by name.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-frame"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+collections = { path = "../../vendor/zed/crates/collections" }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+futures.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
+jiff.workspace = true
+language = { path = "../../vendor/zed/crates/language" }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-agent-hosts = { workspace = true, features = ["client"] }
+rho-db.workspace = true
+rho-dealer.workspace = true
+rho-journal.workspace = true
+rho-ledger = { workspace = true, features = ["client"] }
+rho-transcript.workspace = true
+rho-window.workspace = true
+text = { path = "../../vendor/zed/crates/text" }
+settings = { path = "../../vendor/zed/crates/settings" }
+theme = { path = "../../vendor/zed/crates/theme" }
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+uuid.workspace = true
+vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
+vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }

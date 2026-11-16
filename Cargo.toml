@@ -45,6 +45,7 @@ members = [
   "crates/rho-agents-view",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
+  "crates/rho-chat",
   "crates/rho-db",
   "crates/rho-dealer",
   "crates/rho-desktop-client",
@@ -52,12 +53,13 @@ members = [
   "crates/rho-desktop-proto",
   "crates/rho-fake-slack",
   "crates/rho-files",
+  "crates/rho-frame",
   "crates/rho-gui",
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-ledger",
+  "crates/rho-notes",
   "crates/rho-profiling",
-  "crates/rho-qa",
   "crates/rho-rpc",
   "crates/rho-rtc",
   "crates/rho-shell-view",
@@ -101,6 +103,7 @@ fnv = "1"
 futures = "0.3"
 futures-util = "0.3"
 iroh = { version = "1.3.0", default-features = false }
+iroh-ipc-transport = { path = "vendor/iroh-ipc-transport" }
 jiff = "0.2"
 json-stream = { path = "crates/json-stream" }
 libc = "0.2"
@@ -133,6 +136,7 @@ rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-agent-hosts = { path = "crates/rho-agent-hosts" }
 rho-agent-types = { path = "crates/rho-agent-types" }
 rho-agents-client = { path = "crates/rho-agents-client" }
+rho-chat = { path = "crates/rho-chat" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }
@@ -148,6 +152,7 @@ rho-devshell = { path = "agent-host/rho-devshell" }
 rho-fake-model = { path = "agent-host/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
+rho-frame = { path = "crates/rho-frame" }
 rho-fs-view = { path = "agent-host/rho-fs-view" }
 rho-git = { path = "agent-host/rho-git" }
 rho-image = { path = "agent-host/rho-image" }
@@ -155,6 +160,7 @@ rho-inference = { path = "agent-host/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-ledger = { path = "crates/rho-ledger" }
+rho-notes = { path = "crates/rho-notes" }
 rho-ledger-server = { path = "agent-host/rho-ledger-server" }
 rho-notebook = { path = "agent-host/rho-notebook" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
@@ -271,6 +277,7 @@ pulseaudio = { path = "vendor/pulseaudio-rs" }
 # preserving noq's strict priority classes. Keep both crates patched because
 # `noq` exposes the API and `noq-proto` owns the packet scheduler.
 iroh = { path = "vendor/iroh/iroh" }
+iroh-base = { path = "vendor/iroh/iroh-base" }
 noq = { path = "vendor/noq/noq" }
 noq-proto = { path = "vendor/noq/noq-proto" }
 # Local redb fork: compaction keeps relocating pages past one it cannot

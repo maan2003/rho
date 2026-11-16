@@ -1,6 +1,6 @@
 //! The agents part of the agent host, and the parts about one agent's workset:
-//! its terminals and shells. The session carries the directory, the chat,
-//! the rows of the worksets a client follows, the live tails and the quota;
+//! its terminals and shells. The session carries the directory, the rows
+//! of the worksets a client follows, the live tails and the quota;
 //! requests, terminals and shells are streams of their own.
 
 use std::collections::{HashMap, HashSet};
@@ -10,13 +10,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::record::Event;
-use rho_agent::store::{AgentHead, Appended, ChatRead as _, StoreRead as _, WorksetHead};
-use rho_agent_types::{AgentId, ChatSeq, WorksetId, WorksetKind, Wpos};
+use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
+use rho_agent_types::{AgentId, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
-    AgentEntry, AgentLog, AgentLogPage, Cancel, ChangeTopic, ClientFrame, CreateStream,
-    CreateWorkset, CreatedWorkset, DeleteWorksets, Eval, EvalResult, Leave, LogNext, MoveMessages,
-    MoveTo, Open, Post, Request, RestartWorkset, ServerFrame, StartTopic, WorksetEntry,
+    AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
+    DeleteWorksets, Eval, EvalResult, LogNext, Open, Request, RestartWorkset, ServerFrame,
+    WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -29,7 +29,7 @@ use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::{NEXT_CONNECTION_ID, Services, prepare_image_content, usage};
+use crate::{NEXT_CONNECTION_ID, Services, usage};
 
 /// Serves one agents stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -149,8 +149,8 @@ impl Drop for Attached {
     }
 }
 
-/// How many rows or chat events travel in one frame while a client is catching
-/// up, so a cold copy goes in pages the connection can interleave.
+/// How many rows travel in one frame while a client is catching up, so a
+/// cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
 /// How often a session hears the quota when nothing has moved it.
@@ -158,14 +158,13 @@ const QUOTA_REFRESH: std::time::Duration = std::time::Duration::from_secs(10 * 6
 
 /// What a client asks the session's follower for.
 enum Follow {
-    Chat(ChatSeq),
     Worksets(Vec<(WorksetId, Wpos)>),
     Focus(HashSet<AgentId>),
 }
 
 /// A client's session: `Hello`, the directory, then whatever the client
-/// follows (the chat, some worksets' rows, the live tails of the agents it
-/// looks at) as it lands, beside the auth state and the quota. A stream of
+/// follows (some worksets' rows, the live tails of the agents it looks
+/// at) as it lands, beside the auth state and the quota. A stream of
 /// its own, so a catch-up queues behind nothing and holds nothing up.
 async fn serve_session<R, W>(
     services: Arc<Services>,
@@ -190,13 +189,10 @@ where
     // between is lost; positions drop what is told twice.
     let feed = rho_agent::store::feed(&services.db);
     let statuses = services.pool.watch_statuses().await;
-    let (chat_head, agent_counter) = {
-        let read = services.db.read();
-        (read.chat_head(), read.last_agent_counter())
-    };
+    let agent_counter = services.db.read().last_agent_counter();
     let _ = outgoing_tx.send(ServerFrame::Hello {
         machine_seed: services.machine_seed,
-        chat_head,
+        endpoint: services.endpoint,
         agent_counter,
     });
     let _ = outgoing_tx.send(directory(&services.db));
@@ -265,9 +261,6 @@ where
                 Err(error) => break Err(error),
             };
         match frame {
-            ClientFrame::FollowChat { since } => {
-                let _ = follow_tx.send(Follow::Chat(since));
-            }
             ClientFrame::FollowWorksets { from } => {
                 let _ = follow_tx.send(Follow::Worksets(from));
             }
@@ -354,10 +347,10 @@ fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
 }
 
 /// The session's one pipe for everything that follows the store: directory
-/// changes, then chat and rows past what the client holds, then the
-/// statuses, which arrive after the rows they reflect commit. Rows are read
-/// from the store, never from the feed: an append only says something
-/// landed. A lagged feed sends the directory whole.
+/// changes, then rows past what the client holds, then the statuses, which
+/// arrive after the rows they reflect commit. Rows are read from the store,
+/// never from the feed: an append only says something landed. A lagged feed
+/// sends the directory whole.
 ///
 /// Statuses are full snapshots, the latest per agent: an unsent one is
 /// replaced rather than queued, so a slow connection never falls behind.
@@ -368,18 +361,12 @@ async fn follow(
     statuses: Arc<rho_agent::host::pool::Statuses>,
     mut asks: mpsc::UnboundedReceiver<Follow>,
 ) {
-    let mut chat: Option<ChatSeq> = None;
     let mut worksets: HashMap<WorksetId, Wpos> = HashMap::new();
     let mut focus: HashSet<AgentId> = HashSet::new();
     loop {
         // Taken before the rows are read: an agent's status arrives after
         // the rows it reflects commit, so they go out first.
         let changed = statuses.take();
-        if let Some(sent) = chat.as_mut()
-            && !send_chat_from(&services.db, &outgoing_tx, sent).await
-        {
-            return;
-        }
         for (workset, next) in &mut worksets {
             if !send_rows_from(&services.db, &outgoing_tx, *workset, next).await {
                 return;
@@ -438,7 +425,6 @@ async fn follow(
             () = statuses.changed() => {}
             ask = asks.recv() => match ask {
                 None => return,
-                Some(Follow::Chat(since)) => chat = Some(since),
                 Some(Follow::Worksets(from)) => {
                     // A workset already followed goes on from what this
                     // stream sent: rows past the client's position are on
@@ -462,27 +448,6 @@ async fn follow(
                 }
             },
         }
-    }
-}
-
-/// Pages the chat out from after `sent`, moving it as it goes. False when
-/// the connection is gone.
-async fn send_chat_from(
-    db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<ServerFrame>,
-    sent: &mut ChatSeq,
-) -> bool {
-    loop {
-        let records = db.read().chat_since(*sent, LOG_PAGE);
-        let Some(last) = records.last() else {
-            return true;
-        };
-        *sent = last.seq;
-        if outgoing_tx.send(ServerFrame::Chat { records }).is_err() {
-            return false;
-        }
-        // Catching up must never starve the connection's own traffic.
-        tokio::task::yield_now().await;
     }
 }
 
@@ -596,95 +561,6 @@ where
             respond(writer, call, |Eval { workset, code }| async move {
                 Ok(eval_result(services.pool.eval(workset, code).await?))
             })
-            .await
-        }
-        Request::Post(call) => {
-            respond(
-                writer,
-                call,
-                |Post {
-                     client_id,
-                     topic,
-                     mentions,
-                     mut content,
-                 }| async move {
-                    prepare_image_content(&mut content).await?;
-                    services
-                        .pool
-                        .post_user(client_id, topic, mentions, content)
-                        .await
-                },
-            )
-            .await
-        }
-        Request::StartTopic(call) => {
-            respond(
-                writer,
-                call,
-                |StartTopic {
-                     client_id,
-                     stream,
-                     name,
-                     mentions,
-                     mut content,
-                 }| async move {
-                    prepare_image_content(&mut content).await?;
-                    services
-                        .pool
-                        .start_user_topic(client_id, stream, name, mentions, content)
-                        .await
-                },
-            )
-            .await
-        }
-        Request::CreateStream(call) => {
-            respond(writer, call, |CreateStream { name }| async move {
-                services.pool.create_stream(name).await
-            })
-            .await
-        }
-        Request::Leave(call) => {
-            respond(writer, call, |Leave { topic, agent }| async move {
-                services.pool.leave_user(topic, agent).await
-            })
-            .await
-        }
-        Request::ChangeTopic(call) => {
-            respond(
-                writer,
-                call,
-                |ChangeTopic {
-                     topic,
-                     stream,
-                     name,
-                     resolved,
-                 }| async move {
-                    services
-                        .pool
-                        .change_topic(topic, stream, name, resolved)
-                        .await
-                },
-            )
-            .await
-        }
-        Request::MoveMessages(call) => {
-            respond(
-                writer,
-                call,
-                |MoveMessages {
-                     client_id,
-                     messages,
-                     to,
-                 }| async move {
-                    let to = match to {
-                        MoveTo::Topic(topic) => rho_agent::store::MoveTo::Topic(topic),
-                        MoveTo::NewTopic { stream, name } => {
-                            rho_agent::store::MoveTo::NewTopic { stream, name }
-                        }
-                    };
-                    services.pool.move_messages(client_id, messages, to).await
-                },
-            )
             .await
         }
         Request::Cancel(call) => {

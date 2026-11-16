@@ -18,7 +18,7 @@ rho itself calls:
 - `deliver(agent)`, async: hands the agent its chat messages for as long as
   the process runs. It starts once for each agent of the workset after
   init.py ran, and once for each agent `rho.agents.create` makes later. Only
-  Python joins agents to topics, so this is also where agents join them.
+  Python joins agents to threads, so this is also where agents join them.
 """
 
 

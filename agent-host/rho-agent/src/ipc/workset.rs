@@ -66,57 +66,49 @@ pub(crate) enum PyRequest {
         control: crate::ipc::protocol::Control,
     },
     Delivered(rho_agent_types::AgentId),
-    /// A message from an agent.
+    /// A message from an agent, under `parent` or as a root.
     Post {
         sender: rho_agent_types::AgentId,
-        topic: rho_agent_types::TopicId,
-        mentions: Vec<rho_agent_types::Mention>,
-        content: Vec<rho_agent_types::ContentPart>,
-    },
-    /// A topic an agent starts, with its first message, in the stream of
-    /// that name: created if there is none. Answered with the message.
-    /// (`Messages` of one).
-    StartTopic {
-        sender: rho_agent_types::AgentId,
-        stream: String,
-        name: String,
+        parent: Option<rho_agent_types::MessageId>,
         mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
     },
     Join {
-        topic: rho_agent_types::TopicId,
+        thread: rho_agent_types::MessageId,
         agent: rho_agent_types::AgentId,
     },
     Leave {
-        topic: rho_agent_types::TopicId,
+        thread: rho_agent_types::MessageId,
         agent: rho_agent_types::AgentId,
     },
-    /// Gives a topic its whole head, for `agent`. The stream of that name
-    /// is created if there is none.
-    ChangeTopic {
+    /// Puts a message and its thread under `parent`, or among the roots,
+    /// for `agent`.
+    Reparent {
         agent: rho_agent_types::AgentId,
-        topic: rho_agent_types::TopicId,
-        stream: String,
+        message: rho_agent_types::MessageId,
+        parent: Option<rho_agent_types::MessageId>,
+    },
+    /// Names a thread for `agent`; empty takes the name back.
+    Name {
+        agent: rho_agent_types::AgentId,
+        thread: rho_agent_types::MessageId,
         name: String,
-        resolved: bool,
     },
-    /// Moves messages for `agent`; answered with the topic they are in.
-    Move {
-        agent: rho_agent_types::AgentId,
-        messages: Vec<rho_agent_types::MessageId>,
-        to: PyMoveTo,
-    },
-    /// The direct conversation of `sender` and `other`, started if needed.
-    Direct {
+    /// Mail from `sender` to another agent of this host: handed to it as
+    /// input, with a tool's authority, and kept nowhere else.
+    Mail {
         sender: rho_agent_types::AgentId,
-        other: rho_agent_types::AgentId,
+        to: rho_agent_types::AgentId,
+        text: String,
     },
-    Topic(rho_agent_types::TopicId),
+    /// The thread under a message (`Thread`).
+    Thread(rho_agent_types::MessageId),
     /// One message: `Messages` with it, or with none.
     Message(rho_agent_types::MessageId),
-    /// A conversation's `last` newest messages, oldest first.
+    /// A thread's `last` newest messages, oldest first; the roots for
+    /// `None`.
     Read {
-        topic: rho_agent_types::TopicId,
+        thread: Option<rho_agent_types::MessageId>,
         last: u64,
     },
     /// What `agent` receives after `after`, answered once there is some.
@@ -152,25 +144,13 @@ pub(crate) enum PyRequest {
     ExternalContacts(rho_agent_types::AgentId),
 }
 
-/// Where a move from Python puts messages.
-#[derive(Encode, Decode)]
-pub(crate) enum PyMoveTo {
-    Topic(rho_agent_types::TopicId),
-    /// A new topic in the stream of that name, created if there is none.
-    NewTopic {
-        stream: String,
-        name: String,
-    },
-}
-
 #[derive(Encode, Decode)]
 pub(crate) enum PyReply {
     Agent(rho_agent_types::AgentId),
     Agents(Vec<(rho_agent_types::AgentId, crate::record::AgentSpec)>),
     Seq(rho_agent_types::ChatSeq),
     Messages(Vec<rho_agent_types::Message>),
-    /// A conversation, and the name of its stream if it is a topic.
-    Topic(Option<(crate::store::TopicHead, Option<String>)>),
+    Thread(Option<crate::store::ThreadHead>),
     Models(Vec<crate::record::Runtime>),
     Text(String),
     ExternalContacts(Vec<crate::store::GccpContact>),

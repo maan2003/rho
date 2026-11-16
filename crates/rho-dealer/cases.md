@@ -6,50 +6,37 @@ for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
 Home shows three sections: **next**, every card by priority until it fades
-below the floor, **recent**, the topics agents wrote in lately, unread
+below the floor, **recent**, the threads agents wrote in lately, unread
 ones marked, folded, and **piles**, what the
 user put away, which they open to be dealt from it.
 
-## Topics
+## Threads
 
-Agents and the user talk in chat: each host has streams, a stream has
-topics, and a topic has messages. A message goes to a topic, not to a
-person, and draws the user only by mentioning them. Each topic is a node;
-an agent is never a card. Whether an agent is running never ranks. A
-mention of the user names its kind, picked by whether the user needs to
-read it now:
+Agents and the user talk in chat: each host holds a forest of messages,
+and the thread under a message is every reply below it. A message goes to
+a thread, not to a person, and draws the user only by mentioning them.
+Each thread is a node; an agent is never a card. What the chat claims for
+each of its cases is the chat's own, in `rho-chat/src/cards.rs`, tested
+there. The rows below are what the dealer makes of a source shaped like
+it, with a stand-in thread that asks and answers.
 
-```
-1. Yes: it asks them for something the work needs: a decision, an
-   approval, information, or an action, even while the agent keeps
-   working. An offer of work beyond what they asked is not one. → ask
-2. Yes: what they asked for is done, or it answers their question.
-   Not while part of it is still pending.                       → result
-3. No, but it is worth keeping: a finding, an assumption, a report
-   while follow-through is pending.                             → fyi
-4. No, and it is passing: "on it", "86% done".                  → no mention
-```
-
-The user sees a topic explicitly: a done, or a message of their own in
-it, sees it through to its newest message. Opening it sees nothing. Done
-is also how the user says they read a topic, through its newest message
-or through one they pick: there is no separate read. A card is titled by
-the topic's name, and its context is its stream.
+A card is titled by the thread's name, and its context is its root, the
+channel.
 
 | # | History and facts | Card |
 |---|---|---|
 | A1 | An unseen ask | "asks", rises |
 | A2 | An unseen result | "result", below an ask, fades, gone after ~3 days |
-| A3 | An unseen fyi | nothing, and it hides no ask or result; the topic is unread on Home's recent list |
+| A3 | An unseen fyi | nothing, and it hides no ask or result; the thread is unread on Home |
 | A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
 | A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
 | A6 | Seen | nothing until a newer ask or result |
-| A7 | The user wrote in the topic within the hour before the mention | a bonus, fading over the hour |
+| A7 | The user wrote in the thread within the hour before the mention | a bonus, fading over the hour |
 | A8 | Done through a message before the mention | the mention still deals |
-| A10 | Another agent's message in the topic, mentioning the topic's agent | context, never unread; the topic deals by mentions of the user |
+| A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not chat |
-| A13 | The topic muted, its host gone, or every one of its agents deleted | nothing |
+| A13 | The thread muted, its host gone, or every one of its agents deleted | nothing |
 
 ## Snoozes
 
@@ -58,7 +45,7 @@ the topic's name, and its context is its stream.
 | Z1 | Snoozed | nothing until it ends |
 | Z2 | Snooze ends, the node still wants the user | its own card, its wait counting from the snooze's end |
 | Z3 | Snooze ends, the node wants nothing | nothing |
-| Z4 | Snoozed, then the user wrote in the topic | the snooze holds, but a reply within 1h of the user's message comes through |
+| Z4 | Snoozed, then the user wrote in the thread | the snooze holds, but a reply within 1h of the user's message comes through |
 | Z5 | Snoozed, then the other side wrote | a direct message, or a thread of 3 people or fewer: a small bump per message when it comes back; nothing for other threads and agents |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
 
@@ -77,8 +64,8 @@ the topic's name, and its context is its stream.
 | T1 | Todo | low, never fades, rises slowly, stays until done |
 | T2 | Todo with a start date | nothing until then, then as T1 |
 | T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
-| T4 | Todo on a topic | as T1, whatever its agents are doing |
-| T5 | Todo on a topic, then the user writes in it | the todo stays; only done clears it |
+| T4 | Todo on a thread | as T1, whatever its agents are doing |
+| T5 | Todo on a thread, then the user writes in it | the todo stays; only done clears it |
 | T6 | Done or muted | takes back the todo, the deadline and the snooze |
 
 ## Slack

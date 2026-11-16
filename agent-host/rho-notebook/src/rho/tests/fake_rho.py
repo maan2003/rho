@@ -16,10 +16,10 @@ class State:
         self.agents = {}
         self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
-        self.streams = {}  # name -> id
-        self.directs = {}  # (a, b), a < b -> topic
-        self.topics = {}  # id -> TopicRecord
-        self.messages = []  # MessageRecord, in order
+        self.messages = []  # MessageRecord, in order, with `_to`: who receives it
+        self.members = {}  # (thread, agent) -> joined (True) or left
+        self.names = {}  # thread -> name
+        self.mail = []  # (sender, to, text) handed outside the chat
         self.inputs = []  # (agent, text, role, message)
         self.calls = []  # (name, args)
         self.endpoint = "ab" * 32  # the host's own; None for a host without iroh
@@ -153,52 +153,63 @@ def _event():
     return STATE.events
 
 
-def _post(sender, topic, text, mentions):
+def _message(id):
+    return next((m for m in STATE.messages if m["id"] == id), None)
+
+
+def _members_under(parent):
+    """Whom a message under `parent` reaches by membership: for each agent
+    with a record at `parent` or above, the nearest decides."""
+    decided = {}
+    thread = parent
+    while thread is not None:
+        for (at, agent), joined in STATE.members.items():
+            if at == thread and agent not in decided:
+                decided[agent] = joined
+        thread = _message(thread)["parent"]
+    return [agent for agent, joined in decided.items() if joined]
+
+
+def _post(sender, parent, text, mentions):
     """With the lock held. Who receives a message is fixed when it is
     posted, as the host's inbox index fixes it."""
-    if topic not in STATE.topics:
-        raise ValueError(f"no topic {topic}")
+    if parent is not None and _message(parent) is None:
+        raise ValueError(f"no message {parent}")
     if not text.strip():
         raise ValueError("a message needs text")
-    head = STATE.topics[topic]
-    if head["stream"] is None and sender not in head["agents"]:
-        raise ValueError("only its two agents post in a direct conversation")
     for address, kind in mentions:
         assert kind in ("ask", "result", "fyi"), kind
-        assert address == "user" or address in STATE.agents, address
-    to = [agent for agent in head["agents"] + [address for address, _ in mentions] if agent not in ("user", sender)]
+        assert address == "user" or address in STATE.agents or address in STATE.elsewhere, address
+    to = [agent for agent in _members_under(parent) + [address for address, _ in mentions] if agent not in ("user", sender)]
     id = _event()
-    STATE.messages.append({"id": id, "at": 0, "topic": topic, "sender": sender, "mentions": list(mentions), "text": text, "_to": set(to)})
+    STATE.messages.append({"id": id, "at": 0, "parent": parent, "sender": sender, "mentions": list(mentions), "text": text, "_to": set(to)})
     return id
-
-
-def _start(sender, stream, name, text, mentions):
-    stream, name = stream.strip(), name.strip()
-    if not stream or not name:
-        raise ValueError("a topic needs a stream and a name")
-    if stream not in STATE.streams:
-        STATE.streams[stream] = _event()
-    topic = _event()
-    STATE.topics[topic] = {"id": topic, "name": name, "stream": stream, "resolved": False, "agents": []}
-    return topic, _post(sender, topic, text, mentions)
 
 
 def _public(message):
     return {key: value for key, value in copy.deepcopy(message).items() if not key.startswith("_")}
 
 
-def post(sender, topic, text, *, mentions=None):
+def post(sender, parent, text, *, mentions=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        return _post(sender, topic, text, mentions or [])
+        return _post(sender, parent, text, mentions or [])
 
 
-def start_topic(sender, stream, name, text, *, mentions=None):
+def mail(sender, to, text):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        return _start(sender, stream, name, text, mentions or [])
+        if to not in STATE.agents and to not in STATE.elsewhere:
+            raise ValueError("agent was deleted or does not exist")
+        if sender == to:
+            raise ValueError("an agent does not mail itself")
+        if not text.strip():
+            raise ValueError("a message needs text")
+        STATE.mail.append((sender, to, text))
+        if to in STATE.agents:
+            STATE.inputs.append((to, text, "tool", None))
 
 
 def resolve_agent(prefix):
@@ -258,62 +269,64 @@ def external_contacts(agent):
         ]
 
 
-def direct(sender, other):
+def join(thread, agent):
     with STATE.lock:
-        assert sender in STATE.agents and sender != other
-        if other not in STATE.agents and other not in STATE.elsewhere:
-            raise ValueError("agent was deleted or does not exist")
-        pair = tuple(sorted((sender, other)))
-        if pair not in STATE.directs:
-            topic = _event()
-            STATE.topics[topic] = {"id": topic, "name": None, "stream": None, "resolved": False, "agents": list(pair)}
-            STATE.directs[pair] = topic
-        return STATE.directs[pair]
+        if _message(thread) is None:
+            raise ValueError(f"no message {thread}")
+        STATE.members[thread, agent] = True
 
 
-def join(topic, agent):
+def leave(thread, agent):
     with STATE.lock:
-        head = STATE.topics[topic]
-        if head["stream"] is None:
-            raise ValueError("no one joins a direct conversation")
-        if agent not in head["agents"]:
-            head["agents"].append(agent)
+        if _message(thread) is None:
+            raise ValueError(f"no message {thread}")
+        if agent in _members_under(thread):
+            STATE.members[thread, agent] = False
 
 
-def leave(topic, agent):
+def _above(message, thread):
+    """Whether `thread` is `message` or above it."""
+    while thread is not None:
+        if thread == message:
+            return True
+        thread = _message(thread)["parent"]
+    return False
+
+
+def reparent(agent, message, parent):
     with STATE.lock:
-        head = STATE.topics[topic]
-        if head["stream"] is None:
-            raise ValueError("no one leaves a direct conversation")
-        if agent in head["agents"]:
-            head["agents"].remove(agent)
+        record = _message(message)
+        if record is None or (parent is not None and _message(parent) is None):
+            raise ValueError("no such message")
+        if parent is not None and _above(message, parent):
+            raise ValueError("a message does not go under its own thread")
+        record["parent"] = parent
 
 
-def change_topic(agent, topic, stream, name, resolved):
+def name(agent, thread, name):
     with STATE.lock:
-        if STATE.topics[topic]["stream"] is None:
-            raise ValueError("a direct conversation is not renamed, moved or resolved")
-        if stream not in STATE.streams:
-            STATE.streams[stream] = _event()
-        STATE.topics[topic].update(stream=stream, name=name, resolved=resolved)
+        if _message(thread) is None:
+            raise ValueError(f"no message {thread}")
+        name = " ".join(name.split())
+        if name:
+            STATE.names[thread] = name
+        else:
+            STATE.names.pop(thread, None)
 
 
-def move_messages(agent, messages, to=None, *, stream=None, name=None):
+def _name(id):
+    return STATE.names.get(id) or _message(id)["text"].strip().splitlines()[0]
+
+
+def thread(id):
     with STATE.lock:
-        if to is None:
-            if stream not in STATE.streams:
-                STATE.streams[stream] = _event()
-            to = _event()
-            STATE.topics[to] = {"id": to, "name": name, "stream": stream, "resolved": False, "agents": []}
-        for message in STATE.messages:
-            if message["id"] in messages:
-                message["topic"] = to
-        return to
-
-
-def topic(id):
-    with STATE.lock:
-        return copy.deepcopy(STATE.topics.get(id))
+        if _message(id) is None:
+            return None
+        path, cursor = [], id
+        while cursor is not None:
+            path.append((cursor, _name(cursor)))
+            cursor = _message(cursor)["parent"]
+        return {"id": id, "name": _name(id), "path": path[::-1], "agents": _members_under(id)}
 
 
 def message(id):
@@ -321,21 +334,17 @@ def message(id):
         return next((_public(m) for m in STATE.messages if m["id"] == id), None)
 
 
-def read(topic, last):
+def read(thread, last):
     with STATE.lock:
-        return [_public(m) for m in STATE.messages if m["topic"] == topic][-last:] if last else []
+        if thread is not None and _message(thread) is None:
+            raise ValueError(f"no message {thread}")
+        return [_public(m) for m in STATE.messages if m["parent"] == thread][-last:] if last else []
 
 
-def post_user(topic, text, mentions=()):
+def post_user(parent, text, mentions=()):
     """What the host does with the GUI's Post: the user's mentions ask."""
     with STATE.lock:
-        return _post("user", topic, text, [(agent, "ask") for agent in mentions])
-
-
-def start_user_topic(stream, name, text, mentions=()):
-    """What the host does with the GUI's StartTopic."""
-    with STATE.lock:
-        return _start("user", stream, name, text, [(agent, "ask") for agent in mentions])
+        return _post("user", parent, text, [(agent, "ask") for agent in mentions])
 
 
 async def inbox(agent, after):

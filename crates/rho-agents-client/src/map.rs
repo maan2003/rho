@@ -39,9 +39,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_agent_hosts::HostId;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, EndpointId};
 
-use crate::fold::{AgentIdentity, Digest, MirroredAgent};
+use crate::fold::{AgentIdentity, MirroredAgent};
 use crate::now_ms;
 use crate::protocol::worksets::SpecView;
 
@@ -57,6 +57,8 @@ pub enum AgentLife {
 struct HostSnapshot {
     name: String,
     machine_seed: u64,
+    /// The host's identity, once its agents stream has said hello.
+    endpoint: Option<EndpointId>,
     agent_counter: u64,
 }
 
@@ -81,7 +83,6 @@ pub struct AgentFacts {
     /// What its host last said it is doing, `None` while it has said
     /// nothing.
     pub runtime: Option<crate::protocol::transcript::RuntimeState>,
-    pub last_user_message_at: rho_agent_types::UnixMs,
 }
 
 type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;
@@ -98,7 +99,7 @@ pub struct AgentMap {
     agents: BTreeMap<AgentId, AgentLife>,
     /// Ephemeral snapshots, never part of the mirror or persisted filing.
     runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
-    /// The mirror, folded: what every agent is and what happened to it.
+    /// The mirror: what every agent is.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: muted agents, their labels,
     /// and what the user called them.
@@ -174,15 +175,28 @@ impl AgentMap {
             .unwrap_or_default()
     }
 
+    /// The host's identity, which names it to the rest of the world; `None`
+    /// before its agents stream has said hello.
+    pub fn host_endpoint(&self, host: HostId) -> Option<EndpointId> {
+        self.hosts.get(&host).and_then(|h| h.endpoint)
+    }
+
     pub fn host_of_agent(&self, agent_id: AgentId) -> Option<HostId> {
         self.agent_hosts.get(&agent_id).copied()
     }
 
     /// What a host's agents stream says of it when it opens. The agents
     /// come by the directory, not here.
-    pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
+    pub fn set_host_data(
+        &mut self,
+        host: HostId,
+        machine_seed: u64,
+        endpoint: EndpointId,
+        agent_counter: u64,
+    ) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
+        snapshot.endpoint = Some(endpoint);
         snapshot.agent_counter = agent_counter;
     }
 
@@ -260,8 +274,8 @@ impl AgentMap {
         self.mirror.values()
     }
 
-    /// Agents read back from the client's own copy, digest and all, so
-    /// nothing has to be folded again. Rows that come after fold on top.
+    /// Agents read back from the client's own copy. What the directory
+    /// says after replaces them.
     pub fn restore(&mut self, agents: Vec<MirroredAgent>) {
         if agents.is_empty() {
             return;
@@ -278,10 +292,6 @@ impl AgentMap {
 
     pub fn mirrored(&self, agent_id: AgentId) -> Option<&MirroredAgent> {
         self.mirror.get(&agent_id)
-    }
-
-    pub fn agent_digest(&self, agent_id: AgentId) -> Option<&Digest> {
-        self.mirror.get(&agent_id).map(|mirrored| &mirrored.digest)
     }
 
     pub fn agent_identity(&self, agent_id: AgentId) -> Option<&AgentIdentity> {
@@ -343,8 +353,7 @@ impl AgentMap {
         };
         let host = mirrored.host;
         let identity = &mirrored.identity;
-        let digest = &mirrored.digest;
-        let last_active = digest.last_active.max(identity.entry.created_at);
+        let last_active = identity.entry.created_at;
         let now = (identity.parent(), identity.handle_prefix());
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
         let active = self
@@ -570,14 +579,14 @@ impl AgentMap {
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_types::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }
-    /// The chronology, folded from the story rather than sent.
+    /// What the host last said of the agent; nothing for an agent the
+    /// directory has not named.
     pub fn agent_facts(&self, agent_id: AgentId) -> AgentFacts {
-        let Some(digest) = self.agent_digest(agent_id) else {
+        if !self.mirror.contains_key(&agent_id) {
             return AgentFacts::default();
-        };
+        }
         AgentFacts {
             runtime: self.runtime.get(&agent_id).cloned(),
-            last_user_message_at: digest.last_user_message_at,
         }
     }
     /// What the agent is called: the name the user gave it if they gave
@@ -592,7 +601,8 @@ impl AgentMap {
             .filter(|name| !name.is_empty())
             .or_else(|| self.mirror.get(&agent_id).and_then(MirroredAgent::title))
     }
-    /// What a topic calls an agent: its name, or its id when it has none.
+    /// What a short mention calls an agent: its name, or its id when it
+    /// has none.
     pub fn agent_short_label(&self, agent_id: AgentId) -> String {
         self.agent_display_name(agent_id)
             .map_or_else(|| self.agent_id_label(agent_id), str::to_owned)
@@ -616,22 +626,12 @@ impl AgentMap {
             _ => name,
         }
     }
-    /// What the user last said to the agent, for finding it by the words
-    /// they remember rather than by a name they never gave it.
-    pub fn agent_last_user_message(&self, agent_id: AgentId) -> Option<&str> {
-        self.agent_digest(agent_id)
-            .map(|digest| digest.last_user_message_text.trim())
-            .filter(|text| !text.is_empty())
-    }
     pub fn agent_human_name(&self, agent_id: AgentId) -> String {
         let Some(identity) = self.agent_identity(agent_id) else {
             return "Untitled agent".into();
         };
         if let Some(name) = self.agent_display_name(agent_id) {
             return name.into();
-        }
-        if let Some(said) = self.agent_last_user_message(agent_id) {
-            return said.into();
         }
         if identity.is_advisor() {
             "Advisor".into()
@@ -726,10 +726,7 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{
-        Address, AgentIdDomain, ChatSeq, ContentPart, Message, MessageId, TopicId, UnixMs,
-        WorksetKind, props,
-    };
+    use rho_agent_types::{AgentIdDomain, UnixMs, WorksetKind, props};
 
     use super::*;
     use crate::protocol::transcript::RuntimeKind;
@@ -767,17 +764,6 @@ mod tests {
 
     type Props = rho_agent_types::Props;
 
-    fn said(id: u64, from: Address, text: &str) -> Message {
-        Message {
-            id: MessageId(ChatSeq(id)),
-            at: UnixMs(id),
-            topic: TopicId(ChatSeq(1)),
-            from,
-            mentions: Vec::new(),
-            content: vec![ContentPart::Text { text: text.into() }],
-        }
-    }
-
     #[test]
     fn runtime_status_is_live_and_disconnect_clears_it() {
         use crate::protocol::transcript::RuntimeState;
@@ -787,7 +773,7 @@ mod tests {
         // No host has said anything yet.
         assert!(map.agent_facts(agent(1)).runtime.is_none());
         // A connected host that says nothing of an agent says nothing.
-        map.set_host_data(host, 0, 1);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 1);
         assert!(map.agent_facts(agent(1)).runtime.is_none());
         map.set_runtime(
             agent(1),
@@ -810,7 +796,7 @@ mod tests {
     #[test]
     fn an_agent_is_the_users_unless_an_agent_made_it() {
         let mut registry = AgentMap::default();
-        registry.set_host_data(HostId::default(), 0, 3);
+        registry.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         registry.told(vec![named(1, None, 1), named(2, Some(agent(1)), 2)]);
 
         assert!(registry.owned_by_user(agent(1)));
@@ -843,35 +829,26 @@ mod tests {
         assert!(!registry.set_agent_filings(filings));
     }
 
-    /// What the rails read is the fold of the agent's messages: what the
-    /// user last said to it, and when it was last active.
+    /// An agent was last active when it was made, or when the user last
+    /// touched it, whichever is later: the directory saying it again does
+    /// not move it back.
     #[test]
-    fn the_messages_are_what_the_rails_read() {
+    fn an_agent_is_active_from_when_it_was_made() {
         let host = HostId::default();
         let mut registry = AgentMap::default();
-        registry.set_host_data(host, 0, 1);
-        let mut mirrored = named(1, None, 1);
-        mirrored
-            .digest
-            .tell(&said(1, Address::User, "which one?\nthe flaky one"));
-        assert_eq!(registry.told(vec![mirrored.clone()]), [agent(1)]);
+        registry.set_host_data(host, 0, EndpointId([0; 32]), 1);
+        assert_eq!(registry.told(vec![named(1, None, 5)]), [agent(1)]);
         assert_eq!(registry.host_of_agent(agent(1)), Some(host));
-        assert_eq!(
-            registry.agent_last_user_message(agent(1)),
-            Some("which one?")
-        );
-        mirrored
-            .digest
-            .tell(&said(5, Address::Agent(agent(1)), "this one"));
-        registry.told(vec![mirrored]);
-        assert_eq!(
-            registry.agent_last_active(agent(1)),
-            Some(UnixMs(5)),
-            "posting is activity"
-        );
+        assert_eq!(registry.agent_last_active(agent(1)), Some(UnixMs(5)));
+        registry.touch_agent(agent(1));
+        let touched = registry.agent_last_active(agent(1)).unwrap();
+        assert!(touched > UnixMs(5), "a touch is now");
+        registry.told(vec![named(1, None, 5)]);
+        assert_eq!(registry.agent_last_active(agent(1)), Some(touched));
 
         registry.reset_host(host);
         assert_eq!(registry.all_mirrored().len(), 0);
+        assert_eq!(registry.agent_last_active(agent(1)), None);
     }
 
     /// Labels read the preset: an advisor is `adv-`, anything else `eng-`,
@@ -880,7 +857,7 @@ mod tests {
     fn a_label_reads_the_preset() {
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.set_host_data(host, 0, 3);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 3);
         let mut advisor = named(2, None, 2);
         advisor
             .identity
@@ -903,7 +880,7 @@ mod tests {
     #[test]
     fn the_order_puts_the_newest_first_and_leaves_the_rest_where_they_were() {
         let mut map = AgentMap::default();
-        map.set_host_data(HostId::default(), 0, 3);
+        map.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         map.told(vec![named(1, None, 10)]);
         map.told(vec![named(2, None, 20)]);
         assert_eq!(map.next_agent(None, 1), Some(agent(2)));
@@ -916,11 +893,7 @@ mod tests {
         assert_eq!(map.next_agent(None, 1), Some(agent(3)));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
 
-        let mut again = named(1, None, 10);
-        again
-            .digest
-            .tell(&said(1, Address::Agent(agent(1)), "news"));
-        map.told(vec![again]);
+        map.told(vec![named(1, None, 40)]);
         assert_eq!(map.next_agent(None, 1), Some(agent(3)));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
     }
@@ -928,7 +901,7 @@ mod tests {
     #[test]
     fn a_filed_agent_is_stepped_over_and_comes_back_in_place() {
         let mut map = AgentMap::default();
-        map.set_host_data(HostId::default(), 0, 3);
+        map.set_host_data(HostId::default(), 0, EndpointId([0; 32]), 3);
         for (nth, at) in [(1, 10), (2, 20), (3, 30)] {
             map.told(vec![named(nth, None, at)]);
         }
@@ -952,7 +925,7 @@ mod tests {
     fn the_indexes_follow_what_changed() {
         let host = HostId::default();
         let mut map = AgentMap::default();
-        map.set_host_data(host, 0, 3);
+        map.set_host_data(host, 0, EndpointId([0; 32]), 3);
         map.told(vec![
             named(1, None, 10),
             named(2, Some(agent(1)), 20),

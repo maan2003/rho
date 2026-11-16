@@ -57,7 +57,7 @@ async def download(url: str, *, timeout: float = 300) -> bytes:
     `files_info`. The host adds the bot token and fetches only
     `https://files.slack.com/` URLs. Raises `SlackApiError` when the host or
     Slack refuses."""
-    socket = str(Path(os.environ["RHO_SOCKET_PATH"]).with_name("slack.sock"))
+    socket = str(Path(os.environ["RHO_RUNTIME_DIR"]) / "slack.sock")
     async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=socket), timeout=timeout) as client:
         resp = await client.get("http://slack/download", params={"url": url})
     if resp.status_code != 200:

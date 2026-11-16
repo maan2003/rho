@@ -5,7 +5,9 @@
 //! projection without disturbing a draft while commands run.
 //!
 //! [`protocol`] is what a client and a host say about shells; the host and
-//! the workset runtime use it alone, without the `client` feature.
+//! the workset runtime use it alone, without the `client` feature. With
+//! `ui`, [`ui`] is the shells as the frame shows them: the `shell` system
+//! and its surface.
 
 pub mod protocol;
 
@@ -13,6 +15,8 @@ pub mod protocol;
 pub mod channel;
 #[cfg(feature = "client")]
 mod surface;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 #[cfg(feature = "client")]
 pub use surface::*;
