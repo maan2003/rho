@@ -201,10 +201,10 @@ pub fn claude_to_native(
          history from its log: Claude's thinking did not carry over."
     );
     match summary {
-        Some(summary) => opening.push_str(&format!(
-            " When Claude Code last compacted the conversation, it summarized what came \
-             before like this:\n\n{summary}\n\nThe turns from the one it compacted in follow"
-        )),
+        Some(_) => opening.push_str(
+            " Claude Code's summary of the conversation before its last compaction comes \
+             next, then the turns from the one it compacted in",
+        ),
         None => opening.push_str(" The turns follow"),
     }
     opening.push_str(&left_out_note(left_out));
@@ -212,14 +212,24 @@ pub fn claude_to_native(
         ". Claude Code's own tools are gone; `exec` works as before. The notebook \
          restarted with the switch, so its globals and running cells are gone.",
     );
+    // Rho's framing in its own voice; the summary where Claude Code puts it,
+    // in the user's seat ([DECISION-roles](../specs/DECISION-roles.md)).
+    let mut inputs = vec![Input {
+        role: Role::System,
+        message: None,
+        content: vec![ContentPart::Text { text: opening }],
+    }];
+    inputs.extend(summary.map(|summary| Input {
+        role: Role::User,
+        message: None,
+        content: vec![ContentPart::Text {
+            text: summary.to_owned(),
+        }],
+    }));
     let mut history = vec![Event::Request {
         agent,
         output: Vec::new(),
-        inputs: vec![Input {
-            role: Role::System,
-            message: None,
-            content: vec![ContentPart::Text { text: opening }],
-        }],
+        inputs,
         notices: Vec::new(),
         compact: false,
         turn: None,

@@ -200,7 +200,14 @@ fn claude_rows_since_the_compaction_become_native_steps_and_requests() {
         said[0].starts_with("request out=\"\" in=[\"System:This agent ran on Claude Code (Opus)"),
         "{said:#?}"
     );
-    assert!(said[0].contains("SUMMARY: the user wants rows counted."));
+    // The framing is Rho's, the summary is Claude's and sits in the user's
+    // seat, as Claude Code puts it.
+    assert!(
+        said[0].ends_with("\", \"User:SUMMARY: the user wants rows counted.\"]"),
+        "{said:#?}"
+    );
+    assert_eq!(said[0].matches("SUMMARY").count(), 1, "{said:#?}");
+    assert!(said[0].contains("summary of the conversation before its last compaction"));
     assert!(!said[0].contains("left out"));
     assert_eq!(
         said[1..],
@@ -237,6 +244,10 @@ fn a_session_that_never_compacted_replays_from_the_start() {
     );
     let said = shape(&out);
     assert!(said[0].contains("The turns follow"), "{said:#?}");
+    assert!(
+        !said[0].contains("User:"),
+        "no summary, no user input: {said:#?}"
+    );
     assert_eq!(said[1], "request out=\"\" in=[\"User:long ago\"]");
     assert_eq!(said[2], "step prose=\"Done long ago.\" exec=None call=None");
 }

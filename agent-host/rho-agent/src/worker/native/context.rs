@@ -405,7 +405,8 @@ mod tests {
         assert_eq!(told[1], "after-compaction");
     }
     /// A Claude agent switched to native replays its handoff as an ordinary
-    /// native context: the summary and the person's words as user items, each
+    /// native context: Rho's framing, Claude's summary and the person's words
+    /// as user items, each
     /// exec step followed by the report its call is paired with.
     #[test]
     fn a_switched_claude_history_replays_as_native_context() {
@@ -425,7 +426,9 @@ mod tests {
             .items()
             .iter()
             .map(|item| match item {
-                Item::User { text, .. } if text.contains("SUMMARY") => "user: opening".into(),
+                Item::User { text, .. } if text.starts_with("This agent ran on") => {
+                    "user: framing".into()
+                }
                 Item::User { text, .. } => format!("user: {text}"),
                 Item::Step { carry, exec } => format!(
                     "step {:?} {exec:?}",
@@ -444,7 +447,8 @@ mod tests {
         assert_eq!(
             items,
             [
-                "user: opening",
+                "user: framing",
+                "user: SUMMARY",
                 "user: Count the rows.",
                 "step Some(\"toolu_old\") Some(\"old()\")",
                 "report to \"toolu_old\": old output",

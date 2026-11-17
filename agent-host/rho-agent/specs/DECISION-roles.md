@@ -1,18 +1,21 @@
 # DECISION-roles: Every input has a role, and each role reads as itself
 
-Authority: confirmed, 2026-11-06, maan2003
+Authority: confirmed, 2026-11-17, maan2003
 
 ## Decision
 
 Every input carries one `Role`, in both runtimes:
 
 - `user`: what a person typed, with a chat header around it. It wakes the agent
-  soon.
+  soon. One exception: when an agent switches from Claude to native, Claude
+  Code's compaction summary rides here, since Claude Code itself puts it in
+  the user's seat and the agent has read it there all along.
 - `tool`: anything no person typed and Rho did not write: another agent's
   message, and notebook output, which is an input like any other. It reaches
   the model only inside an `exec` result. A message wakes the agent after a wait;
   output has its own wake rules.
-- `system`: what `hooks.on_compaction` gives back, such as a kept skill's text.
+- `system`: what `hooks.on_compaction` gives back, such as a kept skill's text,
+  and the lines Rho writes to frame a runtime switch.
   Only Rust gives this role: `_rho.input` takes `user` or `tool`. It wakes nobody
   and rides along with the next request. The model reads it as `role: user`, like
   the fixed lines that say output waits.
