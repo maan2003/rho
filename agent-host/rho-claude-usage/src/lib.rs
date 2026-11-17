@@ -244,6 +244,11 @@ async fn probe_usage(
     timed_result.context("Claude quota probe timed out")?
 }
 
+/// The probe's scratch directory, empty and private before each run so Claude
+/// starts with nothing to read. It is rho's own, under its state directory,
+/// and holds only what a probe's Claude leaves behind (an older probe made it
+/// Claude's config directory), so whatever is there goes. A symlink or a file
+/// in its place is someone else's and an error.
 fn prepare_probe_dir(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -252,35 +257,19 @@ fn prepare_probe_dir(path: &Path) -> anyhow::Result<()> {
                 "Claude quota probe path is not a real directory: {}",
                 path.display()
             );
-            anyhow::ensure!(
-                std::fs::read_dir(path)
-                    .with_context(|| format!(
-                        "read Claude quota probe directory {}",
-                        path.display()
-                    ))?
-                    .next()
-                    .is_none(),
-                "Claude quota probe directory is not empty: {}",
-                path.display()
-            );
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
-                || format!("secure Claude quota probe directory {}", path.display()),
-            )?;
+            std::fs::remove_dir_all(path).with_context(|| {
+                format!("clear Claude quota probe directory {}", path.display())
+            })?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            use std::os::unix::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path)
-                .with_context(|| {
-                    format!("create Claude quota probe directory {}", path.display())
-                })?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect Claude quota probe directory"),
     }
-    Ok(())
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("create Claude quota probe directory {}", path.display()))
 }
 
 fn parse_usage_screen(text: &str, now: DateTime<Utc>) -> Option<ClaudeUsage> {
@@ -486,7 +475,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_directory_must_be_empty_and_private() {
+    fn probe_directory_is_emptied_and_private() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().unwrap();
@@ -496,8 +485,24 @@ mod tests {
             std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        std::fs::write(probe.join("unexpected"), b"data").unwrap();
-        assert!(prepare_probe_dir(&probe).is_err());
+        std::fs::write(probe.join("CLAUDE.md"), b"data").unwrap();
+        std::fs::create_dir(probe.join("projects")).unwrap();
+        std::fs::write(probe.join("projects").join("session.jsonl"), b"{}").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_probe_dir(&probe).unwrap();
+        assert_eq!(std::fs::read_dir(&probe).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), b"data").unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(prepare_probe_dir(&link).is_err());
+        assert!(elsewhere.join("keep").exists());
     }
 
     #[test]
