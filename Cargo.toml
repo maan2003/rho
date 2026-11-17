@@ -17,6 +17,7 @@ members = [
   "agent-host/rho-agent-host",
   "agent-host/rho-ci",
   "agent-host/rho-claude",
+  "agent-host/rho-claude-usage",
   "agent-host/rho-cli",
   "agent-host/rho-context-config",
   "agent-host/rho-devshell",
@@ -136,6 +137,7 @@ rho-agents-client = { path = "crates/rho-agents-client" }
 rho-chat = { path = "crates/rho-chat" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-claude = { path = "agent-host/rho-claude" }
+rho-claude-usage = { path = "agent-host/rho-claude-usage" }
 rho-context-config = { path = "agent-host/rho-context-config" }
 rho-db = { path = "crates/rho-db" }
 rho-dealer = { path = "crates/rho-dealer" }

@@ -1,5 +1,39 @@
 use super::*;
 
+/// Lines come by account and then window, with the used share rather than
+/// the remaining one; ChatGPT quota and unknown resets do not break them.
+#[test]
+fn claude_usage_lines_by_account_and_window() {
+    let summary = |model: &str, account: Option<&str>, remaining: u8, reset: Option<i64>| {
+        agents::QuotaSummary {
+            model: model.to_owned(),
+            auth_namespace: account.map(str::to_owned),
+            remaining_percent: remaining,
+            burn_10m: 0,
+            burn_2h: 0,
+            burn_1d: 0,
+            burn_3d: 0,
+            reset_at_unix: reset,
+        }
+    };
+    let lines = claude_usage_lines(&[
+        summary("fable", Some("work"), 88, Some(1_786_000_000)),
+        summary("gpt", Some("chatgpt"), 50, Some(1_786_000_000)),
+        summary("opus", Some("work"), 93, Some(1_786_000_000)),
+        summary("opus", Some("default"), 60, None),
+        summary("session", Some("work"), 77, Some(1_785_600_000)),
+    ]);
+    assert_eq!(
+        lines,
+        vec![
+            "default\tweekly\t40%\t-",
+            "work\t5-hour\t23%\t2026-08-01T16:00Z",
+            "work\tweekly\t7%\t2026-08-06T07:06Z",
+            "work\tweekly-fable\t12%\t2026-08-06T07:06Z",
+        ]
+    );
+}
+
 #[test]
 fn github_init_parses() {
     let args = Args::try_parse(["github", "init"].into_iter().map(str::to_owned)).unwrap();

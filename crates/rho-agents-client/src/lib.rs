@@ -27,6 +27,8 @@ pub mod map;
 #[cfg(feature = "client")]
 pub mod model;
 #[cfg(feature = "client")]
+pub mod quota;
+#[cfg(feature = "client")]
 pub mod remote;
 #[cfg(feature = "client")]
 pub mod session;
@@ -38,6 +40,8 @@ pub mod state;
 pub mod store;
 #[cfg(feature = "client")]
 pub mod stream;
+#[cfg(feature = "client")]
+pub mod usage;
 
 #[cfg(feature = "client")]
 pub use create::{Creation, Start, StartBase, StartFieldMode};
