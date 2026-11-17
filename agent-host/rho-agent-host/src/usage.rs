@@ -349,14 +349,17 @@ pub(crate) fn spawn_claude_quota_recorder(
             };
             let observed_at = rho_agent_types::UnixMs::now();
             let mut write = db.write().await;
-            let mut changed = write.record_quota_observation(QuotaObservationRecord {
-                provider: QuotaProvider::Claude,
-                model: QuotaModel::SESSION,
-                auth_namespace: Some(account.clone()),
-                observed_at,
-                used_percent: usage.session.used_percent,
-                reset_at_unix: Some(usage.session.reset_at_unix),
-            });
+            let mut changed = false;
+            if let Some(session) = usage.session {
+                changed |= write.record_quota_observation(QuotaObservationRecord {
+                    provider: QuotaProvider::Claude,
+                    model: QuotaModel::SESSION,
+                    auth_namespace: Some(account.clone()),
+                    observed_at,
+                    used_percent: session.used_percent,
+                    reset_at_unix: Some(session.reset_at_unix),
+                });
+            }
             changed |= write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,

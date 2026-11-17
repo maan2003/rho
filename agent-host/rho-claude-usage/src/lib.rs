@@ -32,8 +32,8 @@ pub struct UsageWindow {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClaudeUsage {
-    /// The five-hour session window.
-    pub session: UsageWindow,
+    /// The five-hour session window, which not every plan's screen shows.
+    pub session: Option<UsageWindow>,
     /// The weekly window over every model.
     pub all_models: UsageWindow,
     /// The weekly window for Fable alone.
@@ -277,7 +277,7 @@ fn parse_usage_screen(text: &str, now: DateTime<Utc>) -> Option<ClaudeUsage> {
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>();
-    let session = parse_window(&lines, "Current session", now)?;
+    let session = parse_window(&lines, "Current session", now);
     let all_models = parse_window(&lines, "Current week (all models)", now)?;
     let fable = parse_window(&lines, "Current week (Fable)", now)?;
     Some(ClaudeUsage {
@@ -514,9 +514,29 @@ mod tests {
         }
         let now = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
         let usage = parse_usage_screen(&screen.text(), now).unwrap();
-        assert_eq!(usage.session.used_percent, 23);
+        assert_eq!(usage.session.unwrap().used_percent, 23);
         assert_eq!(usage.all_models.used_percent, 7);
         assert_eq!(usage.fable.used_percent, 12);
+    }
+
+    /// What a Claude Ultra account's screen showed on 2026-11-17: weekly
+    /// windows only.
+    #[test]
+    fn parses_claude_usage_panel_without_a_session_window() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 17, 18, 0, 0).unwrap();
+        let usage = parse_usage_screen(
+            "Current week (all models)\n██ 4% used\nResets Nov 24, 4:59pm (UTC)\n\nCurrent week (Fable)\n██ 4% used\nResets Nov 24, 4:59pm (UTC)\n\nWhat's contributing to your limits usage?\nScanning local sessions…",
+            now,
+        )
+        .unwrap();
+        assert_eq!(usage.session, None);
+        assert_eq!(usage.all_models.used_percent, 4);
+        assert_eq!(
+            usage.fable.reset_at_unix,
+            Utc.with_ymd_and_hms(2026, 11, 24, 16, 59, 0)
+                .unwrap()
+                .timestamp()
+        );
     }
 
     #[test]
@@ -594,9 +614,10 @@ mod tests {
             now,
         )
         .unwrap();
-        assert_eq!(usage.session.used_percent, 23);
+        let session = usage.session.unwrap();
+        assert_eq!(session.used_percent, 23);
         assert_eq!(
-            usage.session.reset_at_unix,
+            session.reset_at_unix,
             Utc.with_ymd_and_hms(2026, 7, 28, 15, 0, 0)
                 .unwrap()
                 .timestamp()
