@@ -808,7 +808,7 @@ mod tests {
     fn session(host: Arc<Host>, addr: std::net::SocketAddr) -> TestInferenceSession {
         let policy = host.policy(addr);
         TestInferenceSession {
-            session: policy.session(Default::default(), InferenceModel::Gpt61Sol),
+            session: policy.session(Default::default(), InferenceModel::Sol),
             policy,
         }
     }
@@ -829,7 +829,7 @@ mod tests {
         let (observations, _) = mpsc::unbounded_channel();
         Session {
             base_url: "http://127.0.0.1:1".into(),
-            model: InferenceModel::Gpt61Sol,
+            model: InferenceModel::Sol,
             effort: ReasoningEffort::Low,
             fast: false,
             routes,
@@ -946,6 +946,40 @@ mod tests {
         assert_eq!(sent.input[3].get(), TAIL);
         assert!(!wire.contains("evicted"));
         assert!(!wire.contains("\"old\""));
+    }
+
+    /// A step another runtime took replays as its words and an exec call
+    /// that the next report answers by the same id, with no reasoning.
+    #[test]
+    fn a_transcribed_step_replays_as_words_and_an_answered_call() {
+        let carry = super::super::transcribed(
+            "Looking.",
+            Some(rho_agent::inference::Call::new(
+                "toolu_a",
+                "print(6*7)".into(),
+            )),
+        );
+        let result = super::super::reply(&carry, "42", &[]).remove(0);
+        let words = super::super::transcribed("There are 42.", None);
+        assert!(!words.has_call());
+        assert!(super::super::reply(&words, "stray", &[]).is_empty());
+        let body = local_model().body(&Request::new(
+            "instructions".into(),
+            vec![Item::Step(carry), Item::Result(result), Item::Step(words)],
+            CacheKey::from_u128(1),
+        ));
+        assert_eq!(
+            body["input"].as_array().unwrap()[2..],
+            [
+                json!({"type":"message","role":"assistant",
+                       "content":[{"type":"output_text","text":"Looking."}]}),
+                json!({"type":"custom_tool_call","id":"ctc_toolu_a","call_id":"toolu_a",
+                       "name":"exec","input":"print(6*7)"}),
+                json!({"type":"custom_tool_call_output","call_id":"toolu_a","output":"42"}),
+                json!({"type":"message","role":"assistant",
+                       "content":[{"type":"output_text","text":"There are 42."}]}),
+            ]
+        );
     }
 
     #[test]
@@ -1194,7 +1228,7 @@ mod tests {
                     effort: ReasoningEffort::Xhigh,
                     fast_mode: false,
                 },
-                InferenceModel::Gpt61Terra,
+                InferenceModel::Terra,
             ),
             policy,
         };

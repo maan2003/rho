@@ -20,6 +20,10 @@ pub trait Backend: Send + Sync {
     fn session(&self, profile: InferenceProfile, model: InferenceModel) -> InferenceSession;
     fn text(&self, instructions: Arc<str>, input: String) -> BoxFuture<'_, anyhow::Result<String>>;
     fn web_credentials(&self) -> BoxFuture<'_, anyhow::Result<rho_web_search::Credentials>>;
+    /// A step this provider never produced, as it replays one: what another
+    /// runtime's model said and the exec it ran. What a runtime switch
+    /// rebuilds history with.
+    fn transcribed(&self, prose: &str, call: Option<Call>) -> Carry;
 }
 
 pub trait Session: Send + Sync {

@@ -113,7 +113,21 @@ impl AgentHead {
         self.last = pos;
         self.native.observe(pos, event);
         match event {
-            Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
+            Event::AgentChanged { spec, .. } => {
+                // A switch of runtime starts the new one's history here:
+                // what follows is the handoff (`handoff`).
+                if std::mem::discriminant(&spec.runtime)
+                    != std::mem::discriminant(&self.spec.runtime)
+                {
+                    self.native = NativeCursor {
+                        from: pos,
+                        archived: self.native.archived,
+                        ..NativeCursor::default()
+                    };
+                    self.claude_rewind = None;
+                }
+                self.spec = spec.clone()
+            }
             Event::Request { inputs, .. } => {
                 let newest = inputs.iter().filter_map(|input| input.message).max();
                 if let Some(newest) = newest {

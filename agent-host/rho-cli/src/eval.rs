@@ -25,8 +25,8 @@ pub(crate) struct EvalArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.1 Sol,
-    /// high-eng GPT-6 Astra; opus-eng and fable-eng run Claude Code and
+    /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.2 Sol,
+    /// high-eng GPT-6.2 Astra; opus-eng and fable-eng run Claude Code and
     /// need --claude-accounts. Every runtime works in the Python notebook.
     #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]
     pub role: String,
@@ -69,6 +69,11 @@ pub(crate) struct EvalArgs {
     /// task text becomes its next user message.
     #[arg(long, requires = "state_dir")]
     pub resume: Option<String>,
+    /// With --resume, first move the agent to --role's runtime, as the
+    /// model picker's `set_runtime` does: across runtime kinds this is a
+    /// switch, which hands the agent's history to the new runtime.
+    #[arg(long, requires = "resume")]
+    pub switch: bool,
     /// Each time the agent sends its Nth request, snapshot --workdir, which
     /// must be a bcachefs subvolume, read-only into this directory as
     /// r<N>: the files that request was asked about.
@@ -265,6 +270,21 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             .to_owned(),
         WorksetKind::Host { cwd } => cwd,
     };
+    if args.switch {
+        let evaluated = pool
+            .eval(
+                workset,
+                snippets::set_runtime(id, &role_runtime(&args.role)),
+            )
+            .await?;
+        if let Some(error) = evaluated.error {
+            anyhow::bail!("switching the evaluation agent failed: {error}");
+        }
+    }
+    let head = db
+        .read()
+        .agent(id)
+        .context("the evaluation agent has no head")?;
     let (_, agent, _) = pool.load(id).await?;
     emit(
         json!({"type":"start", "role":args.role, "agent":format!("{id:?}"),

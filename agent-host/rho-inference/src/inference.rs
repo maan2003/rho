@@ -326,7 +326,7 @@ impl Inference {
                 effort: crate::config::ReasoningEffort::Medium,
                 fast_mode: true,
             },
-            InferenceModel::Gpt61Terra,
+            InferenceModel::Terra,
         );
         let mut response = session.text_start(instructions, input, selected.clone(), auth);
         while let Some(event) = response.recv().await {

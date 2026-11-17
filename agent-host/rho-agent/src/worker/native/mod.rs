@@ -1334,9 +1334,9 @@ fn inference_session(
     profile: InferenceProfile,
 ) -> (InferenceSession, String) {
     let billed = match model {
-        InferenceModel::Gpt6Astra => crate::log::AgentUsageModel::ASTRA,
-        InferenceModel::Gpt61Terra => crate::log::AgentUsageModel::TERRA,
-        InferenceModel::Gpt61Sol => crate::log::AgentUsageModel::GPT,
+        InferenceModel::Astra => crate::log::AgentUsageModel::ASTRA,
+        InferenceModel::Terra => crate::log::AgentUsageModel::TERRA,
+        InferenceModel::Sol => crate::log::AgentUsageModel::GPT,
     };
     (inference.session(profile, model), billed.name().to_owned())
 }

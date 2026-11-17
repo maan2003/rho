@@ -309,6 +309,30 @@ fn reply(carry: &Carry, text: &str, images: &[Image]) -> Vec<CallResult> {
         })
         .collect()
 }
+/// A step another runtime's model took, as a Responses replay: its words as
+/// an assistant message and its exec as a completed call, which the next
+/// report answers like any other. No reasoning: the other provider's cannot be
+/// replayed here.
+pub(crate) fn transcribed(prose: &str, call: Option<Call>) -> Carry {
+    let mut items = Vec::new();
+    if !prose.is_empty() {
+        items.push(serde_json::json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": prose}],
+        }));
+    }
+    if let Some(call) = &call {
+        items.push(serde_json::json!({
+            "type": "custom_tool_call", "id": format!("ctc_{}", call.display_id()),
+            "call_id": call.display_id(), "name": EXEC, "input": call.code,
+        }));
+    }
+    Carry::new(
+        serde_json::json!({ "items": items }),
+        call.into_iter().collect(),
+        false,
+    )
+}
 #[cfg(test)]
 fn with_code(carry: &Carry, code: String) -> Call {
     Call::new(call_ids(carry).last().unwrap().as_str(), code)

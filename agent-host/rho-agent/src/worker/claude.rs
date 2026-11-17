@@ -388,6 +388,11 @@ impl ClaudeLoop {
                     .await?
                 {
                     Some(_) => ClaudeStartMode::Resume,
+                    None if head.native.from > head.created => {
+                        // Switched here from native: the session starts
+                        // from that history.
+                        handed_over(&host, &head, &claude, &permissions, &root, session_id).await?
+                    }
                     None => ClaudeStartMode::New,
                 };
             (session_id, start_mode, false)
@@ -2134,6 +2139,47 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uu
         })
         .collect();
     Some((rows[index].0, sent))
+}
+
+/// The session a native agent switched to Claude starts from: its native
+/// history, written as a Claude Code transcript (`handoff`), which the
+/// process then resumes. `head.native.from` is the switch's row.
+async fn handed_over(
+    host: &HostClient,
+    head: &AgentHead,
+    claude: &rho_claude::accounts::ClaudePaths,
+    permissions: &Permissions,
+    root: &camino::Utf8Path,
+    session_id: Uuid,
+) -> anyhow::Result<ClaudeStartMode> {
+    let rows = host.history().await?;
+    let before = rows.partition_point(|(pos, _)| *pos < head.native.from);
+    let era = crate::handoff::era(&rows[..before]);
+    let from = rows[..before]
+        .iter()
+        .rev()
+        .find_map(|(_, record)| match &record.event {
+            Event::AgentCreated { spec, .. } | Event::AgentChanged { spec, .. } => {
+                Some(crate::handoff::runtime_label(&spec.runtime))
+            }
+            _ => None,
+        })
+        .context("a switched agent has a spec before its switch")?;
+    let mode = match permissions {
+        Permissions::Bypass => PermissionMode::Bypass,
+        Permissions::Auto { .. } => PermissionMode::Auto,
+    };
+    let messages = crate::handoff::native_to_claude(
+        era,
+        &from,
+        &crate::handoff::runtime_label(&head.spec.runtime),
+        rho_claude::mcp::model_tool_name(mode),
+        crate::handoff::HANDOFF_BYTES,
+    );
+    rho_claude::write_session_transcript(&claude.projects(), session_id, root, &messages)
+        .await
+        .context("write the Claude session a switch hands over")?;
+    Ok(ClaudeStartMode::Resume)
 }
 
 /// Where a session forked to forget the user message `uuid` and all after

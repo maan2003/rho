@@ -404,4 +404,55 @@ mod tests {
         assert!(told[0].contains("are waiting"), "{told:?}");
         assert_eq!(told[1], "after-compaction");
     }
+    /// A Claude agent switched to native replays its handoff as an ordinary
+    /// native context: the summary and the person's words as user items, each
+    /// exec step followed by the report its call is paired with.
+    #[test]
+    fn a_switched_claude_history_replays_as_native_context() {
+        use crate::handoff;
+        let rows = handoff::tests::rows(handoff::tests::claude_era());
+        let events = handoff::claude_to_native(
+            handoff::tests::agent(),
+            handoff::era(&rows),
+            Some("SUMMARY"),
+            "Claude Code (Opus)",
+            "gpt-6.2-astra in Rho's native runtime",
+            handoff::HANDOFF_BYTES,
+            &handoff::tests::transcribe,
+        );
+        let request = request("instructions".into(), &events, CacheKey::new());
+        let items: Vec<String> = request
+            .items()
+            .iter()
+            .map(|item| match item {
+                Item::User { text, .. } if text.contains("SUMMARY") => "user: opening".into(),
+                Item::User { text, .. } => format!("user: {text}"),
+                Item::Step { carry, exec } => format!(
+                    "step {:?} {exec:?}",
+                    carry
+                        .display_calls()
+                        .first()
+                        .map(|call| call.display_id().to_owned())
+                ),
+                Item::Report { text, reply_to, .. } => format!(
+                    "report to {:?}: {text}",
+                    reply_to.display_calls()[0].display_id()
+                ),
+                Item::CompactionTrigger => "compact".into(),
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                "user: opening",
+                "user: Count the rows.",
+                "step Some(\"toolu_old\") Some(\"old()\")",
+                "report to \"toolu_old\": old output",
+                "step Some(\"toolu_a\") Some(\"print(6*7)\")",
+                "report to \"toolu_a\": 42\n\n[message from eng-x]\nalso this",
+                "step None None",
+                "user: Thanks. Next?",
+            ]
+        );
+    }
 }

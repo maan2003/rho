@@ -71,7 +71,7 @@ pub(crate) fn host_tools(
                         })
                     },
                     agent_id.encoded().to_owned(),
-                    InferenceModel::Gpt61Sol.as_str(),
+                    InferenceModel::Sol.as_str(),
                 ),
             },
         ));

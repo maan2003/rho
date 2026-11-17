@@ -646,6 +646,17 @@ fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()
         .map(|(_, spec)| spec)
         .ok_or_else(|| PyValueError::new_err(format!("no agent {}", agent.encoded())))?;
     let spec = spec_from_py(&spec, Some(&current))?;
+    // A switch to native in an auto workset would leave an agent that cannot
+    // load there.
+    if let Some(permissions) = super::permissions::PERMISSIONS.get() {
+        super::permissions::admits(&permissions, matches!(spec.runtime, Runtime::Native { .. }))
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "agent {} cannot switch to native: {error}",
+                    agent.encoded()
+                ))
+            })?;
+    }
     match PyHost::block(py, PyRequest::SetSpec { agent, spec })? {
         PyReply::Done => Ok(()),
         _ => Err(unexpected()),
@@ -1308,9 +1319,9 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
     let runtime = match kind.as_str() {
         "native" => {
             let model = match model.as_str() {
-                "sol" => InferenceModel::Gpt61Sol,
-                "terra" => InferenceModel::Gpt61Terra,
-                "astra" => InferenceModel::Gpt6Astra,
+                "sol" => InferenceModel::Sol,
+                "terra" => InferenceModel::Terra,
+                "astra" => InferenceModel::Astra,
                 _ => return Err(PyValueError::new_err(format!("no native model {model:?}"))),
             };
             let effort = match effort.as_str() {

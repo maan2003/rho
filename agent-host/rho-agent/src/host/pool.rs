@@ -1117,6 +1117,86 @@ impl AgentPool {
 
     /// The agent, if it belongs to `workset`: a workset acts on its own
     /// agents only.
+    /// Moves an agent to the other runtime kind
+    /// ([SPEC-runtime-switch](../../specs/SPEC-runtime-switch.md)). Its
+    /// runtime stops first, and only when it has no work, so the history it
+    /// hands over is complete. A Claude agent's turns since its last
+    /// compaction become native rows after the `AgentChanged`, in the same
+    /// transaction; a native agent's become a Claude Code session when the
+    /// Claude runtime first loads, which is where the name of its exec tool is
+    /// known.
+    async fn switch_runtime(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        agent: AgentId,
+        current: AgentSpec,
+        spec: AgentSpec,
+    ) -> anyhow::Result<()> {
+        let lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _loading = lock.lock_owned().await;
+        let loaded = self.agents.lock().await.get(&agent).cloned();
+        if let Some(loaded) = loaded {
+            loaded.retire().await.with_context(|| {
+                format!(
+                    "agent {} switches runtime only once it has no work: \
+                     switch it from another agent or the GUI while it is idle",
+                    agent.encoded()
+                )
+            })?;
+            self.agents.lock().await.remove(&agent);
+            self.recent
+                .lock()
+                .expect("poison")
+                .retain(|id| *id != agent);
+            loaded.shutdown().await;
+        }
+        let (head, rows, root) = {
+            let read = self.db.read();
+            let head = read.agent(agent).context("agent was deleted")?;
+            let rows = read.agent_rows(agent, head.created);
+            let root = workset_root(&read.workset(workset).context("workset was deleted")?.kind);
+            (head, rows, root)
+        };
+        anyhow::ensure!(
+            head.claude_rewind.is_none(),
+            "agent {} has a Claude rewind in progress; switch it once that settles",
+            agent.encoded()
+        );
+        let mut events = vec![Event::AgentChanged {
+            agent,
+            spec: spec.clone(),
+        }];
+        if let Runtime::Claude { session_id, .. } = current.runtime {
+            let summary =
+                rho_claude::last_compact_summary(&self.claude.projects(), session_id, &root)
+                    .await
+                    .context("read the Claude session's compaction summary")?;
+            let inference = self.inference.client();
+            events.extend(crate::handoff::claude_to_native(
+                agent,
+                crate::handoff::era(&rows),
+                summary.as_deref(),
+                &crate::handoff::runtime_label(&current.runtime),
+                &crate::handoff::runtime_label(&spec.runtime),
+                crate::handoff::HANDOFF_BYTES,
+                &|prose, call| inference.transcribed(prose, call),
+            ));
+        }
+        let mut write = self.db.write().await;
+        let at = UnixMs::now();
+        for event in events {
+            write.append(workset, &Record { at, event })?;
+        }
+        write.commit();
+        Ok(())
+    }
+
     fn own_agent(&self, workset: WorksetId, agent: AgentId) -> anyhow::Result<AgentSpec> {
         let head = self
             .db
@@ -1176,11 +1256,11 @@ impl AgentPool {
             }
             PyRequest::SetSpec { agent, spec } => {
                 let current = self.own_agent(workset, agent)?;
-                anyhow::ensure!(
-                    std::mem::discriminant(&current.runtime)
-                        == std::mem::discriminant(&spec.runtime),
-                    "an agent keeps its runtime kind"
-                );
+                if std::mem::discriminant(&current.runtime) != std::mem::discriminant(&spec.runtime)
+                {
+                    self.switch_runtime(workset, agent, current, spec).await?;
+                    return Ok(PyReply::Done);
+                }
                 {
                     let mut write = self.db.write().await;
                     write.append(
@@ -1455,9 +1535,9 @@ pub fn workset_root(kind: &WorksetKind) -> camino::Utf8PathBuf {
 fn models() -> Vec<Runtime> {
     use crate::inference::config::{InferenceModel, InferenceProfile};
     let native = [
-        InferenceModel::Gpt61Sol,
-        InferenceModel::Gpt61Terra,
-        InferenceModel::Gpt6Astra,
+        InferenceModel::Sol,
+        InferenceModel::Terra,
+        InferenceModel::Astra,
     ]
     .map(|model| Runtime::Native {
         model,
