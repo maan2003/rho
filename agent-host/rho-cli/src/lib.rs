@@ -302,6 +302,9 @@ pub(crate) enum ClaudeAccountCommand {
     Login { name: String },
     /// Put new agents on an account. Running agents keep theirs.
     Use { name: String },
+    /// Print each account's Claude usage as the agent host last saw it: one
+    /// line per window with the percent used and the reset time, in UTC.
+    Usage,
 }
 
 /// Accounts are directories, so making one is a local matter; which one
@@ -315,6 +318,13 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
         ClaudeAccountCommand::Use { name } => {
             let call = agents::SetClaudeAccount { name: name.clone() };
             host_call(&paths, call).await?
+        }
+        ClaudeAccountCommand::Usage => {
+            let summaries = host_call(&paths, agents::QuotaUsage).await?;
+            for line in claude_usage_lines(&summaries) {
+                println!("{line}");
+            }
+            return Ok(());
         }
         ClaudeAccountCommand::Login { name } => {
             let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
@@ -332,6 +342,40 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
         println!("{mark} {name}");
     }
     Ok(())
+}
+
+/// `account window used reset`, tab-separated, by account and then from the
+/// shortest window; ChatGPT quota and windows the CLI does not know are left
+/// out. A reset the host does not know is `-`.
+fn claude_usage_lines(summaries: &[agents::QuotaSummary]) -> Vec<String> {
+    const WINDOWS: [(&str, &str); 3] = [
+        ("session", "5-hour"),
+        ("opus", "weekly"),
+        ("fable", "weekly-fable"),
+    ];
+    let mut rows = summaries
+        .iter()
+        .filter_map(|summary| {
+            let account = summary.auth_namespace.as_deref()?;
+            let order = WINDOWS
+                .iter()
+                .position(|(model, _)| *model == summary.model)?;
+            let reset = match summary.reset_at_unix {
+                Some(at) => jiff::Timestamp::from_second(at)
+                    .map(|at| at.strftime("%Y-%m-%dT%H:%MZ").to_string())
+                    .unwrap_or_else(|_| "-".to_owned()),
+                None => "-".to_owned(),
+            };
+            let used = 100u8.saturating_sub(summary.remaining_percent);
+            Some((account.to_owned(), order, used, reset))
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.into_iter()
+        .map(|(account, order, used, reset)| {
+            format!("{account}\t{}\t{used}%\t{reset}", WINDOWS[order].1)
+        })
+        .collect()
 }
 
 #[derive(Clone, clap::Args)]

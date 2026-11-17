@@ -11,6 +11,8 @@
 //! ([`AgentAddress`]): the same system opens them, with the agent's host
 //! as their link, and offers the rows that start one from any surface of
 //! the agent.
+//! The system also opens the usage charts ([`crate::usage`]): it asks the
+//! hosts it reaches and keeps their answers, and a chart observes it.
 
 mod address;
 mod start;
@@ -22,11 +24,15 @@ use std::sync::Arc;
 
 pub use address::{AgentAddress, Part};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Context, Entity, Subscription, Task, WeakEntity, Window};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
+};
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{AgentId, EndpointId, MessageId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
+use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
+use rho_agents_client::quota::Quotas;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, now_ms};
@@ -38,6 +44,7 @@ use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, System,
 };
+use rho_rpc::protocol::Call;
 use rho_shell_view::ui::ShellSurface;
 use rho_terminal::ui::TerminalSurface;
 use rho_window::style::StyleClass;
@@ -45,8 +52,11 @@ use surface::AgentSurface;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::transcript::{TranscriptFrame, Transcripts};
+use crate::usage::{self, Request, Usage, UsageChart, UsageMoved, UsageSurface};
 
-const KINDS: &[&str] = &[AgentRef::KIND];
+/// Every kind the system opens: agents, and the usage charts
+/// (`SPEC-usage-addresses`).
+const KINDS: &[&str] = &[AgentRef::KIND, UsageChart::KIND];
 
 pub struct AgentsSystem {
     client: AgentsClient,
@@ -60,6 +70,9 @@ pub struct AgentsSystem {
     /// Each host's desktops stream, and the desktops it last said it runs.
     desktops: DesktopStreams,
     sessions: HashMap<HostId, Vec<DesktopSession>>,
+    quotas: Quotas,
+    /// What the hosts answered for the spend charts.
+    usage: Usage,
     chat: Entity<ChatSystem>,
     frame: FrameLink,
     /// Agents asked for with the user's message, by the id the chat gave
@@ -124,6 +137,8 @@ impl AgentsSystem {
             links: HashMap::new(),
             desktops,
             sessions: HashMap::new(),
+            quotas: Quotas::default(),
+            usage: Usage::default(),
             chat,
             frame,
             starting: HashMap::new(),
@@ -227,6 +242,15 @@ impl AgentsSystem {
             } => {
                 self.registry
                     .set_host_data(host, machine_seed, endpoint, agent_counter);
+                cx.notify();
+            }
+            ModelMsg::Auth { auth } => {
+                self.quotas.set_auth(host, auth);
+                cx.emit(UsageMoved::Quota);
+                cx.notify();
+            }
+            ModelMsg::QuotaUsage { summaries } => {
+                self.quotas.set_summaries(host, summaries);
                 cx.notify();
             }
         }
@@ -627,6 +651,91 @@ impl AgentsSystem {
         }
     }
 
+    pub(crate) fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    /// Every host's quota history merged, with the accounts agents run on;
+    /// `None` until a host has answered.
+    pub(crate) fn quota_history(&self) -> Option<(Vec<QuotaSeries>, Vec<String>)> {
+        self.quotas.has_history().then(|| {
+            (
+                self.quotas.merged_history(&self.registry),
+                self.quotas.active_namespaces(&self.registry),
+            )
+        })
+    }
+
+    pub(crate) fn attached_hosts(&self) -> usize {
+        self.links.len()
+    }
+
+    /// Asks every host for the series `chart` draws; each answer lands as
+    /// it comes and the charts it concerns draw again.
+    pub(crate) fn ask(&self, chart: UsageChart, cx: &mut Context<Self>) {
+        match chart.request(now_ms()) {
+            Request::QuotaHistory => self.ask_every_host(
+                QuotaHistory,
+                |this, host, series, cx| {
+                    this.quotas.set_history(host, series);
+                    cx.emit(UsageMoved::Quota);
+                },
+                cx,
+            ),
+            Request::GlobalUsage { since_ms } => self.ask_every_host(
+                GlobalUsage { since_ms },
+                move |this, host, series, cx| {
+                    this.usage.record_spend(chart, host, series);
+                    cx.emit(UsageMoved::Series(chart));
+                },
+                cx,
+            ),
+            Request::AgentCostDistribution { since_ms } => self.ask_every_host(
+                AgentCostDistribution { since_ms },
+                move |this, host, series, cx| {
+                    this.usage.record_agent_cost(chart.days, host, series);
+                    cx.emit(UsageMoved::Series(chart));
+                },
+                cx,
+            ),
+        }
+    }
+
+    /// Asks every attached host the same question. An answer from a host
+    /// detached since is dropped, so what it said stays forgotten.
+    fn ask_every_host<C: Call + Clone>(
+        &self,
+        call: C,
+        arrived: impl Fn(&mut Self, HostId, C::Reply, &mut Context<Self>) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        for (&host, link) in &self.links {
+            let reply = AgentsLink::new(link.clone()).call(call.clone());
+            let arrived = arrived.clone();
+            cx.spawn(async move |this, cx| {
+                let reply = reply.await;
+                this.update(cx, |this, cx| {
+                    if !this.links.contains_key(&host) {
+                        return;
+                    }
+                    match reply {
+                        Ok(reply) => arrived(this, host, reply, cx),
+                        Err(error) => {
+                            let name = this.registry.host_name(host).to_owned();
+                            this.frame.echo(
+                                format!("{name}: {error:#}"),
+                                StyleClass::SystemImportant,
+                                cx,
+                            );
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
         let chat = self.chat.read(cx);
         point
@@ -636,6 +745,8 @@ impl AgentsSystem {
             .or_else(|| chat.thread_of(&point.surface))
     }
 }
+
+impl EventEmitter<UsageMoved> for AgentsSystem {}
 
 impl System for AgentsSystem {
     fn kinds(&self) -> &'static [&'static str] {
@@ -648,6 +759,12 @@ impl System for AgentsSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
+        if let Some(chart) = UsageChart::from_address(address) {
+            let system = cx.entity();
+            let surface = cx.new(|cx| UsageSurface::new(system, chart, window, cx));
+            self.ask(chart, cx);
+            return Some(AnySurface::new(surface));
+        }
         let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
         self.registry.mirrored(agent)?;
         let surface = match part {
@@ -688,6 +805,9 @@ impl System for AgentsSystem {
         self.client.detach_host(host);
         self.links.remove(&host);
         self.sessions.remove(&host);
+        self.quotas.forget(host);
+        self.usage.forget(host);
+        cx.emit(UsageMoved::Host);
         let departed = self.registry.detach_host(host);
         self.deleted(departed, cx);
     }
@@ -697,17 +817,18 @@ impl System for AgentsSystem {
         if let Some(here) = AgentAddress::from_address(&point.surface) {
             return self.agent_rows(here, cx);
         }
+        let mut rows = vec![Row::menu("shift-u", "usage…", usage::menu(this.clone()))];
         let Some(thread) = self.thread_at(point, cx) else {
-            return Vec::new();
+            return rows;
         };
         if self.host_of(thread.host).is_none() {
-            return Vec::new();
+            return rows;
         }
-        let mut rows = vec![Row::menu(
+        rows.push(Row::menu(
             "a",
             "start agent here",
             start::rows(self, this.clone(), thread, start::Origin::Message, cx),
-        )];
+        ));
         let draft = !self
             .chat
             .read(cx)
@@ -725,6 +846,9 @@ impl System for AgentsSystem {
     }
 
     fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+        if let Some(chart) = UsageChart::from_address(address) {
+            return Some((chart.title(), "usage".to_owned()));
+        }
         let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
         self.registry.mirrored(agent)?;
         let (label, host) = self.label(agent);
@@ -758,6 +882,14 @@ impl System for AgentsSystem {
                 recency: 0,
             })
         });
-        agents.chain(desktops).collect()
+        agents
+            .chain(desktops)
+            .chain(UsageChart::all().map(|chart| Found {
+                address: chart.address(),
+                title: chart.title(),
+                description: "usage".to_owned(),
+                recency: 0,
+            }))
+            .collect()
     }
 }

@@ -14,6 +14,7 @@ use rho_agent::host::pool::AgentPool;
 use rho_agent::store::StoreRead as _;
 use rho_agent_hosts::protocol::GitProviderFrame;
 use rho_agent_types::{AgentId, ContentPart};
+use rho_agents_client::protocol::AuthState;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
 use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
@@ -28,6 +29,7 @@ mod host;
 mod realtime;
 mod secret_store;
 mod transcript;
+mod usage;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
@@ -659,6 +661,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default(),
     };
+    let quota_path_overrides = path_overrides.clone();
     // The mirror keeper keeps every mirror fetched so new agents start on
     // the remote's latest state; without it (no git on PATH, say) agents
     // get plain git and nothing is shared.
@@ -731,6 +734,34 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         )
         .await?,
     );
+    spawn_inference_projection(Arc::clone(&services));
+    // One probe per account: a subscription's headroom is the account's, and
+    // agents move between accounts. The probe has no view to mount an
+    // account into, so it names the account directory outright.
+    for account in claude.list()? {
+        let quota_environment = services.user_environment.clone();
+        let quota_path_overrides = quota_path_overrides.clone();
+        let account_dir = claude.account_dir(&account)?;
+        usage::spawn_claude_quota_recorder(
+            rho_claude_usage::spawn_poller(
+                move || {
+                    let mut command = tokio::process::Command::new("claude");
+                    quota_environment.apply(&mut command);
+                    let path = quota_environment
+                        .get("PATH")
+                        .context("user environment has no PATH")?;
+                    command.env("PATH", quota_path_overrides.add_to(path));
+                    command.env("CLAUDE_CONFIG_DIR", account_dir.as_str());
+                    Ok(command)
+                },
+                default_db_path()?.with_file_name(format!("claude-quota-probe-{account}")),
+            ),
+            account,
+            services.db.clone(),
+            services.quota.clone(),
+        );
+    }
+
     let start_iroh = {
         let services = services.clone();
         let iroh_auth = iroh_auth.clone();
@@ -1151,6 +1182,9 @@ struct Services {
     endpoint: rho_agent_types::EndpointId,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
+    /// Marked whenever a quota observation lands; every agents session
+    /// tells its client the quota again.
+    quota: tokio::sync::watch::Sender<()>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
     /// The Claude configuration this agent host runs against, resolved in
@@ -1189,6 +1223,7 @@ impl Services {
             machine_seed,
             endpoint,
             platform_secrets,
+            quota: tokio::sync::watch::channel(()).0,
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
@@ -1196,6 +1231,19 @@ impl Services {
             stop: tokio::sync::Notify::new(),
         };
         Ok(registry)
+    }
+
+    fn auth_state(&self) -> AuthState {
+        let state = self.inference.state();
+        AuthState {
+            namespaces: state.namespaces,
+            disabled_namespaces: state.disabled_namespaces,
+            active_namespace: state.active_namespace,
+        }
+    }
+
+    async fn set_auth_account_enabled(&self, name: &str, enabled: bool) {
+        self.inference.set_account_enabled(name, enabled).await;
     }
 
     /// An agent named by its id or a unique prefix of it, with or without
@@ -1268,6 +1316,21 @@ where
 }
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// An inference state change moves the quota every session shows.
+fn spawn_inference_projection(services: Arc<Services>) {
+    let mut state = services.inference.subscribe();
+    let services = Arc::downgrade(&services);
+    tokio::spawn(async move {
+        while state.changed().await.is_ok() {
+            let Some(services) = services.upgrade() else {
+                break;
+            };
+            let _ = state.borrow_and_update();
+            services.quota.send_replace(());
+        }
+    });
+}
 
 /// Repo roots must be absolute (the agent host's cwd is meaningless by design):
 /// agents start on host-made clones, so both workdir registration and
@@ -1438,6 +1501,7 @@ mod tests {
         assert!(paths.slack_socket().exists());
         assert!(paths.notion_socket().exists());
         assert!(paths.host_lock().exists());
+        assert!(!paths.browser_socket().exists());
         assert_eq!(
             std::fs::read_dir(runtime.path())
                 .unwrap()
