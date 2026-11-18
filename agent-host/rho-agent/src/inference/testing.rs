@@ -21,6 +21,13 @@ impl Backend for Fake {
     fn web_credentials(&self) -> BoxFuture<'_, anyhow::Result<rho_web_search::Credentials>> {
         Box::pin(async { anyhow::bail!("fake credentials unavailable") })
     }
+    fn transcribed(&self, prose: &str, call: Option<super::Call>) -> super::Carry {
+        super::Carry::new(
+            serde_json::json!({"transcribed": prose, "call": call.as_ref().map(super::Call::display_id)}),
+            call.into_iter().collect(),
+            false,
+        )
+    }
 }
 
 impl Session for Fake {

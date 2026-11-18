@@ -53,6 +53,10 @@ pub(crate) struct EvalArgs {
     /// The account under --claude-accounts that Claude agents run on.
     #[arg(long, default_value = rho_claude::accounts::DEFAULT_ACCOUNT)]
     pub claude_account: String,
+    /// Run native agents on this inference account (`rho auth list`) only.
+    /// It disables the others in the run's own database, not the host's.
+    #[arg(long, value_name = "NAME")]
+    pub inference_account: Option<String>,
     /// Override the OpenAI Responses base URL (isolated QA providers).
     #[arg(long, value_name = "URL")]
     pub openai_base_url: Option<String>,
@@ -69,6 +73,11 @@ pub(crate) struct EvalArgs {
     /// task text becomes its next user message.
     #[arg(long, requires = "state_dir")]
     pub resume: Option<String>,
+    /// With --resume, first move the agent to --role's runtime, as the
+    /// model picker's `set_runtime` does: across runtime kinds this is a
+    /// switch, which hands the agent's history to the new runtime.
+    #[arg(long, requires = "resume")]
+    pub switch: bool,
     /// Each time the agent sends its Nth request, snapshot --workdir, which
     /// must be a bcachefs subvolume, read-only into this directory as
     /// r<N>: the files that request was asked about.
@@ -175,6 +184,18 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
         None => rho_inference::Accounts::new(db.clone()).await?,
     };
+    if let Some(account) = &args.inference_account {
+        let namespaces = inference.state().namespaces;
+        anyhow::ensure!(
+            namespaces.contains(account),
+            "no inference account {account:?}; there are {namespaces:?}"
+        );
+        for namespace in &namespaces {
+            inference
+                .set_account_enabled(namespace, namespace == account)
+                .await;
+        }
+    }
     // An eval keeps its Claude state in its own directory; only a login,
     // when asked for, comes from the user's accounts.
     let claude_home = camino::Utf8PathBuf::try_from(temp.path().join("claude"))?;
@@ -265,6 +286,21 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             .to_owned(),
         WorksetKind::Host { cwd } => cwd,
     };
+    if args.switch {
+        let evaluated = pool
+            .eval(
+                workset,
+                snippets::set_runtime(id, &role_runtime(&args.role)),
+            )
+            .await?;
+        if let Some(error) = evaluated.error {
+            anyhow::bail!("switching the evaluation agent failed: {error}");
+        }
+    }
+    let head = db
+        .read()
+        .agent(id)
+        .context("the evaluation agent has no head")?;
     let (_, agent, _) = pool.load(id).await?;
     emit(
         json!({"type":"start", "role":args.role, "agent":format!("{id:?}"),

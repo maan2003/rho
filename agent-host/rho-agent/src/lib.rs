@@ -12,6 +12,7 @@ pub use worker::native::AgentHandle;
 
 pub mod db;
 pub mod entry;
+pub mod handoff;
 pub mod heap;
 pub mod log;
 mod papercut;

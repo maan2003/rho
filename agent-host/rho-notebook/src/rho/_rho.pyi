@@ -102,7 +102,10 @@ def agents() -> dict[str, Spec]:
     """Every agent of this workset, by id."""
 def set_spec(agent: str, spec: Spec) -> None:
     """Log `AgentChanged` with the whole new spec. A model change keeps the
-    cache key and the Claude session."""
+    cache key and the Claude session. A change of `kind` switches runtime:
+    the agent must have no work, its history is handed to the new runtime
+    (thinking and encrypted reasoning are dropped), and its notebook restarts.
+    An auto workset refuses a switch to native."""
 def input(agent: str, text: str, *, role: Role, message: int | None = None) -> None:
     """Give the agent an input: it waits in memory until a request can carry
     it, and that request's row holds it. This returns once the agent has it. A

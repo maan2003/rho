@@ -380,6 +380,114 @@ fn latest_chain(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
     chain
 }
 
+/// The summary Claude Code wrote when it last compacted the session's active
+/// branch, as text; `None` when it never compacted.
+pub async fn last_compact_summary(
+    projects: &Utf8Path,
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<Option<String>> {
+    let Some(path) = find_session_transcript(projects, session_id, cwd).await? else {
+        return Ok(None);
+    };
+    let entries = read_transcript_entries(&path).await?;
+    Ok(latest_chain(&entries)
+        .into_iter()
+        .rev()
+        .find(|entry| entry.is_compact_summary == Some(true))
+        .map(|entry| message_text(&entry.message)))
+}
+
+fn message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+/// Writes a new session whose history is `messages`, each a Messages API
+/// `{"role", "content"}`, where `--resume` finds it for `cwd`. What a switch
+/// from another runtime starts Claude Code with. A session that already has
+/// a file is refused: its history is Claude's.
+pub async fn write_session_transcript(
+    projects: &Utf8Path,
+    session_id: Uuid,
+    cwd: &Utf8Path,
+    messages: &[Value],
+) -> Result<Utf8PathBuf> {
+    anyhow::ensure!(
+        find_session_transcript(projects, session_id, cwd)
+            .await?
+            .is_none(),
+        "Claude session {session_id} already has a transcript"
+    );
+    let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
+    let project_key = project_key(&cwd);
+    anyhow::ensure!(
+        project_key.len() <= MAX_PROJECT_KEY_LEN,
+        "Claude shortens a project key this long with a hash this crate does not compute"
+    );
+    let dir = projects.join(&project_key);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("create Claude project directory {dir}"))?;
+    let path = dir.join(format!("{session_id}.jsonl"));
+    let text = session_lines(session_id, &cwd, messages, &now_rfc3339());
+    tokio::fs::write(&path, text)
+        .await
+        .with_context(|| format!("write Claude transcript {path}"))?;
+    Ok(path)
+}
+
+fn now_rfc3339() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+/// The JSONL lines of a session holding `messages`, each the child of the
+/// one before.
+fn session_lines(session_id: Uuid, cwd: &Utf8Path, messages: &[Value], at: &str) -> String {
+    let mut parent: Option<Uuid> = None;
+    let mut text = String::new();
+    for message in messages {
+        let uuid = Uuid::new_v4();
+        let role = message["role"].as_str().unwrap_or("user");
+        let message = if role == "assistant" {
+            serde_json::json!({
+                "id": format!("msg_rho_{}", uuid.simple()),
+                "type": "message",
+                "role": "assistant",
+                "model": "rho-switch",
+                "content": message["content"],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            })
+        } else {
+            serde_json::json!({"role": "user", "content": message["content"]})
+        };
+        let line = serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "type": role,
+            "uuid": uuid,
+            "timestamp": at,
+            "userType": "external",
+            "cwd": cwd.as_str(),
+            "sessionId": session_id,
+            "message": message,
+        });
+        text.push_str(&line.to_string());
+        text.push('\n');
+        parent = Some(uuid);
+    }
+    text
+}
+
 /// Usage recorded with the most recent assistant message, if any. Transcript
 /// entries log `input_tokens` as a streaming placeholder, but the cache
 /// read/creation buckets — which dominate context occupancy — are recorded
@@ -623,6 +731,136 @@ mod tests {
         let (all_turns, resume_at) = rewind_session_messages(&messages, 2).unwrap();
         assert!(all_turns.is_empty());
         assert_eq!(resume_at, None);
+    }
+
+    /// Lines shaped like Claude Code's own: thinking with a signature, a
+    /// call and its result, and two compactions, the later one mid-branch.
+    fn compacted_session(session_id: Uuid) -> String {
+        let sid = session_id.to_string();
+        let lines = [
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":sid}),
+            json!({"parentUuid":null,"type":"user","uuid":"00000000-0000-4000-8000-000000000101",
+                   "sessionId":sid,"message":{"role":"user","content":[{"type":"text","text":"start"}]}}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000101","type":"assistant",
+                   "uuid":"00000000-0000-4000-8000-000000000102","sessionId":sid,
+                   "message":{"id":"msg_1","role":"assistant","content":[
+                       {"type":"thinking","thinking":"private","signature":"c2ln"},
+                       {"type":"tool_use","id":"toolu_1","name":"mcp__py__exec","input":{"source":"print(1)"}}]}}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000102","type":"user",
+                   "uuid":"00000000-0000-4000-8000-000000000103","sessionId":sid,
+                   "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1",
+                       "content":[{"type":"text","text":"1"}]}]}}),
+            json!({"parentUuid":null,"logicalParentUuid":"00000000-0000-4000-8000-000000000103",
+                   "type":"system","subtype":"compact_boundary","content":"Conversation compacted",
+                   "uuid":"00000000-0000-4000-8000-000000000104","sessionId":sid}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000104","type":"user",
+                   "uuid":"00000000-0000-4000-8000-000000000105","sessionId":sid,"isCompactSummary":true,
+                   "message":{"role":"user","content":[{"type":"text","text":"OLD SUMMARY"}]}}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000105","type":"assistant",
+                   "uuid":"00000000-0000-4000-8000-000000000106","sessionId":sid,
+                   "message":{"id":"msg_2","role":"assistant","content":[
+                       {"type":"redacted_thinking","data":"b3BhcXVl"},
+                       {"type":"text","text":"carrying on"}]}}),
+            json!({"parentUuid":null,"logicalParentUuid":"00000000-0000-4000-8000-000000000106",
+                   "type":"system","subtype":"compact_boundary","content":"Conversation compacted",
+                   "compactMetadata":{"trigger":"auto","preservedSegment":{
+                       "headUuid":"00000000-0000-4000-8000-000000000106",
+                       "anchorUuid":"00000000-0000-4000-8000-000000000106",
+                       "tailUuid":"00000000-0000-4000-8000-000000000106"}},
+                   "uuid":"00000000-0000-4000-8000-000000000107","sessionId":sid}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000107","type":"user",
+                   "uuid":"00000000-0000-4000-8000-000000000108","sessionId":sid,"isCompactSummary":true,
+                   "message":{"role":"user","content":"This session is being continued.\nSummary:\n1. Count rows."}}),
+            json!({"parentUuid":"00000000-0000-4000-8000-000000000108","type":"assistant",
+                   "uuid":"00000000-0000-4000-8000-000000000109","sessionId":sid,
+                   "message":{"id":"msg_3","role":"assistant","content":[
+                       {"type":"thinking","thinking":"more","signature":"c2ln"},
+                       {"type":"text","text":"42"}]}}),
+        ];
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn the_latest_compaction_summary_is_read_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        let cwd = Utf8Path::new("/nowhere/src");
+        let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000007");
+        assert_eq!(
+            last_compact_summary(&projects, session_id, cwd)
+                .await
+                .unwrap(),
+            None,
+            "no file, no summary"
+        );
+        let project = projects.join("-nowhere-src");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            compacted_session(session_id),
+        )
+        .unwrap();
+        assert_eq!(
+            last_compact_summary(&projects, session_id, cwd)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("This session is being continued.\nSummary:\n1. Count rows.")
+        );
+    }
+
+    /// A session written for a switch reads back, through the reader rho
+    /// resumes with, as the messages it was given, in order, and a second
+    /// write to it is refused.
+    #[tokio::test]
+    async fn a_written_session_reads_back_as_its_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        let cwd = Utf8Path::new("/nowhere/src");
+        let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000008");
+        let messages = vec![
+            json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+            json!({"role":"assistant","content":[
+                {"type":"text","text":"ok"},
+                {"type":"tool_use","id":"toolu_rho_switch_1","name":"exec","input":{"source":"print(1)"}}]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_rho_switch_1","content":[{"type":"text","text":"1"}]}]}),
+        ];
+        let path = write_session_transcript(&projects, session_id, cwd, &messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            path,
+            projects
+                .join("-nowhere-src")
+                .join(format!("{session_id}.jsonl"))
+        );
+        let read = read_session_messages_by_id(
+            &projects,
+            session_id,
+            cwd,
+            SessionMessagesOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.iter().map(|message| message.kind).collect::<Vec<_>>(),
+            [
+                SessionMessageKind::User,
+                SessionMessageKind::Assistant,
+                SessionMessageKind::User
+            ]
+        );
+        for (read, given) in read.iter().zip(&messages) {
+            assert_eq!(read.session_id, session_id);
+            assert_eq!(read.message["content"], given["content"]);
+        }
+        assert_eq!(read[1].message["role"], "assistant");
+        assert!(
+            write_session_transcript(&projects, session_id, cwd, &messages)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

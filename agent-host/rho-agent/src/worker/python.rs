@@ -646,6 +646,17 @@ fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()
         .map(|(_, spec)| spec)
         .ok_or_else(|| PyValueError::new_err(format!("no agent {}", agent.encoded())))?;
     let spec = spec_from_py(&spec, Some(&current))?;
+    // A switch to native in an auto workset would leave an agent that cannot
+    // load there.
+    if let Some(permissions) = super::permissions::PERMISSIONS.get() {
+        super::permissions::admits(&permissions, matches!(spec.runtime, Runtime::Native { .. }))
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "agent {} cannot switch to native: {error}",
+                    agent.encoded()
+                ))
+            })?;
+    }
     match PyHost::block(py, PyRequest::SetSpec { agent, spec })? {
         PyReply::Done => Ok(()),
         _ => Err(unexpected()),

@@ -38,6 +38,9 @@ impl agent::Backend for crate::Inference {
             })
         })
     }
+    fn transcribed(&self, prose: &str, call: Option<agent::Call>) -> agent::Carry {
+        super::transcribed(prose, call)
+    }
 }
 
 struct Session {
