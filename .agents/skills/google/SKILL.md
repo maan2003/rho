@@ -40,8 +40,6 @@ text = (await google.get(f"/www.googleapis.com/drive/v3/files/{files[0]['id']}/e
                          params={"mimeType": "text/plain"})).text
 ```
 
-From a shell: `curl --unix-socket "$RHO_RUNTIME_DIR/google.sock" 'http://google/www.googleapis.com/drive/v3/about?fields=user'`.
-
 - **Meet transcripts** are Google Docs in Drive, named after the meeting
   with `Transcript` in the name. Gemini's meeting notes are Docs too.
   Export a Doc as `text/plain` or `text/markdown`; an export is at most
