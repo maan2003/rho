@@ -13,7 +13,7 @@ use crate::record::Runtime;
 fn spec(name: &str) -> AgentSpec {
     AgentSpec {
         runtime: Runtime::Native {
-            model: InferenceModel::Gpt61Sol,
+            model: InferenceModel::Sol,
             profile: InferenceProfile {
                 effort: ReasoningEffort::High,
                 fast_mode: false,

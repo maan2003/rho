@@ -1308,9 +1308,9 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
     let runtime = match kind.as_str() {
         "native" => {
             let model = match model.as_str() {
-                "sol" => InferenceModel::Gpt61Sol,
-                "terra" => InferenceModel::Gpt61Terra,
-                "astra" => InferenceModel::Gpt6Astra,
+                "sol" => InferenceModel::Sol,
+                "terra" => InferenceModel::Terra,
+                "astra" => InferenceModel::Astra,
                 _ => return Err(PyValueError::new_err(format!("no native model {model:?}"))),
             };
             let effort = match effort.as_str() {

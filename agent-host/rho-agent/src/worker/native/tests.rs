@@ -51,7 +51,7 @@ impl Harness {
                         agent,
                         spec: AgentSpec {
                             runtime: Runtime::Native {
-                                model: InferenceModel::Gpt61Sol,
+                                model: InferenceModel::Sol,
                                 profile: InferenceProfile {
                                     effort: ReasoningEffort::High,
                                     fast_mode: false,

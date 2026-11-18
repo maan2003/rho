@@ -141,9 +141,9 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
 pub fn usage_model_of(runtime: &Runtime) -> AgentUsageModel {
     match runtime {
         Runtime::Native { model, .. } => match model {
-            crate::inference::config::InferenceModel::Gpt6Astra => AgentUsageModel::ASTRA,
-            crate::inference::config::InferenceModel::Gpt61Terra => AgentUsageModel::TERRA,
-            crate::inference::config::InferenceModel::Gpt61Sol => AgentUsageModel::GPT,
+            crate::inference::config::InferenceModel::Astra => AgentUsageModel::ASTRA,
+            crate::inference::config::InferenceModel::Terra => AgentUsageModel::TERRA,
+            crate::inference::config::InferenceModel::Sol => AgentUsageModel::GPT,
         },
         Runtime::Claude { model, .. } => match model {
             rho_claude::Model::Opus => AgentUsageModel::OPUS,

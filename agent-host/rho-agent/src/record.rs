@@ -189,9 +189,9 @@ impl Runtime {
     pub fn model_name(&self) -> &'static str {
         match self {
             Self::Native { model, .. } => match model {
-                InferenceModel::Gpt61Sol => "sol",
-                InferenceModel::Gpt61Terra => "terra",
-                InferenceModel::Gpt6Astra => "astra",
+                InferenceModel::Sol => "sol",
+                InferenceModel::Terra => "terra",
+                InferenceModel::Astra => "astra",
             },
             Self::Claude { model, .. } => match model {
                 rho_claude::Model::Fable => "fable",

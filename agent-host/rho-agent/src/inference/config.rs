@@ -22,23 +22,29 @@ impl ReasoningEffort {
     }
 }
 
-/// Which Responses-API model a step talks to. Not part of
-/// [`InferenceProfile`]: agent modes carry it separately, so persisted configs
-/// stay unchanged. The variant names are persisted, so they keep the model
-/// generation they were added with; `as_str` follows each family's newest slug.
+/// Which Responses-API model a step talks to, by the name Python gives it.
+/// Each name follows its family's newest slug: an agent on `Astra` moves to a
+/// new Astra at its next request. Not part of [`InferenceProfile`]: agent
+/// modes carry it separately, so persisted configs stay unchanged.
+///
+/// The `rename`s keep the wire ids of the rows written when the variants were
+/// named for their slugs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Encode, Decode)]
 pub enum InferenceModel {
-    Gpt61Sol,
-    Gpt61Terra,
-    Gpt6Astra,
+    #[senax(rename = "Gpt61Sol")]
+    Sol,
+    #[senax(rename = "Gpt61Terra")]
+    Terra,
+    #[senax(rename = "Gpt6Astra")]
+    Astra,
 }
 
 impl InferenceModel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gpt61Sol => "gpt-6.2-sol",
-            Self::Gpt61Terra => "gpt-6.1-terra",
-            Self::Gpt6Astra => "gpt-6.2-astra",
+            Self::Sol => "gpt-6.2-sol",
+            Self::Terra => "gpt-6.1-terra",
+            Self::Astra => "gpt-6.2-astra",
         }
     }
 }
@@ -56,6 +62,32 @@ impl Default for InferenceProfile {
         Self {
             effort: ReasoningEffort::Medium,
             fast_mode: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows written when the variants were named for their slugs read back
+    /// as the same models.
+    #[test]
+    fn models_keep_their_wire_ids_across_the_rename() {
+        #[derive(Encode)]
+        enum Before {
+            Gpt61Sol,
+            Gpt61Terra,
+            Gpt6Astra,
+        }
+        for (before, now) in [
+            (Before::Gpt61Sol, InferenceModel::Sol),
+            (Before::Gpt61Terra, InferenceModel::Terra),
+            (Before::Gpt6Astra, InferenceModel::Astra),
+        ] {
+            let bytes = senax_encoder::encode(&before).unwrap();
+            let read: InferenceModel = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+            assert_eq!(read, now);
         }
     }
 }
