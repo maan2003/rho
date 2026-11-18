@@ -808,7 +808,7 @@ mod tests {
     fn session(host: Arc<Host>, addr: std::net::SocketAddr) -> TestInferenceSession {
         let policy = host.policy(addr);
         TestInferenceSession {
-            session: policy.session(Default::default(), InferenceModel::Gpt61Sol),
+            session: policy.session(Default::default(), InferenceModel::Sol),
             policy,
         }
     }
@@ -829,7 +829,7 @@ mod tests {
         let (observations, _) = mpsc::unbounded_channel();
         Session {
             base_url: "http://127.0.0.1:1".into(),
-            model: InferenceModel::Gpt61Sol,
+            model: InferenceModel::Sol,
             effort: ReasoningEffort::Low,
             fast: false,
             routes,
@@ -1194,7 +1194,7 @@ mod tests {
                     effort: ReasoningEffort::Xhigh,
                     fast_mode: false,
                 },
-                InferenceModel::Gpt61Terra,
+                InferenceModel::Terra,
             ),
             policy,
         };

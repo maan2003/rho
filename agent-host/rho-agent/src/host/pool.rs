@@ -1455,9 +1455,9 @@ pub fn workset_root(kind: &WorksetKind) -> camino::Utf8PathBuf {
 fn models() -> Vec<Runtime> {
     use crate::inference::config::{InferenceModel, InferenceProfile};
     let native = [
-        InferenceModel::Gpt61Sol,
-        InferenceModel::Gpt61Terra,
-        InferenceModel::Gpt6Astra,
+        InferenceModel::Sol,
+        InferenceModel::Terra,
+        InferenceModel::Astra,
     ]
     .map(|model| Runtime::Native {
         model,

@@ -992,7 +992,7 @@ mod tests {
                         agent,
                         spec: AgentSpec {
                             runtime: Runtime::Native {
-                                model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                model: rho_agent::inference::config::InferenceModel::Sol,
                                 profile: Default::default(),
                                 cache_key: rho_agent::inference::PromptCacheKey::generate(),
                             },
@@ -1205,7 +1205,7 @@ mod tests {
                                     agent,
                                     spec: AgentSpec {
                                         runtime: Runtime::Native {
-                                            model: rho_agent::inference::config::InferenceModel::Gpt61Sol,
+                                            model: rho_agent::inference::config::InferenceModel::Sol,
                                             profile: Default::default(),
                                             cache_key: rho_agent::inference::PromptCacheKey::generate(),
                                         },

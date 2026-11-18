@@ -147,7 +147,7 @@ impl RouteSelection {
         fast: bool,
         selected: Option<&SelectedAuth>,
     ) -> DialRoute {
-        if model == crate::config::InferenceModel::Gpt61Terra && !fast {
+        if model == crate::config::InferenceModel::Terra && !fast {
             let route = self;
             if route.route == DialRoute::Dns
                 || selected.is_some_and(|selected| {
@@ -370,7 +370,7 @@ async fn probe_route(
 
 fn probe_body(prompt_cache_key: uuid::Uuid) -> serde_json::Value {
     json!({
-            "type": "response.create", "generate": false, "model": crate::config::InferenceModel::Gpt61Terra.as_str(),
+            "type": "response.create", "generate": false, "model": crate::config::InferenceModel::Terra.as_str(),
             "instructions": "", "input": [{"type":"additional_tools","role":"developer","tools":[]}],
             "store": false, "parallel_tool_calls": false, "text": {"verbosity":"low"},
             "reasoning": {"context":"all_turns","effort":"medium","summary":"auto"},
@@ -482,7 +482,7 @@ mod tests {
 
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt61Terra,
+                crate::config::InferenceModel::Terra,
                 false,
                 Some(&selected("one", "account-1")),
             ),
@@ -490,7 +490,7 @@ mod tests {
         );
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt61Terra,
+                crate::config::InferenceModel::Terra,
                 false,
                 Some(&selected("two", "account-2")),
             ),
@@ -498,7 +498,7 @@ mod tests {
         );
         assert_eq!(
             routes.selected.borrow().for_model(
-                crate::config::InferenceModel::Gpt61Terra,
+                crate::config::InferenceModel::Terra,
                 true,
                 Some(&selected("one", "account-1")),
             ),
