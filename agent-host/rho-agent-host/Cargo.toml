@@ -36,6 +36,7 @@ octo-server.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
 rho-claude.workspace = true
+rho-claude-usage.workspace = true
 rho-agent-types.workspace = true
 slack-server.workspace = true
 notion-server.workspace = true

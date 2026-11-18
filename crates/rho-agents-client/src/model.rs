@@ -68,6 +68,12 @@ pub enum ModelMsg {
         endpoint: EndpointId,
         agent_counter: u64,
     },
+    /// Which provider accounts the host's agents may run on.
+    Auth { auth: crate::protocol::AuthState },
+    /// The host's quota: every account's latest usage.
+    QuotaUsage {
+        summaries: Vec<crate::protocol::QuotaSummary>,
+    },
 }
 
 pub struct ModelEvent {
@@ -333,6 +339,8 @@ impl Model {
                     });
                     out
                 }
+                ServerFrame::Auth { auth } => event(ModelMsg::Auth { auth }),
+                ServerFrame::QuotaUsage { summaries } => event(ModelMsg::QuotaUsage { summaries }),
                 ServerFrame::Directory { worksets, agents } => {
                     self.directory(host, worksets, agents)
                 }

@@ -13646,6 +13646,7 @@ dependencies = [
  "rho-agents-client",
  "rho-chat",
  "rho-claude",
+ "rho-claude-usage",
  "rho-db",
  "rho-desktop-client",
  "rho-desktop-media",
@@ -13842,6 +13843,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-claude-usage"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "chrono",
+ "libc",
+ "rustix-openpty",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-cli"
 version = "0.1.0"
 dependencies = [
@@ -13850,6 +13864,7 @@ dependencies = [
  "camino",
  "clap",
  "dirs 7.0.0",
+ "jiff",
  "libc",
  "notion-server",
  "prefix-id",
