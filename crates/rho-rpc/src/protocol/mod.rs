@@ -147,6 +147,10 @@ impl RuntimePaths {
         self.directory.join("notion.sock")
     }
 
+    pub fn google_socket(&self) -> std::path::PathBuf {
+        self.directory.join("google.sock")
+    }
+
     pub fn browser_socket(&self) -> std::path::PathBuf {
         self.directory.join("rho-browser.sock")
     }

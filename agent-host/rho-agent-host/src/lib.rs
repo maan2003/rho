@@ -386,6 +386,18 @@ fn spawn_notion_server(listener: tokio::net::UnixListener, secrets: PlatformSecr
     });
 }
 
+fn spawn_google_server(listener: tokio::net::UnixListener, secrets: PlatformSecrets) {
+    let router = google_server::router(
+        Arc::new(move |name| secrets.get(name)),
+        google_server::Endpoints::google(),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = google_server::serve(listener, router).await {
+            tracing::error!(%error, "google server stopped");
+        }
+    });
+}
+
 /// The runtime directory, locked, with the proxies agents use listening in
 /// it. The host itself listens over iroh; its IPC socket joins the
 /// directory when the endpoint binds.
@@ -399,18 +411,23 @@ fn start_runtime_sockets(
     let octo_socket = paths.octo_socket();
     let slack_socket = paths.slack_socket();
     let notion_socket = paths.notion_socket();
+    let google_socket = paths.google_socket();
     prepare_socket_path(&octo_socket, "octo")?;
     prepare_socket_path(&slack_socket, "slack")?;
     prepare_socket_path(&notion_socket, "notion")?;
+    prepare_socket_path(&google_socket, "google")?;
     let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
         .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
     let slack_listener = tokio::net::UnixListener::bind(&slack_socket)
         .with_context(|| format!("bind slack socket {}", slack_socket.display()))?;
     let notion_listener = tokio::net::UnixListener::bind(&notion_socket)
         .with_context(|| format!("bind notion socket {}", notion_socket.display()))?;
+    let google_listener = tokio::net::UnixListener::bind(&google_socket)
+        .with_context(|| format!("bind google socket {}", google_socket.display()))?;
     spawn_octo_server(octo_listener, secrets.clone())?;
     spawn_slack_server(slack_listener, secrets.clone())?;
-    spawn_notion_server(notion_listener, secrets);
+    spawn_notion_server(notion_listener, secrets.clone());
+    spawn_google_server(google_listener, secrets);
     Ok(RuntimeSockets { paths, _lock: lock })
 }
 
@@ -1500,6 +1517,7 @@ mod tests {
         assert!(paths.octo_socket().exists());
         assert!(paths.slack_socket().exists());
         assert!(paths.notion_socket().exists());
+        assert!(paths.google_socket().exists());
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert_eq!(
