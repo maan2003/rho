@@ -47,6 +47,19 @@ fn github_init_parses() {
 }
 
 #[test]
+fn google_init_accepts_only_stdin_for_credentials() {
+    let parse = |args: &[&str]| Args::try_parse(args.iter().map(|arg| (*arg).to_owned()));
+    assert!(matches!(
+        parse(&["google", "--runtime-dir", "/tmp/google-host", "init"])
+            .unwrap()
+            .command,
+        Command::Google(_)
+    ));
+    assert!(parse(&["google", "init", "credentials.json"]).is_err());
+    assert!(parse(&["google", "init", "--refresh-token", "secret"]).is_err());
+}
+
+#[test]
 fn pr_commands_are_not_available() {
     assert!(Args::try_parse(["pr", "status"].into_iter().map(str::to_owned)).is_err());
 }

@@ -82,6 +82,10 @@ rho_rpc::calls! {
 impl rho_rpc::protocol::ProtocolOpen for Open {
     const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Host;
 
+    fn log_stream(&self) -> bool {
+        !matches!(self, Self::Request(Request::PlatformSecretsSet(_)))
+    }
+
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
             Self::Request(request) => Some(request.debug_answer(frame)),
@@ -273,6 +277,20 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded: T = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn protocol_traces_exclude_platform_secret_installation() {
+        assert!(Open::Request(Snapshot.into()).log_stream());
+        assert!(
+            !Open::Request(
+                PlatformSecretsSet {
+                    secrets: vec![("name".into(), "private".into())]
+                }
+                .into()
+            )
+            .log_stream()
+        );
     }
 
     #[test]

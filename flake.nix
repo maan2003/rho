@@ -606,6 +606,7 @@
         # The skills the `rho` package ships at share/rho/skills.
         bundledSkills = [
           "github-workflow"
+          "google-workspace"
           "rho-wayland"
           "rho-workstreams"
           "slack"

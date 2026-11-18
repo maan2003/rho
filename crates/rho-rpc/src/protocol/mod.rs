@@ -135,6 +135,10 @@ impl RuntimePaths {
         self.directory.join("endpoint")
     }
 
+    pub fn google_socket(&self) -> std::path::PathBuf {
+        self.directory.join("google.sock")
+    }
+
     pub fn octo_socket(&self) -> std::path::PathBuf {
         self.directory.join("octo.sock")
     }
@@ -201,6 +205,12 @@ pub struct Open {
 /// A protocol's own opening frame.
 pub trait ProtocolOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
     const PROTOCOL: Protocol;
+
+    /// Whether a protocol trace may record this stream, including its opening
+    /// frame.
+    fn log_stream(&self) -> bool {
+        true
+    }
 
     /// A reply on a stream this opened, as a protocol log prints it; `None`
     /// for a stream frame, which the log does not read.

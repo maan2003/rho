@@ -31,6 +31,7 @@ tempfile.workspace = true
 rho-claude.workspace = true
 rho-agent-host.workspace = true
 notion-server.workspace = true
+google-server.workspace = true
 rho-inference.workspace = true
 rho-visualizations.workspace = true
 rho-fs-view.workspace = true

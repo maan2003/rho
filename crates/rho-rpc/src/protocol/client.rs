@@ -89,6 +89,9 @@ impl Client {
 
     /// Opens the stream for a protocol: the first frame sent.
     pub async fn open<T: ProtocolOpen>(&mut self, open: &T) -> anyhow::Result<()> {
+        if !open.log_stream() {
+            self.logger = None;
+        }
         self.send(&Open::of(open)?).await
     }
 
@@ -153,5 +156,57 @@ impl ProtocolLogger {
             return;
         };
         let _ = append_protocol_log_record(&mut *file, now_ms, direction, &frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Protocol;
+
+    #[derive(
+        Debug,
+        senax_encoder::Encode,
+        senax_encoder::Decode,
+        senax_encoder::Pack,
+        senax_encoder::Unpack,
+    )]
+    struct TestOpen {
+        recordable: bool,
+    }
+
+    impl ProtocolOpen for TestOpen {
+        const PROTOCOL: Protocol = Protocol::Host;
+        fn log_stream(&self) -> bool {
+            self.recordable
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_opens_still_reach_the_host_but_leave_no_trace() {
+        for recordable in [false, true] {
+            let file = tempfile::tempfile().unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut client = Client {
+                stream: crate::Dialer::InProcess(tx).open(None).await.unwrap(),
+                logger: Some(ProtocolLogger {
+                    file: Arc::new(Mutex::new(file.try_clone().unwrap())),
+                }),
+            };
+            let mut host = rx.recv().await.unwrap();
+            client.open(&TestOpen { recordable }).await.unwrap();
+            assert_eq!(
+                read_frame::<_, Open>(&mut host)
+                    .await
+                    .unwrap()
+                    .unpack::<TestOpen>()
+                    .unwrap()
+                    .recordable,
+                recordable
+            );
+            write_frame(&mut host, &42u32).await.unwrap();
+            assert_eq!(client.recv::<u32>().await.unwrap(), 42);
+            assert_eq!(file.metadata().unwrap().len() > 0, recordable);
+        }
     }
 }

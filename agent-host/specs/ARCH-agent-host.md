@@ -13,7 +13,7 @@ which model, how messages reach them, and workset setup.
 - **Agent host.** Owns worksets (creation, deletion, one process each), the
   workset logs, the agent directory, the chat log, and everything that must
   stay outside a workset: credentials, inference accounts, the git keeper, and
-  the Slack, Notion and GitHub servers. It enforces only what protects the
+  the agents’ credentialed API proxies. It enforces only what protects the
   host: credentials, accounts, and caps on processes and loaded agents.
 - **Workset process.** One per workset, with one CPython interpreter. An
   `Isolated` workset gets a private `/src` namespace; a `Host` workset runs

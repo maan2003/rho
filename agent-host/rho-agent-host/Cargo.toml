@@ -21,6 +21,7 @@ rho-agent-hosts.workspace = true
 rho-desktop-proto = { workspace = true, features = ["local"] }
 alacritty_terminal.workspace = true
 anyhow.workspace = true
+axum.workspace = true
 bytes.workspace = true
 clock.workspace = true
 camino.workspace = true
@@ -32,6 +33,7 @@ futures.workspace = true
 iroh.workspace = true
 json-stream.workspace = true
 libc.workspace = true
+google-server.workspace = true
 octo-server.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true

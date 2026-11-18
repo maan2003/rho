@@ -396,21 +396,33 @@ fn start_runtime_sockets(
     let paths = rho_rpc::protocol::RuntimePaths::new(runtime_dir)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
-    let octo_socket = paths.octo_socket();
-    let slack_socket = paths.slack_socket();
-    let notion_socket = paths.notion_socket();
-    prepare_socket_path(&octo_socket, "octo")?;
-    prepare_socket_path(&slack_socket, "slack")?;
-    prepare_socket_path(&notion_socket, "notion")?;
-    let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
-        .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
-    let slack_listener = tokio::net::UnixListener::bind(&slack_socket)
-        .with_context(|| format!("bind slack socket {}", slack_socket.display()))?;
-    let notion_listener = tokio::net::UnixListener::bind(&notion_socket)
-        .with_context(|| format!("bind notion socket {}", notion_socket.display()))?;
-    spawn_octo_server(octo_listener, secrets.clone())?;
-    spawn_slack_server(slack_listener, secrets.clone())?;
-    spawn_notion_server(notion_listener, secrets);
+    let bind = |path: PathBuf, name| -> anyhow::Result<_> {
+        prepare_socket_path(&path, name)?;
+        tokio::net::UnixListener::bind(&path)
+            .with_context(|| format!("bind {name} socket {}", path.display()))
+    };
+    let octo = bind(paths.octo_socket(), "octo")?;
+    let slack = bind(paths.slack_socket(), "slack")?;
+    let notion = bind(paths.notion_socket(), "notion")?;
+    let path = paths.google_socket();
+    prepare_socket_path(&path, "google")?;
+    let google = tokio::net::UnixSocket::new_stream()?;
+    google
+        .bind(&path)
+        .with_context(|| format!("bind Google socket {}", path.display()))?;
+    // An explicit runtime directory need not be private. Set permissions before
+    // listen so another user cannot queue a connection during startup.
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    let google = google.listen(libc::SOMAXCONN as u32)?;
+    spawn_octo_server(octo, secrets.clone())?;
+    spawn_slack_server(slack, secrets.clone())?;
+    spawn_notion_server(notion, secrets.clone());
+    let router = google_server::router(move || secrets.get(google_server::GOOGLE_AUTHORIZED_USER));
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(google, router).await {
+            tracing::error!(%error, "Google server stopped");
+        }
+    });
     Ok(RuntimeSockets { paths, _lock: lock })
 }
 
@@ -1500,6 +1512,27 @@ mod tests {
         assert!(paths.octo_socket().exists());
         assert!(paths.slack_socket().exists());
         assert!(paths.notion_socket().exists());
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            paths
+                .google_socket()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let response = reqwest::Client::builder()
+            .unix_socket(paths.google_socket())
+            .build()
+            .unwrap()
+            .get("http://localhost/drive/v3/files")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.text().await.unwrap().contains("rho google init"));
         assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert_eq!(
