@@ -17,6 +17,7 @@ use rho_rpc::protocol::{Answer, Call, client};
 
 mod eval;
 mod github;
+mod google;
 mod notion;
 mod share;
 mod slack;
@@ -69,6 +70,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Github(args) => github::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::Notion(args) => notion::run(args).await,
+        Command::Google(args) => google::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
@@ -240,6 +242,7 @@ enum Command {
     Github(GithubArgs),
     Slack(SlackArgs),
     Notion(NotionArgs),
+    Google(GoogleArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Wayland(wayland::WaylandArgs),
@@ -278,6 +281,7 @@ enum CliCommand {
     Github(GithubArgs),
     Slack(SlackArgs),
     Notion(NotionArgs),
+    Google(GoogleArgs),
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
@@ -465,6 +469,26 @@ pub(crate) enum SlackCommand {
 }
 
 #[derive(Clone, clap::Args)]
+pub(crate) struct GoogleArgs {
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: GoogleCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum GoogleCommand {
+    /// Sign this host in to Google, in a browser, as the account agents
+    /// read Drive and Meet as.
+    Init {
+        /// The ID of an OAuth client of the Desktop app type; the command
+        /// asks for its secret.
+        #[arg(long)]
+        client_id: String,
+    },
+}
+
+#[derive(Clone, clap::Args)]
 pub(crate) struct NotionArgs {
     #[arg(long = "runtime-dir")]
     runtime_dir: Option<PathBuf>,
@@ -524,6 +548,7 @@ impl Args {
             CliCommand::Github(args) => Command::Github(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Notion(args) => Command::Notion(args),
+            CliCommand::Google(args) => Command::Google(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Wayland(args) => Command::Wayland(args),

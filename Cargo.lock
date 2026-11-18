@@ -6101,6 +6101,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "google-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "gpu-alloc"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13630,6 +13647,7 @@ dependencies = [
  "clock",
  "dirs 7.0.0",
  "futures",
+ "google-server",
  "image",
  "iroh",
  "json-stream",
@@ -13863,6 +13881,7 @@ dependencies = [
  "camino",
  "clap",
  "dirs 7.0.0",
+ "google-server",
  "jiff",
  "libc",
  "notion-server",
