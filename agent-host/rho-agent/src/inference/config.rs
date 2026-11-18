@@ -24,7 +24,8 @@ impl ReasoningEffort {
 
 /// Which Responses-API model a step talks to. Not part of
 /// [`InferenceProfile`]: agent modes carry it separately, so persisted configs
-/// stay unchanged.
+/// stay unchanged. The variant names are persisted, so they keep the model
+/// generation they were added with; `as_str` follows each family's newest slug.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Encode, Decode)]
 pub enum InferenceModel {
     Gpt61Sol,
@@ -35,9 +36,9 @@ pub enum InferenceModel {
 impl InferenceModel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gpt61Sol => "gpt-6.1-sol",
+            Self::Gpt61Sol => "gpt-6.2-sol",
             Self::Gpt61Terra => "gpt-6.1-terra",
-            Self::Gpt6Astra => "gpt-6-astra",
+            Self::Gpt6Astra => "gpt-6.2-astra",
         }
     }
 }
