@@ -22,6 +22,7 @@ use rho_agent_types::{Address as Party, AgentId, ContentPart, Doing, EndpointId,
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
+use rho_frame::attention::Verdict;
 use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, RoomRow, Row, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
@@ -621,6 +622,30 @@ impl System for ChatSystem {
                         window,
                         cx,
                     );
+                },
+            ));
+        }
+        // A verdict is about the card; about one message of it alone is
+        // rare, so it is reached by name from the palette and has no binding.
+        if let Some(message) = point
+            .subject
+            .clone()
+            .filter(|subject| Some(subject) != point.card.as_ref())
+            .filter(|subject| self.thread_of(subject).is_some())
+        {
+            let done = message.clone();
+            rows.push(Row::run(
+                "d",
+                "done with this message",
+                move |frame, window, cx| {
+                    frame.verdict(&done, Verdict::Done, "done".to_owned(), window, cx)
+                },
+            ));
+            rows.push(Row::run(
+                "m",
+                "mute this message",
+                move |frame, window, cx| {
+                    frame.verdict(&message, Verdict::Mute, "muted".to_owned(), window, cx)
                 },
             ));
         }

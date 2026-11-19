@@ -36,13 +36,15 @@ use crate::{keys, palette};
 /// The kind of the frame's own surface: Home.
 pub const FRAME_KIND: &str = "frame";
 
-/// Where the reader is: the surface in view, and what the point in it is
+/// Where the reader is: the surface in view, what the point in it is
 /// on, which is the surface's own address when it is a page about one
-/// thing and a row's when it lists things.
+/// thing and a row's when it lists things, and the card that holds it,
+/// which a verdict is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Point {
     pub surface: Address,
     pub subject: Option<Address>,
+    pub card: Option<Address>,
 }
 
 /// How long an echo stays on the line.
@@ -199,18 +201,26 @@ impl Frame {
     /// Where the reader is.
     pub fn point(&self, cx: &App) -> Point {
         let surface = self.current_address().clone();
-        let subject = match self.current_surface().subject(cx) {
+        let resolve = |subject: Subject| match subject {
             Subject::Own if surface.kind() == FRAME_KIND => None,
             Subject::Own => Some(surface.clone()),
             Subject::Address(address) => Some(address),
             Subject::None => None,
         };
-        Point { surface, subject }
+        let current = self.current_surface();
+        let subject = resolve(current.subject(cx));
+        let card = resolve(current.card(cx));
+        Point {
+            surface,
+            subject,
+            card,
+        }
     }
 
-    /// The card a verdict lands on: what the point is on.
+    /// The card a verdict lands on: the one that holds what the point is
+    /// on.
     pub fn card_target(&self, cx: &App) -> Option<Address> {
-        self.point(cx).subject
+        self.point(cx).card
     }
 
     /// The card the surface in view stands for, which is nothing on Home:

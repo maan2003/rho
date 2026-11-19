@@ -828,6 +828,31 @@ impl Surface for ThreadView {
         }
     }
 
+    /// The thread the subject is in, as the dealer counts threads: in a
+    /// thread, the thread wherever the point is in it; in a channel, the
+    /// thread under the point, as a row is on Home.
+    fn card(&self, cx: &App) -> Subject {
+        let system = self.system.read(cx);
+        let message = match self.subject(cx) {
+            Subject::Address(subject) => system.thread_of(&subject).map(|thread| thread.message),
+            _ => None,
+        }
+        .unwrap_or(self.thread.message);
+        let Some(chat) = system.chat(self.thread.host) else {
+            return Subject::Own;
+        };
+        match chat.thread_of(message) {
+            thread if thread == self.thread.message => Subject::Own,
+            thread => Subject::Address(
+                ThreadId {
+                    host: self.thread.host,
+                    message: thread,
+                }
+                .address(),
+            ),
+        }
+    }
+
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
         vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
