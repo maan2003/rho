@@ -1,6 +1,6 @@
 # agents
 
-The agents do the work. The user starts one from a message, talks to it in its thread, and looks into what it does: its transcript, its terminals, its shell, and its desktops. Agents have no list and no screen of their own to visit; each is reached from the thread it works in, or by name.
+The agents do the work. The user starts one from a message, talks to it in its thread, and looks into what it does: its transcript, its terminals, its shell, and its desktops. Agents have no list; each is reached from the thread it works in, or by name, and its screen is its transcript.
 
 ## bet An agent is labour, not a colleague
 instead of: a list of agents with profiles and direct messages, like people in a contact list.
@@ -19,13 +19,12 @@ purpose: do a piece of the user's work on a host, in a thread the user can read 
 principle: the user starts an agent from the message `fix the flaky test`; the agent joins that thread, reads the message first, works in its workset, and posts there; when it asks, the thread becomes a card.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.
 has:
-- one `Transcript`
 - many `Terminal`
 - one `Shell`
 - many `Desktop`
 - many `chat.Thread`, the one it started from first
 does:
-- open: from the `with` line of a thread, or by name with `window.Find`
+- open: from the `with` line of a thread, or by name with `window.Palette`; its screen, `Agent`, opens at its newest step
 - open its thread, from the palette as `open its thread`: open the thread it started from
 - rewind turns, from the palette: take back its last turn; the palette has no way to give a count, so it is always one
 - compact context, from the palette: shorten what it holds in mind
@@ -37,19 +36,7 @@ While the agent's host is away, each of these echoes `the agent's host is not at
 
 In a thread, a message from an agent is signed with its long code, such as `q9tz45g2bcvs`, while the `with` line names the same agent by its workset name or short code.
 
-## concept Transcript
-purpose: show everything an agent did, so the user can check its work or see why it is stuck.
-principle: an agent has been quiet for an hour; the user opens its transcript and sees the same error repeat; they cancel the request and set another runtime.
-sees: a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took.
-
-There is no box to write in. The user talks to an agent only in its thread.
-
-## concept Workset
-purpose: give an agent a place on a host to work, with its own copy of a repository.
-principle: the user starts an agent with `new workset on a repository…` and gives the repository; the agent works in a copy of its own; a second agent can join that workset to work beside it.
-sees: its name, which is also the name of the agents in it.
-
-A new agent gets a new workset on a repository, works in a folder on the host as it is, or joins the workset of an agent already there.
+The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user talks to an agent only in its thread.
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
@@ -99,33 +86,38 @@ does:
 - copy `y`, while drawing: put the picture, with its lines, on the clipboard; the bottom line reads `Annotation copied`
 - back to live `escape` or `ctrl-g`, while drawing, or `back to live` from the palette: drop the lines and show the app live again
 
-A desktop is also in `window.Find`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
+A desktop is also a place in `window.Palette`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
 
-## screen Transcript
-shows: `Agent`, `Transcript`
-starts: `Look into what an agent did`, `Steer an agent`
+## screen Agent
+shows: `Agent`, its transcript
+starts: `Look into what an agent did`, `Steer an agent`, `Work beside an agent`
 
 ## job Start an agent from a message
+status: every start asks where the agent works, through the menu in step 3, and which runtime, at `runtime (sol-medium):`.
+day: Turn ideas into work.
 when: a message in a thread, mine or not yet sent, is work I want an agent to do
 want: start an agent on it, in the right place, on the right model
 so that: the agent reads that message first and works in that thread
 flow:
 1. put the cursor on the message, or write the message in the box
 2. open the palette and choose `start agent here`, or `send and start agent` for the message in the box
-3. pick where in the menu: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join an agent already there
-4. answer `repository (url or host path):` or `directory on the host:`, when asked
-5. answer `runtime (sol-medium):`, or press `enter` for that runtime
+3. the agent works where the channel's project is, in a workset: a copy of the repository of its own, which a second agent can join to work beside it; to put it elsewhere, pick in the menu: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, as the folder is, or a number to join the workset of an agent already there
+4. answer `repository (url or host path):` or `directory on the host:`, when the place picked needs one
+5. the agent runs on the default runtime; `Agent.set runtime` changes it later
 6. the echo line reads `agent … started`, and the agent joins the thread
-system: lists the thread's own agents first among those to join, then the host's other agents; sends the message first when it is still in the box, and starts the agent once the host has it.
-user: where the agent works, and its runtime.
+system: knows where the channel's work lives and which runtime is the default; lists the thread's own agents first among those to join, then the host's other agents; sends the message first when it is still in the box, and starts the agent once the host has it.
+user: the message; where the agent works and its runtime, only when not the channel's place and the default.
+
+An idea becomes an agent at work with the fewest questions the product can manage. Where the agent works follows from the channel, which is a project, and the model follows from a default written in the product; the user changes either when they want to.
 cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away
 
 ## job Look into what an agent did
+day: Keep the work moving.
 when: an agent says it is done, or has been quiet too long
 want: see what it actually did
 so that: I can trust its result or see where it is stuck
 flow:
-1. in its thread, put the cursor on the `with` line and press `enter`; the `Transcript` opens at its newest step
+1. in its thread, put the cursor on the `with` line and press `enter`; the agent's screen, `Agent`, opens at its newest step
 2. read up through what it ran and what came back
 3. `window.Screen.back` to the thread
 system: shows what the agent is doing now in the top line.
@@ -133,22 +125,24 @@ user: the judgement.
 cases: the agent is `retrying` after errors from its model
 
 ## job Steer an agent
+day: Keep the work moving.
 when: an agent is stuck, going the wrong way, or on the wrong model
 want: change its course without starting over
 so that: its work goes on from a good point
 flow:
-1. open its `Transcript`
+1. open its screen, `Agent`
 2. open the palette and choose `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`
 3. go to its thread and tell it what to do instead
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
 
 ## job Work beside an agent
+day: Reach anything.
 when: I want to check or fix something in an agent's workset with my own hands
 want: open its terminal, its shell, or its desktop
 so that: I see what it sees and can act there
 flow:
-1. open the agent's `Transcript`
+1. open the agent's screen, `Agent`
 2. open the palette and choose `terminal`, `new terminal`, `shell`, or `desktop…`
 3. work there; to leave a terminal, press `ctrl-shift-n`, then `q` or `tab`; to leave a desktop, press `ctrl-shift-;` and choose `home`
 system: starts a terminal or the shell when none runs, and keeps it running after the user leaves.
@@ -159,6 +153,7 @@ cases: the agent's host is a host on this machine, where its desktop does not op
 when an `Agent` starts from a `chat.Message`, then it joins that message's `chat.Thread` and reads the message before anything else.
 
 ## job Approve a push or a fetch
+day: Keep the work moving.
 when: an agent pushes a branch to, or fetches from, a repository that needs my ssh login
 want: see exactly where it goes and what it pushes, and say yes or no
 so that: no agent uses my login without my word, and the agent does not wait long

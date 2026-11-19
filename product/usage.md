@@ -22,6 +22,7 @@ shows: `Chart`
 starts: `Check what is left`
 
 ## job Check what is left
+day: Keep the work moving.
 when: agents seem slow, or I am about to start many of them
 want: see how much allowance each account has left and when it resets
 so that: I put new work on an account that can take it
