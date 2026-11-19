@@ -104,6 +104,10 @@ fn a_call_replays_signed_and_its_report_answers_it_by_id() {
         "high"
     );
     assert_eq!(request["sessionId"], CacheKey::from_u128(7).to_string());
+    assert_eq!(
+        body(&items)["userPromptId"],
+        CacheKey::from_u128(7).to_string()
+    );
     assert_eq!(body(&items)["model"], "gemini-4-hydrogen-sonar");
 }
 
