@@ -758,6 +758,7 @@ mod tests {
                         PolicyRequest::SelectAccount | PolicyRequest::ResolveAuth(_) => {
                             panic!("transport must use pushed credential selection")
                         }
+                        PolicyRequest::GeminiAuth => panic!("OpenAI never asks for Gemini auth"),
                     };
                     let _ = call.reply.send(Ok(reply));
                 }

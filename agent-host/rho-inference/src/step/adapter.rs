@@ -13,10 +13,17 @@ impl agent::Backend for crate::Inference {
         profile: agent::InferenceProfile,
         model: agent::InferenceModel,
     ) -> agent::InferenceSession {
-        Arc::new(Session {
-            inference: self.clone(),
-            transport: self.session(profile, model),
-        })
+        match model {
+            agent::InferenceModel::Hydrogen => {
+                crate::gemini::Session::new(self.clone(), profile, model)
+            }
+            agent::InferenceModel::Sol
+            | agent::InferenceModel::Terra
+            | agent::InferenceModel::Astra => Arc::new(Session {
+                inference: self.clone(),
+                transport: self.session(profile, model),
+            }),
+        }
     }
     fn text(&self, instructions: Arc<str>, input: String) -> BoxFuture<'_, anyhow::Result<String>> {
         Box::pin(self.text(instructions, input))

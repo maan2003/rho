@@ -1337,6 +1337,7 @@ fn inference_session(
         InferenceModel::Astra => crate::log::AgentUsageModel::ASTRA,
         InferenceModel::Terra => crate::log::AgentUsageModel::TERRA,
         InferenceModel::Sol => crate::log::AgentUsageModel::GPT,
+        InferenceModel::Hydrogen => crate::log::AgentUsageModel::HYDROGEN,
     };
     (inference.session(profile, model), billed.name().to_owned())
 }

@@ -26,9 +26,10 @@ pub(crate) struct EvalArgs {
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
     /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.2 Sol,
-    /// high-eng GPT-6.2 Astra; opus-eng and fable-eng run Claude Code and
+    /// high-eng GPT-6.2 Astra, hydrogen-eng Gemini 4 Hydrogen through the
+    /// host's Antigravity login; opus-eng and fable-eng run Claude Code and
     /// need --claude-accounts. Every runtime works in the Python notebook.
-    #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"])]
+    #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "hydrogen-eng", "opus-eng", "fable-eng"])]
     pub role: String,
     /// The policy function that makes the agent, as a draft names it: the
     /// default policy's `new_agent`, or one --init defines.
@@ -85,6 +86,7 @@ fn role_runtime(role: &str) -> snippets::Runtime {
         "mini-eng" => "terra-xhigh",
         "med-eng" => "sol-medium",
         "high-eng" => "astra-high",
+        "hydrogen-eng" => "hydrogen-high",
         "opus-eng" => "opus-medium",
         "fable-eng" => "fable-medium",
         _ => unreachable!("clap validates evaluation roles"),
@@ -596,14 +598,22 @@ mod tests {
 
     #[test]
     fn every_role_names_a_runtime() {
-        let runtimes = ["mini-eng", "med-eng", "high-eng", "opus-eng", "fable-eng"]
-            .map(|role| role_runtime(role).label());
+        let runtimes = [
+            "mini-eng",
+            "med-eng",
+            "high-eng",
+            "hydrogen-eng",
+            "opus-eng",
+            "fable-eng",
+        ]
+        .map(|role| role_runtime(role).label());
         assert_eq!(
             runtimes,
             [
                 "terra-xhigh",
                 "sol-medium",
                 "astra-high",
+                "hydrogen-high",
                 "opus-medium",
                 "fable-medium"
             ]

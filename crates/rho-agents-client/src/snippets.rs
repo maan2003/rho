@@ -23,7 +23,7 @@ pub struct Runtime {
 
 /// The models each runtime kind offers, and the efforts each takes, as
 /// `_rho.pyi` lists them.
-const NATIVE_MODELS: [&str; 3] = ["sol", "terra", "astra"];
+const NATIVE_MODELS: [&str; 4] = ["sol", "terra", "astra", "hydrogen"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];

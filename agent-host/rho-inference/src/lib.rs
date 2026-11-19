@@ -1,9 +1,11 @@
-//! OpenAI Responses Lite transport and its ChatGPT account/route policy.
+//! The model transports (OpenAI Responses Lite, and Gemini through
+//! Antigravity) and their account/route policy.
 
 mod accounts;
 pub mod auth_cli;
 pub use rho_agent::inference::config;
 mod credentials;
+mod gemini;
 mod inference;
 mod policy;
 mod wiring;

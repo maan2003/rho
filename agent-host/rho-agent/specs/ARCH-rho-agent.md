@@ -40,7 +40,11 @@ workers cannot administer accounts. Each OpenAI Responses Lite session has one
 socket-owning task across active and idle periods. It receives resolved
 credentials and emits model events and acknowledged account observations; it
 does not call host services or retry responses. Dropping a response receiver
-cancels that exchange and discards its connection.
+cancels that exchange and discards its connection. A Gemini session (Cloud
+Code, through the host's Antigravity login) makes one request per step and
+asks the host for a token before each. Its carry holds the model's parts with
+their thought signatures, and its compaction is a summary the model writes,
+whose carry replaces the history before it.
 
 The native runtime owns the prepared turn, Python admission, and retry decision.
 Provider call identity and result pairing stay inside inference's replay payload;

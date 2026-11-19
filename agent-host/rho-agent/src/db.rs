@@ -144,6 +144,7 @@ pub fn usage_model_of(runtime: &Runtime) -> AgentUsageModel {
             crate::inference::config::InferenceModel::Astra => AgentUsageModel::ASTRA,
             crate::inference::config::InferenceModel::Terra => AgentUsageModel::TERRA,
             crate::inference::config::InferenceModel::Sol => AgentUsageModel::GPT,
+            crate::inference::config::InferenceModel::Hydrogen => AgentUsageModel::HYDROGEN,
         },
         Runtime::Claude { model, .. } => match model {
             rho_claude::Model::Opus => AgentUsageModel::OPUS,
