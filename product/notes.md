@@ -13,7 +13,7 @@ does:
 - notes, from the palette: open `Notes`, which lists every note
 - open `enter` on a note in `Notes`, or on a private reply: open the note
 
-No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase, which the window cannot enter. The window has no way to delete a note.
+No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. The window has no way to delete a note.
 
 While the user types a new note, the top line still reads `untitled note`; it shows the first line once the note is opened again.
 

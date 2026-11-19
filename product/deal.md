@@ -40,7 +40,7 @@ does:
 
 A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is. A verdict about one message alone is a rare act, by name from the palette.
 
-What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device`. The window has no way to enter the phrase. A device without it keeps its verdicts to itself, and when another device has written verdicts, the echo line says so and names `space s s` as the way to enter the phrase, a key that opens the snooze times instead.
+What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
 ## job Clear what waits
 day: Know what wants them, and where they were.
