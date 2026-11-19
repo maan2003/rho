@@ -23,11 +23,13 @@ While they are in a place, they do not watch the rest. The product keeps it for 
 ## Values
 
 1. **Personal software, built for the long run.** rho has one user, so it can make unusual choices that take longer to learn when they are better for that one person over months of daily use. Test: Is this choice better for the user after a month of daily use, even if it costs more on the first day?
-2. **Little on screen.** The user is very busy and works on many projects at a time. Every extra thing on a screen costs them attention and can confuse them. Test: Does every thing on this screen help with the step the user is on?
+2. **One place, in focus.** The user works in one place for an hour at a time, on one of many projects. Every extra thing on the screen costs them attention, and anything that pulls at them from outside the place breaks their work. The lamp is the only pull allowed. Test: Does every thing on this screen help with the step the user is on, and can they stay in this place for an hour without the rest of the world pulling at them?
 3. **Rare power, neatly tucked away.** Advanced functions stay reachable, but out of sight, because they are rare. The common flow stays short and smooth. Test: Can the user reach the rare function by name, without it adding a step or a thing on screen to the common flow?
-4. **The system does what it can.** Every screen and every flow is judged from the user's side: is there something the system could do for them here? Test: Is there a step in this flow that the system could do or decide on its own instead of the user?
-5. **An editor, not an app.** Every screen is text the user moves through with the same keys: the same motions, search, and Vim modes everywhere. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. Test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
+4. **The system does what it can.** Every screen and every flow is judged from the user's side: is there something the system could do for them here? On the phone, every step is a thumb's work, so the question is asked twice. Test: Is there a step in this flow that the system could do or decide on its own instead of the user?
+5. **An editor, not an app.** Every screen is text the user moves through with the same keys: the same motions, search, and Vim modes everywhere. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser. Test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
 6. **Notes are the user's own.** A note holds only what the user typed. No agent reads it, and the machine never writes or changes its text. Test: After this change, is every word of every note still typed by the user, and still hidden from every agent?
+7. **Moving between places costs nothing.** The user changes place hundreds of times a day. Any place is one name away, and the way back is one key, with nothing lost in the place they left. Test: Can the user reach this place by name from anywhere, and return in one key, with the place they left as it was?
+8. **The phone is a full device.** Every job is possible on the phone. Where the thumb makes a job longer, that is a cost chosen on purpose and written down, never a job that the phone cannot do. Test: Can the user finish this job with one thumb? If not, is the cost chosen on purpose and written in the module?
 
 ## Non-goals
 
@@ -37,3 +39,4 @@ While they are in a place, they do not watch the rest. The product keeps it for 
 - Labels, piles, and to-do lists for sorting things. A card is answered with a verdict and goes away.
 - Settings screens.
 - Other people as users. rho has no accounts, no sharing, and no view for anyone but its one user.
+- A second product for the phone. The phone shows the same places and runs the same jobs, with a thumb instead of keys.
