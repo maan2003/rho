@@ -216,6 +216,9 @@ pub(super) fn body(
         "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
         "userAgent": "antigravity",
         "requestType": "agent",
+        // Antigravity's client sends it too. Whether it helps the cache is
+        // not known.
+        "userPromptId": cache_key.to_string(),
         "request": {
             "contents": contents.contents,
             "systemInstruction": {"parts": [{"text": instructions}]},
