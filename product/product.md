@@ -20,6 +20,18 @@ One place fills the window. Two places side by side is an expert flow, used rare
 
 While they are in a place, they do not watch the rest. The product keeps it for them: what waits and since when, and what they said about each card. It also keeps their unsent drafts, and where they were on each device.
 
+## Day
+
+What the user does in rho, all day, in order of weight. Every job in a module serves one of these.
+
+1. **Keep the work moving.** Answer what an agent asks, check what it did, steer it, and know when it stops.
+2. **Turn ideas into work.** An idea becomes an agent at work, in one step, from either device.
+3. **Answer the world.** Slack, and later mail and the rest. Read, reply, done.
+4. **Reach anything.** A terminal, a desktop, a page in the browser, a file, for what has no place of its own yet.
+5. **Keep their own memory.** Notes and private replies, in their words only.
+
+Under all five, all day, on both devices: **know what wants them, and where they were.**
+
 ## Values
 
 1. **Personal software, built for the long run.** rho has one user, so it can make unusual choices that take longer to learn when they are better for that one person over months of daily use. Test: Is this choice better for the user after a month of daily use, even if it costs more on the first day?
