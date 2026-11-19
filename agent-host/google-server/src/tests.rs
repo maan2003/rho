@@ -88,11 +88,18 @@ async fn fake() -> (Url, Arc<Mutex<Fake>>) {
 }
 
 async fn server(grant: bool, google: &Url) -> String {
+    server_with(grant.then(|| Arc::new(Mutex::new("r1".to_owned()))), google).await
+}
+
+/// A server whose grant's refresh token is `refresh_token`, which a test
+/// can replace as `rho google init` does.
+async fn server_with(refresh_token: Option<Arc<Mutex<String>>>, google: &Url) -> String {
+    let grant = refresh_token.is_some();
     let app = router(
-        Arc::new(move |name| match name {
-            CLIENT_ID if grant => Ok("client".to_owned()),
-            CLIENT_SECRET if grant => Ok("secret\n".to_owned()),
-            REFRESH_TOKEN if grant => Ok("r1".to_owned()),
+        Arc::new(move |name| match (name, &refresh_token) {
+            (CLIENT_ID, _) if grant => Ok("client".to_owned()),
+            (CLIENT_SECRET, _) if grant => Ok("secret\n".to_owned()),
+            (REFRESH_TOKEN, Some(token)) => Ok(token.lock().unwrap().clone()),
             _ => anyhow::bail!("no {name}"),
         }),
         Endpoints::at(google),
@@ -173,6 +180,29 @@ async fn keeps_the_token_until_it_nears_expiry() {
             "Bearer a3"
         ]
     );
+}
+
+#[tokio::test]
+async fn a_new_grant_replaces_the_kept_token_at_once() {
+    let (google, fake) = fake().await;
+    let refresh_token = Arc::new(Mutex::new("r1".to_owned()));
+    let server = server_with(Some(refresh_token.clone()), &google).await;
+    let get = || reqwest::get(format!("{server}/www.googleapis.com/drive/v3/files"));
+
+    get().await.unwrap();
+    // `rho google init` installs a grant with other scopes; a1 is still
+    // valid for an hour.
+    *refresh_token.lock().unwrap() = "r2".to_owned();
+    get().await.unwrap();
+    get().await.unwrap();
+
+    let bearers: Vec<String> = calls(&fake).into_iter().map(|call| call.2).collect();
+    assert_eq!(bearers, ["Bearer a1", "Bearer a2", "Bearer a2"]);
+    let used: Vec<String> = std::mem::take(&mut fake.lock().unwrap().refreshes)
+        .into_iter()
+        .map(|form| form["refresh_token"].clone())
+        .collect();
+    assert_eq!(used, ["r1", "r2"]);
 }
 
 #[tokio::test]

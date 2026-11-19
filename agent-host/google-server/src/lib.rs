@@ -49,6 +49,9 @@ struct AppState {
 struct AccessToken {
     value: String,
     refresh_at: Instant,
+    /// The refresh token it came from: a new `rho google init` replaces it,
+    /// and the new grant's scopes apply from the next call.
+    grant: String,
 }
 
 pub fn router(read_secret: SecretReader, endpoints: Endpoints) -> Router {
@@ -186,16 +189,10 @@ fn relay(response: reqwest::Response) -> Response {
     relayed
 }
 
-/// The kept access token, unless it is `stale` or about to expire;
-/// otherwise a fresh one from the grant.
+/// The kept access token, unless it is `stale`, about to expire, or from
+/// a replaced grant; otherwise a fresh one from the grant.
 async fn access_token(state: &AppState, stale: Option<&str>) -> Result<String, Refusal> {
     let mut kept = state.token.lock().await;
-    if let Some(token) = &*kept
-        && Some(token.value.as_str()) != stale
-        && Instant::now() < token.refresh_at
-    {
-        return Ok(token.value.clone());
-    }
     let read = |name| {
         (state.read_secret)(name)
             .ok()
@@ -210,6 +207,13 @@ async fn access_token(state: &AppState, stale: Option<&str>) -> Result<String, R
             message: "rho_no_google_grant: run `rho google init` on the agent host".to_owned(),
         });
     };
+    if let Some(token) = &*kept
+        && token.grant == refresh_token
+        && Some(token.value.as_str()) != stale
+        && Instant::now() < token.refresh_at
+    {
+        return Ok(token.value.clone());
+    }
     let client = oauth::OAuthClient { id, secret };
     let tokens = oauth::refresh(&state.client, &state.endpoints, &client, &refresh_token)
         .await
@@ -223,6 +227,7 @@ async fn access_token(state: &AppState, stale: Option<&str>) -> Result<String, R
     let token = AccessToken {
         refresh_at: Instant::now() + tokens.expires_in.saturating_sub(EXPIRY_MARGIN),
         value: tokens.access_token,
+        grant: refresh_token,
     };
     *kept = Some(token.clone());
     Ok(token.value)
