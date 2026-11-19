@@ -18,14 +18,19 @@ use sha2::{Digest as _, Sha256};
 /// the address it shows back into `rho google init`.
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8977/callback";
 
-/// What agents may reach, all read-only: Drive files, Meet transcripts
-/// among them; Meet's conference records; and Calendar events. The Sheets
-/// and Docs APIs accept `drive.readonly`, so they need no scope of their
-/// own, only their API enabled.
+/// What agents may read and change: Drive files, Meet transcripts among
+/// them; Meet's conference records and meeting spaces; and Calendar
+/// events. The Sheets and Docs APIs accept `drive`, so they need no scope
+/// of their own, only their API enabled. Meet has no scope that writes
+/// every space: `meetings.space.created` covers the spaces agents create,
+/// `meetings.space.readonly` reads the others, and
+/// `meetings.space.settings` edits their settings.
 pub const SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/meetings.space.created",
     "https://www.googleapis.com/auth/meetings.space.readonly",
-    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/meetings.space.settings",
+    "https://www.googleapis.com/auth/calendar",
 ];
 
 /// Google's OAuth endpoints, and where API calls go.
