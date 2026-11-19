@@ -151,7 +151,7 @@ when: an agent pushes a branch to, or fetches from, a repository that needs my s
 want: see exactly where it goes and what it pushes, and say yes or no
 so that: no agent uses my login without my word, and the agent does not wait long
 flow:
-1. a prompt opens by itself, over whatever is on screen, such as `rho: git asks `Push via SSH to ssh://…: branch fix-flaky-test Approve? [shift-Y/N]` · allow? (y/n):`
+1. a prompt opens by itself, over whatever is on screen; it reads the agent's name, `git asks`, what git asks, such as `Push via SSH to ssh://…: branch fix-flaky-test Approve? [shift-Y/N]`, and `allow? (y/n):`
 2. type `y` and press `enter` to allow
    - anything else, or `escape`, says no
    - after a minute with no answer, the push or fetch fails, and the echo line says that the approval timed out

@@ -32,7 +32,7 @@ The echo line is also where rho says that something failed, for example that a h
 ## concept Palette
 purpose: reach every command by its name, so no command needs a key the user must remember.
 principle: the user presses `:`; the prompt line reads `command:` and lists every command that fits this screen; they type `sa`, `start agent here` comes first, and enter runs it.
-sees: `home`, `find`, `undo`, `hosts`, and `quit` first, then the commands for the screen in view and for the thing under the cursor, each with the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`.
+sees: `home`, `find`, `undo`, `hosts`, and `quit` on every screen, mixed with the commands for the screen in view and for the thing under the cursor; with nothing typed, the shorter names come first; each row has the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`.
 does:
 - open `:`: list the commands, best match first as the user types
 - run `enter`: run the command; a command that is a `Menu` opens that menu; a name that fits no command echoes `no command …`
@@ -47,7 +47,6 @@ does:
 - pick a key, or click or tap a row: run the row; a row that opens another menu replaces this one
 - count digits before a key: give the row a number, such as `3` before `d` for three days
 - back `escape` or `ctrl-g`: return to the menu before, or close the menu
-- home `space`: close the menu and go to `home.Home`, or back from it
 
 A menu with nothing in it does not open; the echo line reads its title and `nothing here`.
 
