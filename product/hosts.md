@@ -48,6 +48,20 @@ sees: a link that starts `rho://`, as the host prints it; then the prompt `name 
 
 The link works once to make the host trust this device. After that the device's security key is enough. Nothing attaches until the user names the host. Opening a link while the window runs hands the link to that window, and the prompt opens there.
 
+## job Pair this device
+status: the window has no way to take the phrase; each device keeps its own verdicts, notes, and drafts.
+when: I set up a new device, or my first one
+want: have this device hold my secret phrase
+so that: my verdicts, notes, and drafts are the same here as on my other devices
+flow:
+1. on the first device ever, the window makes the phrase and shows it once; I write it down
+2. on any later device, the window says that my verdicts stay on this device until it is paired
+3. I type the twelve words once
+4. the device has everything my other devices have said and written
+system: makes the phrase once, seals everything with it, and never shows it again.
+user: keeping the phrase, and typing it once per device.
+cases: I never pair a device, and it keeps its own verdicts for good
+
 ## job Attach a host
 when: I set up a new device, or I have a new host
 want: have the window reach the host and show its threads and agents
