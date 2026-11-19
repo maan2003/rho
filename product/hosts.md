@@ -1,6 +1,6 @@
 # hosts
 
-A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their chat and agents together. A host also carries what the user says about cards, and their notes, between devices that hold the user's secret phrase, sealed so the host cannot read them; see `deal.Card`.
+A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their chat and agents together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
 
 ## bet Agents live on hosts, and the window attaches to many
 instead of: one server, or everything on the laptop.
@@ -23,12 +23,12 @@ costs: a prompt that opens over whatever the user is doing, and a push that fail
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
 principle: the user attaches the server as `rho`; its channels appear on Home, each tagged `rho`; when the connection drops, the top line says so in red until it is back.
-sees: its name, which the user chose, as the tag on its rooms on Home and in `window.Find`; whether it is `online`, `connecting`, `reconnecting · 12s`, or `disconnected` with the reason; when more than one is attached, the thread's host before its name at the top.
+sees: its name, which the user chose, as the tag on its rooms on Home and in `window.Palette`; whether it is `online`, `connecting`, `reconnecting · 12s`, or `disconnected` with the reason; when more than one is attached, the thread's host before its name at the top.
 has:
 - many `chat.Channel`
 - many `agents.Agent`
 does:
-- attach, from the palette as `hosts › attach`: ask for a name and the way to reach the host, on one line, and attach it under that name; the prompt shows the form the line takes
+- attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
 - detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen; its rooms, agents, and their screens go from the window
 - status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
 
@@ -39,17 +39,21 @@ A host is reached in one of three ways:
 
 The hosts attached when the window last ran are attached again when it starts. The same machine attached twice under two names is attached once, under the first name.
 
+A pairing link saves typing where the host is. It works once, to make the host trust this device; after that the device's security key is enough. Nothing attaches until the user names the host. Opening a link while the window runs hands the link to that window, and the prompt opens there.
+
 A host on this machine shows no agent's desktop; see `agents.Desktop`.
 
-## concept Pairing link
-purpose: let a new device reach a host with one link, without the user typing where the host is.
-principle: the host prints a pairing link that starts `rho://`; they open it on the phone; the window asks `name this host:`; they type `rho`, and the host is attached and trusts this device from then on.
-sees: a link that starts `rho://`, as the host prints it; then the prompt `name this host:`.
+## concept Device
+status: not built; the window has no way to take the phrase, and each device keeps its own verdicts, notes, and drafts.
+purpose: make each laptop or phone the user works on hold the same verdicts, notes, and drafts as the others, without any host being able to read them.
+principle: the user sets up a second laptop and types their twelve-word secret phrase once; the cards they put away on the first laptop are away here too, and their notes and drafts are here.
+sees: until it is paired, the echo line saying that its verdicts stay on this device.
 
-The link works once to make the host trust this device. After that the device's security key is enough. Nothing attaches until the user names the host. Opening a link while the window runs hands the link to that window, and the prompt opens there.
+A device is paired once it holds the user's secret phrase; see `Pair this device`. The first device ever makes the phrase.
 
 ## job Pair this device
 status: the window has no way to take the phrase; each device keeps its own verdicts, notes, and drafts.
+day: Know what wants them, and where they were.
 when: I set up a new device, or my first one
 want: have this device hold my secret phrase
 so that: my verdicts, notes, and drafts are the same here as on my other devices
@@ -63,11 +67,12 @@ user: keeping the phrase, and typing it once per device.
 cases: I never pair a device, and it keeps its own verdicts for good
 
 ## job Attach a host
+day: Keep the work moving.
 when: I set up a new device, or I have a new host
 want: have the window reach the host and show its threads and agents
 so that: I can work with the agents on it from this device
 flow:
-1. on the host, get a pairing link, and open it on the device
+1. on the host, get a pairing link, and open it on the device, as `Host.attach`
    - or open the palette, choose `hosts › attach`, and type the name and the way to reach the host
 2. answer `name this host:` with a short name
 3. touch the security key when the desktop asks for it; the first time on a device it asks twice
@@ -78,6 +83,7 @@ user: the name, the touch of the key, and, without a link, the command on the ho
 cases: the phone, where typing the way to reach a host by thumb is long and a link saves it; a host on this machine, which needs no key
 
 ## job Know my hosts are reachable
+day: Keep the work moving.
 when: something seems quiet
 want: know whether a host has dropped
 so that: I do not wait on agents I cannot reach

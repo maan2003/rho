@@ -22,26 +22,29 @@ does:
 Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of rooms the same way they move through a thread or a chart's numbers.
 
 ## concept Status line
-purpose: tell the user, at a glance, where they are and what is wrong, without a screen of its own.
-principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; a host drops; the line says `disconnected` in red, with the host's name when more than one is attached, until it is back.
-sees: where the user is: the room and the thing under the cursor, and when that thing is a card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the `deal.Lamp`; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`.
+purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
+principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
+sees: where the user is: the room and the thing under the cursor, and when that thing is a card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
+
+The lamp is the only thing outside the user's place that pulls at them. When a card rises past a higher line, the window also chimes once.
+
+When a host drops, the line says `disconnected` in red, with the host's name when more than one is attached, until it is back.
 
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
-## concept Echo line
-purpose: answer the key the user just pressed, so they know what happened.
-principle: the user says done on a card; the top line reads `done: debug` for a few seconds, then shows where they are again.
-sees: one line of words in the place of the `Status line`, for about four seconds.
-
-The echo line is also where rho says that something failed, for example that a host refused to start an agent.
-
 ## concept Palette
-purpose: reach every command by its name, so no command needs a key the user must remember.
-principle: the user presses `:`; the prompt line reads `command:` and lists every command that fits this screen; they type `sa`, `start agent here` comes first, and enter runs it.
-sees: `home`, `find`, `undo`, `hosts`, and `quit` on every screen, mixed with the commands for the screen in view and for the thing under the cursor; with nothing typed, the shorter names come first; each row has the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`.
+status: there are two prompts: `:` opens `command:`, which lists only commands, and `ctrl-shift-f` opens `find:`, which lists only places, at most 40, and answers a name that fits nothing with `find: nothing called …`; each note is a place there; the `slack` menu has a third, `jump…` with `ctrl-p`, for Slack conversations.
+purpose: reach every place and every command by its name, so nothing needs a place on screen or a key the user must remember.
+principle: the user presses `ctrl-shift-f` and types `privacy`; the thread `privacy VM` is in the list, with its channel beside it; enter opens it. Later they press `:` and type `sa`; `start agent here` comes first, and enter runs it.
+sees: one prompt, listing places and commands together, best match first as the user types:
+- places: every channel, thread, agent, agent's desktop, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`
+- commands: `home`, `notes`, `undo`, `hosts`, and `quit` on every screen, mixed with the commands for the screen in view and for the thing under the cursor; with nothing typed, the shorter names come first; each row has the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`
 does:
-- open `:`: list the commands, best match first as the user types
-- run `enter`: run the command; a command that is a `Menu` opens that menu; a name that fits no command echoes `no command …`
+- open `:`: open the prompt with the commands listed first
+- find `ctrl-shift-f`: open the same prompt with the places listed first
+- run `enter`: open the place chosen, or run the command; a command that is a `Menu` opens that menu; a name that fits nothing echoes `no command …`
+
+A note is not among the places. Notes have one door, the command `notes`; see `notes.Notes`.
 
 The keys shown beside a command are the keys inside its menu, such as `a` in `hosts › attach` after `hosts` is open. A command at the top of the list shows a key too, such as `shift-u` beside `usage…` or `a` beside `start agent here`, but no menu holds the top of the list, so outside the palette that key does something else or nothing.
 
@@ -61,7 +64,7 @@ On the phone, a menu is a sheet of tall rows over the screen, with `‹ back` an
 ## concept Prompt
 purpose: ask the user for one line of text, with completion, so a question never needs a dialog.
 principle: the user chooses `hosts › detach`; the prompt line reads `detach host:` and lists the hosts; they press tab to complete one and enter to detach it.
-sees: the question, such as `find:` or `runtime (sol-medium):`, the text typed so far, and below it the answers that fit, each with a word on what it is.
+sees: the question, such as `detach host:` or `runtime (sol-medium):`, the text typed so far, and below it the answers that fit, each with a word on what it is.
 does:
 - answer `enter`: take the highlighted answer, or the text typed
 - next and previous `ctrl-n`, `ctrl-p`, or the arrows: move through the answers
@@ -72,42 +75,36 @@ A prompt for a secret, such as a Slack token, shows what is typed or pasted like
 
 A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
-## concept Find
-purpose: go to anything by its name, so nothing needs a place on screen to be reachable.
-principle: the user presses `ctrl-shift-f` and types `privacy`; the thread `privacy VM` is in the list, with its channel beside it; enter opens it.
-sees: every channel, thread, agent, agent's desktop, note, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`; at most 40 at a time.
-does:
-- find `ctrl-shift-f`: open the prompt `find:`, which narrows the list as the user types
-- open `enter`: open the thing chosen; a name that fits nothing echoes `find: nothing called …`
-
 ## concept Phone bar
 purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, Home shows the rooms and a bar along the bottom edge; the user puts the cursor on a room, taps `done`, and the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
-- on `home.Home`: `back` and `menu`, and, while the cursor is on a room, `open`, `done`, `mute`, `snooze`, and `more`
+- on `home.Home`: `back` and `menu`, and, while the cursor is on a room, `open`, `done`, `mute`, `snooze`, and `more`; `done`, `mute`, and `snooze` are the `deal.Verdict` of that name
 - on any other screen: `back`, `home`, `menu`, `more` while the cursor is on something a verdict can land on, and `send` when the screen has a message box
 - while a prompt is open: `cancel` and `enter`
 does:
 - flick up from the end of a screen: forward, and from the newest screen deal the next card, as `Screen.forward` does
 - flick down from the top of a screen: back, as `Screen.back` does
 - `menu`: open the `Palette`
-- `more`: open the verdict menu, as `space` does
+- `more`: open the menu of `deal.Verdict`, as `space` does
 
 The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
 
 ## job Go to something by name
+day: Reach anything.
 when: I know what I want to look at, and it is not the card in front of me
 want: reach it by typing part of its name
 so that: I never hunt through lists for it
 flow:
-1. `Find.find`; the prompt `find:` lists everything, newest first
+1. `Palette.find`; the `Palette` lists every place, newest first
 2. type part of the name; the list narrows
-3. `Find.open`; the thing fills the window
+3. `Palette.run`; the place fills the window
 system: keeps every name of every system in one list, and puts the most recently active first.
 user: the words of the name.
 cases: two threads with the same name in different channels; an agent whose workset name I do not remember, only its short code
 
 ## job Run a command I rarely use
+day: Reach anything.
 when: I want something rare, such as a usage chart, renaming a thread, or attaching a host
 want: say its name and run it
 so that: I do not need to remember a key for it
@@ -124,6 +121,7 @@ cases: on the phone, where the list of commands cannot be tapped and the user mu
 when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
 
 ## job Report a slow window
+day: Keep the work moving.
 when: the window stutters or freezes for a moment, and I want it fixed
 want: send what it was doing to a place an agent can read
 so that: an agent can find the cause without my own words for it
