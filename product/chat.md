@@ -93,6 +93,10 @@ system: names the thread, folds the replies under each message, keeps the draft 
 user: the words of the answer.
 cases: the host is away while I write; the agent that asked is gone
 
+An idea becomes an agent at work with the fewest questions the product can manage. Where the agent works follows from the channel, which is a project, and the model follows from a default written in the product; the user changes either when they want to.
+
+status: every start asks where the agent works and which runtime, through the palette.
+
 ## job Start a thread
 when: I have a new piece of work or a question
 want: write it once in the right channel and have it become a thread
