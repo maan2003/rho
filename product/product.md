@@ -28,7 +28,7 @@ What the user does in rho, all day, in order of weight. Every job in a module se
 2. **Turn ideas into work.** An idea becomes an agent at work, in one step, from either device.
 3. **Answer the world.** Slack, and later mail and the rest. Read, reply, done.
 4. **Reach anything.** A terminal, a desktop, a page in the browser, a file, for what has no place of its own yet.
-5. **Keep their own memory.** Notes and private replies, in their words only.
+5. **Keep their own memory.** Rare. A private corner for reminders and for things no agent may know, in their words only, and almost never about the work in the repositories.
 
 Under all five, all day, on both devices: **know what wants them, and where they were.**
 
