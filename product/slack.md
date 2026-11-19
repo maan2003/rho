@@ -4,12 +4,16 @@ rho reads and writes the user's Slack itself, so Slack's asks come to the same d
 
 ## concept Workspace
 purpose: connect rho to one of the user's Slack workspaces.
-principle: the user runs `register workspace…`, gives the name, the token, and the cookie from their browser; the echo line reads `slack: fake registered`; Slack's asks start to come in as cards.
-sees: its name, as the tag on its rooms on Home.
+principle: the user runs `register workspace…`, gives the name, the token, and the cookie from their browser; the echo line reads `slack: acme registered`; Slack's asks start to come in as cards.
+sees: its name, as the tag on its rooms on Home; at the top of `Conversations`, `connecting to slack…` while it connects, or `slack unavailable:` and the reason when Slack refuses it.
 does:
-- register workspace…, from the palette under `slack`: ask `slack workspace:`, then `… xoxc token:`, then `… d cookie:`; the last two are hidden as they are typed
+- register workspace…, from the palette under `slack`: ask `slack workspace:`, then `… xoxc token:`, then `… d cookie:`; the token and the cookie show on screen as they are pasted, and rho's history of prompts keeps neither
 
 Giving a registered name again replaces its token and cookie. The window answers a wrong token with what was wrong, never with the token.
+
+rho works with one workspace at a time: the first one registered. A second one registered is kept, but rho does not connect to it while the first one is there.
+
+A short drop of the connection says nothing. After a long one, or when Slack keeps refusing, the echo line says what is wrong, such as `slack: connection lost`. When rho has caught up on what it missed, the echo line reads `slack: caught up`.
 
 ## concept Conversation
 purpose: hold one Slack channel, group, or direct message, for reading and writing.
@@ -24,7 +28,12 @@ does:
 - star `z` in the `slack` menu: make it a room on Home, or stop
 - attach file… `a` in the `slack` menu: ask for a file to send with the next message; `remove attachment…` takes one back
 - next unread `shift-n`: open the next conversation with something unread
-- new message… `ctrl-n`: ask `new message — people (comma separated):` and open a conversation with them
+- new message… `ctrl-n`: ask `new message — people (comma separated):` with one to eight people, and open a conversation with them
+- conversations `o` in the `slack` menu: open `Conversations`
+- browse channels… `c` in the `slack` menu: ask `browse channels — choose to join and open:` with the workspace's channels, and join and open the one chosen
+- drafts… `d` in the `slack` menu: ask `slack drafts:` with every conversation that holds an unsent message, and open the one chosen at its box; with none, the echo line reads `slack: no drafts`
+
+A message being sent shows `sending…` under the box; one that failed shows `send failed · Enter retries`. Older messages load as the user scrolls up to `older messages not loaded`.
 
 ## concept Thread
 purpose: hold the replies under one Slack message.
@@ -41,7 +50,13 @@ principle: a colleague posts a link the user wants later; the user puts the curs
 sees: the writer's initials, the text with emoji and links drawn, reactions, files, and the replies under it.
 does:
 - message actions… `e` in the `slack` menu, over the message under the cursor: `edit` and `delete…` on the user's own, `react…`, `copy link`, `forward…`, `mark unread`, and `save / unsave for later (local)`
-- edit `e`, react `r`, mark unread `m`, save for later `b`: the same, by key, on the message under the cursor
+- edit `e`, react `r`, mark unread `m`, save for later `b`: the same, by key, on the message under the cursor; `e` on someone else's message echoes `slack: only your own messages can be edited`
+- react…: a menu of the emoji already on the message and the user's recent ones, each on a key, with `/` `by name…` for any other; picking one the user already gave takes it away
+- delete…: ask `delete message? type delete:`; only the word `delete` deletes, for good
+- forward…: ask `forward to:` with the user's conversations, and send the message there
+- open `enter`, on what the cursor is on, the most specific first: unfold a long message at `Show more ↓`; press an app's button, or open its link in the browser; open a file with the device's own app for it; open a link, and a link to a Slack message opens that message here; otherwise open the thread the line is in
+
+An app's other controls and an app's dialogs do not work here. The echo line says so and sends the user to Slack, such as `slack: app dialogs are not supported here yet; use Slack for this one`.
 
 ## concept Activity
 purpose: list what Slack is asking the user about, in one place.
@@ -110,8 +125,11 @@ flow:
 2. answer `slack workspace:` with its name
 3. paste the token at `… xoxc token:`
 4. paste the cookie at `… d cookie:`; the echo line reads `slack: … registered`
-system: completes the name from the workspaces already registered, and hides the token and cookie.
+system: completes the name from the workspaces already registered, and keeps the token and cookie out of rho's history of prompts.
 user: the token and the cookie, copied from a browser where they are signed in.
 
 ## rule a Slack conversation that asks is a room
 when Slack would badge a `Conversation` for the user, or the user starred it, then it is a `home.Room` on Home, tagged with the `Workspace` name.
+
+## rule a snooze stays in rho
+when `deal.Card.snooze` on a card from Slack, then Slack itself is not told, and the conversation stays unread in every other Slack app.

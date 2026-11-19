@@ -7,9 +7,9 @@ purpose: show one thing at a time, so the user is never looking at two things th
 principle: the user opens a room; it fills the window; they open a thread from it, and the thread fills the window; `Screen.back` returns to the room exactly as they left it.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
 does:
-- back `ctrl-k`: go to the screen before, as it was left
+- back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
 - forward `ctrl-j`: go to the screen after; from the newest screen, deal the next card, as `deal.Card.deal` does
-- close `q`: close this screen; no back or forward reaches it again
+- close `q`, or `ctrl-shift-backspace` while typing: close this screen; no back or forward reaches it again
 - close and deal `ctrl-shift-j`: close this screen and deal the next card
 - home `tab`: go to `home.Home`; on Home, go back to the screen before
 
@@ -32,12 +32,12 @@ The echo line is also where rho says that something failed, for example that a h
 ## concept Palette
 purpose: reach every command by its name, so no command needs a key the user must remember.
 principle: the user presses `:`; the prompt line reads `command:` and lists every command that fits this screen; they type `sa`, `start agent here` comes first, and enter runs it.
-sees: the commands for the screen in view and for the thing under the cursor, each with the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`.
+sees: `home`, `find`, `undo`, `hosts`, and `quit` first, then the commands for the screen in view and for the thing under the cursor, each with the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`.
 does:
 - open `:`: list the commands, best match first as the user types
-- run `enter`: run the command; a command that is a `Menu` opens that menu
+- run `enter`: run the command; a command that is a `Menu` opens that menu; a name that fits no command echoes `no command …`
 
-The keys shown beside a command are the keys inside its menu, such as `a` in `hosts › attach` after `hosts` is open. A command at the top of the list, such as `usage…`, shows a key such as `shift-u` that does something else when pressed outside the palette.
+The keys shown beside a command are the keys inside its menu, such as `a` in `hosts › attach` after `hosts` is open. A command at the top of the list shows a key too, such as `shift-u` beside `usage…` or `a` beside `start agent here`, but no menu holds the top of the list, so outside the palette that key does something else or nothing.
 
 ## concept Menu
 purpose: offer a short list of choices where the list itself is the information, such as how long to snooze or which agent to join.
@@ -46,7 +46,10 @@ sees: the menu's title, then its rows as key and words, laid out in columns; a r
 does:
 - pick a key, or click or tap a row: run the row; a row that opens another menu replaces this one
 - count digits before a key: give the row a number, such as `3` before `d` for three days
-- back `escape`: return to the menu before, or close the menu
+- back `escape` or `ctrl-g`: return to the menu before, or close the menu
+- home `space`: close the menu and go to `home.Home`, or back from it
+
+A menu with nothing in it does not open; the echo line reads its title and `nothing here`.
 
 On the phone, a menu is a sheet of tall rows over the screen, with `‹ back` and `close` at its top, and the key still shown at the end of each row.
 
@@ -60,15 +63,17 @@ does:
 - complete `tab`: put the highlighted answer into the line
 - cancel `escape` or `ctrl-g`: close the prompt and change nothing
 
-This is the minibuffer. At a prompt for a secret, such as a Slack token, rho's history of what was typed at prompts keeps nothing.
+A prompt for a secret, such as a Slack token, shows what is typed or pasted like any other prompt. Only rho's history of what was typed at prompts keeps nothing of it.
+
+A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
 ## concept Find
 purpose: go to anything by its name, so nothing needs a place on screen to be reachable.
 principle: the user presses `ctrl-shift-f` and types `privacy`; the thread `privacy VM` is in the list, with its channel beside it; enter opens it.
-sees: every channel, thread, agent, note, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`.
+sees: every channel, thread, agent, agent's desktop, note, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`; at most 40 at a time.
 does:
 - find `ctrl-shift-f`: open the prompt `find:`, which narrows the list as the user types
-- open `enter`: open the thing chosen
+- open `enter`: open the thing chosen; a name that fits nothing echoes `find: nothing called …`
 
 ## concept Phone bar
 purpose: give the thumb what the keys give on the laptop.
@@ -112,3 +117,14 @@ cases: on the phone, where the list of commands cannot be tapped and the user mu
 
 ## rule a menu or prompt takes the keys
 when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
+
+## job Report a slow window
+when: the window stutters or freezes for a moment, and I want it fixed
+want: send what it was doing to a place an agent can read
+so that: an agent can find the cause without my own words for it
+flow:
+1. open the `Palette` and choose `upload performance report`
+2. the echo line reads `uploading a … KiB performance report to …`, then `performance report stored on … at …`
+system: keeps a record of the last half minute of how the window drew and what it worked on, all the time; sends it to the attached host whose name comes first.
+user: the moment to send it, soon after the stutter.
+cases: no host attached, where the echo line reads `performance report: no host is attached`

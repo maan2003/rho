@@ -11,7 +11,7 @@ does:
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit
 - open: from Home, from `window.Find`, or with `enter` on a private reply
 
-No agent sees a note. A note's text passes between the user's devices through the hosts, sealed. The window has no way to delete a note.
+No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase, which the window cannot enter. The window has no way to delete a note.
 
 While the user types a new note, the top line still reads `untitled note`; it shows the first line once the note is opened again.
 

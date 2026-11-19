@@ -14,11 +14,11 @@ does:
 - done `space` then `d`, or `done` on the phone: say the user is through with everything in it so far; the card goes away, and when it was on screen, the next one opens
 - mute `space` then `m`, or `mute` on the phone: say nothing from it should reach the user again; the card goes away, and when it was on screen, the next one opens
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
-- undo `shift-u`, or `space` then `u`: take back the last verdict; the card opens again as it was
+- undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
 
 A verdict lands on what the cursor is on. On a thread that the deal opened, the cursor starts on the newest message, so the verdict menu and the `window.Status line` name that message rather than the card, until the user moves the cursor to the thread's first line.
 
-What the user says about a card is kept on their own devices. It passes between them through the hosts, sealed, so no host and no agent can read it.
+What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it. The window has no way to enter the phrase. A device without it keeps its verdicts to itself, and when another device has written verdicts, the echo line says so and names `space s s` as the way to enter the phrase, a key that opens the snooze times instead.
 
 ## concept Ask
 purpose: say that an agent needs something from the user before its work can go on.

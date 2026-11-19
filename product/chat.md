@@ -25,7 +25,7 @@ has:
 - many `notes.Private reply`
 does:
 - open `enter` on its line: open the thread
-- write `i`: put the cursor in the box at the bottom; `escape` goes back to the messages
+- write `i`, or `ctrl-down`: put the cursor in the box at the bottom, which reads `message · ctrl-enter sends` while empty; `escape` or `ctrl-up` goes back to the messages
 - send `ctrl-enter`, or `send` on the phone: post what is in the box
 - name, from the palette as `name this thread`: ask `name (current):` and give the thread that name
 - open a participant `enter` on the `with` line: open the first agent's transcript

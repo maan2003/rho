@@ -6,7 +6,7 @@ rho is the one window where one person works with many AI agents, their Slack, a
 
 One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work.
 
-They use two devices. On the laptop they drive everything with keys, the way they drive Vim and Emacs. On the phone they use one thumb and a bar of buttons along the bottom edge. Both show the same screens and the same state.
+They use two devices. On the laptop they drive everything with keys, the way they drive Vim and Emacs. On the phone they use one thumb and a bar of buttons along the bottom edge. Both show the same screens, and the same hosts, threads, agents, and Slack. Their verdicts and notes are the same on both only when both devices hold the user's secret phrase.
 
 They come back many times a day, often for a minute or two between other things, and sometimes stay for a long working session in one thread or one agent. Between visits they do not remember which thread asked what, or how long ago. The product keeps that for them: what waits and since when, what they said about each card, their unsent drafts, and where they were.
 
