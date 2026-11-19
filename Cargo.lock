@@ -14368,6 +14368,7 @@ dependencies = [
  "multi_buffer",
  "rho-dealer",
  "rho-frame",
+ "rho-transcript",
  "rho-window",
  "theme",
  "uuid",

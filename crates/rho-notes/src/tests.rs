@@ -131,7 +131,7 @@ fn notes_about_a_thing_are_its_private_replies() {
 }
 
 /// A reply says what it is about and nothing else; a new note says
-/// nothing at all, so once typed into it is a private room.
+/// nothing at all, so once typed into it is a note about nothing.
 #[test]
 fn a_new_note_is_about_where_it_was_made_or_nothing() {
     let note = NoteId(uuid::Uuid::new_v4());
@@ -148,34 +148,33 @@ fn a_new_note_is_about_where_it_was_made_or_nothing() {
     }
 }
 
+/// `notes` lists every note, a reply under something too, by its first
+/// line, the one last written first: an older note edited last goes on
+/// top, a deleted one goes, and one never typed into is not there yet.
 #[test]
-fn find_lists_live_notes() {
+fn notes_lists_every_note_last_written_first() {
     let mut world = World::default();
-    let kept = world.note("kept");
-    let gone = world.note("gone");
-    world.write(gone, "gone", true);
-    let found: Vec<(String, String, Address)> = found(&world.marks)
-        .into_iter()
-        .map(|found| (found.title, found.description, found.address))
-        .collect();
-    assert_eq!(found, vec![("kept".into(), "note".into(), kept.address())]);
-}
-
-/// Home lists the notes about nothing as private rooms, the one last
-/// written first; a reply under something is not a room.
-#[test]
-fn home_lists_the_private_rooms_newest_written_first() {
-    let mut world = World::default();
-    let older = world.note("older room");
+    let older = world.note("older\nand more");
     let reply = world.note("a reply");
     world.say(Fact::About {
         node: reply.address(),
         about: Some(thread(7)),
     });
-    let newer = world.note("newer room");
-    world.write(older, "older room, edited last", false);
-    let rooms = private_rooms(&world.marks);
-    let titles: Vec<&str> = rooms.iter().map(|row| row.name.as_str()).collect();
-    assert_eq!(titles, ["older room, edited last", "newer room"]);
-    assert_eq!(rooms[1].address, newer.address());
+    let newer = world.note("");
+    let gone = world.note("gone");
+    world.write(gone, "gone", true);
+    let fresh = NoteId(uuid::Uuid::new_v4());
+    world.say(Fact::About {
+        node: fresh.address(),
+        about: Some(thread(7)),
+    });
+    world.write(older, "older, edited last", false);
+    assert_eq!(
+        listed(&world.marks),
+        [
+            (older.address(), "older, edited last".to_owned()),
+            (newer.address(), UNTITLED.to_owned()),
+            (reply.address(), "a reply".to_owned()),
+        ]
+    );
 }

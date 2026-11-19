@@ -21,8 +21,8 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::attention::{Verdict, Write};
 use rho_frame::{
-    AnySurface, Candidate, Found, Frame, FrameLink, Point, Reversal, RoomRow, Row, Rows, Subject,
-    System,
+    AnySurface, Candidate, Found, Frame, FrameLink, Point, Reversal, RoomRow, Row, Rows, Standing,
+    Subject, System,
 };
 use rho_window::style::StyleClass;
 
@@ -463,6 +463,7 @@ impl System for SlackSystem {
                 RoomRow {
                     address: SlackAddress::Unit(workspace.clone(), Unit::conversation(&row.id))
                         .address(),
+                    standing: Standing::Worked,
                     name: row.label,
                     tag: workspace.0.clone(),
                     waiting,

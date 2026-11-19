@@ -8,21 +8,28 @@
 //! typed and not yet written. The machine never writes a note's text:
 //! every revision this crate says is a buffer's text as the user left it.
 //!
+//! Notes live apart from the work: no note is a room on Home or a place
+//! in `find`. Their one door is the command `notes`, which opens
+//! [`NotesView`], every note by its first line, the last written first.
+//!
 //! Addresses are `note:<id>`
-//! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)). A deadline on
+//! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)), and the list
+//! of them is `notes:all`. A deadline on
 //! a note is the dealer's to rank, like on anything else; a bare reminder
 //! is a note with a deadline. This system only opens the card.
 
+mod list;
 mod view;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Subscription, Task, Window};
+pub use list::NotesView;
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, RoomRow, Row, System};
+use rho_frame::{AnySurface, Frame, FrameLink, Point, Row, System};
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -30,6 +37,14 @@ const SAVE_AFTER: Duration = Duration::from_millis(700);
 
 /// What a note without a first line is called.
 const UNTITLED: &str = "untitled note";
+
+/// The kind of the one list of every note.
+const NOTES: &str = "notes";
+
+/// The list of every note.
+fn notes_address() -> Address {
+    Address::new(NOTES, "all")
+}
 
 /// A note, by the id it was minted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,32 +102,19 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
-/// The private rooms: every note that is about nothing, the one last
-/// written first.
-fn private_rooms(marks: &Marks) -> Vec<RoomRow> {
-    marks
-        .private_roots()
+/// Every note, about something or about nothing, by its first line: the
+/// one last written first.
+fn listed(marks: &Marks) -> Vec<(Address, String)> {
+    let mut notes: Vec<_> = marks.notes().collect();
+    notes.sort_by_key(|(address, held)| {
+        (
+            std::cmp::Reverse(held.written_ms.or(held.created_ms)),
+            *address,
+        )
+    });
+    notes
         .into_iter()
-        .map(|(address, held)| RoomRow {
-            address: address.clone(),
-            name: note_title(marks, address),
-            tag: "private".to_owned(),
-            waiting: String::new(),
-            at: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
-        })
-        .collect()
-}
-
-/// Every note, for `find`.
-fn found(marks: &Marks) -> Vec<Found> {
-    marks
-        .notes()
-        .map(|(address, held)| Found {
-            address: address.clone(),
-            title: note_title(marks, address),
-            description: "note".to_owned(),
-            recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
-        })
+        .map(|(address, _)| (address.clone(), note_title(marks, address)))
         .collect()
 }
 
@@ -147,6 +149,7 @@ impl NoteSystem {
             }
             std::future::ready(())
         });
+        list::bind_keys(cx);
         Self {
             frame,
             pending: HashMap::new(),
@@ -203,16 +206,15 @@ fn reply_privately(
     frame.open(note.address(), window, cx);
 }
 
-/// A new note about `about`, or about nothing: a private room. It has no
-/// text, and is nothing in the ledger until it is about something or
-/// typed into.
+/// A new note about `about`, or about nothing. It has no text, and is
+/// nothing in the ledger until it is about something or typed into.
 fn new_note(frame: &mut Frame, about: Option<&Address>, cx: &mut Context<Frame>) -> NoteId {
     let note = NoteId(uuid::Uuid::new_v4());
     frame.write_marks(new_note_marks(note, about), cx);
     note
 }
 
-/// `new note`: a private room of its own, opened to type into.
+/// `new note`: a note about nothing, opened to type into.
 fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
     let note = new_note(frame, None, cx);
     frame.open(note.address(), window, cx);
@@ -220,7 +222,7 @@ fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
 
 impl System for NoteSystem {
     fn kinds(&self) -> &'static [&'static str] {
-        &[Address::NOTE]
+        &[Address::NOTE, NOTES]
     }
 
     fn open(
@@ -229,9 +231,13 @@ impl System for NoteSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
-        let note = NoteId::from_address(address)?;
         let system = cx.entity();
         let frame = self.frame.clone();
+        if *address == notes_address() {
+            let view = cx.new(|cx| NotesView::new(system, frame, window, cx));
+            return Some(AnySurface::new(view));
+        }
+        let note = NoteId::from_address(address)?;
         let view = cx.new(|cx| NoteView::new(system, frame, note, window, cx));
         Some(AnySurface::new(view))
     }
@@ -246,6 +252,9 @@ impl System for NoteSystem {
             ));
         }
         rows.push(Row::run("w", "new note", make_note));
+        rows.push(Row::run("shift-w", "notes", |frame, window, cx| {
+            frame.open(notes_address(), window, cx)
+        }));
         rows
     }
 
@@ -255,16 +264,9 @@ impl System for NoteSystem {
         NoteId::from_address(address).map(|_| (UNTITLED.to_owned(), String::new()))
     }
 
-    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
-        found(marks)
-    }
-
-    fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
-        private_rooms(marks)
-    }
-
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
-        // A note surface reads its text from the marks.
+        // A note surface reads its text from the marks, and the list its
+        // notes.
         cx.notify();
     }
 }
