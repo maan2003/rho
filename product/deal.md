@@ -22,7 +22,9 @@ does:
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
 - undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
 
-A verdict lands on what the cursor is on. On a thread that the deal opened, the cursor starts on the newest message, so the verdict menu and the `window.Status line` name that message rather than the card, until the user moves the cursor to the thread's first line.
+A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is. A verdict about one message alone is a rare act, by name from the palette.
+
+status: a verdict lands on what the cursor is on. On a thread that the deal opened, the cursor starts on the newest message, so the verdict menu and the `window.Status line` name that message rather than the card, until the user moves the cursor to the thread's first line.
 
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it. The window has no way to enter the phrase. A device without it keeps its verdicts to itself, and when another device has written verdicts, the echo line says so and names `space s s` as the way to enter the phrase, a key that opens the snooze times instead.
 
@@ -51,7 +53,7 @@ want: see each thing that asks for me, and answer it
 so that: nothing waits on me without my knowing
 flow:
 1. press `space` then `n`; the top `Card` opens
-2. read it; move the cursor to the thread's first line if I want the verdict to cover the whole thread
+2. read it
 3. answer in the thread if it needs words from me
 4. `Card.done`, or `Card.snooze` and a time, or `Card.mute`; the next card opens
 5. repeat from 2 until the deal is empty and `home.Home` is on screen
