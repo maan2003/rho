@@ -2,12 +2,6 @@
 
 Notes are the user's memory: text only they write and only their devices hold. A note is about nothing, and is then a room of its own on Home, or about a message, and is then a private reply under it.
 
-## bet Notes are untouched by the machine
-instead of: notes that agents read, that the product summarises, or that a model helps write.
-serves: Keep their own memory.
-because: a note holds what no agent may know; its every word is the user's, it never reaches a host in the open, and the machine never changes it.
-costs: no agent can act on a note, and the product cannot help with its text.
-
 ## concept Note
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
 principle: the user thinks of something to check tomorrow; they run `new note` and type it; it is kept a moment after they stop typing, and Home lists it as a room tagged `private`.

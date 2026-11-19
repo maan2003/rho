@@ -8,29 +8,11 @@ serves: Keep the work moving.
 because: the user has dozens of agents and cares about the work, not the worker; the thread is where the work is, so the agent is reached from there or by name.
 costs: an agent has a code for a name, and the user must map it to the work it does.
 
-## bet A message is the brief
-instead of: a form with fields for the task, the repository, and the model.
-serves: Turn ideas into work.
-because: an idea is a sentence; the user writes it where the work belongs, and the agent starts from that message and reads it first.
-costs: where the agent works and which model it runs on are questions asked after the message.
-
 ## bet Trust by inspection
 instead of: agents that report what they did, which the user believes.
 serves: Keep the work moving.
 because: the user does not edit code by hand and must still know whether a result is right; the transcript shows every step, and the terminal, shell, and desktop let the user stand beside the agent.
 costs: a transcript is long, and the user reads it to find what went wrong.
-
-## bet A workset per agent
-instead of: every agent in one checkout of the repository.
-serves: Keep the work moving.
-because: many agents work on one repository at once, and each must be free to change files without stepping on another; an agent that must work beside another joins its workset.
-costs: the user names a repository or a directory when an agent starts, and a host holds many copies.
-
-## bet The user picks the model and watches the allowance
-instead of: the product choosing the model and the account for each agent.
-serves: Keep the work moving.
-because: the accounts have limits that reset on their own clocks, and the user knows which work deserves the expensive model.
-costs: a question at every start, and a chart the user must remember to look at.
 
 ## concept Agent
 purpose: do a piece of the user's work on a host, in a thread the user can read and answer.

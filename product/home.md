@@ -2,12 +2,6 @@
 
 Home is where the user lands: every room they can read, one line each, the one that wants them most at the top.
 
-## bet Rooms are the places the user changes project from
-instead of: a tree of hosts and channels, tabs, or a sidebar.
-serves: Know what wants them, and where they were.
-because: the user runs many projects and comes back to each many times a day; one list, ordered by what wants them, with one line per place, is the shortest way back.
-costs: every place that can be read is a row, whether or not the user works there.
-
 ## concept Room
 purpose: give every place the user reads one line on Home, so they see at a glance where something waits.
 principle: an agent asks the user something in a thread of the channel `debug`; on Home, `debug` moves to the top and reads `asks · 8.3d`; the user opens it and answers.

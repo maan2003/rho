@@ -5,14 +5,15 @@ Chat is where the user and the agents talk: on each host, channels, threads unde
 ## bet Chat is the medium
 instead of: a session per agent, a task board, a form, or a pull request to review.
 serves: Keep the work moving.
-because: the user runs many projects and many agents at once, and a thread keeps each piece of work, its agents, and every word said about it in one place that both can read.
+because: the user runs many projects and many agents at once, and a thread keeps each piece of work, its agents, and every word said about it in one place that both can read; a message is the brief, so an agent starts from one and reads it first.
 costs: an agent's progress is a stream of messages the user must read, not a status they can see at a glance.
 
-## bet An agent reaches the user only by mention
-instead of: every message from an agent asking for the user's attention.
+## bet An agent reaches the user by mention, or by a stop it did not choose
+status: an agent that fails, retries for a long time, or is lost by its host makes no card; the user finds it in the transcript or in `window.Find`.
+instead of: every message from an agent asking for the user's attention, or agent state driving attention.
 serves: Know what wants them, and where they were.
-because: agents write far more than the user can read; a mention that is an ask or a result is the agent's one way to say "you, now".
-costs: an agent that stops without a mention is not heard.
+because: agents write far more than the user can read; a mention that is an ask or a result is the agent's one way to say "you, now", and a stop it did not choose says the same without words.
+costs: a card for a failure the user may not care about, which `deal.Card.mute` puts away.
 
 ## concept Channel
 purpose: keep the threads of one subject or one project together, so the user reads them in one place.

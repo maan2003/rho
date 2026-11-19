@@ -8,12 +8,6 @@ serves: Know what wants them, and where they were.
 because: between two places the user has a minute and no memory of what asked; a list makes them choose, a card makes them answer, and the product remembers the rest.
 costs: whatever the user has not answered is behind the top card, and a verdict is a decision they must make.
 
-## bet One pull only, the lamp
-instead of: badges, counts, popups, and sounds wherever something is new.
-serves: Know what wants them, and where they were.
-because: the user stays in one place for an hour at a time; one yellow dot says that something important waits, and nothing else moves.
-costs: the user looks at the dot, and a thing that is new but not important waits until they next deal.
-
 ## concept Card
 purpose: hand the user the one thing that wants them most, so they never scan a list.
 principle: an agent's message in a thread asks the user something; the thread becomes a card; the user presses `space` then `n`, and the thread opens; they answer it and say done; the next card opens.

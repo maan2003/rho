@@ -2,35 +2,11 @@
 
 The one window that every screen sits in: one screen at a time, the line at the top that says where the user is, and the ways to reach any command, any place, and any earlier screen by keys or by thumb.
 
-## bet An editor, not an app
-instead of: an app with dialogs, buttons, and a different set of controls on each screen.
-serves: Reach anything.
-because: the user spends eight to ten hours a day here and drives everything with keys; one set of motions, search, and modes on every screen pays back over months.
-costs: the first weeks are harder, and the phone must be given the keys' work another way.
-
 ## bet One window becomes the operating system
 instead of: rho beside a terminal, a browser, and other apps on the laptop.
 serves: Reach anything.
 because: everything the user does should be a place with the same keys and the same way back; terminals, desktops, and the browser come inside, and what the user uses most becomes a place of its own.
 costs: what has no place yet is reached through a terminal, the browser, or an agent.
-
-## bet One place fills the window
-instead of: panes, tabs, or a sidebar always on screen.
-serves: Know what wants them, and where they were.
-because: the user works in one place for an hour at a time, and nothing else should pull at them; two places side by side is rare power, used on purpose.
-costs: two things the user wants to see together are two places, one key apart.
-
-## bet The phone is the same window, laid out smaller
-instead of: a phone app with its own screens.
-serves: Reach anything.
-because: the phone is as powerful as the laptop, and every job must be possible there; the same places and the same stack, with a bar of buttons for the thumb.
-costs: a prompt or a palette that is easy with keys is slow by thumb.
-
-## bet Defaults are written in the code, not set by the user
-instead of: settings screens.
-serves: Know what wants them, and where they were.
-because: rho has one user; what they do is observed, and the decision is written into the product once, so there is nothing to configure and nothing that adapts on its own.
-costs: changing a default is a change to the product.
 
 ## concept Screen
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
