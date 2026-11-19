@@ -1,0 +1,55 @@
+# rho
+
+rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, and lets them answer it, talk to agents, and look into what the agents do.
+
+## User
+
+One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work.
+
+The laptop is rho. For eight to ten hours a day, everything they do on the laptop happens in this window. They do not come and go. They are here, and they move between places: a thread, a transcript, a terminal, a desktop, a page in the browser, a note. Between two places, they look at what wants them. Sometimes they rest here too.
+
+They rarely edit code by hand. When they must, they use an editor in a terminal. What rho has no place for yet, they reach through an agent, a terminal, or the browser. Over time, the things they use most become places of their own.
+
+Ideas come to them anywhere, at the laptop or on the go. An idea must become an agent at work in one short step, from either device.
+
+The phone is the same window, smaller, used with one thumb and a bar of buttons along the bottom edge. They use it ten to twenty minutes a day. On a day away, it is all they have, and they keep working from it. They answer what wants them, read, steer agents, and start new work. The phone is as powerful as the laptop. They never have to say "I cannot do that from the phone". What is common is easy there. What is rare may take longer there.
+
+Both devices show the same places and the same hosts. Their verdicts, notes, and drafts are the same on both.
+
+One place fills the window. Two places side by side is an expert flow, used rarely and on purpose.
+
+While they are in a place, they do not watch the rest. The product keeps it for them: what waits and since when, and what they said about each card. It also keeps their unsent drafts, and where they were on each device.
+
+## Day
+
+What the user does in rho, all day, in order of weight. Every job in a module serves one of these.
+
+1. **Keep the work moving.** Answer what an agent asks, check what it did, steer it, and know when it stops.
+2. **Turn ideas into work.** An idea becomes an agent at work, in one step, from either device.
+3. **Answer the world.** Slack, and later mail and the rest. Read, reply, done.
+4. **Reach anything.** A terminal, a desktop, a page in the browser, a file, for what has no place of its own yet.
+5. **Keep their own memory.** Rare. A private corner for reminders and for things no agent may know, in their words only, and almost never about the work in the repositories.
+
+Under all five, all day, on both devices: **know what wants them, and where they were.**
+
+## Values
+
+1. **Personal software, built for the long run.** rho has one user, so it can make unusual choices that take longer to learn when they are better for that one person over months of daily use. Test: Is this choice better for the user after a month of daily use, even if it costs more on the first day?
+2. **rho remembers, so the user does not.** Anything the user would have to hold in their head between two places, rho holds for them, exactly and on every device. That is what waits and since when, what they said and chose, where they were, and what each agent is doing. The defaults are decided once, in the product, from how its one user works. Nothing adapts on its own. Test: Is there anything the user must remember between two places that the product could keep for them? Does this change ever make that memory wrong, or lose it?
+3. **One place, in focus.** The user works in one place for an hour at a time, on one of many projects. Every extra thing on the screen costs them attention, and anything that pulls at them from outside the place breaks their work. The lamp is the only pull allowed. Test: Does every thing on this screen help with the step the user is on, and can they stay in this place for an hour without the rest of the world pulling at them?
+4. **Rare power, neatly tucked away.** Advanced functions stay reachable, but out of sight, because they are rare. The common flow stays short and smooth. Test: Can the user reach the rare function by name, without it adding a step or a thing on screen to the common flow?
+5. **The system does what it can.** Every screen and every flow is judged from the user's side: is there something the system could do for them here? On the phone, every step is a thumb's work, so the question is asked twice. Test: Is there a step in this flow that the system could do or decide on its own instead of the user?
+6. **An editor, not an app.** Every screen is text the user moves through with the same keys: the same motions, search, and Vim modes everywhere. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser. Test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
+7. **Notes are the user's own.** A note holds only what the user typed. No agent reads it, and the machine never writes or changes its text. Test: After this change, is every word of every note still typed by the user, and still hidden from every agent?
+8. **Moving between places costs nothing.** The user changes place hundreds of times a day. Any place is one name away, and the way back is one key, with nothing lost in the place they left. Test: Can the user reach this place by name from anywhere, and return in one key, with the place they left as it was?
+9. **The phone is a full device.** Every job is possible on the phone. Where the thumb makes a job longer, that is a cost chosen on purpose and written down, never a job that the phone cannot do. Test: Can the user finish this job with one thumb? If not, is the cost chosen on purpose and written in the module?
+
+## Non-goals
+
+- A feed or inbox that the user scans from top to bottom to find what needs them. The deal hands them the next card instead.
+- A sidebar, tabs, or other fixed controls around the screen.
+- A list or dashboard of agents. An agent is reached from the thread it works in, or by name.
+- Labels, piles, and to-do lists for sorting things. A card is answered with a verdict and goes away.
+- Settings screens.
+- Other people as users. rho has no accounts, no sharing, and no view for anyone but its one user.
+- A second product for the phone. The phone shows the same places and runs the same jobs, with a thumb instead of keys.
