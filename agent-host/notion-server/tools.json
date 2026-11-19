@@ -1,5 +1,6 @@
 {
   "tools": [
+    "notion-search",
     "notion-fetch",
     "notion-create-pages",
     "notion-update-page",

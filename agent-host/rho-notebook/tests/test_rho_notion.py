@@ -74,14 +74,14 @@ class RhoNotionTest(unittest.IsolatedAsyncioTestCase):
     async def test_call_sends_the_arguments_and_raises_on_refusals_and_tool_errors(self):
         async def body():
             self.assertEqual(await rho_notion.call("notion-fetch", id=PAGE), {"content": []})
-            with self.assertRaisesRegex(rho_notion.NotionError, "rho_page_outside_root"):
+            with self.assertRaisesRegex(rho_notion.NotionError, "rho_tool_unavailable"):
                 await rho_notion.call("notion-fetch", id="x")
             with self.assertRaisesRegex(rho_notion.NotionError, "no such page"):
                 await rho_notion.call("notion-fetch", id="y")
 
         requests = await self.run_with([
             (200, {"content": []}),
-            (403, {"error": "rho_page_outside_root: ..."}),
+            (403, {"error": "rho_tool_unavailable"}),
             (200, {"isError": True, "content": [{"type": "text", "text": "no such page"}]}),
         ], body)
         self.assertEqual(requests[0], ("POST", "/tools/notion-fetch", {"id": PAGE}))

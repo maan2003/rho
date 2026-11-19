@@ -6,7 +6,6 @@ use crate::{NotionArgs, NotionCommand, host_call};
 pub(crate) async fn run(args: NotionArgs) -> anyhow::Result<()> {
     match args.command {
         NotionCommand::Init => init(args.runtime_dir).await,
-        NotionCommand::Root { page } => root(args.runtime_dir, page).await,
     }
 }
 
@@ -31,22 +30,6 @@ async fn init(runtime_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
             (notion_server::CLIENT_ID.to_owned(), grant.client_id),
             (notion_server::REFRESH_TOKEN.to_owned(), grant.refresh_token),
         ],
-    )
-    .await?;
-    eprintln!("Name the page agents work under with `rho notion root <page URL>`.");
-    Ok(())
-}
-
-/// Names the page agents work under: they reach only it and the pages under
-/// it.
-async fn root(runtime_dir: Option<std::path::PathBuf>, page: String) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        notion_server::page_id(&page).is_some(),
-        "not a Notion page URL or ID"
-    );
-    install(
-        runtime_dir,
-        vec![(notion_server::ROOT_PAGE.to_owned(), page)],
     )
     .await
 }

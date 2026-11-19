@@ -7,11 +7,10 @@ description: Use when a task needs a Notion page, for writing a plan, report or 
 
 ## When
 
-Agents own pages in one area of the user's Notion: the root page the user
-named with `rho notion root`, and the pages under it. Create a page there
+Agents reach the pages the user's Notion sign-in reaches. Create a page
 when the task needs a document people read and comment on, keep it
-current while the task runs, and answer its comments. Nothing else in
-the workspace is reachable.
+current while the task runs, and answer its comments. Read or change
+other pages only when the task names them.
 
 Agents write **as the user**: pages and comments show the user's name.
 Start each comment with `🤖` so readers, and you, can tell it is an
@@ -35,27 +34,25 @@ page = await notion.call("notion-fetch", id=page_id)
 print(notion.text(page))               # Notion-flavoured Markdown
 ```
 
-The tools agents may call: `notion-create-pages`, `notion-fetch`,
-`notion-update-page`, `notion-create-comment`, `notion-get-comments`,
-`notion-get-users` (to mention someone), and `notion-get-async-task`.
+The tools agents may call: `notion-search` (to find a page),
+`notion-fetch`, `notion-create-pages`, `notion-update-page`,
+`notion-create-comment`, `notion-get-comments`, `notion-get-users` (to
+mention someone), and `notion-get-async-task`.
 `await notion.tools()` gives each one's `description` and `inputSchema`,
 Notion's own documentation: read it before a tool's first use.
 
-- New pages go under the root without a `parent`; pass
-  `parent={"page_id": ...}` to nest under a page of yours.
+- Pass `parent={"page_id": ...}` to put a new page under the page the
+  task names; if the task names none, ask the user where it belongs.
 - Edit with `notion-update-page`; prefer `update_content`'s
   search-and-replace over rewriting the page.
 - Reply to a comment with `notion-create-comment`, its `page_id` and
   its `discussion_id` (the `discussion://` URL).
 
 Writes need no approval: write when the task calls for it.
-`notion.NotionError` carries the reason: `rho_page_outside_root` for a
-page outside the root, `rho_tool_unavailable` for a tool not on the list
-(do not work around either), `rho_no_notion_grant` or
+`notion.NotionError` carries the reason: `rho_tool_unavailable` for a
+tool not on the list (do not work around it), `rho_no_notion_grant` or
 `rho_notion_unauthorized` when the host is not signed in (ask the user to
-run `rho notion init` on the agent host), `rho_no_notion_root` when it has
-no root page (ask the user to run `rho notion root <page URL>`), or
-Notion's own error.
+run `rho notion init` on the agent host), or Notion's own error.
 
 ## Waiting for comments
 

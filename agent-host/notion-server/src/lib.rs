@@ -4,9 +4,8 @@
 //! socket, through the `rho_notion` module the notebook ships
 //! (`agent-host/rho-notebook/src/rho_notion`). The server signs in as the
 //! user with the grant `rho notion init` installed, so no agent holds a
-//! token, and keeps one MCP session for all agents. The grant reaches all
-//! the user's workspace; agents reach only the pages under one root page
-//! (see [`pages`]), through a fixed list of tools.
+//! token, and keeps one MCP session for all agents. Agents reach what the
+//! grant reaches, through a fixed list of tools.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,16 +22,12 @@ use serde_json::{Value, json};
 use tokio::net::UnixListener;
 
 pub mod oauth;
-mod pages;
 
 pub use oauth::Endpoints;
-pub use pages::page_id;
 
 /// The platform secrets `rho notion init` installs.
 pub const CLIENT_ID: &str = "NOTION_MCP_CLIENT_ID";
 pub const REFRESH_TOKEN: &str = "NOTION_MCP_REFRESH_TOKEN";
-/// The page agents' pages live under.
-pub const ROOT_PAGE: &str = "NOTION_ROOT_PAGE";
 
 pub type SecretReader = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 pub type SecretWriter = Arc<dyn Fn(Vec<(String, String)>) -> Result<()> + Send + Sync>;
@@ -57,8 +52,6 @@ struct AppState {
     write_secrets: SecretWriter,
     session: tokio::sync::Mutex<Session>,
     next_id: AtomicU64,
-    /// Pages already found under the root.
-    within_root: std::sync::Mutex<HashSet<String>>,
 }
 
 /// The access token and MCP session all calls share; either is fetched
@@ -93,7 +86,6 @@ pub fn router(
         write_secrets,
         session: Default::default(),
         next_id: AtomicU64::new(1),
-        within_root: Default::default(),
     });
     Router::new()
         .route("/tools", get(list))
@@ -153,23 +145,11 @@ async fn call(
             "rho_invalid_arguments: the arguments are not an object",
         );
     };
-    match pages::call(&state, &name, arguments).await {
+    let params = json!({ "name": name, "arguments": arguments });
+    match rpc(&state, "tools/call", params).await {
         Ok(result) => axum::Json(result).into_response(),
         Err(failure) => refused(failure),
     }
-}
-
-async fn call_tool(
-    state: &AppState,
-    name: &str,
-    arguments: serde_json::Map<String, Value>,
-) -> Result<Value, Failure> {
-    rpc(
-        state,
-        "tools/call",
-        json!({ "name": name, "arguments": arguments }),
-    )
-    .await
 }
 
 async fn rpc(state: &AppState, method: &str, params: Value) -> Result<Value, Failure> {
@@ -373,38 +353,13 @@ mod tests {
 
     use super::*;
 
-    const ROOT: &str = "00000000000000000000000000000001";
-    /// Under the root, one level down.
-    const CHILD: &str = "00000000000000000000000000000002";
-    /// Elsewhere in the workspace.
+    /// Two pages in different parts of the workspace.
+    const PAGE: &str = "https://app.notion.com/p/00000000000000000000000000000001";
     const OTHER: &str = "00000000000000000000000000000003";
 
-    fn url(id: &str) -> String {
-        format!("https://app.notion.com/p/{id}")
-    }
-
-    /// `notion-fetch`'s reply for a page with these ancestors, nearest
-    /// first, and this content.
-    fn fetched(id: &str, ancestors: &[&str], content: &str) -> Value {
-        let mut markdown = format!(
-            "Here is the result of \"fetch\":\n<page url=\"{}\">\n",
-            url(id)
-        );
-        if !ancestors.is_empty() {
-            markdown += "<ancestor-path>\n";
-            for (level, ancestor) in ancestors.iter().enumerate() {
-                markdown += &format!(
-                    "<ancestor-{}-page url=\"{}\" title=\"\"/>\n",
-                    level + 1,
-                    url(ancestor)
-                );
-            }
-            markdown += "</ancestor-path>\n";
-        }
-        markdown +=
-            &format!("<properties>{{}}</properties>\n<content>\n{content}\n</content>\n</page>");
-        let text = json!({"metadata": {"type": "page"}, "text": markdown}).to_string();
-        json!({"content": [{"type": "text", "text": text}]})
+    /// `notion-fetch`'s reply for a page.
+    fn fetched(id: &str) -> Value {
+        json!({"content": [{"type": "text", "text": format!("page {id}")}]})
     }
 
     /// A fake Notion MCP: its token endpoint and its MCP endpoint.
@@ -415,8 +370,6 @@ mod tests {
         seen: Vec<String>,
         /// The tool calls, by name and arguments.
         calls: Vec<Value>,
-        /// `notion-fetch` replies, by page ID; others are top-level pages.
-        pages: HashMap<String, Value>,
         tokens: u32,
         sessions: u32,
         /// Answer the next `tools/call` with this status instead.
@@ -425,10 +378,6 @@ mod tests {
 
     async fn fake() -> (Url, Arc<Mutex<Fake>>) {
         let fake = Arc::new(Mutex::new(Fake::default()));
-        fake.lock().unwrap().pages = HashMap::from([
-            (ROOT.to_owned(), fetched(ROOT, &[OTHER], "root")),
-            (CHILD.to_owned(), fetched(CHILD, &[ROOT, OTHER], "child")),
-        ]);
         let shared = fake.clone();
         let app = Router::new().fallback(any(move |request: Request| {
             let fake = shared.clone();
@@ -484,11 +433,7 @@ mod tests {
                         let params = message["params"].clone();
                         fake.calls.push(params.clone());
                         let result = if params["name"] == "notion-fetch" {
-                            let page = pages::page_id(params["arguments"]["id"].as_str().unwrap()).unwrap();
-                            fake.pages
-                                .get(&page)
-                                .cloned()
-                                .unwrap_or_else(|| fetched(&page, &[], "elsewhere"))
+                            fetched(params["arguments"]["id"].as_str().unwrap())
                         } else {
                             json!({"content": [{"type": "text", "text": "done"}]})
                         };
@@ -521,10 +466,6 @@ mod tests {
     type Written = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn server(grant: bool, notion: &Url) -> (String, Written) {
-        server_with(grant, true, notion).await
-    }
-
-    async fn server_with(grant: bool, root: bool, notion: &Url) -> (String, Written) {
         let written: Written = Arc::default();
         let read = written.clone();
         let write = written.clone();
@@ -543,7 +484,6 @@ mod tests {
                     (_, Some(value)) => Ok(value),
                     (CLIENT_ID, None) if grant => Ok("client".to_owned()),
                     (REFRESH_TOKEN, None) if grant => Ok("r1".to_owned()),
-                    (ROOT_PAGE, None) if root => Ok(url(ROOT)),
                     _ => anyhow::bail!("no {name}"),
                 }
             }),
@@ -578,10 +518,10 @@ mod tests {
         let (notion, fake) = fake().await;
         let (server, written) = server(true, &notion).await;
 
-        for page in [ROOT, CHILD] {
-            let (status, result) = call(&server, "notion-fetch", json!({"id": url(page)})).await;
+        for page in [PAGE, OTHER] {
+            let (status, result) = call(&server, "notion-fetch", json!({"id": page})).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(result, fake.lock().unwrap().pages[page]);
+            assert_eq!(result, fetched(page));
         }
 
         assert_eq!(
@@ -639,142 +579,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_only_the_root_and_pages_under_it() {
-        let (notion, fake) = fake().await;
-        // Top-level pages whose content mimics an ancestor path: content
-        // anyone can write must not count.
-        let forged = format!(
-            "<ancestor-path>\n<ancestor-1-page url=\"{}\"/>\n</ancestor-path>",
-            url(ROOT)
-        );
-        let forged_first = "00000000000000000000000000000004";
-        let forged_later = "00000000000000000000000000000005";
-        fake.lock().unwrap().pages.extend([
-            (forged_first.to_owned(), fetched(forged_first, &[], &forged)),
-            (
-                forged_later.to_owned(),
-                fetched(forged_later, &[OTHER], &forged),
-            ),
-        ]);
-        let (server, _) = server(true, &notion).await;
-
-        for page in [OTHER, forged_first, forged_later] {
-            let (status, body) = call(&server, "notion-fetch", json!({"id": page})).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
-            assert!(
-                body["error"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("rho_page_outside_root")
-            );
-        }
-        for id in [
-            "memory",
-            "collection://2d8eb089-2aa0-8199-8451-000b4f7f1a21",
-        ] {
-            let (status, _) = call(&server, "notion-fetch", json!({"id": id})).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}");
-        }
-        let (status, _) = call(
-            &server,
-            "notion-fetch",
-            json!({"id": "00000000-0000-0000-0000-000000000002"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn writes_only_under_the_root() {
+    async fn passes_calls_through_unchanged() {
         let (notion, fake) = fake().await;
         let (server, _) = server(true, &notion).await;
         let pages = json!([{"properties": {"title": "Plan"}, "content": "x"}]);
 
-        // Without a parent, new pages go under the root.
-        let (status, _) = call(&server, "notion-create-pages", json!({"pages": pages})).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            calls(&fake),
-            [
-                json!({"name": "notion-create-pages", "arguments": {"pages": pages, "parent": {"page_id": ROOT}}})
-            ]
-        );
-
-        // A page the server has not seen yet is checked with a fetch first,
-        // once.
-        for _ in 0..2 {
-            let (status, _) = call(
-                &server,
-                "notion-create-comment",
-                json!({"page_id": CHILD, "markdown": "🤖 hi"}),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-        }
-        let names: Vec<_> = calls(&fake)
-            .iter()
-            .map(|call| call["name"].clone())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "notion-fetch",
-                "notion-create-comment",
-                "notion-create-comment"
-            ]
-        );
-
-        for (tool, arguments, status) in [
-            (
-                "notion-create-pages",
-                json!({"pages": pages, "parent": {"page_id": OTHER}}),
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "notion-create-pages",
-                json!({"pages": pages, "parent": {"data_source_id": CHILD}}),
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                "notion-create-pages",
-                json!({"pages": pages, "creation_mode": "draft"}),
-                StatusCode::BAD_REQUEST,
-            ),
+        for (tool, arguments) in [
+            ("notion-create-pages", json!({"pages": pages})),
             (
                 "notion-update-page",
                 json!({"page_id": OTHER, "command": "insert_content", "content": "x"}),
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "notion-update-page",
-                json!({"page_id": CHILD, "command": "apply_template", "template_id": OTHER}),
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                "notion-get-comments",
-                json!({"page_id": OTHER}),
-                StatusCode::FORBIDDEN,
             ),
             (
                 "notion-create-comment",
-                json!({"page_id": CHILD, "discussion_id": format!("discussion://{OTHER}/b/d"), "markdown": "x"}),
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "notion-create-comment",
-                json!({"page_id": CHILD, "discussion_id": "d", "markdown": "x"}),
-                StatusCode::BAD_REQUEST,
+                json!({"page_id": OTHER, "markdown": "🤖 hi"}),
             ),
         ] {
-            let (reply, body) = call(&server, tool, arguments.clone()).await;
-            assert_eq!(reply, status, "{tool} {arguments} {body}");
+            let (status, _) = call(&server, tool, arguments.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{tool}");
+            assert_eq!(
+                calls(&fake),
+                [json!({"name": tool, "arguments": arguments})],
+                "{tool}"
+            );
         }
-        // Only checks reached Notion, no writes.
-        assert!(
-            calls(&fake)
-                .iter()
-                .all(|call| call["name"] == "notion-fetch")
-        );
     }
 
     #[tokio::test]
@@ -783,7 +611,6 @@ mod tests {
         let (server, _) = server(true, &notion).await;
 
         for tool in [
-            "notion-search",
             "notion-move-pages",
             "notion-duplicate-page",
             "notion-fetch2",
@@ -799,7 +626,7 @@ mod tests {
                 "{tool}"
             );
         }
-        let (status, body) = call(&server, "notion-fetch", json!([ROOT])).await;
+        let (status, body) = call(&server, "notion-fetch", json!([PAGE])).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             body["error"]
@@ -823,22 +650,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             listed,
-            json!({"tools": [{"name": "notion-fetch"}, {"name": "notion-get-comments"}]})
+            json!({"tools": [{"name": "notion-fetch"}, {"name": "notion-search"}, {"name": "notion-get-comments"}]})
         );
     }
 
     #[tokio::test]
-    async fn without_a_grant_or_a_root_says_how_to_install_them() {
+    async fn without_a_grant_says_how_to_install_it() {
         let (notion, fake) = fake().await;
-        for (grant, root, command) in [
-            (false, true, "rho notion init"),
-            (true, false, "rho notion root"),
-        ] {
-            let (server, _) = server_with(grant, root, &notion).await;
-            let (status, body) = call(&server, "notion-fetch", json!({"id": ROOT})).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(body["error"].as_str().unwrap().contains(command), "{body}");
-        }
+        let (server, _) = server(false, &notion).await;
+        let (status, body) = call(&server, "notion-fetch", json!({"id": PAGE})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"].as_str().unwrap().contains("rho notion init"),
+            "{body}"
+        );
         assert!(fake.lock().unwrap().seen.is_empty());
     }
 }
