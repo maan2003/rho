@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
-use rho_ledger::{Channel, Ledger, Secret};
+use rho_ledger::{Channel, Ledger, Pairing, Secret};
 
 use super::*;
 
@@ -192,6 +192,74 @@ async fn a_record_larger_than_one_wire_chunk_is_read_once_complete() {
         reader.streams.ledger().items(Channel::Notes)[0].bytes,
         payload
     );
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
+async fn the_first_device_makes_the_phrase_and_a_later_one_pairs_with_it() {
+    let (server, _dir) = host().await;
+    let mut first = device(None).await;
+    let a = connect(&server, &first);
+    let LedgerEvent::SecretMade(secret) = next(&mut first).await else {
+        panic!("the first device makes the phrase");
+    };
+    assert_eq!(first.streams.ledger().pairing(), Pairing::Paired);
+    // It has said nothing yet, and the host holds its log all the same.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.lengths().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("announced in time");
+    first
+        .streams
+        .append(Channel::Facts, vec![b"from the first".to_vec()])
+        .await;
+
+    let mut later = device(None).await;
+    later
+        .streams
+        .append(Channel::Facts, vec![b"before pairing".to_vec()])
+        .await;
+    let b = connect(&server, &later);
+    assert!(
+        matches!(next(&mut later).await, LedgerEvent::Appended(_)),
+        "its own write"
+    );
+    assert_eq!(next(&mut later).await, LedgerEvent::NeedsKey);
+    assert_eq!(later.streams.ledger().pairing(), Pairing::Unpaired);
+    assert!(
+        later.streams.ledger().secret().is_none(),
+        "a later device makes no phrase"
+    );
+
+    // Real words with a good checksum, but not the phrase.
+    let wrong = later.streams.set_secret(Secret::generate()).await;
+    assert_eq!(
+        wrong.unwrap_err().to_string(),
+        "this phrase does not open what your other devices wrote"
+    );
+    assert_eq!(later.streams.ledger().pairing(), Pairing::Unpaired);
+
+    later.streams.set_secret(secret).await.unwrap();
+    assert_eq!(later.streams.ledger().pairing(), Pairing::Paired);
+    let facts = |device: &Device| {
+        let mut facts: Vec<Vec<u8>> = device
+            .streams
+            .ledger()
+            .items(Channel::Facts)
+            .into_iter()
+            .map(|item| item.bytes)
+            .collect();
+        facts.sort();
+        facts
+    };
+    let both = vec![b"before pairing".to_vec(), b"from the first".to_vec()];
+    assert_eq!(facts(&later), both);
+    wait_for(&first, Channel::Facts, 2).await;
+    assert_eq!(facts(&first), both);
     a.abort();
     b.abort();
 }

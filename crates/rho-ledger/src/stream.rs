@@ -16,8 +16,15 @@ use crate::secret::Secret;
 #[derive(Debug, PartialEq, Eq)]
 pub enum LedgerEvent {
     Appended(Vec<Item>),
-    Unreadable { device: Option<DeviceId> },
+    Unreadable {
+        device: Option<DeviceId>,
+    },
+    /// Another device's writes arrived, and this device has no phrase to
+    /// read them with.
     NeedsKey,
+    /// This device is the first, and made the phrase: the one time anyone
+    /// is told it.
+    SecretMade(Secret),
 }
 pub struct LedgerStreams {
     ledger: Ledger,
@@ -111,6 +118,14 @@ impl LedgerStreams {
         let ServerFrame::Lengths { logs } = read_frame(&mut reader).await? else {
             anyhow::bail!("host did not answer hello with lengths")
         };
+        // A host that holds nothing, met by a device that holds nothing and
+        // has no phrase, means no other device has written yet.
+        if logs.is_empty()
+            && let Some(secret) = self.ledger.make_secret_if_first().await
+        {
+            let _ = self.events.unbounded_send(LedgerEvent::SecretMade(secret));
+            let _ = self.changed.send(());
+        }
         let mut host_lengths = logs;
         self.send_missing(&mut writer, &mut host_lengths).await?;
         // A frame read half-way must not be dropped when a change wakes the

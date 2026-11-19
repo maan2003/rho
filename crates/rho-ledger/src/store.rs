@@ -35,6 +35,15 @@ pub fn lengths(read: &ReadTxn) -> BTreeMap<LogId, u64> {
         .collect()
 }
 
+/// [`lengths`], inside a write.
+pub fn lengths_in(write: &mut WriteTxn) -> BTreeMap<LogId, u64> {
+    write
+        .open_table(LENGTHS)
+        .iter()
+        .map(|(log, length)| (LogId(log.value()), length.value()))
+        .collect()
+}
+
 /// How long `log` is, inside a write.
 pub fn length_in(write: &mut WriteTxn, log: LogId) -> u64 {
     write

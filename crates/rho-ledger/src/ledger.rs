@@ -55,6 +55,18 @@ struct Envelope {
     channel: Channel,
     payloads: Vec<Vec<u8>>,
 }
+/// Whether this device holds the user's secret phrase, as far as it can
+/// tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pairing {
+    /// It holds the phrase: what it says reaches the user's other devices.
+    Paired,
+    /// No phrase, and nothing from another device: it may be the first.
+    Alone,
+    /// No phrase, and it holds what another device wrote, which it cannot
+    /// read: what it says stays on it until the user types the phrase.
+    Unpaired,
+}
 #[derive(Default)]
 pub struct Received {
     pub items: Vec<Item>,
@@ -75,6 +87,31 @@ fn append_sealed(write: &mut rho_db::WriteTxn, secret: Secret, envelope: &Envelo
     write
         .open_table(READ)
         .insert(log.0, at + record.len() as u64);
+}
+
+/// What this device said before it held the phrase, taken out of the
+/// unsent table in the order it was said.
+fn take_unsent(write: &mut rho_db::WriteTxn) -> Vec<Envelope> {
+    let pending: Vec<_> = write
+        .open_table(UNSENT)
+        .iter()
+        .map(|(key, envelope)| (key.value(), envelope.value().into_owned()))
+        .collect();
+    let mut unsent = write.open_table(UNSENT);
+    for (index, _) in &pending {
+        unsent.remove(*index);
+    }
+    pending.into_iter().map(|(_, envelope)| envelope).collect()
+}
+
+fn opens_first_record(write: &mut rho_db::WriteTxn, key: &[u8; 32], log: LogId) -> bool {
+    let head = store::read_in(write, log, 0, 4);
+    let Ok(head) = <[u8; 4]>::try_from(head.as_slice()) else {
+        return false;
+    };
+    let len = u32::from_le_bytes(head) as usize;
+    let record = store::read_in(write, log, 0, len.saturating_add(4));
+    seal::open(key, log, 0, &record).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +172,51 @@ impl Ledger {
     }
     pub fn secret(&self) -> Option<Secret> {
         self.me().secret.map(Secret)
+    }
+    pub fn pairing(&self) -> Pairing {
+        match (self.secret(), self.lengths().is_empty()) {
+            (Some(_), _) => Pairing::Paired,
+            // Without a phrase a device's own writes stay unsent, so every
+            // log it holds is another device's.
+            (None, true) => Pairing::Alone,
+            (None, false) => Pairing::Unpaired,
+        }
+    }
+    /// Makes the phrase when this device is the first: it holds none and
+    /// knows of no other device. What it said so far is sealed with it, and
+    /// its log is started even when that is nothing, so that a host holds
+    /// a log from now on and the next device knows it is not the first.
+    pub async fn make_secret_if_first(&self) -> Option<Secret> {
+        let mut write = self.db.write().await;
+        let mut me = write
+            .open_table(SELF)
+            .get(())
+            .expect("ledger identity")
+            .value()
+            .into_owned();
+        if me.secret.is_some() || !store::lengths_in(&mut write).is_empty() {
+            return None;
+        }
+        let secret = Secret::generate();
+        me.secret = Some(secret.0);
+        write.open_table(SELF).insert((), SenValue::borrowed(&me));
+        let pending = take_unsent(&mut write);
+        if pending.is_empty() {
+            append_sealed(
+                &mut write,
+                secret,
+                &Envelope {
+                    device: me.device,
+                    channel: Channel::Facts,
+                    payloads: Vec::new(),
+                },
+            );
+        }
+        for envelope in pending {
+            append_sealed(&mut write, secret, &envelope);
+        }
+        write.commit();
+        Some(secret)
     }
     pub fn items(&self, channel: Channel) -> Vec<Item> {
         let read = self.db.read();
@@ -231,16 +313,23 @@ impl Ledger {
             );
             return Ok(Received::default());
         }
+        // Every log held is another device's. Twelve real words can still be
+        // the wrong phrase (the checksum misses one typo in sixteen), and a
+        // device that took one could never read the others, so a phrase
+        // must open what they wrote before it is kept.
+        let key = secret.derive(KEY_CONTEXT);
+        let held = store::lengths_in(&mut write);
+        anyhow::ensure!(
+            held.is_empty()
+                || held
+                    .keys()
+                    .any(|log| opens_first_record(&mut write, &key, *log)),
+            "this phrase does not open what your other devices wrote"
+        );
         me.secret = Some(secret.0);
         write.open_table(SELF).insert((), SenValue::borrowed(&me));
-        let pending: Vec<_> = write
-            .open_table(UNSENT)
-            .iter()
-            .map(|(key, envelope)| (key.value(), envelope.value().into_owned()))
-            .collect();
-        for (index, envelope) in pending {
+        for envelope in take_unsent(&mut write) {
             append_sealed(&mut write, secret, &envelope);
-            write.open_table(UNSENT).remove(index);
         }
         write.commit();
         let mut received = Received::default();
