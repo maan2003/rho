@@ -591,10 +591,17 @@ impl Frame {
             frame.undo_verdict(window, cx)
         }));
         rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
-        if self.attention.pairing() != Pairing::Paired {
-            rows.push(Row::run("", "pair this device", |frame, window, cx| {
+        match self.attention.secret() {
+            Some(secret) => rows.push(Row::run(
+                "",
+                "show my secret phrase",
+                move |frame, window, cx| {
+                    frame.show_secret(secret, "your secret phrase · enter:", window, cx)
+                },
+            )),
+            None => rows.push(Row::run("", "pair this device", |frame, window, cx| {
                 frame.prompt_pair(String::new(), None, window, cx)
-            }));
+            })),
         }
         rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
         rows.extend(self.current_surface().clone().rows(window, cx));

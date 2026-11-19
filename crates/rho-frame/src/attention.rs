@@ -143,6 +143,10 @@ impl Attention {
         self.streams.ledger().pairing()
     }
 
+    pub fn secret(&self) -> Option<Secret> {
+        self.streams.ledger().secret()
+    }
+
     /// Takes the phrase the user typed, and everything the other devices
     /// wrote that it opens.
     pub fn pair(&self, secret: Secret) -> anyhow::Result<()> {
@@ -258,7 +262,12 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         if let LedgerEvent::SecretMade(secret) = &event {
-            self.show_secret_once(*secret, window, cx);
+            self.show_secret(
+                *secret,
+                "write down your secret phrase; it is not shown again · enter:",
+                window,
+                cx,
+            );
         }
         let (touched, said) = self.attention.ledger_event(event);
         for line in said {
@@ -269,17 +278,24 @@ impl Frame {
         cx.notify();
     }
 
-    /// The first device made the phrase: the prompt line shows it, the one
-    /// time it is ever shown, for the user to write down. Enter or escape
-    /// puts it away. The phrase is a row under the question rather than the
-    /// question itself, since the journal keeps every question asked.
-    fn show_secret_once(&mut self, secret: Secret, window: &mut Window, cx: &mut Context<Self>) {
+    /// The phrase on the prompt line, for the user to write down: when the
+    /// first device makes it, and by name (`show my secret phrase`) on a
+    /// device that holds it. Enter or escape puts it away. The phrase is a
+    /// row under the question rather than the question itself, since the
+    /// journal keeps every question asked.
+    pub(crate) fn show_secret(
+        &mut self,
+        secret: Secret,
+        question: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let phrase = Candidate {
             value: secret.to_words(),
             description: "your secret phrase".to_owned(),
         };
         self.open_prompt(
-            "write down your secret phrase; it is not shown again · enter:",
+            question,
             Rc::new(move |_, _, _| vec![phrase.clone()]),
             Rc::new(|_, _, _, _| {}),
             window,
