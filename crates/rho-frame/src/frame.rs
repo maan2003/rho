@@ -14,7 +14,7 @@ use gpui::{
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostEvent, HostSpec};
 use rho_dealer::Address;
-use rho_ledger::stream::LedgerEvent;
+use rho_ledger::Pairing;
 use rho_window::history::History;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -132,16 +132,16 @@ impl Frame {
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
         };
-        let ledger = cx.spawn(async move |this, cx| {
+        let ledger = cx.spawn_in(window, async move |this, cx| {
             let mut events = ledger_events;
             while let Some(event) = events.next().await {
                 let mut batch = vec![event];
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
-                let updated = this.update(cx, |this, cx| {
+                let updated = this.update_in(cx, |this, window, cx| {
                     for event in batch {
-                        this.ledger_event(event, cx);
+                        this.ledger_event(event, window, cx);
                     }
                 });
                 if updated.is_err() {
@@ -174,14 +174,6 @@ impl Frame {
 
     pub fn home_address() -> Address {
         Address::new(FRAME_KIND, "home")
-    }
-
-    fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
-        let (touched, said) = self.attention.ledger_event(event);
-        for line in said {
-            self.echo(&line, StyleClass::SystemInfo, cx);
-        }
-        self.marks_moved(touched, cx);
     }
 
     // ---- surfaces ----
@@ -599,6 +591,11 @@ impl Frame {
             frame.undo_verdict(window, cx)
         }));
         rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
+        if self.attention.pairing() != Pairing::Paired {
+            rows.push(Row::run("", "pair this device", |frame, window, cx| {
+                frame.prompt_pair(String::new(), None, window, cx)
+            }));
+        }
         rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
         rows.extend(self.current_surface().clone().rows(window, cx));
         for system in self.systems.clone() {
@@ -944,11 +941,14 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
+        let unpaired = (self.attention.pairing() == Pairing::Unpaired)
+            .then_some("verdicts stay on this device until it is paired");
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.
         let right_words = lamp
             .into_iter()
+            .chain(unpaired)
             .chain(unwell.as_deref())
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
@@ -997,6 +997,7 @@ impl Frame {
             .items_center()
             .gap_3()
             .children(lamp.map(|lamp| div().text_color(status.warning).child(lamp)))
+            .children(unpaired.map(|text| div().text_color(colors.text_muted).child(text)))
             .children(unwell.map(|text| div().text_color(status.error).child(text)))
             .child(div().text_color(mode_color).child(mode));
         div()
