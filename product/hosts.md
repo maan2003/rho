@@ -2,6 +2,24 @@
 
 A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their chat and agents together. A host also carries what the user says about cards, and their notes, between devices that hold the user's secret phrase, sealed so the host cannot read them; see `deal.Card`.
 
+## bet Agents live on hosts, and the window attaches to many
+instead of: one server, or everything on the laptop.
+serves: Keep the work moving.
+because: agents must run when the laptop is shut, and the user has more than one machine; the window reaches each host over the network, and hosts do not trust each other.
+costs: a host can be away, and the user must attach each host on each device.
+
+## bet The user's own state lives on their devices, sealed
+instead of: the host keeping what the user said about each card, their notes, and their drafts.
+serves: Know what wants them, and where they were.
+because: a host runs code the user did not write, and an agent on it must never read what the user decided or wrote for themselves; the hosts carry bytes they cannot open.
+costs: two devices agree only when both hold the user's secret phrase.
+
+## bet The window holds the secrets
+instead of: a host holding the user's Slack token, browser session, or ssh login.
+serves: Reach anything.
+because: the window is the user's own device, and an agent that needs the user's login asks for it each time, so no agent uses it without the user's word.
+costs: a prompt that opens over whatever the user is doing, and a push that fails when they do not answer in a minute.
+
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
 principle: the user attaches the server as `rho`; its channels appear on Home, each tagged `rho`; when the connection drops, the top line says so in red until it is back.

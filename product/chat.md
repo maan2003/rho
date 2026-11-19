@@ -2,6 +2,18 @@
 
 Chat is where the user and the agents talk: on each host, channels, threads under them, and threads under those. A message goes to a thread, not to a person, and reaches the user only when it mentions them.
 
+## bet Chat is the medium
+instead of: a session per agent, a task board, a form, or a pull request to review.
+serves: Keep the work moving.
+because: the user runs many projects and many agents at once, and a thread keeps each piece of work, its agents, and every word said about it in one place that both can read.
+costs: an agent's progress is a stream of messages the user must read, not a status they can see at a glance.
+
+## bet An agent reaches the user only by mention
+instead of: every message from an agent asking for the user's attention.
+serves: Know what wants them, and where they were.
+because: agents write far more than the user can read; a mention that is an ask or a result is the agent's one way to say "you, now".
+costs: an agent that stops without a mention is not heard.
+
 ## concept Channel
 purpose: keep the threads of one subject or one project together, so the user reads them in one place.
 principle: the user makes a channel `fedi`; every thread about that project starts in it; on Home, `fedi` is one row that says what waits in it.

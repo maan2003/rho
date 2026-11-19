@@ -2,6 +2,12 @@
 
 rho reads and writes the user's Slack itself, so Slack's asks come to the same deal as the agents' and the user answers them in the same window. Slack stays the source: what the user reads, mutes, stars, or follows here, Slack shows the same way in every other Slack app.
 
+## bet The window is the Slack client
+instead of: a host relaying Slack, or Slack staying an app of its own.
+serves: Answer the world.
+because: the user answers Slack all day, and it must come to the same deal as the agents' asks; the window reads and writes Slack with the user's own token, and Slack stays the record of what is read.
+costs: a token and a cookie copied from a browser, and what Slack's apps can do that the window cannot.
+
 ## concept Workspace
 purpose: connect rho to one of the user's Slack workspaces.
 principle: the user runs `register workspace…`, gives the name, the token, and the cookie from their browser; the echo line reads `slack: acme registered`; Slack's asks start to come in as cards.
