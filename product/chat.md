@@ -48,6 +48,10 @@ A thread is named for the user: after its second message, the host gives it a sh
 
 The list of threads in a channel puts the threads with a mention of the user first, then the ones with something new, each group newest first.
 
+A thread shows what each of its agents is doing, and the user steers an agent from the thread, not from its transcript.
+
+status: the `with` line names the agents without their state, and steering is from the transcript's palette.
+
 ## concept Message
 purpose: carry one thing said in a thread, by the user or by an agent.
 sees: who wrote it, `you` or the agent's long code such as `q9tz45g2bcvs`, and when, such as `06:16` today or `Fri 2 Oct 07:27` before; then its text, with lists, bold, code, and links drawn; a picture is named as `[image · image/png]`; under it, `↳ 2 replies · name · time` when it has replies.
