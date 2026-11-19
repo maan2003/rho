@@ -38,3 +38,5 @@ inbound world, like Slack. The GUI is the product.
 - Vendored subtrees (`vendor/*`, `crates/senax-encoder`) are first-class
   code: fix things where they belong (`git-subtree` skill). Plain `rg`
   skips `vendor/`; name the path to search it.
+- This project uses the Product Model convention; consult the `product-model`
+  skill before designing, reviewing, or changing anything the user sees or does.

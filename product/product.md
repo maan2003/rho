@@ -1,0 +1,29 @@
+# rho
+
+rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, and lets them answer it, talk to agents, and look into what the agents do.
+
+## User
+
+One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work.
+
+They use two devices. On the laptop they drive everything with keys, the way they drive Vim and Emacs. On the phone they use one thumb and a bar of buttons along the bottom edge. Both show the same screens and the same state.
+
+They come back many times a day, often for a minute or two between other things, and sometimes stay for a long working session in one thread or one agent. Between visits they do not remember which thread asked what, or how long ago. The product keeps that for them: what waits and since when, what they said about each card, their unsent drafts, and where they were.
+
+## Values
+
+1. **Personal software, built for the long run.** rho has one user, so it can make unusual choices that take longer to learn when they are better for that one person over months of daily use. Test: Is this choice better for the user after a month of daily use, even if it costs more on the first day?
+2. **Little on screen.** The user is very busy and works on many projects at a time. Every extra thing on a screen costs them attention and can confuse them. Test: Does every thing on this screen help with the step the user is on?
+3. **Rare power, neatly tucked away.** Advanced functions stay reachable, but out of sight, because they are rare. The common flow stays short and smooth. Test: Can the user reach the rare function by name, without it adding a step or a thing on screen to the common flow?
+4. **The system does what it can.** Every screen and every flow is judged from the user's side: is there something the system could do for them here? Test: Is there a step in this flow that the system could do or decide on its own instead of the user?
+5. **An editor, not an app.** Every screen is text the user moves through with the same keys: the same motions, search, and Vim modes everywhere. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. Test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
+6. **Notes are the user's own.** A note holds only what the user typed. No agent reads it, and the machine never writes or changes its text. Test: After this change, is every word of every note still typed by the user, and still hidden from every agent?
+
+## Non-goals
+
+- A feed or inbox that the user scans from top to bottom to find what needs them. The deal hands them the next card instead.
+- A sidebar, tabs, or other fixed controls around the screen.
+- A list or dashboard of agents. An agent is reached from the thread it works in, or by name.
+- Labels, piles, and to-do lists for sorting things. A card is answered with a verdict and goes away.
+- Settings screens.
+- Other people as users. rho has no accounts, no sharing, and no view for anyone but its one user.
