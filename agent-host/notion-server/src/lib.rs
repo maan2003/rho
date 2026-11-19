@@ -611,7 +611,6 @@ mod tests {
         let (server, _) = server(true, &notion).await;
 
         for tool in [
-            "notion-search",
             "notion-move-pages",
             "notion-duplicate-page",
             "notion-fetch2",
@@ -651,7 +650,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listed,
-            json!({"tools": [{"name": "notion-fetch"}, {"name": "notion-get-comments"}]})
+            json!({"tools": [{"name": "notion-fetch"}, {"name": "notion-search"}, {"name": "notion-get-comments"}]})
         );
     }
 

@@ -34,9 +34,10 @@ page = await notion.call("notion-fetch", id=page_id)
 print(notion.text(page))               # Notion-flavoured Markdown
 ```
 
-The tools agents may call: `notion-create-pages`, `notion-fetch`,
-`notion-update-page`, `notion-create-comment`, `notion-get-comments`,
-`notion-get-users` (to mention someone), and `notion-get-async-task`.
+The tools agents may call: `notion-search` (to find a page),
+`notion-fetch`, `notion-create-pages`, `notion-update-page`,
+`notion-create-comment`, `notion-get-comments`, `notion-get-users` (to
+mention someone), and `notion-get-async-task`.
 `await notion.tools()` gives each one's `description` and `inputSchema`,
 Notion's own documentation: read it before a tool's first use.
 
