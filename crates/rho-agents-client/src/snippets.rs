@@ -30,11 +30,12 @@ const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
 
 /// What the model picker cycles through, first the default. Any other
 /// pair the policy takes can be typed.
-pub const RUNTIMES: [&str; 6] = [
+pub const RUNTIMES: [&str; 7] = [
     "sol-medium",
     "sol-high",
     "terra-medium",
     "astra-high",
+    "hydrogen-high",
     "opus-high",
     "fable-high",
 ];
@@ -288,6 +289,11 @@ mod tests {
         assert!(Runtime::parse("med-eng").is_err());
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");
+        assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
+        assert_eq!(
+            Runtime::parse("hydrogen-high").unwrap().kind,
+            RuntimeKind::Rho
+        );
         assert_eq!(cycle_runtime(RUNTIMES[RUNTIMES.len() - 1]), RUNTIMES[0]);
         assert_eq!(
             cycle_runtime("terra-xhigh"),
