@@ -215,6 +215,7 @@ async fn call(inference: &Accounts, body: Request, sender: &PolicySender) -> any
             send(sender, Message::Route(route)).await?;
             Reply::Done
         }
+        Request::GeminiAuth => Reply::GeminiAuth(inference.gemini_auth().await?),
     })
 }
 

@@ -15,7 +15,7 @@ Role = Literal["user", "tool"]
 
 class NativeRuntime(TypedDict):
     kind: Literal["native"]
-    model: Literal["sol", "terra", "astra"]
+    model: Literal["sol", "terra", "astra", "hydrogen"]
     effort: Literal["low", "medium", "high", "xhigh"]
     fast: bool
 

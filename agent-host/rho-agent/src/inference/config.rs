@@ -22,9 +22,9 @@ impl ReasoningEffort {
     }
 }
 
-/// Which Responses-API model a step talks to, by the name Python gives it.
-/// Each name follows its family's newest slug: an agent on `Astra` moves to a
-/// new Astra at its next request. Not part of [`InferenceProfile`]: agent
+/// Which model a step talks to, by the name Python gives it. Each name
+/// follows its family's newest slug: an agent on `Astra` moves to a new Astra
+/// at its next request. Not part of [`InferenceProfile`]: agent
 /// modes carry it separately, so persisted configs stay unchanged.
 ///
 /// The `rename`s keep the wire ids of the rows written when the variants were
@@ -37,6 +37,9 @@ pub enum InferenceModel {
     Terra,
     #[senax(rename = "Gpt6Astra")]
     Astra,
+    /// Gemini 4 Hydrogen, through an Antigravity account. `-sonar` is the
+    /// slug the free tier may call.
+    Hydrogen,
 }
 
 impl InferenceModel {
@@ -45,6 +48,7 @@ impl InferenceModel {
             Self::Sol => "gpt-6.2-sol",
             Self::Terra => "gpt-6.1-terra",
             Self::Astra => "gpt-6.2-astra",
+            Self::Hydrogen => "gemini-4-hydrogen-sonar",
         }
     }
 }

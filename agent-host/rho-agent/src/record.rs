@@ -192,6 +192,7 @@ impl Runtime {
                 InferenceModel::Sol => "sol",
                 InferenceModel::Terra => "terra",
                 InferenceModel::Astra => "astra",
+                InferenceModel::Hydrogen => "hydrogen",
             },
             Self::Claude { model, .. } => match model {
                 rho_claude::Model::Fable => "fable",

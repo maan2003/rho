@@ -18,6 +18,7 @@ impl AgentUsageModel {
     pub const TERRA: Self = Self(4);
     pub const LUNA: Self = Self(5);
     pub const ASTRA: Self = Self(7);
+    pub const HYDROGEN: Self = Self(8);
 
     pub fn name(self) -> &'static str {
         match self {
@@ -27,6 +28,7 @@ impl AgentUsageModel {
             Self::TERRA => "terra",
             Self::LUNA => "luna",
             Self::ASTRA => "astra",
+            Self::HYDROGEN => "hydrogen",
             _ => "unknown",
         }
     }
@@ -40,6 +42,7 @@ impl AgentUsageModel {
             Self::TERRA,
             Self::LUNA,
             Self::ASTRA,
+            Self::HYDROGEN,
         ]
         .into_iter()
         .find(|model| model.name() == name)

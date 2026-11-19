@@ -18,6 +18,7 @@ pub struct Accounts(Arc<HostInner>);
 #[derive(Debug)]
 struct HostInner {
     accounts: Arc<AccountManager>,
+    gemini: crate::gemini::Login,
     routes: RouteSelector,
     responses_base_url: Arc<str>,
     credentials: OnceLock<watch::Receiver<crate::CredentialSnapshot>>,
@@ -56,6 +57,7 @@ pub(crate) enum PolicyRequest {
         route: DialRoute,
         selected: Option<SelectedAuth>,
     },
+    GeminiAuth,
 }
 
 #[derive(Encode, Decode)]
@@ -65,6 +67,7 @@ pub(crate) enum PolicyReply {
     RateLimited(bool),
     Done,
     Error(String),
+    GeminiAuth(crate::gemini::GeminiAuth),
 }
 
 /// A local request to the workset IPC client, not another transport reader.
@@ -95,6 +98,7 @@ impl Accounts {
         }
         let host = Self(Arc::new(HostInner {
             accounts,
+            gemini: crate::gemini::Login::open_default()?,
             routes: RouteSelector::new(Some(db)),
             responses_base_url: config.responses_base_url,
             credentials: OnceLock::new(),
@@ -154,7 +158,13 @@ impl Accounts {
                 self.report_connect_failure(route, selected.as_ref()).await;
                 PolicyReply::Done
             }
+            PolicyRequest::GeminiAuth => PolicyReply::GeminiAuth(self.gemini_auth().await?),
         })
+    }
+
+    /// The Antigravity login's token, renewed here when it is due.
+    pub(crate) async fn gemini_auth(&self) -> anyhow::Result<crate::gemini::GeminiAuth> {
+        self.0.gemini.resolve().await
     }
 
     pub fn route_updates(&self) -> watch::Receiver<RouteSelection> {
@@ -389,6 +399,13 @@ impl Inference {
                 _ = closed.changed() => anyhow::bail!("agent connection closed"),
                 change = credentials.changed() => change?,
             }
+        }
+    }
+
+    pub(crate) async fn gemini_auth(&self) -> anyhow::Result<crate::gemini::GeminiAuth> {
+        match self.request(PolicyRequest::GeminiAuth).await? {
+            PolicyReply::GeminiAuth(auth) => Ok(auth),
+            _ => anyhow::bail!("unexpected credential service reply"),
         }
     }
 
