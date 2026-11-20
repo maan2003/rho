@@ -117,7 +117,8 @@ def on_notebook(agent, ns):
             if thread:
                 _rho.send_mail(agent.id, thread[0], text, **address)
             else:
-                thread.append(_rho.send_mail(agent.id, None, text, **address))
+                message, _unanswered = _rho.send_mail(agent.id, None, text, **address)
+                thread.append(message)
     ns["human"] = Human()
 
 hooks.on_notebook = on_notebook
