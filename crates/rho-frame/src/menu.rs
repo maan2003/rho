@@ -222,6 +222,28 @@ impl Rows {
         self.rows.is_empty()
     }
 
+    /// The palette runs commands directly instead of opening a menu.
+    pub fn into_commands(self) -> Vec<Row> {
+        let mut result = Vec::new();
+        self.append_commands("", &mut result);
+        result
+    }
+
+    fn append_commands(self, parent: &str, result: &mut Vec<Row>) {
+        let prefix = format!("{parent}{} › ", self.title);
+        for mut row in self.rows {
+            match &mut row.pick {
+                Pick::Menu(menu) => menu.clone().append_commands(&prefix, result),
+                Pick::Run { label, .. } | Pick::Infix { label, .. } => {
+                    *label = format!("{prefix}{label}");
+                    row.key.clear();
+                    row.shortcut = None;
+                    result.push(row);
+                }
+            }
+        }
+    }
+
     /// The block under the point: each item's action is its row's index.
     pub(crate) fn transient(&self) -> Transient<usize> {
         let mut transient = Transient::new(self.title.clone());

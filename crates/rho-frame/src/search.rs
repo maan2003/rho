@@ -42,7 +42,7 @@ impl Frame {
                 }
                 let search = Search { query, backwards };
                 frame.search = Some(search.clone());
-                frame.find_match(&search, window, cx);
+                frame.find_match(&search, true, window, cx);
             }),
             window,
             cx,
@@ -64,19 +64,25 @@ impl Frame {
             backwards: search.backwards != reverse,
             ..search
         };
-        self.find_match(&search, window, cx);
+        self.find_match(&search, false, window, cx);
     }
 
-    fn find_match(&mut self, search: &Search, window: &mut Window, cx: &mut Context<Self>) {
+    fn find_match(
+        &mut self,
+        search: &Search,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = self.active_editor(cx);
         let Found {
             matches,
             at,
             wrapped,
-        } = found(&editor, search, cx);
+        } = found(&editor, search, first, cx);
         let Some(at) = at else {
             editor.update(cx, |editor, cx| {
-                editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+                editor.clear_highlights(HighlightKey::BufferSearchHighlights, cx);
             });
             self.echo(
                 &format!("search: no {}", search.query),
@@ -94,18 +100,18 @@ impl Frame {
                         ..snapshot.anchor_before(MultiBufferOffset(range.end))
                 })
                 .collect::<Vec<_>>();
-            let point = anchors[at].start;
-            editor.highlight_background(
+            let selected = anchors[at].clone();
+            editor.highlight_text(
                 HighlightKey::BufferSearchHighlights,
-                &anchors,
-                |_, theme| theme.colors().search_match_background.into(),
+                anchors,
+                StyleClass::UserMessage.resolve(cx),
                 cx,
             );
             editor.change_selections(
                 SelectionEffects::scroll(Autoscroll::center()),
                 window,
                 cx,
-                |selections| selections.select_anchor_ranges([point..point]),
+                |selections| selections.select_anchor_ranges([selected]),
             );
         });
         let echo = match wrapped {
@@ -126,14 +132,14 @@ struct Found {
     wrapped: bool,
 }
 
-fn found(editor: &Entity<Editor>, search: &Search, cx: &mut Context<Frame>) -> Found {
+fn found(editor: &Entity<Editor>, search: &Search, first: bool, cx: &mut Context<Frame>) -> Found {
     editor.update(cx, |editor, cx| {
         let display = editor.display_snapshot(cx);
         let snapshot = display.buffer_snapshot();
         let point = editor
             .selections
             .newest_anchor()
-            .head()
+            .start
             .to_offset(snapshot)
             .0;
         // The text is the buffer's source, which holds what the reader
@@ -151,7 +157,24 @@ fn found(editor: &Entity<Editor>, search: &Search, cx: &mut Context<Frame>) -> F
             .into_iter()
             .filter(|found| shown(found.start))
             .collect::<Vec<_>>();
-        let (at, wrapped) = match next(&matches, point, search.backwards) {
+        let editable = |offset| {
+            Editor::point_is_editable(
+                snapshot,
+                snapshot.offset_to_point(MultiBufferOffset(offset)),
+            )
+        };
+        let draft = first && !snapshot.is_singleton() && editable(point);
+        let selection = if draft {
+            next_in_draft(&matches, point, search.backwards, editable).or_else(|| {
+                // The history precedes the draft. The first history match
+                // can be reached directly going back, but going forward
+                // from the draft wraps into it.
+                next(&matches, point, search.backwards)
+            })
+        } else {
+            next(&matches, point, search.backwards)
+        };
+        let (at, wrapped) = match selection {
             Some((at, wrapped)) => (Some(at), wrapped),
             None => (None, false),
         };
@@ -218,6 +241,32 @@ fn next(matches: &[Range<usize>], point: usize, backwards: bool) -> Option<(usiz
     })
 }
 
+/// Start in the draft even if the point is after its last match. Only
+/// `n`/`N` advance into the rest of the buffer after the first selection.
+fn next_in_draft(
+    matches: &[Range<usize>],
+    point: usize,
+    backwards: bool,
+    editable: impl Fn(usize) -> bool,
+) -> Option<(usize, bool)> {
+    let draft = matches
+        .iter()
+        .enumerate()
+        .filter(|(_, hit)| editable(hit.start));
+    if backwards {
+        draft
+            .clone()
+            .rfind(|(_, hit)| hit.start <= point)
+            .or_else(|| draft.last())
+    } else {
+        draft
+            .clone()
+            .find(|(_, hit)| hit.start >= point)
+            .or_else(|| draft.into_iter().next())
+    }
+    .map(|(index, _)| (index, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +276,17 @@ mod tests {
             .into_iter()
             .map(|range| &text[range])
             .collect()
+    }
+
+    #[test]
+    fn initial_search_stays_in_the_draft_without_reporting_a_wrap() {
+        let matches = [3..6, 20..23, 32..35];
+        let draft = |at| at >= 15;
+        assert_eq!(next_in_draft(&matches, 39, false, draft), Some((1, false)));
+        assert_eq!(next_in_draft(&matches, 24, false, draft), Some((2, false)));
+        assert_eq!(next_in_draft(&matches, 16, true, draft), Some((2, false)));
+        assert_eq!(next_in_draft(&matches[..1], 19, false, draft), None);
+        assert_eq!(next(&matches, 32, false), Some((0, true)));
     }
 
     #[test]

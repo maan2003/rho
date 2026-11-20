@@ -132,6 +132,28 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// frame already holds the screen in history.
     fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    fn show_search_match(
+        &mut self,
+        point: &crate::SearchPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let crate::SearchPoint::Line(row) = *point else {
+            return;
+        };
+        if let Some(editor) = self.editor(cx) {
+            editor.update(cx, |editor, cx| {
+                let point = language::Point::new(row, 0);
+                editor.change_selections(
+                    editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([point..point]),
+                );
+            });
+        }
+    }
+
     fn phone_send(&mut self, _cx: &mut Context<Self>) -> Option<PhoneSend> {
         None
     }
@@ -158,6 +180,7 @@ trait SurfaceHandle {
     fn heading(&self, cx: &App) -> Option<String>;
     fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
+    fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
 }
@@ -221,6 +244,12 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
         self.update(cx, |surface, cx| surface.show_card(card, window, cx));
+    }
+
+    fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App) {
+        self.update(cx, |surface, cx| {
+            surface.show_search_match(point, window, cx)
+        })
     }
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
@@ -316,6 +345,15 @@ impl AnySurface {
 
     pub(crate) fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
         self.0.show_card(card, window, cx);
+    }
+
+    pub(crate) fn show_search_match(
+        &self,
+        point: &crate::SearchPoint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.show_search_match(point, window, cx)
     }
 
     pub(crate) fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {

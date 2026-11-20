@@ -200,8 +200,22 @@ impl HostMail {
     /// A root that was itself addressed to the user is mail, not a project.
     pub fn is_project(&self, id: MessageId) -> bool {
         self.message(id).is_some_and(|root| {
-            root.parent.is_none() && root.revision != Revision::Deleted && !root.to_user()
+            root.parent.is_none() && root.revision != Revision::Deleted && root.mentions.is_empty()
         })
+    }
+
+    /// Standalone messages addressed to agents (including maintenance
+    /// requests) and direct agent threads are visible from an agent's
+    /// history, not projects or results in the human's catalogue.
+    pub fn agent_only(&self, id: MessageId) -> bool {
+        let Some(mail) = self.message(id) else {
+            return false;
+        };
+        (mail.parent.is_none() && !mail.mentions.is_empty() && !mail.to_user())
+            || mail
+                .mentions
+                .iter()
+                .any(|mention| matches!(mention, rho_agent_types::Mention::Direct(_)))
     }
 
     pub fn message(&self, id: MessageId) -> Option<&Message> {
@@ -436,6 +450,23 @@ mod tests {
                 content: vec![ContentPart::Text { text: text.into() }],
             },
         )
+    }
+
+    #[test]
+    fn an_addressed_maintenance_root_is_not_a_project() {
+        let mut mail = HostMail::default();
+        let mut maintenance = posted(1, None, Address::User, "Restart fixture");
+        let ChatEvent::Posted { mentions, .. } = &mut maintenance.event else {
+            unreachable!()
+        };
+        mentions.push(rho_agent_types::Mention::Agent(agent(1)));
+        mail.tell(&maintenance);
+        mail.tell(&posted(2, Some(1), Address::Agent(agent(1)), "Restarted"));
+        mail.tell(&posted(3, None, Address::User, "Calendar repairs"));
+        assert!(!mail.is_project(id(1)));
+        assert!(mail.agent_only(id(1)));
+        assert!(mail.root_named("Restart fixture").is_none());
+        assert_eq!(mail.root_named("Calendar repairs"), Some(id(3)));
     }
 
     #[test]

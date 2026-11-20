@@ -19,15 +19,18 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
-    ThreadWork,
+    Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message,
+    MessageId, ThreadWork,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::desk::MovingThread;
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
-use rho_frame::{AnySurface, Candidate, Found, FoundThread, FrameLink, Point, Row, System};
+use rho_frame::{
+    AnySurface, Candidate, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint,
+    System, TextKind, TextQuery,
+};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
@@ -1115,6 +1118,80 @@ impl System for MailSystem {
         });
     }
 
+    fn find_text(
+        &self,
+        query: &TextQuery<'_>,
+        current: &Address,
+        _marks: &Marks,
+        _cx: &App,
+    ) -> Vec<FoundText> {
+        if !query.includes(TextKind::Mail) {
+            return Vec::new();
+        }
+        let mut results = Vec::new();
+        if let Some(thread) = self.thread_of(current)
+            && let Some((row, line)) =
+                query.matching_line(self.draft(thread.host, Some(thread.message)))
+        {
+            results.push(FoundText {
+                address: current.clone(),
+                title: "Draft".into(),
+                line: line.to_owned(),
+                point: SearchPoint::Draft(row),
+                time: 0,
+            });
+        }
+        for (host, alias) in self.hosts() {
+            let Some(chat) = self.logs.get(&host) else {
+                continue;
+            };
+            for mail in chat.messages() {
+                if chat.is_project(mail.id)
+                    || mail.revision == rho_agent_types::Revision::Deleted
+                    || chat.agent_only(mail.id)
+                    || chat.agent_only(chat.root_of(mail.id))
+                {
+                    continue;
+                }
+                let words = mail.text();
+                let Some((row, line)) = query.matching_line(&words) else {
+                    continue;
+                };
+                let thread = mail
+                    .parent
+                    .filter(|parent| !chat.is_project(*parent))
+                    .unwrap_or(mail.id);
+                let id = ThreadId {
+                    host,
+                    message: thread,
+                };
+                let Some(subject) = chat.name(chat.thread_of(thread)) else {
+                    continue;
+                };
+                let project = cards::context(chat, thread, &alias);
+                results.push(FoundText {
+                    address: id.address(),
+                    title: if project.is_empty() {
+                        format!("Mail · {subject}")
+                    } else {
+                        format!("Mail · {subject} · {project}")
+                    },
+                    line: line.to_owned(),
+                    point: SearchPoint::Mail {
+                        message: ThreadId {
+                            host,
+                            message: mail.id,
+                        }
+                        .address(),
+                        line: row,
+                    },
+                    time: mail.version().1.0,
+                });
+            }
+        }
+        results
+    }
+
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         let mut found = Vec::new();
         for (host, alias) in self.hosts() {
@@ -1129,7 +1206,7 @@ impl System for MailSystem {
                 let Some(mail) = chat.message(id) else {
                     continue;
                 };
-                if mail.revision == rho_agent_types::Revision::Deleted {
+                if mail.revision == rho_agent_types::Revision::Deleted || chat.agent_only(id) {
                     continue;
                 }
                 let Some(subject) = chat.name(id) else {

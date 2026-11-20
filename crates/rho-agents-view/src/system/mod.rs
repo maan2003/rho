@@ -29,7 +29,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{AgentId, EndpointId, MessageId};
+use rho_agent_types::{Address as Party, AgentId, EndpointId, Message, MessageId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
@@ -1232,36 +1232,59 @@ impl System for AgentsSystem {
         if self.host_of(thread.host).is_none() {
             return rows;
         }
-        rows.push(Row::menu(
-            "a",
+        let (desk, mail) = {
+            let system = self.mail.read(cx);
+            let here = system.thread_of(&point.surface);
+            let chat = system.host_mail(thread.host);
+            let desk = here.is_none()
+                || here
+                    .is_some_and(|place| chat.is_some_and(|chat| chat.is_project(place.message)));
+            let author = |mail: &Message| match mail.from {
+                Party::Agent(agent) | Party::System { agent, .. } => Some(agent),
+                _ => None,
+            };
+            let written = chat.and_then(|chat| {
+                let mail = if desk {
+                    std::iter::once(thread.message)
+                        .chain(chat.children(Some(thread.message)).iter().copied())
+                        .filter_map(|id| chat.message(id))
+                        .filter(|mail| author(mail).is_some() && !chat.agent_only(mail.id))
+                        .max_by_key(|mail| mail.version().0)
+                } else {
+                    chat.message(thread.message)
+                }?;
+                Some((author(mail)?, mail.clone()))
+            });
+            (desk, written)
+        };
+        if let Some((agent, mail)) = mail
+            && self.registry.mirrored(agent).is_some()
+        {
+            if desk {
+                let system = self.mail.clone();
+                rows.push(Row::run("", "look into the work", move |_, _, cx| {
+                    system.update(cx, |_, cx| {
+                        cx.emit(MailEvent::Inspect {
+                            agent,
+                            mail: mail.clone(),
+                        })
+                    });
+                }));
+            } else {
+                rows.extend(surface::steer_rows(this.clone(), agent));
+            }
+        }
+        rows.extend(
             start::rows(
                 self,
-                this.clone(),
+                this,
                 thread,
                 start::Origin::Mail,
                 start::Runtimes::Ask,
                 cx,
-            ),
-        ));
-        let draft = !self
-            .mail
-            .read(cx)
-            .draft(thread.host, Some(thread.message))
-            .trim()
-            .is_empty();
-        if draft {
-            rows.push(Row::menu(
-                "shift-s",
-                start::rows(
-                    self,
-                    this,
-                    thread,
-                    start::Origin::Draft(rho_mail::ui::IdeaSource::ProjectDraft),
-                    start::Runtimes::Ask,
-                    cx,
-                ),
-            ));
-        }
+            )
+            .into_commands(),
+        );
         rows
     }
 

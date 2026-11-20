@@ -3,7 +3,6 @@
 Notes are the user's memory: text only they write and only their devices hold. They live apart from the work and can be found from the user's palette. A note is about nothing and listed in `Notes`, or about a `mail.Mail` and also a private reply beside it.
 
 ## concept Note
-status: the palette finds notes by title only; full-text search is on `Notes`.
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
 principle: the user thinks of something to check tomorrow; they run `new note` and type it; it is kept a moment after they stop typing; the next day they run `notes`, and it is at the top of the list.
 sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text.

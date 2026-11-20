@@ -35,7 +35,6 @@ When a host drops, the line names it and says `reconnecting · 12s` in red, coun
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
-status: one prompt lists commands, places and notes, and a phone tap chooses a row. Full-text search across mail and notes is not built.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
 sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits (left out on `desk.Desk`, where it is already in view), then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or the project's latest words otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently visited. The current place ranks last among matching places. A place whose name starts with the typed word comes before a recent place that only contains it, and a match on words in order beats one out of order. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one; on a narrow window it shows its name only. The draft of the current thread is searched before the mail history.
@@ -49,7 +48,6 @@ rejected:
 When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
 ## screen Palette
-status: full-text search across mail and notes is not built; the matching mail line in the mock does not appear.
 answers: where can the user go, or what can they run, with these words?
 shows:
 - the query in the `Palette` prompt, with the selected position and total at its right end
@@ -126,7 +124,6 @@ does:
 The snooze button opens the snooze times as a sheet, the same rows as on the laptop, each with its time.
 
 ## flow Go to something by name
-status: the prompt reaches places by name; it cannot search the full text of mails or notes yet.
 runs: 20 a day
 day: Reach anything.
 when: the user knows the place they want or remembers words from a mail or note
