@@ -506,7 +506,7 @@ impl Watch<'_> {
                 }
                 let text = text_of(&message.content);
                 let agent = format!("{from:?}");
-                if from == self.id && message.mentions(Address::User).is_some() {
+                if from == self.id && message.to_user() {
                     if !self.final_answer.is_empty() {
                         self.final_answer.push('\n');
                     }
