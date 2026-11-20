@@ -1,12 +1,16 @@
 //! The desk shows the dealer's hand, recent status changes, and the idea box.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Window, div};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, Pixels, TextRun, Window,
+    WindowTextSystem, div, px,
+};
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
@@ -15,6 +19,7 @@ use rho_dealer::rank::Hand;
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
+use crate::phone::Layout;
 use crate::surface::{Subject, Surface};
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
@@ -90,12 +95,13 @@ pub(crate) fn desk_rows(
             target: DeskTarget::Card(card.address.clone()),
         })
         .collect();
-    // A moving row with a waiting card wears the first such card's words
-    // even when that card is below the desk's seven waiting rows.
-    let mut by_thread = HashMap::new();
-    for card in &hand.cards {
-        by_thread.entry(&card.address).or_insert(card);
-    }
+    // The hand, not just the visible seven cards, tells us what is waiting.
+    let waiting_threads = hand
+        .cards
+        .iter()
+        .map(|card| &card.address)
+        .collect::<HashSet<_>>();
+    moving.retain(|thread| !waiting_threads.contains(&thread.thread));
     moving.sort_by(|a, b| (Reverse(a.changed), &a.thread).cmp(&(Reverse(b.changed), &b.thread)));
     let more = moving.len().saturating_sub(MOVING_LIMIT);
     let mut next_age = None;
@@ -103,27 +109,16 @@ pub(crate) fn desk_rows(
         .into_iter()
         .take(MOVING_LIMIT)
         .map(|thread| {
-            let card = by_thread.get(&thread.thread);
-            let words = match card {
-                Some(card) => card.label.clone(),
-                None => {
-                    let (age, next) = age(thread.changed, now);
-                    if let Some(next) = next {
-                        next_age = Some(next_age.map_or(next, |other: Timestamp| other.min(next)));
-                    }
-                    format!("{} · {age}", thread.status)
-                }
-            };
-            let target = match card {
-                Some(card) => DeskTarget::Card(card.address.clone()),
-                None => DeskTarget::Thread(thread.thread.clone()),
-            };
+            let (age, next) = age(thread.changed, now);
+            if let Some(next) = next {
+                next_age = Some(next_age.map_or(next, |other: Timestamp| other.min(next)));
+            }
             DeskRow {
+                target: DeskTarget::Thread(thread.thread.clone()),
                 key: DeskKey::Moving(thread.thread),
                 subject: thread.subject,
-                words,
+                words: format!("{} · {age}", thread.status),
                 project: thread.project,
-                target,
             }
         })
         .collect();
@@ -187,7 +182,43 @@ pub(crate) struct DeskView {
     transcript: Transcript<DeskKey, DeskClass, DeskTarget>,
     editor: Entity<Editor>,
     rows: DeskRows,
-    width: usize,
+    layout: DeskLayout,
+    text_system: Arc<WindowTextSystem>,
+}
+
+#[derive(PartialEq, Eq)]
+struct DeskLayout {
+    viewport: Pixels,
+    font: Font,
+    font_size: Pixels,
+}
+
+impl DeskLayout {
+    fn read(editor: &Entity<Editor>, window: &Window, cx: &mut App) -> Self {
+        editor.update(cx, |editor, cx| {
+            let text = &editor.style(cx).text;
+            Self {
+                viewport: window.viewport_size().width,
+                font: text.font(),
+                font_size: text.font_size.to_pixels(window.rem_size()),
+            }
+        })
+    }
+
+    fn measure(&self, text_system: &WindowTextSystem, text: &str) -> Pixels {
+        text_system
+            .layout_line(
+                text,
+                self.font_size,
+                &[TextRun {
+                    len: text.len(),
+                    font: self.font.clone(),
+                    ..Default::default()
+                }],
+                None,
+            )
+            .width
+    }
 }
 
 impl DeskView {
@@ -224,12 +255,13 @@ impl DeskView {
             editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             editor
         });
-        let width = row_width(&editor, window, cx);
+        let layout = DeskLayout::read(&editor, window, cx);
         let mut view = Self {
             transcript: Transcript::new(buffer),
             editor,
             rows: DeskRows::default(),
-            width,
+            layout,
+            text_system: window.text_system().clone(),
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // The empty desk still answers what waits.
@@ -286,27 +318,27 @@ impl DeskView {
             DeskKey::WaitHeader,
             format!("{} wait", self.rows.wait_count),
         )];
-        let field_width = |field: fn(&DeskRow) -> &str| {
-            self.rows
-                .waiting
-                .iter()
-                .chain(&self.rows.moving)
-                .map(|row| first_line(field(row)).chars().count())
-                .max()
-                .unwrap_or(0)
-        };
-        let subject_width = field_width(|row| &row.subject).min(40);
-        let project_width = field_width(|row| &row.project).min(30);
-        let words_width = field_width(|row| &row.words).min(42);
-        let compact = subject_width + project_width + words_width + 4 > self.width;
-        let row_item = |row: &DeskRow| {
-            if compact {
-                row.compact(self.width, project_width)
-            } else {
-                row.wide(subject_width, words_width, project_width)
+        let rows = || self.rows.waiting.iter().chain(&self.rows.moving);
+        let measure = |text: &str| self.layout.measure(&self.text_system, text);
+        let ch = measure("0");
+        // Leave room for the editor's gutter.
+        let room = (self.layout.viewport - ch * 4.).max(px(0.));
+        let row_item: Box<dyn Fn(&DeskRow) -> _> = match Layout::of(self.layout.viewport) {
+            Layout::Phone => {
+                let width = (room / ch) as usize;
+                let project_width = rows()
+                    .map(|row| first_line(&row.project).chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .min(30);
+                Box::new(move |row| row.compact(width, project_width))
+            }
+            Layout::Desktop => {
+                let wide = WideRow::new(room, ch, rows().map(|row| row.words.as_str()), measure);
+                Box::new(move |row| wide.item(row))
             }
         };
-        items.extend(self.rows.waiting.iter().map(row_item));
+        items.extend(self.rows.waiting.iter().map(&row_item));
         if !self.rows.moving.is_empty() {
             items.push(line(DeskKey::Gap, String::new()));
             items.push(line(DeskKey::MovingHeader, "moving".into()));
@@ -357,30 +389,6 @@ impl DeskRow {
             DeskTarget::Card(_) => DeskClass::Label,
             DeskTarget::Thread(_) => DeskClass::Muted,
         }
-    }
-
-    fn wide(
-        &self,
-        subject_width: usize,
-        words_width: usize,
-        project_width: usize,
-    ) -> Item<DeskKey, DeskClass, DeskTarget> {
-        let (text, styles) = columns(&[
-            (
-                cut(&self.subject, subject_width),
-                DeskClass::Title,
-                subject_width,
-            ),
-            (
-                cut_words(&self.words, words_width),
-                self.words_class(),
-                words_width,
-            ),
-            (cut(&self.project, project_width), DeskClass::Muted, 0),
-        ]);
-        Item::new(self.key.clone(), text)
-            .with_styles(styles)
-            .with_lines(vec![self.target.clone()])
     }
 
     fn compact(&self, width: usize, project_width: usize) -> Item<DeskKey, DeskClass, DeskTarget> {
@@ -438,18 +446,104 @@ fn cut(text: &str, width: usize) -> String {
     }
 }
 
-/// How many characters of the desk's text fit across the window. Measured on
-/// `0`, the font's average width, less two for the editor's gutter.
-fn row_width(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> usize {
-    let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
-    let font_size = style.text.font_size.to_pixels(window.rem_size());
-    let font_id = window.text_system().resolve_font(&style.text.font());
-    let advance = window
-        .text_system()
-        .ch_advance(font_id, font_size)
-        .expect("the editor's font resolves");
-    let columns = f32::from(window.viewport_size().width) / f32::from(advance);
-    (columns as usize).saturating_sub(4)
+/// Laptop rows share a fixed subject column even when the hand changes. An
+/// editor line is plain text: shape the cells in its actual font before using
+/// spaces to position the next cell.
+struct WideRow<M> {
+    measure: M,
+    subject: Pixels,
+    words: Pixels,
+    project: Pixels,
+    space: Pixels,
+}
+
+impl<M: Fn(&str) -> Pixels> WideRow<M> {
+    fn new<'a>(room: Pixels, ch: Pixels, words: impl Iterator<Item = &'a str>, measure: M) -> Self {
+        let space = measure(" ");
+        let subject = (room * (1. / 3.)).min(ch * 30.);
+        let words = (words
+            .map(|text| measure(first_line(text)))
+            .max()
+            .unwrap_or_default()
+            + space * 2.)
+            .min(ch * 42.)
+            .min((room - subject) * (2. / 3.));
+        Self {
+            subject,
+            words,
+            project: (room - subject - words).min(ch * 30.),
+            space,
+            measure,
+        }
+    }
+
+    fn item(&self, row: &DeskRow) -> Item<DeskKey, DeskClass, DeskTarget> {
+        let room = |cell: Pixels| (cell - self.space * 2.).max(px(0.));
+        let subject = self.cut(&row.subject, room(self.subject), "");
+        let mut text = subject;
+        let title_end = text.len();
+        self.pad(&mut text, self.subject);
+
+        let words_start = text.len();
+        let words = first_line(&row.words);
+        if (self.measure)(words) <= room(self.words) {
+            text.push_str(words);
+        } else if let DeskTarget::Thread(_) = row.target
+            && let Some((status, age)) = words.rsplit_once(" · ")
+        {
+            text.push_str(&self.cut(status, room(self.words), &format!(" · {age}")));
+        } else {
+            text.push_str(&self.cut(words, room(self.words), ""));
+        }
+        let words_end = text.len();
+        let project = self.cut(&row.project, self.project, "");
+        let mut styles = vec![
+            (DeskClass::Title, 0..title_end),
+            (row.words_class(), words_start..words_end),
+        ];
+        if !project.is_empty() {
+            self.pad(&mut text, self.subject + self.words);
+            let start = text.len();
+            text.push_str(&project);
+            styles.push((DeskClass::Muted, start..text.len()));
+        }
+        text.truncate(text.trim_end().len());
+        styles.retain(|(_, range)| !range.is_empty() && range.end <= text.len());
+        Item::new(row.key.clone(), text)
+            .with_styles(styles)
+            .with_lines(vec![row.target.clone()])
+    }
+
+    fn cut(&self, text: &str, room: Pixels, suffix: &str) -> String {
+        let text = first_line(text);
+        let mut shown = format!("{text}{suffix}");
+        if (self.measure)(&shown) <= room {
+            return shown;
+        }
+        shown = format!("…{suffix}");
+        if (self.measure)(&shown) > room {
+            return String::new();
+        }
+        for end in text.char_indices().skip(1).map(|(end, _)| end) {
+            let prefix = text[..end].trim_end();
+            let candidate = format!("{prefix}…{suffix}");
+            if (self.measure)(&candidate) > room {
+                break;
+            }
+            shown = candidate;
+        }
+        shown
+    }
+
+    fn pad(&self, text: &mut String, column: Pixels) {
+        let remaining = (column - (self.measure)(text)).max(px(0.));
+        // The editor shows non-ASCII spaces as invisible characters, so
+        // round to the nearest position plain spaces can represent.
+        text.extend(std::iter::repeat_n(
+            ' ',
+            (remaining / self.space).round() as usize,
+        ));
+    }
 }
 
 fn line(key: DeskKey, text: String) -> Item<DeskKey, DeskClass, DeskTarget> {
@@ -481,9 +575,9 @@ fn columns(cells: &[(String, DeskClass, usize)]) -> (String, Vec<(DeskClass, Ran
 
 impl Render for DeskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = row_width(&self.editor, window, cx);
-        if width != self.width {
-            self.width = width;
+        let layout = DeskLayout::read(&self.editor, window, cx);
+        if layout != self.layout {
+            self.layout = layout;
             self.transcript.reconcile(self.items(), cx);
         }
         div()
@@ -563,9 +657,9 @@ mod tests {
     }
 
     #[test]
-    fn moving_uses_status_order_and_wears_a_card_even_below_the_waiting_cutoff() {
+    fn moving_excludes_the_whole_hand_before_taking_and_counting_rows() {
         let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
-        let moving = [28, 7, 32, 3, 14, 26, 4, 12, 6, 18, 11, 5]
+        let moving = [28, 7, 32, 3, 14, 26, 4, 12, 6, 18, 11, 5, 9, 35]
             .into_iter()
             .map(|n| MovingThread {
                 thread: address(n),
@@ -576,10 +670,14 @@ mod tests {
             })
             .collect();
         let hand = Hand {
-            cards: [50, 42, 45, 61, 80, 19, 99, 6].map(card).to_vec(),
+            cards: [3, 42, 45, 61, 80, 19, 99, 6].map(card).to_vec(),
             next_change: None,
         };
         let rows = desk_rows(&hand, moving, |_| None, now);
+        assert_eq!(rows.wait_count, 8);
+        assert_eq!(rows.waiting[0].target, DeskTarget::Card(address(3)));
+        assert_eq!(rows.moving[0].words, "running 4 tests · 4m");
+        assert_eq!(rows.moving[0].target, DeskTarget::Thread(address(4)));
         assert_eq!(rows.more, 2);
         assert_eq!(
             rows.moving
@@ -587,22 +685,79 @@ mod tests {
                 .map(|row| row.subject.as_str())
                 .collect::<Vec<_>>(),
             [
-                "thread 3",
                 "thread 4",
                 "thread 5",
-                "thread 6",
                 "thread 7",
+                "thread 9",
                 "thread 11",
                 "thread 12",
                 "thread 14",
                 "thread 18",
-                "thread 26"
+                "thread 26",
+                "thread 28"
             ]
         );
-        assert_eq!(rows.moving[0].words, "running 3 tests · 3m");
-        assert_eq!(rows.moving[0].target, DeskTarget::Thread(address(3)));
-        assert_eq!(rows.moving[3].words, "asks · 6m");
-        assert_eq!(rows.moving[3].target, DeskTarget::Card(address(6)));
+    }
+
+    #[test]
+    fn laptop_subjects_share_a_pixel_column_and_ellipsize_before_it() {
+        // Equal character counts have quite different advances; one title
+        // fits as-is, while the other has to keep a visible ellipsis.
+        let measure = |text: &str| {
+            px(text
+                .chars()
+                .map(|ch| match ch {
+                    'W' => 9.,
+                    'i' => 2.,
+                    '…' => 6.,
+                    ' ' => 4.,
+                    _ => 5.,
+                })
+                .sum())
+        };
+        let waiting = DeskRow {
+            key: DeskKey::Waiting(address(3)),
+            subject: "WiWi".into(),
+            words: "asks".into(),
+            project: "mini".into(),
+            target: DeskTarget::Card(address(3)),
+        };
+        let moving = DeskRow {
+            key: DeskKey::Moving(address(4)),
+            subject: "WWWW".into(),
+            words: "fixing".into(),
+            project: "mini".into(),
+            target: DeskTarget::Thread(address(4)),
+        };
+        for (room, moving_title, waiting_offset, moving_offset) in [
+            // At 100 px the cell is 33⅓ px; ASCII spaces put rows on the
+            // nearest representable offset to that column.
+            (100., "WW…", 34., 32.),
+            (117., "WW…", 38., 40.),
+            (135., "WWWW", 46., 44.),
+        ] {
+            let wide = WideRow::new(
+                px(room),
+                px(5.),
+                [&waiting, &moving]
+                    .map(|row| row.words.as_str())
+                    .into_iter(),
+                measure,
+            );
+            for (row, title, offset) in [
+                (&waiting, "WiWi", waiting_offset),
+                (&moving, moving_title, moving_offset),
+            ] {
+                let item = wide.item(row);
+                let (class, range) = &item.styles[1];
+                assert_eq!(*class, row.words_class());
+                assert_eq!(&item.text[range.clone()], row.words);
+                assert_eq!(&item.text[item.styles[0].1.clone()], title);
+                assert_eq!(measure(&item.text[..range.start]), px(offset));
+                assert_eq!(item.lines, std::slice::from_ref(&row.target));
+                assert_eq!(item.text.lines().count(), 1);
+            }
+        }
     }
 
     #[test]
