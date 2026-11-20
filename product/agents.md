@@ -93,23 +93,19 @@ shows: `Agent`, its transcript
 starts: `Look into what an agent did`, `Steer an agent`, `Work beside an agent`
 
 ## job Start an agent from a message
-status: every start asks where the agent works, through the menu in step 3, and which runtime, at `runtime (sol-medium):`.
 day: Turn ideas into work.
-when: a message in a thread, mine or not yet sent, is work I want an agent to do
-want: start an agent on it, in the right place, on the right model
+when: I have an idea, or a message in a thread is work I want an agent to do
+want: have an agent at work on it, in the right place, with nothing asked that the product can know
 so that: the agent reads that message first and works in that thread
 flow:
-1. put the cursor on the message, or write the message in the box
-2. open the palette and choose `start agent here`, or `send and start agent` for the message in the box
-3. the agent works where the channel's project is, in a workset: a copy of the repository of its own, which a second agent can join to work beside it; to put it elsewhere, pick in the menu: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, as the folder is, or a number to join the workset of an agent already there
-4. answer `repository (url or host path):` or `directory on the host:`, when the place picked needs one
-5. the agent runs on the default runtime; `Agent.set runtime` changes it later
-6. the echo line reads `agent … started`, and the agent joins the thread
-system: knows where the channel's work lives and which runtime is the default; lists the thread's own agents first among those to join, then the host's other agents; sends the message first when it is still in the box, and starts the agent once the host has it.
-user: the message; where the agent works and its runtime, only when not the channel's place and the default.
-
-An idea becomes an agent at work with the fewest questions the product can manage. Where the agent works follows from the channel, which is a project, and the model follows from a default written in the product; the user changes either when they want to.
-cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away
+1. in a `chat.Channel`, press `i` and write the idea; the box reads `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`
+2. `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
+   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; answer `repository (url or host path):` or `directory on the host:` when asked; the next ideas in that channel ask nothing
+   - `ctrl-shift-enter` only sends, for a message that is not work
+3. for a message already in a thread, put the cursor on it, open the palette and choose `start agent…`; it asks where and `runtime (opus-high):`, as does `send and start agent…` for the box
+system: puts the agent where the channel's newest agent works, in that agent's workset, a copy of the repository of its own that others can join; runs it on the default runtime, `opus-high`, written in the product; sends the message first when it is still in the box, and starts the agent once the host has it.
+user: the words; where the agent works, once per channel; the runtime only by the rare path or `Agent.set runtime` afterwards.
+cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea
 
 ## job Look into what an agent did
 day: Keep the work moving.

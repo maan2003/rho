@@ -114,10 +114,10 @@ so that: an agent can start from it and the conversation stays in one place
 flow:
 1. open the `Channel`
 2. press `i` and write the message
-3. `Thread.send`; the message is a new thread in the channel
+3. `ctrl-enter`; the message is a new thread in the channel, and an agent starts on it, as in `agents.Start an agent from a message`; `ctrl-shift-enter` makes the thread and starts nobody
 system: names the thread after the second message.
 user: the channel and the words.
-cases: I want an agent to start at once: use `send and start agent` instead, as in `agents.Start an agent from a message`
+cases: a question for myself, no agent: `ctrl-shift-enter`
 
 ## rule a channel is a room
 when a host's `Channel` is one the user made or has written in, or holds a `deal.Card` or an unread mention of the user, then it is a `home.Room` on Home, tagged with the host's name; a channel the user never wrote in that asks nothing is not.
