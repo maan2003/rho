@@ -110,7 +110,7 @@ mock:
 ```text
 tide@lab › Flaky clock test                                     asks · 2h     NOR
 
-user · 09:12
+you · 09:12
 Fix the clock test that fails one run in five.
 
 tide@lab · 09:52
