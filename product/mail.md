@@ -189,6 +189,3 @@ why: a thread of ten mails that each supersede the last is a feed; one live mail
 
 ## rule a cold mail stands alone
 when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; the project edits live `Mail` to stand alone with a short exact quote instead of a recap. New cold mail also stands alone; warm mail is short.
-
-## rule a stuck agent asks
-when an `agents.Agent` is stuck reaching its model, then its `Thread` says so and the project sends one stop mail. When work carries on, the project edits the stop and it no longer deals.

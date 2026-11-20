@@ -218,6 +218,9 @@ cases: two agents push at once, where the second question waits for the first; a
 ## rule a push waits for the user
 when an `Agent` pushes to or fetches from a repository through the user's ssh login, then the window asks the user first, and without a `y` the push or fetch does not happen.
 
+## rule a refused start leaves mail
+when `start agent here` cannot use the chosen host directory before it creates an `Agent`, then the `mail.Thread` keeps a `failed` stop with the directory and host and tells the user how to choose again. A later start shows its own progress without erasing the stop from history.
+
 ## rule a stuck agent asks
 when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop mail. When the model answers again, the project edits that stop and it no longer deals.
 
