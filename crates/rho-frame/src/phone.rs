@@ -232,8 +232,7 @@ enum Button {
     Back,
     Desk,
     Menu,
-    /// The row under the cursor, as `enter` opens it: on Desk, or on a
-    /// row that names a thread.
+    /// The waiting card or moving thread under the desk cursor.
     Open,
     Done,
     Mute,
@@ -296,8 +295,8 @@ struct BarState {
 /// The bar's buttons, left to right. A prompt takes the bar for its own
 /// answer. On Desk, opening and the verdicts are buttons over the row
 /// under the cursor, where a tap only puts the cursor, because dealing from
-/// Desk is what the phone is for; elsewhere they are one button for the menu,
-/// and the space goes to opening the row a list offers and to sending.
+/// the desk is what the phone is for; elsewhere they are one button for
+/// the menu, with room left for sending.
 fn buttons(state: BarState) -> Vec<Button> {
     if state.prompting {
         return vec![Button::Cancel, Button::Enter];
@@ -913,7 +912,13 @@ mod tests {
         };
         assert_eq!(buttons(thread), [Back, Desk, Menu, Verdicts, Send]);
         assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
-        assert_eq!(buttons(BarState { composing_idea: true, ..thread }), [Cancel, Send]);
+        assert_eq!(
+            buttons(BarState {
+                composing_idea: true,
+                ..thread
+            }),
+            [Cancel, Send]
+        );
         assert_eq!(
             buttons(BarState {
                 prompting: true,

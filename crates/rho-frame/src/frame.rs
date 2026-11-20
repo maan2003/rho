@@ -1206,6 +1206,13 @@ impl Frame {
     /// thread's or a prompt's, has no vim of its own and always types; the
     /// vim the mode indicator follows is the last one that had the keys.
     fn mode(&self, window: &Window, cx: &App) -> String {
+        let idea = self.idea_editor();
+        if idea
+            .as_ref()
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+        {
+            return "insert".to_owned();
+        }
         // A surface with a mode of its own says it while it has the keys;
         // a menu or a prompt over it is the editor's to say.
         if self.menu.is_none() && self.minibuffer.is_none() {
