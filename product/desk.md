@@ -1,56 +1,84 @@
-# home
+# desk
 
-Home is where the user lands: every room they work in, one line each, the one that wants them most at the top.
+The desk answers what waits and what is moving, and gives the user a place to write a new idea.
 
 ## journey Switching projects
+status: the user goes to a room on Home or finds a channel by name. A channel lists threads and unread counts, not how its work is moving.
 goal: the user picks up a different project where they left off.
 starts when: the user decides to work on a different project now.
 steps:
-1. the user looks for the project's `Room` on `Home`, `Glance at what waits`
-2. the user opens the room by name, `window.Go to something by name`
-3. the user sees what moved in its threads, `chat.Answer an agent`
-4. the user picks up where they left off, with their draft still there, `chat.Answer an agent`, `chat.Draft`
-done when: the user is back in the project's room, knows what moved, and can carry on where they left off, drafts and all.
+1. the user sees what has moved on the desk, `Glance at what moves`
+2. the user opens the project by name, `window.Go to something by name`
+3. the user opens its work by subject, `window.Go to something by name`
+4. the user picks up the thread, with their draft still there, `mail.Answer a mail`, `mail.Draft`
+done when: the user knows what moved and can carry on where they left off, drafts and all.
 day: Know what wants them, and where they were.
 
-## concept Room
-purpose: give every place the user works in one line on Home, so they see at a glance where something waits.
-principle: an agent asks the user something in a thread of the channel `debug`; on Home, `debug` moves to the top and reads `asks · 8.3d`; the user opens it and answers.
-sees: its name; what waits in it: a card's words such as `asks · 48.4d` in yellow, or `1 unread · 22h` in grey, or `snoozed · until 06:07` in grey while its card sleeps, or nothing; where it is: the host's name or the Slack workspace's name.
-has:
-- many `chat.Thread`, when the room is a `chat.Channel`
-- one `chat.Thread`, when the room is a Slack conversation
+## concept Desk
+status: built as Home, a list of rooms by project. It has no face-up deck, moving section, addressed idea box, or cold return.
+purpose: show what wants the user, what has moved, and where to put the next idea.
+principle: the user comes back after lunch, sees three things waiting and a test run under `moving`, and writes a new idea to `tide@lab`.
+sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status`, newest status change first, then `and N more` for the rest; an idea box addressed to a `mail.Project`, with completion.
 does:
-- open `enter`, or `open` on the phone: open the room
-- answer `space`: open the menu of `deal.Verdict` for the `deal.Card` over the room
+- open `tab`: show the desk, as `window.Screen`
+- deal `space`: open the first waiting card
+- open a row `enter`: open the selected card or thread
+- write an idea: address and send a new idea, as `mail.Write an idea`
 
-A room is a place the user works in. It is one of two things: a `chat.Channel` the user made or has written in, or that holds a `deal.Card` or an unread mention of the user; or a Slack conversation the user starred or that asks them. A message without a parent that the user never wrote in and that asks nothing is not a room; it is reached by name in `window.Palette`. A note is never a room; see `notes.Note`. A long name is cut to keep the row on one line.
+## screen Desk
+status: built as Home. The rows are rooms ranked by card, then unread, then recent; the window restores the previous screen without a ten-minute cutoff.
+answers: what needs the user now, and what has moved?
+shows:
+- `Desk`: the count of everything that waits
+- `deal.Card`: up to seven waiting rows, in deal order
+- `mail.Thread`: up to ten rows under `moving`, in order of their latest `mail.Status` change; when a row has a card, its words take the place of its status
+- `mail.Project`: the address on the `Desk` idea box
+states:
+- empty: `0 wait`; no waiting or moving rows; the idea box remains
+- loading: not agreed
+- partial: not agreed
+- error: not agreed
+- full: waiting rows, moving rows, and the addressed idea box
+keys:
+- `space`: deal the first card, `Desk.deal`
+- `enter`: open the selected row, `Desk.open a row`
+- `tab`: `window.Screen`
+- `:`: `window.Palette`
+starts: `Glance at what moves`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
+mock:
+```text
+desk                                                                        NOR
 
-## screen Home
-shows: `Room`, `deal.Card` words on the rooms that hold one
-starts: `Glance at what waits`, `deal.Clear what waits`, `window.Go to something by name`
+3 wait
+  tide@lab       Flaky clock test                               asks · 2h
+  slack@harness  Release window                                asks · 20m
+  shoal@lab      Shoreline import                              result · 8m
 
-With no rooms, Home reads `no rooms yet · attach a host or register a Slack workspace from the palette (:)`.
+moving
+  tide@lab       Cache eviction tests                          Running the tests
+  shoal@lab      Release notes                                 Checking the links
 
-The rooms go in this order: first the rooms that hold a card, in the order the deal would hand them; then the rooms with something unread, newest first; then every other room, newest first. With no room at all, Home reads `no rooms yet`.
+idea to: tide@lab
+```
 
-## flow Glance at what waits
+## flow Glance at what moves
+status: Home puts rooms with cards first and does not show a face-up deck or the current status of work.
 runs: 30 a day
 day: Know what wants them, and where they were.
-when: the user has a moment and wants to know if anything needs them
-want: see, in one look, which rooms want the user and how much
-so that: the user can decide to answer now or later
+when: the user has a moment or comes back after a while
+want: see what asks for them and what is moving without opening a thread
+so that: they can choose whether to answer, look into the work, or carry on where they were
 steps:
-1. the user presses `tab`, or opens the product; `Home` is on screen with the cursor on the top room
-2. the user reads the top rows and their words
-3. the user either opens a room with `Room.open` or presses `tab` to go back to where they were
-system: orders the rooms by what wants the user most, and writes each room's words.
-user: the choice of what to open.
-cases: dozens of rooms with nothing waiting under the few that do; a room whose words come from a card in one of its threads
+1. the user opens the `Desk` with `tab`, or sees it on a cold return
+2. the user reads what waits at the top
+3. the user reads the latest changes under `moving`
+system: counts and ranks waiting cards, and puts threads with the latest change of status first under `moving`.
+user: what, if anything, to open.
+cases: nothing waits but work is moving; more than seven cards or ten moving threads; a cold return.
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
-## rule a card puts its room first
-when the deal holds a `deal.Card` for a room or for a thread inside it, then that `Room` goes to the top of `Home` in the card's order and shows the card's words instead of its own.
+The historical review was of Glance at what waits on Home.
 
-## rule a verdict on a room row lands on its card
-when the user gives a `deal.Verdict` on a `Room` on `Home` whose words come from a card on a thread inside it, then the verdict is about that card, and the row changes at once.
+## rule a cold return opens the desk
+status: the window restores its previous screen when reopened, however long it was away; Home is reached with `tab`.
+when the user returns within ten minutes away, then their `window.Screen` is where they left it; after more than ten minutes away, the `Desk` is on screen.

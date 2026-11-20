@@ -9,24 +9,26 @@ because: everything the user does should be a place with the same keys and the s
 costs: what has no place yet is reached through a terminal, the browser, or an agent.
 
 ## concept Screen
+status: `tab` reaches Home, the room list. When the window starts again it restores where the user was without a ten-minute cutoff.
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
-principle: the user opens a room; it fills the window; they open a thread from it, and the thread fills the window; `Screen.back` returns to the room exactly as they left it.
+principle: the user opens a `mail.Project`, then one of its threads; `Screen.back` returns to the project exactly as they left it.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
 does:
 - back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
 - forward `ctrl-j`: go to the screen after; from the newest screen, deal the next card, as `deal.Card.deal` does
 - close `q`, or `ctrl-shift-backspace` while typing: close this screen; no back or forward reaches it again
 - close and deal `ctrl-shift-j`: close this screen and deal the next card
-- home `tab`: go to `home.Home`; on Home, go back to the screen before
+- desk `tab`: go to `desk.Desk`; on the desk, go back to the screen before
 
-The screens and the one in view come back as they were when the window starts again. A screen that can no longer open is passed over. Home is always at the bottom.
+The way back keeps the user's earlier screens, as they were left. A screen that can no longer open is passed over. Returning after more than ten minutes opens the desk; see `desk.a cold return opens the desk`.
 
-Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of rooms the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
+Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
 
 ## concept Status line
+status: shows the channel and thread names where those apply, not a project mail address and subject.
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
 principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
-sees: where the user is: the room and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
+sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
 
 The lamp is the only thing outside the user's place that pulls at them. When a card rises past a higher line, the window also chimes once.
 
@@ -35,24 +37,45 @@ When a host drops, the line names it and says `reconnecting · 12s` in red, coun
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
-status: there are two prompts: `:` opens `command:`, which lists only commands, and `ctrl-shift-f` opens `find:`, which lists only places, at most 40, and answers a name that fits nothing with `find: nothing called …`; each note is a place there; the `slack` menu has a third, `jump…` with `ctrl-p`, for Slack conversations.
-purpose: reach every place and every command by its name, so nothing needs a place on screen or a key the user must remember.
-principle: the user presses `ctrl-shift-f` and types `privacy`; the thread `privacy VM` is in the list, with its channel beside it; enter opens it. Later they press `:` and type `sa`; `start agent here` comes first, and enter runs it.
-sees: one prompt, listing places and commands together, best match first as the user types:
-- places: every channel, thread, agent, agent's desktop, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`
-- commands: `home`, `notes`, `undo`, `hosts`, and `quit` on every screen, after the commands for the screen in view and for the thing under the cursor, which come first; with a query, the best match comes first; a command inside a menu shows its path and key, such as `hosts › attach`
+status: `:` lists commands and `ctrl-shift-f` lists places, at most 40 by name. They are separate prompts, with no full-text search across mail and notes.
+purpose: reach any place, command, or remembered words in one prompt.
+principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
+sees: best matches first as the user types; with nothing typed, the screen's commands first, then recent places, then what waits. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its `mail.Status` or, when it waits, its `deal.Card` words. Commands show their keys where they have them.
 does:
-- open `:`, or `ctrl-shift-;` from any place, a terminal, a desktop, a page, or a box the user is typing in: open the prompt with the commands listed first; the place under it does not see the keys
-- find `ctrl-shift-f`: open the same prompt with the places listed first
-- run `enter`: open the place chosen, or run the command; a command that is a `Menu` opens that menu; a name that fits nothing echoes `no command …`
+- open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a box the user is typing in: open the same prompt; the place under it does not see the keys
+- search: match places and commands by name and search the full text of mail and notes; optional prefixes narrow the search
+- run `enter`: open the chosen place or run the chosen command; a command that is a `Menu` opens that menu
 
-A note is not among the places. Notes have one door, the command `notes`; see `notes.Notes`.
+When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
-A command at the top of the list shows no key. A command inside a menu shows the key it has there, such as `a` in `hosts › attach`, once `hosts` is open. Two commands with one name are both listed; the second gets ` (2)`.
+## screen Palette
+status: built as separate prompts, `command:` and `find:`, without a common list or full-text search of mails and notes.
+answers: where can the user go, or what can they run, with these words?
+shows:
+- the query in the `Palette` prompt
+- the `Palette` rows in match order, with each command's key and the `mail.Status` or `deal.Card` words where a thread has them
+states:
+- empty: an empty query lists the screen's commands, then recent places, then what waits; a query with no match shows no rows
+- loading: not agreed
+- partial: not agreed
+- error: not agreed
+- full: the rows that match the query
+keys:
+- `enter`: `Palette.run`
+- `ctrl-n`, `ctrl-p`, `escape`: `Prompt`
+starts: `Go to something by name`, `Run a command I rarely use`
+mock:
+```text
+: clock
+
+Flaky clock test         tide@lab                              asks · 2h
+Cache eviction tests     tide@lab                              Running the clock tests
+Mail · Flaky clock test  The mock clock is shared between tests.
+```
 
 ## concept Menu
 purpose: offer a short list of choices where the list itself is the information, such as how long to snooze or which agent to join.
-principle: the user presses `space` on a card; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `45` then `m`, and the card sleeps for 45 minutes.
+principle: the user presses `space` on a card open in a thread; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `45` then `m`, and the card sleeps for 45 minutes.
 sees: the menu's title, then its rows as key and words, laid out in columns; a row that holds a value shows the value.
 does:
 - pick a key, or click or tap a row: run the row; a row that opens another menu replaces this one
@@ -73,15 +96,16 @@ does:
 - complete `tab`: put the highlighted answer into the line
 - cancel `escape` or `ctrl-g`: close the prompt and change nothing
 
-A prompt for a secret, such as a Slack token, shows what is typed or pasted like any other prompt. Only rho's history of what was typed at prompts keeps nothing of it.
+A prompt for a secret, such as the phrase that pairs devices, shows what is typed or pasted like any other prompt. Only rho's history of what was typed at prompts keeps nothing of it.
 
 A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
 ## concept Phone bar
+status: the built bar acts on Home's room rows; there is no desk or idea box from anywhere.
 purpose: give the thumb what the keys give on the laptop.
-principle: on the phone, Home shows the rooms and a bar along the bottom edge; the user puts the cursor on a room, taps `done`, and the echo line says it is done.
+principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
-- on `home.Home`: `back` and `menu`, and, while the cursor is on a room, `open`, `done`, `mute`, `snooze`, and `more`; `done`, `mute`, and `snooze` are the `deal.Verdict` of that name
+- on `desk.Desk`: the bar reaches the desk's actions by thumb; the exact buttons are not agreed
 - on any other screen: `back`, `home`, `menu`, `more` while the cursor is on something a verdict can land on, and `send` when the screen has a message box
 - while a prompt is open: `cancel` and `enter`
 does:
@@ -93,18 +117,20 @@ does:
 The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
 
 ## flow Go to something by name
+status: the user opens `find:` with `ctrl-shift-f`; it lists places by name, separately from commands, and cannot search the full text of mails or notes.
 runs: 20 a day
 day: Reach anything.
-when: the user knows what they want to look at, and it is not the card in front of them
-want: reach it by typing part of its name
-so that: the user never hunts through lists for it
+when: the user knows the place they want or remembers words from a mail or note
+want: reach it by typing what they remember
+so that: they never hunt through lists for it
 steps:
-1. the user uses `Palette.find`; the `Palette` lists every place, newest first
-2. the user types part of the name; the list narrows
-3. the user chooses the place with `Palette.run`; the place fills the window
-system: keeps every name of every system in one list, and puts the most recently active first.
-user: the words of the name.
-cases: two threads with the same name in different channels; an agent whose short code the user remembers, but not its workset name
+1. the user opens the `Palette` with `:`
+2. the user types part of the name or remembered words
+   - if they choose to narrow the search, the user adds a prefix
+3. the user opens the match with `Palette.run`
+system: ranks matches by what the user typed and searches mail and notes in the same prompt as places and commands.
+user: the name or the words they remember.
+cases: two threads with the same subject in different projects; the user remembers a line of a mail but not its subject.
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## flow Run a command I rarely use

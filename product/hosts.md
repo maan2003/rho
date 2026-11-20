@@ -1,6 +1,6 @@
 # hosts
 
-A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their chat and agents together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
+A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their projects and mail together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
 
 ## bet Agents live on hosts, and the window attaches to many
 instead of: one server, or everything on the laptop.
@@ -15,32 +15,33 @@ because: a host runs code the user did not write, and an agent on it must never 
 costs: two devices agree only when both hold the user's secret phrase.
 
 ## bet The window holds the secrets
-instead of: a host holding the user's Slack token, browser session, or ssh login.
+instead of: a host holding the user's browser session or ssh login.
 serves: Reach anything.
 because: the window is the user's own device, and an agent that needs the user's login asks for it each time, so no agent uses it without the user's word.
 costs: a prompt that opens over whatever the user is doing, and a push that fails when they do not answer in a minute.
 
 ## journey A new machine
+status: a new idea is written in a channel; there is no addressed idea from anywhere.
 goal: the user can put their first idea to work within minutes on a new machine.
 starts when: the user has a new laptop or a new host.
 steps:
 1. the user attaches the host, `Attach a host`
 2. the user pairs the device if it is new, `Pair this device`
-3. the user connects Slack if it is not already connected, `slack.Connect a Slack workspace`
-4. the user puts their first idea to work, `agents.Start an agent from a message`
+3. the user puts their first idea to work, `mail.Write an idea`
 done when: the user's first idea is at work within minutes.
 day: Turn ideas into work.
 
 ## concept Host
+status: attaching a host brings its channels back, as rooms on Home; it does not give them project mail addresses.
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
-principle: the user attaches the server as `rho`; its channels appear on Home, each tagged `rho`; when the connection drops, the top line says so in red until it is back.
-sees: its name, which the user chose, as the tag on its rooms on Home and in `window.Palette`; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; when more than one is attached, the thread's host before its name at the top.
+principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with addresses ending in `@rho`; when the connection drops, the top line says so in red until it is back.
+sees: its name, which the user chose, as the host part of its projects' addresses; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `mail.Project` address.
 has:
-- many `chat.Channel`
+- many `mail.Project`
 - many `agents.Agent`
 does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
-- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its rooms, agents, and their screens go from the window, and its messages come back from the host when it is attached again; drafts and unsent messages stay
+- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its mail comes back from the host when it is attached again; drafts and unsent messages stay
 - status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
 
 A host is reached in one of three ways:
@@ -78,17 +79,18 @@ cases: the user never pairs a device, and it keeps its own verdicts for good; th
 reviewed: 2026-11-20 · laptop · reviewer · ok
 
 ## flow Attach a host
+status: the rooms on Home are tagged by host; there are no project addresses.
 runs: 1 a month
 day: Keep the work moving.
 when: the user sets up a new device, or has a new host
-want: have the window reach the host and show its threads and agents
+want: have the window reach the host and show its projects and their work
 so that: the user can work with the agents on it from this device
 steps:
 1. the user gets a pairing link on the host and opens it on the device, as `Host.attach`
    - or the user opens the palette, chooses `hosts › attach`, and types the name and the way to reach the host
 2. the user answers `name this host:` with a short name
 3. the user touches the security key when the desktop asks for it; the first time on a device it asks twice
-4. the host's rooms appear on Home, tagged with its name
+4. the host's projects are available by name, with addresses ending in the host's name
    - if the host does not trust this device yet, the top line reads `disconnected · enroll this rho on the host: …` with a command and a code; the user runs that command on the host, and the window tries again within half a minute
 system: remembers the host for the next start, reconnects by itself, and asks for the security key only once each time the window starts.
 user: the name, the touch of the key, and, without a link, the command on the host.

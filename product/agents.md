@@ -1,42 +1,46 @@
 # agents
 
-The agents do the work. The user starts one from a message, talks to it in its thread, and looks into what it does: its transcript, its terminals, its shell, and its desktops. Agents have no list; each is reached from the thread it works in, or by name, and its screen is its transcript.
+The agents do the work behind the project's mail. The user goes one level down from the work to see an agent's transcript, terminals, shell, or desktops.
 
 ## bet An agent is labour, not a colleague
-instead of: a list of agents with profiles and direct messages, like people in a contact list.
+status: agents already have no dashboard, but they appear by name in chat and can be opened and steered from its `with` line.
+instead of: reaching an individually named agent from each thread.
 serves: Keep the work moving.
-because: the user has dozens of agents and cares about the work, not the worker; the thread is where the work is, so the agent is reached from there or by name.
-costs: an agent has a code for a name, and the user must map it to the work it does.
+because: the user cares about the work, not the worker. The project speaks for the work and an agent is reached only when the user needs to look into it.
+costs: the user goes one level down to see what a particular agent did.
 
 ## bet Trust by inspection
+status: the transcript, terminal, shell and desktop are built; the result does not yet carry proof.
 instead of: agents that report what they did, which the user believes.
 serves: Keep the work moving.
-because: the user does not edit code by hand and must still know whether a result is right; the transcript shows every step, and the terminal, shell, and desktop let the user stand beside the agent.
+because: the user does not edit code by hand and must still know whether a result is right; the result mail carries proof, the transcript shows how the work was done, and the terminal, shell, and desktop let the user stand beside the agent.
 costs: a transcript is long, and the user reads it to find what went wrong.
 
 ## journey An agent in trouble gets back on track
-goal: the user gets the agent back to work so its result comes.
+status: the deal reports an agent stop without a mail; the user can steer the agent directly from the thread or write in chat.
+goal: the user gets the work going again so the result comes.
 starts when: an agent stops or goes quiet.
 steps:
-1. the user learns of it without looking for it, `deal.Clear what waits`
-2. the user sees why in one glance, `Look into what an agent did`
-3. the user steers it, `Steer an agent`
-   - or the user tells it what to do in its thread, `chat.Answer an agent`
-4. the user gets the result after the agent carries on, `deal.Clear what waits`
-done when: the user sees the agent's result.
+1. the user opens the project's mail about the stop, `deal.Clear what waits`
+2. the user reads the reason, `mail.Answer a mail`
+   - when they need more, the user goes into the transcript, `Look into the work`
+3. the user replies with what the project should do next, `mail.Answer a mail`
+4. the user gets the result after the work carries on, `deal.Clear what waits`
+done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Agent
-purpose: do a piece of the user's work on a host, in a thread the user can read and answer.
-principle: the user starts an agent from the message `fix the flaky test`; the agent joins that thread, reads the message first, works in its workset, and posts there; when it asks, the thread becomes a card.
+status: a host thread shows agent names and state on its `with` line and offers their commands from there; the user can also find agents by name.
+purpose: do a piece of the user's work on a host, and let the user inspect what was done if needed.
+principle: an agent works from the user's mail about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.
 has:
 - many `Terminal`
 - one `Shell`
 - many `Desktop`
-- many `chat.Thread`, the one it started from first
+- many `mail.Thread`, the one it started from first
 does:
-- open: from the `with` line of a thread, or by name with `window.Palette`; its screen, `Agent`, opens at its newest step
+- open: from the `mail.Thread` one level down, as in `Look into the work`; its screen, `Agent`, opens at its newest step
 - open its thread, from the palette as `open its thread`: open the thread it started from
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind
@@ -46,9 +50,7 @@ does:
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.
 
-In a thread, a message from an agent is signed with its long code, such as `q9tz45g2bcvs`, while the `with` line names the same agent by its workset name or short code.
-
-The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. Each command line ends with `ok` or `error` and how long it ran; the same error again counts on one line, `×7`; a cancel reads `you cancelled the request`. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user talks to an agent only in its thread.
+The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. Each command line ends with `ok` or `error` and how long it ran; the same error again counts on one line, `×7`; a cancel reads `you cancelled the request`. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user writes to the project in `mail.Thread`; the transcript is for looking, not for replying.
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
@@ -87,7 +89,7 @@ Closing the shell's screen leaves the shell running on the host. The agent has o
 
 ## concept Desktop
 purpose: let the user see and use a graphical app that an agent runs, such as a browser or the rho window itself.
-principle: an agent runs the window it is testing on a desktop of its own; the user opens `desktop…` from the agent's screens and sees it live; they freeze a frame, circle a button that is wrong, copy the picture, and paste it into the agent's thread.
+principle: an agent runs the window it is testing on a desktop of its own; the user opens `desktop…` from the agent's screens and sees it live; they freeze a frame, circle a button that is wrong, copy the picture, and paste it into the work's thread.
 sees: the app, live, scaled to fit the window; at the top, the agent's name, `desktop`, and the desktop's name; `connecting to desktop … of …` while it opens; while drawing, a line along the bottom with `DRAW`, `u undo`, `y copy`, and `esc live`.
 does:
 - desktop…, from the palette on any of the agent's screens: open the agent's desktop, or, with more than one, ask `desktop:` and open the one chosen; the row shows only when the agent runs one
@@ -101,42 +103,31 @@ does:
 A desktop is also a place in `window.Palette`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
 
 ## screen Agent
+status: the transcript is reached from the host thread's `with` line or by agent name.
 shows: `Agent`, its transcript
-starts: `Look into what an agent did`, `Steer an agent`, `Work beside an agent`
+starts: `Steer an agent`, `Work beside an agent`
 
-## flow Start an agent from a message
-runs: 12 a day
-day: Turn ideas into work.
-when: the user has an idea, or a message in a thread is work they want an agent to do
-want: have an agent at work on it, in the right place, with nothing asked that the product can know
-so that: the agent reads that message first and works in that thread
-steps:
-1. in a `chat.Channel`, the user presses `i` and writes the idea; the box reads `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`
-2. the user presses `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
-   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; the user answers `repository (url or host path):` or `directory on the host:` when asked, with the host's known repositories and directories offered, newest first; the next ideas in that channel ask nothing, even when that first start failed
-   - `ctrl-shift-enter` only sends, for a message that is not work
-3. for a message already in a thread, the user puts the cursor on it, opens the palette and chooses `start agent, choosing where and runtime…`; it asks where and `runtime (opus-high):`, as does `send and start agent, choosing where and runtime…` for the box
-system: puts the agent where the channel's newest agent works, in that agent's workset, a copy of the repository of its own that others can join; runs it on the default runtime, `opus-high`, written in the product; sends the message first when it is still in the box, and starts the agent once the host has it.
-user: the words; where the agent works, once per channel; the runtime only by the rare path or `Agent.set runtime` afterwards.
-cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea; a start that fails, where the echo line reads `agent did not start: <why>`, such as the account that is not logged in and what to run on the host, and the thread's `with` line and the channel's row say the same
-reviewed: 2026-11-20 · laptop · reviewer · 4 findings
-
-## flow Look into what an agent did
+## flow Look into the work
+status: the user puts the cursor on the `with` line of a host thread and presses `enter` on an agent to open its transcript at the newest step.
 runs: 15 a day
 day: Keep the work moving.
-when: an agent says it is done, or has been quiet too long
-want: see what it actually did
-so that: the user can trust its result or see where it is stuck
+when: the user has a result or a report of trouble and wants to see how the work was done
+want: see what actually happened without making agent activity part of the thread
+so that: the user can trust the result or understand where the work is stuck
 steps:
-1. in the agent's thread, the user puts the cursor on the `with` line and presses `enter`; the agent's screen, `Agent`, opens at its newest step
-2. the user reads up through what the agent ran and what came back
-3. the user goes back to the thread with `window.Screen.back`
-system: shows what the agent is doing now in the top line.
+1. the user opens the work's `mail.Thread`
+2. the user goes one level down to the `Agent` transcript
+3. the user reads what the agent ran and what came back
+4. the user goes back to the thread with `window.Screen.back`
+system: keeps the transcript with the work it explains.
 user: the judgement.
-cases: the agent is `retrying` after errors from its model
+cases: a stopped agent; more than one agent worked on the piece.
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
+The historical review was of Look into what an agent did.
+
 ## flow Steer an agent
+status: the same controls are also offered from the host thread's `with` line, and the user writes to the agent there.
 runs: 3 a day
 day: Keep the work moving.
 when: an agent is stuck, going the wrong way, or on the wrong model
@@ -145,12 +136,13 @@ so that: its work goes on from a good point
 steps:
 1. the user opens the agent's screen, `Agent`
 2. the user opens the palette and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`
-3. the user goes to the agent's thread and tells it what to do instead
+3. if the work needs new instructions, the user returns to the thread and writes to the project, `mail.Answer a mail`
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
 ## flow Work beside an agent
+status: the terminal, shell and desktop open from the transcript as described; the way out to the desk goes to Home.
 runs: 3 a day
 day: Reach anything.
 when: the user wants to check or fix something in an agent's workset with their own hands
@@ -159,14 +151,15 @@ so that: the user sees what the agent sees and can act there
 steps:
 1. the user opens the agent's screen, `Agent`
 2. the user opens the palette and chooses `terminal`, `new terminal`, `shell`, or `desktop…`
-3. the user works there; to leave a terminal, they press `ctrl-shift-n`, then `q` or `tab`; to leave a desktop, they press `ctrl-shift-;` and choose `home`
+3. the user works there; to leave a terminal, they press `ctrl-shift-n`, then `q` or `tab`; to leave a desktop, they press `ctrl-shift-;` and open the desk, `desk.Desk`
 system: starts a terminal or the shell when none runs, and keeps it running after the user leaves.
 user: what to type.
 cases: the agent's host is a host on this machine, where its desktop does not open; the host drops while the user types in the shell
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
-## rule an agent starts in its message's thread
-when an `Agent` starts from a `chat.Message`, then it joins that message's `chat.Thread` and reads the message before anything else.
+## rule an idea starts the work in its thread
+status: sending an idea from a channel starts an agent in its message's thread; the user cannot send an addressed idea from anywhere.
+when the user sends a `mail.Mail` as a new idea to a `mail.Project`, then the agent starts in the `mail.Thread` for that work and reads the idea first.
 
 ## flow Approve a push or a fetch
 runs: 3 a day

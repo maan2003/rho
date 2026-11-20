@@ -1,10 +1,10 @@
 # rho
 
-rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, and lets them answer it, talk to agents, and look into what the agents do.
+rho is the one window where one person works with many AI agents, their Slack, and their own notes. It hands the user the next thing that wants them, lets them write to a project, and gives them a way to look into the work.
 
 ## user
 
-One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work.
+One person, the only user. They run many projects at once, each with agents working on it, and they read and answer Slack for their work, using their own account in rho's browser.
 
 The laptop is rho. For eight to ten hours a day, everything they do on the laptop happens in this window. They do not come and go. They are here, and they move between places: a thread, a transcript, a terminal, a desktop, a page in the browser, a note. Between two places, they look at what wants them. Sometimes they rest here too.
 
@@ -12,7 +12,7 @@ They rarely edit code by hand. When they must, they use an editor in a terminal.
 
 Ideas come to them anywhere, at the laptop or on the go. An idea must become an agent at work in one short step, from either device.
 
-The phone is the same window, smaller, used with one thumb and a bar of buttons along the bottom edge. They use it ten to twenty minutes a day. On a day away, it is all they have, and they keep working from it. They answer what wants them, read, steer agents, and start new work. The phone is as powerful as the laptop. They never have to say they cannot do something from the phone. What is common is easy there. What is rare may take longer there.
+The phone is the same window, smaller, used with one thumb and a bar of buttons along the bottom edge. They use it ten to twenty minutes a day. On a day away, it is all they have, and they keep working from it. They answer what wants them, read, and start new work. The phone is as powerful as the laptop. They never have to say they cannot do something from the phone. What is common is easy there. What is rare may take longer there.
 
 Both devices show the same places and the same hosts. Their verdicts, notes, and drafts are the same on both.
 
@@ -21,12 +21,13 @@ One place fills the window. Two places side by side is an expert flow, used rare
 While they are in a place, they do not watch the rest. The product keeps it for them: what waits and since when, and what they said about each card. It also keeps their unsent drafts, and where they were on each device.
 
 ## day
+status: the user answers named agents in threads, and can steer them from the thread itself.
 
 What the user does in rho, all day, in order of weight. Every flow in a module serves one of these.
 
-1. **Keep the work moving.** Answer what an agent asks, check what it did, steer it, and know when it stops.
+1. **Keep the work moving.** Answer what the work asks, check what was done, give it a new direction, and know when it stops.
 2. **Turn ideas into work.** An idea becomes an agent at work, in one step, from either device.
-3. **Answer the world.** Slack, and later mail and the rest. Read, reply, done.
+3. **Answer the world.** Slack, and later email and the rest. Read, reply, done.
 4. **Reach anything.** A terminal, a desktop, a page in the browser, a file, for what has no place of its own yet.
 5. **Keep their own memory.** Rare. A private corner for reminders and for things no agent may know, in their words only, and almost never about the work in the repositories.
 
@@ -75,10 +76,11 @@ A feed or inbox that the user scans from top to bottom to find what needs them. 
 A sidebar, tabs, or other fixed controls around the screen.
 
 ## non-goal An agent dashboard
-A list or dashboard of agents. An agent is reached from the thread it works in, or by name.
+status: agents do not have a dashboard; they appear by name in host threads and in find.
+A list or dashboard of agents. Agents are reached one level down from the work, when the user needs to inspect it.
 
 ## non-goal Labels, piles, and to-do lists
-Labels, piles, and to-do lists for sorting things. A card is answered with a verdict and goes away.
+Labels, piles, and to-do lists for sorting things. A card is answered with a reply or a verdict and goes away.
 
 ## non-goal Settings screens
 Settings screens.
