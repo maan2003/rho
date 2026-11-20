@@ -85,7 +85,7 @@ does:
 
 A menu with nothing in it does not open; the echo line reads its title and `nothing here`.
 
-On the phone, a menu is a sheet of tall rows over the screen, with `‹ back` and `close` at its top, and the key still shown at the end of each row.
+On the phone, a menu is a sheet of tall rows over the screen, with the key still shown at the end of each row. `‹ back` returns to the previous sheet. `close`, `cancel` at the bottom edge, or a tap in the dimmed area dismisses the whole menu without running a row or changing the work. A tap that starts outside a row cannot run it.
 
 ## concept Prompt
 purpose: ask the user for one line of text, with completion, so a question never needs a dialog.
@@ -105,12 +105,13 @@ A prompt for a secret, such as the phrase that pairs devices, shows what is type
 A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
 ## concept Phone bar
-status: in a thread, `send` opens the empty reply box for typing or sends a written reply.
 purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
 - on `desk.Desk`: the bar reaches the desk's actions by thumb; the exact buttons are not agreed
-- on any other screen: `back`, `home`, `menu`, `more` while the cursor is on something a verdict can land on, and `send` when the screen has a `design.Draft tail`
+- with a card open in a thread: `back`, `menu`, `done`, `snooze`, and `more`; `send` appears only when there is a draft
+- from the agent transcript belonging to an open card: `back`, `done`, `snooze`, `more`, and `menu`
+- reading elsewhere: `back`, `desk`, and `menu`; `send` appears only when there is a draft
 - while a prompt is open: `cancel` and `enter`
 does:
 - flick up from the end of a screen: forward, and from the newest screen deal the next card, as `Screen.forward` does

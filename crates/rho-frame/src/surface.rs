@@ -11,7 +11,7 @@ use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
 
-/// The action under Send on the phone bar, when a surface has a box.
+/// The action under Send on the phone bar, when a surface has a draft to send.
 pub type PhoneSend = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// What a verdict, a note or `file` pressed over the surface lands on.
