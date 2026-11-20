@@ -89,9 +89,8 @@ pub struct ShareSummary {
     pub days: u64,
     pub requests: u64,
     pub approximate: bool,
-    /// The latest share of each model, in the order fable, gpt, astra,
-    /// opus, terra, luna — which is the order the bands use.
-    pub latest: [f64; 6],
+    /// Each model's latest share.
+    pub legend: Vec<Legend>,
     /// Cumulative stacked band heights at each column, 0..=1 of the chart.
     pub columns: Vec<(f32, [f32; 6])>,
     pub midnights: Vec<f32>,
@@ -318,7 +317,7 @@ pub fn cost_summary(
     let total = ["fable", "opus", "gpt", "astra", "luna", "terra"]
         .into_iter()
         .map(|model| model_cost(series, model, start))
-        .sum();
+        .fold(0.0, |total, cost| total + cost);
 
     CostSummary {
         days,
@@ -357,10 +356,27 @@ pub fn share_summary(
     let start = now.saturating_sub(window_ms);
     let shares = usage_share_points(series, now, days);
     let scale = usage_share_scale(&shares);
-    let latest = shares
+    let latest: [f64; 6] = shares
         .last()
         .map(|(_, share, _)| *share)
         .unwrap_or_default();
+    // The bands' order is fable, gpt, astra, opus, terra, luna; the
+    // legend's is the cost chart's, so a model sits in the same place on
+    // both.
+    let legend = [
+        (SeriesColor::Fable, "fable", latest[0]),
+        (SeriesColor::Opus, "opus", latest[3]),
+        (SeriesColor::Gpt, "gpt", latest[1]),
+        (SeriesColor::Astra, "astra", latest[2]),
+        (SeriesColor::Luna, "luna", latest[5]),
+        (SeriesColor::Terra, "terra", latest[4]),
+    ]
+    .into_iter()
+    .map(|(color, model, share)| Legend {
+        color,
+        label: format!("{model} {:.0}%", share * 100.0),
+    })
+    .collect();
     let stacked = shares
         .iter()
         .map(|(at, shares, total_usage)| {
@@ -380,7 +396,7 @@ pub fn share_summary(
         days,
         requests: requests_since(series, start),
         approximate: approximate_since(series, start),
-        latest,
+        legend,
         columns: reduce(stacked, columns),
         midnights: midnights(start, now),
     }
@@ -746,7 +762,9 @@ fn model_cost(series: &[crate::protocol::AgentUsageSeries], model: &str, since: 
         .flat_map(|series| &series.buckets)
         .filter(|bucket| bucket.bucket_start_ms >= since)
         .map(|bucket| bucket_cost_usd(bucket, model))
-        .sum()
+        // Not `sum`: a float sum starts at -0.0, so a model that spent
+        // nothing would read `$-0.00`.
+        .fold(0.0, |total, cost| total + cost)
 }
 
 /// What a bucket cost, at the provider's posted rates per million tokens.
@@ -790,6 +808,67 @@ mod tests {
         assert_eq!(bucket_cost_usd(&usage, "astra"), 73.5);
         assert_eq!(bucket_cost_usd(&usage, "terra"), 20.875);
         assert_eq!(bucket_cost_usd(&usage, "luna"), 8.35);
+    }
+
+    #[test]
+    fn a_model_that_spent_nothing_costs_zero_dollars_not_minus_zero() {
+        let now = 40 * HOUR_MS;
+        let gpt_only = vec![crate::protocol::AgentUsageSeries {
+            model: "gpt".to_owned(),
+            buckets: vec![crate::protocol::AgentUsageBucket {
+                bucket_start_ms: 10 * HOUR_MS,
+                output_tokens: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            }],
+        }];
+        let labels = |cost: &CostSummary| {
+            cost.legend
+                .iter()
+                .map(|entry| entry.label.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let spent = cost_summary(&gpt_only, 7, now, 100);
+        assert_eq!(
+            labels(&spent),
+            [
+                "fable $0.00",
+                "opus $0.00",
+                "gpt $30.00",
+                "astra $0.00",
+                "luna $0.00",
+                "terra $0.00"
+            ]
+        );
+
+        let idle = cost_summary(&[], 7, now, 100);
+        assert_eq!(format!("${:.2}", idle.total), "$0.00");
+        assert_eq!(format!("${:.2}", idle.total / 2.0), "$0.00");
+        assert!(labels(&idle).iter().all(|label| label.ends_with(" $0.00")));
+    }
+
+    #[test]
+    fn the_star_marks_only_the_account_in_use() {
+        let point = |remaining_percent| crate::protocol::QuotaPoint {
+            observed_at_ms: 39 * HOUR_MS,
+            remaining_percent,
+            reset_at_unix: None,
+        };
+        let gpt = |namespace: &str, remaining| crate::protocol::QuotaSeries {
+            model: "gpt".to_owned(),
+            auth_namespace: Some(namespace.to_owned()),
+            points: vec![point(remaining)],
+        };
+        let series = [gpt("work", 40), gpt("home", 90)];
+
+        let summary = quota_summary(&series, &["work".to_owned()], 7, 40 * HOUR_MS, 100);
+        let labels = summary
+            .legend
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["gpt/home 90%", "★ gpt/work 40%"]);
     }
 
     #[test]
