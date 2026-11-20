@@ -16,7 +16,7 @@ because: the user does not edit code by hand and must still know whether a resul
 costs: a transcript is long, and the user reads it to find what went wrong.
 
 ## journey An agent in trouble gets back on track
-status: the user can still steer the agent directly from the thread's `with` line or write to it in chat.
+status: the window has no desk; the user reaches the stopped work from Home or the card.
 goal: the user gets the work going again so the result comes.
 starts when: an agent stops or goes quiet.
 steps:
