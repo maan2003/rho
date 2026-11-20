@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(ids(&listing, "fl"), [1, 0, 2]);
         assert_eq!(ids(&listing, "ck fla"), [1, 0, 2]);
         assert_eq!(ids(&listing, "ave flaky asks"), [1]);
-        assert_eq!(ids(&listing, "asks ice"), []);
+        assert!(ids(&listing, "asks ice").is_empty());
         assert_eq!(ids(&listing, "timing ice"), [0]);
     }
 
