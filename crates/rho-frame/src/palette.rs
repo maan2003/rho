@@ -206,19 +206,32 @@ impl Listing {
 }
 
 /// How well `label` answers `query` by the starts of its words: the
-/// query's letters, in order, in runs that each begin a word of the label,
-/// so `sa` answers `start agent here` and `sales`, and `rename` does not
-/// answer `start agent, choosing where and runtime…`. A space in the query
-/// begins a new run. Higher is better: each run costs, and each run that
-/// is a whole word earns more back, so `ops` answers `ops` better than
-/// `opsgenie` and `sales` better than `start agent`. An empty query
-/// answers all alike.
+/// query's letters, in order, in runs that each begin a word of the label.
+/// Runs typed together begin words next to each other, so `sa` answers
+/// `start agent here` and `sales`, while `4pm` does not answer `build
+/// #4103 passed on main`; a space in the query begins a run at any later
+/// word, so `fix flaky` answers `fix the flaky test`. Higher is better:
+/// each run costs, and each run that is a whole word earns more back, so
+/// `ops` answers `ops` better than `opsgenie` and `sales` better than
+/// `start agent`. An empty query answers all alike.
 fn word_starts(query: &str, label: &str) -> Option<i32> {
     const RUN: i32 = 3;
     const WHOLE_WORD: i32 = 4;
     let label: Vec<char> = label.chars().flat_map(char::to_lowercase).collect();
     let starts_word = |at: usize| at == 0 || !label[at - 1].is_alphanumeric();
     let ends_word = |at: usize| at + 1 == label.len() || !label[at + 1].is_alphanumeric();
+    // Which word each letter is in, counting from one.
+    let word: Vec<usize> = label
+        .iter()
+        .enumerate()
+        .scan(0, |words, (at, letter)| {
+            if letter.is_alphanumeric() && starts_word(at) {
+                *words += 1;
+            }
+            Some(*words)
+        })
+        .collect();
+    let words = word.last().copied().unwrap_or(0);
     // `best[at]`: the best score for the letters so far with the last of
     // them at `at`, counting the whole words of every run but its own.
     let mut best: Option<Vec<Option<i32>>> = None;
@@ -228,28 +241,35 @@ fn word_starts(query: &str, label: &str) -> Option<i32> {
             after_space = true;
             continue;
         }
+        // The best score with the run before ended in each word, and
+        // anywhere before each letter.
+        let mut ended_in = vec![None; words + 1];
+        let mut ended_before: Vec<Option<i32>> = vec![None; label.len() + 1];
+        if let Some(best) = &best {
+            for at in 0..label.len() {
+                let ended =
+                    best[at].map(|score| score + if ends_word(at) { WHOLE_WORD } else { 0 });
+                ended_in[word[at]] = ended_in[word[at]].max(ended);
+                ended_before[at + 1] = ended_before[at].max(ended);
+            }
+        }
         let mut next = vec![None; label.len()];
-        let mut ended_before: Option<i32> = None;
         for at in 0..label.len() {
-            if label[at] == wanted {
-                let begun = match &best {
-                    None => Some(0),
-                    Some(_) => ended_before,
-                }
-                .filter(|_| starts_word(at))
-                .map(|score| score - RUN);
-                let continued = match &best {
-                    Some(best) if at > 0 && !after_space => best[at - 1],
-                    _ => None,
-                };
-                next[at] = begun.max(continued);
+            if label[at] != wanted {
+                continue;
             }
-            if let Some(best) = &best
-                && let Some(score) = best[at]
-            {
-                let run_ends = score + if ends_word(at) { WHOLE_WORD } else { 0 };
-                ended_before = ended_before.max(Some(run_ends));
+            let begun = match &best {
+                None => Some(0),
+                Some(_) if after_space => ended_before[at],
+                Some(_) => ended_in[word[at].saturating_sub(1)],
             }
+            .filter(|_| starts_word(at))
+            .map(|score| score - RUN);
+            let continued = match &best {
+                Some(best) if at > 0 && !after_space => best[at - 1],
+                _ => None,
+            };
+            next[at] = begun.max(continued);
         }
         best = Some(next);
         after_space = false;
@@ -330,9 +350,20 @@ mod tests {
         );
         assert_eq!(word_starts("det", "delete…"), None);
         assert_eq!(word_starts("det", "hosts › detach"), Some(-3));
-        // A space begins a new run.
+        // A space begins a new run, at any later word; runs typed
+        // together begin words next to each other.
         assert_eq!(word_starts("ne w", "new"), None);
         assert_eq!(word_starts("new ch", "new channel"), Some(-2));
+        assert_eq!(word_starts("fix flaky", "fix the flaky test"), Some(2));
+        assert_eq!(word_starts("ff", "fix the flaky test"), None);
+        assert_eq!(
+            word_starts(
+                "4pm",
+                "deploy event 4: build #4103 of rho-web passed on main"
+            ),
+            None
+        );
+        assert_eq!(word_starts("ha", "hosts › attach"), Some(-6));
     }
 
     fn command(label: &str) -> Row {
