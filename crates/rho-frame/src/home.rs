@@ -46,8 +46,9 @@ pub struct RoomLine {
     /// The card's words when the dealer holds one in the room, the
     /// system's otherwise.
     pub label: String,
-    /// A card in the hand is in it: its words are the dealer's.
-    pub dealt: bool,
+    /// The card in the hand that gave the row its words, when one did:
+    /// what a verdict on the row is about.
+    pub card: Option<Address>,
 }
 
 /// The rooms in Home's order: a room with a card in `hand` by its first
@@ -64,9 +65,9 @@ pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
             if card.is_none() && room.standing == Standing::WhileCard {
                 return None;
             }
-            let (label, dealt) = match card {
-                Some((_, card)) => (card.label.clone(), true),
-                None => (room.waiting.clone(), false),
+            let label = match card {
+                Some((_, card)) => card.label.clone(),
+                None => room.waiting.clone(),
             };
             Some((
                 card.map(|(index, _)| index),
@@ -77,7 +78,7 @@ pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
                     name: room.name,
                     tag: room.tag,
                     label,
-                    dealt,
+                    card: card.map(|(_, card)| card.address.clone()),
                 },
             ))
         })
@@ -281,9 +282,9 @@ impl HomeView {
                     (false, true) => room.label.clone(),
                     (false, false) => format!("{} · {}", room.label, room.tag),
                 };
-                let class = match room.dealt {
-                    true => HomeClass::Label,
-                    false => HomeClass::Muted,
+                let class = match room.card {
+                    Some(_) => HomeClass::Label,
+                    None => HomeClass::Muted,
                 };
                 // The lead, the gap before the words and the words are
                 // what the row keeps; the name has the rest.
@@ -318,6 +319,20 @@ impl Surface for HomeView {
             Some(HomeTarget::Address(address)) => Subject::Address(address.clone()),
             _ => Subject::None,
         }
+    }
+
+    /// The card that gave the row its words, or the room itself when
+    /// none did.
+    fn card(&self, cx: &App) -> Subject {
+        let Subject::Address(room) = self.subject(cx) else {
+            return Subject::None;
+        };
+        let card = self
+            .rooms
+            .iter()
+            .find(|line| line.address == room)
+            .and_then(|line| line.card.clone());
+        Subject::Address(card.unwrap_or(room))
     }
 }
 
@@ -447,7 +462,8 @@ mod tests {
 
     /// The hand's order first, by the card in a room or the room itself;
     /// then what waits, newest first; then the rest, newest first. A
-    /// dealt room wears its first card's words, the others their own.
+    /// dealt room wears its first card's words and names that card, the
+    /// others their own.
     #[test]
     fn rooms_go_by_the_hand_then_by_what_waits_then_by_age() {
         let hand = Hand {
@@ -467,19 +483,27 @@ mod tests {
             room("d", "mention", 60),
         ];
         let lines = room_lines(rooms, &hand);
-        let names: Vec<(&str, &str, bool)> = lines
+        let names: Vec<(&str, &str, Option<&str>)> = lines
             .iter()
-            .map(|line| (line.name.as_str(), line.label.as_str(), line.dealt))
+            .map(|line| {
+                (
+                    line.name.as_str(),
+                    line.label.as_str(),
+                    line.card.as_ref().map(Address::rest),
+                )
+            })
             .collect();
+        // The row of `c` wears the words of its first card, and that card
+        // is what a verdict on the row is about, not the room.
         assert_eq!(
             names,
             [
-                ("c", "asks · 5m", true),
-                ("a", "needs reply · 1h", true),
-                ("d", "mention", false),
-                ("b", "2 unread · 3m", false),
-                ("quiet-new", "", false),
-                ("quiet-old", "", false),
+                ("c", "asks · 5m", Some("c/7")),
+                ("a", "needs reply · 1h", Some("a")),
+                ("d", "mention", None),
+                ("b", "2 unread · 3m", None),
+                ("quiet-new", "", None),
+                ("quiet-old", "", None),
             ]
         );
     }

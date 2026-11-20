@@ -27,7 +27,6 @@ In a channel's list of threads, a thread with a mention of the user waiting unre
 The user answers a card with a `Verdict`.
 
 ## concept Verdict
-status: a verdict lands on what the cursor is on. On a thread that the deal opened, the cursor starts on the newest message, so the verdict menu and the `window.Status line` name that message rather than the card, until the user moves the cursor to the thread's first line.
 purpose: let the user say once what a card means to them, so it goes away and rho remembers their answer.
 principle: the user reads a card's thread and has nothing to add; they press `space` then `d`; the echo line reads `done: debug`, and the next card opens; a minute later they change their mind and press `shift-u`, and the card is back as it was.
 sees: the verdict menu over the card, after `space`; the echo line naming the verdict and the card, such as `done: debug`.
@@ -37,7 +36,7 @@ does:
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
 - undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
 
-A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is. A verdict about one message alone is a rare act, by name from the palette.
+A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is in it, on the `with` line or in the box too. On a channel's list, a thread's row is that thread's card. A verdict about one message alone is a rare act, by name from the palette: `done with this message` and `mute this message`, offered only when the line under the cursor is a message that is not itself the card; the card stays.
 
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 

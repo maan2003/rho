@@ -38,5 +38,4 @@ cases: dozens of rooms with nothing waiting under the few that do; a room whose 
 when the deal holds a `deal.Card` for a room or for a thread inside it, then that `Room` goes to the top of `Home` in the card's order and shows the card's words instead of its own.
 
 ## rule a verdict on a room row lands on its card
-status: the verdict is said about the room itself, and the thread's card keeps its place and its words.
 when the user gives a `deal.Verdict` on a `Room` on `Home` whose words come from a card on a thread inside it, then the verdict is about that card, and the row changes at once.

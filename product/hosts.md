@@ -44,7 +44,6 @@ A pairing link saves typing where the host is. It works once, to make the host t
 A host on this machine shows no agent's desktop; see `agents.Desktop`.
 
 ## concept Device
-status: not built; the window has no way to take the phrase, and each device keeps its own verdicts, notes, and drafts.
 purpose: make each laptop or phone the user works on hold the same verdicts, notes, and drafts as the others, without any host being able to read them.
 principle: the user sets up a second laptop and types their twelve-word secret phrase once; the cards they put away on the first laptop are away here too, and their notes and drafts are here.
 sees: until it is paired, the echo line saying that its verdicts stay on this device.

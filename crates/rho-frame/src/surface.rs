@@ -36,6 +36,13 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         Subject::Own
     }
 
+    /// The card a verdict pressed over the surface is about: what holds
+    /// the subject as the dealer counts it. A thread is one card wherever
+    /// the point is in it; a list's row is its own card.
+    fn card(&self, cx: &App) -> Subject {
+        self.subject(cx)
+    }
+
     /// The surface's own rows for the palette, for what is in view.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
@@ -49,6 +56,7 @@ trait SurfaceHandle {
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subject(&self, cx: &App) -> Subject;
+    fn card(&self, cx: &App) -> Subject;
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
 }
 
@@ -75,6 +83,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn subject(&self, cx: &App) -> Subject {
         self.read(cx).subject(cx)
+    }
+
+    fn card(&self, cx: &App) -> Subject {
+        self.read(cx).card(cx)
     }
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
@@ -113,6 +125,10 @@ impl AnySurface {
 
     pub fn subject(&self, cx: &App) -> Subject {
         self.0.subject(cx)
+    }
+
+    pub fn card(&self, cx: &App) -> Subject {
+        self.0.card(cx)
     }
 
     pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
