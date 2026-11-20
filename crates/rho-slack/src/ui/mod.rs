@@ -108,7 +108,7 @@ pub enum Class {
     Conversation,
     /// A thread's summary line.
     Topic,
-    /// An unread count.
+    /// The rule over the first message the reader has not read.
     Unread,
     /// A count that includes a mention of you.
     Mention,
@@ -165,11 +165,12 @@ impl Class {
     pub fn resolve(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
         let (color, weight) = match self {
-            Self::Sender | Self::You => (colors.text, FontWeight::BOLD),
+            // Named as every thread names a writer.
+            Self::Sender | Self::You => (colors.text_accent, FontWeight::BOLD),
             Self::Time => (colors.text_muted, FontWeight::NORMAL),
             Self::Conversation => (colors.text_muted, FontWeight::NORMAL),
             Self::Topic => (colors.text, FontWeight::NORMAL),
-            Self::Unread => (colors.text, FontWeight::NORMAL),
+            Self::Unread => (colors.text_accent, FontWeight::NORMAL),
             Self::Mention => (colors.text_accent, FontWeight::NORMAL),
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),

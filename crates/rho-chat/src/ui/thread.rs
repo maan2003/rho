@@ -22,7 +22,7 @@ use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, Event, ago, when};
+use super::{ChatSystem, Event, ago};
 use crate::{AgentRef, HostChat, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
@@ -476,7 +476,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
                     _ => "replies",
                 },
                 chat.name(*id).unwrap_or_default(),
-                when(at.0),
+                thread::when(at.0 as i64),
             );
             items.push(
                 line(Key::Fold(*id), &text, Class::Fold).with_lines(vec![Meta::Message(*id)]),
@@ -562,10 +562,7 @@ fn private_items(
             .replies_to(&address)
             .into_iter()
             .map(|(note, held)| {
-                let time = held
-                    .written_ms
-                    .map(|ms| when(ms.max(0) as u64))
-                    .unwrap_or_default();
+                let time = held.written_ms.map(thread::when).unwrap_or_default();
                 let header = format!("🔒 you · {time}");
                 let body = held.body.as_deref().unwrap_or_default().trim_end();
                 let text = format!("{header}\n{body}");
@@ -857,7 +854,7 @@ fn message_item(message: &rho_agent_types::Message, meta: Meta) -> Item<Key, Cla
         Party::User => "you".to_owned(),
         Party::Agent(agent) => agent.encoded(),
     };
-    let time = when(message.at.0);
+    let time = thread::when(message.at.0 as i64);
     let header = format!("{from} · {time}");
     let mut text = header.clone();
     text.push('\n');

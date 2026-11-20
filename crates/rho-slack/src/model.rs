@@ -40,9 +40,10 @@ pub enum Waiting {
 /// opted into here, which is rho's own fact and no less the reader's word
 /// for it.
 ///
-/// The words are rendered from this at the moment a card is drawn, by
-/// [`reason_text`], so a conversation named after the message landed reads
-/// as `#design` rather than by its id.
+/// The words are rendered from this by [`reason_text`]; where it is, the
+/// card's context, is the roster's label at the moment the card is drawn,
+/// so a conversation named after the message landed reads as `#design`
+/// rather than by its id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attention {
     /// The reader was named, by handle, group, or a channel-wide broadcast.
@@ -59,18 +60,14 @@ pub enum Attention {
     ChannelTraffic,
 }
 
-/// What a card says it is for, in the words the reader reads. Built when
-/// the card is drawn and never stored: `conversation` is the label the
-/// roster gives now, so a name learned late is not baked into a stale
-/// sentence.
-pub fn reason_text(reason: Attention, conversation: &str) -> String {
+/// What a card says it is for, in the words the reader reads. It does not
+/// say where: the card's heading and its Home row already name the
+/// conversation, so the reason beside them would only say it again.
+pub fn reason_text(reason: Attention) -> &'static str {
     match reason {
-        Attention::Mentioned => format!("mentioned in {conversation}"),
-        Attention::DirectMessage => format!("unread in {conversation}"),
-        Attention::FollowedThread => {
-            format!("a reply in a followed thread in {conversation}")
-        }
-        Attention::ChannelTraffic => format!("unread in {conversation}"),
+        Attention::Mentioned => "mentioned",
+        Attention::DirectMessage | Attention::ChannelTraffic => "unread",
+        Attention::FollowedThread => "a reply in a followed thread",
     }
 }
 
@@ -665,6 +662,29 @@ impl Model {
                 Some(format!("#{}", conversation.name))
             }
         }
+    }
+
+    /// A search as the reader would say it: each `in:` scope that names a
+    /// conversation rho knows becomes that conversation's own name, so a
+    /// group reads as its people rather than as `#mpdm-david--keith-1`.
+    /// Slack still gets the query as it was written.
+    pub fn said_query(&self, query: &str) -> String {
+        query
+            .split(' ')
+            .map(|word| {
+                word.strip_prefix("in:")
+                    .and_then(|scope| {
+                        self.conversations
+                            .keys()
+                            .find(|channel| self.search_scope(channel).as_deref() == Some(scope))
+                    })
+                    .map_or_else(
+                        || word.to_owned(),
+                        |channel| format!("in {}", self.label(channel)),
+                    )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Every conversation rho knows of, for a caller that has to visit them
@@ -1373,6 +1393,20 @@ impl Model {
         self.handled.get(unit)
     }
 
+    /// How far the reader has dealt with this unit: the later of rho's own
+    /// cursor and Slack's mark, so a message read on the phone is as dealt
+    /// with as one answered here. What asks for the reader is everything
+    /// from someone else after this, and that is where a unit opens.
+    pub fn dealt_through(&self, unit: &Unit) -> Option<&Ts> {
+        match (self.handled_through(unit), self.read_through(unit)) {
+            (Some(handled), Some(read)) => Some(match read.is_newer_than(handled) {
+                true => read,
+                false => handled,
+            }),
+            (handled, read) => handled.or(read),
+        }
+    }
+
     /// Where Slack's own mark stands for this unit: the other half of the
     /// join, in Slack's words. Taken before a verdict moves anything, so an
     /// undo can put both halves back.
@@ -1930,48 +1964,32 @@ impl Model {
         // Nothing from anyone else since the reader last looked: whoever
         // else has written, they have read it.
         let newest = facts.newest_from_other.as_ref()?;
-        // rho's own half of the cursor. Slack's mark is asked below, in the
-        // words Slack keeps it in; what has been dealt with is the later of
-        // the two, so either one being past the newest message closes it.
+        // Read on another client, or dealt with here: either way nothing
+        // from anyone else is newer than where the reader is done.
         if self
-            .handled
-            .get(unit)
-            .is_some_and(|handled| !newest.is_newer_than(handled))
+            .dealt_through(unit)
+            .is_some_and(|dealt| !newest.is_newer_than(dealt))
         {
             return None;
         }
         match &unit.thread {
             Some(root) => {
-                let key = self.key(&unit.channel, root);
                 // Slack owns the follow list. A thread it stopped following
                 // is not the reader's business, whatever rho once raised.
-                if !self.followed.contains(&key) {
-                    return None;
-                }
-                self.thread_read
-                    .get(&key)
-                    .is_none_or(|read| newest.is_newer_than(read))
+                self.followed
+                    .contains(&self.key(&unit.channel, root))
                     .then_some(Attention::FollowedThread)
             }
-            None => {
-                if self
-                    .conversation_read
-                    .get(&unit.channel)
-                    .is_some_and(|read| !newest.is_newer_than(read))
-                {
-                    return None;
-                }
-                match facts.reason {
-                    Reason::DirectMessage => Some(Attention::DirectMessage),
-                    Reason::Mention => Some(Attention::Mentioned),
-                    // A thread reply that landed before the follow list
-                    // did, so it is filed against the conversation. The feed
-                    // only carries threads that are the reader's, so it asks
-                    // for them as surely as one filed against its thread.
-                    Reason::Thread => Some(Attention::FollowedThread),
-                    Reason::Channel => Some(Attention::ChannelTraffic),
-                }
-            }
+            None => match facts.reason {
+                Reason::DirectMessage => Some(Attention::DirectMessage),
+                Reason::Mention => Some(Attention::Mentioned),
+                // A thread reply that landed before the follow list did, so
+                // it is filed against the conversation. The feed only
+                // carries threads that are the reader's, so it asks for them
+                // as surely as one filed against its thread.
+                Reason::Thread => Some(Attention::FollowedThread),
+                Reason::Channel => Some(Attention::ChannelTraffic),
+            },
         }
     }
 
@@ -2343,8 +2361,11 @@ mod tests {
         assert_eq!(cards[0].attention, Some(Attention::ChannelTraffic));
         assert!(!cards[0].others_replied, "one voice so far");
         assert_eq!(
-            reason_text(cards[0].attention.unwrap(), &cards[0].conversation),
-            "unread in #design"
+            (
+                cards[0].conversation.as_str(),
+                reason_text(cards[0].attention.unwrap())
+            ),
+            ("#design", "unread")
         );
 
         // A second voice in the same run: the room is being answered
@@ -2394,10 +2415,7 @@ mod tests {
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::Mentioned)
         );
-        assert_eq!(
-            reason_text(Attention::Mentioned, "#design"),
-            "mentioned in #design"
-        );
+        assert_eq!(reason_text(Attention::Mentioned), "mentioned");
 
         // The phone marked it read at the mention itself.
         model.mark_read(&design, &Ts("100".into()));
@@ -2469,8 +2487,8 @@ mod tests {
         let unit = Unit::thread(&design, &Ts("100".into()));
         assert_eq!(model.attention(&unit), Some(Attention::FollowedThread));
         assert_eq!(
-            reason_text(Attention::FollowedThread, "#design"),
-            "a reply in a followed thread in #design"
+            reason_text(Attention::FollowedThread),
+            "a reply in a followed thread"
         );
 
         model.mark_read(&design, &Ts("999".into()));
@@ -2494,10 +2512,7 @@ mod tests {
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::DirectMessage)
         );
-        assert_eq!(
-            reason_text(Attention::DirectMessage, "@ada"),
-            "unread in @ada"
-        );
+        assert_eq!(reason_text(Attention::DirectMessage), "unread");
         model.set_muted([ChannelId("D1".into())]);
         assert!(model.cards(0).is_empty());
     }
@@ -3430,6 +3445,34 @@ mod tests {
             model.search_scope(&ChannelId("C1".into())).as_deref(),
             Some("#design"),
             "legacy Slack search accepts the channel name, not its C-id"
+        );
+    }
+
+    #[test]
+    fn a_search_reads_with_the_names_the_reader_knows_its_conversations_by() {
+        let mut model = model();
+        model.add_users([User {
+            id: UserId("U1".into()),
+            name: "Ada Lovelace".to_owned(),
+            handle: "ada".to_owned(),
+        }]);
+        model.add_conversations([Conversation {
+            id: ChannelId("G1".into()),
+            kind: ConversationKind::Group,
+            name: "mpdm-ada--manmeet-1".to_owned(),
+            user: None,
+            members: vec![UserId("U1".into()), UserId("ME".into())],
+        }]);
+        assert_eq!(
+            model.said_query("release in:#mpdm-ada--manmeet-1"),
+            "release in Ada Lovelace",
+            "a group reads as its people, not its machine name"
+        );
+        assert_eq!(model.said_query("in:#design curve"), "in #design curve");
+        assert_eq!(
+            model.said_query("in:#nowhere in:design"),
+            "in:#nowhere in:design",
+            "a scope rho cannot name is left as written"
         );
     }
 }

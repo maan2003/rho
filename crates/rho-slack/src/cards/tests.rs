@@ -256,10 +256,10 @@ fn s1_a_direct_message_asks_before_a_mention_before_a_big_thread() {
 }
 
 #[test]
-fn s1_a_card_says_why_in_the_conversation_s_name() {
+fn s1_a_card_says_why_and_its_context_says_where() {
     let mut w = world();
     w.dm("D1", "U1");
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
+    assert_eq!(w.hand(), "D1 · unread · needs reply · 0m");
     let claim = claims(&w.slack, None, &w.marks, None).remove(0);
     assert_eq!(claim.context, "@u1", "the card is where it is");
     assert_eq!(claim.under, None, "a conversation hangs under nothing");
@@ -300,7 +300,7 @@ fn s3_s4_read_or_replied_is_nothing_until_a_new_message() {
     assert_eq!(w.hand(), "", "read in Slack");
     w.pass(hours(1));
     w.post("D1", None, "U1", "one more thing");
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
+    assert_eq!(w.hand(), "D1 · unread · needs reply · 0m");
     w.post("D1", None, "ME", "sure");
     assert_eq!(w.hand(), "", "replied");
 }
@@ -316,7 +316,7 @@ fn s3_s4_done_on_another_device_holds_until_a_newer_message() {
     w.post("D1", None, "U1", "one more thing");
     assert_eq!(
         w.hand(),
-        "D1 · unread in @u1 · needs reply · 0m",
+        "D1 · unread · needs reply · 0m",
         "counting from the new message"
     );
 }

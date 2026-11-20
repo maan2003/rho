@@ -12,6 +12,8 @@ pub(super) struct TextLayout {
     pub code: Vec<Range<usize>>,
     pub code_blocks: Vec<Range<usize>>,
     pub underlines: Vec<Range<usize>>,
+    /// The words of each link, which are drawn as a link wherever they are.
+    pub links: Vec<Range<usize>>,
     pub mentions: Vec<Range<usize>>,
     pub concealed: Vec<Range<usize>>,
     pub paragraph_gaps: Vec<usize>,
@@ -40,6 +42,7 @@ impl TextLayout {
                         continue;
                     }
                     "html_tag" => tags.push(range),
+                    "link_text" => layout.links.push(range),
                     "backslash_escape" => layout.concealed.push(range.start..range.start + 1),
                     "list_item" => {
                         let mut cursor = node.walk();

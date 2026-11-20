@@ -88,7 +88,7 @@ pub fn claims(
             ),
         };
         let label = model.label(&unit.channel);
-        let why = reason_text(attention, &label);
+        let why = reason_text(attention);
         let mut claim = Claim::new(
             address,
             curve,

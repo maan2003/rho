@@ -801,12 +801,20 @@ impl Surface for SlackSurface {
     fn title(&self, cx: &App) -> String {
         let session = self.session.read(cx);
         match &self.view {
-            View::Conversation(view) => session.label(view.read(cx).source()),
+            View::Conversation(view) => view.read(cx).heading(cx),
             View::Results { listing, asked, .. } => match (listing, asked) {
-                (_, Some((query, _))) => format!("slack: {query}"),
+                (_, Some((query, _))) => format!("slack: {}", session.model().said_query(query)),
                 (Listing::Messages, None) => "slack messages".to_owned(),
                 (Listing::Files, None) => "slack files".to_owned(),
             },
+        }
+    }
+
+    /// The message under the point, as the title names it.
+    fn heading(&self, cx: &App) -> Option<String> {
+        match &self.view {
+            View::Conversation(view) => Some(view.read(cx).heading(cx)),
+            View::Results { .. } => None,
         }
     }
 

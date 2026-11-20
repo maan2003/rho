@@ -1725,14 +1725,19 @@ async fn only_what_slack_would_badge_is_handed_over() {
     let cards = model.cards(0);
     let reasons = cards
         .iter()
-        .map(|card| rho_slack::model::reason_text(card.attention.unwrap(), &card.conversation))
+        .map(|card| {
+            (
+                card.conversation.as_str(),
+                rho_slack::model::reason_text(card.attention.unwrap()),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         reasons,
         vec![
-            "mentioned in #design".to_owned(),
-            "unread in #random".to_owned(),
-            "unread in @ada".to_owned()
+            ("#design", "mentioned"),
+            ("#random", "unread"),
+            ("@ada", "unread")
         ],
         "three cards, longest wait first, each saying what it is for"
     );

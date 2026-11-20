@@ -4,7 +4,7 @@
 //! that means something in normal mode is bound for `vim_mode == normal`
 //! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
 
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, actions};
 
 actions!(
     rho_frame,
@@ -27,6 +27,14 @@ actions!(
         Home,
         OpenRow,
         FindAddress,
+        /// `/`: search forward in what is in view.
+        SearchForward,
+        /// `?`: search back.
+        SearchBackward,
+        /// `n`: the last search again, the same way.
+        SearchNext,
+        /// `N`: the last search again, the other way.
+        SearchPrevious,
         UndoVerdict,
         MinibufferConfirm,
         MinibufferCancel,
@@ -48,7 +56,31 @@ pub fn normal_contexts(surface: &str, more: &str) -> [String; 2] {
 /// while typing.
 pub fn bind(cx: &mut App) {
     cx.bind_keys(bindings());
+    cx.bind_keys([end_of_document(cx)]);
     crate::thread::bind(cx);
+}
+
+/// `G` as the end of the document, as vim has it. Helix keeps `G` for
+/// goto-line, which does nothing without a count; a reader pressing it
+/// in a transcript wants the newest message. `g e` stays as Helix has it.
+/// vim's motions are not public types, so the action is built by name.
+fn end_of_document(cx: &App) -> KeyBinding {
+    let action = cx
+        .build_action("vim::EndOfDocument", None)
+        .expect("vim is initialised before the frame binds its keys");
+    let context = KeyBindingContextPredicate::parse(
+        "RhoFrame > Editor && vim_mode == helix_normal && vim_operator == none",
+    )
+    .expect("the context parses");
+    KeyBinding::load(
+        "shift-g",
+        action,
+        Some(context.into()),
+        false,
+        None,
+        &DummyKeyboardMapper,
+    )
+    .expect("the keystroke parses")
 }
 
 fn bindings() -> Vec<KeyBinding> {
@@ -79,8 +111,17 @@ fn bindings() -> Vec<KeyBinding> {
         ]);
     }
     for context in normal_contexts("RhoFrame", " && vim_operator == none") {
-        bindings.push(KeyBinding::new("shift-u", UndoVerdict, Some(&context)));
+        bindings.extend([
+            KeyBinding::new("shift-u", UndoVerdict, Some(&context)),
+            // vim's search keys reach for a Zed pane's search bar, which no
+            // surface has; the frame searches the surface's editor instead.
+            KeyBinding::new("/", SearchForward, Some(&context)),
+            KeyBinding::new("?", SearchBackward, Some(&context)),
+            KeyBinding::new("n", SearchNext, Some(&context)),
+            KeyBinding::new("shift-n", SearchPrevious, Some(&context)),
+        ]);
     }
+
     for context in normal_contexts("RhoHome", "") {
         bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
     }
