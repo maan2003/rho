@@ -65,7 +65,7 @@ A thread is named for the user: after its second message, the host gives it a sh
 
 The list of threads in a channel puts the threads with a mention of the user first, then the ones with something new, each group newest first.
 
-A thread shows what each of its agents is doing. The `with` line reads each agent with its state and age, such as `with eng-q9tz · working 12m, eng-kjhi · failed 1h`, refreshed each minute, and with the cursor on that line the palette offers that agent's steering commands, so the user steers from the thread.
+A thread shows what each of its agents is doing. The `with` line reads each agent with its state and age, such as `with eng-q9tz · working 12m, eng-kjhi · failed 1.0h: the model refused the request`, the age in the same words as the card's, refreshed each minute, and with the cursor on that line the palette offers that agent's steering commands, so the user steers from the thread.
 
 A Slack conversation is a thread whose messages are what was said in a Slack channel, group, or direct message, with the Slack thread under each message folded beneath it. Its name is such as `#design-24`, `@Barbara Liskov`, or the names of a group. It also shows a line for each new day and a centred `— new —` rule above the first message from someone else that the user has not dealt with, where the cursor lands when it opens; a link is underlined, and a link's preview shows its site and title with the rest behind `Show more ↓`; older messages load as the user scrolls up to `older messages not loaded`. A message being sent shows `sending…` under the box; one that failed shows `send failed · Enter retries`.
 
@@ -104,7 +104,7 @@ With no threads yet, the channel reads `no threads yet · the composer starts on
 answers: what was said here last, who is at work on it and how it goes, and whether the user owes an answer.
 shows:
 - the newest `Message`s, and the user's own place among them
-- the `with` line: each `agents.Agent` in the thread, what it is doing and for how long, such as `working 12m` or `failed 1h`
+- the `with` line: each `agents.Agent` in the thread, what it is doing and for how long, such as `working 12m` or `failed 1.0h: the model refused the request`
 - the first `Message`, the brief every agent started from
 - under a `Message` with replies, `↳ 2 replies · name · time`
 - the line of threads above this one, such as `tide`, when there is one
@@ -131,7 +131,7 @@ tide › flaky test                                       asks · 2h            
 tide
 you · 09:12
 hey, fix the flaky test in sync_tests.rs, it fails one run in five
-with eng-q9tz · working 12m, eng-kjhi · failed 1h
+with eng-q9tz · working 12m, eng-kjhi · failed 1.0h: cargo test exited 101
 
 q9tz45g2bcvs · 09:13
 Reading sync_tests.rs. The failure is a race on the clock mock.

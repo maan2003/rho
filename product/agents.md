@@ -38,17 +38,17 @@ has:
 does:
 - open: from the `with` line of a thread, or by name with `window.Palette`; its screen, `Agent`, opens at its newest step
 - open its thread, from the palette as `open its thread`: open the thread it started from
-- rewind turns, from the palette: take back its last turn; the palette has no way to give a count, so it is always one
+- rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind
 - new cache key, from the palette: make it start its model's cache afresh
-- set runtime, from the palette: ask `runtime (current):` and switch the model it runs on
+- set runtime, from the palette: ask `runtime (current):`, offering only the other runtimes of its kind, one word each, and switch the model it runs on; another kind is refused with `set runtime: an agent keeps its runtime kind`
 - cancel the request, from the palette: stop what it is asking its model now
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.
 
 In a thread, a message from an agent is signed with its long code, such as `q9tz45g2bcvs`, while the `with` line names the same agent by its workset name or short code.
 
-The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user talks to an agent only in its thread.
+The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. Each command line ends with `ok` or `error` and how long it ran; the same error again counts on one line, `×7`; a cancel reads `you cancelled the request`. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user talks to an agent only in its thread.
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
