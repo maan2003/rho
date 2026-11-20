@@ -19,7 +19,6 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
-use crate::attention::Verdict;
 use crate::frame::Point;
 use crate::menu::Row;
 use crate::surface::AnySurface;
@@ -33,7 +32,7 @@ pub struct RoomRow {
     pub address: Address,
     pub standing: Standing,
     pub name: String,
-    /// Where it is: a host's name, a Slack workspace.
+    /// Where it is: the host's name.
     pub tag: String,
     /// What waits in it, in the system's words (`3 unread · 2h`); empty
     /// when nothing does.
@@ -46,7 +45,7 @@ pub struct RoomRow {
 /// hand's to say, which Home reads; the rest is the system's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Standing {
-    /// The user works in it: they made it or wrote in it, starred it, or
+    /// The user works in it: they made it or wrote in it, or
     /// something in it asks them or mentions them unread.
     Worked,
     /// Only a place a card can be in: a room while the hand holds one in
@@ -63,10 +62,6 @@ pub struct Found {
     /// When it last moved, for ordering; zero when nothing says.
     pub recency: u64,
 }
-
-/// What takes back the side of a verdict a system did outside the ledger:
-/// Slack's own cursor moved back, a unit unmuted there.
-pub type Reversal = Box<dyn FnOnce(&mut App)>;
 
 pub trait System: Sized + 'static {
     /// The address kinds this system opens.
@@ -160,24 +155,6 @@ pub trait System: Sized + 'static {
     /// from another. Asked with the frame busy: a system reads the marks
     /// afterwards, through [`crate::FrameLink::read`].
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, _cx: &mut Context<Self>) {}
-
-    /// Whether this system holds a mute of the address itself, where the
-    /// user can lift it too: the ledger then only settles it, so a mute
-    /// lifted there is lifted here.
-    fn mutes_itself(&self, _address: &Address) -> bool {
-        false
-    }
-
-    /// The user said this about one of the system's addresses; what the
-    /// system does about it outside the ledger, and how to take that back.
-    fn said(
-        &mut self,
-        _address: &Address,
-        _verdict: &Verdict,
-        _cx: &mut Context<Self>,
-    ) -> Option<Reversal> {
-        None
-    }
 }
 
 trait SystemHandle {
@@ -208,8 +185,6 @@ trait SystemHandle {
     fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
-    fn mutes_itself(&self, address: &Address, cx: &App) -> bool;
-    fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal>;
 }
 
 impl<S: System> SystemHandle for Entity<S> {
@@ -282,14 +257,6 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.update(cx, |system, cx| system.marks_moved(touched, cx))
-    }
-
-    fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
-        self.read(cx).mutes_itself(address)
-    }
-
-    fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
-        self.update(cx, |system, cx| system.said(address, verdict, cx))
     }
 }
 
@@ -369,13 +336,5 @@ impl AnySystem {
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.0.marks_moved(touched, cx)
-    }
-
-    pub fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
-        self.0.mutes_itself(address, cx)
-    }
-
-    pub fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
-        self.0.said(address, verdict, cx)
     }
 }

@@ -1,12 +1,11 @@
 //! The client's one database.
 //!
 //! A rho client keeps several kinds of state: the agent mirror, the desk
-//! mirror, the Slack mirror and its cursors, the action journal, the
-//! inbox, the hosts it attaches. Each was its own redb file, which is one
-//! file lock, one page cache and one allocator rebuild per kind, and five
-//! chances for a session to be half open. They are one file now, the way
-//! the agent host's store is one file. Every crate keeps its own tables and
-//! its own types; only the file is shared.
+//! mirror, the action journal, the inbox, the hosts it attaches. Each was its
+//! own redb file, which is one file lock, one page cache and one allocator
+//! rebuild per kind, and five chances for a session to be half open. They are
+//! one file now, the way the agent host's store is one file. Every crate keeps
+//! its own tables and its own types; only the file is shared.
 //!
 //! It is opened once, by `main` and before anything else happens, and
 //! handed to each crate. Nothing here resolves the state directory: that
@@ -19,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::RhoDb;
+
+mod retire_slack;
 
 pub const FILE_NAME: &str = "rho-client.redb";
 /// Held for as long as the database is open. redb takes its own lock and
@@ -41,6 +42,7 @@ pub fn open(state_dir: &Path) -> std::io::Result<RhoDb> {
     let lock = acquire_lock(state_dir)?;
     let db = RhoDb::open(path(state_dir)).holding(lock);
     own_the_file(state_dir)?;
+    retire_slack::migrate(state_dir, &db).map_err(std::io::Error::other)?;
     Ok(db)
 }
 

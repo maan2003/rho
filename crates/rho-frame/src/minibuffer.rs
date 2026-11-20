@@ -138,22 +138,11 @@ pub type CandidateSource = Rc<dyn Fn(&Frame, &str, &App) -> Vec<Candidate>>;
 pub type SubmitHandler = Rc<dyn Fn(&mut Frame, String, &mut Window, &mut Context<Frame>)>;
 /// Runs when Escape dismisses a prompt that owns external state.
 pub type CancelHandler = Rc<dyn Fn(&mut Frame, &mut Window, &mut Context<Frame>)>;
-/// Receives the input as it now stands, after each edit, while the
-/// minibuffer is still open.
-///
-/// [`CandidateSource`] answers "what could this become" and may only read;
-/// this answers "what should the reader be looking at now" and may act. It is
-/// what makes a prompt narrow the thing behind it as the reader types, which
-/// is the whole of an Emacs-style narrowing read and is not something
-/// completion can do. Optional per prompt: a prompt that sets none pays a
-/// `None` check per keystroke and nothing else.
-pub type ChangeHandler = Rc<dyn Fn(&mut Frame, &str, &mut Window, &mut Context<Frame>)>;
 
 pub struct Minibuffer {
     prompt: SharedString,
     editor: Entity<Editor>,
     complete: CandidateSource,
-    on_change: Option<ChangeHandler>,
     on_submit: SubmitHandler,
     on_cancel: Option<CancelHandler>,
     candidates: Vec<Candidate>,
@@ -185,15 +174,10 @@ impl Minibuffer {
         self.secret
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "editor primitives pass their callbacks and GPUI window/context explicitly"
-    )]
     pub fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
         complete: CandidateSource,
-        on_change: Option<ChangeHandler>,
         on_submit: SubmitHandler,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
@@ -212,11 +196,9 @@ impl Minibuffer {
             });
             editor
         });
-        // `subscribe_in` rather than `subscribe`: the change handler may act
-        // on the workspace, and acting needs a window. One edit, one call.
-        let edits = cx.subscribe_in(&editor, window, |this: &mut Frame, _, event, window, cx| {
+        let edits = cx.subscribe(&editor, |this: &mut Frame, _, event, cx| {
             if matches!(event, editor::EditorEvent::BufferEdited) {
-                this.refresh_minibuffer(window, cx);
+                this.refresh_minibuffer(cx);
             }
         });
         window.focus(&editor.focus_handle(cx), cx);
@@ -224,7 +206,6 @@ impl Minibuffer {
             prompt: prompt.into(),
             editor,
             complete,
-            on_change,
             on_submit,
             on_cancel,
             candidates: Vec::new(),
@@ -249,10 +230,6 @@ impl Minibuffer {
     /// The prompt's change handler, if it set one. Cloned rather than
     /// borrowed because running it needs the workspace mutably, and the
     /// minibuffer lives in the workspace.
-    pub fn on_change(&self) -> Option<ChangeHandler> {
-        self.on_change.clone()
-    }
-
     pub fn on_cancel(&self) -> Option<CancelHandler> {
         self.on_cancel.clone()
     }

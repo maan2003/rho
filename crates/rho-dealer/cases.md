@@ -44,8 +44,8 @@ A card is titled by the thread's subject and the project's address.
 | Z2 | Snooze ends, the node still wants the user | its own card, its wait counting from the snooze's end |
 | Z3 | Snooze ends, the node wants nothing | nothing |
 | Z4 | Snoozed, then the user wrote in the thread | the snooze holds, but a reply within 1h of the user's message comes through |
-| Z5 | Snoozed, then the other side wrote | a direct message, or a thread of 3 people or fewer: a small bump per message when it comes back; nothing for other threads and agents |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
+| Z7 | A channel is snoozed | its threads hold too |
 
 ## What older builds wrote
 
@@ -63,17 +63,6 @@ the user's logs and still read.
 |---|---|---|
 | T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
 | T6 | Done or muted | takes back the deadline and the snooze |
-
-## Slack
-
-| # | History and facts | Card |
-|---|---|---|
-| S1 | Unread direct message / mention / reply in a followed thread | starts at 1.2 / 1.1 / 0.6 and rises alike; a thread of 3 people or fewer asks like a direct message |
-| S2 | Unread channel traffic | starts at 0.1, gone within a day, or half a day once someone else answers |
-| S3 | Read anywhere, or replied | nothing |
-| S4 | A new message after that | a card again, counting from the new message |
-| S6 | Muted in Slack | nothing |
-| S7 | A room snoozed | every thread in it holds too |
 
 ## Notes
 

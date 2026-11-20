@@ -1,11 +1,8 @@
 //! The cases in `cases.md`, each under its row's name, and the rules
 //! every history keeps.
 //!
-//! The sources here are stand-ins: a thread that asks and answers, and a
-//! Slack-shaped conversation that is read or not. Each claims the way its
-//! real source does for the one or two cases the dealer's own rules need;
-//! what a real source must claim for each of its cases is that source's
-//! own test, beside its code.
+//! The source is a stand-in thread that asks and answers. What the real
+//! source claims for each of its cases is tested beside that source.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -26,21 +23,9 @@ enum Said {
 }
 
 /// One thing a stand-in source holds.
-enum Thing {
-    /// A chat thread between the user and one agent: posts in order, each
-    /// numbered the way a host numbers them.
-    Thread { posts: Vec<Post> },
-    /// A Slack conversation: a direct one, or a thread in a room with
-    /// this many people in it.
-    Slack {
-        reason: String,
-        head_start: f64,
-        room: Option<Address>,
-        /// A conversation with the user: what it slept through counts.
-        direct: bool,
-        messages: Vec<Msg>,
-        read_through: Option<String>,
-    },
+struct Thread {
+    posts: Vec<Post>,
+    channel: Option<Address>,
 }
 
 struct Post {
@@ -51,17 +36,10 @@ struct Post {
     ask: Option<bool>,
 }
 
-struct Msg {
-    ts: String,
-    at: Timestamp,
-    from_me: bool,
-}
-
 /// Everything `rank` reads, and a clock to move.
 struct World {
-    things: BTreeMap<Address, Thing>,
+    things: BTreeMap<Address, Thread>,
     seq: u64,
-    ts: u64,
     marks: Marks,
     skips: Skips,
     now: Zoned,
@@ -76,7 +54,6 @@ fn world_in(zone: TimeZone) -> World {
     World {
         things: BTreeMap::new(),
         seq: 0,
-        ts: 0,
         marks: Marks::default(),
         skips: Skips::default(),
         now: "2026-08-23T09:00:00Z"
@@ -108,8 +85,13 @@ impl World {
 
     fn agent(&mut self, name: &str) -> Address {
         let address = Address::new("thread", format!("0/{}", self.things.len() + 1));
-        self.things
-            .insert(address.clone(), Thing::Thread { posts: Vec::new() });
+        self.things.insert(
+            address.clone(),
+            Thread {
+                posts: Vec::new(),
+                channel: None,
+            },
+        );
         self.names.insert(address.clone(), name.into());
         address
     }
@@ -117,7 +99,7 @@ impl World {
     fn post_in(&mut self, address: &Address, from_user: bool, ask: Option<bool>) {
         self.seq += 1;
         let at = self.at();
-        let Some(Thing::Thread { posts }) = self.things.get_mut(address) else {
+        let Some(Thread { posts, .. }) = self.things.get_mut(address) else {
             panic!("not a thread")
         };
         posts.push(Post {
@@ -145,94 +127,6 @@ impl World {
         self.post_in(address, true, None);
     }
 
-    // Slack
-
-    fn next_ts(&mut self) -> String {
-        self.ts += 1;
-        format!("{}.{:06}", self.now.timestamp().as_second(), self.ts)
-    }
-
-    fn slack(
-        &mut self,
-        address: Address,
-        name: &str,
-        reason: &str,
-        head_start: f64,
-        room: Option<Address>,
-        direct: bool,
-    ) -> Address {
-        if !self.things.contains_key(&address) {
-            self.things.insert(
-                address.clone(),
-                Thing::Slack {
-                    reason: reason.into(),
-                    head_start,
-                    room,
-                    direct,
-                    messages: Vec::new(),
-                    read_through: None,
-                },
-            );
-        }
-        self.names.insert(address.clone(), name.into());
-        address
-    }
-
-    fn post(&mut self, address: &Address, from_me: bool) {
-        let ts = self.next_ts();
-        let at = self.at();
-        let Some(Thing::Slack { messages, .. }) = self.things.get_mut(address) else {
-            panic!("not slack")
-        };
-        messages.push(Msg { ts, at, from_me });
-    }
-
-    /// A direct message from the user `channel` is with.
-    fn dm(&mut self, channel: &str, user: &str) -> Address {
-        let address = self.slack(
-            Address::new("slack", format!("acme/{channel}")),
-            channel,
-            &format!("unread in @{user} · needs reply · {{age}}"),
-            SLACK_DM_HEAD_START,
-            None,
-            true,
-        );
-        self.post(&address, false);
-        address
-    }
-
-    /// A thread in #design the user follows, with a reply from each of
-    /// `users` in turn.
-    fn thread(&mut self, users: &[&str]) -> Address {
-        let root = self.next_ts();
-        let room = Address::new("slack", "acme/C1");
-        let address = self.slack(
-            Address::new("slack", format!("acme/C1/{root}")),
-            "thread",
-            "#design · needs reply · {age}",
-            SLACK_THREAD_HEAD_START,
-            Some(room),
-            users.len() < SLACK_SMALL_THREAD_PEOPLE,
-        );
-        self.post(&address, true);
-        for _ in users {
-            self.post(&address, false);
-        }
-        address
-    }
-
-    fn read(&mut self, address: &Address) {
-        let Some(Thing::Slack {
-            messages,
-            read_through,
-            ..
-        }) = self.things.get_mut(address)
-        else {
-            panic!("not slack")
-        };
-        *read_through = messages.last().map(|message| message.ts.clone());
-    }
-
     // The user
 
     fn tell(&mut self, fact: Fact) {
@@ -249,10 +143,8 @@ impl World {
     /// How far the user has seen `address`: everything its source has.
     fn seen(&self, address: &Address) -> Seen {
         match self.things.get(address) {
-            Some(Thing::Thread { posts }) => Seen::Topic(posts.last().map_or(0, |post| post.seq)),
-            Some(Thing::Slack { messages, .. }) => messages
-                .last()
-                .map_or(Seen::Whole, |message| Seen::Slack(message.ts.clone())),
+            Some(Thread { posts, .. }) => Seen::Topic(posts.last().map_or(0, |post| post.seq)),
+
             None => Seen::Whole,
         }
     }
@@ -320,110 +212,66 @@ impl World {
         let at = self.at();
         let mut claims = Vec::new();
         let mut trace = trace;
-        for (address, thing) in &self.things {
+        for (address, Thread { posts, channel }) in &self.things {
             let facts = self.marks.get(address).facts();
-            match thing {
-                Thing::Thread { posts } => {
-                    // Done, or the user's own words, see through to there.
-                    let seen = facts.seen_topic().unwrap_or(0).max(
-                        posts
-                            .iter()
-                            .filter(|post| post.from_user)
-                            .map(|post| post.seq)
-                            .max()
-                            .unwrap_or(0),
-                    );
-                    let unseen: Vec<&Post> = posts
-                        .iter()
-                        .filter(|post| post.ask.is_some() && post.seq > seen)
-                        .collect();
-                    let (mention, curve, reason) =
-                        if let Some(ask) = unseen.iter().find(|post| post.ask == Some(true)) {
-                            (
-                                *ask,
-                                Curve::Waiting {
-                                    head_start: AGENT_BLOCKED_HEAD_START,
-                                    since: ask.at,
-                                },
-                                "asks · {age}",
-                            )
-                        } else if let Some(result) = unseen.last() {
-                            (
-                                *result,
-                                Curve::Waiting {
-                                    head_start: AGENT_BLOCKED_HEAD_START,
-                                    since: result.at,
-                                },
-                                "result · {age}",
-                            )
-                        } else {
-                            if let Some(trace) = trace.as_deref_mut() {
-                                trace.outcome(address, "no card: nothing unread".to_owned());
-                            }
-                            continue;
-                        };
-                    let mut claim = Claim::new(
-                        address.clone(),
-                        curve,
-                        reason,
-                        unseen.last().unwrap().seq.to_string(),
-                    );
-                    claim.title = self.names[address].clone();
-                    if let Some(spoke) = posts
-                        .iter()
-                        .filter(|post| post.from_user)
-                        .map(|post| post.at)
-                        .max()
-                    {
-                        claim.bonus = recency_bonus(spoke, at);
-                        if mention.at.duration_since(spoke) <= REPLY_BREAKTHROUGH {
-                            claim.breaks_snooze_set_by = Some(spoke);
-                        }
-                    }
-                    claims.push(claim);
-                }
-                Thing::Slack {
-                    reason,
-                    head_start,
-                    room,
-                    direct,
-                    messages,
-                    read_through,
-                } => {
-                    let Some(newest) = messages.last() else {
-                        continue;
-                    };
-                    if read_through.as_deref() == Some(newest.ts.as_str())
-                        || facts
-                            .seen_slack()
-                            .is_some_and(|seen| seen >= newest.ts.as_str())
-                    {
-                        if let Some(trace) = trace.as_deref_mut() {
-                            trace.outcome(address, "no card: read".to_owned());
-                        }
-                        continue;
-                    }
-                    let mut claim = Claim::new(
-                        address.clone(),
+            // Done, or the user's own words, see through to there.
+            let seen = facts.seen_topic().unwrap_or(0).max(
+                posts
+                    .iter()
+                    .filter(|post| post.from_user)
+                    .map(|post| post.seq)
+                    .max()
+                    .unwrap_or(0),
+            );
+            let unseen: Vec<&Post> = posts
+                .iter()
+                .filter(|post| post.ask.is_some() && post.seq > seen)
+                .collect();
+            let (mention, curve, reason) =
+                if let Some(ask) = unseen.iter().find(|post| post.ask == Some(true)) {
+                    (
+                        *ask,
                         Curve::Waiting {
-                            head_start: *head_start,
-                            since: newest.at,
+                            head_start: AGENT_BLOCKED_HEAD_START,
+                            since: ask.at,
                         },
-                        reason.clone(),
-                        newest.ts.clone(),
-                    );
-                    claim.title = self.names[address].clone();
-                    claim.under = room.clone();
-                    if *direct {
-                        claim.others = messages
-                            .iter()
-                            .filter(|message| !message.from_me)
-                            .map(|message| message.at)
-                            .collect();
+                        "asks · {age}",
+                    )
+                } else if let Some(result) = unseen.last() {
+                    (
+                        *result,
+                        Curve::Waiting {
+                            head_start: AGENT_BLOCKED_HEAD_START,
+                            since: result.at,
+                        },
+                        "result · {age}",
+                    )
+                } else {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.outcome(address, "no card: nothing unread".to_owned());
                     }
-                    claims.push(claim);
+                    continue;
+                };
+            let mut claim = Claim::new(
+                address.clone(),
+                curve,
+                reason,
+                unseen.last().unwrap().seq.to_string(),
+            );
+            claim.title = self.names[address].clone();
+            if let Some(spoke) = posts
+                .iter()
+                .filter(|post| post.from_user)
+                .map(|post| post.at)
+                .max()
+            {
+                claim.bonus = recency_bonus(spoke, at);
+                if mention.at.duration_since(spoke) <= REPLY_BREAKTHROUGH {
+                    claim.breaks_snooze_set_by = Some(spoke);
                 }
             }
+            claim.under.clone_from(channel);
+            claims.push(claim);
         }
         claims
     }
@@ -504,25 +352,27 @@ fn note(w: &mut World, name: &str) -> Address {
 #[test]
 fn z1_a_snooze_holds_until_it_ends() {
     let mut w = world();
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     w.snooze(&d, hours(1));
     assert_eq!(w.hand(), "");
     w.pass(mins(59));
     assert_eq!(w.hand(), "");
     w.pass(mins(1));
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
+    assert_eq!(w.hand(), "D1 · asks · 0m");
 }
 
 #[test]
 fn z2_a_node_back_from_a_snooze_counts_from_its_end() {
     let mut w = world();
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     w.snooze(&d, hours(1));
     w.pass(mins(90));
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 30m");
+    assert_eq!(w.hand(), "D1 · asks · 30m");
     assert!(close(
         w.priority(&d).unwrap(),
-        SLACK_DM_HEAD_START + WAITING_SLOPE_PER_DAY / 48.0
+        AGENT_BLOCKED_HEAD_START + WAITING_SLOPE_PER_DAY / 48.0
     ));
 }
 
@@ -535,9 +385,6 @@ fn z3_a_snooze_ending_on_a_node_that_wants_nothing_brings_nothing() {
     w.pass(mins(5));
     w.writes_to(&a);
     w.works(&a);
-    let d = w.dm("D1", "u1");
-    w.snooze(&d, hours(1));
-    w.read(&d);
     w.pass(hours(2));
     assert_eq!(w.hand(), "");
 }
@@ -570,42 +417,26 @@ fn z4_a_reply_within_the_hour_of_the_users_message_comes_through_a_snooze() {
 }
 
 #[test]
-fn z5_a_direct_conversation_comes_back_higher_for_what_it_slept_through() {
-    let mut w = world();
-    let d = w.dm("D1", "u1");
-    w.snooze(&d, hours(2));
-    let big = w.thread(&["U1", "U2", "U3", "U4"]);
-    w.snooze(&big, hours(2));
-    w.pass(hours(1));
-    w.post(&d, false);
-    w.post(&d, false);
-    w.post(&big, false);
-    w.pass(hours(1));
-    assert!(close(
-        w.priority(&d).unwrap(),
-        SLACK_DM_HEAD_START + 2.0 * SNOOZED_MESSAGE_BUMP
-    ));
-    assert!(close(w.priority(&big).unwrap(), SLACK_THREAD_HEAD_START));
-}
-
-#[test]
 fn z6_every_snooze_is_kept() {
     let mut w = world();
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     for _ in 0..3 {
         w.snooze(&d, hours(1));
         w.pass(hours(1));
     }
     assert_eq!(w.marks.get(&d).facts().snoozes(), 3);
-    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
+    assert_eq!(w.hand(), "D1 · asks · 0m");
 }
 
 #[test]
 fn z7_a_snoozed_room_holds_what_is_under_it() {
     let mut w = world();
-    let room = Address::new("slack", "acme/C1");
+    let room = Address::new("topic", "0/100");
     w.snooze(&room, hours(1));
-    let thread = w.thread(&["U1"]);
+    let thread = w.agent("thread");
+    w.things.get_mut(&thread).unwrap().channel = Some(room);
+    w.asks(&thread);
     assert_eq!(w.hand(), "");
     w.pass(hours(1));
     assert!(w.priority(&thread).is_some());
@@ -619,7 +450,8 @@ fn z7_a_snoozed_room_holds_what_is_under_it() {
 #[test]
 fn p1_an_old_pile_clears_what_came_before_and_holds_nothing() {
     let mut w = world();
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     let n = note(&mut w, "n");
     w.snooze(&d, hours(3));
     w.due_in(&n, 2);
@@ -631,7 +463,7 @@ fn p1_an_old_pile_clears_what_came_before_and_holds_nothing() {
     }
     assert_eq!(
         w.hand(),
-        "D1 · unread in @u1 · needs reply · 0m",
+        "D1 · asks · 0m",
         "the snooze is gone and the pile saw nothing"
     );
     w.pass(hours(3));
@@ -645,7 +477,8 @@ fn t1_an_old_todo_reads_as_a_read() {
     let mut w = world();
     let a = w.agent("a");
     w.asks(&a);
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     w.snooze(&d, hours(1));
     for address in [&a, &d] {
         let seen = w.seen(address);
@@ -738,11 +571,14 @@ fn x1_a_node_is_one_card_at_its_strongest() {
 #[test]
 fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
     let mut w = world();
-    let a = w.dm("D1", "u1");
+    let a = w.agent("D1");
+    w.asks(&a);
     w.pass(hours(3));
-    w.dm("D2", "u2");
+    let b = w.agent("D2");
+    w.asks(&b);
     w.pass(hours(1));
-    w.dm("D3", "u3");
+    let c = w.agent("D3");
+    w.asks(&c);
     let skip_top = |w: &mut World| {
         let card = w.deal().cards[0].clone();
         w.skips.skip(card.address, card.cursor, w.now.timestamp());
@@ -758,7 +594,7 @@ fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
     assert_eq!(skip_top(&mut w).as_deref(), Some("D1"));
     assert!(w.deal().cards.iter().all(|card| card.skipped));
 
-    w.post(&a, false);
+    w.asks(&a);
     let first = w.deal().cards[0].clone();
     assert!(
         first.address == a && !first.skipped,
@@ -774,23 +610,21 @@ fn x2_a_skip_sends_a_card_to_the_back_until_its_source_moves_or_it_runs_out() {
 #[test]
 fn x3_the_hand_says_when_it_next_changes() {
     let mut w = world();
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     w.snooze(&d, hours(1));
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + hours(1)));
     w.pass(hours(1));
     // Back from its snooze, it counts from the snooze's end: `0m` until it
     // says `1m` half a minute on.
-    assert_eq!(w.deal().cards[0].label, "unread in @u1 · needs reply · 0m");
+    assert_eq!(w.deal().cards[0].label, "asks · 0m");
     let back = w.now.timestamp();
     assert_eq!(
         w.deal().next_change,
         Some(back + SignedDuration::from_secs(30))
     );
     w.pass(hours(2));
-    assert_eq!(
-        w.deal().cards[0].label,
-        "unread in @u1 · needs reply · 2.0h"
-    );
+    assert_eq!(w.deal().cards[0].label, "asks · 2.0h");
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + mins(3)));
     let cursor = w.deal().cards[0].cursor.clone();
     let skipped = w.now.timestamp();
@@ -808,7 +642,8 @@ fn x4_tomorrow_is_the_users_own_midnight() {
     let mut w = world_in(TimeZone::fixed(
         Offset::from_seconds(5 * 3600 + 1800).unwrap(),
     ));
-    let d = w.dm("D1", "u1");
+    let d = w.agent("D1");
+    w.asks(&d);
     // 09:00 UTC is 14:30 on the user's clock; tomorrow starts at 18:30 UTC.
     w.say(
         &d,
@@ -831,8 +666,6 @@ enum Step {
     Asks(usize),
     Works(usize),
     WritesTo(usize),
-    Dm(usize),
-    Read(usize),
     Snooze(usize, i64),
     Done(usize),
     Mute(usize),
@@ -847,11 +680,9 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
         (0usize..3).prop_map(Step::Asks),
         (0usize..3).prop_map(Step::Works),
         (0usize..3).prop_map(Step::WritesTo),
-        (0usize..2).prop_map(Step::Dm),
-        (0usize..2).prop_map(Step::Read),
-        ((0usize..5), (1i64..600)).prop_map(|(node, mins)| Step::Snooze(node, mins)),
-        (0usize..5).prop_map(Step::Done),
-        (0usize..5).prop_map(Step::Mute),
+        ((0usize..3), (1i64..600)).prop_map(|(node, mins)| Step::Snooze(node, mins)),
+        (0usize..3).prop_map(Step::Done),
+        (0usize..3).prop_map(Step::Mute),
         Just(Step::SkipTop),
     ]
 }
@@ -867,9 +698,7 @@ proptest::proptest! {
     fn every_history_keeps_the_rules(steps in proptest::collection::vec(step(), 1..40)) {
         let mut w = world();
         let agents: Vec<Address> = ["a0", "a1", "a2"].iter().map(|name| w.agent(name)).collect();
-        let dms = ["D1", "D2"];
-        let dm_nodes: Vec<Address> = dms.iter().map(|channel| Address::new("slack", format!("acme/{channel}"))).collect();
-        let all: Vec<Address> = agents.iter().chain(&dm_nodes).cloned().collect();
+
         for step in steps {
             match step {
                 Step::Pass(minutes) => w.pass(mins(minutes)),
@@ -877,15 +706,9 @@ proptest::proptest! {
                 Step::Asks(i) => w.asks(&agents[i]),
                 Step::Works(i) => w.works(&agents[i]),
                 Step::WritesTo(i) => w.writes_to(&agents[i]),
-                Step::Dm(i) => { w.dm(dms[i], ["u1", "u2"][i]); }
-                Step::Read(i) => {
-                    if w.things.contains_key(&dm_nodes[i]) {
-                        w.read(&dm_nodes[i]);
-                    }
-                }
-                Step::Snooze(i, minutes) => w.snooze(&all[i], mins(minutes)),
-                Step::Done(i) => w.done(&all[i]),
-                Step::Mute(i) => w.say(&all[i], Said::Mute),
+                Step::Snooze(i, minutes) => w.snooze(&agents[i], mins(minutes)),
+                Step::Done(i) => w.done(&agents[i]),
+                Step::Mute(i) => w.say(&agents[i], Said::Mute),
                 Step::SkipTop => {
                     if let Some(card) = w.deal().cards.first().cloned() {
                         w.skips.skip(card.address, card.cursor, w.now.timestamp());
@@ -903,7 +726,11 @@ proptest::proptest! {
                 proptest::prop_assert!(!facts.muted());
                 // Z1: nothing snoozed shows, but for an agent's quick reply.
                 if let Some(snooze) = facts.snooze() && at < snooze.until {
-                    proptest::prop_assert_eq!(card.address.kind(), "thread");
+                    let posts = &w.things[&card.address].posts;
+                    let spoke = posts.iter().rfind(|post| post.from_user).unwrap();
+                    proptest::prop_assert!(spoke.at >= snooze.set.timestamp());
+                    proptest::prop_assert!(posts.iter().any(|reply| reply.ask.is_some()
+                        && reply.seq > spoke.seq && reply.at.duration_since(spoke.at) <= hours(1)));
                 }
             }
             // X3: nothing arrives by itself before the next change.
@@ -922,8 +749,10 @@ proptest::proptest! {
 #[test]
 fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
     let mut w = world();
-    let asking = w.dm("D1", "u1");
-    let snoozed = w.dm("D2", "u2");
+    let asking = w.agent("asking");
+    w.asks(&asking);
+    let snoozed = w.agent("snoozed");
+    w.asks(&snoozed);
     w.snooze(&snoozed, hours(1));
     let quiet = w.agent("a");
     w.finishes(&quiet);

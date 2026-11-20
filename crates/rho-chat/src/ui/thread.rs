@@ -654,11 +654,10 @@ fn pending_items(
     items
 }
 
-/// A root's threads, one line each, the way the Slack list shows
-/// conversations: the name and what waits in it, with the unread ones
-/// first, a mention of the user before a plain unread, and each group
-/// newest first. The words are in the thread; the list is for choosing one.
-/// Without `marks` nothing is known to be unread.
+/// A root's threads, one line each: the name and what waits in it, with the
+/// unread ones first, a mention of the user before a plain unread, and each
+/// group newest first. The words are in the thread; the list is for choosing
+/// one. Without `marks` nothing is known to be unread.
 fn thread_rows(
     system: &ChatSystem,
     chat: &HostChat,

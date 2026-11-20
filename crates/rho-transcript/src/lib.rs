@@ -1,12 +1,12 @@
 //! A keyed, incremental transcript over one buffer.
 //!
-//! Items sit in display order, each keyed by the caller (Slack: conversation
-//! plus timestamp) and each owning an anchored range in the buffer, its
+//! Items sit in display order, each keyed by the caller and owning an
+//! anchored range in the buffer, its
 //! styles, its below-line blocks and its per-line metadata. Every operation
 //! (insert a run before or after a key, replace one item, remove one) edits
 //! only the range it names, so anchors outside it — the cursor, the scroll
 //! anchor, other items' highlights and blocks — survive untouched. Nothing
-//! here knows about Slack, agents or GitHub: day rules and gap lines are
+//! here knows about the caller's domain: day rules and gap lines are
 //! ordinary items under caller-chosen keys.
 //!
 //! Highlights are bucketed: items are grouped into runs of [`BUCKET`], each
@@ -78,7 +78,7 @@ pub struct Item<K, C, M> {
     pub backgrounds: Vec<(C, Range<usize>)>,
     pub blocks: Vec<BlockSpec>,
     /// One entry per line of `text`, for whatever the surface reads back
-    /// under the cursor (Slack: the thread and the file a line offers).
+    /// under the cursor.
     pub lines: Vec<M>,
     /// The run of the item's text the gutter bar marks, if any: the same
     /// bar the agent transcript draws beside a message, which is how a

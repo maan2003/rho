@@ -1,10 +1,9 @@
 //! Home: the rooms, the one that wants the user most first.
 //!
 //! A room is a place the user works in: a host's channel they made or
-//! wrote in, a Slack conversation they starred, or one that holds a card
-//! or something for them unread. Each system lists its own
-//! ([`System::rooms`](crate::system::System::rooms)); nothing here
-//! scores anything. A root that is a room only while it holds a card
+//! wrote in, or one that holds a card or something for them unread. Each system
+//! lists its own ([`System::rooms`](crate::system::System::rooms)); nothing
+//! here scores anything. A root that is a room only while it holds a card
 //! ([`Standing::WhileCard`]) is left off while the dealer's hand holds
 //! none in it. A room with a card in the hand goes by that card, in the
 //! hand's order, wearing the card's words; the rest go by what waits in
@@ -32,7 +31,7 @@ use crate::system::{RoomRow, Standing};
 use crate::when::until_said;
 
 /// Home's own highlight-key space, clear of the transcript's semantic slots
-/// at zero and Slack's at the top. Buckets grow upwards from here.
+/// at zero. Buckets grow upwards from here.
 const HOME_KEY_BASE: usize = usize::MAX / 3;
 
 /// The most of a room's name a row shows. A note's name is its first
@@ -285,10 +284,10 @@ impl HomeView {
             return vec![
                 line(
                     HomeKey::Empty,
-                    "no rooms yet · attach a host or register a Slack workspace from the palette (:)",
+                    "no rooms yet · attach a host from the palette (:)",
                     HomeClass::Muted,
                 )
-                    .with_lines(vec![HomeTarget::None]),
+                .with_lines(vec![HomeTarget::None]),
             ];
         }
         let column = column_of(self.rooms.iter().map(|room| room.name.clone()).collect());

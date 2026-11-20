@@ -14,28 +14,9 @@ pub const DEAL_QUEUE_FLOOR: f64 = -1.0;
 pub const WAITING_SLOPE_PER_DAY: f64 = 12.0;
 /// A project mail addressed to the user: an ask, result, or stop.
 pub const AGENT_BLOCKED_HEAD_START: f64 = 1.0;
-/// A direct message: the most personal ask, just above a mention.
-pub const SLACK_DM_HEAD_START: f64 = 1.2;
-pub const SLACK_MENTION_HEAD_START: f64 = 1.1;
-/// A reply in a thread Slack follows for the user: a conversation they
-/// are in, but not one addressed to them.
-pub const SLACK_THREAD_HEAD_START: f64 = 0.6;
-/// A thread this small is a conversation with the user, and asks like a
-/// direct message.
-pub const SLACK_SMALL_THREAD_PEOPLE: usize = 3;
-/// Unread traffic in a channel nobody addressed the user in: barely
-/// above nothing, and gone within the day, or half of it once someone else
-/// is answering.
-pub const CHANNEL_TRAFFIC_HEAD_START: f64 = 0.1;
-pub const CHANNEL_TRAFFIC_GONE_DAYS: f64 = 1.0;
-pub const CHANNEL_ANSWERED_GONE_DAYS: f64 = 0.5;
 /// How many days before a deadline it starts to press, when the user did
 /// not say.
 pub const DEADLINE_LEAD_DAYS: u32 = 3;
-/// What each new message from somebody else in a direct conversation adds
-/// to its card when a snooze on it ends, up to the cap.
-pub const SNOOZED_MESSAGE_BUMP: f64 = 0.1;
-pub const SNOOZED_MESSAGE_BUMP_CAP: f64 = 0.5;
 /// An agent's reply this soon after the user's own message reaches them
 /// through a snooze: they are in that conversation.
 pub const REPLY_BREAKTHROUGH: SignedDuration = SignedDuration::from_hours(1);
@@ -242,12 +223,12 @@ mod tests {
     #[test]
     fn someone_waiting_rises_and_information_fades_to_the_floor() {
         let waiting = Curve::Waiting {
-            head_start: SLACK_DM_HEAD_START,
+            head_start: AGENT_BLOCKED_HEAD_START,
             since: ago(2.0),
         };
         assert_eq!(
             waiting.priority(noon()),
-            SLACK_DM_HEAD_START + 2.0 * WAITING_SLOPE_PER_DAY
+            AGENT_BLOCKED_HEAD_START + 2.0 * WAITING_SLOPE_PER_DAY
         );
         assert_eq!(
             waiting.label("needs reply · {age}", noon()),
@@ -260,23 +241,6 @@ mod tests {
         };
         assert!(information(2.9).priority(noon()) > DEAL_QUEUE_FLOOR);
         assert!(information(3.0).priority(noon()) <= DEAL_QUEUE_FLOOR);
-    }
-
-    #[test]
-    fn a_channel_is_gone_within_the_day_and_never_overtakes_a_thread() {
-        let room = |days, gone_days| Curve::Fading {
-            head_start: CHANNEL_TRAFFIC_HEAD_START,
-            since: ago(days),
-            gone_days,
-        };
-        assert!(room(0.9, CHANNEL_TRAFFIC_GONE_DAYS).priority(noon()) > DEAL_QUEUE_FLOOR);
-        assert!(room(1.0, CHANNEL_TRAFFIC_GONE_DAYS).priority(noon()) <= DEAL_QUEUE_FLOOR);
-        assert!(room(0.5, CHANNEL_ANSWERED_GONE_DAYS).priority(noon()) <= DEAL_QUEUE_FLOOR);
-        let thread = Curve::Waiting {
-            head_start: SLACK_THREAD_HEAD_START,
-            since: noon(),
-        };
-        assert!(room(0.0, CHANNEL_TRAFFIC_GONE_DAYS).priority(noon()) < thread.priority(noon()));
     }
 
     #[test]
