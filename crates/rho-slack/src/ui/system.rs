@@ -191,7 +191,7 @@ impl SlackSystem {
                 editor.set_show_compact_gutter(false, cx);
                 editor.set_mouse_click_selection_enabled(true, cx);
             },
-            configure_markdown: rho_window::markdown::configure_buffer,
+            configure_markdown: rho_window::markdown::configure_document,
             gutter_colour: rho_window::style::user_prompt_gutter_color,
         }
     }
@@ -374,9 +374,10 @@ impl System for SlackSystem {
                 let source = Self::source(model, &unit);
                 // Opened while it asks for the reader, it lands on the
                 // oldest message from someone else they have not dealt
-                // with: three mentions are one card, and this is the first.
+                // with, here or by reading it in Slack: three mentions are
+                // one card, and this is the first.
                 let land = model.attention(&unit).and_then(|_| {
-                    let cursor = model.handled_through(&unit).cloned();
+                    let cursor = model.dealt_through(&unit).cloned();
                     session
                         .read(cx)
                         .oldest_from_other_after(&unit, cursor.as_ref())

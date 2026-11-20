@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::block::{Emphasis, Flavour, Names, emphasis};
+use crate::block::{Emphasis, Flavour, Names, bare_urls, emphasis, markdown_link};
 use crate::types::{Attachment, FileSummary};
 
 /// What the sender said, as markdown.
@@ -66,21 +66,34 @@ pub(crate) fn remark(text: &str) -> String {
 }
 
 /// One run of text with no code in it: every emphasised stretch rewritten,
-/// everything else escaped.
+/// every bare address made a link, everything else escaped.
 fn marked(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for (kind, range) in emphasis(text) {
-        out.push_str(&escape(&text[at..range.start]));
+        out.push_str(&linked(&text[at..range.start]));
         let marker = match kind {
             Emphasis::Bold => "**",
             Emphasis::Italic => "*",
             Emphasis::Struck => "~~",
         };
         out.push_str(marker);
-        out.push_str(&escape(&text[range.start + 1..range.end - 1]));
+        out.push_str(&linked(&text[range.start + 1..range.end - 1]));
         out.push_str(marker);
         at = range.end;
+    }
+    out.push_str(&linked(&text[at..]));
+    out
+}
+
+/// Plain text, escaped, with the addresses in it written as links.
+fn linked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for url in bare_urls(text) {
+        out.push_str(&escape(&text[at..url.start]));
+        out.push_str(&markdown_link(&text[url.clone()], &text[url.clone()]));
+        at = url.end;
     }
     out.push_str(&escape(&text[at..]));
     out
@@ -159,7 +172,20 @@ mod tests {
             said("see <https://example.com|the notes>"),
             "see [the notes](https://example.com)"
         );
-        assert_eq!(said("<https://example.com>"), "<https://example.com>");
+        assert_eq!(
+            said("<https://example.com>"),
+            "[https://example.com](https://example.com)"
+        );
+    }
+
+    /// A URL typed into the text is a link, as Slack draws it, and the
+    /// punctuation after it is the sentence's, not the address's.
+    #[test]
+    fn a_bare_url_is_a_link() {
+        assert_eq!(
+            said("see https://example.com/a_b. then"),
+            "see [https://example.com/a_b](https://example.com/a_b). then"
+        );
     }
 
     /// Ids never survive, in either flavour: the mention is a name.

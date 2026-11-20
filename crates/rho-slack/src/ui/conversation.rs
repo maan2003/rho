@@ -45,7 +45,6 @@ pub struct ChromeGutter;
 /// Marks folds owned by custom emoji rendering. The shortcode stays in the
 /// buffer while the display conceals it behind an image inlay.
 struct CustomEmojiFold;
-struct AvatarFold;
 struct MessageTextFold;
 struct PreviewRows;
 struct CodeBlockRows;
@@ -152,7 +151,9 @@ pub struct ConversationView {
     emoji_image_bytes: usize,
     emoji_revision: u64,
     avatar_authors: HashMap<Row, crate::types::UserId>,
-    avatar_folds: HashMap<Row, Range<MultiBufferAnchor>>,
+    /// Where each message's picture is drawn in the gutter: beside the
+    /// line that names its writer.
+    avatars: HashMap<Row, MultiBufferAnchor>,
     edited_inlays: HashMap<Row, InlayId>,
     thread_inlays: HashMap<Row, Vec<InlayId>>,
     next_custom_inlay: usize,
@@ -593,7 +594,7 @@ impl ConversationView {
             emoji_image_bytes: 0,
             emoji_revision: 0,
             avatar_authors: HashMap::new(),
-            avatar_folds: HashMap::new(),
+            avatars: HashMap::new(),
             edited_inlays: HashMap::new(),
             thread_inlays: HashMap::new(),
             next_custom_inlay: 0,
@@ -650,6 +651,13 @@ impl ConversationView {
     fn cursor_at_end(&self, cx: &mut Context<Self>) -> bool {
         let last = self.transcript.buffer().read(cx).max_point().row as usize;
         self.cursor_row(cx) >= last
+    }
+
+    /// Whether the cursor is still where the surface landed it -- on the
+    /// message a deal, a search or the unread rule opened on -- with the
+    /// reader not having moved since.
+    fn reading_the_landing(&self) -> bool {
+        (self.dealt_placed || self.unread_placed) && !self.fill.moved
     }
 
     /// Puts the cursor on the last line of the messages, in view.
@@ -1122,6 +1130,46 @@ impl ConversationView {
     /// Puts words in the composer, the way typing does.
     pub fn set_compose_for_test(&mut self, text: String, cx: &mut Context<Self>) {
         self.set_compose(text, cx);
+    }
+
+    /// What the status line calls this screen: where it is, and what the
+    /// point is on there. A conversation names the message under the
+    /// cursor, so a jump to a linked message says where it landed; a thread
+    /// names its first message, which is what the thread is about.
+    pub fn heading(&self, cx: &App) -> String {
+        let session = self.session.read(cx);
+        let model = session.model();
+        let label = model.label(self.source.channel());
+        let about = match &self.source {
+            Source::Thread(key) => Some(key.thread_ts.clone()),
+            Source::Conversation(_) => {
+                let head = self.editor.read(cx).selections.newest_anchor().head();
+                let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+                let row = multi_buffer::ToPoint::to_point(&head, &snapshot).row;
+                match self.transcript.key_at_row(row, cx) {
+                    Some(Row::Message(ts)) => Some(ts.clone()),
+                    _ => None,
+                }
+            }
+        };
+        let said = about
+            .and_then(|ts| {
+                session
+                    .loaded(&self.source)?
+                    .messages
+                    .iter()
+                    .find(|message| message.ts == ts)
+                    .map(|message| model.render_parts(message).0)
+            })
+            .and_then(|said| {
+                said.lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+            });
+        match said {
+            Some(said) => format!("{label} › {}", said.trim()),
+            None => label,
+        }
     }
 
     /// The message the cursor is on, if the transcript has one there.
@@ -1839,8 +1887,10 @@ impl ConversationView {
         // search rather than a pass over what is shown.
         let was_on = self.cursor_message_ts(cx);
         // A reader at the end stays at the end as messages arrive, as in
-        // every thread.
-        let at_end = self.cursor_at_end(cx);
+        // every thread. A reader the surface landed on a message is reading
+        // that message, even when it is the last one: the cursor stays on it
+        // until they move.
+        let at_end = self.cursor_at_end(cx) && !self.reading_the_landing();
         let placed = (self.dealt_placed, self.unread_placed);
         let Some((revision, updates)) = self
             .session
@@ -1896,10 +1946,10 @@ impl ConversationView {
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let dates = self
+        let rules = self
             .transcript
             .keys()
-            .filter(|row| matches!(row, Row::Day(_)))
+            .filter(|row| matches!(row, Row::Day(_) | Row::Unread))
             .filter_map(|row| snapshot.anchor_in_excerpt(self.transcript.range_of(row)?.start))
             .collect();
         let buffer = self.transcript.buffer().read(cx).snapshot();
@@ -1940,7 +1990,7 @@ impl ConversationView {
             })
             .collect();
         self.editor.update(cx, |editor, cx| {
-            editor.set_centered_rows(dates, cx);
+            editor.set_centered_rows(rules, cx);
             spacing.extend(paragraph_spacing);
             editor.set_row_spacing(spacing, cx);
         });
@@ -1984,7 +2034,7 @@ impl ConversationView {
 
     #[cfg(any(test, feature = "fake"))]
     pub fn avatar_count_for_test(&self) -> usize {
-        self.avatar_folds.len()
+        self.avatars.len()
     }
 
     #[cfg(any(test, feature = "fake"))]
@@ -2022,16 +2072,9 @@ impl ConversationView {
             self.editor
                 .update(cx, |editor, cx| editor.splice_inlays(&[id], vec![], cx));
         }
-        if let Some(range) = self.avatar_folds.remove(row) {
-            self.editor.update(cx, |editor, cx| {
-                editor.set_gutter_image(range.start, None, cx);
-                editor.remove_folds_with_type(
-                    std::slice::from_ref(&range),
-                    TypeId::of::<AvatarFold>(),
-                    false,
-                    cx,
-                );
-            });
+        if let Some(start) = self.avatars.remove(row) {
+            self.editor
+                .update(cx, |editor, cx| editor.set_gutter_image(start, None, cx));
         }
         let Some(decorations) = self.emoji_decorations.remove(row) else {
             return;
@@ -2053,7 +2096,7 @@ impl ConversationView {
         let rows = self
             .emoji_decorations
             .keys()
-            .chain(self.avatar_folds.keys())
+            .chain(self.avatars.keys())
             .chain(self.edited_inlays.keys())
             .chain(self.thread_inlays.keys())
             .cloned()
@@ -2303,6 +2346,7 @@ impl ConversationView {
         }
         let code = layout.code.into_iter().filter_map(&range).collect();
         let underlines = layout.underlines.into_iter().filter_map(&range).collect();
+        let links = layout.links.into_iter().filter_map(&range).collect();
         let mentions = layout.mentions.into_iter().filter_map(&range).collect();
         let indents = indents
             .into_values()
@@ -2335,6 +2379,17 @@ impl ConversationView {
         };
         let control_style = gpui::HighlightStyle {
             color: Some(colors.terminal_ansi_blue.into()),
+            ..Default::default()
+        };
+        // A link reads the same in every thread: the accent colour,
+        // underlined.
+        let link_style = gpui::HighlightStyle {
+            color: Some(colors.text_accent.into()),
+            underline: Some(gpui::UnderlineStyle {
+                thickness: gpui::px(1.),
+                color: Some(colors.text_accent.into()),
+                wavy: false,
+            }),
             ..Default::default()
         };
         let underline_style = gpui::HighlightStyle {
@@ -2377,6 +2432,7 @@ impl ConversationView {
                 (usize::MAX - 605, reply_links, control_style),
                 (usize::MAX - 602, underlines, underline_style),
                 (usize::MAX - 603, mentions, mention_style),
+                (usize::MAX - 606, links, link_style),
             ] {
                 editor.highlight_text(editor::HighlightKey::SyntaxTreeView(key), ranges, style, cx);
             }
@@ -2689,36 +2745,23 @@ impl ConversationView {
                     .map(std::path::Path::to_path_buf);
                 let image = path.as_ref().and_then(|path| self.decoded_image(path, cx));
                 pending |= self.session.read(cx).avatar_loading(&user);
-                // Author identity and row geometry never depend on the
-                // download. The source still retains the name
-                // for copy/search.
-                let header = text.lines().next().unwrap_or_default();
-                let initials = header
+                // The picture sits in the gutter beside the line that names
+                // the writer; the name itself is text, so it never waits on
+                // the download and the initials stand in until it lands.
+                let initials = crate::block::Names::user(self.session.read(cx).model(), &user)
+                    .unwrap_or_default()
                     .split_whitespace()
                     .filter_map(|word| word.chars().next())
                     .flat_map(char::to_uppercase)
                     .take(2)
                     .collect::<String>();
-                let mut header_end = text.find('\n').map_or(0, |offset| offset + 1);
-                let body = &text[header_end..];
-                if (body.starts_with("```") || body.starts_with("~~~"))
-                    && let Some(end) = body.find('\n')
+                let start = self.transcript.buffer().read(cx).anchor_before(base);
+                if let Some(start) = self
+                    .multi_buffer
+                    .read(cx)
+                    .snapshot(cx)
+                    .anchor_in_excerpt(start)
                 {
-                    header_end += end + 1;
-                }
-                let (start, end) = {
-                    let buffer = self.transcript.buffer().read(cx);
-                    (
-                        buffer.anchor_before(base),
-                        buffer.anchor_after(base + header_end),
-                    )
-                };
-                let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-                if let (Some(start), Some(end)) = (
-                    snapshot.anchor_in_excerpt(start),
-                    snapshot.anchor_in_excerpt(end),
-                ) {
-                    let range = start..end;
                     self.editor.update(cx, |editor, cx| {
                         editor.set_gutter_image(
                             start,
@@ -2728,17 +2771,8 @@ impl ConversationView {
                             }),
                             cx,
                         );
-                        editor.fold_creases(
-                            vec![Crease::simple(
-                                range.clone(),
-                                FoldPlaceholder::concealed(TypeId::of::<AvatarFold>()),
-                            )],
-                            false,
-                            window,
-                            cx,
-                        );
                     });
-                    self.avatar_folds.insert(row.clone(), range);
+                    self.avatars.insert(row.clone(), start);
                 }
             }
             if pending {
@@ -3849,26 +3883,29 @@ fn image_block(
     }
 }
 
-/// Bound the initial quote by both lines and characters, cutting at a word
-/// boundary. Source and formatting beyond this point remain in the buffer.
-fn preview_cutoff(text: &str) -> Option<usize> {
-    let mut lines = 0;
-    let mut boundary = 0;
-    for (characters, (offset, ch)) in text.char_indices().enumerate() {
-        if ch.is_whitespace() {
-            boundary = offset;
-        }
-        if ch == '\n' {
-            lines += 1;
-        }
-        if characters >= 480 || lines >= 6 {
-            if text[boundary..].chars().count() > 80 {
-                return Some(boundary);
-            }
-            return None;
-        }
-    }
-    None
+/// Where an unfurl's body starts: after the lines that say what the link
+/// is -- its site or author, and its title. The body is someone else's page,
+/// so it waits behind `Show more ↓` rather than filling the conversation.
+fn unfurl_body_start(
+    attachment: &crate::types::Attachment,
+    text: &str,
+    model: &Model,
+) -> Option<usize> {
+    let head = crate::types::Attachment {
+        text: None,
+        fallback: None,
+        fields: Vec::new(),
+        blocks: Vec::new(),
+        ..attachment.clone()
+    };
+    let head_lines =
+        crate::block::render_attachment(crate::block::Flavour::Markdown, &head, model).len();
+    let start = text
+        .split_inclusive('\n')
+        .take(head_lines)
+        .map(str::len)
+        .sum::<usize>();
+    (start < text.len()).then_some(start)
 }
 
 fn continues_author(previous: &Message, message: &Message, model: &Model) -> bool {
@@ -3920,14 +3957,12 @@ fn message_item_with_header(
         return item(Row::Message(message.ts.clone()), spans, lines);
     }
 
-    let you = message.user.as_ref() == Some(model.self_id());
-    let name = Span::styled(
-        model.author(message),
-        match you {
-            true => Class::You,
-            false => Class::Sender,
-        },
-    );
+    // The writer as every thread names one: `you` for the reader, so their
+    // own messages are found at a glance, and the name for anyone else.
+    let name = match message.user.as_ref() == Some(model.self_id()) {
+        true => Span::styled("you", Class::You),
+        false => Span::styled(model.author(message), Class::Sender),
+    };
     let said = crate::markdown::body(&message.blocks, &message.text, &[], &[], model);
     let said = said.trim_end().to_owned();
     let mut links = crate::block::links(&message.blocks, &message.text, &message.attachments);
@@ -3968,9 +4003,12 @@ fn message_item_with_header(
     };
 
     if header {
-        // A text-cell gap separates the profile inlay from the author name.
-        spans.push(Span::plain(" "));
         spans.push(name);
+        spans.push(Span::plain(" · "));
+        spans.push(Span::styled(
+            rho_frame::thread::when(message.ts.epoch_seconds() as i64 * 1000),
+            Class::Time,
+        ));
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
@@ -4019,7 +4057,7 @@ fn message_item_with_header(
         lines.push(LineMeta::default());
         let cutoff = attachment
             .is_unfurl
-            .then(|| preview_cutoff(&text))
+            .then(|| unfurl_body_start(attachment, &text, model))
             .flatten();
         let is_expanded = expanded.contains(&(message.ts.clone(), index));
         let mut offset = 0;
@@ -4224,11 +4262,11 @@ fn first_unread(messages: &[Message], from: &Ts) -> Option<Ts> {
 }
 
 /// The unread rule, written as the document's own heading so the parse
-/// draws it and hides its markers. It reads as unread rather than as
-/// chrome: a day break is where the reader is in the week, this is where
-/// they stopped.
+/// draws it and hides its markers, and centred like the day rule. It reads
+/// as unread rather than as chrome: a day break is where the reader is in
+/// the week, this is where they stopped.
 fn unread_rule() -> Rendered {
-    muted_item(Row::Unread, "## new\n", Class::Unread)
+    muted_item(Row::Unread, "## ── new ──\n", Class::Unread)
 }
 
 fn day_rule(label: String) -> Rendered {
@@ -5149,17 +5187,24 @@ mod tests {
             false,
         );
         let lines_text = text.lines().collect::<Vec<_>>();
+        let said_at = |seconds: i64| format!("ada · {}", rho_frame::thread::when(seconds * 1000));
         let hello = lines_text.iter().position(|line| *line == "hello").unwrap();
-        assert!(lines_text[hello - 1].trim() == "ada");
+        assert_eq!(lines_text[hello - 1], said_at(1_700_000_000));
         assert_eq!(
-            lines_text[hello + 1].trim(),
-            "ada",
-            "no timestamp or blank spacer row"
+            lines_text[hello + 1],
+            said_at(1_700_000_600),
+            "no blank spacer row"
         );
         let over = lines_text.iter().position(|line| *line == "over").unwrap();
-        assert!(lines_text[over - 1].trim() == "ada");
         assert_eq!(lines_text[over + 1], "two lines");
-        assert!(classed(&text, &styles, Class::Time).is_empty());
+        assert_eq!(classed(&text, &styles, Class::Sender), vec!["ada", "ada"]);
+        assert_eq!(
+            classed(&text, &styles, Class::Time),
+            vec![
+                rho_frame::thread::when(1_700_000_000_000),
+                rho_frame::thread::when(1_700_000_600_000)
+            ]
+        );
         assert_eq!(lines.len(), text.matches('\n').count());
     }
 
@@ -5186,7 +5231,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_is_named_like_anyone_else_and_told_apart_by_class() {
+    fn the_reader_s_own_message_says_you_and_a_mention_names_them() {
         let mut model = model();
         model.add_users([crate::types::User {
             id: UserId("ME".into()),
@@ -5198,17 +5243,16 @@ mod tests {
         let mention = message("1700000001.0", None, "can <@ME> take this?");
         let (text, styles, _) = render_messages(&[own, mention], &model, false);
 
-        assert!(!text.contains("you"), "the word never appears: {text}");
-        assert!(text.contains("Manmeet"), "{text}");
         assert!(
             text.contains("can <mark>@Manmeet</mark> take this?"),
             "{text}"
         );
         assert_eq!(
             classed(&text, &styles, Class::You),
-            vec!["Manmeet", "@Manmeet"],
-            "own author line and a mention of the reader, class only"
+            vec!["you", "@Manmeet"],
+            "own author line and a mention of the reader"
         );
+        assert_eq!(classed(&text, &styles, Class::Sender), vec!["ada"]);
     }
 
     #[test]
@@ -5469,9 +5513,42 @@ mod tests {
         assert_eq!(rendered.lines[control].preview_toggle, Some(0));
         assert!(rendered.lines[control].link.is_none());
         assert!(rendered.lines[control].thread.is_none());
-        assert_eq!(preview_cutoff("short quote"), None);
-        let cutoff = preview_cutoff(&body).unwrap();
-        assert!(body.is_char_boundary(cutoff));
+    }
+
+    /// An unfurl is someone else's page: what the link is stays in view,
+    /// and the page's own words wait behind `Show more ↓`, however short.
+    #[test]
+    fn an_unfurl_shows_what_the_link_is_and_folds_the_page() {
+        let message = parsed(json!({
+            "ts":"1700000000.0", "user":"U1", "text":"look",
+            "attachments":[{
+                "is_msg_unfurl": true,
+                "service_name": "example.com",
+                "title": "Worth a read",
+                "text": "one short line",
+            }]
+        }));
+        let rendered = message_item(&message, &model(), false);
+        let hidden = |wanted: &str| {
+            let row = rendered
+                .text
+                .lines()
+                .position(|line| line == wanted)
+                .unwrap_or_else(|| panic!("{wanted:?} in {}", rendered.text));
+            rendered.lines[row].preview_hidden
+        };
+        assert_eq!(hidden("example.com"), None, "the site stays");
+        assert_eq!(hidden("**Worth a read**"), None, "the title stays");
+        assert_eq!(hidden("one short line"), Some(0), "the page waits");
+        assert!(rendered.text.lines().any(|line| line == "Show more ↓"));
+
+        // With nothing past the title there is nothing to show more of.
+        let bare = parsed(json!({
+            "ts":"1700000000.0", "user":"U1", "text":"look",
+            "attachments":[{"is_msg_unfurl": true, "title": "Worth a read"}]
+        }));
+        let rendered = message_item(&bare, &model(), false);
+        assert!(!rendered.text.contains("Show more"), "{}", rendered.text);
     }
 
     #[test]
@@ -5520,7 +5597,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_are_hidden_without_changing_attachment_text() {
+    fn a_message_says_its_time_beside_its_sender_and_not_on_its_attachments() {
         let with_file = parsed(json!({
             "ts": "1700000000.0",
             "user": "U1",
@@ -5535,9 +5612,16 @@ mod tests {
             }],
         }));
         let (text, _, _) = render_messages(&[with_file], &model(), false);
-        assert!(
-            !text.contains(&crate::ui::clock_time(1_700_000_000)),
-            "{text}"
+        let time = crate::ui::clock_time(1_700_000_000);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains(&time))
+                .collect::<Vec<_>>(),
+            [format!(
+                "ada · {}",
+                rho_frame::thread::when(1_700_000_000_000)
+            )],
+            "the time is said once, beside the sender: {text}"
         );
         assert!(
             text.lines().any(|line| line.trim() == "deck.pdf · 220 KB"),
@@ -5790,7 +5874,7 @@ mod tests {
         assert_eq!(first_unread(&held(&["100.0", "200.0"]), &read), None);
 
         let rule = unread_rule();
-        assert_eq!(rule.text, "## new\n");
+        assert_eq!(rule.text, "## ── new ──\n", "it is a rule like the day's");
         assert_eq!(
             rule.styles
                 .iter()

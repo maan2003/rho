@@ -59,6 +59,14 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         self.subject(cx)
     }
 
+    /// What the status line calls the surface while it is the card in
+    /// view. By default the card's own heading; a surface that knows where
+    /// the point is in it, such as the message under the cursor, says that
+    /// instead.
+    fn heading(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
     /// The surface's own rows for the palette, for what is in view.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
@@ -74,6 +82,7 @@ trait SurfaceHandle {
     fn subject(&self, cx: &App) -> Subject;
     fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
+    fn heading(&self, cx: &App) -> Option<String>;
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
 }
 
@@ -108,6 +117,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn card(&self, cx: &App) -> Subject {
         self.read(cx).card(cx)
+    }
+
+    fn heading(&self, cx: &App) -> Option<String> {
+        self.read(cx).heading(cx)
     }
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
@@ -154,6 +167,10 @@ impl AnySurface {
 
     pub fn card(&self, cx: &App) -> Subject {
         self.0.card(cx)
+    }
+
+    pub fn heading(&self, cx: &App) -> Option<String> {
+        self.0.heading(cx)
     }
 
     pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {

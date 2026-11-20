@@ -864,19 +864,6 @@ pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
     }
 }
 
-/// A message's time on the user's clock: the hour when it is today, the
-/// day in front of it when it is not.
-pub(crate) fn when(at_ms: u64) -> String {
-    let at = Timestamp::from_millisecond(at_ms as i64)
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-        .to_zoned(jiff::tz::TimeZone::system());
-    let now = jiff::Zoned::now();
-    match at.date() == now.date() {
-        true => at.strftime("%H:%M").to_string(),
-        false => at.strftime("%a %-d %b %H:%M").to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

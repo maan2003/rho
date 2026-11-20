@@ -138,7 +138,13 @@ impl ResultsView {
         self.draw(
             vec![(
                 None,
-                vec![Span::styled(format!("looking for {query}…"), Class::Muted)],
+                vec![Span::styled(
+                    format!(
+                        "looking for {}…",
+                        self.session.read(cx).model().said_query(query)
+                    ),
+                    Class::Muted,
+                )],
             )],
             window,
             cx,
@@ -161,7 +167,8 @@ impl ResultsView {
         self.loading = false;
         self.kind = SearchKind::Messages;
         let hits = &page.hits;
-        let mut lines = vec![(None, heading(query, hits.len(), page.total))];
+        let said = self.session.read(cx).model().said_query(query);
+        let mut lines = vec![(None, heading(&said, hits.len(), page.total))];
         if hits.is_empty() {
             lines.push((None, vec![Span::styled("nobody said that", Class::Muted)]));
         }
@@ -198,7 +205,7 @@ impl ResultsView {
                         },
                     ),
                     Span::plain("  "),
-                    Span::styled(label_of(hit), Class::Conversation),
+                    Span::styled(label_of(hit, session.model()), Class::Conversation),
                     Span::plain("  "),
                     Span::styled(when, Class::Time),
                 ],
@@ -235,7 +242,8 @@ impl ResultsView {
         self.pages = page.pages;
         self.loading = false;
         self.kind = SearchKind::Files;
-        let mut lines = vec![(None, heading(query, page.files.len(), page.total))];
+        let said = self.session.read(cx).model().said_query(query);
+        let mut lines = vec![(None, heading(&said, page.files.len(), page.total))];
         if page.files.is_empty() {
             lines.push((None, vec![Span::styled("no files matched", Class::Muted)]));
         }
@@ -313,7 +321,10 @@ impl ResultsView {
         };
         self.draw(
             vec![
-                (None, heading(query, 0, 0)),
+                (
+                    None,
+                    heading(&self.session.read(cx).model().said_query(query), 0, 0),
+                ),
                 (None, vec![Span::styled(said, Class::Error)]),
             ],
             window,
@@ -491,13 +502,17 @@ fn heading(query: &str, shown: usize, total: u32) -> Vec<Span> {
     vec![Span::styled(said, Class::Muted)]
 }
 
-/// The conversation's name as the search answered it. Slack names the
-/// channel inside every match, so this needs neither the roster nor a
-/// conversation the reader has ever opened.
-fn label_of(hit: &SearchHit) -> String {
-    match hit.channel_label.is_empty() {
-        true => "somewhere".to_owned(),
-        false => format!("#{}", hit.channel_label),
+/// The conversation a match is in, by the name it has everywhere else: a
+/// group is its people. Slack names the channel inside every match, so one
+/// the reader has never opened still reads as Slack's name for it.
+fn label_of(hit: &SearchHit, model: &crate::model::Model) -> String {
+    match (
+        model.conversation(&hit.channel),
+        hit.channel_label.is_empty(),
+    ) {
+        (Some(_), _) => model.label(&hit.channel),
+        (None, true) => "somewhere".to_owned(),
+        (None, false) => format!("#{}", hit.channel_label),
     }
 }
 

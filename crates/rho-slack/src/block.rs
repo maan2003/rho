@@ -10,6 +10,8 @@
 //! when the name is not known yet the element renders as the raw handle
 //! Slack itself would show, never as `U024BE7LH`.
 
+use std::ops::Range;
+
 use serde_json::Value;
 
 use crate::markdown::{escape, remark};
@@ -403,9 +405,11 @@ fn block_links(block: &Value, found: &mut Vec<Link>) {
 fn mrkdwn_links(text: &str, found: &mut Vec<Link>) {
     let mut rest = text;
     while let Some(start) = rest.find('<') {
+        bare_links(&rest[..start], found);
         let after = &rest[start + 1..];
         let Some(end) = after.find('>') else {
-            return;
+            rest = after;
+            continue;
         };
         let body = &after[..end];
         rest = &after[end + 1..];
@@ -419,6 +423,18 @@ fn mrkdwn_links(text: &str, found: &mut Vec<Link>) {
         let url = unescape_entities(target);
         found.push(Link {
             label: label.map(unescape_entities).unwrap_or_else(|| url.clone()),
+            url,
+        });
+    }
+    bare_links(rest, found);
+}
+
+/// The addresses typed out bare in a run of text, each its own label.
+fn bare_links(text: &str, found: &mut Vec<Link>) {
+    for range in bare_urls(text) {
+        let url = unescape_entities(&text[range]);
+        found.push(Link {
+            label: url.clone(),
             url,
         });
     }
@@ -763,8 +779,8 @@ fn render_inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String
                 // The address travels in the text now: a document of
                 // markdown carries its own links, and the line no longer
                 // has to be asked what it points at.
-                (Flavour::Markdown, "") => format!("<{url}>"),
-                (Flavour::Markdown, label) => format!("[{}]({url})", escape(label)),
+                (Flavour::Markdown, "") => markdown_link(url, url),
+                (Flavour::Markdown, label) => markdown_link(label, url),
             }
         }
         // A date element always ships the text Slack itself would show.
@@ -978,11 +994,54 @@ fn render_escape(flavour: Flavour, body: &str, names: &dyn Names) -> String {
             match (flavour, label) {
                 (Flavour::Mrkdwn, Some(label)) => label.to_owned(),
                 (Flavour::Mrkdwn, None) => target.to_owned(),
-                (Flavour::Markdown, Some(label)) => format!("[{}]({target})", escape(label)),
-                (Flavour::Markdown, None) => format!("<{target}>"),
+                (Flavour::Markdown, Some(label)) => markdown_link(label, target),
+                (Flavour::Markdown, None) => markdown_link(target, target),
             }
         }
     }
+}
+
+/// A link as markdown: its label, or the address itself when it has none,
+/// drawn as a link either way. An autolink would leave its angle brackets
+/// on screen; an inline link conceals everything but the words.
+pub(crate) fn markdown_link(label: &str, url: &str) -> String {
+    format!("[{}]({url})", escape(label))
+}
+
+/// Where the web addresses typed out as plain text are, so they are links
+/// like any other: Slack wraps the ones its own client sends, but a bot or
+/// an API caller can send an address bare. A trailing full stop or bracket
+/// is the sentence's, not the address's.
+pub(crate) fn bare_urls(text: &str) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = text[at..].find("http") {
+        let start = at + offset;
+        let rest = &text[start..];
+        let scheme = ["https://", "http://"]
+            .into_iter()
+            .find(|scheme| rest.starts_with(scheme));
+        let word_start = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric());
+        let Some(scheme) = scheme.filter(|_| word_start) else {
+            at = start + "http".len();
+            continue;
+        };
+        let length = rest
+            .find(|character: char| {
+                character.is_whitespace() || matches!(character, '<' | '>' | '|')
+            })
+            .unwrap_or(rest.len());
+        let url = rest[..length]
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"', ')', ']', '}']);
+        if url.len() > scheme.len() {
+            found.push(start..start + url.len());
+        }
+        at = start + length.max(scheme.len());
+    }
+    found
 }
 
 fn unescape_entities(text: &str) -> String {

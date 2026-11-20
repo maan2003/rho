@@ -110,9 +110,8 @@ fn main() -> anyhow::Result<()> {
     for card in cards.iter().take(10) {
         let reason = rho_slack::model::reason_text(
             card.attention.expect("a card is a card because it asks"),
-            &card.conversation,
         );
-        println!("  {:>6.1}d  {reason}", card.wait_days);
+        println!("  {:>6.1}d  {} {reason}", card.wait_days, card.conversation);
     }
     if cards.is_empty() {
         println!("  (nothing is asking)");

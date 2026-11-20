@@ -28,6 +28,7 @@ use crate::minibuffer::{
     bottom_strip,
 };
 use crate::phone::{Layout, Phone};
+use crate::search::Search;
 use crate::surface::{AnySurface, Mode, Subject};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
@@ -73,6 +74,8 @@ pub struct Frame {
     pub(crate) chime: Rc<dyn Fn()>,
     /// What `find:` listed last, so the chosen title opens its address.
     found: Vec<Found>,
+    /// The last `/` or `?`, which `n` and `N` repeat in any surface.
+    pub(crate) search: Option<Search>,
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
     _subscriptions: Vec<Subscription>,
@@ -130,6 +133,7 @@ impl Frame {
             signals: Signals::default(),
             chime,
             found: Vec::new(),
+            search: None,
             phone: Phone::default(),
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
@@ -1038,15 +1042,22 @@ impl Frame {
         };
         // An echo is the answer to the key just pressed, so it takes the
         // line while it lasts. Otherwise the line is about what is in view:
-        // a card says which card and why; anything else says its name.
-        let left: AnyElement = match (&self.echo, self.card_in_view(cx)) {
+        // a surface that is a card says which card and why; anything else,
+        // a list or results included, says its own name, whatever card
+        // the row under the point belongs to.
+        let surface = self.current_surface();
+        let own_card = self
+            .card_in_view(cx)
+            .filter(|address| address == self.current_address());
+        let left: AnyElement = match (&self.echo, own_card) {
             (Some(echo), _) => div()
                 .text_color(status.info)
                 .child(echo.text().to_owned())
                 .into_any_element(),
             (None, Some(address)) => {
                 let card = self.card_for(&address, cx);
-                let (heading, label) = fit(&card.heading(), &card.label);
+                let heading = surface.heading(cx).unwrap_or_else(|| card.heading());
+                let (heading, label) = fit(&heading, &card.label);
                 div()
                     .flex()
                     .flex_row()
@@ -1056,7 +1067,7 @@ impl Frame {
                     .into_any_element()
             }
             (None, None) => div()
-                .child(fit(&self.current_surface().title(cx), "").0)
+                .child(fit(&surface.title(cx), "").0)
                 .into_any_element(),
         };
         // A host that is away outranks the notice, which is cut first when
@@ -1226,6 +1237,18 @@ impl Render for Frame {
             .on_action(cx.listener(|this, _: &keys::Home, window, cx| this.toggle_home(window, cx)))
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
             .on_action(cx.listener(|this, _: &keys::FindAddress, window, cx| this.find(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
+                this.search(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchBackward, window, cx| {
+                this.search(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchNext, window, cx| {
+                this.search_again(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchPrevious, window, cx| {
+                this.search_again(true, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &keys::UndoVerdict, window, cx| {
                     this.undo_verdict(window, cx)
