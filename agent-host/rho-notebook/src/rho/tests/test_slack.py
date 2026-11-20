@@ -134,6 +134,38 @@ class Routing(SlackCase):
             slack.route_messages(lambda agent, event: None)
 
 
+#: An edit of the top-level message 5.0 that makes "@RoboMan" a mention.
+#: Its own ts, 5.1, is not the message's.
+MENTION_ADDED = {
+    "type": "message", "subtype": "message_changed", "hidden": True, "channel": "C1", "channel_type": "channel",
+    "ts": "5.1", "event_ts": "5.1",
+    "message": {"type": "message", "user": "UPERSON", "ts": "5.0", "text": "<@UBOT> hi", "edited": {"user": "UPERSON", "ts": "5.1"}},
+    "previous_message": {"type": "message", "user": "UPERSON", "ts": "5.0", "text": "@RoboMan hi"},
+}
+
+
+class RoutingAnEdit(SlackCase):
+    init = """
+from rho import slack
+got = []
+slack.route_messages(lambda agent, event: got.append((agent.id, event)))
+"""
+    batches = [[MENTION_ADDED]]
+
+    def seed(self, state):
+        self.main = add_agent(state, claude(), cwd="/")
+        state.slack_routes = {"5.1": (self.main, "5.0")}
+
+    def test_a_heard_edit_reaches_its_agent_as_the_message_it_made(self):
+        got = workset.namespace["got"]
+        wait_for(lambda: len(got) == 1, "the edit")
+        self.assertEqual(got, [(self.main, {**MENTION_ADDED["message"], "channel": "C1", "previous_message": MENTION_ADDED["previous_message"]})])
+        self.assertEqual(
+            slack.render(got[0][1]),
+            "[Slack C1 thread 5.0, ts 5.0, edited by <@UPERSON>]\n<@UBOT> hi\n[before the edit]\n@RoboMan hi",
+        )
+
+
 class Handlers(SlackCase):
     batches = [[REACTION, message("1.0", "hi")], [message("1.1", "after the removal")]]
 

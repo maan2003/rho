@@ -79,27 +79,43 @@ struct Message<'a> {
 }
 
 impl<'a> Message<'a> {
-    /// The new message `event` is, if it is one routing delivers: not an
-    /// edit, deletion or reaction, not in a direct conversation, and not
-    /// one of the bot's own.
+    /// The message `event` delivers, if routing reads it: a new message,
+    /// or an edit of its text, as edited. Not a deletion, a reaction or an
+    /// edit that leaves the text as it was, such as an unfurl; not in a
+    /// direct conversation, and not one of the bot's own.
     fn of(event: &'a Value, bot: Bot<'_>) -> Option<Self> {
         let field = |name: &str| event.get(name).and_then(Value::as_str);
         if field("type") != Some("message") {
             return None;
         }
+        if matches!(field("channel_type"), Some("im" | "mpim")) {
+            return None;
+        }
+        let channel = field("channel")?;
+        if field("subtype") != Some("message_changed") {
+            return Self::read(event, channel, bot);
+        }
+        let text = |message: &'a Value| message.get("text").and_then(Value::as_str);
+        let (edited, previous) = (event.get("message")?, event.get("previous_message")?);
+        if text(edited) == text(previous) {
+            return None;
+        }
+        Self::read(edited, channel, bot)
+    }
+
+    /// `message`, a message of `channel` as a new message event or an
+    /// edit carries it.
+    fn read(message: &'a Value, channel: &'a str, bot: Bot<'_>) -> Option<Self> {
+        let field = |name: &str| message.get(name).and_then(Value::as_str);
         if !matches!(
             field("subtype"),
             None | Some("thread_broadcast" | "file_share")
         ) {
             return None;
         }
-        if matches!(field("channel_type"), Some("im" | "mpim")) {
-            return None;
-        }
         if field("user") == Some(bot.user) || field("bot_id") == Some(bot.id) {
             return None;
         }
-        let channel = field("channel")?;
         let ts = field("ts")?;
         let thread = field("thread_ts").unwrap_or(ts);
         let mention = format!("<@{}>", bot.user);
@@ -175,7 +191,8 @@ impl<'db> Routes<'db> {
     /// channel's route, else the workspace's, hears mentions of the bot and
     /// what its mode adds. A mention in a thread with no route routes the
     /// thread to the agent it goes to, so the replies that follow reach
-    /// that agent before it answers.
+    /// that agent before it answers. An edit of a message's text is heard
+    /// as the message as edited.
     pub(crate) async fn who_hears(&self, event: &Value, bot: Bot<'_>) -> Option<(AgentId, String)> {
         if let Some(reaction) = Reaction::of(event, bot) {
             let read = self.db.read();

@@ -134,6 +134,116 @@ async fn direct_messages_edits_other_mentions_and_the_bots_own_posts_are_not_hea
     assert_eq!(hears(&routes, &broadcast).await, Some(agent(2)));
 }
 
+/// An edit of `message` to `text`, as Slack sends it: the message as edited
+/// and as it was, inside a `message_changed` event of the channel.
+fn edit(message: &Value, text: &str) -> Value {
+    let mut previous = message.clone();
+    previous.as_object_mut().unwrap().remove("channel");
+    let mut edited = previous.clone();
+    edited["text"] = json!(text);
+    json!({
+        "type": "message",
+        "subtype": "message_changed",
+        "hidden": true,
+        "channel": message["channel"],
+        "channel_type": message["channel_type"],
+        "ts": "9.9",
+        "event_ts": "9.9",
+        "message": edited,
+        "previous_message": previous,
+    })
+}
+
+#[tokio::test]
+async fn an_edit_that_adds_a_mention_is_heard_and_routes_its_thread() {
+    let db = db().await;
+    let routes = Routes::of(&db);
+    routes
+        .route_wide(Wide::Workspace, agent(1), Mode::Mentions)
+        .await;
+    // "@RoboMan" typed without picking the bot is plain text; the edit
+    // makes it a mention.
+    let typed = message("C1", "1.0", None, "@RoboMan can you look");
+    assert_eq!(hears(&routes, &typed).await, None);
+    let fixed = edit(&typed, "<@UBOT> can you look");
+    assert_eq!(
+        routes.who_hears(&fixed, BOT).await,
+        Some((agent(1), "1.0".to_owned()))
+    );
+    assert_eq!(routes.owner(Some("C1"), Some("1.0")), Some(agent(1)));
+    let reply = message("C1", "1.1", Some("1.0"), "more");
+    assert_eq!(hears(&routes, &reply).await, Some(agent(1)));
+    // An edit that mentions nobody is not heard where its message was not.
+    let unheard = message("C1", "2.0", None, "hello");
+    assert_eq!(hears(&routes, &edit(&unheard, "hello all")).await, None);
+}
+
+#[tokio::test]
+async fn an_edit_goes_to_whoever_hears_the_message_as_edited() {
+    let db = db().await;
+    let routes = Routes::of(&db);
+    routes
+        .route_wide(channel("C1"), agent(1), Mode::TopLevel)
+        .await;
+    routes.route_thread("C1", "5.0", agent(2)).await;
+    // A routed thread hears every edit in it, mention or not.
+    let reply = message("C1", "5.1", Some("5.0"), "first try");
+    assert_eq!(
+        hears(&routes, &edit(&reply, "second try")).await,
+        Some(agent(2))
+    );
+    // A top_level route hears edits of top-level messages, not of replies.
+    let top = message("C1", "1.0", None, "question");
+    assert_eq!(
+        hears(&routes, &edit(&top, "better question")).await,
+        Some(agent(1))
+    );
+    let reply = message("C1", "3.1", Some("3.0"), "aside");
+    assert_eq!(hears(&routes, &reply).await, None);
+    assert_eq!(hears(&routes, &edit(&reply, "an aside")).await, None);
+    // That reply was not heard; the mention its edit adds is, and the
+    // thread is the channel agent's from then on.
+    assert_eq!(
+        hears(&routes, &edit(&reply, "<@UBOT> an aside")).await,
+        Some(agent(1))
+    );
+    assert_eq!(routes.owner(Some("C1"), Some("3.0")), Some(agent(1)));
+}
+
+#[tokio::test]
+async fn an_edit_that_keeps_the_text_is_not_heard() {
+    let db = db().await;
+    let routes = Routes::of(&db);
+    routes
+        .route_wide(Wide::Workspace, agent(1), Mode::All)
+        .await;
+    // Slack sends `message_changed` when a link unfurls, too.
+    let linked = message("C1", "1.0", None, "see https://fedi.xyz");
+    let mut unfurled = edit(&linked, "see https://fedi.xyz");
+    unfurled["message"]["attachments"] = json!([{"from_url": "https://fedi.xyz"}]);
+    assert_eq!(hears(&routes, &unfurled).await, None);
+    assert_eq!(
+        hears(&routes, &edit(&linked, "see https://fedi.xyz now")).await,
+        Some(agent(1))
+    );
+}
+
+#[tokio::test]
+async fn edits_in_direct_messages_and_of_the_bots_posts_are_not_heard() {
+    let db = db().await;
+    let routes = Routes::of(&db);
+    routes
+        .route_wide(Wide::Workspace, agent(1), Mode::Mentions)
+        .await;
+    let mut direct = message("D1", "1.0", None, "hi");
+    direct["channel_type"] = json!("im");
+    assert_eq!(hears(&routes, &edit(&direct, "<@UBOT> hi")).await, None);
+    let mut own = message("C1", "2.0", None, "my answer");
+    own["user"] = json!(BOT.user);
+    own["bot_id"] = json!(BOT.id);
+    assert_eq!(hears(&routes, &edit(&own, "<@UBOT> my answer")).await, None);
+}
+
 #[tokio::test]
 async fn the_most_specific_route_wins() {
     let db = db().await;
