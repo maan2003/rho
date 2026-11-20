@@ -952,7 +952,7 @@ impl AgentPool {
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
-        let mut mentions = self.user_mentions(mentions)?;
+        let mut mentions = self.user_mentions(mentions);
         // On an explicitly addressed mail the GUI supplies the writer.
         // A direct reply underneath an agent's mail can infer it even
         // when the writer left the thread. Deleted agents receive nothing.
@@ -1012,22 +1012,20 @@ impl AgentPool {
         Ok(())
     }
 
-    /// The user's mentions of agents: each asks the agent to read it.
-    fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
-        let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
-        for agent in agents {
-            self.workset_of(agent)?;
-            if mentions
-                .iter()
-                .all(|mention| mention.to != Address::Agent(agent))
-            {
-                mentions.push(Mention {
-                    to: Address::Agent(agent),
-                    kind: MentionKind::Ask,
-                });
-            }
-        }
-        Ok(mentions)
+    /// Give the user's mail to a named writer if they still exist. A writer
+    /// can be removed after the mail was read or while the GUI was offline.
+    /// That cannot stop the user's reply from being saved in its thread.
+    fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
+        let read = self.db.read();
+        let mut seen = HashSet::new();
+        agents
+            .into_iter()
+            .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
+            .map(|agent| Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            })
+            .collect()
     }
 
     /// Start the process of every workset with an agent that receives

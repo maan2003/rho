@@ -201,9 +201,14 @@ impl ChatSystem {
     }
 
     pub fn project_address(&self, channel: ThreadId) -> Option<String> {
+        let alias = &self
+            .hosts
+            .values()
+            .find(|slot| slot.endpoint == Some(channel.host))?
+            .name;
         self.chat(channel.host)?
             .project(channel.message)
-            .map(|project| project.address(&self.host_name(channel.host)))
+            .map(|project| project.address(alias))
     }
 
     /// Resolves a project address against aliases this device owns and the
