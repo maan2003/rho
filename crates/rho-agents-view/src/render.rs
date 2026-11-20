@@ -787,15 +787,15 @@ fn tool_heading(tool: &UiTool, source: &str) -> String {
         return action.to_owned();
     }
     if native && let Some(shell) = python_shell_command(source) {
-        return format!("$ {}", preview(&shell));
+        return format!("$ {shell}");
     }
     if native && source.trim() == "end_turn()" {
         return "ended the turn".into();
     }
     if native {
-        return format!("ran code: {}", preview(source));
+        return format!("ran code: {}", source.trim_end());
     }
-    preview(source)
+    source.trim_end().to_owned()
 }
 
 pub(crate) fn preview(text: &str) -> String {
@@ -815,15 +815,6 @@ fn tool_detail(tool: &UiTool, source: &str) -> Option<String> {
         && preview(&mail) != mail
     {
         detail.push(mail);
-    } else if let Some(shell) = python_shell_command(source) {
-        if preview(&shell) != shell {
-            detail.push(shell);
-        }
-    } else if (source.contains('\n') || source.chars().count() > 100)
-        && mail_preview(source).is_none()
-        && mail_operation(source).is_none()
-    {
-        detail.push(source.to_owned());
     }
     if let Some(output) = tool.output.as_deref().or(tool.error.as_deref()) {
         let output = output.trim_end();
@@ -1420,6 +1411,19 @@ mod tests {
             text_of(&render(&block, None, 0, &|_| String::new()).spans),
             "wrote mail\n"
         );
+    }
+
+    #[test]
+    fn long_shell_and_code_inputs_keep_their_last_token_and_lines() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.name = "exec".into();
+        let shell = format!("printf '%s' {}", "x".repeat(150));
+        let source = format!("command({shell:?})");
+        assert_eq!(tool_heading(&exec, &source), format!("$ {shell}"));
+        assert!(tool_detail(&exec, &source).is_none());
+
+        let source = format!("{}\nsecond_call()", "long_call(".repeat(12));
+        assert_eq!(tool_heading(&exec, &source), format!("ran code: {source}"));
     }
 
     #[test]

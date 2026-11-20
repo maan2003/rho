@@ -289,13 +289,6 @@ impl AgentModel {
         self.transcript.mail_point(mail)
     }
 
-    pub(crate) fn tool_output_ranges(
-        &self,
-        cx: &App,
-    ) -> Vec<(String, bool, std::ops::Range<multi_buffer::Anchor>)> {
-        self.transcript.tool_output_ranges(cx)
-    }
-
     /// How much of the transcript is composed nowhere yet, in blocks.
     pub fn uncomposed_blocks(&self) -> usize {
         self.transcript.uncomposed_blocks()

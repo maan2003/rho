@@ -1297,35 +1297,6 @@ impl TranscriptModel {
         mail_point(&self.blocks, mail)
     }
 
-    pub(crate) fn tool_output_ranges(
-        &self,
-        cx: &gpui::App,
-    ) -> Vec<(String, bool, Range<multi_buffer::Anchor>)> {
-        let doc = self.document_multi_buffer.read(cx).snapshot(cx);
-        self.records
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| {
-                let UiBlock::Tool(tool) = &*self.blocks[self.block_of(index)] else {
-                    return None;
-                };
-                let text = record.text.trim_end_matches('\n');
-                // Separators can put an empty line before a command.
-                let begin = text.find(|c: char| c != '\n')?;
-                let end_of_heading = begin + text[begin..].find('\n')?;
-                let buffer = record.buffer.read(cx);
-                let start = record.range.start.to_offset(buffer);
-                let lo = doc.anchor_in_excerpt(buffer.anchor_after(start + end_of_heading))?;
-                let hi = doc.anchor_in_excerpt(buffer.anchor_before(start + text.len()))?;
-                Some((
-                    tool.id.clone(),
-                    tool.status == rho_agents_client::state::UiToolStatus::Error,
-                    lo..hi,
-                ))
-            })
-            .collect()
-    }
-
     /// Where a point in an attached editor sits in the store: which block,
     /// and how far into it. A buffer offset does not survive a transcript
     /// whose history is composed on demand; this does. Costs the buffer it

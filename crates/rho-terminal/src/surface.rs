@@ -194,18 +194,29 @@ impl TerminalView {
     }
 
     #[cfg(feature = "ui")]
-    pub(crate) fn reading_text(&self, cx: &gpui::App) -> (String, usize) {
+    pub(crate) fn reading_text(&self, cx: &gpui::App) -> TerminalReading {
         let screen = &self.model.read(cx).screen;
         let physical = screen
             .scrollback
             .iter()
             .map(|item| match item {
                 ScrollbackItem::Line(row) => reading_row(row),
-                ScrollbackItem::Gap(lost) => (format!("· · · {lost} lines lost · · ·"), false),
+                ScrollbackItem::Gap(lost) => {
+                    ReadingRow::plain(format!("· · · {lost} lines lost · · ·"))
+                }
             })
             .chain(screen.rows.iter().map(reading_row))
             .collect::<Vec<_>>();
-        join_reading_rows(physical, self.scroll_offset)
+        let (text, row, runs) = join_reading_rows(physical, self.scroll_offset);
+        let palette = Palette::new(cx.theme().colors());
+        TerminalReading {
+            text,
+            row,
+            painted: runs
+                .into_iter()
+                .map(|(paint, ranges)| (paint.highlight(&palette), ranges))
+                .collect(),
+        }
     }
 
     #[cfg(feature = "ui")]
@@ -336,9 +347,8 @@ impl Render for TerminalView {
         text_style.font_weight = font.weight;
         text_style.font_size = font_size.into();
         text_style.line_height = line_height.into();
-        let foreground: Hsla = colors.terminal_foreground.into();
-        let background: Hsla = colors.terminal_background.into();
-        text_style.color = foreground;
+        let palette = Palette::new(&colors);
+        text_style.color = palette.foreground;
 
         let cell_width = window
             .text_system()
@@ -380,11 +390,6 @@ impl Render for TerminalView {
         )
         .size_full();
 
-        let palette = Palette {
-            foreground,
-            background,
-            colors: &colors,
-        };
         let mut rows: Vec<AnyElement> = Vec::new();
         for line in self.visible_lines(&model.screen) {
             rows.push(match line {
@@ -395,7 +400,7 @@ impl Render for TerminalView {
                 VisibleLine::Gap(lost) => div()
                     .h(line_height)
                     .child(format!("· · · {lost} lines lost · · ·"))
-                    .text_color(foreground.opacity(0.5))
+                    .text_color(palette.foreground.opacity(0.5))
                     .into_any_element(),
             });
         }
@@ -445,7 +450,7 @@ impl Render for TerminalView {
                     .w_full()
                     .px_2()
                     .bg(colors.element_background)
-                    .text_color(foreground.opacity(0.8))
+                    .text_color(palette.foreground.opacity(0.8))
                     .child(status)
             }))
     }
@@ -457,7 +462,15 @@ struct Palette<'a> {
     colors: &'a theme::ThemeColors,
 }
 
-impl Palette<'_> {
+impl<'a> Palette<'a> {
+    fn new(colors: &'a theme::ThemeColors) -> Self {
+        Self {
+            foreground: colors.terminal_foreground.into(),
+            background: colors.terminal_background.into(),
+            colors,
+        }
+    }
+
     fn fg(&self, color: TermColor) -> Hsla {
         match color {
             TermColor::Foreground => self.foreground,
@@ -582,95 +595,179 @@ pub fn terminal_rgb_color(r: u8, g: u8, b: u8) -> Hsla {
     .into()
 }
 
-fn cell_highlight(cell: &TermCell, palette: &Palette<'_>) -> HighlightStyle {
-    let mut fg = palette.fg(cell.fg);
-    let mut bg = palette.bg(cell.bg);
-    if cell.flags & TermCellFlags::INVERSE != 0 {
-        let old_fg = fg;
-        fg = bg.unwrap_or(palette.background);
-        bg = Some(old_fg);
+/// The wire attributes that affect paint. Both views use the same palette.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CellPaint {
+    fg: TermColor,
+    bg: TermColor,
+    flags: u16,
+}
+
+impl CellPaint {
+    fn from_cell(cell: &TermCell) -> Self {
+        const ATTRS: u16 = TermCellFlags::BOLD
+            | TermCellFlags::DIM
+            | TermCellFlags::ITALIC
+            | TermCellFlags::UNDERLINE
+            | TermCellFlags::INVERSE
+            | TermCellFlags::STRIKEOUT
+            | TermCellFlags::HIDDEN;
+        Self {
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags & ATTRS,
+        }
     }
-    if cell.flags & TermCellFlags::HIDDEN != 0 {
-        fg = bg.unwrap_or(palette.background);
-    }
-    let mut style = HighlightStyle {
-        color: Some(fg),
-        background_color: bg,
-        ..Default::default()
-    };
-    if cell.flags & TermCellFlags::BOLD != 0 {
-        style.font_weight = Some(gpui::FontWeight::BOLD);
-    }
-    if cell.flags & TermCellFlags::ITALIC != 0 {
-        style.font_style = Some(gpui::FontStyle::Italic);
-    }
-    if cell.flags & TermCellFlags::DIM != 0 {
-        style.fade_out = Some(0.3);
-    }
-    if cell.flags & TermCellFlags::UNDERLINE != 0 {
-        style.underline = Some(gpui::UnderlineStyle {
-            thickness: px(1.0),
+
+    fn highlight(self, palette: &Palette<'_>) -> HighlightStyle {
+        let mut fg = palette.fg(self.fg);
+        let mut bg = palette.bg(self.bg);
+        if self.flags & TermCellFlags::INVERSE != 0 {
+            let old_fg = fg;
+            fg = bg.unwrap_or(palette.background);
+            bg = Some(old_fg);
+        }
+        if self.flags & TermCellFlags::HIDDEN != 0 {
+            fg = bg.unwrap_or(palette.background);
+        }
+        let mut style = HighlightStyle {
             color: Some(fg),
-            wavy: false,
-        });
+            background_color: bg,
+            ..Default::default()
+        };
+        if self.flags & TermCellFlags::BOLD != 0 {
+            style.font_weight = Some(gpui::FontWeight::BOLD);
+        }
+        if self.flags & TermCellFlags::ITALIC != 0 {
+            style.font_style = Some(gpui::FontStyle::Italic);
+        }
+        if self.flags & TermCellFlags::DIM != 0 {
+            style.fade_out = Some(0.3);
+        }
+        if self.flags & TermCellFlags::UNDERLINE != 0 {
+            style.underline = Some(gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(fg),
+                wavy: false,
+            });
+        }
+        if self.flags & TermCellFlags::STRIKEOUT != 0 {
+            style.strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(fg),
+            });
+        }
+        style
     }
-    if cell.flags & TermCellFlags::STRIKEOUT != 0 {
-        style.strikethrough = Some(gpui::StrikethroughStyle {
-            thickness: px(1.0),
-            color: Some(fg),
-        });
-    }
-    style
 }
 
 #[cfg(feature = "ui")]
-fn reading_row(row: &TermRow) -> (String, bool) {
-    let wrapped = row
+pub(crate) struct TerminalReading {
+    pub(crate) text: String,
+    pub(crate) row: usize,
+    pub(crate) painted: Vec<(HighlightStyle, Vec<Range<usize>>)>,
+}
+
+#[cfg(feature = "ui")]
+struct ReadingRow {
+    text: String,
+    wrapped: bool,
+    painted: Vec<(Range<usize>, CellPaint)>,
+}
+
+#[cfg(feature = "ui")]
+impl ReadingRow {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            wrapped: false,
+            painted: Vec::new(),
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+fn reading_row(row: &TermRow) -> ReadingRow {
+    let mut reading = ReadingRow::plain(String::new());
+    reading.wrapped = row
         .cells
         .last()
         .is_some_and(|cell| cell.flags & TermCellFlags::WRAPLINE != 0);
-    let mut text = String::new();
     for cell in &row.cells {
         if cell.flags & TermCellFlags::WIDE_SPACER != 0 {
             continue;
         }
+        let start = reading.text.len();
         if cell.flags & TermCellFlags::HIDDEN != 0 {
-            text.push(' ');
+            reading.text.push(' ');
         } else {
-            text.push(cell.c);
+            reading.text.push(cell.c);
             if let Some(extra) = &cell.extra {
-                text.push_str(extra);
+                reading.text.push_str(extra);
             }
         }
+        let paint = CellPaint::from_cell(cell);
+        if let Some((last, previous)) = reading.painted.last_mut()
+            && *previous == paint
+        {
+            last.end = reading.text.len();
+        } else {
+            reading.painted.push((start..reading.text.len(), paint));
+        }
     }
-    if !wrapped {
-        text.truncate(text.trim_end().len());
+    if !reading.wrapped {
+        let retained = reading.text.trim_end().len();
+        // Keep coloured background cells, even spaces at the right edge.
+        let coloured_end = reading
+            .painted
+            .iter()
+            .rev()
+            .find(|(_, paint)| {
+                paint.bg != TermColor::DEFAULT_BG || paint.flags & TermCellFlags::INVERSE != 0
+            })
+            .map_or(0, |(range, _)| range.end);
+        let retained = retained.max(coloured_end);
+        reading.text.truncate(retained);
+        reading.painted.retain_mut(|(range, _)| {
+            range.end = range.end.min(retained);
+            range.start < range.end
+        });
     }
-    (text, wrapped)
+    reading
 }
 
 #[cfg(feature = "ui")]
-fn join_reading_rows(physical: Vec<(String, bool)>, scroll_offset: usize) -> (String, usize) {
+type PaintRuns = std::collections::HashMap<CellPaint, Vec<Range<usize>>>;
+
+#[cfg(feature = "ui")]
+fn join_reading_rows(
+    physical: Vec<ReadingRow>,
+    scroll_offset: usize,
+) -> (String, usize, PaintRuns) {
     let target = physical.len().saturating_sub(1 + scroll_offset);
-    let mut lines = Vec::new();
-    let mut line = String::new();
+    let mut text = String::new();
+    let mut runs: PaintRuns = Default::default();
     let mut row = 0;
-    for (index, (part, wrapped)) in physical.into_iter().enumerate() {
+    let mut line = 0;
+    for (index, part) in physical.into_iter().enumerate() {
         if index == target {
-            row = lines.len();
+            row = line;
         }
-        line.push_str(&part);
-        if !wrapped {
-            lines.push(std::mem::take(&mut line));
+        let base = text.len();
+        for (range, paint) in part.painted {
+            runs.entry(paint)
+                .or_default()
+                .push(base + range.start..base + range.end);
+        }
+        text.push_str(&part.text);
+        if !part.wrapped {
+            text.push('\n');
+            line += 1;
         }
     }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    (lines.join("\n"), row.min(lines.len().saturating_sub(1)))
+    text.truncate(text.trim_end_matches('\n').len());
+    let lines = text.lines().count();
+    (text, row.min(lines.saturating_sub(1)), runs)
 }
 
 fn row_element(
@@ -695,7 +792,7 @@ fn row_element(
         if let Some(extra) = &cell.extra {
             text.push_str(extra);
         }
-        let mut style = cell_highlight(cell, palette);
+        let mut style = CellPaint::from_cell(cell).highlight(palette);
         let under_cursor = cursor_col.is_some_and(|col| {
             let col = usize::from(col);
             col == column || (col == column + 1 && cell.flags & TermCellFlags::WIDE != 0)
@@ -792,15 +889,52 @@ mod tests {
             ],
         };
         let physical = vec![
-            ("older".into(), false),
+            ReadingRow::plain("older".into()),
             reading_row(&first),
             reading_row(&second),
-            ("".into(), false),
+            ReadingRow::plain("".into()),
         ];
-        assert_eq!(
-            join_reading_rows(physical, 2),
-            ("older\n猫\u{20dd} a b".into(), 1)
+        let (text, row, _) = join_reading_rows(physical, 2);
+        assert_eq!((text, row), ("older\n猫\u{20dd} a b".into(), 1));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn read_mode_keeps_paint_for_a_wide_cell_and_trailing_background() {
+        let red = TermColor::Indexed(1);
+        let blue = TermColor::Rgb(20, 30, 80);
+        let cell = |c, fg, bg, flags| TermCell {
+            c,
+            extra: None,
+            fg,
+            bg,
+            flags,
+        };
+        let first = TermRow {
+            cells: vec![
+                cell('猫', red, TermColor::DEFAULT_BG, TermCellFlags::WIDE),
+                cell(
+                    ' ',
+                    red,
+                    TermColor::DEFAULT_BG,
+                    TermCellFlags::WIDE_SPACER | TermCellFlags::WRAPLINE,
+                ),
+            ],
+        };
+        let second = TermRow {
+            cells: vec![cell(' ', red, blue, 0), TermCell::default()],
+        };
+        let (text, point, runs) = join_reading_rows(
+            vec![
+                ReadingRow::plain("old".into()),
+                reading_row(&first),
+                reading_row(&second),
+            ],
+            1,
         );
+        assert_eq!((text.as_str(), point), ("old\n猫 ", 1));
+        assert_eq!(runs[&CellPaint::from_cell(&first.cells[0])], vec![4..7]);
+        assert_eq!(runs[&CellPaint::from_cell(&second.cells[0])], vec![7..8]);
     }
 
     fn rgba(red: f32, green: f32, blue: f32) -> gpui::Rgba {

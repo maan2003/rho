@@ -92,6 +92,7 @@ enum Class {
     Crumb,
     User,
     Recap,
+    Proof,
     Time,
     Fold,
     Pending,
@@ -109,13 +110,14 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 12;
+    const COUNT: usize = 13;
 
     fn slot(self) -> usize {
         match self {
             Self::Crumb => 0,
             Self::User => 1,
             Self::Recap => 11,
+            Self::Proof => 12,
             Self::Time => 2,
             Self::Fold => 3,
             Self::Pending => 4,
@@ -143,6 +145,7 @@ impl rho_transcript::Style for Class {
             Self::Fold => (cx.theme().status().info, None),
             Self::Quote => (colors.text_muted, None),
             Self::Name => (colors.text, None),
+            Self::Proof => (colors.text, Some(gpui::FontWeight::BOLD)),
             Self::Unread => (colors.text, Some(gpui::FontWeight::BOLD)),
             Self::Mention => (cx.theme().status().warning, Some(gpui::FontWeight::BOLD)),
             Self::Private => (colors.text_muted, None),
@@ -1640,6 +1643,11 @@ fn message_item(
     };
     let body = body(&message.content);
     let recap = rho_agent_types::recap_section(&body);
+    let proof_heading = message
+        .pings_user()
+        .then(|| rho_agent_types::proof_section(&body))
+        .flatten()
+        .map(|range| range.start);
     let mut text = String::new();
     let mut styles = Vec::new();
     let mut lines = Vec::new();
@@ -1658,6 +1666,7 @@ fn message_item(
     let mut first_body = true;
     while let Some((first_line, line)) = body_lines.next() {
         let in_recap = recap.as_ref().is_some_and(|range| range.contains(&offset));
+        let starts_proof = proof_heading == Some(offset);
         offset += line.len() + 1;
         if in_recap && !cold {
             // The preceding separator belongs to the hidden section.
@@ -1671,7 +1680,7 @@ fn message_item(
             text.push('\n');
         }
         let start = text.len();
-        text.push_str(line);
+        text.push_str(if starts_proof { "Proof" } else { line });
         if line.starts_with("> ") && !in_recap {
             let quote = QuoteId {
                 mail: message.id,
@@ -1699,7 +1708,13 @@ fn message_item(
             lines.push(Meta::Quote(quote));
         } else {
             styles.push((
-                if in_recap { Class::Recap } else { voice },
+                if in_recap {
+                    Class::Recap
+                } else if starts_proof {
+                    Class::Proof
+                } else {
+                    voice
+                },
                 start..text.len(),
             ));
             lines.push(Meta::Mail(message.id));
@@ -2226,6 +2241,28 @@ mod tests {
             ..original
         };
         assert!(message_item(&deleted, None, true, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn a_ping_keeps_proof_visible_when_its_recap_is_hidden() {
+        let writer = AgentId::from_counter(11, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let mut result = mail(
+            Party::Agent(writer),
+            Revision::Original,
+            "Done.\n\n## recap\nEarlier plan.\n\n## proof\n42 tests passed.",
+        );
+        result.mentions = vec![rho_agent_types::Mention::User { ping: true }];
+        result.ping_started = Some((result.id.0, result.at));
+        let warm = message_item(&result, None, false, &HashSet::new()).unwrap();
+        assert_eq!(warm.text, "Done.\nProof\n42 tests passed.\n");
+        assert!(
+            warm.styles.iter().any(
+                |(class, bytes)| *class == Class::Proof && &warm.text[bytes.clone()] == "Proof"
+            )
+        );
+        let cold = message_item(&result, None, true, &HashSet::new()).unwrap();
+        assert!(cold.text.contains("## recap\nEarlier plan."));
+        assert!(cold.text.contains("Proof\n42 tests passed."));
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! The surface over one agent's transcript.
 
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use editor::Editor;
@@ -17,7 +16,7 @@ use theme::ActiveTheme as _;
 use super::AgentsSystem;
 use crate::agent_view::{AgentModel, AgentModelEvent};
 
-gpui::actions!(rho_agent, [NextError, PreviousError, ToggleOutput]);
+gpui::actions!(rho_agent, [NextError, PreviousError]);
 
 enum Inspect {
     Reading(Message),
@@ -31,7 +30,6 @@ pub struct AgentSurface {
     model: Entity<AgentModel>,
     inspect_mail: Option<Inspect>,
     default_landing: bool,
-    folded_calls: HashSet<String>,
 }
 
 impl AgentSurface {
@@ -44,10 +42,7 @@ impl AgentSurface {
     ) -> Self {
         let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
         cx.observe(&system, |_, _, cx| cx.notify()).detach();
-        cx.observe_in(&model, window, |this, _, window, cx| {
-            this.update_folds(window, cx)
-        })
-        .detach();
+        cx.observe(&model, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(
             &model,
             window,
@@ -60,7 +55,6 @@ impl AgentSurface {
                         model.go_to_store_point(&this.editor, *point, window, cx)
                     });
                 }
-                this.update_folds(window, cx);
                 if matches!(event, AgentModelEvent::Loaded) {
                     let mut landed = false;
                     if matches!(&this.inspect_mail, Some(Inspect::Ready(_))) {
@@ -77,20 +71,14 @@ impl AgentSurface {
             },
         )
         .detach();
-        let ready = model.read(cx).initial_load_ready();
-        let mut this = Self {
+        Self {
             system,
             agent,
             editor,
             model,
             inspect_mail: None,
             default_landing: false,
-            folded_calls: HashSet::new(),
-        };
-        if ready {
-            this.update_folds(window, cx);
         }
-        this
     }
 
     fn title_with_folder(&self, compact: bool, cx: &App) -> String {
@@ -252,94 +240,11 @@ impl AgentSurface {
         self.jump_error(current, forward, window, cx);
     }
 
-    fn update_folds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ranges = self.model.read(cx).tool_output_ranges(cx);
-        let mut fold = Vec::new();
-        let mut unfold = Vec::new();
-        for (id, error, range) in ranges {
-            if error {
-                if self.folded_calls.remove(&id) {
-                    unfold.push(range);
-                }
-            } else if self.folded_calls.insert(id) {
-                fold.push(range);
-            }
-        }
-        if !fold.is_empty() || !unfold.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.unfold_ranges(&unfold, false, false, cx);
-                editor.fold_ranges(fold, false, window, cx);
-            });
-        }
-    }
-
-    fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
-        let anchor = self.editor.read(cx).selections.newest_anchor().head();
-        self.toggle_at(anchor, false, window, cx);
-    }
-
-    fn tap_command(
-        &mut self,
-        event: &gpui::MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(anchor) = rho_frame::phone_editor_tap(self.editor.read(cx), event, window)
-            && self.toggle_at(anchor, true, window, cx)
-        {
-            window.prevent_default();
-            cx.stop_propagation();
-        }
-    }
-
-    fn toggle_at(
-        &self,
-        anchor: multi_buffer::Anchor,
-        tapped: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        use multi_buffer::ToPoint as _;
-        let ranges = self.model.read(cx).tool_output_ranges(cx);
-        self.editor.update(cx, |editor, cx| {
-            let snap = editor.buffer().read(cx).snapshot(cx);
-            let row = anchor.to_point(&snap).row;
-            let Some((_, _, range)) = ranges
-                .into_iter()
-                .find(|(_, _, range)| range.start.to_point(&snap).row == row)
-            else {
-                return false;
-            };
-            if tapped {
-                editor.change_selections(
-                    editor::SelectionEffects::no_scroll(),
-                    window,
-                    cx,
-                    |selections| {
-                        selections.select_anchor_ranges([anchor..anchor]);
-                    },
-                );
-            }
-            if editor
-                .display_snapshot(cx)
-                .folds_in_range(range.clone())
-                .next()
-                .is_some()
-            {
-                editor.unfold_ranges(&[range], false, false, cx);
-            } else {
-                editor.fold_ranges(vec![range], false, window, cx);
-            }
-            true
-        })
-    }
-
     pub(super) fn bind_keys(cx: &mut App) {
         for context in rho_frame::normal_contexts("RhoAgent", " && vim_operator == none") {
             cx.bind_keys([
                 KeyBinding::new("] e", NextError, Some(&context)),
                 KeyBinding::new("[ e", PreviousError, Some(&context)),
-                KeyBinding::new("enter", ToggleOutput, Some(&context)),
             ]);
         }
     }
@@ -673,7 +578,6 @@ impl Render for AgentSurface {
         div()
             .id("rho-agent-transcript")
             .key_context("RhoAgent")
-            .capture_any_mouse_down(cx.listener(Self::tap_command))
             .on_action(
                 cx.listener(|this, _: &NextError, window, cx| this.move_error(true, window, cx)),
             )
@@ -682,7 +586,6 @@ impl Render for AgentSurface {
                     this.move_error(false, window, cx)
                 }),
             )
-            .on_action(cx.listener(Self::toggle_output))
             .size_full()
             .flex()
             .flex_col()

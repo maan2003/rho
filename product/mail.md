@@ -18,7 +18,6 @@ because: the user only needs what asks for them or returns a result, not each ag
 costs: a failure can still ask for the user when they have nothing to add.
 
 ## journey An idea becomes a merged result
-status: a result carries no designated proof yet.
 goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:
@@ -57,11 +56,11 @@ does:
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
-status: a result does not yet carry designated proof.
 purpose: carry a brief, an ask, a result, or a word on the work's progress in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the words, with the voice told by colour alone: the user's own mail in `design.marked`, the project's in reading text; a quiet name line above a mail from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the mail quotes; proof on a result; a `## recap` section while the thread is cold
 does:
+- show proof: a result mail designates evidence under `## proof`. The heading and evidence stay visible on warm and cold threads.
 - ping: a mail either pings the user or it does not. A mail that pings is dealt as a `deal.Card` and reads `waits · 2h` on its row. A mail that does not ping stays in the thread with no card; it is how the project says what it is doing while it works, edited in place as the work moves
 - look into the work `enter` on the mail: open the `agents.Agent` that wrote the mail at the step that produced its current words; a failed stop opens its error
 - reply: send the user's words to whoever wrote the mail
@@ -124,7 +123,7 @@ rejected:
 
 The point never rests on the blank line between two mails. A reply from a dealt card settles the card and stays on the thread; the next card waits for `deal.Card.deal`. On the phone, the whole space below the last mail is the draft's tap target.
 
-Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), both of the built screen before this design.
+Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), and [an outcome with its proof](design/laptop-proof.png).
 
 mock:
 ```text
@@ -155,7 +154,7 @@ reply
 ```
 
 ## flow Answer a mail
-status: a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
+status: the user's Slack is in the browser, and the bot is not built.
 runs: 100 a day
 day: Keep the work moving.
 when: a project or the Slack bot has something that asks for the user, or the user opens a result
