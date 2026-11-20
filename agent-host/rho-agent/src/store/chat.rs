@@ -33,6 +33,8 @@ const INBOX: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("chat_in
 /// The user's posts by the client's own id for them, so a resend is
 /// logged once: the seq of the event the post made.
 const CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("chat_client_ids");
+/// The first Joined names where an agent's work began.
+const FIRST_THREAD: TableDefinition<AgentId, u64> = TableDefinition::new("chat_first_thread");
 /// A thread's given name, when it has one.
 const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 
@@ -318,15 +320,9 @@ impl ChatRead for ReadTxn {
     }
 
     fn first_thread(&self, agent: AgentId) -> Option<MessageId> {
-        self.open_table(CHAT_LOG)
-            .iter()
-            .find_map(|(_, row)| match row.value().into_owned().event {
-                ChatEvent::Joined {
-                    thread,
-                    agent: member,
-                } if agent == member => Some(thread),
-                _ => None,
-            })
+        self.open_table(FIRST_THREAD)
+            .get(agent)
+            .map(|thread| MessageId(ChatSeq(thread.value())))
     }
 
     fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
@@ -609,6 +605,7 @@ impl ChatWrite for WriteTxn {
         self.open_table(CLIENT_IDS);
         self.open_table(NAMES);
         self.open_table(REVISIONS);
+        self.open_table(FIRST_THREAD);
     }
 
     fn post(
@@ -840,6 +837,7 @@ impl ChatWrite for WriteTxn {
             }
             ChatEvent::Joined { thread, agent } => {
                 self.open_table(MEMBERS).insert((thread.0.0, *agent), true);
+                index_first_join(self, *agent, *thread);
             }
             ChatEvent::Left { thread, agent } => {
                 self.open_table(MEMBERS).insert((thread.0.0, *agent), false);
@@ -856,5 +854,28 @@ impl ChatWrite for WriteTxn {
                 }
             }
         }
+    }
+}
+
+fn index_first_join(write: &mut WriteTxn, agent: AgentId, thread: MessageId) {
+    let mut first = write.open_table(FIRST_THREAD);
+    if first.get(agent).is_none() {
+        first.insert(agent, thread.0.0);
+    }
+}
+
+/// Existing posts and workset rows keep their original encoding. Seed the
+/// first-thread projection from the same log old hosts wrote.
+pub(crate) fn migrate_mail(write: &mut WriteTxn) {
+    let joined = write
+        .open_table(CHAT_LOG)
+        .iter()
+        .filter_map(|(_, row)| match row.value().into_owned().event {
+            ChatEvent::Joined { thread, agent } => Some((agent, thread)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (agent, thread) in joined {
+        index_first_join(write, agent, thread);
     }
 }

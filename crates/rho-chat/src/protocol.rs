@@ -123,7 +123,7 @@ pub enum ServerFrame {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind, UnixMs};
+    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind, Stop, UnixMs};
 
     use super::*;
 
@@ -141,6 +141,30 @@ mod tests {
     fn frames_and_requests_round_trip() {
         let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
         round_trips(ClientFrame::Follow { since: ChatSeq(9) });
+        round_trips(ClientFrame::View {
+            thread: Some(MessageId(ChatSeq(4))),
+        });
+        round_trips(ClientFrame::View { thread: None });
+        round_trips(ServerFrame::Statuses {
+            statuses: vec![ThreadStatus {
+                thread: MessageId(ChatSeq(14)),
+                at: UnixMs(28),
+                text: "Waiting for the review".into(),
+            }],
+        });
+        round_trips(ServerFrame::Statuses {
+            statuses: Vec::new(),
+        });
+        round_trips(Open::Request(
+            ResolveProject {
+                name: "tide".into(),
+            }
+            .into(),
+        ));
+        round_trips(rho_rpc::protocol::Answer::Done(Some(Project {
+            channel: MessageId(ChatSeq(2)),
+            name: "tide".into(),
+        })));
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
@@ -166,6 +190,46 @@ mod tests {
                     event: ChatEvent::Reparented {
                         message: MessageId(ChatSeq(4)),
                         parent: None,
+                    },
+                },
+            ],
+        });
+        round_trips(ServerFrame::Chat {
+            records: vec![
+                ChatRecord {
+                    seq: ChatSeq(8),
+                    at: UnixMs(19),
+                    event: ChatEvent::Edited {
+                        message: MessageId(ChatSeq(4)),
+                        content: vec![ContentPart::Text {
+                            text: "fixed".into(),
+                        }],
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(9),
+                    at: UnixMs(22),
+                    event: ChatEvent::Deleted {
+                        message: MessageId(ChatSeq(5)),
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(10),
+                    at: UnixMs(29),
+                    event: ChatEvent::Posted {
+                        parent: Some(MessageId(ChatSeq(7))),
+                        from: Address::System {
+                            agent,
+                            stop: Stop::Stuck,
+                            since: UnixMs(23),
+                        },
+                        mentions: vec![Mention {
+                            to: Address::User,
+                            kind: MentionKind::Ask,
+                        }],
+                        content: vec![ContentPart::Text {
+                            text: "stuck · retries".into(),
+                        }],
                     },
                 },
             ],

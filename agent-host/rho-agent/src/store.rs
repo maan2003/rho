@@ -519,6 +519,7 @@ pub(crate) mod agent_rows;
 pub mod chat;
 pub mod gccp;
 
+pub(crate) use chat::migrate_mail;
 pub use chat::{ChatRead, ChatWrite, MailHit, NewMessage, ThreadHead};
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
 #[cfg(test)]

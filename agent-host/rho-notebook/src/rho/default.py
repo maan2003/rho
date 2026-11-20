@@ -91,7 +91,7 @@ def render(record: dict) -> str:
     where to answer."""
     head = chat.thread(chat.thread_of(record))
     sender = record["sender"]
-    who = "the user" if sender == chat.USER else prompt.label(sender)
+    who = "the user" if sender == chat.USER else ("the system bot" if sender == "system" else prompt.label(sender))
     return f"{tools.where(head)} Message from {who}:\n{record['text']}"
 
 
