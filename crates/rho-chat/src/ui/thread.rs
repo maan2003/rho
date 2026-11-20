@@ -23,7 +23,7 @@ use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{
     self, OpenRow, QuoteSelection, RedoDraftOrUndoVerdict, SendMessage, SendOnly,
 };
-use rho_frame::{Candidate, Row, Subject, Surface, draft};
+use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
 use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -167,6 +167,7 @@ pub struct ThreadView {
     system: Entity<ChatSystem>,
     thread: ThreadId,
     transcript: Transcript<Key, Class, Meta>,
+    layout: Layout,
     editor: Entity<Editor>,
     draft: Entity<Buffer>,
     draft_subscription: Subscription,
@@ -279,6 +280,7 @@ impl ThreadView {
             system: entity,
             thread,
             transcript: Transcript::new(buffer),
+            layout: Layout::of(window.viewport_size().width),
             editor,
             draft,
             draft_subscription,
@@ -294,6 +296,7 @@ impl ThreadView {
             system,
             thread,
             view.is_list(system),
+            view.layout,
             &view.expanded_quotes,
             cx,
         );
@@ -330,6 +333,7 @@ impl ThreadView {
             self.system.read(cx),
             self.thread,
             list,
+            self.layout,
             &self.expanded_quotes,
             cx,
         );
@@ -495,6 +499,7 @@ fn items(
     system: &ChatSystem,
     thread: ThreadId,
     list: bool,
+    layout: Layout,
     expanded_quotes: &HashSet<QuoteId>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
@@ -512,14 +517,20 @@ fn items(
     {
         items.push(line(Key::Status, &status, Class::Crumb));
     }
-    let project = system.project_of(thread);
-    let separator = if list {
-        format!("── idea to {project} · ctrl-enter starts an agent · ctrl-shift-enter only sends")
-    } else {
-        format!("── reply to {project} · ctrl-enter / send")
-    };
-    items.push(line(Key::Separator, &separator, Class::Crumb));
+    items.push(separator_item(&system.project_of(thread), list, layout));
     items
+}
+
+fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class, Meta> {
+    let label = match (layout, list) {
+        (Layout::Phone, false) => format!("── reply to {project}"),
+        (Layout::Phone, true) => format!("── idea to {project}"),
+        (Layout::Desktop, false) => format!("── reply to {project} · ctrl-enter sends"),
+        (Layout::Desktop, true) => format!(
+            "── idea to {project} · ctrl-enter starts an agent · ctrl-shift-enter only sends"
+        ),
+    };
+    line(Key::Separator, &label, Class::Crumb)
 }
 
 fn history_items(
@@ -1364,8 +1375,16 @@ impl Focusable for ThreadView {
 }
 
 impl Render for ThreadView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let context = if self.is_list(self.system.read(cx)) {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let system = self.system.read(cx);
+        let list = self.is_list(system);
+        let layout = Layout::of(window.viewport_size().width);
+        if layout != self.layout {
+            self.layout = layout;
+            let label = separator_item(&system.project_of(self.thread), list, layout);
+            self.transcript.replace(&Key::Separator, label, cx);
+        }
+        let context = if list {
             thread::PROJECT_SCREEN
         } else {
             thread::SCREEN

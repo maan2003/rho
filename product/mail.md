@@ -121,7 +121,7 @@ tide@lab · 09:52
 The mock clock is shared between tests. Is a separate clock per test enough?
 
 Running the tests with a separate clock
-── reply to tide@lab · ctrl-enter / send
+── reply to tide@lab · ctrl-enter sends
 Yes, use a separate clock.
 ```
 

@@ -129,7 +129,7 @@ states:
 used on: `desk.Desk`, `mail.Thread`, and the built channel (`mail.Project`).
 form:
 ```text
-── reply to tide@lab · ctrl-enter / send
+── reply to tide@lab · ctrl-enter sends
 Yes, use a separate clock.
 ```
 
