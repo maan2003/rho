@@ -16,7 +16,7 @@ day: Know what wants them, and where they were.
 ## concept Room
 purpose: give every place the user works in one line on Home, so they see at a glance where something waits.
 principle: an agent asks the user something in a thread of the channel `debug`; on Home, `debug` moves to the top and reads `asks · 8.3d`; the user opens it and answers.
-sees: its name; what waits in it: a card's words such as `asks · 48.4d` in yellow, or `1 unread · 22h` in grey, or nothing; where it is: the host's name or the Slack workspace's name.
+sees: its name; what waits in it: a card's words such as `asks · 48.4d` in yellow, or `1 unread · 22h` in grey, or `snoozed · until 06:07` in grey while its card sleeps, or nothing; where it is: the host's name or the Slack workspace's name.
 has:
 - many `chat.Thread`, when the room is a `chat.Channel`
 - one `chat.Thread`, when the room is a Slack conversation

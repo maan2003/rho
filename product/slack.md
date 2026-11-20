@@ -50,7 +50,7 @@ steps:
 2. the user reads from the cursor down
 3. the user presses `i`, writes the reply, and presses `ctrl-enter`
 4. the user says done with `deal.Verdict.done`; Slack marks it read, and the next card opens
-system: makes a card of each direct message, mention, and reply in a followed thread; puts a small group's thread with the direct messages; lets plain channel traffic make only a small card that is gone within a day.
+system: makes a card of each direct message, mention, and reply in a followed thread; puts a small group's thread with the direct messages; lets plain channel traffic make only a small card that is gone within a day; dates a card from the message that asks, the newest from someone else; after a restart, deals exactly what Slack still holds unread, so a mark made in another Slack app while rho was off counts.
 user: the reply, and the verdict.
 cases: the reply is in a thread under a message; the user reads it in another Slack app first, and the card goes away by itself
 reviewed: 2026-11-20 · laptop · reviewer · 6 findings
