@@ -29,13 +29,13 @@ has:
 does:
 - deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour
 
-A result waits like an ask; nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
+The longest-waiting card deals first, with asks and stops before results; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 
 ## concept Verdict
 status: Slack in the browser has no rho verdicts.
 purpose: let the user say once what a card means to them, so rho remembers their answer.
 principle: the user replies if they have words; otherwise they say done. If they change their mind about a verdict, they can take it back.
-sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`.
+sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
 does:
 - reply: send the user's words and settle the card, as in `mail.Answer a mail`
 - done `space` then `d`, or `done` on the phone: the user has nothing more to say; put away the card, and if it was on screen, open the next one

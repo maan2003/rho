@@ -9,7 +9,8 @@ use editor::Editor;
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window, div, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Pixels, Subscription, Task, Window,
+    div, px,
 };
 use jiff::Timestamp;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
@@ -38,6 +39,7 @@ use crate::{keys, palette, place};
 
 /// The kind of the frame's own surface: Desk.
 pub const FRAME_KIND: &str = "frame";
+pub(crate) const FRAME_PADDING: Pixels = px(2.);
 
 /// Where the reader is: the surface in view, what the point in it is
 /// on, which is the surface's own address when it is a page about one
@@ -125,10 +127,8 @@ impl Frame {
         let desk_editor = desk.read(cx).editor(cx).expect("Desk is an editor");
         let desk_selection = cx.subscribe(&desk_editor, |frame, _, event, cx| {
             if frame.desk_in_view() {
-                match event {
-                    editor::EditorEvent::SelectionsChanged { .. } => cx.notify(),
-                    editor::EditorEvent::ScrollPositionChanged { .. } => frame.systems_changed(cx),
-                    _ => {}
+                if matches!(event, editor::EditorEvent::SelectionsChanged { .. }) {
+                    cx.notify();
                 }
             }
         });
@@ -1225,7 +1225,9 @@ impl Frame {
             false => colors.terminal_ansi_bright_cyan,
         };
         let mode = mode_word(&mode);
-        let lamp = self.signals.lamp_on.then_some("●");
+        // Signal evaluation is deferred. Desk must not paint the lamp
+        // from the previous screen while that update is still pending.
+        let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
         let unwell = self.unwell_hosts();
         let surface = self.current_surface();
         let phone_titles = match layout {
@@ -1525,7 +1527,7 @@ impl Render for Frame {
         if self.desk_in_view() {
             self.sync_desk_idea(layout, cx);
         }
-        let inset = px(2.);
+        let inset = FRAME_PADDING;
         let frame = div()
             .id("rho-frame")
             .relative()

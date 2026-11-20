@@ -563,6 +563,8 @@ pub enum SizingBehavior {
     /// scroll margin as requested by user settings.
     #[default]
     Default,
+    /// A full editor with one page of overscroll, even if the document fits.
+    FullOverscrollMargin,
     /// The editor will layout itself using `size_full`, but will not have any
     /// vertical overscroll.
     ExcludeOverscrollMargin,

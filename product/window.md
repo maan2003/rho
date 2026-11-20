@@ -28,7 +28,7 @@ purpose: tell the user, at a glance, where they are, what just happened, and whe
 principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
 sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Helix mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
 
-The lamp is the only thing outside the user's place that pulls at them. When a card rises past a higher line, the window also chimes once.
+The lamp stays off on `desk.Desk`. Elsewhere, the card already in view does not light the lamp or ring the chime; another waiting card can. When that card rises past a higher line, the window chimes once.
 
 When a host drops, the line names it and says `reconnecting · 12s` in red, counting from the drop, until it is back; the echo line says why once, `rho: disconnected · connection lost`, or `cannot reach the host` when it never answered.
 

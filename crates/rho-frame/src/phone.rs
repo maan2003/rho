@@ -589,11 +589,12 @@ impl Frame {
         let surface = self.current_surface().clone();
         let send = surface.phone_send(cx);
         let prompting = self.minibuffer.is_some();
-        let composing_idea = self.idea_here(cx);
+        let typing = self.mode(window, cx).contains("insert");
+        let composing_idea = self.idea_editor().is_some() || (typing && self.idea_here(cx));
         let mut tools = if prompting || composing_idea {
             Vec::new()
         } else {
-            surface.phone_tools(self.mode(window, cx).contains("insert"), cx)
+            surface.phone_tools(typing, cx)
         };
         let state = BarState {
             prompting,

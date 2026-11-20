@@ -6,7 +6,11 @@ for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
 The deal ranks cards above the floor. A result waits like an ask: it
-does not fade. The user answers waiting mail with a reply or verdict.
+does not fade. An ask or stop deals before a result; within each of
+those groups the longest-waiting card deals first. A recent reply can
+still raise the lamp or chime pressure without changing this order.
+The user's overdue deadlines and skips keep their turns. The user
+answers waiting mail with a reply or verdict.
 
 ## Threads
 
@@ -28,7 +32,7 @@ A card is titled by the thread's subject and the project's address.
 | A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
 | A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
 | A6 | Seen | nothing until a newer ask or result |
-| A7 | The user wrote in the thread within the hour before the mention | a bonus, fading over the hour |
+| A7 | The user wrote in the thread within the hour before the mention | a signal pressure bonus, fading over the hour |
 | A8 | Done through a message before the mention | the mention still deals |
 | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |

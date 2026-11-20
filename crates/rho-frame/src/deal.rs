@@ -12,13 +12,14 @@ use std::collections::BTreeSet;
 use gpui::{Context, Window};
 use jiff::{Timestamp, Zoned};
 use rho_dealer::facts::Seen;
-use rho_dealer::rank::{Hand, Sources, Trace};
+use rho_dealer::rank::{CardKind, Hand, Sources, Trace};
 use rho_dealer::{Address, Card, Claim};
 use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
 use crate::desk::desk_rows;
 use crate::frame::Frame;
+use crate::phone::Layout;
 use crate::when::{SnoozeUnit, snooze_target};
 
 /// What the echo line says when a pull finds nothing to deal.
@@ -166,6 +167,7 @@ impl Frame {
             title,
             context,
             label: String::new(),
+            kind: CardKind::Other,
             priority: f64::NEG_INFINITY,
             cursor: String::new(),
             skipped: false,
@@ -256,11 +258,16 @@ impl Frame {
         // away says the deal is empty too.
         match self.deal_next(window, cx) {
             true => self.echo(&said, StyleClass::SystemInfo, cx),
-            false => self.echo(
-                &format!("{said} · {NOTHING_WAITS}"),
-                StyleClass::SystemInfo,
-                cx,
-            ),
+            false => {
+                let words = if matches!(verdict, Verdict::Done)
+                    && Layout::of(window.viewport_size().width) == Layout::Phone
+                {
+                    format!("{NOTHING_WAITS} · {said}")
+                } else {
+                    format!("{said} · {NOTHING_WAITS}")
+                };
+                self.echo(&words, StyleClass::SystemInfo, cx);
+            }
         }
     }
 
@@ -332,8 +339,14 @@ impl Frame {
         }
         // A pull ranks afresh: the skip just said moves it on, and time
         // has passed since the last change.
-        self.signals.hand = self.rank(cx);
-        let Some(card) = self.hand().top(in_view.as_ref()).cloned() else {
+        let hand = self.rank(cx);
+        let card = hand.top(in_view.as_ref()).cloned();
+        if card.is_none() {
+            // Focus Desk against the empty deal, not the previous hand.
+            self.refresh_desk(&hand, cx);
+        }
+        self.signals.hand = hand;
+        let Some(card) = card else {
             self.open_desk(window, cx);
             return false;
         };
@@ -393,26 +406,18 @@ impl Frame {
                     let _ = this.update(cx, |this, cx| this.systems_changed(cx));
                 })
             });
-        // What the lamp is about is what is *not* in front of the reader:
-        // the card they are already reading is not news.
+        // The lamp signals a card only when it cannot already be read here.
+        // Desk is itself a view of the hand, including its overflow.
         let in_view = self.card_in_view(cx);
-        let visible = if self.desk_in_view() {
-            self.desk.update(cx, |desk, cx| desk.visible_cards(cx))
-        } else {
-            Vec::new()
-        };
-        let top = hand.cards.iter().find(|card| {
-            Some(&card.address) != in_view.as_ref() && !visible.contains(&card.address)
-        });
-        let max_priority = top.map(|card| card.priority);
-        let card = top.map(|card| journal_card(&card.address));
-        // Scrolling can uncover a card and light the lamp, but it cannot
-        // raise the card's priority and must not ring again.
         let chime_card = hand
             .cards
             .iter()
-            .find(|card| Some(&card.address) != in_view.as_ref())
-            .map(|card| (card.priority, journal_card(&card.address)));
+            .filter(|card| Some(&card.address) != in_view.as_ref())
+            .max_by(|a, b| a.priority.total_cmp(&b.priority));
+        let top = chime_card.filter(|_| !self.desk_in_view());
+        let max_priority = top.map(|card| card.priority);
+        let card = top.map(|card| journal_card(&card.address));
+        let chime_card = chime_card.map(|card| (card.priority, journal_card(&card.address)));
         self.signals.hand = hand;
         let lamp_on =
             max_priority.is_some_and(|priority| priority >= rho_dealer::curve::LAMP_THRESHOLD);
