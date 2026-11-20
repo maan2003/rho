@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_hosts::{Dialer, HostId, HostStream};
-use rho_agent_types::{ChatRecord, ChatSeq, EndpointId, MessageId, ThreadStatus};
+use rho_agent_types::{ChatRecord, ChatSeq, EndpointId, MessageId, ThreadWork};
 use rho_rpc::protocol::{Call, read_frame, write_frame, write_open};
 
 use crate::protocol::{ClientFrame, Open, ServerFrame};
@@ -34,10 +34,10 @@ pub enum MailEvent {
         host: HostId,
         records: Vec<ChatRecord>,
     },
-    /// A replacement snapshot of the host's ephemeral thread statuses.
-    Statuses {
+    /// A replacement snapshot of the host's ephemeral thread threads.
+    Work {
         host: HostId,
-        statuses: Vec<ThreadStatus>,
+        threads: Vec<(MessageId, ThreadWork)>,
     },
     /// The session ended; it opens again with the connection.
     Closed { host: HostId },
@@ -153,9 +153,7 @@ impl HostStream for MailStream {
                         let frame = read_frame::<_, ServerFrame>(&mut reader).await?;
                         let event = match frame {
                             ServerFrame::Mail { records } => MailEvent::Records { host, records },
-                            ServerFrame::Statuses { statuses } => {
-                                MailEvent::Statuses { host, statuses }
-                            }
+                            ServerFrame::Work { threads } => MailEvent::Work { host, threads },
                             ServerFrame::Hello { .. } => continue,
                         };
                         if events.unbounded_send(event).is_err() {

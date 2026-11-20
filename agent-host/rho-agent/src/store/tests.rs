@@ -1,8 +1,8 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Revision, Role,
-    UnixMs, WorksetId, WorksetKind, Wpos,
+    Address, ChatEvent, ChatSeq, ContentPart, Mention, MessageId, Revision, Role, UnixMs,
+    WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
 
@@ -307,10 +307,7 @@ async fn direct_mail_keeps_the_original_conversation_and_only_reaches_its_addres
     let (_dir, db) = db().await;
     let (a, b, follower) = (agent(1), agent(2), agent(3));
     let direct = |from, to, reply_to, text| NewMessage {
-        mentions: vec![Mention {
-            to: Address::Agent(to),
-            kind: MentionKind::Direct,
-        }],
+        mentions: vec![Mention::Direct(to)],
         reply_to,
         ..said(Address::Agent(from), text)
     };
@@ -472,16 +469,7 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
             UnixMs(11),
             Some(reply),
             NewMessage {
-                mentions: vec![
-                    Mention {
-                        to: Address::Agent(b),
-                        kind: MentionKind::Ask,
-                    },
-                    Mention {
-                        to: Address::Agent(c),
-                        kind: MentionKind::Fyi,
-                    },
-                ],
+                mentions: vec![Mention::Agent(b), Mention::Agent(c)],
                 ..said(Address::User, "b, c, look")
             },
             None,
@@ -784,10 +772,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         .post(at, Some(channel), said(Address::User, "Other idea"), None)
         .unwrap();
     let mut asked = said(Address::Agent(a), "Which clock?");
-    asked.mentions.push(Mention {
-        to: Address::User,
-        kind: MentionKind::Ask,
-    });
+    asked.mentions.push(Mention::User { ping: true });
     let ask = write.post(at, Some(thread), asked.clone(), None).unwrap();
     let spare_ask = write.post(at, Some(thread), asked, None).unwrap();
     let revised = said(Address::Agent(a), "Which monotonic clock?").content;
@@ -801,12 +786,12 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         .unwrap();
     assert!(
         write
-            .edit(at, b, ask, revised.clone())
+            .edit(at, b, ask, revised.clone(), None)
             .unwrap_err()
             .to_string()
             .contains("own mail")
     );
-    write.edit(at, a, ask, revised.clone()).unwrap();
+    write.edit(at, a, ask, revised.clone(), None).unwrap();
     write
         .post(at, Some(thread), said(Address::User, "I'm back"), None)
         .unwrap();
@@ -824,11 +809,11 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     write.reparent(at, answer, Some(other)).unwrap();
     write.reparent(at, ask, Some(other)).unwrap();
     let err = write
-        .edit(at, a, ask, said(Address::Agent(a), "Ship it").content)
+        .edit(at, a, ask, said(Address::Agent(a), "Ship it").content, None)
         .unwrap_err();
     assert!(err.to_string().contains("already answered"));
     // Another ask by the same writer in the same thread is still editable.
-    write.edit(at, a, spare_ask, revised.clone()).unwrap();
+    write.edit(at, a, spare_ask, revised.clone(), None).unwrap();
     assert!(
         write
             .delete(at, a, ask)
@@ -856,7 +841,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     write.delete(at, a, note).unwrap();
     assert!(
         write
-            .edit(at, a, note, revised)
+            .edit(at, a, note, revised, None)
             .unwrap_err()
             .to_string()
             .contains("deleted")
@@ -870,7 +855,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     assert_eq!(answer.parent, Some(other));
     assert_eq!(ask.text(), "Which monotonic clock?");
     assert!(matches!(ask.revision, Revision::Edited { .. }));
-    assert_eq!(ask.mentions(Address::User), Some(MentionKind::Ask));
+    assert!(ask.pings_user());
     let removed = read.message(note).unwrap();
     assert_eq!(removed.revision, Revision::Deleted);
     assert!(removed.text().is_empty());
@@ -902,10 +887,7 @@ async fn last_project_mail_waits_for_a_user_reply_not_a_new_post() {
             at,
             Some(thread),
             NewMessage {
-                mentions: vec![Mention {
-                    to: Address::User,
-                    kind: MentionKind::Result,
-                }],
+                mentions: vec![Mention::User { ping: true }],
                 ..said(Address::Agent(b), "Gateway passed")
             },
             None,
@@ -964,7 +946,8 @@ async fn last_project_mail_waits_for_a_user_reply_not_a_new_post() {
                 at,
                 b,
                 result,
-                said(Address::Agent(b), "Actually failed").content
+                said(Address::Agent(b), "Actually failed").content,
+                None
             )
             .unwrap_err()
             .to_string()
@@ -1014,15 +997,12 @@ async fn a_live_ask_is_one_mail_across_writers_and_is_never_delivered_to_peers()
         .unwrap();
     write.join(at, thread, a).unwrap();
     write.join(at, thread, b).unwrap();
-    let addressed = |agent, kind, text| NewMessage {
-        mentions: vec![Mention {
-            to: Address::User,
-            kind,
-        }],
+    let addressed = |agent, ping, text| NewMessage {
+        mentions: vec![Mention::User { ping }],
         ..said(Address::Agent(agent), text)
     };
-    let first = addressed(a, MentionKind::Ask, "Can I use clock A?");
-    assert_eq!(write.restate_ask(at, thread, &first).unwrap(), None);
+    let first = addressed(a, true, "Can I use clock A?");
+    assert_eq!(write.restate_ping(at, thread, &first).unwrap(), None);
     let ask = write.post(at, Some(thread), first.clone(), None).unwrap();
 
     let control = write
@@ -1033,25 +1013,26 @@ async fn a_live_ask_is_one_mail_across_writers_and_is_never_delivered_to_peers()
             None,
         )
         .unwrap();
-    let repeat = addressed(b, MentionKind::Ask, "Can I use clock A?");
+    let repeat = addressed(b, true, "Can I use clock A?");
     assert_eq!(
-        write.restate_ask(UnixMs(21), thread, &repeat).unwrap(),
+        write.restate_ping(UnixMs(21), thread, &repeat).unwrap(),
         Some((ask, false))
     );
     assert_eq!(write.mail_writer(ask), Some(a));
-    let changed = addressed(b, MentionKind::Ask, "Can I use clock B?");
+    let changed = addressed(b, true, "Can I use clock B?");
     assert_eq!(
-        write.restate_ask(UnixMs(22), thread, &changed).unwrap(),
+        write.restate_ping(UnixMs(22), thread, &changed).unwrap(),
         Some((ask, true))
     );
     assert_eq!(write.mail_writer(ask), Some(b));
-    assert!(write.edit(at, a, ask, first.content.clone()).is_err());
+    assert!(write.edit(at, a, ask, first.content.clone(), None).is_err());
     write
         .edit(
             UnixMs(23),
             b,
             ask,
-            addressed(b, MentionKind::Ask, "Can I use a monotonic clock?").content,
+            addressed(b, true, "Can I use a monotonic clock?").content,
+            None,
         )
         .unwrap();
     let user_answer = NewMessage {
@@ -1059,21 +1040,16 @@ async fn a_live_ask_is_one_mail_across_writers_and_is_never_delivered_to_peers()
         ..said(Address::User, "Yes")
     };
     write.post(at, Some(thread), user_answer, None).unwrap();
-    assert_eq!(write.restate_ask(at, thread, &changed).unwrap(), None);
-    assert!(write.edit(at, b, ask, first.content.clone()).is_err());
+    assert_eq!(write.restate_ping(at, thread, &changed).unwrap(), None);
+    assert!(write.edit(at, b, ask, first.content.clone(), None).is_err());
     let fresh = write.post(at, Some(thread), changed.clone(), None).unwrap();
     let result = write
-        .post(
-            at,
-            Some(thread),
-            addressed(a, MentionKind::Result, "Clock B works"),
-            None,
-        )
+        .post(at, Some(thread), addressed(a, true, "Clock B works"), None)
         .unwrap();
     assert_eq!(
-        write.restate_ask(at, thread, &first).unwrap(),
-        None,
-        "a result is not overwritten"
+        write.restate_ping(at, thread, &first).unwrap(),
+        Some((result, true)),
+        "unanswered pinging mail stays live"
     );
     write.commit();
 
@@ -1085,7 +1061,7 @@ async fn a_live_ask_is_one_mail_across_writers_and_is_never_delivered_to_peers()
     assert_eq!(
         read.thread_messages(Some(thread), usize::MAX)
             .into_iter()
-            .filter(|m| m.mentions(Address::User).is_some())
+            .filter(|m| m.to_user())
             .map(|m| m.id)
             .collect::<Vec<_>>(),
         [ask, fresh, result]
@@ -1134,10 +1110,7 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
         .post(at, Some(root), said(Address::User, "Clocks"), None)
         .unwrap();
     let send = |writer, text| NewMessage {
-        mentions: vec![Mention {
-            to: Address::User,
-            kind: MentionKind::Ask,
-        }],
+        mentions: vec![Mention::User { ping: true }],
         ..said(Address::Agent(writer), text)
     };
     let log_mail = |write: &mut rho_db::WriteTxn, message: MessageId| {
@@ -1165,14 +1138,14 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
         .unwrap();
     let to = log_mail(&mut write, cross);
     write
-        .restate_ask(at, thread, &send(b, "Which monotonic clock?"))
+        .restate_ping(at, thread, &send(b, "Which monotonic clock?"))
         .unwrap();
     let later = write
         .post(at, Some(thread), send(a, "Which timezone?"), None)
         .unwrap();
     log_mail(&mut write, later);
     write
-        .edit(at, a, later, send(a, "Which local timezone?").content)
+        .edit(at, a, later, send(a, "Which local timezone?").content, None)
         .unwrap();
     log_mail(&mut write, later);
     write
@@ -1194,14 +1167,11 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
         "retain the version the user read"
     );
     assert!(matches!(taken.revision, Revision::TakenBack { .. }));
-    assert!(taken.mentions(Address::User).is_none());
-    assert_eq!(
-        read.message(older).unwrap().mentions(Address::User),
-        Some(MentionKind::Ask)
-    );
+    assert!(!taken.pings_user());
+    assert_eq!(read.message(older).unwrap().pings_user(), true);
     let cross = read.message(cross).unwrap();
     assert_eq!(cross.from, Address::Agent(b));
-    assert_eq!(cross.mentions(Address::User), Some(MentionKind::Ask));
+    assert!(cross.pings_user());
 }
 
 #[tokio::test]
@@ -1250,17 +1220,14 @@ async fn recovery_settles_only_its_stuck_streak_in_place() {
         carried_on.text(),
         "The model answered again. Work carried on."
     );
-    assert!(carried_on.mentions(Address::User).is_none());
+    assert!(!carried_on.pings_user());
     assert_eq!(
         carried_on.version().1,
         UnixMs(305_000),
         "recovery is idempotent"
     );
     for unaffected in [new, other] {
-        assert_eq!(
-            read.message(unaffected).unwrap().mentions(Address::User),
-            Some(MentionKind::Ask)
-        );
+        assert_eq!(read.message(unaffected).unwrap().pings_user(), true);
     }
     assert_eq!(read.thread_messages(Some(thread), 12).len(), 3);
 }
@@ -1310,10 +1277,7 @@ async fn a_stop_is_logged_once_per_agent_per_stop_and_is_not_in_the_inbox() {
     write.commit();
     let read = db.read();
     assert_eq!(read.message(stop).unwrap().from, sender);
-    assert_eq!(
-        read.message(again).unwrap().mentions(Address::User),
-        Some(MentionKind::Ask)
-    );
+    assert_eq!(read.message(again).unwrap().pings_user(), true);
     assert!(read.inbox(a, ChatSeq::ZERO).is_empty());
     assert!(read.inbox(b, ChatSeq::ZERO).is_empty());
 }
@@ -1358,6 +1322,7 @@ async fn mail_search_sees_the_current_subject_and_body_only_inside_scope() {
             a,
             reply,
             said(Address::Agent(a), "Use a native NAPI socket.").content,
+            None,
         )
         .unwrap();
     write.delete(at, a, removed).unwrap();

@@ -332,8 +332,7 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
     assert!(code.contains("mail.send("));
     assert!(code.contains("end_turn()"));
     assert!(code.contains("clarify"));
-    assert!(code.contains(r#"thread=57, kind="ask""#));
-    assert!(code.contains(r#"mail.status(57, "Waiting for clarification")"#));
+    assert!(code.contains(r#"thread=57)"#));
     clarifying.shutdown().await.unwrap();
 }
 
@@ -427,7 +426,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
             );
         } else {
             assert!(code.contains("mail.send("));
-            assert!(code.contains(r#"kind="result""#));
+            assert!(code.contains("mail.send("));
             assert!(code.contains("end_turn()"));
         }
     }

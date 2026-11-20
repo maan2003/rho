@@ -12,8 +12,8 @@
 
 use redb::TableDefinition;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, MentionKind, Message,
-    MessageId, Revision, UnixMs,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, Message, MessageId,
+    Revision, UnixMs,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
@@ -44,6 +44,242 @@ const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 const REVISIONS: TableDefinition<u64, u64> = TableDefinition::new("chat_revisions");
 
 const AGENT_MAIL_PROJECT: &str = "Agent mail";
+
+/// The format before a mail pinged. Only the one-hop store migration uses it.
+mod prior_ping {
+    use super::{Address, AgentId, ChatSeq, ContentPart, Decode, Encode, MessageId, UnixMs};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    enum MentionKind {
+        Ask,
+        Result,
+        Fyi,
+        Direct,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    struct Mention {
+        to: Address,
+        kind: MentionKind,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    enum ChatEvent {
+        Posted {
+            parent: Option<MessageId>,
+            reply_to: Option<MessageId>,
+            from: Address,
+            mentions: Vec<Mention>,
+            content: Vec<ContentPart>,
+        },
+        Reparented {
+            message: MessageId,
+            parent: Option<MessageId>,
+        },
+        Joined {
+            thread: MessageId,
+            agent: AgentId,
+        },
+        Left {
+            thread: MessageId,
+            agent: AgentId,
+        },
+        Named {
+            thread: MessageId,
+            name: String,
+        },
+        Edited {
+            message: MessageId,
+            content: Vec<ContentPart>,
+        },
+        Deleted {
+            message: MessageId,
+        },
+        Revised {
+            message: MessageId,
+            author: AgentId,
+            content: Vec<ContentPart>,
+        },
+        TakenBack {
+            message: MessageId,
+            version: ChatSeq,
+            author: AgentId,
+        },
+        Recovered {
+            message: MessageId,
+            content: Vec<ContentPart>,
+        },
+    }
+
+    // Sen's table type name is the unqualified Rust name; this opens the
+    // same table with the old row shape.
+    #[derive(Clone, Debug, Encode, Decode)]
+    pub(super) struct ChatRecord {
+        pub seq: ChatSeq,
+        pub at: UnixMs,
+        event: ChatEvent,
+    }
+
+    impl ChatRecord {
+        pub(super) fn migrate(self) -> super::ChatRecord {
+            let Self { seq, at, event } = self;
+            let event = match event {
+                ChatEvent::Posted {
+                    parent,
+                    reply_to,
+                    from,
+                    mentions,
+                    content,
+                } => super::ChatEvent::Posted {
+                    parent,
+                    reply_to,
+                    from,
+                    content,
+                    mentions: mentions
+                        .into_iter()
+                        .filter_map(|Mention { to, kind }| {
+                            Some(match to {
+                                Address::User => super::Mention::User {
+                                    ping: match kind {
+                                        MentionKind::Ask => true,
+                                        // Results already faded when the rule changed stay gone.
+                                        MentionKind::Result => {
+                                            at.0 > 1795185540000 - 3 * 24 * 60 * 60 * 1000
+                                        }
+                                        MentionKind::Fyi | MentionKind::Direct => false,
+                                    },
+                                },
+                                Address::Agent(agent) => match kind {
+                                    MentionKind::Direct => super::Mention::Direct(agent),
+                                    _ => super::Mention::Agent(agent),
+                                },
+                                _ => return None, // No public producer addressed a system voice.
+                            })
+                        })
+                        .collect(),
+                },
+                ChatEvent::Reparented { message, parent } => {
+                    super::ChatEvent::Reparented { message, parent }
+                }
+                ChatEvent::Joined { thread, agent } => super::ChatEvent::Joined { thread, agent },
+                ChatEvent::Left { thread, agent } => super::ChatEvent::Left { thread, agent },
+                ChatEvent::Named { thread, name } => super::ChatEvent::Named { thread, name },
+                ChatEvent::Edited { message, content } => {
+                    super::ChatEvent::Edited { message, content }
+                }
+                ChatEvent::Deleted { message } => super::ChatEvent::Deleted { message },
+                ChatEvent::Revised {
+                    message,
+                    author,
+                    content,
+                } => super::ChatEvent::Revised {
+                    message,
+                    author,
+                    content,
+                    ping: None,
+                },
+                ChatEvent::TakenBack {
+                    message,
+                    version,
+                    author,
+                } => super::ChatEvent::TakenBack {
+                    message,
+                    version,
+                    author,
+                },
+                ChatEvent::Recovered { message, content } => {
+                    super::ChatEvent::Recovered { message, content }
+                }
+            };
+            super::ChatRecord { seq, at, event }
+        }
+
+        pub(super) fn needs_rewrite(&self) -> bool {
+            matches!(&self.event, ChatEvent::Posted { mentions, .. } if !mentions.is_empty())
+        }
+    }
+    #[tokio::test]
+    async fn the_log_rewrite_keeps_old_mail_and_only_excludes_results_that_had_already_faded() {
+        use redb::TableHandle as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("mail.redb"));
+        let old =
+            redb::TableDefinition::<u64, rho_db::Sen<ChatRecord>>::new(super::MAIL_LOG.name());
+        let mut write = db.write().await;
+        let before = 1_795_185_540_000 - 3 * 24 * 60 * 60 * 1000;
+        for (key, at, kind) in [
+            (1, before, MentionKind::Result),
+            (2, before + 1, MentionKind::Result),
+            (3, before - 42_000, MentionKind::Ask),
+            (4, before + 78_000, MentionKind::Fyi),
+        ] {
+            write.open_table(old).insert(
+                key,
+                rho_db::SenValue::borrowed(&ChatRecord {
+                    seq: ChatSeq(key),
+                    at: UnixMs(at),
+                    event: ChatEvent::Posted {
+                        parent: None,
+                        reply_to: None,
+                        from: Address::User,
+                        content: vec![ContentPart::Text {
+                            text: format!("mail {key}"),
+                        }],
+                        mentions: vec![Mention {
+                            to: Address::User,
+                            kind,
+                        }],
+                    },
+                }),
+            );
+        }
+        super::migrate_pings(&mut write);
+        write.commit();
+        let recovered: Vec<_> = db
+            .read()
+            .open_table(super::MAIL_LOG)
+            .iter()
+            .map(|(_, row)| {
+                let row = row.value().into_owned();
+                let mail = rho_agent_types::Message::from_record(&row).unwrap();
+                (row.seq.0, mail.text(), mail.pings_user())
+            })
+            .collect();
+        assert_eq!(
+            recovered,
+            [
+                (1, "mail 1".into(), false),
+                (2, "mail 2".into(), true),
+                (3, "mail 3".into(), true),
+                (4, "mail 4".into(), false),
+            ]
+        );
+    }
+}
+
+pub(crate) fn migrate_pings(write: &mut WriteTxn) {
+    use redb::TableHandle as _;
+    let old = TableDefinition::<u64, Sen<prior_ping::ChatRecord>>::new(MAIL_LOG.name());
+    let mut before = 0;
+    loop {
+        let records: Vec<_> = write
+            .open_table(old)
+            .range(before..)
+            .take(256)
+            .map(|(key, row)| (key.value(), row.value().into_owned()))
+            .collect();
+        let Some((last, _)) = records.last() else {
+            return;
+        };
+        before = last + 1;
+        let mut table = write.open_table(MAIL_LOG);
+        for (key, row) in records {
+            if row.needs_rewrite() {
+                table.insert(key, SenValue::borrowed(&row.migrate()));
+            }
+        }
+    }
+}
 
 /// The root of the forest in the children index.
 const ROOT: u64 = 0;
@@ -400,7 +636,9 @@ impl MailRead for ReadTxn {
 fn user_facing(sender: Address, mentions: &[Mention]) -> bool {
     matches!(sender, Address::System { .. } | Address::StartFailed)
         || matches!(sender, Address::Agent(_))
-            && mentions.iter().any(|mention| mention.to == Address::User)
+            && mentions
+                .iter()
+                .any(|mention| matches!(mention, Mention::User { .. }))
 }
 
 /// Delivery is fixed by the record, not by which process happens to be
@@ -413,14 +651,14 @@ fn recipients(
     if user_facing(sender, mentions) {
         return Vec::new();
     }
-    let mut agents = if mentions.iter().any(|m| m.kind == MentionKind::Direct) {
+    let mut agents = if mentions.iter().any(|m| matches!(m, Mention::Direct(_))) {
         Vec::new()
     } else {
         members()
     };
     for mention in mentions {
-        if let Address::Agent(agent) = mention.to
-            && sender != mention.to
+        if let Some(agent) = mention.agent()
+            && sender != Address::Agent(agent)
             && !agents.contains(&agent)
         {
             agents.push(agent);
@@ -433,16 +671,7 @@ fn recipients(
 }
 
 fn peer_pair(from: Address, mentions: &[Mention]) -> Option<[AgentId; 2]> {
-    let (
-        Address::Agent(from),
-        [
-            Mention {
-                to: Address::Agent(to),
-                kind: MentionKind::Direct,
-            },
-        ],
-    ) = (from, mentions)
-    else {
+    let (Address::Agent(from), [Mention::Direct(to)]) = (from, mentions) else {
         return None;
     };
     let mut pair = [from, *to];
@@ -508,9 +737,9 @@ pub trait MailWrite {
     ) -> anyhow::Result<MessageId>;
     /// The latest project mail in this thread, if it has no user reply.
     fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)>;
-    /// Reuses the current unanswered ask, if the thread has one, and whether
-    /// its words changed.
-    fn restate_ask(
+    /// Reuses the current unanswered pinging mail, if the thread has one,
+    /// and whether its words changed.
+    fn restate_ping(
         &mut self,
         at: UnixMs,
         thread: MessageId,
@@ -531,12 +760,14 @@ pub trait MailWrite {
     fn recover_stuck(&mut self, at: UnixMs, author: AgentId, since: UnixMs);
 
     /// Change an agent's own posted mail, except mail the user answered.
+    /// `ping` turns the ping of mail to the user on or off; `None` keeps it.
     fn edit(
         &mut self,
         at: UnixMs,
         agent: AgentId,
         message: MessageId,
         content: Vec<ContentPart>,
+        ping: Option<bool>,
     ) -> anyhow::Result<()>;
     fn delete(&mut self, at: UnixMs, agent: AgentId, message: MessageId) -> anyhow::Result<()>;
     /// A stop is logged at most once for a particular agent and start time.
@@ -757,7 +988,7 @@ fn last_project_mail(
 ) -> Option<Message> {
     let anchor = current_message(write, thread)?;
     // A project root is a collection of threads, not a single conversation.
-    if anchor.parent.is_none() && anchor.mentions(Address::User).is_none() {
+    if anchor.parent.is_none() && !anchor.to_user() {
         return None;
     }
     let mut candidates: Vec<_> = write
@@ -807,20 +1038,27 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
     Ok(mail)
 }
 
+/// Only the latest revision of a mail is read back, so a revision of mail
+/// to the user says its ping whether or not it changes it.
 fn revise(
     write: &mut WriteTxn,
     at: UnixMs,
     mail: &Message,
     writer: AgentId,
     content: Vec<ContentPart>,
+    ping: Option<bool>,
 ) -> bool {
-    if mail.content == content {
+    let ping = mail
+        .to_user()
+        .then(|| ping.unwrap_or_else(|| mail.pings_user()));
+    if mail.content == content && ping.is_none_or(|ping| ping == mail.pings_user()) {
         return false;
     }
     let event = ChatEvent::Revised {
         message: mail.id,
         author: writer,
         content,
+        ping,
     };
     let seq = append(write, at, event.clone());
     write.index_mail_event(seq, &event);
@@ -938,7 +1176,10 @@ impl MailWrite for WriteTxn {
     fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)> {
         let latest = last_project_mail(self, thread, |mail| {
             matches!(mail.from, Address::Agent(_))
-                && !mail.mentions.iter().any(|m| m.kind == MentionKind::Direct)
+                && !mail
+                    .mentions
+                    .iter()
+                    .any(|m| matches!(m, Mention::Direct(_)))
         })?;
         let Address::Agent(writer) = latest.from else {
             unreachable!()
@@ -946,7 +1187,7 @@ impl MailWrite for WriteTxn {
         (!has_user_reply(self, latest.id)).then_some((latest.id, writer))
     }
 
-    fn restate_ask(
+    fn restate_ping(
         &mut self,
         at: UnixMs,
         thread: MessageId,
@@ -955,33 +1196,23 @@ impl MailWrite for WriteTxn {
         let Address::Agent(writer) = message.from else {
             return Ok(None);
         };
-        let ask = Mention {
-            to: Address::User,
-            kind: MentionKind::Ask,
-        };
-        if message.mentions != [ask] {
+        let ping = Mention::User { ping: true };
+        if message.mentions != [ping] {
             return Ok(None);
         }
         let Some(mail) = last_project_mail(self, thread, |mail| {
-            matches!(mail.from, Address::Agent(_))
-                && matches!(
-                    mail.mentions(Address::User),
-                    Some(MentionKind::Ask | MentionKind::Result)
-                )
+            matches!(mail.from, Address::Agent(_)) && mail.pings_user()
         }) else {
             return Ok(None);
         };
-        if !matches!(mail.from, Address::Agent(_))
-            || mail.mentions != [ask]
-            || has_user_reply(self, mail.id)
-        {
+        if mail.mentions != [ping] || has_user_reply(self, mail.id) {
             return Ok(None);
         }
         if let Some(reply_to) = message.reply_to {
             anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
         }
         anyhow::ensure!(has_content(&message.content), "a message needs content");
-        let changed = revise(self, at, &mail, writer, message.content.clone());
+        let changed = revise(self, at, &mail, writer, message.content.clone(), None);
         Ok(Some((mail.id, changed)))
     }
 
@@ -1041,7 +1272,7 @@ impl MailWrite for WriteTxn {
         let Some(mail) = id.and_then(|id| current_message(self, id)) else {
             return;
         };
-        if mail.mentions(Address::User).is_none() || has_user_reply(self, mail.id) {
+        if !mail.pings_user() || has_user_reply(self, mail.id) {
             return;
         }
         let event = ChatEvent::Recovered {
@@ -1060,10 +1291,15 @@ impl MailWrite for WriteTxn {
         agent: AgentId,
         message: MessageId,
         content: Vec<ContentPart>,
+        ping: Option<bool>,
     ) -> anyhow::Result<()> {
         let mail = check_revision(self, agent, message)?;
         anyhow::ensure!(has_content(&content), "a message needs content");
-        revise(self, at, &mail, agent, content);
+        anyhow::ensure!(
+            ping.is_none() || mail.to_user(),
+            "only mail to the user pings"
+        );
+        revise(self, at, &mail, agent, content, ping);
         Ok(())
     }
 
@@ -1104,10 +1340,7 @@ impl MailWrite for WriteTxn {
             NewMessage {
                 from: sender,
                 reply_to: None,
-                mentions: vec![Mention {
-                    to: Address::User,
-                    kind: MentionKind::Ask,
-                }],
+                mentions: vec![Mention::User { ping: true }],
                 content: vec![ContentPart::Text { text }],
             },
             None,

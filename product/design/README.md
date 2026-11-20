@@ -1,6 +1,6 @@
 # Built rho renders
 
-Captured 2026-11-20 from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The card captures were updated 2026-11-20 for the headerless thread. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -71,13 +71,13 @@ form_way phone input 'key:tab' 'wait:600'
 form_way phone click 390 1640
 sleep .7
 form_shot phone card-empty
-# The second mail header is the project's ask. Tap it to inspect the writing step.
+# Tap the project's words to inspect their writing step.
 form_way phone click 165 203
 sleep .75
 form_shot phone agent
 ```
 
-This makes the phone card and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action. To capture a [card with `send`](phone-card.png), return to the card, tap the draft separator, and type a reply without sending it before taking the screenshot.
+This makes the phone card and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action. To capture a [card with `send`](phone-card.png), return to the card, tap anywhere below the project’s words, and type a reply without sending it before taking the screenshot.
 
 ## Desk on laptop and phone: waiting and moving together
 
@@ -115,7 +115,7 @@ The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show two res
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk holds the card words in their own column on the laptop and below the subject on the phone. The project list is still a different screen, with its unread counts below the title when they wrap.
-- The draft separator is part of the threaded mail or Desk buffer. On phones it names the recipient without the keyboard shortcut. The card bar gives `done` and `snooze` their own buttons; the Desk bar does not offer verdicts.
+- In a thread, the draft is the next mail; `reply` appears while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The Desk still has its old draft tail.
 - The palette shows the matching name on the laptop and recent places before commands in the blank phone view. A menu's shortcut leads on the laptop and sits at the far edge on the phone.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 

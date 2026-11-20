@@ -30,7 +30,9 @@ class Spec(TypedDict):
     runtime: Runtime
     props: dict[str, str]
 
-MentionKind = Literal["ask", "result", "fyi"]
+# How a mention reaches: mail to the user pings or is quiet; an agent is
+# reached as a member would be, or directly, without the thread's members.
+MentionKind = Literal["ping", "quiet", "member", "direct"]
 
 class MessageRecord(TypedDict):
     id: int
@@ -138,8 +140,9 @@ class MailHit(TypedDict):
     subject: str
     excerpt: str
 
-def thread_status(agent: str, thread: int, text: str) -> None: ...
-def edit_message(agent: str, id: int, text: str) -> None: ...
+def edit_message(agent: str, id: int, text: str, *, ping: bool | None = None) -> None:
+    """Change your own mail. `ping` turns the ping of mail to the user on or
+    off; None keeps it."""
 def delete_message(agent: str, id: int) -> None: ...
 def search_mail(query: str, project: int | None, limit: int) -> list[MailHit]: ...
 
@@ -149,13 +152,13 @@ def send_mail(
     text: str,
     *,
     to: str | None = None,
-    kind: MentionKind | None = None,
+    ping: bool | None = None,
     reply_to: int | None = None,
 ) -> tuple[int, tuple[int, str] | None]:
     """Return the new id and, if unanswered, the preceding project's mail id and writer.
     Send durable mail as `sender`. With an agent in `to`, the host
-    chooses the conversation. Only mail to "user" takes a kind and must
-    pass the STE check."""
+    chooses the conversation. Only mail to "user" takes `ping`, which it
+    needs, and must pass the STE check."""
 def agent_handle(agent: str) -> str | None: ...
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts

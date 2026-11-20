@@ -2372,6 +2372,7 @@ mod tests {
             from: Address::Agent(agent),
             mentions: Vec::new(),
             content: Vec::new(),
+            ping_started: None,
             revision: Revision::Edited {
                 seq: ChatSeq(2),
                 at: UnixMs(2),

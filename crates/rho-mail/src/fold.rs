@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, MentionKind, Message, MessageId, Revision,
-    ThreadStatus, UnixMs, one_line,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, Revision, ThreadWork,
+    UnixMs, one_line,
 };
 
 /// What one record changed.
@@ -53,7 +53,7 @@ pub struct HostMail {
     /// Each message's children in log order; `None` holds the roots.
     children: BTreeMap<Option<MessageId>, Vec<MessageId>>,
     names: HashMap<MessageId, String>,
-    statuses: BTreeMap<MessageId, ThreadStatus>,
+    work: BTreeMap<MessageId, ThreadWork>,
     /// What each agent last said about each thread: joined or left.
     members: BTreeMap<(MessageId, AgentId), bool>,
     /// The first thread each agent joined: its thread, the one it started
@@ -134,19 +134,56 @@ impl HostMail {
     }
 
     /// Applies the current ephemeral snapshot from the host, never from disk.
-    pub fn set_statuses(&mut self, statuses: Vec<ThreadStatus>) {
-        self.statuses = statuses
-            .into_iter()
-            .map(|status| (status.thread, status))
-            .collect();
+    pub fn set_work(&mut self, work: Vec<(MessageId, ThreadWork)>) {
+        self.work = work.into_iter().collect();
     }
 
-    pub fn status(&self, thread: MessageId) -> Option<&ThreadStatus> {
-        self.statuses.get(&thread)
+    /// The latest project mail, even if it does not ping. Agent-to-agent
+    /// mail is never the project's words to the user.
+    pub fn latest_words(&self, thread: MessageId) -> Option<(String, UnixMs)> {
+        let mut latest = None;
+        let mut latest_user = None;
+        for mail in std::iter::once(thread)
+            .chain(self.children(Some(thread)).iter().copied())
+            .filter_map(|id| self.message(id))
+            .filter(|mail| {
+                !matches!(
+                    mail.revision,
+                    Revision::Deleted | Revision::TakenBack { .. }
+                )
+            })
+        {
+            if mail.from == Address::User {
+                latest_user = Some(mail);
+            } else if mail.to_user()
+                && latest.is_none_or(|old: &Message| old.version().0 < mail.version().0)
+            {
+                latest = Some(mail);
+            }
+        }
+        if self.work.get(&thread) == Some(&ThreadWork::Working)
+            && latest_user
+                .is_some_and(|user| latest.is_none_or(|mail| mail.version().0 < user.id.0))
+        {
+            return latest_user.map(|mail| ("working".into(), mail.at));
+        }
+        latest.map(|mail| (mail.headline(), mail.version().1))
     }
 
-    pub fn statuses(&self) -> impl Iterator<Item = &ThreadStatus> {
-        self.statuses.values()
+    pub fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
+        self.children(Some(thread))
+            .iter()
+            .rev()
+            .copied()
+            .chain(std::iter::once(thread))
+            .filter_map(|id| self.message(id))
+            .find(|mail| mail.from == Address::User)
+            .or_else(|| self.message(thread))
+            .map(|mail| mail.at)
+    }
+
+    pub fn work(&self, thread: MessageId) -> Option<ThreadWork> {
+        self.work.get(&thread).copied()
     }
 
     /// One root channel by id, with the name used in a project address.
@@ -163,12 +200,7 @@ impl HostMail {
     /// A root that was itself addressed to the user is mail, not a project.
     pub fn is_project(&self, id: MessageId) -> bool {
         self.message(id).is_some_and(|root| {
-            root.parent.is_none()
-                && root.revision != Revision::Deleted
-                && !matches!(
-                    root.mentions(Address::User),
-                    Some(MentionKind::Ask | MentionKind::Result)
-                )
+            root.parent.is_none() && root.revision != Revision::Deleted && !root.to_user()
         })
     }
 

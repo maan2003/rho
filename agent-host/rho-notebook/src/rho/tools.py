@@ -96,27 +96,26 @@ class Mail:
     def __init__(self, agent: str):
         self._agent = agent
 
-    def send(self, to, text, *, thread=None, reply_to=None, kind=None):
+    def send(self, to, text, *, thread=None, reply_to=None, ping=True):
         """Send to a local project, #thread, agent handle, or "user".
         With reply_to=#id, you can pass None to address the writer.
-        Mail to "user" needs kind and a thread or reply_to.
-        The returned id may carry a `notice` suggesting an edit.
+        Mail to "user" needs a thread or reply_to; it pings the user unless
+        ping=False. The returned id may carry a `notice` suggesting an edit.
         """
-        message = rho_mail.send(self._agent, to, text, thread=thread, reply_to=reply_to, kind=kind)
+        message = rho_mail.send(self._agent, to, text, thread=thread, reply_to=reply_to, ping=ping)
         if to != rho_mail.USER or message.notice:
             print(f"Sent mail #{message}.")
         if message.notice:
             print(message.notice)
         return message
 
-    def status(self, thread, text):
-        """Replace the thread's one-line status; pass "" to clear it."""
-        _host(_rho.thread_status, self._agent, rho_mail.ident(thread), str(text))
-        return _DONE
-
-    def edit(self, message, text):
-        """Replace the body of your mail #message; answered mail is fixed."""
-        _host(_rho.edit_message, self._agent, rho_mail.ident(message), _text(text))
+    def edit(self, message, text, *, ping=None):
+        """Replace the body of your mail #message; answered mail is fixed.
+        ping=True deals mail to the user as a card, ping=False stops it
+        pinging; by default it pings as it did."""
+        if ping is not None and type(ping) is not bool:
+            raise ValueError(f"ping is True, False or None, not {ping!r}")
+        _host(_rho.edit_message, self._agent, rho_mail.ident(message), _text(text), ping=ping)
         return _DONE
 
     def delete(self, message):
@@ -310,10 +309,10 @@ class External:
         return "<agents.external>"
 
 
-def _host(call, *args):
+def _host(call, *args, **kwargs):
     """A host call whose refusal is the caller's mistake to read."""
     try:
-        return call(*args)
+        return call(*args, **kwargs)
     except RuntimeError as error:
         raise ValueError(str(error)) from None
 
@@ -419,7 +418,7 @@ class UserAgents(Agents):
         elif rho_mail.thread(int(thread)) is None:
             raise ValueError(f"no thread #{int(thread)}")
         self._check_depth()
-        message = rho_mail.send(me.id, rho_mail.USER, str(prompt), thread=thread, kind="fyi")
+        message = rho_mail.send(me.id, rho_mail.USER, str(prompt), thread=thread, ping=False)
         rho_mail.name(me.id, message, str(task_name))
         props = {
             "name": task_name,

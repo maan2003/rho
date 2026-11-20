@@ -20,7 +20,7 @@ use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
-    ThreadStatus,
+    ThreadWork,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -129,6 +129,8 @@ pub struct MailSystem {
     creating_projects: Vec<(CreatingProject, CreatedProject)>,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
+    last_open: HashMap<ThreadId, Timestamp>,
+    view_cold: bool,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
@@ -182,6 +184,8 @@ impl MailSystem {
                 .collect(),
             cache,
             view: None,
+            last_open: HashMap::new(),
+            view_cold: false,
             hosts: HashMap::new(),
             logs,
             events,
@@ -224,11 +228,35 @@ impl MailSystem {
     /// Reports which mail thread is open in the focused place, if any.
     /// A focus change to a non-mail screen sends `None`; neither opens
     /// nor closes change a verdict or read mark.
-    pub fn set_view(&mut self, thread: Option<ThreadId>) {
+    fn set_view(&mut self, thread: Option<ThreadId>, cx: &mut Context<Self>) {
+        if self.view == thread {
+            return;
+        }
+        let now = Timestamp::now();
+        if let Some(previous) = self.view.take() {
+            self.last_open.insert(previous, now);
+        }
+        self.view_cold = thread.is_some_and(|thread| self.thread_is_cold(thread, now));
         self.view = thread;
         for slot in self.hosts.values() {
             Self::sync_view(slot, thread);
         }
+        cx.notify();
+    }
+
+    fn thread_is_cold(&self, thread: ThreadId, now: Timestamp) -> bool {
+        if self.view == Some(thread) {
+            return self.view_cold;
+        }
+        let last_open = self.last_open.get(&thread).copied();
+        let last_written = self
+            .host_mail(thread.host)
+            .and_then(|chat| chat.last_user_mail(thread.message))
+            .and_then(|at| Timestamp::from_millisecond(at.0.try_into().ok()?).ok());
+        last_open.max(last_written).is_some_and(|last| {
+            now.duration_since(last)
+                > jiff::SignedDuration::try_from(rho_agent_types::THREAD_COLD_AFTER).unwrap()
+        })
     }
 
     fn sync_view(slot: &Slot, view: Option<ThreadId>) {
@@ -242,8 +270,8 @@ impl MailSystem {
         });
     }
 
-    pub fn status(&self, thread: ThreadId) -> Option<&ThreadStatus> {
-        self.host_mail(thread.host)?.status(thread.message)
+    pub fn work(&self, thread: ThreadId) -> Option<ThreadWork> {
+        self.host_mail(thread.host)?.work(thread.message)
     }
 
     /// A mail thread's subject and project address for a row elsewhere.
@@ -406,12 +434,9 @@ impl MailSystem {
                 self.finish_project_creation(cx);
                 self.changed(endpoint, cx);
             }
-            MailEvent::Statuses { host, statuses } => {
+            MailEvent::Work { host, threads } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
-                    self.logs
-                        .entry(endpoint)
-                        .or_default()
-                        .set_statuses(statuses);
+                    self.logs.entry(endpoint).or_default().set_work(threads);
                     self.changed(endpoint, cx);
                 }
             }
@@ -419,7 +444,7 @@ impl MailSystem {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint)
                     && let Some(chat) = self.logs.get_mut(&endpoint)
                 {
-                    chat.set_statuses(Vec::new());
+                    chat.set_work(Vec::new());
                     self.changed(endpoint, cx);
                 }
             }
@@ -772,14 +797,14 @@ impl System for MailSystem {
         Some(AnySurface::new(view))
     }
 
-    fn active_surface(&mut self, address: Option<&Address>, _cx: &mut Context<Self>) {
+    fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
         let thread = address
             .and_then(|address| self.thread_of(address))
             .filter(|thread| {
                 self.host_mail(thread.host)
                     .is_some_and(|chat| !chat.is_project(thread.message))
             });
-        self.set_view(thread);
+        self.set_view(thread, cx);
     }
 
     fn streams(
@@ -1007,28 +1032,30 @@ impl System for MailSystem {
         self.logs
             .iter()
             .flat_map(|(&host, chat)| {
-                chat.statuses().filter_map(move |status| {
-                    if matches!(
-                        status.state,
-                        rho_agent_types::StatusText::StoppedByYou
-                            | rho_agent_types::StatusText::Stuck
-                    ) {
-                        return None;
-                    }
-                    let thread = ThreadId {
-                        host,
-                        message: status.thread,
-                    };
-                    let project = self.project_root(thread)?;
-                    (project != thread).then_some(())?;
-                    Some(MovingThread {
-                        thread: thread.address(),
-                        subject: chat.name(thread.message)?,
-                        project: self.project_address(project)?,
-                        status: status.state.words().to_owned(),
-                        changed: Timestamp::from_millisecond(status.at.0.try_into().ok()?).ok()?,
+                chat.roots()
+                    .iter()
+                    .filter_map(move |&root| {
+                        let project = self.project_address(ThreadId {
+                            host,
+                            message: root,
+                        })?;
+                        Some((root, project))
                     })
-                })
+                    .flat_map(move |(root, project)| {
+                        chat.children(Some(root))
+                            .iter()
+                            .filter_map(move |&message| {
+                                let (status, at) = chat.latest_words(message)?;
+                                Some(MovingThread {
+                                    thread: ThreadId { host, message }.address(),
+                                    subject: chat.name(message)?,
+                                    project: project.clone(),
+                                    status,
+                                    changed: Timestamp::from_millisecond(at.0.try_into().ok()?)
+                                        .ok()?,
+                                })
+                            })
+                    })
             })
             .collect()
     }
@@ -1095,13 +1122,9 @@ impl System for MailSystem {
                 continue;
             };
             let mut seen = BTreeSet::new();
-            let ids = chat
-                .roots()
-                .iter()
-                .flat_map(|&root| {
-                    std::iter::once(root).chain(chat.children(Some(root)).iter().copied())
-                })
-                .chain(chat.statuses().map(|status| status.thread));
+            let ids = chat.roots().iter().flat_map(|&root| {
+                std::iter::once(root).chain(chat.children(Some(root)).iter().copied())
+            });
             for id in ids.filter(|id| seen.insert(*id)) {
                 let Some(mail) = chat.message(id) else {
                     continue;
@@ -1119,9 +1142,7 @@ impl System for MailSystem {
                     title: if is_project { project.clone() } else { subject },
                     description: if is_project { String::new() } else { project },
                     thread: (!is_project).then(|| FoundThread {
-                        status: chat
-                            .status(id)
-                            .map(|status| status.state.words().to_owned()),
+                        status: chat.latest_words(id).map(|(words, _)| words),
                     }),
                     recency: chat.newest_in(id).map_or(mail.at.0, |(_, at)| at.0),
                 });

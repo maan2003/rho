@@ -258,6 +258,7 @@ enum Button {
     Snooze,
     More,
     Send,
+    Undo,
     Cancel,
     Enter,
 }
@@ -273,6 +274,7 @@ impl Button {
             Self::Snooze => "rho-phone-snooze",
             Self::More => "rho-phone-verdicts",
             Self::Send => "rho-phone-send",
+            Self::Undo => "rho-phone-undo",
             Self::Cancel => "rho-phone-cancel",
             Self::Enter => "rho-phone-enter",
         }
@@ -288,6 +290,7 @@ impl Button {
             Self::Snooze => ("◷", "snooze"),
             Self::More => ("⋯", "more"),
             Self::Send => ("↑", "send"),
+            Self::Undo => ("↶", "undo"),
             Self::Cancel => ("×", "cancel"),
             Self::Enter => ("↵", "enter"),
         }
@@ -311,6 +314,7 @@ struct BarState {
     card: Option<OpenCard>,
     /// The surface in view has a draft to send.
     send: bool,
+    writing: bool,
 }
 
 /// The bar's buttons, left to right.
@@ -325,13 +329,26 @@ fn buttons(state: BarState) -> Vec<Button> {
             ..
         } => vec![Cancel, Send],
         BarState { desk: true, .. } => vec![Menu, Open, More],
-        BarState { card, send, .. } => {
+        BarState {
+            card: Some(OpenCard::Here),
+            writing: true,
+            ..
+        } => vec![Back, Menu, Undo, Send],
+        BarState {
+            card,
+            send,
+            writing,
+            ..
+        } => {
             let mut buttons = match card {
                 Some(OpenCard::Here) => vec![Back, Menu, Done, Snooze, More],
                 Some(OpenCard::Related) => vec![Back, Done, Snooze, More, Menu],
                 None => vec![Back, Desk, Menu],
             };
-            buttons.extend(send.then_some(Send));
+            if writing {
+                buttons.push(Undo);
+                buttons.extend(send.then_some(Send));
+            }
             buttons
         }
     }
@@ -611,6 +628,7 @@ impl Frame {
                     }
                 }),
             send: send.is_some(),
+            writing: typing,
         };
         let colors = cx.theme().colors();
         let render_tool = |tool: crate::surface::PhoneTool| {
@@ -739,6 +757,16 @@ impl Frame {
                 self.open_menu(rows, window, cx);
             }
             Button::More => self.verdict_menu(window, cx),
+            Button::Undo => {
+                if let Some(editor) = self
+                    .idea_editor()
+                    .or_else(|| self.current_surface().editor(cx))
+                {
+                    editor.update(cx, |editor, cx| {
+                        editor.undo(&editor::actions::Undo, window, cx)
+                    });
+                }
+            }
             Button::Send if self.idea_here(cx) => self.send_idea(window, cx),
             Button::Send => {
                 if let Some(send) = send {
@@ -1021,7 +1049,14 @@ mod tests {
         };
         assert_eq!(buttons(card), [Back, Menu, Done, Snooze, More]);
         let thread = BarState { send: true, ..card };
-        assert_eq!(buttons(thread), [Back, Menu, Done, Snooze, More, Send]);
+        assert_eq!(buttons(thread), [Back, Menu, Done, Snooze, More]);
+        assert_eq!(
+            buttons(BarState {
+                writing: true,
+                ..thread
+            }),
+            [Back, Menu, Undo, Send]
+        );
         assert_eq!(
             buttons(BarState {
                 card: Some(OpenCard::Related),

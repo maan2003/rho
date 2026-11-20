@@ -6,7 +6,7 @@
 //! The formats and budgets follow `codex-rs` (`realtime_context.rs`,
 //! `context/realtime_delegation.rs`), so the model sees what it is tuned on.
 
-use rho_agent_types::{Address, AgentId, MentionKind, Message};
+use rho_agent_types::{Address, AgentId, Message};
 use rho_openai_realtime::ContextChannel;
 
 use crate::transcript::content_text;
@@ -132,10 +132,7 @@ pub(super) fn reply(message: &Message, agent: AgentId) -> Option<(ContextChannel
     if message.from != Address::Agent(agent) {
         return None;
     }
-    let complete = matches!(
-        message.mentions(Address::User),
-        Some(MentionKind::Result | MentionKind::Ask)
-    );
+    let complete = message.pings_user();
     Some(told(&content_text(&message.content), complete))
 }
 
@@ -240,17 +237,12 @@ mod tests {
                 text: text.to_owned(),
             }],
             revision: rho_agent_types::Revision::Original,
+            ping_started: None,
         }
     }
 
-    fn mention(to: Address, kind: MentionKind) -> Vec<Mention> {
-        vec![Mention { to, kind }]
-    }
-
-    /// What agent 1 posts mentioning the user with `kind`, or without a
-    /// mention.
-    fn sent(kind: Option<MentionKind>, text: &str) -> Message {
-        let mentions = kind.map_or_else(Vec::new, |kind| mention(Address::User, kind));
+    fn sent(ping: Option<bool>, text: &str) -> Message {
+        let mentions = ping.map_or_else(Vec::new, |ping| vec![Mention::User { ping }]);
         message(Address::Agent(agent(1)), mentions, text)
     }
 
@@ -335,24 +327,9 @@ mod tests {
     fn the_mention_of_the_user_picks_the_channel_and_whether_the_request_is_done() {
         let cases = [
             (None, "commentary", "[STATUS] looking", false),
-            (
-                Some(MentionKind::Fyi),
-                "commentary",
-                "[STATUS] looking",
-                false,
-            ),
-            (
-                Some(MentionKind::Result),
-                "speakable",
-                "[COMPLETE] looking",
-                true,
-            ),
-            (
-                Some(MentionKind::Ask),
-                "speakable",
-                "[COMPLETE] looking",
-                true,
-            ),
+            (Some(false), "commentary", "[STATUS] looking", false),
+            (Some(true), "speakable", "[COMPLETE] looking", true),
+            (Some(true), "speakable", "[COMPLETE] looking", true),
         ];
         for (kind, channel, text, complete) in cases {
             let (got_channel, got_text, got_complete) =
@@ -367,14 +344,14 @@ mod tests {
         // the request; another agent's message is not this agent's answer.
         let to_agent = message(
             Address::Agent(agent(1)),
-            mention(Address::Agent(agent(7)), MentionKind::Result),
+            vec![Mention::Direct(agent(7))],
             "x",
         );
         assert_eq!(
             reply(&to_agent, agent(1)).map(|(_, _, done)| done),
             Some(false)
         );
-        assert_eq!(reply(&sent(Some(MentionKind::Result), "x"), agent(7)), None);
+        assert_eq!(reply(&sent(Some(true), "x"), agent(7)), None);
         let (channel, text, complete) = stopped("quota");
         assert_eq!(
             (channel_name(channel), text.as_str(), complete),
@@ -390,7 +367,7 @@ mod tests {
             Some(Said::User("ask".to_owned()))
         );
         assert_eq!(
-            Said::of(&sent(Some(MentionKind::Result), "done"), agent(1)),
+            Said::of(&sent(Some(true), "done"), agent(1)),
             Some(Said::Agent("done".to_owned()))
         );
         assert_eq!(Said::of(&message(other, vec![], "x"), agent(1)), None);
@@ -399,7 +376,7 @@ mod tests {
     #[test]
     fn a_long_reply_is_cut_to_two_thousand_tokens() {
         let text = format!("HEAD{}TAIL", "ü".repeat(20_000));
-        let (_, reply, _) = reply(&sent(Some(MentionKind::Result), &text), agent(1)).unwrap();
+        let (_, reply, _) = reply(&sent(Some(true), &text), agent(1)).unwrap();
         assert!(reply.starts_with("[COMPLETE] HEAD") && reply.ends_with("TAIL"));
         assert!(reply.len() <= REPLY_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN + 20);
     }

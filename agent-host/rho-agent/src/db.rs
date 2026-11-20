@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "9f7265ce";
+const CURRENT_AGENT_DB_FORMAT: &str = "7c2a5f9d";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
@@ -67,7 +67,12 @@ const MIGRATIONS: &[Migration] = &[
     ("b5082aa5", "d8e4c62f", |_| {}),
     // Existing mail rows decode unchanged. Older hosts cannot read a new
     // live revision or a stop with no agent.
-    ("d8e4c62f", CURRENT_AGENT_DB_FORMAT, |_| {}),
+    ("d8e4c62f", "9f7265ce", |_| {}),
+    (
+        "9f7265ce",
+        CURRENT_AGENT_DB_FORMAT,
+        crate::store::mail::migrate_pings,
+    ),
 ];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
@@ -646,6 +651,7 @@ mod tests {
         assert_eq!(
             hops,
             [
+                "9f7265ce->7c2a5f9d",
                 "a8f02c31->b5082aa5",
                 "b5082aa5->d8e4c62f",
                 "d8e4c62f->9f7265ce",

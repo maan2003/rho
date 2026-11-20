@@ -1,5 +1,5 @@
 //! Deal the first waiting mail after the user's reply. When there is no
-//! such mail, the first waiting ask/stop or newest waiting result still waits.
+//! such mail, the oldest unanswered pinging mail still waits.
 //! A visible mail is the only source of a claim; a stop remains after its
 //! agent moves on, and no addressed result fades unread. Marks still belong
 //! to the user, and a reply settles the mail that preceded it.
@@ -7,9 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use jiff::Timestamp;
-use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, EndpointId, MentionKind, Message, MessageId,
-};
+use rho_agent_types::{Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId};
 use rho_dealer::curve::{self, Curve};
 use rho_dealer::rank::{CardKind, Trace};
 use rho_dealer::{Addressed, Claim, Marks};
@@ -53,19 +51,6 @@ fn unix(ms: u64) -> Timestamp {
     Timestamp::from_millisecond(ms as i64).expect("a message's time")
 }
 
-/// When results stopped fading: the first release that keeps a result
-/// waiting until the user deals it, 2026-11-20T14:39Z. Before it, a result
-/// faded and was gone three days after it was written, with no verdict
-/// asked. A result already gone then was read as far as the user knew, and
-/// the rule change does not bring it back as a card.
-const RESULTS_WAIT_SINCE: u64 = 1795185540000;
-const RESULT_GONE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
-
-fn faded_before_results_waited(mail: &Message) -> bool {
-    mail.mentions(Party::User) == Some(MentionKind::Result)
-        && mail.at.0.saturating_add(RESULT_GONE_MS) <= RESULTS_WAIT_SINCE
-}
-
 /// Every thread on the host that wants the user, as a claim each.
 pub fn claims(
     host: &Host<'_>,
@@ -80,7 +65,7 @@ pub fn claims(
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
     let mut answered = HashSet::new();
     for message in chat.messages() {
-        let mentioned = message.mentions(Party::User).is_some();
+        let mentioned = message.pings_user();
         let from_user = message.from == Party::User;
         if !mentioned && !from_user {
             continue;
@@ -116,11 +101,10 @@ pub fn claims(
             .into_iter()
             .filter(|message| {
                 !answered.contains(&message.id)
-                    && !faded_before_results_waited(message)
                     && seen.is_none_or(|seen| message.version().0 > seen)
             })
             .collect::<Vec<_>>();
-        unseen.sort_by_key(|message| message.version().0);
+        unseen.sort_by_key(|message| message.ping_since(seen).0);
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
                 &address,
@@ -133,38 +117,26 @@ pub fn claims(
             trace.input(&address, "seen through", format!("{seen:?}"));
         }
 
-        let waiting = unseen
-            .iter()
-            .copied()
-            .find(|mail| mail.mentions(Party::User) == Some(MentionKind::Ask));
-        let result = unseen
-            .iter()
-            .copied()
-            .rfind(|mail| mail.mentions(Party::User) == Some(MentionKind::Result));
         // An addressed reply settles only its target. Older unanswered mail
         // still waits, but the next mail in the conversation is where to land.
         let next = user_wrote
             .filter(|reply| reply.id != thread)
             .and_then(|reply| {
-                unseen.iter().copied().find(|mail| {
-                    mail.version().0 > reply.id.0
-                        && matches!(
-                            mail.mentions(Party::User),
-                            Some(MentionKind::Ask | MentionKind::Result)
-                        )
-                })
+                unseen
+                    .iter()
+                    .copied()
+                    .find(|mail| mail.version().0 > reply.id.0)
             });
-        let Some(mail) = next.or(waiting).or(result) else {
+        let Some(mail) = next.or_else(|| unseen.first().copied()) else {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.outcome(&address, "no card: nothing unread".to_owned());
             }
             continue;
         };
-        let reason = match (mail.from, mail.mentions(Party::User)) {
-            (Party::System { stop, .. }, _) => CardKind::Stop(stop.word()),
-            (Party::StartFailed, _) => CardKind::Stop("failed"),
-            (_, Some(MentionKind::Result)) => CardKind::Result,
-            _ => CardKind::Ask,
+        let reason = match mail.from {
+            Party::System { stop, .. } => CardKind::Stop(stop.word()),
+            Party::StartFailed => CardKind::Stop("failed"),
+            _ => CardKind::Waits,
         };
         let since = unix(
             match mail.from {
@@ -173,7 +145,7 @@ pub fn claims(
                     since,
                     ..
                 } => since,
-                _ => mail.version().1,
+                _ => mail.ping_since(seen).1,
             }
             .0,
         );
@@ -181,10 +153,14 @@ pub fn claims(
             head_start: curve::AGENT_BLOCKED_HEAD_START,
             since,
         };
-        // The first part is where to open the card; the last part changes
-        // when more mail arrives, even if the trigger is still the same ask.
-        let newest = unseen.last().expect("the trigger is unseen");
-        let cursor = format!("{}/{}", mail.id.0.0, newest.version().0.0);
+        // The cursor locates the trigger and notices new pings, not edits
+        // of a ping the user hasn't settled yet.
+        let newest = unseen
+            .iter()
+            .map(|mail| mail.ping_since(seen).0)
+            .max()
+            .expect("the trigger is unseen");
+        let cursor = format!("{}/{}", mail.id.0.0, newest.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
@@ -374,30 +350,27 @@ mod tests {
             &mut self,
             thread: MessageId,
             reply: Option<MessageId>,
-            kind: MentionKind,
+            ping: bool,
         ) -> MessageId {
             let from = Party::Agent(self.agents[&thread]);
             self.post(
                 Some(reply.unwrap_or(thread)),
                 from,
-                vec![Mention {
-                    to: Party::User,
-                    kind,
-                }],
+                vec![Mention::User { ping }],
                 "update",
             )
         }
 
-        fn sends(&mut self, thread: MessageId, kind: MentionKind) -> MessageId {
-            self.sends_under(thread, None, kind)
+        fn sends(&mut self, thread: MessageId, ping: bool) -> MessageId {
+            self.sends_under(thread, None, ping)
         }
 
         fn finishes(&mut self, thread: MessageId) -> MessageId {
-            self.sends(thread, MentionKind::Result)
+            self.sends(thread, true)
         }
 
         fn asks(&mut self, thread: MessageId) -> MessageId {
-            self.sends(thread, MentionKind::Ask)
+            self.sends(thread, true)
         }
 
         /// Says what it is doing, mentioning nobody.
@@ -477,10 +450,7 @@ mod tests {
                     stop,
                     since: UnixMs(self.ms()),
                 },
-                vec![Mention {
-                    to: Party::User,
-                    kind: MentionKind::Ask,
-                }],
+                vec![Mention::User { ping: true }],
                 "lost connection",
             )
         }
@@ -537,10 +507,7 @@ mod tests {
         let root = w.post(
             None,
             Party::Agent(agent),
-            vec![Mention {
-                to: Party::User,
-                kind: MentionKind::Ask,
-            }],
+            vec![Mention::User { ping: true }],
             "root asks",
         );
         let a = w.agent("a");
@@ -557,7 +524,7 @@ mod tests {
         w.writes_to(root);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · now",
+            "rho@lab › a · waits · now",
             "the reply settles the standalone ask without clearing an unrelated thread"
         );
     }
@@ -589,7 +556,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · now");
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
         let first = w.priority(a).unwrap();
         assert!(first >= AGENT_BLOCKED_HEAD_START);
         w.pass(hours(1));
@@ -612,46 +579,21 @@ mod tests {
             .iter()
             .find(|card| card.address == w.address(a))
             .unwrap();
-        assert_eq!(card.label, "result · 6.0d");
+        assert_eq!(card.label, "waits · 6.0d");
         assert_eq!(attention_mail(&card.cursor), Some(result));
         w.writes_to(a);
-        assert_eq!(w.hand(), "rho@lab › b · asks · 6.0d");
-    }
-
-    /// Before results waited, a result faded and was gone in three days.
-    /// One already gone at the change stays gone; an ask from then still
-    /// waits, and a result still fading then waits from now on.
-    #[test]
-    fn a2b_a_result_gone_before_results_waited_makes_no_card() {
-        let mut w = world();
-        w.now = "2026-11-10T09:00:00Z"
-            .parse::<Timestamp>()
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::UTC);
-        let gone = w.agent("gone");
-        w.finishes(gone);
-        let asked = w.agent("asked");
-        w.asks(asked);
-        w.pass(hours(24 * 8));
-        let fading = w.agent("fading");
-        w.finishes(fading);
-        w.pass(hours(24 * 5));
-        assert!(w.now.timestamp().as_millisecond() as u64 > RESULTS_WAIT_SINCE);
-        let hand = w.hand();
-        assert!(!hand.contains("gone"), "{hand}");
-        assert!(hand.contains("asked · asks"), "{hand}");
-        assert!(hand.contains("fading · result"), "{hand}");
+        assert_eq!(w.hand(), "rho@lab › b · waits · 6.0d");
     }
 
     #[test]
     fn a3_an_fyi_is_no_card() {
         let mut w = world();
         let a = w.agent("a");
-        w.sends(a, MentionKind::Fyi);
+        w.sends(a, false);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        w.sends(a, MentionKind::Fyi);
-        assert_eq!(w.hand(), "rho@lab › a · asks · now", "an fyi hides no ask");
+        w.sends(a, false);
+        assert_eq!(w.hand(), "rho@lab › a · waits · now", "an fyi hides no ask");
     }
 
     #[test]
@@ -661,27 +603,19 @@ mod tests {
         let b = w.agent("b");
         w.works(a);
         let from = Party::Agent(w.agents[&a]);
-        w.post(
-            Some(a),
-            from,
-            vec![Mention {
-                to: Party::Agent(w.agents[&b]),
-                kind: MentionKind::Ask,
-            }],
-            "b, help",
-        );
+        w.post(Some(a), from, vec![Mention::Agent(w.agents[&b])], "b, help");
         assert_eq!(w.hand(), "");
         w.finishes(a);
         w.works(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · result · now",
+            "rho@lab › a · waits · now",
             "and it hides nothing"
         );
     }
 
     #[test]
-    fn asks_and_stops_deal_oldest_first_before_even_older_results() {
+    fn pinging_mail_and_stops_deal_oldest_first() {
         let mut w = world();
         let old_result = w.agent("later-alphabetically");
         let new_result = w.agent("earlier-alphabetically");
@@ -704,13 +638,13 @@ mod tests {
                 .iter()
                 .map(|card| card.address.clone())
                 .collect::<Vec<_>>(),
-            [old_ask, stop, new_ask, old_result, new_result].map(|thread| w.address(thread)),
+            [old_result, new_result, old_ask, stop, new_ask].map(|thread| w.address(thread)),
         );
         assert!(w.priority(new_ask).unwrap() > w.priority(old_ask).unwrap());
     }
 
     #[test]
-    fn a5_several_unseen_mentions_are_one_card_an_ask_above_a_result() {
+    fn a5_several_pings_are_one_card_anchored_at_the_oldest() {
         let mut w = world();
         let a = w.agent("a");
         let b = w.agent("b");
@@ -723,16 +657,16 @@ mod tests {
         w.asks(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · 20m",
-            "from the first ask unseen"
+            "rho@lab › a · waits · 30m",
+            "from the first unseen ping"
         );
         w.finishes(b);
         w.pass(mins(30));
         w.finishes(b);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · 50m\nrho@lab › b · result · now",
-            "from the newest result"
+            "rho@lab › a · waits · 1.0h\nrho@lab › b · waits · 30m",
+            "both threads deal from their first ping"
         );
     }
 
@@ -746,11 +680,43 @@ mod tests {
         w.works(a);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · now");
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
         w.writes_to(a);
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
-        assert_eq!(w.hand(), "rho@lab › a · result · now");
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+    }
+
+    #[test]
+    fn editing_while_it_waits_preserves_the_card_but_toggling_ping_starts_a_new_wait() {
+        let mut w = world();
+        let a = w.agent("a");
+        let ask = w.asks(a);
+        let original = w.deal().cards[0].cursor.clone();
+        w.pass(mins(7));
+        for ping in [None, Some(false), Some(true)] {
+            w.record(ChatEvent::Revised {
+                message: ask,
+                author: w.agents[&a],
+                ping,
+                content: vec![ContentPart::Text {
+                    text: "Clock clarification.".into(),
+                }],
+            });
+            let hand = w.deal();
+            match ping {
+                None => {
+                    assert_eq!(hand.cards[0].cursor, original);
+                    assert_eq!(hand.cards[0].label, "waits · 7m");
+                }
+                Some(false) => assert!(hand.cards.is_empty()),
+                Some(true) => {
+                    assert_ne!(hand.cards[0].cursor, original);
+                    assert_eq!(hand.cards[0].label, "waits · now");
+                    assert_eq!(attention_mail(&hand.cards[0].cursor), Some(ask));
+                }
+            }
+        }
     }
 
     #[test]
@@ -765,6 +731,7 @@ mod tests {
         w.record(ChatEvent::Revised {
             message: ask,
             author: w.agents[&a],
+            ping: None,
             content: vec![ContentPart::Text {
                 text: "I need a monotonic clock.".into(),
             }],
@@ -775,7 +742,7 @@ mod tests {
         };
         assert_eq!(attention_mail(&card.cursor), Some(ask));
         assert_ne!(attention_mail(&card.cursor), Some(older));
-        assert_eq!(card.label, "asks · now", "age is the revision's");
+        assert_eq!(card.label, "waits · now", "age is the revision's");
         w.done(a);
         assert_eq!(w.hand(), "");
         w.answers(a, ask);
@@ -814,10 +781,7 @@ mod tests {
         let failure = w.post(
             Some(thread),
             Party::StartFailed,
-            vec![Mention {
-                to: Party::User,
-                kind: MentionKind::Ask,
-            }],
+            vec![Mention::User { ping: true }],
             "Could not start.",
         );
         let hand = w.deal();
@@ -840,7 +804,7 @@ mod tests {
         w.finishes(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › b · asks · 5m\nrho@lab › a · result · now"
+            "rho@lab › b · waits · 5m\nrho@lab › a · waits · now"
         );
         assert!(w.priority(a).unwrap() >= CHIME_THRESHOLD);
         assert!(w.priority(b).unwrap() < CHIME_THRESHOLD);
@@ -876,7 +840,7 @@ mod tests {
         w.done_through(a, result);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · now",
+            "rho@lab › a · waits · now",
             "the ask came after the done"
         );
         w.done(a);
@@ -892,8 +856,8 @@ mod tests {
     fn a9_a_mention_on_a_tangent_is_the_tangent_threads_card() {
         let mut w = world();
         let a = w.agent("a");
-        let reply = w.sends(a, MentionKind::Fyi);
-        let trigger = w.sends_under(a, Some(reply), MentionKind::Ask);
+        let reply = w.sends(a, false);
+        let trigger = w.sends_under(a, Some(reply), true);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(reply));
         assert_eq!(attention_mail(&hand.cards[0].cursor), Some(trigger));
@@ -913,15 +877,12 @@ mod tests {
         w.post(
             Some(parent),
             from,
-            vec![Mention {
-                to: Party::Agent(w.agents[&parent]),
-                kind: MentionKind::Result,
-            }],
+            vec![Mention::Agent(w.agents[&parent])],
             "done, parent",
         );
         assert_eq!(w.hand(), "");
         w.asks(parent);
-        assert_eq!(w.hand(), "rho@lab › parent · asks · now");
+        assert_eq!(w.hand(), "rho@lab › parent · waits · now");
     }
 
     #[test]
@@ -934,7 +895,7 @@ mod tests {
         w.asks(child);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(child));
-        assert_eq!(w.hand(), "rho@lab › child · asks · now");
+        assert_eq!(w.hand(), "rho@lab › child · waits · now");
     }
 
     #[test]
@@ -968,14 +929,14 @@ mod tests {
         let older = w.stop(a, Stop::Failed);
         let answered = w.asks(a);
         w.answers(a, answered);
-        w.sends(a, MentionKind::Fyi);
+        w.sends(a, false);
         let next = w.finishes(a);
         w.pass(mins(3));
         let newest = w.asks(a);
 
         let card = &w.deal().cards[0];
         assert_eq!(attention_mail(&card.cursor), Some(next));
-        assert_eq!(card.label, "result · 3m");
+        assert_eq!(card.label, "waits · 3m");
         w.answers(a, next);
         // This reply is after the latest ask; it did not answer that ask or
         // the older stop, and both still wait.
@@ -993,7 +954,7 @@ mod tests {
         w.stop(a, Stop::Failed);
         let deal = w.deal();
         let card = &deal.cards[0];
-        assert_eq!(card.label, "asks · 2m");
+        assert_eq!(card.label, "waits · 2m");
         assert_eq!(attention_mail(&card.cursor), Some(ask));
         w.mute(a);
         assert_eq!(w.hand(), "");
@@ -1004,17 +965,14 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · now");
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
         // A message right under the root is a thread of its own.
         let root = w.root();
         let from = Party::Agent(w.agents[&a]);
         w.post(
             Some(root),
             from,
-            vec![Mention {
-                to: Party::User,
-                kind: MentionKind::Ask,
-            }],
+            vec![Mention::User { ping: true }],
             "at the root",
         );
         let hand = w.deal();

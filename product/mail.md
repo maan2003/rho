@@ -58,7 +58,7 @@ does:
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
-status: a result does not yet carry designated proof. The built thread still shows a header with the writer and the time above each mail.
+status: a result does not yet carry designated proof.
 purpose: carry a brief, an ask, a result, or a word on the work's progress in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the words, with the voice told by colour alone: the user's own mail in `design.marked`, the project's in reading text; a quiet name line above a mail from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the mail quotes; proof on a result; a `## recap` section while the thread is cold
@@ -91,7 +91,6 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
-status: the built screen shows a header above each mail, a status line, and a separator before the draft, and opens scrolled to the end. The deal lands on the first waiting mail after the latest reply when there is one. An older unanswered mail still waits. An attempt to edit mail echoes `mail cannot be edited · write below the line`.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
