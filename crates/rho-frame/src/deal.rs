@@ -5,7 +5,7 @@
 //! (`rho_dealer::rank`) over the claims every system makes, passes over
 //! the card in view, and opens the top of the rest. A verdict is a fact
 //! in the ledger, said once and synced; `shift-u` takes the last one
-//! back, including what a system did about it outside the ledger.
+//! back by retracting that fact.
 
 use std::collections::BTreeSet;
 
@@ -174,8 +174,7 @@ impl Frame {
     }
 
     /// What the echo line calls a card: a note by its first line, anything
-    /// else by the name its system gives it -- a Slack conversation by the
-    /// conversation, not by its newest words -- and by the card's title
+    /// else by the name its system gives it, and by the card's title
     /// when its system names nothing.
     fn called(&self, address: &Address, cx: &gpui::App) -> String {
         match self.attention.marks.get(address).title() {
@@ -229,33 +228,14 @@ impl Frame {
         tracing::debug!(address = %address, ?verdict, "verdict");
         let called = self.called(address, cx);
         let seen = self.seen(address, cx);
-        // A mute the system holds itself is only settled here: lifted
-        // there, it is lifted.
-        let ledger = match verdict {
-            Verdict::Mute
-                if self.systems.iter().any(|system| {
-                    system.opens(address, cx) && system.mutes_itself(address, cx)
-                }) =>
-            {
-                Verdict::Done
-            }
-            _ => verdict.clone(),
-        };
-        let fact = crate::attention::Attention::fact(address, &ledger, seen);
+        let fact = crate::attention::Attention::fact(address, &verdict, seen);
         let takeback = self.write_marks(vec![Write::Fact(fact)], cx);
-        let mut reversals = Vec::new();
-        for system in self.systems.clone() {
-            if system.opens(address, cx) {
-                reversals.extend(system.said(address, &verdict, cx));
-            }
-        }
         let journal = verdict.journal();
         self.attention.push_undo(Undo {
-            sequence: 0,
             verb: verb.clone(),
             takeback,
-            card: Some((address.clone(), journal.clone())),
-            reversals,
+            address: address.clone(),
+            verdict: journal.clone(),
         });
         self.attention.skips.clear(address);
         rho_journal::record(rho_journal::Event::Dealer {
@@ -290,16 +270,13 @@ impl Frame {
             self.echo("nothing to undo", StyleClass::SystemInfo, cx);
             return;
         };
-        for reversal in undo.reversals {
-            reversal(cx);
-        }
-        let writes = undo.takeback.into_iter().map(Takeback::write).collect();
-        self.write_marks(writes, cx);
-        let Some((address, verdict)) = undo.card else {
-            self.echo(&format!("undid {}", undo.verb), StyleClass::SystemInfo, cx);
-            self.systems_changed(cx);
-            return;
-        };
+        let Undo {
+            verb,
+            takeback,
+            address,
+            verdict,
+        } = undo;
+        self.write_marks(takeback.into_iter().map(Takeback::write).collect(), cx);
         self.attention.skips.clear(&address);
         let called = self.called(&address, cx);
         rho_journal::record(rho_journal::Event::VerdictUndone {
@@ -307,7 +284,7 @@ impl Frame {
             verdict,
         });
         self.echo(
-            &format!("undid {}: {called}", undo.verb),
+            &format!("undid {verb}: {called}"),
             StyleClass::SystemInfo,
             cx,
         );
@@ -384,27 +361,6 @@ impl Frame {
     ) {
         let (until, said) = snooze_target(unit, count.map_or(1, i64::from), &Zoned::now());
         self.verdict(address, Verdict::Snooze(until), said, window, cx);
-    }
-
-    /// Something a system did over many addresses at once, said as one
-    /// thing `shift-u` takes back: the facts it writes and what the system
-    /// did outside the ledger.
-    pub fn say(
-        &mut self,
-        verb: String,
-        writes: Vec<Write>,
-        reversals: Vec<crate::system::Reversal>,
-        cx: &mut Context<Self>,
-    ) {
-        let takeback = self.write_marks(writes, cx);
-        self.attention.push_undo(Undo {
-            sequence: 0,
-            verb,
-            takeback,
-            card: None,
-            reversals,
-        });
-        self.systems_changed(cx);
     }
 
     /// Schedules one evaluation of the lamp, the chime and Home for the
@@ -503,9 +459,6 @@ pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
         blocked_reply_head_start: AGENT_BLOCKED_HEAD_START,
         blocked_reply_slope_per_day: WAITING_SLOPE_PER_DAY,
         fyi_reply_pace_days: AGENT_FINISHED_GONE_DAYS,
-        thread_reply_head_start: SLACK_THREAD_HEAD_START,
-        channel_traffic_head_start: CHANNEL_TRAFFIC_HEAD_START,
-        channel_answered_drop: 0.0,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,

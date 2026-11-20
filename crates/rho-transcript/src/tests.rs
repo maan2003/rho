@@ -440,10 +440,9 @@ fn measure_the_pipeline_and_not_the_validation() {
 /// One item replaced costs what it touches, whatever else is on screen.
 ///
 /// The rule the surfaces hold to is per event O(rows the event touches) +
-/// O(log n), and a transcript is where an arriving message lands: a Slack
-/// conversation replaces one item when a reaction arrives, an agent's does
-/// it while a turn streams. Anything here that walks every item is that
-/// cost paid on every message.
+/// O(log n), and a transcript is where an arriving message lands. An agent's
+/// transcript replaces one item while a turn streams. Anything here that walks
+/// every item is that cost paid on every message.
 ///
 /// What is timed is this crate's own work -- the buffer edit, the anchors,
 /// the highlights, the blocks -- and not what the editor does with it
@@ -474,8 +473,8 @@ fn one_replacement_costs_what_it_touches(cx: &mut TestAppContext) {
     );
 }
 
-/// The same replacement with a tenth of the items carrying a block, which
-/// is roughly a Slack conversation of pictures and cards.
+/// The same replacement with a tenth of the items carrying a block, as in a
+/// conversation with images.
 ///
 /// Its own bench because a block is the editor's block map rather than this
 /// crate's bookkeeping, and because the block map was suspected of a

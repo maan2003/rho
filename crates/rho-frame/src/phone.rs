@@ -233,8 +233,7 @@ enum Button {
     Back,
     Home,
     Menu,
-    /// The row under the cursor, as `enter` opens it: on Home, or on a
-    /// list that offers `open`.
+    /// Open the room under the cursor, as `enter` does on Home.
     Open,
     Done,
     Mute,
@@ -285,9 +284,8 @@ impl Button {
 struct BarState {
     prompting: bool,
     home: bool,
-    /// The cursor is on a row that opens: on Home, a room; elsewhere,
-    /// a row the surface offers `open` for.
-    row: bool,
+    /// The cursor is on a room on Home.
+    room: bool,
     /// The point is on something a verdict lands on.
     card: bool,
     /// The surface in view offers a `send` row.
@@ -298,7 +296,7 @@ struct BarState {
 /// answer. On Home, opening and the verdicts are buttons over the row
 /// under the cursor, where a tap only puts the cursor, because dealing from
 /// Home is what the phone is for; elsewhere they are one button for the menu,
-/// and the room goes to opening the row a list offers and to sending.
+/// with room left for a send button.
 fn buttons(state: BarState) -> Vec<Button> {
     if state.prompting {
         return vec![Button::Cancel, Button::Enter];
@@ -307,7 +305,7 @@ fn buttons(state: BarState) -> Vec<Button> {
     match state.home {
         true => {
             buttons.push(Button::Menu);
-            if state.row {
+            if state.room {
                 buttons.push(Button::Open);
             }
             if state.card {
@@ -316,9 +314,6 @@ fn buttons(state: BarState) -> Vec<Button> {
         }
         false => {
             buttons.extend([Button::Home, Button::Menu]);
-            if state.row {
-                buttons.push(Button::Open);
-            }
             if state.card {
                 buttons.push(Button::Verdicts);
             }
@@ -350,9 +345,6 @@ fn record_verdict(verdict: PhoneVerdict) {
 
 /// The row a surface offers for sending what is in its composer.
 const SEND_ROW: &str = "send";
-/// The row a list surface offers for opening the row under the cursor,
-/// as `enter` does.
-const OPEN_ROW: &str = "open";
 
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
@@ -560,20 +552,16 @@ impl Frame {
             surface
                 .rows(window, cx)
                 .into_iter()
-                .filter(|row| [SEND_ROW, OPEN_ROW].contains(&row.description.as_str()))
+                .filter(|row| row.description == SEND_ROW)
                 .collect(),
         );
-        let offers = |name: &str| rows.iter().any(|row| row.description == name);
         let home = self.home_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
             home,
-            row: match home {
-                true => self.home.read(cx).cursor_target(cx) != HomeTarget::None,
-                false => offers(OPEN_ROW),
-            },
+            room: home && self.home.read(cx).cursor_target(cx) != HomeTarget::None,
             card: self.card_target(cx).is_some(),
-            send: offers(SEND_ROW),
+            send: !rows.is_empty(),
         };
         let colors = cx.theme().colors();
         let items = buttons(state).into_iter().map(|button| {
@@ -630,8 +618,7 @@ impl Frame {
             Button::Back => self.back(window, cx),
             Button::Home => self.toggle_home(window, cx),
             Button::Menu => self.palette(window, cx),
-            Button::Open if self.home_in_view() => self.open_row(window, cx),
-            Button::Open => run_row(self, OPEN_ROW, window, cx),
+            Button::Open => self.open_row(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Done);
@@ -885,7 +872,7 @@ mod tests {
         use Button::*;
         let home = BarState {
             home: true,
-            row: true,
+            room: true,
             card: true,
             ..BarState::default()
         };
@@ -903,7 +890,7 @@ mod tests {
         );
         assert_eq!(
             buttons(BarState {
-                row: false,
+                room: false,
                 card: false,
                 ..home
             }),
@@ -915,13 +902,7 @@ mod tests {
             ..BarState::default()
         };
         assert_eq!(buttons(thread), [Back, Home, Menu, Verdicts, Send]);
-        // A list elsewhere, such as `notes`, opens its row from the bar.
-        let list = BarState {
-            row: true,
-            card: true,
-            ..BarState::default()
-        };
-        assert_eq!(buttons(list), [Back, Home, Menu, Open, Verdicts]);
+        assert_eq!(buttons(BarState::default()), [Back, Home, Menu]);
         assert_eq!(
             buttons(BarState {
                 prompting: true,
