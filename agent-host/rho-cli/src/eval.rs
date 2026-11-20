@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::entry::{compose, plain_text};
 use rho_agent::record::Event;
-use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
+use rho_agent::store::{Appended, MailRead as _, StoreRead as _};
 use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::snippets;
 use rho_fs_view::{UserEnvironment, Worksets};
@@ -493,7 +493,7 @@ impl Watch<'_> {
                     _ => Ok(None),
                 }
             }
-            Appended::Chat(seq) => {
+            Appended::Mail(seq) => {
                 let Some(message) = self.db.read().message(rho_agent_types::MessageId(seq)) else {
                     return Ok(None);
                 };

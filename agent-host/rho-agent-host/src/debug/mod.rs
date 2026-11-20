@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rho_agent::record::Runtime;
-use rho_agent::store::{ChatRead as _, StoreRead as _};
+use rho_agent::store::{MailRead as _, StoreRead as _};
 use rho_agent_hosts::protocol::DebugReport;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -684,7 +684,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             rows += page.len();
         }
     }
-    let chat = read.chat_head().0;
+    let chat = read.mail_head().0;
 
     let mut output = String::new();
     writeln!(output, "source: {}", snapshot.source.display())?;

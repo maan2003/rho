@@ -329,7 +329,7 @@ fn agent_entry(agent: AgentId, head: &AgentHead) -> AgentEntry {
 /// directory says.
 fn directory_change(db: &RhoDb, appended: Appended) -> Option<ServerFrame> {
     match appended {
-        Appended::Chat(_) => None,
+        Appended::Mail(_) => None,
         Appended::WorksetDeleted(workset) => Some(ServerFrame::WorksetDeleted { workset }),
         Appended::Row { workset, pos } => {
             let read = db.read();

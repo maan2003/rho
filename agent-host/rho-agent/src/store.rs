@@ -1,10 +1,10 @@
 //! The agent store: workset logs, the heads projected from them, and the
-//! chat ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
+//! mail ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 //!
 //! Each workset has one log, keyed by `(workset, wpos)`, dense from zero and
 //! never rewritten. Agent and workset heads are folded from it in the same
-//! transaction as every append. Chat is one host-wide log ([`chat`]).
-//! Deleting a workset removes its log and heads; chat stays.
+//! transaction as every append. Mail is one host-wide log ([`mail`]).
+//! Deleting a workset removes its log and heads; mail stays.
 
 use redb::TableDefinition;
 use rho_agent_types::{
@@ -130,7 +130,7 @@ impl AgentHead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appended {
     Row { workset: WorksetId, pos: Wpos },
-    Chat(ChatSeq),
+    Mail(ChatSeq),
     WorksetDeleted(WorksetId),
 }
 
@@ -325,7 +325,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_LOG);
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
-        self.init_chat_tables();
+        self.init_mail_tables();
         self.init_gccp_tables();
         agent_rows::init(self);
     }
@@ -516,11 +516,11 @@ pub fn role_of(from: Address) -> Role {
 }
 
 pub(crate) mod agent_rows;
-pub mod chat;
 pub mod gccp;
+pub mod mail;
 
-pub(crate) use chat::migrate_mail;
-pub use chat::{ChatRead, ChatWrite, MailHit, NewMessage, ThreadHead};
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
+pub(crate) use mail::migrate_mail;
+pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
 #[cfg(test)]
 mod tests;

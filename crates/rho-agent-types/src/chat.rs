@@ -65,6 +65,8 @@ pub enum MentionKind {
     Result,
     /// Worth reading, not now.
     Fyi,
+    /// Mail to a particular agent, without delivery to thread members.
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

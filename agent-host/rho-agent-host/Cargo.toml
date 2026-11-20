@@ -71,7 +71,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+jiff.workspace = true
 moq-net.workspace = true
+rho-chat = { workspace = true, features = ["client"] }
+rho-dealer.workspace = true
 rho-fake-model.workspace = true
 rho-rpc = { workspace = true, features = ["native-client", "server"] }
 rho-shell.workspace = true

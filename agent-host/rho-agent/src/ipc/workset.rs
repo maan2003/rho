@@ -67,9 +67,10 @@ pub(crate) enum PyRequest {
     },
     Delivered(rho_agent_types::AgentId),
     /// A message from an agent, under `parent` or as a root.
-    Post {
+    SendMail {
         sender: rho_agent_types::AgentId,
         parent: Option<rho_agent_types::MessageId>,
+        reply_to: Option<rho_agent_types::MessageId>,
         mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
     },
@@ -94,13 +95,6 @@ pub(crate) enum PyRequest {
         thread: rho_agent_types::MessageId,
         name: String,
     },
-    /// Mail from `sender` to another agent of this host: handed to it as
-    /// input, with a tool's authority, and kept nowhere else.
-    Mail {
-        sender: rho_agent_types::AgentId,
-        to: rho_agent_types::AgentId,
-        text: String,
-    },
     /// The thread under a message (`Thread`).
     Thread(rho_agent_types::MessageId),
     /// One message: `Messages` with it, or with none.
@@ -124,6 +118,8 @@ pub(crate) enum PyRequest {
     Models,
     /// The one agent of the host whose id starts with this.
     ResolveAgent(String),
+    /// The full role-prefixed address of an agent, if still on this host.
+    AgentHandle(rho_agent_types::AgentId),
     /// The agent's own GCCP address (`Text`).
     ExternalAddress(rho_agent_types::AgentId),
     /// The agent accepts a GCCP address under a name.
@@ -161,6 +157,7 @@ pub(crate) enum PyRequest {
         project: Option<rho_agent_types::MessageId>,
         limit: u64,
     },
+    ProjectNamed(String),
 }
 
 #[derive(Encode, Decode)]
@@ -176,6 +173,8 @@ pub(crate) enum PyReply {
     Done,
     Error(String),
     Search(Vec<crate::store::MailHit>),
+    Project(Option<rho_agent_types::MessageId>),
+    Handle(Option<String>),
 }
 
 #[derive(Encode, Decode)]

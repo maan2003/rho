@@ -3,7 +3,7 @@
 This module is built into the workset process. The `rho` package wraps it;
 policy code imports `rho`, not `_rho`. Every function runs in the workset
 process and acts on its own workset only. Agent ids are their encoded text
-(for example "x4cvbixbtifu"); a chat address is "user" or an agent id.
+(for example "x4cvbixbtifu"); a mail address is "user" or an agent id.
 
 Blocking calls release the GIL. Calls marked async return awaitables that
 run on the asyncio loop of the caller's thread.
@@ -106,9 +106,9 @@ def set_spec(agent: str, spec: Spec) -> None:
 def input(agent: str, text: str, *, role: Role, message: int | None = None) -> None:
     """Give the agent an input: it waits in memory until a request can carry
     it, and that request's row holds it. This returns once the agent has it. A
-    crash loses it unless it is a chat message, which is handed again. `role`
+    crash loses it unless it is a mail, which is handed again. `role`
     says who speaks: "user" for what a person typed, "tool" for anything else.
-    `message` names the chat message it hands over."""
+    `message` names the mail it hands over."""
 def delivered(agent: str) -> int:
     """The newest message id a request carried to the agent, or 0. What waits
     in the agent is not counted."""
@@ -120,16 +120,16 @@ def rewind(agent: str, turns: int) -> None:
 def new_cache_key(agent: str) -> None:
     """Give a native agent a fresh prompt cache key (an `AgentChanged`)."""
 
-# -- chat --------------------------------------------------------------------
+# -- mail --------------------------------------------------------------------
 #
-# The host's chat: a forest of messages. Every id is the position of the
-# event that made it in the host's chat log; a thread's id is its message's.
+# The host's mail: a forest of messages. Every id is the position of the
+# event that made it in the host's mail log; a thread's id is its message's.
 # A message reaches the members of the thread it is posted in and of the
 # threads above it, and every agent it mentions, never its sender. An agent
 # joins or leaves a thread; its nearest record up the chain decides, so a
 # join above and a leave below cut that branch. Neither posting nor a
 # mention joins. Messages from the user come only from the GUI, so Python
-# cannot forge them. Agents mail each other outside the chat.
+# cannot forge them. Direct agent mail reaches only its addressed recipient.
 
 class MailHit(TypedDict):
     project: int
@@ -143,20 +143,19 @@ def edit_message(agent: str, id: int, text: str) -> None: ...
 def delete_message(agent: str, id: int) -> None: ...
 def search_mail(query: str, project: int | None, limit: int) -> list[MailHit]: ...
 
-def post(
+def send_mail(
     sender: str,
     parent: int | None,
     text: str,
     *,
-    mentions: list[tuple[str, MentionKind]] | None = None,
+    to: str | None = None,
+    kind: MentionKind | None = None,
+    reply_to: int | None = None,
 ) -> int:
-    """Post under `parent`, or as a root for None, as `sender`, an agent of
-    this workset; returns the message id once durable. A message that
-    mentions "user" must pass the STE check, or this raises ValueError
-    with the findings."""
-def mail(sender: str, to: str, text: str) -> None:
-    """Hand `text` to agent `to`, any agent of the host, as a tool input.
-    Returns once the agent holds it. Not logged in the chat."""
+    """Send durable mail as `sender`. With an agent in `to`, the host
+    chooses the conversation. Only mail to "user" takes a kind and must
+    pass the STE check."""
+def agent_handle(agent: str) -> str | None: ...
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts
     with `prefix`. Raises when none or several do."""
@@ -185,6 +184,7 @@ def reparent(agent: str, message: int, parent: int | None) -> None:
     delivers nothing again."""
 def name(agent: str, thread: int, name: str) -> None:
     """Name a thread for `agent`; an empty name takes the name back."""
+def project_named(name: str) -> int | None: ...
 def thread(id: int) -> ThreadRecord | None: ...
 def message(id: int) -> MessageRecord | None:
     """A message, under the parent it has now: messages may be moved."""

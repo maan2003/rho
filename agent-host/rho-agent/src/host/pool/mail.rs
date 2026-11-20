@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use super::AgentPool;
 use crate::record::Event;
-use crate::store::{ChatRead as _, ChatWrite as _, StoreRead as _};
+use crate::store::{MailRead as _, MailWrite as _, StoreRead as _};
 use crate::{InferenceState, RuntimeState};
 
 const COLD_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -182,6 +182,31 @@ impl AgentPool {
             thread.0.0
         );
         self.mail.set_status(thread, agent, text, UnixMs::now())
+    }
+
+    /// Use the project the sender works in; children and advisors inherit
+    /// their spawner's project. A reply to direct mail stays with that
+    /// conversation, including when the two agents work in different places.
+    pub(super) fn mail_project(&self, mut agent: AgentId) -> Option<MessageId> {
+        let read = self.db.read();
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(agent) {
+            if let Some(project) = origin(&read, agent)
+                .map(|mail| mail.id)
+                .or_else(|| read.first_thread(agent))
+                .and_then(|id| read.root_of(id))
+            {
+                return Some(project);
+            }
+            let head = read.agent(agent)?;
+            let parent = head
+                .spec
+                .props
+                .get("parent")
+                .or_else(|| head.spec.props.get("started_by"))?;
+            agent = rho_agent_types::parse_full_handle(parent)?;
+        }
+        None
     }
 
     pub(super) fn user_visited(&self, message: MessageId) {

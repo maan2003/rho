@@ -1,10 +1,10 @@
-//! The chat part of the agent host ([`rho_chat::protocol`]): a session
+//! The mail part of the agent host ([`rho_chat::protocol`]): a session
 //! carries the host's log from where a client holds it; what the user does
 //! in the chat is a call on a stream of its own.
 
 use std::sync::Arc;
 
-use rho_agent::store::{Appended, ChatRead as _};
+use rho_agent::store::{Appended, MailRead as _};
 use rho_agent_types::ChatSeq;
 use rho_chat::protocol::{
     ClientFrame, Leave, Name, Open, Post, Project, Reparent, Request, ResolveProject, ServerFrame,
@@ -19,7 +19,7 @@ use crate::{Services, prepare_image_content};
 /// a cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
-/// Serves one chat stream, whichever kind its opening frame asked for.
+/// Serves one mail stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
     services: Arc<Services>,
     open: Open,
@@ -59,7 +59,7 @@ where
         }
     });
     let feed = rho_agent::store::feed(&services.db);
-    let head = services.db.read().chat_head();
+    let head = services.db.read().mail_head();
     let _ = outgoing_tx.send(ServerFrame::Hello {
         head,
         host: services.endpoint,
@@ -129,7 +129,7 @@ async fn follow(
                 send_statuses = true;
             }
             appended = feed.recv() => match appended {
-                Ok(Appended::Chat(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(Appended::Mail(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Ok(Appended::Row { .. } | Appended::WorksetDeleted(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
@@ -149,7 +149,7 @@ async fn send_from(
     sent: &mut ChatSeq,
 ) -> bool {
     loop {
-        let records = db.read().chat_since(*sent, LOG_PAGE);
+        let records = db.read().mail_since(*sent, LOG_PAGE);
         let Some(last) = records.last() else {
             return true;
         };
@@ -176,7 +176,7 @@ where
     write_frame(writer, &Answer::from(reply)).await
 }
 
-/// One call stream's call.
+/// One mail request.
 async fn serve_call<W>(
     services: &Arc<Services>,
     request: Request,

@@ -1,4 +1,4 @@
-//! The host's chat ([`rho_agent_types::ChatEvent`]): one log, dense from
+//! The host's mail ([`rho_agent_types::ChatEvent`]): one log, dense from
 //! one, and the indexes folded from it in the commit of every append.
 //!
 //! The log holds a forest of messages. Each message keeps its parent now
@@ -20,7 +20,8 @@ use senax_encoder::{Decode, Encode};
 
 use super::{Appended, tell};
 
-const CHAT_LOG: TableDefinition<u64, Sen<ChatRecord>> = TableDefinition::new("chat_log");
+// Table names are stable on disk across the mail protocol rename.
+const MAIL_LOG: TableDefinition<u64, Sen<ChatRecord>> = TableDefinition::new("chat_log");
 /// A message's parent now; zero for a root.
 const PARENT: TableDefinition<u64, u64> = TableDefinition::new("chat_parent");
 /// `(parent, message)`: a thread's messages in order, under zero the roots.
@@ -41,6 +42,8 @@ const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 /// `(message, latest edit/delete event)`, pointing into the log rather than
 /// copying its body. The original posting still owns the identity and sender.
 const REVISIONS: TableDefinition<u64, u64> = TableDefinition::new("chat_revisions");
+
+const AGENT_MAIL_PROJECT: &str = "Agent mail";
 
 /// The root of the forest in the children index.
 const ROOT: u64 = 0;
@@ -85,11 +88,11 @@ fn parent_of(seq: u64) -> Option<MessageId> {
     (seq != ROOT).then_some(MessageId(ChatSeq(seq)))
 }
 
-pub trait ChatRead {
+pub trait MailRead {
     /// The newest event; zero for none.
-    fn chat_head(&self) -> ChatSeq;
+    fn mail_head(&self) -> ChatSeq;
     /// Up to `limit` events after `after`, in order.
-    fn chat_since(&self, after: ChatSeq, limit: usize) -> Vec<ChatRecord>;
+    fn mail_since(&self, after: ChatSeq, limit: usize) -> Vec<ChatRecord>;
     /// A message, under its parent now.
     fn message(&self, id: MessageId) -> Option<Message>;
     /// The thread under `id`, if `id` is a message.
@@ -102,6 +105,9 @@ pub trait ChatRead {
     fn members_under(&self, parent: Option<MessageId>) -> Vec<AgentId>;
     /// What `agent` receives after `after`, in order.
     fn inbox(&self, agent: AgentId, after: ChatSeq) -> Vec<Message>;
+    fn recipients_of(&self, message: &Message) -> Vec<AgentId>;
+    /// The enclosing root for any mail.
+    fn root_of(&self, message: MessageId) -> Option<MessageId>;
     /// The host's newest channel with this name.
     fn project_named(&self, name: &str) -> Option<MessageId>;
     fn search_mail(
@@ -115,16 +121,16 @@ pub trait ChatRead {
     fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs>;
 }
 
-impl ChatRead for ReadTxn {
-    fn chat_head(&self) -> ChatSeq {
-        self.open_table(CHAT_LOG)
+impl MailRead for ReadTxn {
+    fn mail_head(&self) -> ChatSeq {
+        self.open_table(MAIL_LOG)
             .iter()
             .next_back()
             .map_or(ChatSeq::ZERO, |(key, _)| ChatSeq(key.value()))
     }
 
-    fn chat_since(&self, after: ChatSeq, limit: usize) -> Vec<ChatRecord> {
-        self.open_table(CHAT_LOG)
+    fn mail_since(&self, after: ChatSeq, limit: usize) -> Vec<ChatRecord> {
+        self.open_table(MAIL_LOG)
             .range(after.0 + 1..)
             .take(limit)
             .map(|(_, record)| record.value().into_owned())
@@ -132,7 +138,7 @@ impl ChatRead for ReadTxn {
     }
 
     fn message(&self, id: MessageId) -> Option<Message> {
-        let record = self.open_table(CHAT_LOG).get(id.0.0)?.value().into_owned();
+        let record = self.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
         let mut message = Message::from_record(&record)?;
         message.parent = parent_of(
             self.open_table(PARENT)
@@ -142,9 +148,9 @@ impl ChatRead for ReadTxn {
         );
         if let Some(revision) = self.open_table(REVISIONS).get(id.0.0) {
             let record = self
-                .open_table(CHAT_LOG)
+                .open_table(MAIL_LOG)
                 .get(revision.value())
-                .expect("a revision is a chat event")
+                .expect("a revision is a mail event")
                 .value()
                 .into_owned();
             message.apply_revision(&record.event);
@@ -224,6 +230,20 @@ impl ChatRead for ReadTxn {
             })
             .filter(|message| message.revision != Revision::Deleted)
             .collect()
+    }
+
+    fn recipients_of(&self, message: &Message) -> Vec<AgentId> {
+        recipients(message.from, &message.mentions, || {
+            self.members_under(message.parent)
+        })
+    }
+
+    fn root_of(&self, mut message: MessageId) -> Option<MessageId> {
+        let parents = self.open_table(PARENT);
+        while let Some(parent) = parent_of(parents.get(message.0.0)?.value()) {
+            message = parent;
+        }
+        Some(message)
     }
 
     fn project_named(&self, name: &str) -> Option<MessageId> {
@@ -327,7 +347,7 @@ impl ChatRead for ReadTxn {
     }
 
     fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
-        let log = self.open_table(CHAT_LOG);
+        let log = self.open_table(MAIL_LOG);
         self.open_table(CHILDREN)
             .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
             .rev()
@@ -366,6 +386,53 @@ impl ChatRead for ReadTxn {
     }
 }
 
+/// Delivery is fixed by the record, not by which process happens to be
+/// running. Directed mail never fans out to inherited thread members.
+fn recipients(
+    sender: Address,
+    mentions: &[Mention],
+    members: impl FnOnce() -> Vec<AgentId>,
+) -> Vec<AgentId> {
+    if matches!(sender, Address::System { .. }) {
+        return Vec::new();
+    }
+    let mut agents = if mentions.iter().any(|m| m.kind == MentionKind::Direct) {
+        Vec::new()
+    } else {
+        members()
+    };
+    for mention in mentions {
+        if let Address::Agent(agent) = mention.to
+            && sender != mention.to
+            && !agents.contains(&agent)
+        {
+            agents.push(agent);
+        }
+    }
+    if let Address::Agent(sender) = sender {
+        agents.retain(|agent| *agent != sender);
+    }
+    agents
+}
+
+fn peer_pair(from: Address, mentions: &[Mention]) -> Option<[AgentId; 2]> {
+    let (
+        Address::Agent(from),
+        [
+            Mention {
+                to: Address::Agent(to),
+                kind: MentionKind::Direct,
+            },
+        ],
+    ) = (from, mentions)
+    else {
+        return None;
+    };
+    let mut pair = [from, *to];
+    pair.sort_unstable();
+    Some(pair)
+}
+
 /// Decides each agent by the nearest record up the chain: a record for an
 /// agent already decided says nothing new.
 fn decide(decided: &mut Vec<(AgentId, bool)>, records: Vec<(AgentId, bool)>) {
@@ -383,7 +450,7 @@ fn joined(decided: Vec<(AgentId, bool)>) -> Vec<AgentId> {
         .collect()
 }
 
-/// [`ChatRead::members_under`] on a write transaction.
+/// [`MailRead::members_under`] on a write transaction.
 fn members_under_write(write: &mut WriteTxn, parent: Option<MessageId>) -> Vec<AgentId> {
     let mut decided: Vec<(AgentId, bool)> = Vec::new();
     let mut cursor = seq_of(parent);
@@ -403,8 +470,8 @@ fn members_under_write(write: &mut WriteTxn, parent: Option<MessageId>) -> Vec<A
     joined(decided)
 }
 
-pub trait ChatWrite {
-    fn init_chat_tables(&mut self);
+pub trait MailWrite {
+    fn init_mail_tables(&mut self);
     /// A message under `parent`, or a root. With `client_id`, a message
     /// already posted under that id is returned instead of a second one.
     fn post(
@@ -413,6 +480,14 @@ pub trait ChatWrite {
         parent: Option<MessageId>,
         message: NewMessage,
         client_id: Option<u64>,
+    ) -> anyhow::Result<MessageId>;
+    /// A direct conversation under a project. Its first mail is the
+    /// anchor; later mail between the same pair goes under that anchor.
+    fn post_peer(
+        &mut self,
+        at: UnixMs,
+        project: Option<MessageId>,
+        message: NewMessage,
     ) -> anyhow::Result<MessageId>;
     /// Change an agent's own posted mail, except an answered ask.
     fn edit(
@@ -453,15 +528,15 @@ pub trait ChatWrite {
     /// gave it. Whether the thread was named now.
     fn name_unnamed(&mut self, at: UnixMs, thread: MessageId, name: String)
     -> anyhow::Result<bool>;
-    /// Replays one event into the indexes: what [`ChatWrite::post`] and the
+    /// Replays one event into the indexes: what [`MailWrite::post`] and the
     /// others do after they append. The migration rebuilds the indexes
     /// with it.
-    fn index_chat_event(&mut self, seq: ChatSeq, event: &ChatEvent);
+    fn index_mail_event(&mut self, seq: ChatSeq, event: &ChatEvent);
 }
 
 fn next_seq(write: &mut WriteTxn) -> ChatSeq {
     write
-        .open_table(CHAT_LOG)
+        .open_table(MAIL_LOG)
         .iter()
         .next_back()
         .map_or(ChatSeq(1), |(key, _)| ChatSeq(key.value()).next())
@@ -470,9 +545,9 @@ fn next_seq(write: &mut WriteTxn) -> ChatSeq {
 fn append(write: &mut WriteTxn, at: UnixMs, event: ChatEvent) -> ChatSeq {
     let seq = next_seq(write);
     write
-        .open_table(CHAT_LOG)
+        .open_table(MAIL_LOG)
         .insert(seq.0, SenValue::borrowed(&ChatRecord { seq, at, event }));
-    tell(write, Appended::Chat(seq));
+    tell(write, Appended::Mail(seq));
     seq
 }
 
@@ -517,8 +592,70 @@ fn is_above_or_self(write: &mut WriteTxn, ancestor: MessageId, message: MessageI
     false
 }
 
+fn direct_pair_at(write: &mut WriteTxn, id: MessageId) -> Option<[AgentId; 2]> {
+    let row = write.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
+    let ChatEvent::Posted { from, mentions, .. } = row.event else {
+        return None;
+    };
+    peer_pair(from, &mentions)
+}
+
+/// A direct conversation may be read one level down, but it cannot
+/// produce user attention. Find the anchor even for a moved conversation,
+/// a deleted posting, or a tangent inside the conversation.
+fn peer_thread(write: &mut WriteTxn, id: MessageId) -> Option<(MessageId, [AgentId; 2])> {
+    let mut cursor = Some(id);
+    let mut thread = None;
+    while let Some(id) = cursor {
+        if let Some(pair) = direct_pair_at(write, id) {
+            if thread.is_some_and(|(_, nearest)| nearest != pair) {
+                break;
+            }
+            thread = Some((id, pair));
+        }
+        cursor = parent_now(write, id);
+    }
+    thread
+}
+
+fn unscoped_peer_project(
+    write: &mut WriteTxn,
+    at: UnixMs,
+    from: Address,
+) -> anyhow::Result<MessageId> {
+    let root_ids: Vec<_> = write
+        .open_table(CHILDREN)
+        .range((ROOT, 0)..=(ROOT, u64::MAX))
+        .rev()
+        .map(|(key, _)| key.value().1)
+        .collect();
+    for id in root_ids {
+        let named = write.open_table(NAMES).get(id).map(|name| name.value());
+        let name = named.or_else(|| {
+            let row = write.open_table(MAIL_LOG).get(id)?.value().into_owned();
+            Some(Message::from_record(&row)?.headline())
+        });
+        if name.as_deref() == Some(AGENT_MAIL_PROJECT) {
+            return Ok(MessageId(ChatSeq(id)));
+        }
+    }
+    write.post(
+        at,
+        None,
+        NewMessage {
+            from,
+            reply_to: None,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: AGENT_MAIL_PROJECT.into(),
+            }],
+        },
+        None,
+    )
+}
+
 fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow::Result<()> {
-    let log = write.open_table(CHAT_LOG);
+    let log = write.open_table(MAIL_LOG);
     let original = log
         .get(id.0.0)
         .and_then(|record| Message::from_record(&record.value().into_owned()))
@@ -532,11 +669,11 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         .open_table(REVISIONS)
         .get(id.0.0)
         .map(|seq| seq.value());
-    let log = write.open_table(CHAT_LOG);
+    let log = write.open_table(MAIL_LOG);
     anyhow::ensure!(
         !revision.is_some_and(|seq| matches!(
             log.get(seq)
-                .expect("a revision is a chat event")
+                .expect("a revision is a mail event")
                 .value()
                 .into_owned()
                 .event,
@@ -567,9 +704,9 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
     Ok(())
 }
 
-impl ChatWrite for WriteTxn {
-    fn init_chat_tables(&mut self) {
-        self.open_table(CHAT_LOG);
+impl MailWrite for WriteTxn {
+    fn init_mail_tables(&mut self) {
+        self.open_table(MAIL_LOG);
         self.open_table(PARENT);
         self.open_table(CHILDREN);
         self.open_table(MEMBERS);
@@ -603,6 +740,15 @@ impl ChatWrite for WriteTxn {
         if let Some(reply_to) = reply_to {
             anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
         }
+        if let Some(parent) = parent
+            && let Some((_, pair)) = peer_thread(self, parent)
+            && let Address::Agent(agent) = from
+        {
+            anyhow::ensure!(
+                peer_pair(from, &mentions) == Some(pair) && pair.contains(&agent),
+                "address the other agent to reply in a direct conversation"
+            );
+        }
         let event = ChatEvent::Posted {
             parent,
             reply_to,
@@ -611,11 +757,59 @@ impl ChatWrite for WriteTxn {
             content,
         };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         if let Some(client_id) = client_id {
             self.open_table(CLIENT_IDS).insert(client_id, seq.0);
         }
         Ok(MessageId(seq))
+    }
+
+    fn post_peer(
+        &mut self,
+        at: UnixMs,
+        project: Option<MessageId>,
+        message: NewMessage,
+    ) -> anyhow::Result<MessageId> {
+        let pair = peer_pair(message.from, &message.mentions)
+            .filter(|pair| pair[0] != pair[1])
+            .ok_or_else(|| anyhow::anyhow!("direct mail needs two different agents"))?;
+        if let Some(reply_to) = message.reply_to {
+            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
+            if let Some((thread, addressed_pair)) = peer_thread(self, reply_to) {
+                anyhow::ensure!(
+                    pair == addressed_pair,
+                    "address the same pair to reply to direct mail"
+                );
+                return self.post(at, Some(thread), message, None);
+            }
+        }
+        // Standalone agents (e.g. from the CLI) still have durable mail.
+        // Keep their conversations together rather than making each a project.
+        let project = match project {
+            Some(project) => project,
+            None => unscoped_peer_project(self, at, message.from)?,
+        };
+        let scope = project.0.0;
+        let children: Vec<_> = self
+            .open_table(CHILDREN)
+            .range((scope, 0)..=(scope, u64::MAX))
+            .map(|(key, _)| key.value().1)
+            .collect();
+        // Read original postings so a deleted first mail still identifies
+        // its conversation. Moves change which project's thread it is.
+        let thread = children
+            .into_iter()
+            .map(|id| MessageId(ChatSeq(id)))
+            .find(|id| direct_pair_at(self, *id) == Some(pair));
+        let id = self.post(at, thread.or(Some(project)), message, None)?;
+        if thread.is_none() {
+            self.name(
+                at,
+                id,
+                format!("{} ↔ {}", pair[0].encoded(), pair[1].encoded()),
+            )?;
+        }
+        Ok(id)
     }
 
     fn edit(
@@ -629,7 +823,7 @@ impl ChatWrite for WriteTxn {
         anyhow::ensure!(has_content(&content), "a message needs content");
         let event = ChatEvent::Edited { message, content };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -637,7 +831,7 @@ impl ChatWrite for WriteTxn {
         check_revision(self, agent, message)?;
         let event = ChatEvent::Deleted { message };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -652,9 +846,12 @@ impl ChatWrite for WriteTxn {
             matches!(sender, Address::System { .. }),
             "a stop is sent by the system bot"
         );
+        if peer_thread(self, thread).is_some() {
+            return Ok(None);
+        }
         // The durable stop mail itself is the deduplication record, including
         // across host re-exec, and if its message or thread is later moved.
-        if self.open_table(CHAT_LOG).iter().rev().any(|(_, row)| {
+        if self.open_table(MAIL_LOG).iter().rev().any(|(_, row)| {
             matches!(
                 row.value().into_owned().event, ChatEvent::Posted { from, .. } if from == sender
             )
@@ -697,7 +894,7 @@ impl ChatWrite for WriteTxn {
         }
         let event = ChatEvent::Reparented { message, parent };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -712,7 +909,7 @@ impl ChatWrite for WriteTxn {
         }
         let event = ChatEvent::Joined { thread, agent };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -734,7 +931,7 @@ impl ChatWrite for WriteTxn {
         }
         let event = ChatEvent::Left { thread, agent };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -751,7 +948,7 @@ impl ChatWrite for WriteTxn {
         }
         let event = ChatEvent::Named { thread, name };
         let seq = append(self, at, event.clone());
-        self.index_chat_event(seq, &event);
+        self.index_mail_event(seq, &event);
         Ok(())
     }
 
@@ -769,7 +966,7 @@ impl ChatWrite for WriteTxn {
         Ok(true)
     }
 
-    fn index_chat_event(&mut self, seq: ChatSeq, event: &ChatEvent) {
+    fn index_mail_event(&mut self, seq: ChatSeq, event: &ChatEvent) {
         match event {
             ChatEvent::Posted {
                 parent,
@@ -777,23 +974,7 @@ impl ChatWrite for WriteTxn {
                 mentions,
                 ..
             } => {
-                // A system stop is mail for the user, not fresh input to the
-                // stopped agent or to another member of its thread.
-                let mut receivers = if matches!(from, Address::System { .. }) {
-                    Vec::new()
-                } else {
-                    members_under_write(self, *parent)
-                };
-                for mention in mentions {
-                    if let Address::Agent(agent) = mention.to
-                        && !receivers.contains(&agent)
-                    {
-                        receivers.push(agent);
-                    }
-                }
-                if let Address::Agent(sender) = from {
-                    receivers.retain(|agent| agent != sender);
-                }
+                let receivers = recipients(*from, mentions, || members_under_write(self, *parent));
                 self.open_table(PARENT).insert(seq.0, seq_of(*parent));
                 self.open_table(CHILDREN)
                     .insert((seq_of(*parent), seq.0), ());
@@ -846,7 +1027,7 @@ fn index_first_join(write: &mut WriteTxn, agent: AgentId, thread: MessageId) {
 /// first-thread projection from the same log old hosts wrote.
 pub(crate) fn migrate_mail(write: &mut WriteTxn) {
     let joined = write
-        .open_table(CHAT_LOG)
+        .open_table(MAIL_LOG)
         .iter()
         .filter_map(|(_, row)| match row.value().into_owned().event {
             ChatEvent::Joined { thread, agent } => Some((agent, thread)),

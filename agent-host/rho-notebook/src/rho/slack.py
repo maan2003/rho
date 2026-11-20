@@ -25,7 +25,7 @@ from slack_sdk.web.async_base_client import AsyncBaseClient
 
 from . import agents
 from .prompt import label
-from .tools import resolve
+from .agents import resolve
 
 #: What a workspace or channel route hears besides mentions of the bot:
 #: nothing more, each new top-level message, or every message.

@@ -43,7 +43,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   Host integrations, such as the Slack bot or GitHub proxy, need not have
   a system in the GUI.
 
-## Chat: a forest of messages per host
+## Mail: a forest of messages per host
 
 - Streams and topics leave the model. A host log holds messages, and a
   message has an optional parent. Children are derived by the fold,
@@ -64,15 +64,11 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   anchor. Agents have no title.
 - No `resolved`: an agent says done with a `result` mention, the user
   with `Settled` in the ledger, which hides the thread.
-- Agent-to-agent messaging is not chat. `agents.message` is mail over
-  the GCCP path, local or remote; the host keeps no log, the transcripts
-  are the record. `DirectStarted` and `DIRECTS` go.
-- The log is five events: `Posted`, `Reparented`, `Joined`, `Left`,
-  `Named`. `Address` is `User | Agent`.
-- Python: `chat.post(parent, text, mentions)`, `chat.join(thread)`,
-  `chat.leave(thread)`, `chat.move(message, parent)`, `chat.name(thread,
-  name)`, `chat.read(thread, last)`, `chat.roots()`. `#N` is a message
-  and the thread under it.
+- Mail between agents on this host uses the same record. The pair's
+  thread is under the project; only the addressed agent receives it, and
+  it never asks for the user. Cross-host delivery still uses GCCP.
+- Python: `mail.send(to, text, ...)` addresses a project, thread, exact
+  reply, the user, or an agent. `#N` is a mail and the thread under it.
 
 ### Around the model
 
@@ -211,7 +207,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `Host` frame carries.
 - The host names a thread under a root once: when its second message
   arrives and nothing named it, a model reads those two messages and the
-  host logs a `Named`. A name from the user or an agent (`rho.chat.name`)
+  host logs a `Named`. A name from the user or an agent (`rho.mail.name`)
   wins, before or after. Without any, the first line of its message serves.
 - Keys: `space` is the verdict transient over the card in view, and
   again it is Home; `tab` is Home; `:` is the palette, every row of the
