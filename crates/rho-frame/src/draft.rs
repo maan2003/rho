@@ -1,7 +1,8 @@
 //! An editor over read-only history followed by a writable draft. The last
 //! history row is the separator; the next row belongs to the draft buffer.
 
-use editor::{Anchor, Bias, Editor};
+use editor::display_map::{DisplaySnapshot, ToDisplayPoint as _};
+use editor::{Anchor, Bias, Editor, RowExt as _};
 use gpui::{App, AppContext as _, Context, Entity, Focusable, Pixels, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
@@ -64,6 +65,64 @@ pub fn on_tail(editor: &Editor, history: &Entity<Buffer>, cx: &App) -> bool {
         >= start(history, cx).row
 }
 
+/// A visible Insert caret before the history above it changes.
+pub struct WritingCaret {
+    anchor: Anchor,
+    screen_y: f64,
+}
+
+impl WritingCaret {
+    pub fn capture(
+        editor: &Entity<Editor>,
+        history: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Option<Self> {
+        if !vim::editor_in_insert_mode(editor, cx) || !on_tail(editor.read(cx), history, cx) {
+            return None;
+        }
+        editor.update(cx, |editor, cx| {
+            let anchor = editor.selections.newest_anchor().head();
+            let scroll = editor.scroll_position(cx);
+            let display = editor.display_snapshot(cx);
+            let screen_y = Self::row_y(anchor, &display) - display.row_y(scroll.y);
+            (0. <= screen_y && screen_y < editor.visible_line_count()?)
+                .then_some(Self { anchor, screen_y })
+        })
+    }
+
+    /// Re-anchor the viewport after the mutation. Its normal top-of-screen
+    /// anchor would keep the history in place instead of the draft.
+    pub fn restore(self, editor: &Entity<Editor>, cx: &mut App) {
+        let editor = editor.clone();
+        // Reconciliation may run outside the window update to read the
+        // frame. Only the scroll adjustment requires the window.
+        cx.defer(move |cx| {
+            cx.with_window(editor.entity_id(), |window, cx| {
+                if !editor.read(cx).is_focused(window) || !vim::editor_in_insert_mode(&editor, cx) {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    if editor.selections.newest_anchor().head() != self.anchor {
+                        return;
+                    }
+                    let mut position = editor.scroll_position(cx);
+                    let display = editor.display_snapshot(cx);
+                    let top = (Self::row_y(self.anchor, &display) - self.screen_y).max(0.);
+                    if (display.row_y(position.y) - top).abs() > 0.01 {
+                        position.y = display.row_at_y(top);
+                        editor.set_scroll_position(position, window, cx);
+                    }
+                });
+            });
+        });
+    }
+
+    fn row_y(anchor: Anchor, display: &DisplaySnapshot) -> f64 {
+        display.row_y(anchor.to_display_point(display).row().as_f64())
+    }
+}
+
+/// Where a pointer landed in the editable tail.
 pub enum Hit {
     Separator,
     Text(Anchor),
@@ -122,6 +181,53 @@ pub fn focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn only_an_attempt_to_change_mail_emits_the_read_only_event(cx: &mut gpui::TestAppContext) {
+        let blocked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (document, history, draft, _subscription) = cx.update(|cx| {
+            let history = cx.new(|cx| {
+                let mut history = Buffer::local("mail to keep\n── reply", cx);
+                history.set_capability(Capability::Read, cx);
+                history
+            });
+            let draft = cx.new(|cx| Buffer::local("some draft", cx));
+            let document = document(&history, &draft, cx);
+            let count = blocked.clone();
+            let subscription = cx.subscribe(&document, move |_, event: &multi_buffer::Event, _| {
+                if matches!(event, multi_buffer::Event::EditBlockedByReadOnly) {
+                    count.set(count.get() + 1);
+                }
+            });
+            (document, history, draft, subscription)
+        });
+        let mail = Point::new(0, 3);
+        let draft_point = Point::new(2, 5);
+        cx.update(|cx| {
+            document.update(cx, |doc, cx| {
+                doc.edit(
+                    [(mail..mail, ""), (draft_point..draft_point, "real ")],
+                    None,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(blocked.get(), 0, "a no-op in the mail did not count");
+        cx.update(|cx| {
+            document.update(cx, |doc, cx| {
+                doc.edit([(Point::new(1, 2)..Point::new(2, 5), "")], None, cx);
+            });
+        });
+        assert_eq!(
+            blocked.get(),
+            1,
+            "the cross-separator delete was partially blocked"
+        );
+        cx.update(|cx| {
+            assert_eq!(history.read(cx).text(), "mail to keep\n── reply");
+            assert_eq!(draft.read(cx).text(), "real draft");
+        });
+    }
 
     #[gpui::test]
     fn editing_changes_only_the_draft_and_history_updates_keep_its_position(

@@ -83,13 +83,13 @@ principle: the user is halfway through an answer when a card that matters comes 
 sees: the unsent text below the separator, as it was left.
 does:
 - edit `i`, `A`, `o` at the tail, or tap the tail: write in place; `escape` returns to Normal with the cursor still in the draft
-- quote `enter` on a visual selection in a mail: add those lines to the draft with `> ` in front
+- quote `enter` on a selection in one mail: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
 - send `ctrl-enter`, or `send` on the phone bar: move the words into the history and leave an empty draft
 
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
-status: the deal lands on the first waiting mail after the latest reply when there is one. An older unanswered mail still waits.
+status: the deal lands on the first waiting mail after the latest reply when there is one. An older unanswered mail still waits. New mail leaves the visible draft cursor in place while writing. An attempt to edit mail echoes `mail cannot be edited · write below the line`.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the asking `Mail` at the cursor when a `deal.Card` opens, with any quoted text or result proof
@@ -104,9 +104,9 @@ states:
 - error: the thread is unavailable; wording not agreed
 - full: the asking mail in view, with history and the draft tail reachable in the same buffer
 keys:
-- `enter` on an agent's mail: `Mail.look into the work`
+- `enter` with no selection on an agent's mail: `Mail.look into the work`
 - `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
-- visual selection then `enter`: `Draft.quote`
+- `enter` on a selection in one mail: `Draft.quote`
 - `space`: `deal.Verdict`, anywhere in Normal mode
 - `:`: `window.Palette`
 - `ctrl-k`, `tab`, `q`: `window.Screen`

@@ -2061,40 +2061,29 @@ impl Editor {
                 LinkedEdits::new()
             };
 
-            let selection_anchors = this.buffer.update(cx, |buffer, cx| {
-                let anchors = {
-                    let snapshot = buffer.read(cx);
-                    let editable_selections = old_selections
-                        .iter()
-                        .map(|selection| {
-                            Self::range_is_editable(&snapshot, selection.start..selection.end)
-                        })
-                        .collect::<Vec<_>>();
-                    let anchors = old_selections
-                        .iter()
-                        .zip(&editable_selections)
-                        .map(|(selection, editable)| {
-                            if *editable {
-                                let anchor = snapshot.anchor_after(selection.head());
-                                selection.map(|_| anchor)
-                            } else {
-                                selection.map(|point| snapshot.anchor_at(point, Bias::Left))
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let edits = old_selections
-                        .iter()
-                        .zip(editable_selections)
-                        .filter_map(|(selection, editable)| {
-                            editable.then(|| (selection.start..selection.end, text.clone()))
-                        })
-                        .collect::<Vec<_>>();
-                    drop(snapshot);
-                    buffer.edit(edits, autoindent_mode, cx);
-                    anchors
-                };
-                anchors
+            let (selection_anchors, blocked) = this.buffer.update(cx, |buffer, cx| {
+                let snapshot = buffer.read(cx);
+                let mut anchors = Vec::with_capacity(old_selections.len());
+                let mut edits = Vec::new();
+                let mut blocked = false;
+                for selection in &old_selections {
+                    if Self::range_is_editable(&snapshot, selection.start..selection.end) {
+                        let anchor = snapshot.anchor_after(selection.head());
+                        anchors.push(selection.map(|_| anchor));
+                        edits.push((selection.start..selection.end, text.clone()));
+                    } else {
+                        blocked |= !selection.is_empty() || !text.is_empty();
+                        anchors.push(selection.map(|point| snapshot.anchor_at(point, Bias::Left)));
+                    }
+                }
+                drop(snapshot);
+                buffer.edit(edits, autoindent_mode, cx);
+                (anchors, blocked)
             });
+
+            if blocked {
+                cx.emit(EditorEvent::EditBlockedByReadOnly);
+            }
 
             linked_edits.apply(cx);
 

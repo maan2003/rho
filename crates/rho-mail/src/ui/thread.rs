@@ -8,7 +8,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use editor::scroll::Autoscroll;
-use editor::{Anchor, Editor, EditorMode, HighlightKey, SelectionEffects, SizingBehavior};
+use editor::{
+    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, SelectionEffects, SizingBehavior,
+};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent,
@@ -175,6 +177,8 @@ pub struct ThreadView {
     layout: Layout,
     editor: Entity<Editor>,
     draft: Entity<Buffer>,
+    /// The last caret in the draft, even while the user selects mail.
+    draft_point: Option<Anchor>,
     draft_subscription: Subscription,
     follow: Option<Follow>,
     /// The mail dealt to this view, also the target when the cursor is
@@ -260,6 +264,27 @@ impl ThreadView {
             editor
         });
         let subscriptions = vec![
+            cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+                if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
+                    let editor = editor.read(cx);
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let head = editor.selections.newest_anchor().head();
+                    if snapshot
+                        .anchor_to_buffer_anchor(head)
+                        .is_some_and(|(_, buffer)| {
+                            buffer.remote_id() == this.draft.read(cx).remote_id()
+                        })
+                    {
+                        this.draft_point = Some(snapshot.anchor_before(head.to_point(&snapshot)));
+                    }
+                } else if matches!(event, EditorEvent::EditBlockedByReadOnly) {
+                    this.system.read(cx).frame.clone().echo(
+                        "mail cannot be edited · write below the line",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            }),
             cx.observe(&entity, |this, _, cx| this.refresh(cx)),
             cx.subscribe(&entity, |this, _, event: &Event, cx| match event {
                 Event::Delivered {
@@ -288,6 +313,7 @@ impl ThreadView {
             layout: Layout::of(window.viewport_size().width),
             editor,
             draft,
+            draft_point: None,
             draft_subscription,
             follow: None,
             dealt_mail: None,
@@ -342,7 +368,11 @@ impl ThreadView {
             &self.expanded_quotes,
             cx,
         );
+        let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
         self.transcript.reconcile(items, cx);
+        if let Some(writing) = writing {
+            writing.restore(&self.editor, cx);
+        }
         if let Some(Follow::Logged(message)) = self.follow
             && self.cursor_to_item(&Key::Thread(message), Autoscroll::fit(), cx)
         {
@@ -386,6 +416,7 @@ impl ThreadView {
         draft::replace(&self.editor, &draft, cx);
         self.draft_subscription = Self::subscribe_draft(&draft, cx);
         self.draft = draft;
+        self.draft_point = None;
         self.reply_to = None;
     }
 
@@ -911,61 +942,92 @@ impl ThreadView {
         draft::focus(&self.editor, self.transcript.buffer(), position, window, cx);
     }
 
+    fn selection_range(&self, cx: &App) -> Range<Point> {
+        let editor = self.editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        selection.start.to_point(&snapshot)..selection.end.to_point(&snapshot)
+    }
+
+    /// The complete lines touched by the main selection, if all are in one
+    /// mail.
+    fn mail_selection(
+        &self,
+        range: Range<Point>,
+        cx: &App,
+    ) -> Option<std::ops::RangeInclusive<u32>> {
+        if self.is_list(self.system.read(cx)) {
+            return None;
+        }
+        let lines = selected_lines(range);
+        let mail = self.transcript.line_meta(*lines.start(), cx)?.mail()?;
+        lines
+            .clone()
+            .all(|row| self.transcript.line_meta(row, cx).and_then(Meta::mail) == Some(mail))
+            .then_some(lines)
+    }
+
     fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
-        let range = {
-            let editor = self.editor.read(cx);
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let selections = editor.selections.disjoint_anchors();
-            let first = selections.first().expect("the editor has a selection");
-            let last = selections.last().expect("the editor has a selection");
-            selected_lines(first.start.to_point(&snapshot)..last.end.to_point(&snapshot))
-        };
-        let mail = self
-            .transcript
-            .line_meta(*range.start(), cx)
-            .and_then(Meta::mail);
-        if self.is_list(self.system.read(cx))
-            || mail.is_none()
-            || !range
-                .clone()
-                .all(|row| self.transcript.line_meta(row, cx).and_then(Meta::mail) == mail)
-        {
+        let Some(lines) = self.mail_selection(self.selection_range(cx), cx) else {
             self.system.read(cx).frame.clone().echo(
                 "select lines in one mail to quote",
                 StyleClass::SystemInfo,
                 cx,
             );
             return;
-        }
+        };
+        self.quote(lines, window, cx);
+    }
 
-        if let Some(mail) = self.selected_reply_target(*range.start(), cx) {
+    fn quote(
+        &mut self,
+        lines: std::ops::RangeInclusive<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mail) = self.selected_reply_target(*lines.start(), cx) {
             self.reply_to = Some(mail);
         }
         let history = self.transcript.buffer().read(cx);
-        let start = history.point_to_offset(Point::new(*range.start(), 0));
-        let end = history.point_to_offset(Point::new(*range.end(), history.line_len(*range.end())));
+        let start = history.point_to_offset(Point::new(*lines.start(), 0));
+        let end = history.point_to_offset(Point::new(*lines.end(), history.line_len(*lines.end())));
         let selected = history.text_for_range(start..end).collect::<String>();
-        let draft = self.draft.read(cx);
-        let quote = quote_lines(&selected, draft.len() > 0 && draft.max_point().column > 0);
+        let quote = quote_lines(&selected);
+        let line_count = *lines.end() - *lines.start() + 1;
+        let draft_start = draft::start(self.transcript.buffer(), cx);
 
         thread::enter_normal_mode(&self.editor, window, cx);
         self.editor.update(cx, |editor, cx| {
-            let end = editor.buffer().read(cx).snapshot(cx).max_point();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let caret = self
+                .draft_point
+                .map_or(draft_start, |point| point.to_point(&snapshot));
+            let insert = Point::new(caret.row, 0);
+            let below = Point::new(caret.row + line_count, caret.column);
             editor.finalize_last_transaction(cx);
             editor.transact(window, cx, |editor, window, cx| {
-                editor.edit([(end..end, quote)], cx);
-                let end = editor.buffer().read(cx).snapshot(cx).max_point();
+                editor.edit([(insert..insert, quote)], cx);
                 editor.change_selections(
                     SelectionEffects::scroll(Autoscroll::fit()),
                     window,
                     cx,
                     |selections| {
-                        selections.select_ranges([end..end]);
+                        selections.select_ranges([below..below]);
                     },
                 );
             });
             editor.finalize_last_transaction(cx);
         });
+        let confirmation = if line_count == 1 {
+            "quoted 1 line".to_string()
+        } else {
+            format!("quoted {line_count} lines")
+        };
+        self.system
+            .read(cx)
+            .frame
+            .clone()
+            .echo(confirmation, StyleClass::SystemInfo, cx);
     }
 
     fn redo_draft_or_undo_verdict(
@@ -1039,7 +1101,14 @@ impl ThreadView {
 
     /// Enter opens the thing under the point: a quote, link, agent's mail,
     /// tangent or crumb.
-    fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = self.selection_range(cx);
+        if !selection.is_empty()
+            && let Some(lines) = self.mail_selection(selection, cx)
+        {
+            self.quote(lines, window, cx);
+            return;
+        }
         let cursor = self.cursor(cx);
         if let Some(target) = self.inline_open(cursor, cx) {
             match target {
@@ -1091,11 +1160,8 @@ fn selected_lines(range: Range<Point>) -> std::ops::RangeInclusive<u32> {
     range.start.row..=end
 }
 
-fn quote_lines(text: &str, separate: bool) -> String {
+fn quote_lines(text: &str) -> String {
     let mut quote = String::new();
-    if separate {
-        quote.push('\n');
-    }
     for line in text.split('\n') {
         quote.push_str("> ");
         quote.push_str(line);
@@ -1565,11 +1631,8 @@ mod tests {
         assert_eq!(selected_lines(Point::new(2, 0)..Point::new(5, 0)), 2..=4);
         assert_eq!(selected_lines(Point::new(2, 4)..Point::new(5, 3)), 2..=5);
         assert_eq!(selected_lines(Point::new(2, 0)..Point::new(2, 0)), 2..=2);
-        assert_eq!(
-            quote_lines("before\n\nafter", true),
-            "\n> before\n> \n> after\n"
-        );
-        assert_eq!(quote_lines("first", false), "> first\n");
+        assert_eq!(quote_lines("before\n\nafter"), "> before\n> \n> after\n");
+        assert_eq!(quote_lines("first"), "> first\n");
     }
 
     #[test]
