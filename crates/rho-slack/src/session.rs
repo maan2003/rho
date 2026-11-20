@@ -19,10 +19,10 @@ use crate::api::{Client, FileSearchPage, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
-use crate::mirror::{Draft, Mirror, Saved, Scope, unit_scope, unit_summary};
+use crate::mirror::{Draft, Mirror, Scope, unit_scope, unit_summary};
 use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
 use crate::socket::{Timings, Wire, run_feed, run_socket};
-use crate::types::{ChannelId, Message, Reaction, Reason, ThreadKey, Ts, UserId};
+use crate::types::{ChannelId, Message, Reaction, ThreadKey, Ts, UserId};
 
 /// How often health is re-examined. An outage produces no events at all, so
 /// something has to look at the clock.
@@ -132,16 +132,6 @@ pub struct Found {
 pub enum FoundPage {
     Messages(SearchPage),
     Files(FileSearchPage),
-}
-
-/// One row in Activity or Saved. It is a place, not a dealer verdict.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActivityEntry {
-    pub source: Source,
-    pub ts: Ts,
-    pub conversation: String,
-    pub summary: String,
-    pub unread: bool,
 }
 
 /// Why a search did not answer, in the terms the reader is told it in.
@@ -1610,57 +1600,6 @@ impl Session {
         self.mirror.as_deref()
     }
 
-    /// Whether there is a listing to draw at all, as against a status line.
-    pub fn has_rows(&self) -> bool {
-        self.model.conversation_count() > 0
-    }
-
-    /// Narrows the list to the conversations a typed query reaches. The
-    /// model answers it from its word index and logs which rows left and
-    /// which arrived.
-    pub fn narrow(&mut self, query: &str) {
-        self.model.narrow(query);
-    }
-
-    /// The conversations a query reaches, in the list's own order, for a
-    /// caller showing matches without narrowing: the minibuffer offering
-    /// names as the reader types.
-    pub fn reached_by(&self, query: &str, most: usize) -> Vec<crate::model::ConversationRow> {
-        self.model.reached_by(query, most)
-    }
-
-    /// What the reader has typed to narrow the list.
-    pub fn query(&self) -> String {
-        self.model.query()
-    }
-
-    /// How many conversations there are, before a query narrows them.
-    pub fn conversation_count(&self) -> usize {
-        self.model.conversation_count()
-    }
-
-    /// Whether a query stands, so a drawer with nothing to draw can say
-    /// that nothing matches rather than talk about the socket.
-    pub fn is_narrowed(&self) -> bool {
-        self.model.is_narrowed()
-    }
-
-    /// Why the narrowed list is empty, when it is, so the drawer can say
-    /// which of the two happened.
-    pub fn empty_narrowing(&self) -> Option<crate::model::Empty> {
-        self.model.empty_narrowing()
-    }
-
-    /// What the conversation list has done since the drawer last asked.
-    /// `None` when the drawer has to write the listing again.
-    pub fn take_row_edits(&mut self) -> Option<Vec<crate::model::RowEdit>> {
-        self.model.take_row_edits()
-    }
-
-    pub fn forget_row_edits(&mut self) {
-        self.model.forget_row_edits();
-    }
-
     /// Where a dealt card lands the reader: the oldest message from someone
     /// else past the cursor their last verdict left. Three mentions in a
     /// channel are one card, and this is the first of the three.
@@ -1699,114 +1638,6 @@ impl Session {
         match self.mirror.as_deref() {
             Some(mirror) => unit_summary(&self.model, mirror, unit),
             None => String::new(),
-        }
-    }
-
-    /// Mentions, direct messages, and followed threads rho knows about,
-    /// including read items. This is deliberately a superset of the dealer.
-    pub fn activity(&self) -> Vec<ActivityEntry> {
-        let mut rows = self
-            .model
-            .tracked()
-            .into_iter()
-            .filter(|unit| {
-                self.model.unit(unit).is_some_and(|facts| {
-                    matches!(
-                        facts.reason,
-                        Reason::Mention | Reason::DirectMessage | Reason::Thread
-                    )
-                })
-            })
-            .filter_map(|unit| {
-                let facts = self.model.unit(&unit)?;
-                let source = match &unit.thread {
-                    Some(root) => Source::Thread(self.model.key(&unit.channel, root)),
-                    None => Source::Conversation(unit.channel.clone()),
-                };
-                Some(ActivityEntry {
-                    source,
-                    ts: facts.newest.clone(),
-                    conversation: self.model.label(&unit.channel),
-                    summary: self.unit_summary(&unit),
-                    unread: self.model.attention(&unit).is_some(),
-                })
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| right.ts.epoch_seconds().total_cmp(&left.ts.epoch_seconds()));
-        rows
-    }
-
-    /// The local Later inventory. Slack has no supported API for its current
-    /// Later list, so these are exactly the messages saved in rho.
-    pub fn saved(&self) -> Vec<ActivityEntry> {
-        let Some(mirror) = self.mirror.as_ref() else {
-            return Vec::new();
-        };
-        mirror
-            .saved(&self.model.workspace().0)
-            .into_iter()
-            .map(|saved| {
-                let source = match saved.thread {
-                    Some(root) => Source::Thread(self.model.key(&saved.channel, &root)),
-                    None => Source::Conversation(saved.channel.clone()),
-                };
-                ActivityEntry {
-                    conversation: self.model.label(&saved.channel),
-                    summary: if saved.summary.is_empty() {
-                        "saved message (content unavailable)".to_owned()
-                    } else {
-                        saved.summary
-                    },
-                    source,
-                    ts: saved.ts,
-                    unread: false,
-                }
-            })
-            .collect()
-    }
-
-    pub fn is_saved_for_later(&self, source: &Source, ts: &Ts) -> bool {
-        self.mirror.as_ref().is_some_and(|mirror| {
-            mirror.saved(&self.model.workspace().0).iter().any(|saved| {
-                saved.channel == *source.channel()
-                    && saved.thread.as_ref() == source.thread_ts()
-                    && saved.ts == *ts
-            })
-        })
-    }
-
-    pub fn save_for_later(&self, source: &Source, message: &Message) {
-        if let Some(mirror) = self.mirror.as_ref() {
-            mirror.save(
-                &self.model.workspace().0,
-                &Saved {
-                    channel: source.channel().clone(),
-                    thread: source.thread_ts().cloned(),
-                    ts: message.ts.clone(),
-                    summary: {
-                        let author = self.model.author(message);
-                        let body = self.model.render_parts(message).0.replace('\n', " ");
-                        match body.trim().is_empty() {
-                            true => author,
-                            false => format!("{author} — {body}"),
-                        }
-                    },
-                },
-            );
-        }
-    }
-
-    pub fn remove_from_later(&self, source: &Source, ts: &Ts) {
-        if let Some(mirror) = self.mirror.as_ref() {
-            mirror.unsave(
-                &self.model.workspace().0,
-                &Saved {
-                    channel: source.channel().clone(),
-                    thread: source.thread_ts().cloned(),
-                    ts: ts.clone(),
-                    summary: String::new(),
-                },
-            );
         }
     }
 

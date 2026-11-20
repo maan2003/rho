@@ -1,14 +1,14 @@
-//! The Slack surfaces: a conversation list and one conversation transcript.
+//! The Slack surfaces: a conversation or a thread, and search results.
 //!
 //! Both are ordinary editors over multibuffers, so motions, search, and Vim
 //! come from the editor rather than bespoke list chrome — the same trick
 //! Rho's dashboard plays.
 //!
-//! A channel, a group, a DM, and a thread are all the same surface: they
-//! differ in where a composed message goes, not in how they read.
+//! A channel, a group, a DM, and a thread are all the same surface, and it
+//! is a thread screen like every other (`rho_frame::thread`): they differ in
+//! where a composed message goes, not in how they read.
 
 pub mod conversation;
-pub mod list;
 pub mod results;
 mod surface;
 pub mod system;
@@ -20,7 +20,6 @@ pub use conversation::{ConversationView, ReactionChoice, ReactionChoices};
 use editor::{Editor, HighlightKey};
 use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Hsla, Window};
 use language::Buffer;
-pub use list::ListView;
 use multi_buffer::MultiBuffer;
 pub use results::{Place, ResultsView, Target};
 pub use surface::SlackSurface;
@@ -45,8 +44,6 @@ pub struct Hooks {
     /// The colour of the bar the host draws in the gutter beside a message,
     /// which is what marks the lines hung off one here.
     pub gutter_colour: fn(&App) -> Hsla,
-    /// The host's semantic treatment for text entered by the reader.
-    pub prompt_style: fn(&App) -> HighlightStyle,
 }
 
 impl Hooks {
@@ -57,7 +54,6 @@ impl Hooks {
             configure_editor: |_, _, _| {},
             configure_markdown: |_, _| {},
             gutter_colour: |_| gpui::transparent_black(),
-            prompt_style: |_| HighlightStyle::default(),
         }
     }
 }
@@ -70,12 +66,6 @@ const SLACK_KEY_BASE: usize = usize::MAX - 500;
 /// of its own rather than a handful of slots: room for far more messages
 /// than a conversation will ever hold on screen.
 const SLACK_TRANSCRIPT_KEY_BASE: usize = usize::MAX / 4;
-
-/// The listing paints in buckets for the same reason the transcript does, so
-/// it needs the same shape of block: a key per class per bucket, in a range
-/// of its own. Buckets come from a counter that only goes up, so the block
-/// has to be wide rather than exact.
-const SLACK_LIST_KEY_BASE: usize = usize::MAX / 2;
 
 impl rho_transcript::Style for Class {
     fn highlight_key(self, bucket: u32) -> HighlightKey {
@@ -170,18 +160,6 @@ impl Class {
 
     pub fn highlight_key(self) -> HighlightKey {
         HighlightKey::SyntaxTreeView(SLACK_KEY_BASE + self.slot())
-    }
-
-    /// The key a listing paints this class with in one bucket of rows.
-    ///
-    /// One key per class per bucket is what lets a row that moved be
-    /// repainted without re-sending the rows that did not: the editor
-    /// replaces the ranges under a key, so a key covering the whole listing
-    /// can only ever be replaced whole.
-    pub fn list_highlight_key(self, bucket: u32) -> HighlightKey {
-        HighlightKey::SyntaxTreeView(
-            SLACK_LIST_KEY_BASE + bucket as usize * Self::ALL.len() + self.slot(),
-        )
     }
 
     pub fn resolve(self, cx: &App) -> HighlightStyle {

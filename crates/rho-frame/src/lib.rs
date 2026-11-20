@@ -37,6 +37,7 @@ mod palette;
 mod phone;
 pub mod surface;
 pub mod system;
+pub mod thread;
 pub mod when;
 
 pub use deal::dealer_policy_snapshot;

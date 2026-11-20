@@ -1,5 +1,5 @@
-//! One Slack screen: the conversations, one conversation or thread, or a
-//! listing. Each is a view from this crate wrapped as a frame surface;
+//! One Slack screen: one conversation or thread, or the results of a
+//! search. Each is a view from this crate wrapped as a frame surface;
 //! the wrapper holds the keys that reach outside the view, into the frame.
 
 use std::rc::Rc;
@@ -8,17 +8,17 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div};
 use rho_dealer::Address;
+use rho_frame::thread::{FocusComposer, FocusLog, SendMessage};
 use rho_frame::{Candidate, Frame, FrameLink, Row, Rows, Subject, Surface};
 use rho_window::style::StyleClass;
 
 use super::conversation::{self, Attaching, EditStart, Submitted};
 use super::results::{self, Place, Target};
 use super::system::{
-    self, CancelEdit, Compose, EditLast, EditMessage, FindFile, FindMessage, MarkUnread, Narrow,
-    NewMessage, NextPage, NextUnread, OpenRow, PreviousPage, React, SaveForLater, Send,
-    SlackSystem, Switch,
+    self, EditMessage, FindFile, FindMessage, MarkUnread, NewMessage, NextPage, NextUnread,
+    OpenRow, PreviousPage, React, SlackSystem,
 };
-use super::{ConversationView, ListView, ReactionChoices, ResultsView, SearchKind};
+use super::{ConversationView, ReactionChoices, ResultsView, SearchKind};
 use crate::address::Listing;
 use crate::session::{FoundPage, Session, SessionEvent, Source};
 use crate::types::{FileSummary, ThreadKey, Ts};
@@ -34,7 +34,6 @@ const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in 
 const REACTION_KEYS: [&str; 12] = ["a", "s", "d", "f", "g", "h", "j", "k", "l", "q", "w", "e"];
 
 pub enum View {
-    List(Entity<ListView>),
     Conversation(Entity<ConversationView>),
     Results {
         view: Entity<ResultsView>,
@@ -62,33 +61,7 @@ pub(super) fn surface_at(frame: &Frame, address: &Address) -> Option<Entity<Slac
         .ok()
 }
 
-/// Puts the keyboard in insert, once the editor it lands in has focus.
-fn enter_insert(window: &mut Window) {
-    window.on_next_frame(|window, cx| {
-        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
-            window.dispatch_action(action, cx);
-        }
-    });
-}
-
 impl SlackSurface {
-    pub(super) fn list(
-        system: Entity<SlackSystem>,
-        frame: FrameLink,
-        session: Entity<Session>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let view = cx.new(|cx| ListView::new(session.clone(), SlackSystem::hooks(), window, cx));
-        Self {
-            system,
-            frame,
-            session,
-            view: View::List(view),
-            _subscriptions: Vec::new(),
-        }
-    }
-
     /// A conversation or a thread, landed on `land` when it is asking for
     /// the reader.
     pub(super) fn conversation(
@@ -127,7 +100,7 @@ impl SlackSurface {
         cx: &mut Context<Self>,
     ) -> Self {
         let view = cx.new(|cx| ResultsView::new(session.clone(), SlackSystem::hooks(), window, cx));
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             cx.subscribe_in(&view, window, |this, _, event, window, cx| {
                 let target = match event {
                     results::Event::Open(place) => Target::Message(place.clone()),
@@ -137,13 +110,7 @@ impl SlackSurface {
             }),
             cx.subscribe_in(&session, window, Self::session_event),
         ];
-        if matches!(listing, Listing::Activity | Listing::Saved) {
-            // The inventories are the mirror's: they move with the session.
-            subscriptions.push(cx.observe_in(&session, window, |this, _, window, cx| {
-                this.draw_inventory(window, cx)
-            }));
-        }
-        let mut surface = Self {
+        Self {
             system,
             frame,
             session,
@@ -153,21 +120,7 @@ impl SlackSurface {
                 asked: None,
             },
             _subscriptions: subscriptions,
-        };
-        surface.draw_inventory(window, cx);
-        surface
-    }
-
-    fn draw_inventory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let View::Results { view, listing, .. } = &self.view else {
-            return;
-        };
-        let (heading, entries) = match listing {
-            Listing::Activity => ("activity", self.session.read(cx).activity()),
-            Listing::Saved => ("saved for later (local)", self.session.read(cx).saved()),
-            Listing::Messages | Listing::Files => return,
-        };
-        view.update(cx, |view, cx| view.inventory(heading, &entries, window, cx));
+        }
     }
 
     /// Asks Slack, drawing that it is asking until the answer comes.
@@ -281,12 +234,20 @@ impl SlackSurface {
     /// unfolds, an app's control runs, a file or link opens, and otherwise
     /// the thread the line is in.
     fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_line(window, cx)
+    }
+
+    fn open_thread_row(
+        &mut self,
+        _: &rho_frame::thread::OpenRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_line(window, cx)
+    }
+
+    fn open_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.view {
-            View::List(view) => {
-                if let Some(source) = view.read(cx).cursor_source(cx) {
-                    self.open_source(&source, cx);
-                }
-            }
             View::Results { view, .. } => {
                 if let Some(target) = view.read(cx).cursor_target(cx) {
                     self.open_target(target, window, cx);
@@ -294,6 +255,11 @@ impl SlackSurface {
             }
             View::Conversation(view) => {
                 let view = view.clone();
+                if view.update(cx, |view, cx| view.cursor_on_crumb(cx)) {
+                    let channel = view.read(cx).source().channel().clone();
+                    self.open_source(&Source::Conversation(channel), cx);
+                    return;
+                }
                 if view.update(cx, |view, cx| view.toggle_cursor_preview(window, cx)) {
                     return;
                 }
@@ -334,22 +300,33 @@ impl SlackSurface {
 
     pub(super) fn compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.conversation_view() {
-            view.update(cx, |view, cx| view.select_compose(window, cx));
-            enter_insert(window);
+            view.update(cx, |view, cx| view.focus_composer(window, cx));
         }
     }
 
-    fn on_compose(&mut self, _: &Compose, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {
         self.compose(window, cx)
     }
 
-    fn send(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Back to the messages. A rewrite open in the box is left, and the
+    /// box holds again what it held before.
+    fn focus_log(&mut self, _: &FocusLog, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.conversation_view().cloned() else {
+            return cx.propagate();
+        };
+        view.update(cx, |view, cx| {
+            view.cancel_edit(cx);
+            view.focus_log(window, cx);
+        });
+    }
+
+    fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.conversation_view().cloned() else {
             return;
         };
         let channel = view.read(cx).source().channel().clone();
         let broadcast = view.read(cx).also_send_to_channel();
-        let submitting = view.update(cx, |view, cx| view.submit_with_options(broadcast, cx));
+        let submitting = view.update(cx, |view, cx| view.send(broadcast, window, cx));
         let session = self.session.downgrade();
         cx.spawn(async move |_, cx| {
             let submitted = submitting.await;
@@ -385,7 +362,7 @@ impl SlackSurface {
             return cx.propagate();
         };
         match view.update(cx, |view, cx| view.start_edit(window, cx)) {
-            EditStart::Started(_) => enter_insert(window),
+            EditStart::Started(_) => {}
             // A key that does nothing quietly reads as broken.
             EditStart::NotYours => self.frame.echo(
                 "slack: only your own messages can be edited",
@@ -393,26 +370,6 @@ impl SlackSurface {
                 cx,
             ),
             EditStart::Nothing => cx.propagate(),
-        }
-    }
-
-    fn edit_last(&mut self, _: &EditLast, window: &mut Window, cx: &mut Context<Self>) {
-        let started = self
-            .conversation_view()
-            .cloned()
-            .map(|view| view.update(cx, |view, cx| view.edit_last_own(window, cx)));
-        if !matches!(started, Some(EditStart::Started(_))) {
-            cx.propagate();
-        }
-    }
-
-    fn cancel_edit(&mut self, _: &CancelEdit, _window: &mut Window, cx: &mut Context<Self>) {
-        let cancelled = self
-            .conversation_view()
-            .cloned()
-            .is_some_and(|view| view.update(cx, |view, cx| view.cancel_edit(cx)));
-        if !cancelled {
-            cx.propagate();
         }
     }
 
@@ -441,63 +398,13 @@ impl SlackSurface {
             .echo("slack: marked unread", StyleClass::SystemInfo, cx);
     }
 
-    fn save_for_later(&mut self, _: &SaveForLater, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.conversation_view().cloned() else {
-            return cx.propagate();
-        };
-        let Some(message) = view.update(cx, |view, cx| view.cursor_message(cx)) else {
-            return cx.propagate();
-        };
-        let source = view.read(cx).source().clone();
-        let session = self.session.read(cx);
-        let said = match session.is_saved_for_later(&source, &message.ts) {
-            true => {
-                session.remove_from_later(&source, &message.ts);
-                "slack: removed from saved"
-            }
-            false => {
-                session.save_for_later(&source, &message);
-                "slack: saved for later"
-            }
-        };
-        // The saved listing reads the mirror the session owns.
-        self.session.update(cx, |_, cx| cx.notify());
-        self.frame.echo(said, StyleClass::SystemInfo, cx);
-    }
-
     fn next_unread(&mut self, _: &NextUnread, _window: &mut Window, cx: &mut Context<Self>) {
         let here = self
             .conversation_view()
             .map(|view| view.read(cx).source().channel().clone());
-        system::next_unread(&self.session, here.as_ref(), &self.frame, cx);
-    }
-
-    /// `s` in the list: narrows it as the reader types; `escape` puts back
-    /// the narrowing there was.
-    fn narrow(&mut self, _: &Narrow, _window: &mut Window, cx: &mut Context<Self>) {
-        let View::List(view) = &self.view else {
-            return cx.propagate();
-        };
-        let before = self.session.read(cx).query();
-        let (changing, submitting, cancelling) = (view.clone(), view.clone(), view.clone());
+        let session = self.session.clone();
         self.frame.with(cx, move |frame, window, cx| {
-            let narrow =
-                |view: &Entity<ListView>, filter: String, window: &mut Window, cx: &mut App| {
-                    view.update(cx, |view, cx| view.set_filter(filter, window, cx));
-                };
-            frame.open_prompt_watching(
-                "narrow conversations:",
-                Rc::new(|_, _, _| Vec::new()),
-                Some(Rc::new(move |_, input, window, cx| {
-                    narrow(&changing, input.to_owned(), window, cx)
-                })),
-                Rc::new(move |_, input, window, cx| narrow(&submitting, input, window, cx)),
-                Some(Rc::new(move |_, window, cx| {
-                    narrow(&cancelling, before.clone(), window, cx)
-                })),
-                window,
-                cx,
-            );
+            system::next_unread(&session, here.as_ref(), frame, window, cx)
         });
     }
 
@@ -520,13 +427,6 @@ impl SlackSurface {
         let session = self.session.clone();
         self.frame.with(cx, move |frame, window, cx| {
             system::prompt_find(session, scope, kind, frame, window, cx)
-        });
-    }
-
-    fn switch(&mut self, _: &Switch, _window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.session.clone();
-        self.frame.with(cx, move |frame, window, cx| {
-            system::prompt_switch(session, frame, window, cx)
         });
     }
 
@@ -735,11 +635,7 @@ fn message_menu(
     if actions.can_edit {
         let (view, ts) = (view.clone(), ts.clone());
         menu = menu.row(Row::run("e", "edit", move |_, window, cx| {
-            if let EditStart::Started(_) =
-                view.update(cx, |view, cx| view.start_edit_at(&ts, window, cx))
-            {
-                enter_insert(window);
-            }
+            view.update(cx, |view, cx| view.start_edit_at(&ts, window, cx));
         }));
     }
     {
@@ -853,11 +749,6 @@ fn message_menu(
     menu.row(Row::run("u", "mark unread", |_, window, cx| {
         window.dispatch_action(Box::new(MarkUnread), cx)
     }))
-    .row(Row::run(
-        "s",
-        "save / unsave for later (local)",
-        |_, window, cx| window.dispatch_action(Box::new(SaveForLater), cx),
-    ))
 }
 
 /// A file from disk, to go with the next message.
@@ -963,11 +854,8 @@ impl Surface for SlackSurface {
     fn title(&self, cx: &App) -> String {
         let session = self.session.read(cx);
         match &self.view {
-            View::List(_) => format!("slack · {}", session.model().workspace()),
             View::Conversation(view) => session.label(view.read(cx).source()),
             View::Results { listing, asked, .. } => match (listing, asked) {
-                (Listing::Activity, _) => "slack activity".to_owned(),
-                (Listing::Saved, _) => "slack saved".to_owned(),
                 (_, Some((query, _))) => format!("slack: {query}"),
                 (Listing::Messages, None) => "slack messages".to_owned(),
                 (Listing::Files, None) => "slack files".to_owned(),
@@ -977,8 +865,7 @@ impl Surface for SlackSurface {
 
     fn editor(&self, cx: &App) -> Option<Entity<Editor>> {
         Some(match &self.view {
-            View::List(view) => view.read(cx).editor().clone(),
-            View::Conversation(view) => view.read(cx).editor().clone(),
+            View::Conversation(view) => view.read(cx).focused_editor().clone(),
             View::Results { view, .. } => view.read(cx).editor().clone(),
         })
     }
@@ -988,7 +875,6 @@ impl Surface for SlackSurface {
     fn subject(&self, cx: &App) -> Subject {
         let model = self.session.read(cx).model();
         match &self.view {
-            View::List(view) => system::subject_of(model, view.read(cx).cursor_source(cx)),
             View::Conversation(_) => Subject::Own,
             View::Results { view, .. } => match view.read(cx).cursor_target(cx) {
                 Some(Target::Message(place)) => system::subject_of(model, Some(place.source)),
@@ -999,16 +885,22 @@ impl Surface for SlackSurface {
 
     /// The `slack` menu, with what this screen adds to it.
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+        let mut rows = Vec::new();
         let mut menu = Rows::new("slack");
         if let Some(view) = self.conversation_view().cloned() {
+            // The thread's own row, as every thread has it.
+            let this = cx.entity();
+            rows.push(Row::run("ctrl-enter", "send", move |_, window, cx| {
+                this.update(cx, |surface, cx| surface.send(&SendMessage, window, cx));
+            }));
             menu.extend(self.conversation_rows(&view, cx));
         }
         menu.extend(SlackSystem::menu_rows(
             &self.system,
             Some(self.session.clone()),
-            cx,
         ));
-        vec![Row::menu("s", "slack", menu)]
+        rows.push(Row::menu("s", "slack", menu));
+        rows
     }
 }
 
@@ -1023,26 +915,25 @@ impl Focusable for SlackSurface {
 impl Render for SlackSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let inner = match &self.view {
-            View::List(view) => view.clone().into_any_element(),
             View::Conversation(view) => view.clone().into_any_element(),
             View::Results { view, .. } => view.clone().into_any_element(),
         };
         div()
+            .when(matches!(self.view, View::Conversation(_)), |div| {
+                div.key_context("RhoSlackConversation")
+            })
             .size_full()
             .on_action(cx.listener(Self::open_row))
-            .on_action(cx.listener(Self::on_compose))
+            .on_action(cx.listener(Self::open_thread_row))
+            .on_action(cx.listener(Self::focus_composer))
+            .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::edit_message))
-            .on_action(cx.listener(Self::edit_last))
-            .on_action(cx.listener(Self::cancel_edit))
             .on_action(cx.listener(Self::react))
             .on_action(cx.listener(Self::mark_unread))
-            .on_action(cx.listener(Self::save_for_later))
             .on_action(cx.listener(Self::next_unread))
-            .on_action(cx.listener(Self::narrow))
             .on_action(cx.listener(Self::find_message))
             .on_action(cx.listener(Self::find_file))
-            .on_action(cx.listener(Self::switch))
             .on_action(cx.listener(Self::new_message))
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::next_page))

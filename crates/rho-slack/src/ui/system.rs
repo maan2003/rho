@@ -42,32 +42,18 @@ gpui::actions!(
         /// Opens what the cursor is on: a conversation, a thread, a hit, a
         /// file, a link, an app's button.
         OpenRow,
-        /// Puts the keyboard in the composer, in insert.
-        Compose,
-        /// Sends what is in the composer, or posts the rewrite.
-        Send,
         /// Rewrites the message under the cursor.
         EditMessage,
-        /// Rewrites the last message of the user's own.
-        EditLast,
-        /// Leaves a rewrite, giving the composer back what it held.
-        CancelEdit,
         /// What to react to the message under the cursor with.
         React,
         /// Marks the message under the cursor and what follows it unread.
         MarkUnread,
-        /// Saves the message under the cursor for later, or unsaves it.
-        SaveForLater,
         /// The next conversation with something unread.
         NextUnread,
-        /// Narrows the conversations by name.
-        Narrow,
         /// Asks Slack for messages.
         FindMessage,
         /// Asks Slack for files.
         FindFile,
-        /// Jumps to a conversation by name.
-        Switch,
         /// A direct message to people.
         NewMessage,
         /// The search page before this one.
@@ -80,9 +66,6 @@ gpui::actions!(
 /// The age `mark read before` offers when the user says nothing: a week of
 /// backlog is the one the question is usually about.
 const DEFAULT_MARK_CUTOFF: &str = "7d";
-
-/// How many matching names a prompt offers while the reader types.
-const MATCHES_OFFERED: usize = 64;
 
 pub struct SlackSystem {
     paths: Paths,
@@ -180,6 +163,15 @@ impl SlackSystem {
                 cx.notify();
             }),
         ];
+        // A workspace rho cannot reach at all says so once, on the echo
+        // line: there is no screen of Slack's own to say it on.
+        if let crate::session::Status::Failed(reason) = session.read(cx).status() {
+            self.frame.echo(
+                format!("slack unavailable: {reason}"),
+                StyleClass::StatusError,
+                cx,
+            );
+        }
         self.session = Some(session);
         self.frame.changed(cx);
         cx.notify();
@@ -211,7 +203,6 @@ impl SlackSystem {
             },
             configure_markdown: rho_window::markdown::configure_buffer,
             gutter_colour: rho_window::style::user_prompt_gutter_color,
-            prompt_style: |cx| StyleClass::UserMessage.resolve(cx),
         }
     }
 
@@ -306,11 +297,7 @@ impl SlackSystem {
 
     /// The rows of the `slack` menu every screen has. Built while the
     /// system may be leased, so it reads nothing of it.
-    pub(super) fn menu_rows(
-        this: &Entity<Self>,
-        session: Option<Entity<Session>>,
-        cx: &App,
-    ) -> Vec<Row> {
+    pub(super) fn menu_rows(this: &Entity<Self>, session: Option<Entity<Session>>) -> Vec<Row> {
         let register = {
             let this = this.clone();
             Row::run("r", "register workspace…", move |frame, window, cx| {
@@ -319,13 +306,6 @@ impl SlackSystem {
         };
         let Some(session) = session else {
             return vec![register];
-        };
-        let workspace = session.read(cx).model().workspace().clone();
-        let open = |key: &str, description: &str, address: SlackAddress| {
-            let address = address.address();
-            Row::run(key, description, move |frame, window, cx| {
-                frame.open(address.clone(), window, cx)
-            })
         };
         let with =
             |key: &str,
@@ -337,13 +317,14 @@ impl SlackSystem {
                 })
             };
         vec![
-            open(
-                "o",
-                "conversations",
-                SlackAddress::Conversations(workspace.clone()),
-            ),
-            with("j", "jump…", prompt_switch),
             with("n", "new message…", prompt_people),
+            with("shift-n", "next unread", |session, frame, window, cx| {
+                let here = match SlackAddress::from_address(frame.current_address()) {
+                    Some(SlackAddress::Unit(_, unit)) => Some(unit.channel),
+                    _ => None,
+                };
+                next_unread(&session, here.as_ref(), frame, window, cx)
+            }),
             with("c", "browse channels…", |session, frame, _, cx| {
                 frame.echo(
                     "slack: loading the channel directory…",
@@ -358,16 +339,6 @@ impl SlackSystem {
             with("f", "search files…", |session, frame, window, cx| {
                 prompt_find(session, None, SearchKind::Files, frame, window, cx)
             }),
-            open(
-                "v",
-                "activity",
-                SlackAddress::Listing(workspace.clone(), Listing::Activity),
-            ),
-            open(
-                "l",
-                "saved (local)",
-                SlackAddress::Listing(workspace, Listing::Saved),
-            ),
             with("d", "drafts…", prompt_drafts),
             with("m", "mark read before…", prompt_mark_read_before),
             register,
@@ -409,9 +380,6 @@ impl System for SlackSystem {
         let system = cx.entity();
         let frame = self.frame.clone();
         let surface = match place {
-            SlackAddress::Conversations(_) => {
-                cx.new(|cx| SlackSurface::list(system, frame, session, window, cx))
-            }
             SlackAddress::Unit(_, unit) => {
                 let model = session.read(cx).model();
                 let source = Self::source(model, &unit);
@@ -440,7 +408,7 @@ impl System for SlackSystem {
         if point.surface.kind() == SlackAddress::KIND {
             return Vec::new();
         }
-        let rows = Self::menu_rows(&cx.entity(), self.session.clone(), cx);
+        let rows = Self::menu_rows(&cx.entity(), self.session.clone());
         let mut menu = Rows::new("slack");
         menu.extend(rows);
         vec![Row::menu("s", "slack", menu)]
@@ -769,66 +737,6 @@ impl SlackSystem {
             .register(credentials)?;
         Ok(workspace)
     }
-}
-
-/// `ctrl-p`: a conversation, by name.
-pub(super) fn prompt_switch(
-    session: Entity<Session>,
-    frame: &mut Frame,
-    window: &mut Window,
-    cx: &mut Context<Frame>,
-) {
-    let reading = session.clone();
-    frame.open_prompt(
-        "jump to conversation:",
-        Rc::new(move |_, query, cx| {
-            let session = reading.read(cx);
-            session
-                .reached_by(query, MATCHES_OFFERED)
-                .into_iter()
-                .map(|row| Candidate {
-                    description: [
-                        session.favorite(&row.id).then_some("starred"),
-                        row.unread.then_some("unread"),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                    value: row.label,
-                })
-                .collect()
-        }),
-        Rc::new(move |frame, input, window, cx| {
-            let session = session.read(cx);
-            let model = session.model();
-            let rows = session.rows();
-            let input = input.trim();
-            let row = rows
-                .iter()
-                .find(|row| row.label.eq_ignore_ascii_case(input))
-                .or_else(|| {
-                    rows.iter()
-                        .find(|row| row.label.to_lowercase().contains(&input.to_lowercase()))
-                });
-            match row {
-                Some(row) => frame.open(
-                    SlackAddress::Unit(model.workspace().clone(), Unit::conversation(&row.id))
-                        .address(),
-                    window,
-                    cx,
-                ),
-                None => frame.echo(
-                    &format!("slack: no conversation called {input}"),
-                    StyleClass::SystemInfo,
-                    cx,
-                ),
-            }
-        }),
-        window,
-        cx,
-    );
-    whole_input(frame);
 }
 
 /// `ctrl-n`: a direct message to one to eight people, opened by Slack and
@@ -1270,41 +1178,28 @@ fn mark_read_before(
     );
 }
 
-/// `shift-n`: the next conversation with something unread, or the list
-/// when there is none.
+/// `shift-n`: the next conversation with something unread.
 pub(super) fn next_unread(
     session: &Entity<Session>,
     here: Option<&ChannelId>,
-    frame: &FrameLink,
-    cx: &mut App,
+    frame: &mut Frame,
+    window: &mut Window,
+    cx: &mut Context<Frame>,
 ) {
     let model = session.read(cx).model();
     let workspace = model.workspace().clone();
     match model.next_unread(here) {
         model::NextUnread::Go(channel) => frame.open(
             SlackAddress::Unit(workspace, Unit::conversation(&channel)).address(),
+            window,
             cx,
         ),
-        // The reader has read everything the narrowing reaches. The key
-        // stops here and says what it is not showing them.
-        model::NextUnread::Outside(waiting) => {
-            frame.echo(outside_the_narrowing(waiting), StyleClass::SystemInfo, cx)
-        }
-        model::NextUnread::Nothing => {
-            frame.open(SlackAddress::Conversations(workspace).address(), cx)
+        // Nothing narrows the conversations any more, so nothing waits
+        // outside a narrowing either.
+        model::NextUnread::Outside(_) | model::NextUnread::Nothing => {
+            frame.echo("slack: nothing unread", StyleClass::SystemInfo, cx)
         }
     }
-}
-
-fn outside_the_narrowing(waiting: usize) -> String {
-    let plural = match waiting {
-        1 => "conversation",
-        _ => "conversations",
-    };
-    format!(
-        "slack: {waiting} unread {plural} outside the narrowing; \
-         s with an empty query shows every conversation"
-    )
 }
 
 /// The address of what a source shows.
@@ -1325,51 +1220,28 @@ fn bind_keys(cx: &mut App) {
     let mut bindings = Vec::new();
     // Deal mode is not here, so these need no `!VimDeal`: a key means one
     // thing per context.
-    for context in rho_frame::normal_contexts("RhoSlackList", "") {
-        bindings.extend([
-            KeyBinding::new("enter", OpenRow, Some(&context)),
-            // `s` narrows the list by name; `shift-s` asks Slack what people
-            // said, which is a request over a network and not an index.
-            KeyBinding::new("s", Narrow, Some(&context)),
-        ]);
-    }
+    // The thread's own keys are the frame's (`rho_frame::thread`); these
+    // are the ones only a Slack message has.
     for context in rho_frame::normal_contexts("RhoSlackConversation", "") {
         bindings.extend([
-            KeyBinding::new("enter", OpenRow, Some(&context)),
-            KeyBinding::new("i", Compose, Some(&context)),
             // On a line that is not one of the user's messages these give the
             // key back to vim.
             KeyBinding::new("e", EditMessage, Some(&context)),
             KeyBinding::new("r", React, Some(&context)),
             KeyBinding::new("m", MarkUnread, Some(&context)),
-            KeyBinding::new("b", SaveForLater, Some(&context)),
         ]);
     }
-    for surface in ["RhoSlackList", "RhoSlackConversation"] {
-        for context in rho_frame::normal_contexts(surface, "") {
+    {
+        for context in rho_frame::normal_contexts("RhoSlackConversation", "") {
             bindings.extend([
                 KeyBinding::new("shift-s", FindMessage, Some(&context)),
                 KeyBinding::new("ctrl-shift-s", FindFile, Some(&context)),
-                KeyBinding::new("ctrl-p", Switch, Some(&context)),
                 KeyBinding::new("ctrl-n", NewMessage, Some(&context)),
                 // `shift-n` and not `n`: `n` is the search the reader just ran.
                 KeyBinding::new("shift-n", NextUnread, Some(&context)),
             ]);
         }
     }
-    // The composer is the end of the conversation's own buffer, so it has
-    // vim's modes: insert is where these mean what they say. With the
-    // completion menu open the keys are the menu's.
-    let insert = "RhoSlackConversation > Editor && vim_mode == insert && !showing_completions";
-    bindings.extend([
-        KeyBinding::new("enter", Send, Some(insert)),
-        KeyBinding::new("shift-enter", editor::actions::Newline, Some(insert)),
-        // `up` on an empty composer is Slack's own habit; `escape` with a
-        // rewrite open gives back what the composer held. Both fall through
-        // to the editor's answer otherwise.
-        KeyBinding::new("up", EditLast, Some(insert)),
-        KeyBinding::new("escape", CancelEdit, Some(insert)),
-    ]);
     let results = "RhoSlackResults > Editor";
     bindings.extend([
         KeyBinding::new("enter", OpenRow, Some(results)),
@@ -1405,12 +1277,6 @@ mod tests {
             "2026-08-15 00:00"
         );
         assert!(parse_mark_cutoff("last tuesday", now).is_none());
-    }
-
-    #[test]
-    fn the_edge_of_a_narrowing_reads_like_english() {
-        assert!(outside_the_narrowing(1).starts_with("slack: 1 unread conversation outside"));
-        assert!(outside_the_narrowing(3).starts_with("slack: 3 unread conversations outside"));
     }
 
     #[test]
