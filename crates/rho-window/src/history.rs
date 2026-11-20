@@ -38,11 +38,12 @@
 //! unlinked the moment they step off.
 //!
 //! And no forward step is ever lost by the machine on its own. Opening
-//! something new while the cursor is in the middle does what the old
-//! workspace history did: it appends at the end and moves the cursor there,
-//! leaving what was ahead of the reader behind them, reachable by going
-//! back. It does not truncate. That is a deliberate restoration, not an
-//! invention.
+//! something new while the cursor is in the middle appends at the end and
+//! moves the cursor there; the entry the reader opened it from goes to the
+//! end first, just behind the new one, so back returns to the screen the
+//! reader was on, not to whatever happened to be ahead of it. What was
+//! ahead of the reader stays in the list, behind them, reachable by going
+//! back. It does not truncate.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -155,6 +156,12 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         let leaving = self.cursor;
         let leaving_is_dead = self.cursor_forgotten;
         self.cursor_forgotten = false;
+        if !leaving_is_dead {
+            // Back from what opens now is where the reader opened it from,
+            // so the entry being left goes to the end first. What was ahead
+            // of it stays where it was, now behind the reader.
+            self.move_to_newest(leaving);
+        }
         let order = self.next_order;
         self.next_order += 1;
         let newest = self.newest;
@@ -306,6 +313,32 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         }
     }
 
+    /// Take `slot` from where it stands and link it as the newest entry.
+    /// The list keeps its length; only the order of `slot` moves.
+    fn move_to_newest(&mut self, slot: usize) {
+        if slot == self.newest {
+            return;
+        }
+        let (prev, next) = {
+            let entry = self.entry(slot);
+            (entry.prev, entry.next)
+        };
+        let next = next.expect("an entry that is not the newest has one after it");
+        if let Some(prev) = prev {
+            self.entry_mut(prev).next = Some(next);
+        }
+        self.entry_mut(next).prev = prev;
+        let newest = self.newest;
+        self.entry_mut(newest).next = Some(slot);
+        let order = self.next_order;
+        self.next_order += 1;
+        let entry = self.entry_mut(slot);
+        entry.prev = Some(newest);
+        entry.next = None;
+        entry.order = order;
+        self.newest = slot;
+    }
+
     fn alloc(&mut self, entry: Entry<K, S>) -> usize {
         match self.free.pop() {
             Some(slot) => {
@@ -406,10 +439,10 @@ mod tests {
         assert_eq!(history.back(), None);
     }
 
-    /// What the old workspace history did, restored deliberately: a new
-    /// open with the cursor in the middle appends at the end and takes the
-    /// cursor there. It does not truncate, so what was ahead is still
-    /// reachable — by going back, which is where it now is.
+    /// A new open with the cursor in the middle appends at the end and
+    /// takes the cursor there, with the entry it was opened from just
+    /// behind it: back is the screen before. Nothing is truncated, so what
+    /// was ahead is still reachable, by going back past it.
     #[test]
     fn opening_with_the_cursor_in_the_middle_appends_and_never_truncates() {
         let mut history = history();
@@ -426,10 +459,30 @@ mod tests {
         assert!(history.at_newest());
         assert_eq!(
             back_keys(&history),
-            ["c", "b", "a", "home"],
-            "b and c were ahead of the reader and are now behind them"
+            ["a", "c", "b", "home"],
+            "back goes to a, where d was opened from; b and c were ahead and are now behind"
         );
         assert_eq!(history.len(), 5);
+        assert_eq!((history.behind(), history.ahead()), (4, 0));
+        assert_eq!(history.back().copied(), Some(1));
+        assert_eq!(forward_keys(&history), ["d"]);
+    }
+
+    /// Two private remarks from one thread: the reader opens a note from
+    /// the thread, goes back, opens a second note. Back from the second is
+    /// the thread, not the first note.
+    #[test]
+    fn back_from_a_second_open_is_where_it_was_opened_from() {
+        let mut history = history();
+        history.show("thread", 1);
+        history.show("note one", 2);
+        history.back();
+        history.show("note two", 3);
+        assert_eq!(history.back().copied(), Some(1));
+        assert_eq!(*history.current_key(), "thread");
+        assert_eq!(history.back().copied(), Some(2));
+        assert_eq!(history.back().copied(), Some(0));
+        assert_eq!(history.back(), None);
     }
 
     #[test]
@@ -552,7 +605,7 @@ mod tests {
         assert_eq!((history.behind(), history.ahead()), (1, 1));
         history.show("home", 7);
         assert_eq!(*history.current(), 7);
-        assert_eq!(back_keys(&history), ["b", "a"]);
+        assert_eq!(back_keys(&history), ["a", "b"]);
         assert_eq!((history.behind(), history.ahead()), (2, 0));
     }
 

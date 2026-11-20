@@ -17,7 +17,7 @@ pub const EXTENSION_ID: &str = "jampgbfcmidekmapffhhlcfjaflcdpho";
 pub const EXTENSION_ORIGIN: &str = "chrome-extension://jampgbfcmidekmapffhhlcfjaflcdpho/";
 pub const HOST_NAME: &str = "dev.rho.browser";
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const SOCKET_PATH_ENV: &str = "RHO_BROWSER_SOCKET_PATH";
@@ -103,6 +103,11 @@ impl Bridge {
             socket_path: path,
             thread: Some(thread),
         })
+    }
+
+    /// Whether the extension is connected now.
+    pub fn is_connected(&self) -> bool {
+        self.inner.connection.lock().unwrap().is_some()
     }
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {

@@ -28,6 +28,18 @@ pub enum Pick {
     Menu(Rows),
 }
 
+/// Whose command a row is, for the palette's order: the screen's and the
+/// thing's under the cursor come before the window's own, which every
+/// screen has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scope {
+    /// For the screen in view, or for what the cursor is on.
+    #[default]
+    Here,
+    /// The window's own: the same on every screen.
+    Window,
+}
+
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
@@ -36,6 +48,7 @@ pub struct Row {
     /// Other words the palette finds the row by.
     pub also: Vec<String>,
     pub pick: Pick,
+    pub scope: Scope,
 }
 
 impl Row {
@@ -50,7 +63,15 @@ impl Row {
             value: None,
             also: Vec::new(),
             pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            scope: Scope::Here,
         }
+    }
+
+    /// The row is one of the window's own commands, on every screen: the
+    /// palette lists it after the screen's.
+    pub fn window_wide(mut self) -> Self {
+        self.scope = Scope::Window;
+        self
     }
 
     /// A row that reads the count typed before it: `45 m`.
@@ -65,6 +86,7 @@ impl Row {
             value: None,
             also: Vec::new(),
             pick: Pick::Run(Rc::new(run)),
+            scope: Scope::Here,
         }
     }
 
@@ -80,6 +102,7 @@ impl Row {
             value: Some(value.into()),
             also: Vec::new(),
             pick: Pick::Infix(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            scope: Scope::Here,
         }
     }
 
@@ -97,6 +120,7 @@ impl Row {
             value: None,
             also: Vec::new(),
             pick: Pick::Menu(rows),
+            scope: Scope::Here,
         }
     }
 }

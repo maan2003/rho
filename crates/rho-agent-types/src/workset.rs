@@ -62,6 +62,20 @@ pub mod props {
     pub const PARENT: &str = "parent";
     /// The chat message the agent was started from, as `chat:<seq>`.
     pub const ORIGIN: &str = "origin";
-    /// The directory a label shows.
+    /// The directory the agent works in, as it sees it: where its
+    /// notebook starts, and where a terminal or shell beside it starts.
     pub const CWD: &str = "cwd";
+    /// The repository the agent's directory was cloned from, as the user
+    /// named it: a URL or a path on the host.
+    pub const REPO: &str = "repo";
+}
+
+/// Where an agent works, as its props say: the `cwd` prop, when set. An
+/// agent without one works where its workset starts.
+pub fn agent_cwd(props: &Props) -> Option<&camino::Utf8Path> {
+    props
+        .get(props::CWD)
+        .map(|cwd| cwd.trim())
+        .filter(|cwd| !cwd.is_empty())
+        .map(camino::Utf8Path::new)
 }

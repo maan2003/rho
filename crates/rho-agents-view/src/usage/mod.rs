@@ -216,6 +216,9 @@ pub enum UsageMoved {
     Series(UsageChart),
     /// A host went, and everything it said with it.
     Host,
+    /// A host connected, or came back. A chart open now asks again: what it
+    /// asked while the host was away failed, and nothing else asks for it.
+    Connected,
 }
 
 impl UsageMoved {
@@ -223,7 +226,7 @@ impl UsageMoved {
         match self {
             Self::Quota => chart.chart == Chart::RateLimit,
             Self::Series(moved) => moved == chart,
-            Self::Host => true,
+            Self::Host | Self::Connected => true,
         }
     }
 }

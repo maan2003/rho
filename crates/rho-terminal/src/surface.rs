@@ -225,6 +225,12 @@ impl TerminalView {
         }
     }
 
+    /// Whether the keys are typed into the terminal, rather than moving
+    /// through it; the status line's mode word says which.
+    pub fn is_raw(&self) -> bool {
+        self.raw
+    }
+
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
@@ -414,17 +420,6 @@ impl Render for TerminalView {
         } else {
             None
         };
-        let normal_badge = (!self.raw).then(|| {
-            div()
-                .absolute()
-                .top_0()
-                .right_2()
-                .px_1()
-                .bg(colors.element_background)
-                .text_color(foreground.opacity(0.7))
-                .child("NORMAL")
-        });
-
         div()
             .id("rho-terminal")
             .track_focus(&self.focus_handle)
@@ -482,7 +477,6 @@ impl Render for TerminalView {
                     .flex_col()
                     .children(rows),
             )
-            .children(normal_badge)
             .children(status.map(|status| {
                 div()
                     .absolute()

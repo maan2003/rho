@@ -58,6 +58,12 @@ impl AgentIdentity {
         Some(MessageId(ChatSeq(id.parse().ok()?)))
     }
 
+    /// The repository its workset was made on, as the user named it, when
+    /// it was cloned from one.
+    pub fn repository(&self) -> Option<&str> {
+        self.prop(props::REPO)
+    }
+
     /// Whether the user manages the agent: one no other agent made.
     pub fn user_facing(&self) -> bool {
         self.parent().is_none()
@@ -84,7 +90,7 @@ impl AgentIdentity {
             WorksetKind::Isolated => camino::Utf8Path::new("/src"),
             WorksetKind::Host { cwd } => cwd.as_path(),
         };
-        let cwd = self.prop(props::CWD).map_or(start, camino::Utf8Path::new);
+        let cwd = rho_agent_types::agent_cwd(&self.entry.spec.props).unwrap_or(start);
         Place {
             cwd: cwd.to_owned(),
             workset: match self.kind {
@@ -219,6 +225,18 @@ impl TranscriptFold {
     }
 
     fn push(&mut self, told_at: Option<Wpos>, block: UiBlock) {
+        // The same notice again, such as a retry failing as the last one
+        // did, is counted on the one before.
+        if let UiBlock::Notice { text, times } = &block
+            && let Some(last) = self.blocks.last_mut()
+            && matches!(&**last, UiBlock::Notice { text: said, .. } if said == text)
+        {
+            if let UiBlock::Notice { times: said, .. } = Arc::make_mut(last) {
+                *said += times;
+            }
+            self.touch(self.blocks.len() - 1);
+            return;
+        }
         // The queue is drawn after the blocks, so a block landing moves
         // every queued row along with it.
         self.touch(self.blocks.len());
@@ -277,8 +295,10 @@ impl TranscriptFold {
         for index in self.unanswered..self.blocks.len() {
             if matches!(&*self.blocks[index], UiBlock::Tool(_)) {
                 self.report_block(index);
-                if let (Some(timing), UiBlock::Tool(tool)) =
-                    (timing, Arc::make_mut(&mut self.blocks[index]))
+                let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) else {
+                    continue;
+                };
+                if let Some(timing) = timing
                     && tool.id == timing.call.as_str()
                 {
                     tool.timing = timing.timing;
@@ -288,12 +308,49 @@ impl TranscriptFold {
         self.unanswered = self.blocks.len();
     }
 
+    /// A call whose cell ended or was cancelled stays so once reported.
     fn report_block(&mut self, index: usize) {
         self.touch(index);
-        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
+            && !matches!(
+                tool.status,
+                UiToolStatus::Success | UiToolStatus::Error | UiToolStatus::Cancelled
+            )
+        {
             tool.status = UiToolStatus::Reported;
-            tool.started_at = None;
             tool.finished_at = None;
+        }
+    }
+
+    /// The call's cell ended: `ok` or `error`, and how long it ran. One the
+    /// user cancelled stays cancelled.
+    fn end_cell(&mut self, end: &rho_agent_types::CellEnd) {
+        let Some(index) = self.blocks.iter().rposition(|block| {
+            matches!(&**block, UiBlock::Tool(tool)
+                if tool.id == end.call.as_str() && tool.status != UiToolStatus::Cancelled)
+        }) else {
+            return;
+        };
+        self.touch(index);
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+            tool.status = match end.failed {
+                true => UiToolStatus::Error,
+                false => UiToolStatus::Success,
+            };
+            tool.finished_at = Some(end.at);
+        }
+    }
+
+    /// Every call still running is over. Only a running one is copied out
+    /// of its sharing.
+    fn cancel_running(&mut self) {
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
+                && let UiBlock::Tool(tool) = Arc::make_mut(block)
+            {
+                tool.status = UiToolStatus::Cancelled;
+                self.dirty_from = Some(self.dirty_from.map_or(index, |held| held.min(index)));
+            }
         }
     }
 
@@ -341,6 +398,7 @@ impl TranscriptFold {
                     pos,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
+                        times: 1,
                     },
                 ));
             }
@@ -370,6 +428,7 @@ impl TranscriptFold {
                             Some(pos),
                             UiBlock::Notice {
                                 text: input.text.clone(),
+                                times: 1,
                             },
                         ),
                     }
@@ -381,6 +440,7 @@ impl TranscriptFold {
                         Some(pos),
                         UiBlock::Notice {
                             text: "compacting context".to_owned(),
+                            times: 1,
                         },
                     );
                 }
@@ -388,6 +448,7 @@ impl TranscriptFold {
                     self.answer_calls(timing.as_ref());
                 }
             }
+            LogEvent::CellEnded { end, .. } => self.end_cell(end),
             LogEvent::CallsEnded { calls, .. } => self.report_calls(calls),
             LogEvent::Replied {
                 items,
@@ -421,6 +482,7 @@ impl TranscriptFold {
                         Some(pos),
                         UiBlock::Notice {
                             text: "compacted".to_owned(),
+                            times: 1,
                         },
                     );
                 }
@@ -440,21 +502,25 @@ impl TranscriptFold {
                     },
                 );
             }
+            LogEvent::Cancelled { .. } => {
+                self.cancel_running();
+                self.push(
+                    Some(pos),
+                    UiBlock::Notice {
+                        text: "you cancelled the request".to_owned(),
+                        times: 1,
+                    },
+                );
+            }
             LogEvent::Stopped { error, .. } => {
                 self.errored = true;
-                // A call the agent never answered is over too. Only a
-                // running one is copied out of its sharing.
-                for block in &mut self.blocks {
-                    if matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
-                        && let UiBlock::Tool(tool) = Arc::make_mut(block)
-                    {
-                        tool.status = UiToolStatus::Cancelled;
-                    }
-                }
+                // A call the agent never answered is over too.
+                self.cancel_running();
                 self.push(
                     Some(pos),
                     UiBlock::Notice {
                         text: error.clone(),
+                        times: 1,
                     },
                 );
             }
@@ -481,6 +547,7 @@ impl TranscriptFold {
                         Some(pos),
                         UiBlock::Notice {
                             text: format!("temporary inference error: {error}; retrying"),
+                            times: 1,
                         },
                     );
                 }
@@ -807,6 +874,81 @@ mod tests {
         }
     }
 
+    fn cell_ended(call: &str, at: u64, failed: bool) -> LogEvent {
+        LogEvent::CellEnded {
+            agent: me(),
+            end: rho_agent_types::CellEnd {
+                call: rho_agent_types::transcript::ExecId::try_from(call).unwrap(),
+                at: UnixMs(at),
+                failed,
+            },
+            at: UnixMs(at + 1),
+        }
+    }
+
+    /// A cell that ended says how and how long it ran, whether a request
+    /// answered it first, after, or never (the turn ended with it). A
+    /// request does not undo it; one still running when answered is only
+    /// reported, and a cancelled one stays cancelled.
+    #[test]
+    fn a_call_says_how_its_cell_ended_and_how_long_it_ran() {
+        use UiToolStatus::{Cancelled, Error, Reported, Success};
+        let mut fold = TranscriptFold::new(
+            me(),
+            &[
+                // Ended, then answered.
+                (Wpos(0), replied(vec![call("one")], None, None, 1_000)),
+                (Wpos(1), cell_ended("one", 1_240, false)),
+                (Wpos(2), request_answering(true, 1_300)),
+                // Answered while running, then ended.
+                (Wpos(3), replied(vec![call("two")], None, None, 2_000)),
+                (Wpos(4), request_answering(true, 2_100)),
+                (Wpos(5), cell_ended("two", 9_000, true)),
+                // Ended the turn: no request follows.
+                (Wpos(6), replied(vec![call("three")], None, None, 10_000)),
+                (Wpos(7), cell_ended("three", 10_050, false)),
+                // Answered, still running.
+                (Wpos(8), replied(vec![call("four")], None, None, 11_000)),
+                (Wpos(9), request_answering(true, 11_100)),
+            ],
+        );
+        assert_eq!(tool_statuses(&fold), [Success, Error, Success, Reported]);
+        let times: Vec<_> = fold
+            .state()
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some((tool.started_at, tool.finished_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [
+                (Some(UnixMs(1_000)), Some(UnixMs(1_240))),
+                (Some(UnixMs(2_000)), Some(UnixMs(9_000))),
+                (Some(UnixMs(10_000)), Some(UnixMs(10_050))),
+                (Some(UnixMs(11_000)), None),
+            ]
+        );
+        // An end that names no call ends nothing; a cancelled call stays so.
+        fold.tell(Wpos(10), &cell_ended("nine", 11_500, false));
+        assert_eq!(tool_statuses(&fold), [Success, Error, Success, Reported]);
+        fold.tell(Wpos(11), &replied(vec![call("five")], None, None, 12_000));
+        fold.tell(
+            Wpos(12),
+            &LogEvent::Cancelled {
+                agent: me(),
+                at: UnixMs(12_100),
+            },
+        );
+        fold.tell(Wpos(13), &cell_ended("five", 12_200, true));
+        assert_eq!(
+            tool_statuses(&fold),
+            [Success, Error, Success, Reported, Cancelled]
+        );
+    }
+
     /// A request that answers closes every call since the last one that did,
     /// past a later call that ended on its own. One that does not, the
     /// compaction of a quiet agent, leaves the call open.
@@ -1035,11 +1177,70 @@ mod tests {
                     phase: None
                 }),
                 Arc::new(UiBlock::Notice {
-                    text: "temporary inference error: overloaded; retrying".to_owned()
+                    text: "temporary inference error: overloaded; retrying".to_owned(),
+                    times: 1,
                 }),
                 Arc::new(UiBlock::Notice {
-                    text: "quota".to_owned()
+                    text: "quota".to_owned(),
+                    times: 1,
                 }),
+            ]
+        );
+    }
+
+    /// A cancel is said where it happened, and ends the call that ran.
+    #[test]
+    fn a_cancel_is_said_and_ends_what_ran() {
+        let state = told(vec![
+            replied(vec![call("long")], None, None, 1),
+            LogEvent::Cancelled {
+                agent: me(),
+                at: UnixMs(2),
+            },
+        ]);
+        assert_eq!(only_tool(&state).status, UiToolStatus::Cancelled);
+        assert_eq!(
+            *state.blocks[1],
+            UiBlock::Notice {
+                text: "you cancelled the request".to_owned(),
+                times: 1,
+            }
+        );
+        assert_ne!(state.status, UiAgentStatus::Error, "a cancel is no failure");
+    }
+
+    /// A retry that fails as the one before did reads once, counted; a
+    /// different error, or the same after something else, reads again.
+    #[test]
+    fn the_same_error_again_is_counted_on_one_line() {
+        let failed = |error: &str, at: u64| LogEvent::Failed {
+            agent: me(),
+            text: String::new(),
+            error: error.to_owned(),
+            retrying: true,
+            at: UnixMs(at),
+        };
+        let state = told(vec![
+            failed("overloaded", 1),
+            failed("overloaded", 2),
+            failed("overloaded", 3),
+            failed("timed out", 4),
+            failed("overloaded", 5),
+        ]);
+        let notices: Vec<_> = state
+            .blocks
+            .iter()
+            .map(|block| match &**block {
+                UiBlock::Notice { text, times } => (text.as_str(), *times),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                ("temporary inference error: overloaded; retrying", 3),
+                ("temporary inference error: timed out; retrying", 1),
+                ("temporary inference error: overloaded; retrying", 1),
             ]
         );
     }

@@ -1,16 +1,14 @@
-//! The palette: every place and every command by name, in one prompt.
+//! `:`: every command and every place by name, in one prompt.
 //!
 //! The menus are data ([`Rows`]), so the commands are the same rows read
-//! another way: flattened to one list, found by a fuzzy query instead of
-//! a key. A command keeps the key it has in the menus as a hint beside
-//! its name, so the palette teaches the keys it replaces. The places are
-//! what every system's `find` lists, each with where it is beside it.
-//! `:` and `ctrl-shift-f` open the same list, and differ only in which
-//! of the two comes first until the query tells them apart.
+//! another way: flattened to one list, found by a query instead of a key.
+//! A command keeps the key it has in the menus as a hint beside its name,
+//! so the palette teaches the keys it replaces. The places are what every
+//! system's `find` lists, each with where it is beside it.
 
 use std::cmp::Reverse;
 
-use crate::menu::{Pick, Rows};
+use crate::menu::{Pick, Row, Rows, Scope};
 use crate::system::Found;
 
 /// The rows the palette shows at most: eight are in view at once and the
@@ -21,53 +19,67 @@ const LISTED: usize = 100;
 /// One command in the palette.
 pub(crate) struct Entry {
     /// What the reader types toward: the row's words, under the menus
-    /// above it (`hosts › attach`).
+    /// above it (`hosts › attach`). Unique in the list.
     pub label: String,
-    /// The keys that reach it through the menus (`shift-h a`).
-    pub keys: String,
-    /// Other words it is found by (see [`crate::menu::Row::also`]).
+    /// Other words it is found by (see [`Row::also`]).
     pub also: Vec<String>,
+    /// The keys that reach it inside the menus above it once the first of
+    /// them is open (`a` in `hosts › attach`); none for the top of the list,
+    /// which no menu holds.
+    pub keys: String,
     pub pick: Pick,
+    /// Whose it is: a row under a menu is its top row's.
+    pub scope: Scope,
 }
 
-/// Every row of `rows` and of the menus under them, each menu as an
-/// entry of its own too, since some menus are the information (the agents
-/// to join, the times to snooze until).
-pub(crate) fn flatten(rows: &Rows) -> Vec<Entry> {
+/// Every row of `top` and of the menus under them, each menu as an entry
+/// of its own too, since some menus are the information (the agents to
+/// join, the times to snooze until).
+pub(crate) fn flatten(top: &[Row]) -> Vec<Entry> {
     let mut entries = Vec::new();
-    walk(rows, "", "", &mut entries);
+    for row in top {
+        entries.push(Entry {
+            label: row.description.clone(),
+            also: row.also.clone(),
+            keys: String::new(),
+            pick: row.pick.clone(),
+            scope: row.scope,
+        });
+        if let Pick::Menu(rows) = &row.pick {
+            walk(rows, &row.description, "", row.scope, &mut entries);
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for entry in &mut entries {
+        let base = entry.label.clone();
+        let mut nth = 1;
+        while seen.contains(&entry.label) {
+            nth += 1;
+            entry.label = format!("{base} ({nth})");
+        }
+        seen.push(entry.label.clone());
+    }
     entries
 }
 
-fn walk(rows: &Rows, label_above: &str, keys_above: &str, into: &mut Vec<Entry>) {
+fn walk(rows: &Rows, label_above: &str, keys_above: &str, scope: Scope, into: &mut Vec<Entry>) {
     for row in &rows.rows {
-        let label = match label_above.is_empty() {
-            true => row.description.clone(),
-            false => format!("{label_above} › {}", row.description),
-        };
+        let label = format!("{label_above} › {}", row.description);
         let keys = match keys_above.is_empty() {
             true => row.key.clone(),
             false => format!("{keys_above} {}", row.key),
         };
         into.push(Entry {
             label: label.clone(),
-            keys: keys.clone(),
             also: row.also.clone(),
+            keys: keys.clone(),
             pick: row.pick.clone(),
+            scope,
         });
         if let Pick::Menu(rows) = &row.pick {
-            walk(rows, &label, &keys, into);
+            walk(rows, &label, &keys, scope, into);
         }
     }
-}
-
-/// Which half of the list the reader opened the palette for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum First {
-    /// `:`.
-    Commands,
-    /// `ctrl-shift-f`.
-    Places,
 }
 
 /// One row of the palette.
@@ -94,10 +106,19 @@ impl Choice {
         }
     }
 
-    fn half(&self) -> First {
+    /// Where the row stands when it answers no better than another: the
+    /// screen's commands, then the places, then the window's own commands
+    /// (`window.Palette`).
+    fn group(&self) -> u8 {
         match self {
-            Choice::Command(_) => First::Commands,
-            Choice::Place(_) => First::Places,
+            Choice::Command(Entry {
+                scope: Scope::Here, ..
+            }) => 0,
+            Choice::Place(_) => 1,
+            Choice::Command(Entry {
+                scope: Scope::Window,
+                ..
+            }) => 2,
         }
     }
 
@@ -128,11 +149,11 @@ impl Choice {
         inside(query, self.name()).then_some((1, 0))
     }
 
-    /// The order among rows of one half that answer alike: the shorter
-    /// command first, the newer place first.
+    /// The order among rows of one group that answer alike: commands as
+    /// they were offered, the newer place first.
     fn order(&self) -> u64 {
         match self {
-            Choice::Command(entry) => entry.label.chars().count() as u64,
+            Choice::Command(_) => 0,
             Choice::Place(found) => u64::MAX - found.recency,
         }
     }
@@ -141,24 +162,24 @@ impl Choice {
 /// What one opening of the palette lists.
 pub(crate) struct Listing {
     pub choices: Vec<Choice>,
-    first: First,
 }
 
 impl Listing {
-    pub(crate) fn new(commands: Vec<Entry>, places: Vec<Found>, first: First) -> Self {
+    pub(crate) fn new(commands: Vec<Entry>, places: Vec<Found>) -> Self {
         let choices = commands
             .into_iter()
             .map(Choice::Command)
             .chain(places.into_iter().map(Choice::Place))
             .collect();
-        Self { choices, first }
+        Self { choices }
     }
 
     /// The rows that answer `query`, as indices into `choices`, best
-    /// first: the better match (see [`Choice::answers`]), then the half the
-    /// palette was opened for, then the shorter command or the newer place.
-    /// With nothing typed every row answers alike, so the opened-for half
-    /// comes first, in its own order.
+    /// first: the better way of answering (see [`Choice::answers`]), then
+    /// the closer match, then the screen's commands, the places and the
+    /// window's commands in that order, then the order within each. With
+    /// nothing typed every row answers alike, so the screen's commands
+    /// come first, then the places newest first, then the window's.
     pub(crate) fn rank(&self, query: &str) -> Vec<usize> {
         let mut found: Vec<_> = self
             .choices
@@ -168,8 +189,8 @@ impl Listing {
                 let (how, score) = choice.answers(query)?;
                 Some((
                     Reverse(how),
-                    choice.half() != self.first,
                     Reverse(score),
+                    choice.group(),
                     choice.order(),
                     index,
                 ))
@@ -253,18 +274,22 @@ mod tests {
     use rho_dealer::Address;
 
     use super::*;
-    use crate::menu::Row;
 
     #[test]
-    fn menus_flatten_to_paths_with_their_keys() {
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("h", "home", |_, _, _| {}));
+    fn the_top_shows_no_key_and_a_menu_shows_its_own() {
         let mut hosts = Rows::new("hosts");
         hosts.push(Row::run("a", "attach", |_, _, _| {}));
-        hosts.push(Row::run("d", "detach", |_, _, _| {}));
-        rows.push(Row::menu("shift-h", "hosts", hosts));
-        rows.push(Row::run("x", "home", |_, _, _| {}));
-        let entries = flatten(&rows);
+        let mut deeper = Rows::new("deeper");
+        deeper.push(Row::run("x", "leaf", |_, _, _| {}));
+        hosts.push(Row::menu("d", "deeper", deeper));
+        // Two top rows on one key, and one name twice: none is dropped.
+        let top = vec![
+            Row::run("h", "home", |_, _, _| {}),
+            Row::menu("shift-h", "hosts", hosts),
+            Row::run("h", "pair this device", |_, _, _| {}),
+            Row::run("", "home", |_, _, _| {}),
+        ];
+        let entries = flatten(&top);
         let seen: Vec<(&str, &str)> = entries
             .iter()
             .map(|entry| (entry.label.as_str(), entry.keys.as_str()))
@@ -272,11 +297,13 @@ mod tests {
         assert_eq!(
             seen,
             [
-                ("home", "h"),
-                ("hosts", "shift-h"),
-                ("hosts › attach", "shift-h a"),
-                ("hosts › detach", "shift-h d"),
-                ("home", "x"),
+                ("home", ""),
+                ("hosts", ""),
+                ("hosts › attach", "a"),
+                ("hosts › deeper", "d"),
+                ("hosts › deeper › leaf", "d x"),
+                ("pair this device", ""),
+                ("home (2)", ""),
             ]
         );
     }
@@ -308,16 +335,8 @@ mod tests {
         assert_eq!(word_starts("new ch", "new channel"), Some(-2));
     }
 
-    fn command(label: &str) -> Entry {
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("k", label, |_, _, _| {}));
-        flatten(&rows).remove(0)
-    }
-
-    fn command_also(label: &str, also: &str) -> Entry {
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("k", label, |_, _, _| {}).also(also));
-        flatten(&rows).remove(0)
+    fn command(label: &str) -> Row {
+        Row::run("", label, |_, _, _| {})
     }
 
     fn place(title: &str, description: &str, recency: u64) -> Found {
@@ -329,16 +348,19 @@ mod tests {
         }
     }
 
-    fn listing(first: First) -> Listing {
+    fn listing() -> Listing {
+        let mut hosts = Rows::new("hosts");
+        hosts.push(Row::run("a", "attach", |_, _, _| {}));
+        let commands = flatten(&[
+            command("home").window_wide(),
+            Row::menu("", "hosts", hosts).window_wide(),
+            command("show my secret phrase").window_wide(),
+            command("start agent here"),
+            command("start agent, choosing where and runtime…"),
+            command("name this thread").also("rename"),
+        ]);
         Listing::new(
-            vec![
-                command("start agent here"),
-                command("home"),
-                command("hosts › attach"),
-                command("start agent, choosing where and runtime…"),
-                command_also("name this thread", "rename"),
-                command("show my secret phrase"),
-            ],
+            commands,
             vec![
                 place("privacy VM", "rho › infra", 10),
                 place("#sales-8", "slack · acme", 30),
@@ -346,7 +368,6 @@ mod tests {
                 place("debug", "infra › deploys", 40),
                 place("sol", "rho · waiting", 5),
             ],
-            first,
         )
     }
 
@@ -362,112 +383,80 @@ mod tests {
     }
 
     #[test]
-    fn nothing_typed_lists_the_opened_half_first_each_in_its_own_order() {
+    fn nothing_typed_lists_the_screens_commands_then_places_then_the_windows() {
         assert_eq!(
-            names(&listing(First::Commands), ""),
+            names(&listing(), ""),
             [
-                "home | k",
-                "hosts › attach | k",
-                // As long as `name this thread`: the order they came in.
-                "start agent here | k",
-                "name this thread | k",
-                "show my secret phrase | k",
-                "start agent, choosing where and runtime… | k",
+                "start agent here | ",
+                "start agent, choosing where and runtime… | ",
+                "name this thread | ",
                 "debug | infra › deploys",
                 "#sales-8 | slack · acme",
                 "debug | rho · channel",
                 "privacy VM | rho › infra",
                 "sol | rho · waiting",
-            ]
-        );
-        assert_eq!(
-            names(&listing(First::Places), "")[..6],
-            [
-                "debug | infra › deploys",
-                "#sales-8 | slack · acme",
-                "debug | rho · channel",
-                "privacy VM | rho › infra",
-                "sol | rho · waiting",
-                "home | k",
+                "home | ",
+                "hosts | ",
+                "hosts › attach | a",
+                "show my secret phrase | ",
             ]
         );
     }
 
     #[test]
-    fn typing_narrows_across_both_halves() {
-        // `:` then a thread's name finds the thread, and nothing else.
+    fn typing_narrows_across_commands_and_places() {
+        // A thread's name finds the thread, and nothing else.
+        assert_eq!(names(&listing(), "privacy"), ["privacy VM | rho › infra"]);
+        // One run that begins a word answers better than two; between
+        // two rows that answer alike, the screen's command comes first.
         assert_eq!(
-            names(&listing(First::Commands), "privacy"),
-            ["privacy VM | rho › infra"]
-        );
-        // `sa` answers a command and a place alike; the half the palette
-        // was opened for comes first.
-        assert_eq!(
-            names(&listing(First::Commands), "sa"),
-            [
-                "start agent here | k",
-                "start agent, choosing where and runtime… | k",
-                "#sales-8 | slack · acme",
-            ]
-        );
-        assert_eq!(
-            names(&listing(First::Places), "sa"),
+            names(&listing(), "sa"),
             [
                 "#sales-8 | slack · acme",
-                "start agent here | k",
-                "start agent, choosing where and runtime… | k",
+                "start agent here | ",
+                "start agent, choosing where and runtime… | ",
             ]
         );
+        assert_eq!(names(&listing(), "ho")[..2], ["home | ", "hosts | "]);
     }
 
     #[test]
     fn a_rare_command_is_found_by_its_word_and_nothing_else_answers() {
-        assert_eq!(
-            names(&listing(First::Commands), "rename"),
-            ["name this thread | k"]
-        );
-        assert_eq!(
-            names(&listing(First::Commands), "secret"),
-            ["show my secret phrase | k"]
-        );
-        assert!(names(&listing(First::Commands), "pair").is_empty());
+        assert_eq!(names(&listing(), "rename"), ["name this thread | "]);
+        assert_eq!(names(&listing(), "secret"), ["show my secret phrase | "]);
+        assert!(names(&listing(), "pair").is_empty());
     }
 
     #[test]
     fn letters_inside_a_word_answer_last() {
         let listing = Listing::new(
-            vec![command("deploy now")],
+            flatten(&[command("deploy now")]),
             vec![place("redeploy", "rho › infra", 1)],
-            First::Places,
         );
         // `deploy` begins a word of the command and is inside the place's.
         assert_eq!(
             names(&listing, "deploy"),
-            ["deploy now | k", "redeploy | rho › infra"]
+            ["deploy now | ", "redeploy | rho › infra"]
         );
         // Two letters inside a word are chance, not an answer.
-        assert_eq!(names(&listing, "pl"), Vec::<String>::new());
+        assert!(names(&listing, "pl").is_empty());
     }
 
     #[test]
     fn a_place_answers_by_where_it_is_when_its_name_does_not() {
-        assert_eq!(
-            names(&listing(First::Places), "waiting"),
-            ["sol | rho · waiting"]
-        );
+        assert_eq!(names(&listing(), "waiting"), ["sol | rho · waiting"]);
         // Both threads called `debug` are listed, newest first, each with
         // its channel beside it.
         assert_eq!(
-            names(&listing(First::Places), "debug"),
+            names(&listing(), "debug"),
             ["debug | infra › deploys", "debug | rho · channel"]
         );
     }
 
     #[test]
     fn a_name_that_answers_beats_a_where_that_answers() {
-        // `ops` begins no word of `@Rob Pike` and only `slack` and `acme`
-        // of where it is, which is not in order; `sol` answers `sol` by
-        // name, and `rho · ops` answers it only by where it is.
+        // `ops` begins no word of `@Rob Pike` and is not in order in where
+        // it is; `deploy` answers only by where it is, after `ops`.
         let listing = Listing::new(
             Vec::new(),
             vec![
@@ -475,7 +464,6 @@ mod tests {
                 place("deploy", "rho › ops", 40),
                 place("ops", "qa · channel", 1),
             ],
-            First::Places,
         );
         assert_eq!(
             names(&listing, "ops"),
@@ -488,7 +476,7 @@ mod tests {
         let places = (0..LISTED as u64 + 20)
             .map(|at| place(&format!("thread {at}"), "rho", at))
             .collect();
-        let listing = Listing::new(Vec::new(), places, First::Places);
+        let listing = Listing::new(Vec::new(), places);
         let ranked = listing.rank("");
         assert_eq!(ranked.len(), LISTED);
         assert_eq!(

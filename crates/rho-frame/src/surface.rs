@@ -20,6 +20,16 @@ pub enum Subject {
     None,
 }
 
+/// Where the keys go on a surface that keeps a mode of its own rather
+/// than being a buffer: what the status line's mode word says for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The keys move through the screen.
+    Normal,
+    /// The keys are typed into the screen.
+    Insert,
+}
+
 /// A view the frame can show. Its address is the frame's to know; the
 /// surface says what it is called, what it is a buffer of, and what the
 /// point is on.
@@ -36,11 +46,25 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         Subject::Own
     }
 
+    /// The mode the surface is in, for a surface that keeps its own;
+    /// `None` leaves the mode word to the editor that has the keys.
+    fn mode(&self, _cx: &App) -> Option<Mode> {
+        None
+    }
+
     /// The card a verdict pressed over the surface is about: what holds
     /// the subject as the dealer counts it. A thread is one card wherever
     /// the point is in it; a list's row is its own card.
     fn card(&self, cx: &App) -> Subject {
         self.subject(cx)
+    }
+
+    /// What the status line calls the surface while it is the card in
+    /// view. By default the card's own heading; a surface that knows where
+    /// the point is in it, such as the message under the cursor, says that
+    /// instead.
+    fn heading(&self, _cx: &App) -> Option<String> {
+        None
     }
 
     /// The surface's own rows for the palette, for what is in view.
@@ -56,7 +80,9 @@ trait SurfaceHandle {
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subject(&self, cx: &App) -> Subject;
+    fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
+    fn heading(&self, cx: &App) -> Option<String>;
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
 }
 
@@ -85,8 +111,16 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).subject(cx)
     }
 
+    fn mode(&self, cx: &App) -> Option<Mode> {
+        self.read(cx).mode(cx)
+    }
+
     fn card(&self, cx: &App) -> Subject {
         self.read(cx).card(cx)
+    }
+
+    fn heading(&self, cx: &App) -> Option<String> {
+        self.read(cx).heading(cx)
     }
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
@@ -127,8 +161,16 @@ impl AnySurface {
         self.0.subject(cx)
     }
 
+    pub fn mode(&self, cx: &App) -> Option<Mode> {
+        self.0.mode(cx)
+    }
+
     pub fn card(&self, cx: &App) -> Subject {
         self.0.card(cx)
+    }
+
+    pub fn heading(&self, cx: &App) -> Option<String> {
+        self.0.heading(cx)
     }
 
     pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {

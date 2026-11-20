@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
@@ -24,10 +25,12 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+redb.workspace = true
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agent-types.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-chat = { workspace = true, features = ["ui"] }
+rho-db.workspace = true
 rho-desktop-client = { workspace = true, features = ["ui"] }
 rho-frame.workspace = true
 rho-rpc.workspace = true
@@ -35,6 +38,7 @@ rho-shell-view = { workspace = true, features = ["ui"] }
 rho-terminal = { workspace = true, features = ["ui"] }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
+senax-encoder.workspace = true
 serde_json.workspace = true
 settings = { path = "../../vendor/zed/crates/settings" }
 text = { path = "../../vendor/zed/crates/text" }

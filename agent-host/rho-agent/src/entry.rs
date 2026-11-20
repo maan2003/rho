@@ -30,8 +30,6 @@ pub enum Wake {
     Prose,
     /// The host restarted; everything running is gone.
     Restarted,
-    /// The model's history branched; notebook state was not changed.
-    Rewound,
     /// Ask the provider to compact the current context.
     Compaction,
     /// Carry on after a compaction that interrupted owed work.
@@ -46,6 +44,9 @@ pub enum Notice {
     Stopped(String),
     Archived,
     FreshNotebook,
+    /// The user cancelled what was in flight: a request, a retry, or a
+    /// cell.
+    Cancelled,
 }
 
 /// What one request says, by role.

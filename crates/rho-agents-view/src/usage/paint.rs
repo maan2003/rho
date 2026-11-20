@@ -19,7 +19,7 @@ use theme::ActiveTheme as _;
 const MIN_CHART_HEIGHT: Pixels = px(220.);
 
 /// What the chart is not allowed to use: the frame's chrome, the header's
-/// two lines, the legend above the chart and the day labels under it.
+/// lines (title, totals and legend) and the day labels under the chart.
 const CHART_CHROME: Pixels = px(150.);
 
 /// What the block paints: already the size of the picture.
@@ -28,6 +28,20 @@ pub(super) enum Summary {
     Cost(CostSummary),
     Share(ShareSummary),
     AgentCost(AgentCostSummary),
+}
+
+impl Summary {
+    /// What each colour in the picture stands for. It is the buffer's
+    /// text, not the picture's, so the point can rest on it and a search
+    /// finds an account by name.
+    pub(super) fn legend(&self) -> &[Legend] {
+        match self {
+            Summary::Quota(quota) => &quota.legend,
+            Summary::Cost(cost) => &cost.legend,
+            Summary::Share(share) => &share.legend,
+            Summary::AgentCost(_) => &[],
+        }
+    }
 }
 
 /// How many points the chart can show: the window's width, since the chart
@@ -83,8 +97,8 @@ pub(super) fn chart_block(
 /// font that is not the buffer's; the axis labels, the end labels and any
 /// word added here would draw black on a dark theme and in the wrong face.
 /// Setting it at the root rather than per element is what makes that true of
-/// the next label as well as these — a legend entry that wants its series'
-/// colour still says so and wins, because a child overrides its parent.
+/// the next label as well as these — a label that wants its series' colour
+/// still says so and wins, because a child overrides its parent.
 fn render_chart(summary: &Summary, height: Pixels, text_style: &TextStyle, cx: &App) -> AnyElement {
     let chart = match summary {
         Summary::Quota(quota) => render_quota(quota, height, cx),
@@ -112,7 +126,6 @@ fn render_quota(summary: &QuotaSummary, height: Pixels, cx: &App) -> AnyElement 
     div()
         .flex()
         .flex_col()
-        .child(legend_row(&summary.legend, cx))
         .child(
             axis_row(
                 height,
@@ -157,7 +170,6 @@ fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .child(legend_row(&summary.legend, cx))
         .child(
             axis_row(
                 height,
@@ -198,20 +210,6 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
         color_of(SeriesColor::Terra, cx),
         color_of(SeriesColor::Luna, cx),
     ];
-    let legend = [
-        (SeriesColor::Fable, "fable", summary.latest[0]),
-        (SeriesColor::Opus, "opus", summary.latest[3]),
-        (SeriesColor::Gpt, "gpt", summary.latest[1]),
-        (SeriesColor::Astra, "astra", summary.latest[2]),
-        (SeriesColor::Luna, "luna", summary.latest[5]),
-        (SeriesColor::Terra, "terra", summary.latest[4]),
-    ]
-    .into_iter()
-    .map(|(color, model, share)| Legend {
-        color,
-        label: format!("{model} {:.0}%", share * 100.0),
-    })
-    .collect::<Vec<_>>();
     let columns = summary
         .columns
         .iter()
@@ -222,7 +220,6 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
     div()
         .flex()
         .flex_col()
-        .child(legend_row(&legend, cx))
         .child(
             axis_row(
                 height,
@@ -306,20 +303,6 @@ fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> An
         .into_any_element()
 }
 
-/// The legend: one coloured label per series, in the order the summary put
-/// them.
-fn legend_row(legend: &[Legend], cx: &App) -> gpui::Div {
-    div()
-        .flex()
-        .gap_4()
-        .px_2()
-        .children(legend.iter().map(|entry| {
-            div()
-                .text_color(color_of(entry.color, cx))
-                .child(entry.label.clone())
-        }))
-}
-
 /// A chart with its axes: the value labels down the left, the chart itself,
 /// and how far back the left edge is under it.
 fn axis_row(
@@ -370,7 +353,7 @@ fn axis_row(
         )
 }
 
-fn color_of(color: SeriesColor, cx: &App) -> Hsla {
+pub(super) fn color_of(color: SeriesColor, cx: &App) -> Hsla {
     let colors = cx.theme().colors();
     match color {
         // Anthropic's own orange: the one colour here that is not the

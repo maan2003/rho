@@ -180,7 +180,7 @@ pub(crate) fn command(
             state.finished = Some(UnixMs::now());
             state.failed = failed;
             drop(state);
-            crate::source::retain_ended(&job);
+            shared_for_work.ended_logs.retain(&job);
             process.done.send_replace(true);
             wake.notify_one();
             result

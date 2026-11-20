@@ -101,14 +101,18 @@ pub struct Host<'a> {
     /// What an agent is doing and since when, as its host last said;
     /// `None` while it has said nothing.
     pub doing: &'a dyn Fn(AgentId) -> Option<Doing>,
+    /// Why an agent stopped, in its host's few words, such as `not logged
+    /// in`; `None` when it said none.
+    pub reason: &'a dyn Fn(AgentId) -> Option<String>,
 }
 
-/// One agent's stop, and when it began.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One agent's stop, when it began, and why, when its host said.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stopped {
     pub agent: AgentId,
     pub stop: Stop,
     pub since: UnixMs,
+    pub reason: Option<String>,
 }
 
 /// The stops the agents of a host are in now, by the thread each draws
@@ -130,6 +134,7 @@ pub fn stops(host: &Host<'_>, now: Timestamp) -> BTreeMap<MessageId, Vec<Stopped
                 agent,
                 stop,
                 since: doing.since,
+                reason: (host.reason)(agent),
             });
     }
     stops
@@ -325,8 +330,26 @@ fn waiting_on(stop: &Stopped) -> (Timestamp, Curve, String) {
             head_start: curve::AGENT_BLOCKED_HEAD_START,
             since,
         },
-        format!("{} · {{age}}", stop.stop.word()),
+        match &stop.reason {
+            Some(reason) => format!("{} · {{age}} · {}", stop.stop.word(), brief(reason)),
+            None => format!("{} · {{age}}", stop.stop.word()),
+        },
     )
+}
+
+/// A reason short enough to sit after a card's age: the first words of
+/// its first line, cut with `…`.
+fn brief(reason: &str) -> String {
+    const MOST: usize = 40;
+    let line = reason
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    match line.char_indices().nth(MOST) {
+        None => line.to_owned(),
+        Some((end, _)) => format!("{}…", line[..end].trim_end()),
+    }
 }
 
 /// Whether the user works in a channel: they made it or wrote in it, or
@@ -418,6 +441,8 @@ mod tests {
         hosts: usize,
         /// What each agent is doing, as its host last said.
         doing: HashMap<AgentId, Doing>,
+        /// Why each stopped agent stopped, when its host said.
+        reasons: HashMap<AgentId, String>,
     }
 
     fn mins(n: i64) -> SignedDuration {
@@ -443,6 +468,7 @@ mod tests {
                 .to_zoned(jiff::tz::TimeZone::UTC),
             hosts: 1,
             doing: HashMap::new(),
+            reasons: HashMap::new(),
         }
     }
 
@@ -621,12 +647,14 @@ mod tests {
         fn seen_now(&self, thread: MessageId) -> Seen {
             let alive = |_: AgentId| true;
             let doing = |agent: AgentId| self.doing.get(&agent).copied();
+            let reason = |agent: AgentId| self.reasons.get(&agent).cloned();
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: None,
                 alive: &alive,
                 doing: &doing,
+                reason: &reason,
             };
             let newest = self.chat.newest_in(thread).map_or(0, |(id, _)| id.0.0);
             match stops(&host, self.now.timestamp())
@@ -656,12 +684,14 @@ mod tests {
         fn deal(&self) -> Hand {
             let alive = |agent: AgentId| !self.gone.contains(&agent);
             let doing = |agent: AgentId| self.doing.get(&agent).copied();
+            let reason = |agent: AgentId| self.reasons.get(&agent).cloned();
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: (self.hosts > 1).then_some("laptop"),
                 alive: &alive,
                 doing: &doing,
+                reason: &reason,
             };
             let claims = claims(&host, &self.marks, self.now.timestamp(), None);
             let names = |address: &Address| {
@@ -995,6 +1025,26 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_says_why_in_its_hosts_few_words() {
+        let mut w = world();
+        let a = w.agent("a");
+        let b = w.agent("b");
+        w.turns(a, Activity::Failed);
+        w.reasons.insert(w.agents[&a], "not logged in".to_owned());
+        w.turns(b, Activity::Lost);
+        w.reasons.insert(
+            w.agents[&b],
+            "the workset process exited with signal 9 while it ran a cell".to_owned(),
+        );
+        w.pass(mins(2));
+        assert_eq!(
+            w.hand(),
+            "rho › a · failed · 2m · not logged in\n\
+             rho › b · lost · 2m · the workset process exited with signal 9…"
+        );
+    }
+
+    #[test]
     fn a14_the_card_is_the_first_thread_the_agent_joined() {
         let mut w = world();
         let a = w.agent("a");
@@ -1147,7 +1197,7 @@ mod tests {
         };
         let worked = |w: &World, root| worked_in(&w.chat, EndpointId([0; 32]), root, &w.marks);
 
-        let made = w.post(None, Party::User, Vec::new(), "fedi");
+        let made = w.post(None, Party::User, Vec::new(), "tide");
         assert!(worked(&w, made), "the user made it");
 
         let deploy = w.post(None, deployer, Vec::new(), "deploy 41");

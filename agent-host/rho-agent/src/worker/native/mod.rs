@@ -19,7 +19,8 @@ mod tests;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, ContentPart, MessageId, Role, UnixMs, Wpos};
+use rho_agent_types::transcript::ExecId;
+use rho_agent_types::{AgentId, CellEnd, ContentPart, MessageId, Role, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -216,6 +217,8 @@ struct Latest {
     cell: CellHandle,
     call: Call,
     published: bool,
+    /// Whether the transcript has been told how the cell ended.
+    end_told: bool,
 }
 
 /// The call of the step in progress, as its code arrives.
@@ -230,8 +233,8 @@ enum Stopped {
     /// Three steps in a row without a call, or a cancel: only the human
     /// wakes it.
     Quiet,
-    /// Model requests kept failing: the human or a retry wakes it.
-    Failed(Arc<str>),
+    /// Model requests kept failing, at `at`: the human or a retry wakes it.
+    Failed { error: Arc<str>, at: UnixMs },
 }
 
 /// Owned request boundary. Concurrent controls update the live context, never
@@ -630,9 +633,11 @@ impl Agent {
         self.cell = None;
         self.progress.told_returned = false;
         self.interrupted = false;
-        self.awaiting = false;
+        // The turn is taken back, and none starts in its place: the agent
+        // waits for the user, who is told so at the next request.
+        self.awaiting = true;
         self.progress.prose = 0;
-        self.stopped = None;
+        self.stopped = Some(Stopped::Quiet);
         self.restarted = false;
         self.rewound = true;
         self.compaction = cursor.compaction;
@@ -774,7 +779,6 @@ impl Agent {
             human: self.waiting.oldest(Role::User),
             agent: self.waiting.oldest(Role::Tool),
             prose: self.progress.prose > 0 || self.retry,
-            rewound: self.rewound,
             compaction: self.compaction.pending,
             compaction_reply: self.compaction.reply,
             archived: self.archived,
@@ -853,8 +857,10 @@ impl Agent {
         if self.restarted {
             notices.push(RequestNotice::Restarted);
         }
+        if std::mem::take(&mut self.rewound) {
+            notices.push(RequestNotice::Rewound);
+        }
         match why {
-            Wake::Rewound => notices.push(RequestNotice::Rewound),
             Wake::Prose if self.progress.prose > 0 => {
                 notices.push(RequestNotice::PreviousResponseHadNoExec)
             }
@@ -918,6 +924,7 @@ impl Agent {
             })
             .await?;
         }
+        self.tell_cell_end().await?;
         self.log(Event::Request {
             agent: self.agent_id,
             output: taken.output,
@@ -930,7 +937,6 @@ impl Agent {
         .await?;
         if !quiet {
             self.restarted = false;
-            self.rewound = false;
             self.progress.ended = false;
         }
         if let Some(notebook) = &self.notebook {
@@ -1039,12 +1045,12 @@ impl Agent {
                 Err(error) => {
                     let retryable = crate::inference::is_retryable(&error);
                     let error = format!("{error:#}");
-                    self.notice(Notice::Error(error.clone())).await?;
                     // Code that already ran cannot be taken back: it stands
                     // as the step, and the model hears it was cut off.
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
                         && let Some(ran) = latest.cell.interrupt()
                     {
+                        self.notice(Notice::Error(error.clone())).await?;
                         Err((
                             streaming.carry,
                             streaming.code[..ran.min(streaming.code.len())].to_owned(),
@@ -1055,7 +1061,10 @@ impl Agent {
                         if self.archived {
                             return self.revive_if_written().await;
                         }
+                        // Only a failure the agent retries says so; one it
+                        // stops on is said once, as its stop.
                         if retryable {
+                            self.notice(Notice::Error(error.clone())).await?;
                             self.backoff = Some(Backoff::failed(previous_backoff, error));
                             return Ok(());
                         }
@@ -1121,6 +1130,7 @@ impl Agent {
                     cell,
                     call,
                     published: false,
+                    end_told: false,
                 });
                 self.progress.told_returned = false;
             }
@@ -1155,13 +1165,22 @@ impl Agent {
     /// Model requests kept failing: stop until someone writes or retries.
     async fn fail(&mut self, error: String) -> anyhow::Result<()> {
         self.backoff = None;
-        self.stopped = Some(Stopped::Failed(Arc::from(error.as_str())));
+        self.stopped = Some(Stopped::Failed {
+            error: Arc::from(error.as_str()),
+            at: UnixMs::now(),
+        });
         self.flush().await?;
         self.turn_ended(TurnEnd::Failed, Some(error));
         Ok(())
     }
 
     async fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
+        let in_flight = self.responding
+            || self.backoff.is_some()
+            || self
+                .cell
+                .as_ref()
+                .is_some_and(|latest| latest.cell.facts().finished.is_none());
         self.backoff = None;
         if let Some(notebook) = &self.notebook {
             notebook.cancel();
@@ -1183,6 +1202,9 @@ impl Agent {
             })
             .await?;
         }
+        if in_flight {
+            self.notice(Notice::Cancelled).await?;
+        }
         Ok(())
     }
 
@@ -1200,6 +1222,7 @@ impl Agent {
                 cell: notebook.stream(),
                 call: carry.with_code(String::new()),
                 published: false,
+                end_told: false,
             });
             self.progress.told_returned = false;
             *streaming = Some(Streaming {
@@ -1274,9 +1297,10 @@ impl Agent {
             }
         } else if self.responding {
             InferenceState::Responding
-        } else if let Some(Stopped::Failed(error)) = &self.stopped {
+        } else if let Some(Stopped::Failed { error, at }) = &self.stopped {
             InferenceState::Failed {
                 error: error.to_string(),
+                since: Some(*at),
             }
         } else {
             InferenceState::Idle
@@ -1314,11 +1338,12 @@ impl Agent {
     /// Durable history is committed before replacing the live response.
     /// Current occupancy is published directly, never appended to history.
     async fn publish(&mut self) -> anyhow::Result<()> {
+        self.tell_cell_end().await?;
         self.flush().await?;
         let status = self.status();
         let working = status.runtime.is_working();
         if working != self.working {
-            if !working && let Some(Stopped::Failed(error)) = &self.stopped {
+            if !working && let Some(Stopped::Failed { error, .. }) = &self.stopped {
                 let notice = Notice::Stopped(error.to_string());
                 self.notice(notice).await?;
             }
@@ -1328,6 +1353,32 @@ impl Agent {
         *self.status.write().expect("poison") = status;
         self.host.published();
         Ok(())
+    }
+}
+
+impl Agent {
+    /// Tells the transcript how the latest cell ended, once it has: the turn
+    /// may end with it, so no request need follow to say so.
+    async fn tell_cell_end(&mut self) -> anyhow::Result<()> {
+        let Some(latest) = self.cell.as_mut().filter(|latest| !latest.end_told) else {
+            return Ok(());
+        };
+        let Some(end) = latest.cell.facts().finished else {
+            return Ok(());
+        };
+        latest.end_told = true;
+        let Ok(call) = ExecId::try_from(latest.call.display_id()) else {
+            return Ok(());
+        };
+        self.log(Event::CellEnded {
+            agent: self.agent_id,
+            end: CellEnd {
+                call,
+                at: end.at,
+                failed: end.failed,
+            },
+        })
+        .await
     }
 }
 

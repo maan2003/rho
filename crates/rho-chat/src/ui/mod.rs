@@ -71,6 +71,8 @@ pub struct Participant {
     pub label: String,
     /// `None` while its host has said nothing of it.
     pub doing: Option<Doing>,
+    /// Why it stopped, in its host's words, while a failure stopped it.
+    pub stopped_because: Option<String>,
 }
 
 /// What the chat knows of an agent of the host with this identity, and
@@ -85,6 +87,9 @@ pub struct ChatSystem {
     cursors: Cursors,
     outbox: Outbox,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
+    /// Threads whose agent did not start from this window, and why, in the
+    /// host's words, while this window runs.
+    failed_starts: HashMap<ThreadId, String>,
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
@@ -127,6 +132,7 @@ impl ChatSystem {
                 .map(|(seed, parent, text)| ((seed, parent), text))
                 .collect(),
             cache,
+            failed_starts: HashMap::new(),
             hosts: HashMap::new(),
             chats,
             events,
@@ -135,6 +141,7 @@ impl ChatSystem {
                 Some(Participant {
                     label: agent.encoded(),
                     doing: None,
+                    stopped_because: None,
                 })
             }),
             _pump: pump,
@@ -317,6 +324,18 @@ impl ChatSystem {
         id
     }
 
+    /// The agent asked for in `thread` did not start, for `reason`: the
+    /// thread says so until an agent is in it.
+    pub fn note_failed_start(&mut self, thread: ThreadId, reason: String, cx: &mut Context<Self>) {
+        self.failed_starts.insert(thread, reason);
+        cx.notify();
+    }
+
+    /// Why the agent asked for in `thread` did not start, when it did not.
+    pub fn failed_start(&self, thread: ThreadId) -> Option<&str> {
+        self.failed_starts.get(&thread).map(String::as_str)
+    }
+
     /// Posts what the user has written under `parent` and clears the
     /// draft; the composer follows. `None` when nothing is written.
     pub fn send_draft(
@@ -455,12 +474,14 @@ impl ChatSystem {
         let name = self.host_name(endpoint);
         let alive = |agent: AgentId| self.participant(endpoint, agent, cx).is_some();
         let doing = |agent: AgentId| self.participant(endpoint, agent, cx)?.doing;
+        let reason = |agent: AgentId| self.participant(endpoint, agent, cx)?.stopped_because;
         let host = cards::Host {
             endpoint,
             chat,
             name: self.many_hosts().then_some(name.as_str()),
             alive: &alive,
             doing: &doing,
+            reason: &reason,
         };
         Some(read(&host))
     }
@@ -532,9 +553,26 @@ impl System for ChatSystem {
         ))]
     }
 
+    /// The host's rooms and their screens go from the window with it. Its
+    /// log is a copy the host still has, so the copy goes too and is read
+    /// again if the host is attached again; what the user wrote and has
+    /// not sent stays for then.
     fn detached(&mut self, host: HostId, cx: &mut Context<Self>) {
-        self.hosts.remove(&host);
-        cx.notify();
+        let Some(endpoint) = self.hosts.remove(&host).and_then(|slot| slot.endpoint) else {
+            cx.notify();
+            return;
+        };
+        self.chats.remove(&endpoint);
+        self.cursors.reset(endpoint);
+        self.cache.reset(endpoint);
+        self.frame.close_all(
+            move |address| {
+                address.kind() == ThreadId::KIND
+                    && ThreadId::parse(address.rest()).is_some_and(|thread| thread.host == endpoint)
+            },
+            cx,
+        );
+        self.changed(endpoint, cx);
     }
 
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
@@ -589,7 +627,13 @@ impl System for ChatSystem {
                 }
             }));
         }
-        if let Some(thread) = point.subject.as_ref().and_then(|a| self.thread_of(a)) {
+        // The thread under the point, or, on a line that is no message, the
+        // thread in view.
+        let thread = match &point.subject {
+            Some(subject) => self.thread_of(subject),
+            None => self.thread_of(&point.surface),
+        };
+        if let Some(thread) = thread {
             let current = self
                 .chats
                 .get(&thread.host)
@@ -679,9 +723,34 @@ impl System for ChatSystem {
         claims
     }
 
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_dealer::Marks,
+        cx: &App,
+    ) -> Option<(String, String)> {
         let thread = self.thread_of(address)?;
         self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+    }
+
+    /// A message is read in the thread it was posted under, where a private
+    /// reply about it shows; a thread straight under a channel is read in
+    /// its own screen, under its head.
+    fn shown_in(&self, address: &Address, _cx: &App) -> Option<Address> {
+        let thread = self.thread_of(address)?;
+        let chat = self.chats.get(&thread.host)?;
+        let parent = chat.message(thread.message)?.parent?;
+        let in_channel = chat
+            .message(parent)
+            .is_some_and(|parent| parent.parent.is_none());
+        let message = if in_channel { thread.message } else { parent };
+        Some(
+            ThreadId {
+                host: thread.host,
+                message,
+            }
+            .address(),
+        )
     }
 
     /// What is unread moved: a root's list reads the marks on its next
@@ -812,19 +881,6 @@ pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
         1..60 => format!("{minutes}m"),
         60..1440 => format!("{}h", minutes / 60),
         _ => format!("{}d", minutes / 1440),
-    }
-}
-
-/// A message's time on the user's clock: the hour when it is today, the
-/// day in front of it when it is not.
-pub(crate) fn when(at_ms: u64) -> String {
-    let at = Timestamp::from_millisecond(at_ms as i64)
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-        .to_zoned(jiff::tz::TimeZone::system());
-    let now = jiff::Zoned::now();
-    match at.date() == now.date() {
-        true => at.strftime("%H:%M").to_string(),
-        false => at.strftime("%a %-d %b %H:%M").to_string(),
     }
 }
 

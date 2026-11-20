@@ -4,7 +4,7 @@
 //! that means something in normal mode is bound for `vim_mode == normal`
 //! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
 
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, actions};
 
 actions!(
     rho_frame,
@@ -17,7 +17,8 @@ actions!(
         Close,
         /// Closes the surface in view and deals the next card.
         CloseAndDeal,
-        /// `:`: the palette, the commands that fit this screen first.
+        /// `:`, and `ctrl-shift-;` where `:` would be typed: every command
+        /// by name.
         Palette,
         /// `space`: the verdicts over the card in view; `space` again is
         /// Home.
@@ -25,8 +26,14 @@ actions!(
         /// `tab`: Home, and from Home the way back.
         Home,
         OpenRow,
-        /// `ctrl-shift-f`: the palette, the places first.
-        Find,
+        /// `/`: search forward in what is in view.
+        SearchForward,
+        /// `?`: search back.
+        SearchBackward,
+        /// `n`: the last search again, the same way.
+        SearchNext,
+        /// `N`: the last search again, the other way.
+        SearchPrevious,
         UndoVerdict,
         MinibufferConfirm,
         MinibufferCancel,
@@ -47,6 +54,35 @@ pub fn normal_contexts(surface: &str, more: &str) -> [String; 2] {
 /// gpui prefers the deeper match, so a root-level binding would lose
 /// while typing.
 pub fn bind(cx: &mut App) {
+    cx.bind_keys(bindings());
+    cx.bind_keys([end_of_document(cx)]);
+    crate::thread::bind(cx);
+}
+
+/// `G` as the end of the document, as vim has it. Helix keeps `G` for
+/// goto-line, which does nothing without a count; a reader pressing it
+/// in a transcript wants the newest message. `g e` stays as Helix has it.
+/// vim's motions are not public types, so the action is built by name.
+fn end_of_document(cx: &App) -> KeyBinding {
+    let action = cx
+        .build_action("vim::EndOfDocument", None)
+        .expect("vim is initialised before the frame binds its keys");
+    let context = KeyBindingContextPredicate::parse(
+        "RhoFrame > Editor && vim_mode == helix_normal && vim_operator == none",
+    )
+    .expect("the context parses");
+    KeyBinding::load(
+        "shift-g",
+        action,
+        Some(context.into()),
+        false,
+        None,
+        &DummyKeyboardMapper,
+    )
+    .expect("the keystroke parses")
+}
+
+fn bindings() -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for context in ["RhoFrame", "RhoFrame > Editor"] {
         bindings.extend([
@@ -57,7 +93,11 @@ pub fn bind(cx: &mut App) {
             KeyBinding::new("ctrl-shift-backspace", Close, Some(context)),
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
-            KeyBinding::new("ctrl-shift-f", Find, Some(context)),
+            // `ctrl-shift-;`, the palette where `:` would be typed: in a
+            // terminal, on a desktop or a page. Spelled as gpui reads it on
+            // Linux and macOS: shift turns `;` into `:` and is dropped, so
+            // `ctrl-shift-;` would never match.
+            KeyBinding::new("ctrl-:", Palette, Some(context)),
         ]);
     }
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
@@ -69,8 +109,17 @@ pub fn bind(cx: &mut App) {
         ]);
     }
     for context in normal_contexts("RhoFrame", " && vim_operator == none") {
-        bindings.push(KeyBinding::new("shift-u", UndoVerdict, Some(&context)));
+        bindings.extend([
+            KeyBinding::new("shift-u", UndoVerdict, Some(&context)),
+            // vim's search keys reach for a Zed pane's search bar, which no
+            // surface has; the frame searches the surface's editor instead.
+            KeyBinding::new("/", SearchForward, Some(&context)),
+            KeyBinding::new("?", SearchBackward, Some(&context)),
+            KeyBinding::new("n", SearchNext, Some(&context)),
+            KeyBinding::new("shift-n", SearchPrevious, Some(&context)),
+        ]);
     }
+
     for context in normal_contexts("RhoHome", "") {
         bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
     }
@@ -84,6 +133,52 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
     ]);
-    cx.bind_keys(bindings);
-    crate::thread::bind(cx);
+    bindings
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+
+    use super::*;
+
+    /// What the window hears when `ctrl-shift-;` is pressed in `surface`.
+    fn chord_in(surface: &str) -> Vec<KeyBinding> {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings());
+        // As gpui on Linux delivers it: shift made `;` into `:`, and is
+        // dropped because `:` is already the shifted key.
+        let typed = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: ":".into(),
+            key_char: Some(":".into()),
+        };
+        let stack = [
+            KeyContext::parse("RhoFrame").unwrap(),
+            KeyContext::parse(surface).unwrap(),
+        ];
+        keymap.bindings_for_input(&[typed], &stack).0.into_vec()
+    }
+
+    #[test]
+    fn ctrl_shift_semicolon_opens_the_palette_from_a_place_that_takes_every_key() {
+        // A raw terminal, a live desktop and a page bind none of it
+        // themselves: the frame's chord reaches through each.
+        for surface in ["RhoTerminal", "RhoDesktop", "RhoBrowser"] {
+            let bindings = chord_in(surface);
+            assert!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.action().as_any().is::<Palette>()),
+                "ctrl-shift-; in {surface} matched {:?}",
+                bindings
+                    .iter()
+                    .map(|b| b.action().name())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
 }

@@ -35,20 +35,30 @@ pub fn snooze_target(unit: SnoozeUnit, count: i64, now: &Zoned) -> (Until, Strin
                 .date()
                 .checked_add(jiff::Span::new().days(days))
                 .unwrap_or(now.date());
-            (
-                Until::Day(date),
-                format!("snooze until {}", date.strftime("%a %-d %b")),
-            )
+            let at = date
+                .to_zoned(now.time_zone().clone())
+                .unwrap_or_else(|_| now.clone());
+            (Until::Day(date), snooze_said(&at, now))
         }
     }
 }
 
-/// The bar's words for a snooze with a clock time: the hour alone when it
-/// is still today, the day in front of it when it is not.
+/// The bar's words for a snooze: `snooze until 05:17`.
 pub fn snooze_said(at: &Zoned, now: &Zoned) -> String {
-    match at.date() == now.date() {
-        true => format!("snooze until {}", at.strftime("%H:%M")),
-        false => format!("snooze until {}", at.strftime("%a %-d %b %H:%M")),
+    format!("snooze {}", until_said(at, now))
+}
+
+/// When a snooze ends, on the user's clock: the hour alone when it is
+/// still today, the day in front of it when it is not, and the day alone
+/// when it ends at the start of one.
+pub fn until_said(at: &Zoned, now: &Zoned) -> String {
+    match (
+        at.date() == now.date(),
+        at.time() == jiff::civil::Time::midnight(),
+    ) {
+        (true, _) => format!("until {}", at.strftime("%H:%M")),
+        (false, true) => format!("until {}", at.strftime("%a %-d %b")),
+        (false, false) => format!("until {}", at.strftime("%a %-d %b %H:%M")),
     }
 }
 

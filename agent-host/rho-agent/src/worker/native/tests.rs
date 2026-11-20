@@ -531,13 +531,106 @@ async fn rewind_branches_before_the_last_human_message() {
         .await;
 
     handle.rewind(1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(script.requests().len(), 2, "a rewind starts no turn");
+    assert!(
+        handle.status().runtime.awaiting_human,
+        "it waits for the user"
+    );
+    say(&handle, "three").await;
     let third = requests(&script, 3).await;
     let told = told(&third[2]);
     assert!(told.contains("rewound"), "{told}");
     assert!(told.contains("one"), "{told}");
+    assert!(told.contains("three"), "{told}");
     assert!(!told.contains("two"), "{told}");
     assert!(harness.received("one"));
     assert!(!harness.received("two"), "the rewound message is hidden");
+}
+
+#[tokio::test]
+async fn rewinding_a_failed_agent_takes_the_turn_back_and_waits() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "one").await;
+    requests(&script, 1).await;
+    harness
+        .until("the first wait", |_| handle.status().runtime.awaiting_human)
+        .await;
+    // Nothing more is scripted: the next request fails for good.
+    say(&handle, "two").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !matches!(
+        handle.status().runtime.inference,
+        InferenceState::Failed { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            handle.status()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    handle.rewind(1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        script.requests().len(),
+        2,
+        "the failed turn is not run again"
+    );
+    let runtime = handle.status().runtime;
+    assert_eq!(runtime.inference, InferenceState::Idle, "no longer failed");
+    assert!(runtime.awaiting_human, "it waits for the user");
+
+    script.then("end_turn()");
+    say(&handle, "three").await;
+    let told = told(&requests(&script, 3).await[2]);
+    assert!(told.contains("rewound"), "{told}");
+    assert!(told.contains("three"), "{told}");
+    assert!(!told.contains("two"), "{told}");
+}
+
+/// Each cell says how it ended, once, whether a request answers it or the
+/// turn ends with it.
+#[tokio::test]
+async fn every_cell_says_how_it_ended_even_the_last_of_a_turn() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script
+        .then("print('reading')")
+        .then("raise ValueError('no')")
+        .then("end_turn()");
+    let (handle, _task) = harness.start(&script).await;
+    say(&handle, "hi").await;
+    let ends = |events: &[Event<'static>]| -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::CellEnded { end, .. } => Some(end.failed),
+                _ => None,
+            })
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while ends(&harness.events()).len() < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:#?}",
+            harness.events()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Long enough for a second telling of the same end.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = harness.events();
+    assert_eq!(ends(&events), [false, true, false]);
+    assert!(
+        matches!(events.last(), Some(Event::CellEnded { .. })),
+        "the turn ended with its last cell: {events:#?}"
+    );
 }
 
 #[tokio::test]
@@ -548,21 +641,26 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
     say(&handle, "hi").await;
     harness
         .until("permanent failure", |entries| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        Event::Notice {
-                            notice: Notice::Error(_),
-                            ..
-                        }
-                    )
-                })
-                .count()
-                == 1
+            entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    Event::Notice {
+                        notice: Notice::Stopped(_),
+                        ..
+                    }
+                )
+            })
         })
         .await;
+    // A failure it does not retry says so once, as its stop: never that
+    // it retries.
+    assert!(!harness.entries().iter().any(|entry| matches!(
+        entry,
+        Event::Notice {
+            notice: Notice::Error(_),
+            ..
+        }
+    )));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !matches!(
         handle.status().runtime.inference,
@@ -654,7 +752,7 @@ async fn explicit_retry_after_restart_resumes_with_recovery_notice() {
                 matches!(
                     entry,
                     Event::Notice {
-                        notice: Notice::Error(_),
+                        notice: Notice::Stopped(_),
                         ..
                     }
                 )
@@ -776,7 +874,7 @@ async fn exhausted_retry_window_stops_without_another_request() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(script.requests().is_empty());
     match handle.status().runtime.inference {
-        InferenceState::Failed { error } => assert!(error.contains("retry window exhausted")),
+        InferenceState::Failed { error, .. } => assert!(error.contains("retry window exhausted")),
         other => panic!("expected terminal error, got {other:?}"),
     }
     drop(handle);

@@ -25,14 +25,15 @@ use crate::deal::Signals;
 use crate::home::{HomeTarget, HomeView};
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
-    Answer, CancelHandler, Candidate, CandidateSource, ChangeHandler, ChooseHandler, Chosen, Echo,
-    Minibuffer, SubmitHandler, bottom_strip,
+    Answer, CancelHandler, Candidate, CandidateSource, ChooseHandler, Chosen, Echo, Minibuffer,
+    SubmitHandler, bottom_strip,
 };
 use crate::phone::{Layout, Phone};
-use crate::surface::{AnySurface, Subject};
+use crate::search::Search;
+use crate::surface::{AnySurface, Mode, Subject};
 use crate::system::AnySystem;
 use crate::when::SnoozeUnit;
-use crate::{keys, palette};
+use crate::{keys, palette, place};
 
 /// The kind of the frame's own surface: Home.
 pub const FRAME_KIND: &str = "frame";
@@ -72,8 +73,13 @@ pub struct Frame {
     mode_indicator: Entity<vim::ModeIndicator>,
     pub(crate) signals: Signals,
     pub(crate) chime: Rc<dyn Fn()>,
+    /// What `find:` listed last, so the chosen title opens its address.
+    /// The last `/` or `?`, which `n` and `N` repeat in any surface.
+    pub(crate) search: Option<Search>,
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
+    /// Writes down where the user is after each move, for the next start.
+    place: place::Writer,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -111,8 +117,9 @@ impl Frame {
             }
         });
         let menu_keys = cx.intercept_keystrokes(menu_keys);
+        let saved_place = place::Saved::load(&db);
         let mut frame = Self {
-            db,
+            db: db.clone(),
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
@@ -128,7 +135,9 @@ impl Frame {
             mode_indicator,
             signals: Signals::default(),
             chime,
+            search: None,
             phone: Phone::default(),
+            place: place::Writer::spawn(db.clone()),
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
         };
@@ -167,9 +176,78 @@ impl Frame {
         for spec in hosts {
             frame.attach_host(spec, cx);
         }
+        if let Some(saved) = saved_place {
+            frame.return_to(saved, window, cx);
+        }
         frame.systems_changed(cx);
         frame.focus_surface(window, cx);
         frame
+    }
+
+    /// Opens the window where the user was when it last ran on this
+    /// device, with the way back and forward as it was. The screens behind
+    /// and ahead are made when the user reaches them; the one they were on
+    /// is made now, and when it no longer opens the window opens on Home.
+    fn return_to(&mut self, saved: place::Saved, window: &mut Window, cx: &mut Context<Self>) {
+        self.history = saved.history(&Self::home_address());
+        let address = self.current_address().clone();
+        if self.surfaces.contains_key(&address) {
+            return;
+        }
+        match self.make_surface(&address, window, cx) {
+            Some(surface) => {
+                self.surfaces.insert(address, surface);
+            }
+            None => {
+                self.history.forget(&address);
+                self.home.update(cx, |home, cx| home.focus_first_row(cx));
+                self.history.show(Self::home_address(), ());
+            }
+        }
+    }
+
+    /// The surface for `address`, from the system that owns its kind.
+    fn make_surface(
+        &self,
+        address: &Address,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnySurface> {
+        self.systems
+            .clone()
+            .into_iter()
+            .find(|system| system.opens(address, cx))
+            .and_then(|system| system.open(address, window, cx))
+    }
+
+    /// Makes the screen the cursor came to, when the history holds it by
+    /// address alone, as one it was given back at start does. One that no
+    /// longer opens leaves the history and the walk goes on the way it
+    /// went, or the other way from the end; Home always opens.
+    fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let address = self.current_address().clone();
+            if self.surfaces.contains_key(&address) {
+                return;
+            }
+            if let Some(surface) = self.make_surface(&address, window, cx) {
+                self.surfaces.insert(address, surface);
+                return;
+            }
+            self.history.forget(&address);
+            let stepped = match forward {
+                true => self.history.forward().is_some() || self.history.back().is_some(),
+                false => self.history.back().is_some() || self.history.forward().is_some(),
+            };
+            if !stepped {
+                self.history.show(Self::home_address(), ());
+            }
+        }
+    }
+
+    /// Writes down where the user is now, for the next start.
+    fn moved(&self) {
+        self.place.write(place::Saved::of(&self.history));
     }
 
     pub fn home_address() -> Address {
@@ -249,13 +327,7 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         if !self.surfaces.contains_key(&address) {
-            let opened = self
-                .systems
-                .clone()
-                .into_iter()
-                .find(|system| system.opens(&address, cx))
-                .and_then(|system| system.open(&address, window, cx));
-            let Some(surface) = opened else {
+            let Some(surface) = self.make_surface(&address, window, cx) else {
                 self.echo(
                     &format!("nothing opens {address}"),
                     StyleClass::SystemInfo,
@@ -269,7 +341,13 @@ impl Frame {
             surface: journal_surface(&address),
             method,
         });
+        // Home opens on its top room, the one that wants the user most;
+        // only the way back returns to it as it was left.
+        if address == Self::home_address() {
+            self.home.update(cx, |home, cx| home.focus_first_row(cx));
+        }
         self.history.show(address, ());
+        self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
         cx.notify();
@@ -313,10 +391,26 @@ impl Frame {
             if address.kind() == FRAME_KIND && self.current_address() == address {
                 self.history.show(Self::home_address(), ());
             }
+            self.settle(false, window, cx);
             self.close_overlays(window, cx);
             self.focus_surface(window, cx);
         }
+        self.moved();
         cx.notify();
+    }
+
+    /// Closes every open surface whose address `which` picks: what a
+    /// detached host leaves behind.
+    pub fn close_all(
+        &mut self,
+        which: impl Fn(&Address) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked: Vec<Address> = self.surfaces.keys().filter(|a| which(a)).cloned().collect();
+        for address in picked {
+            self.close(&address, window, cx);
+        }
     }
 
     pub fn close_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,6 +423,8 @@ impl Frame {
             self.echo("at the oldest", StyleClass::SystemInfo, cx);
             return;
         }
+        self.settle(false, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Back,
             position: self.history.behind(),
@@ -346,6 +442,8 @@ impl Frame {
             self.pull_card(window, cx);
             return;
         }
+        self.settle(true, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Forward,
             position: self.history.behind(),
@@ -549,22 +647,16 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// The palette: every place and every command by name, found by a
-    /// fuzzy query, with the place's where or the command's menu keys
-    /// beside it. `first` says which half leads until the query tells
-    /// them apart. A command that is a menu opens it as a transient.
-    pub(crate) fn palette(
-        &mut self,
-        first: palette::First,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// The palette: every command and every place by name, found by the
+    /// starts of their words, with a command's keys or a place's where
+    /// beside it. A command that is a menu opens it as a transient.
+    pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let commands = palette::flatten(&self.commands(window, cx));
         let mut places = Vec::new();
         for system in &self.systems {
             places.extend(system.find(&self.attention.marks, cx));
         }
-        let listing = Rc::new(palette::Listing::new(commands, places, first));
+        let listing = Rc::new(palette::Listing::new(commands, places));
         // What the rows on screen are, so the row chosen is a choice and
         // not words two rows may share.
         let shown: Rc<RefCell<Vec<usize>>> = Rc::default();
@@ -623,30 +715,30 @@ impl Frame {
     }
 
     /// The frame's rows, the surface's, and every system's for what is in
-    /// view: what the palette lists.
-    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Rows {
+    /// view: what the palette lists. It is a list, not a menu: no key
+    /// opens it, so a row here has no key, and two rows never contend for
+    /// one.
+    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("h", "home", |frame, window, cx| {
-            frame.open_home(window, cx)
-        }));
-        rows.push(Row::run("u", "undo", |frame, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
-        match self.attention.secret() {
-            Some(secret) => rows.push(Row::run(
-                "",
-                "show my secret phrase",
-                move |frame, window, cx| {
-                    frame.show_secret(secret, "your secret phrase · enter:", window, cx)
-                },
-            )),
-            None => rows.push(Row::run("", "pair this device", |frame, window, cx| {
+        // The window's own rows: the palette lists them after the screen's.
+        let mut rows = vec![
+            Row::run("", "home", |frame, window, cx| frame.open_home(window, cx)).window_wide(),
+            Row::run("", "undo", |frame, window, cx| {
+                frame.undo_verdict(window, cx)
+            })
+            .window_wide(),
+            Row::menu("", "hosts", self.hosts_menu()).window_wide(),
+        ];
+        let phrase = match self.attention.secret() {
+            Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
+                frame.show_secret(secret, "your secret phrase · enter:", window, cx)
+            }),
+            None => Row::run("", "pair this device", |frame, window, cx| {
                 frame.prompt_pair(String::new(), None, window, cx)
-            })),
-        }
-        rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
+            }),
+        };
+        rows.push(phrase.window_wide());
+        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
         rows.extend(self.current_surface().clone().rows(window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
@@ -658,7 +750,8 @@ impl Frame {
         let mut rows = Rows::new("hosts");
         rows.push(Row::run("a", "attach", |frame, window, cx| {
             frame.open_prompt(
-                "attach host (name=local[:dir] or name=iroh:...):",
+                "attach host · name=local (this machine), name=iroh:<id>@<ssh host> (ssh), \
+                 or name=iroh:<id> (security key):",
                 Rc::new(|_, _, _| Vec::new()),
                 Rc::new(
                     |frame, input, _, cx| match HostSpec::parse(input.trim(), "rho") {
@@ -681,34 +774,46 @@ impl Frame {
                     frame
                         .hosts
                         .iter()
-                        .filter(|host| host.name.contains(needle))
+                        .filter(|host| host.name.contains(needle.trim()))
                         .map(|host| Candidate {
                             value: host.name.clone(),
-                            description: format!("{:?}", host.status),
+                            description: host.status.label(),
                         })
                         .collect()
                 }),
                 Rc::new(|frame, input, _, cx| {
-                    match frame.hosts.by_name(input.trim()).map(|host| host.id) {
-                        Some(host) => frame.detach_host(host, cx),
-                        None => frame.echo("detach: no such host", StyleClass::SystemInfo, cx),
+                    let name = input.trim();
+                    match frame.hosts.by_name(name).map(|host| host.id) {
+                        Some(host) => {
+                            frame.detach_host(host, cx);
+                            frame.echo(&format!("detached: {name}"), StyleClass::SystemInfo, cx);
+                        }
+                        None => frame.echo(
+                            &format!("detach: no host called {name}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
                     }
                 }),
                 window,
                 cx,
             );
+            // A chooser: enter takes the highlighted host.
+            if let Some(minibuffer) = frame.minibuffer_mut() {
+                minibuffer.set_complete_whole_input();
+            }
         }));
         for (index, host) in self.hosts.iter().enumerate().take(9) {
             let id = host.id;
             rows.push(Row::run(
                 (index + 1).to_string(),
-                format!("{} · {}", host.name, status_words(&host.status)),
+                format!("{} · {}", host.name, host.status.label()),
                 move |frame, _, cx| {
                     let label = frame.hosts.host_label(id);
                     let status = frame
                         .hosts
                         .get(id)
-                        .map(|host| status_words(&host.status))
+                        .map(|host| host.status.label())
                         .unwrap_or_default();
                     frame.echo(&format!("{label}: {status}"), StyleClass::SystemInfo, cx);
                 },
@@ -726,7 +831,11 @@ impl Frame {
             return;
         }
         let Some(target) = self.card_target(cx) else {
-            self.toggle_home(window, cx);
+            // With no card here there is nothing to judge, but the deal
+            // still goes on: `n` is how the user asks what waits.
+            let mut rows = Rows::new("no card here").counted();
+            push_deal_rows(&mut rows);
+            self.open_menu(rows, window, cx);
             return;
         };
         let card = self.card_for(&target, cx);
@@ -749,16 +858,11 @@ impl Frame {
             "m",
             "mute",
             on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx)
+                frame.verdict(target, Verdict::Mute, "mute".to_owned(), window, cx)
             }),
         ));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
-        rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
-            frame.pull_card(window, cx)
-        }));
+        push_deal_rows(&mut rows);
         self.open_menu(rows, window, cx);
     }
 
@@ -789,27 +893,14 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_prompt_watching(prompt, complete, None, on_submit, on_cancel, window, cx);
-    }
-
-    /// A prompt that narrows what is behind it as the reader types:
-    /// `on_change` hears every edit.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
-    )]
-    pub fn open_prompt_watching(
-        &mut self,
-        prompt: impl Into<gpui::SharedString>,
-        complete: CandidateSource,
-        on_change: Option<ChangeHandler>,
-        on_submit: SubmitHandler,
-        on_cancel: Option<CancelHandler>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let answer = Answer::Text(on_submit);
-        self.open_minibuffer(prompt, complete, on_change, answer, on_cancel, window, cx);
+        self.open_minibuffer(
+            prompt,
+            complete,
+            Answer::Text(on_submit),
+            on_cancel,
+            window,
+            cx,
+        );
     }
 
     /// A prompt whose rows are its answers: enter hands `on_choose` the
@@ -822,19 +913,13 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let answer = Answer::Row(on_choose);
-        self.open_minibuffer(prompt, complete, None, answer, None, window, cx);
+        self.open_minibuffer(prompt, complete, Answer::Row(on_choose), None, window, cx);
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
-    )]
     fn open_minibuffer(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
         complete: CandidateSource,
-        on_change: Option<ChangeHandler>,
         answer: Answer,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
@@ -849,16 +934,8 @@ impl Frame {
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer = Minibuffer::open(
-            prompt,
-            &text_style,
-            complete,
-            on_change,
-            answer,
-            on_cancel,
-            window,
-            cx,
-        );
+        let mut minibuffer =
+            Minibuffer::open(prompt, &text_style, complete, answer, on_cancel, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         // The strip is single-occupancy; a stale message after the prompt
@@ -874,17 +951,12 @@ impl Frame {
         self.minibuffer.as_mut()
     }
 
-    pub(crate) fn refresh_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
         minibuffer.refresh(self, cx);
-        let on_change = minibuffer.on_change();
-        let input = minibuffer.input(cx);
         self.minibuffer = Some(minibuffer);
-        if let Some(on_change) = on_change {
-            on_change(self, &input, window, cx);
-        }
         cx.notify();
     }
 
@@ -960,11 +1032,7 @@ impl Frame {
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        let mode = self
-            .mode_indicator
-            .read(cx)
-            .plain_mode(cx)
-            .unwrap_or_else(|| "normal".to_owned());
+        let mode = self.mode(window, cx);
         let mode_color = match mode.contains("insert") {
             true => status.warning,
             false => colors.terminal_ansi_bright_cyan,
@@ -972,15 +1040,17 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
-        let unpaired = (self.attention.pairing() == Pairing::Unpaired)
+        // The notice gives way to an echo, which answers the key just
+        // pressed; on a phone the two do not fit beside each other.
+        let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
             .then_some("verdicts stay on this device until it is paired");
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.
         let right_words = lamp
             .into_iter()
-            .chain(unpaired)
             .chain(unwell.as_deref())
+            .chain(unpaired)
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
         let fit = |path: &str, state: &str| match layout {
@@ -1001,15 +1071,22 @@ impl Frame {
         };
         // An echo is the answer to the key just pressed, so it takes the
         // line while it lasts. Otherwise the line is about what is in view:
-        // a card says which card and why; anything else says its name.
-        let left: AnyElement = match (&self.echo, self.card_in_view(cx)) {
+        // a surface that is a card says which card and why; anything else,
+        // a list or results included, says its own name, whatever card
+        // the row under the point belongs to.
+        let surface = self.current_surface();
+        let own_card = self
+            .card_in_view(cx)
+            .filter(|address| address == self.current_address());
+        let left: AnyElement = match (&self.echo, own_card) {
             (Some(echo), _) => div()
                 .text_color(status.info)
-                .child(echo.text().to_owned())
+                .child(fit("", echo.text()).1)
                 .into_any_element(),
             (None, Some(address)) => {
                 let card = self.card_for(&address, cx);
-                let (heading, label) = fit(&card.heading(), &card.label);
+                let heading = surface.heading(cx).unwrap_or_else(|| card.heading());
+                let (heading, label) = fit(&heading, &card.label);
                 div()
                     .flex()
                     .flex_row()
@@ -1019,18 +1096,27 @@ impl Frame {
                     .into_any_element()
             }
             (None, None) => div()
-                .child(fit(&self.current_surface().title(cx), "").0)
+                .child(fit(&surface.title(cx), "").0)
                 .into_any_element(),
         };
+        // A host that is away outranks the notice, which is cut first when
+        // the line is short.
         let right = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .items_center()
             .gap_3()
-            .children(lamp.map(|lamp| div().text_color(status.warning).child(lamp)))
-            .children(unpaired.map(|text| div().text_color(colors.text_muted).child(text)))
-            .children(unwell.map(|text| div().text_color(status.error).child(text)))
-            .child(div().text_color(mode_color).child(mode));
+            .children(lamp.map(|lamp| div().flex_none().text_color(status.warning).child(lamp)))
+            .children(unwell.map(|text| div().flex_none().text_color(status.error).child(text)))
+            .children(unpaired.map(|text| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .child(text)
+            }))
+            .child(div().flex_none().text_color(mode_color).child(mode));
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -1062,6 +1148,37 @@ impl Frame {
             .into_any_element()
     }
 
+    /// The mode the keys are in, where they go now. A box to write in, a
+    /// thread's or a prompt's, has no vim of its own and always types; the
+    /// vim the mode indicator follows is the last one that had the keys.
+    fn mode(&self, window: &Window, cx: &App) -> String {
+        // A surface with a mode of its own says it while it has the keys;
+        // a menu or a prompt over it is the editor's to say.
+        if self.menu.is_none() && self.minibuffer.is_none() {
+            match self.current_surface().mode(cx) {
+                Some(Mode::Normal) => return "normal".to_owned(),
+                Some(Mode::Insert) => return "insert".to_owned(),
+                None => {}
+            }
+        }
+        let typing = self
+            .minibuffer
+            .as_ref()
+            .map(|minibuffer| minibuffer.editor().clone())
+            .into_iter()
+            .chain(self.current_surface().editor(cx))
+            .any(|editor| {
+                editor.focus_handle(cx).is_focused(window) && !editor.read(cx).use_modal_editing()
+            });
+        if typing {
+            return "insert".to_owned();
+        }
+        self.mode_indicator
+            .read(cx)
+            .plain_mode(cx)
+            .unwrap_or_else(|| "normal".to_owned())
+    }
+
     fn unwell_hosts(&self) -> Option<String> {
         let (name, status) = self.hosts.worst_status()?;
         let unwell = self
@@ -1075,15 +1192,24 @@ impl Frame {
                 self.hosts.len()
             ));
         }
-        let subject = match self.hosts.len() > 1 {
-            true => format!("{name} "),
-            false => String::new(),
-        };
+        // Named even when it is the only host: `reconnecting` alone does
+        // not say what is away.
         match status {
             HostStatus::Online => None,
-            status => Some(format!("{subject}{}", status_words(&status))),
+            status => Some(format!("{name} · {}", status.label())),
         }
     }
+}
+
+/// The verdict menu's rows that need no card: take back the last verdict,
+/// and deal the next card.
+fn push_deal_rows(rows: &mut Rows) {
+    rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
+        frame.undo_verdict(window, cx)
+    }));
+    rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
+        frame.pull_card(window, cx)
+    }));
 }
 
 /// How long `target` sleeps: a unit, and the count typed before it.
@@ -1103,15 +1229,6 @@ pub(crate) fn snooze_rows(target: &Address) -> Rows {
         ));
     }
     snooze
-}
-
-fn status_words(status: &HostStatus) -> String {
-    match status {
-        HostStatus::Connecting => "connecting".to_owned(),
-        HostStatus::Online => "online".to_owned(),
-        HostStatus::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
-        HostStatus::Disconnected(reason) => format!("disconnected · {reason}"),
-    }
 }
 
 /// The status line's mode word: three letters, the way helix does it, so
@@ -1182,9 +1299,7 @@ impl Render for Frame {
                 this.close_current(window, cx);
                 this.pull_card(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| {
-                this.palette(palette::First::Commands, window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
                     this.verdict_menu(window, cx)
@@ -1192,8 +1307,17 @@ impl Render for Frame {
             )
             .on_action(cx.listener(|this, _: &keys::Home, window, cx| this.toggle_home(window, cx)))
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
-            .on_action(cx.listener(|this, _: &keys::Find, window, cx| {
-                this.palette(palette::First::Places, window, cx)
+            .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
+                this.search(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchBackward, window, cx| {
+                this.search(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchNext, window, cx| {
+                this.search_again(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchPrevious, window, cx| {
+                this.search_again(true, window, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &keys::UndoVerdict, window, cx| {

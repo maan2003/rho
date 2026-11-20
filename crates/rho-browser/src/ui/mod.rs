@@ -1,16 +1,15 @@
 //! Pages as the frame shows them.
 //!
 //! [`PageSystem`] is the one entity behind every page surface: it owns the
-//! [`Browser`] (and so Chrome), the timers that close what nothing shows
-//! ([`pages`]), and the `page` address kind. A page surface is the page
-//! view itself; the system hears when one goes and starts that page's
-//! grace period. The browser stays in this process: no host knows a page.
+//! [`Browser`] (and so Chrome), the timers that close tabs no screen ever
+//! showed ([`pages`]), and the `page` address kind. A page surface is the
+//! page view itself; the system hears when one goes, which is the user
+//! closing it, and closes its tab. The browser stays in this process: no
+//! host knows a page.
 //!
 //! A page takes every key, as a desktop does, so the frame's normal-mode
 //! keys cannot reach the frame from one. Its chords can (`ctrl-k`,
-//! `ctrl-j`, `ctrl-shift-f`, `ctrl-shift-backspace`), and the palette is
-//! bound here on `ctrl-shift-;` (`ctrl-:` as gpui reads it), the chord a
-//! desktop opens it with.
+//! `ctrl-j`, `ctrl-shift-backspace`, and the palette's `ctrl-shift-;`).
 
 mod pages;
 
@@ -61,8 +60,7 @@ impl PageSystem {
     /// The browser keeps its state under `state_dir`, the GUI's own state
     /// directory, and talks to its extension over a socket there: one
     /// GUI per state directory, which the browser's lock already says.
-    pub fn new(state_dir: PathBuf, frame: FrameLink, cx: &mut Context<Self>) -> Self {
-        bind_keys(cx);
+    pub fn new(state_dir: PathBuf, frame: FrameLink) -> Self {
         let socket = state_dir.join("rho-browser.sock");
         Self {
             browser: Browser::new(state_dir, socket),
@@ -120,31 +118,39 @@ impl PageSystem {
         self.pages.closing(page, timer);
     }
 
-    /// The surface over `page` went.
+    /// The surface over `page` went: the user closed the page, so its tab
+    /// closes with it.
     fn hidden(&mut self, page: PageId, cx: &mut Context<Self>) {
-        if self.pages.hide(page) {
-            self.start_grace(page, cx);
+        if self.pages.hide(page)
+            && let Some(close) = self.browser.close_page_if_running(page, cx)
+        {
+            close.detach_and_log_err(cx);
         }
     }
 
     /// Opens a new tab at `url` and shows it.
     fn open_url(&mut self, url: &Url, cx: &mut Context<Self>) {
-        let create = self.browser.create_page(url.to_string(), cx);
-        if let Ok(model) = self.browser.model(cx) {
-            self.watch(&model, cx);
+        match self.browser.model(cx) {
+            Ok(model) => self.watch(&model, cx),
+            Err(error) => return self.cannot_open(error, cx),
         }
+        let create = self.browser.create_page(url.to_string(), cx);
         cx.spawn(async move |this, cx| {
             let record = create.await;
             let _ = this.update(cx, |this, cx| match record {
                 Ok(record) => this.frame.open(record.id.address(), cx),
-                Err(error) => {
-                    tracing::error!(%error, "browser page creation failed");
-                    this.frame
-                        .echo(format!("browser: {error:#}"), StyleClass::SystemInfo, cx);
-                }
+                Err(error) => this.cannot_open(error, cx),
             });
         })
         .detach();
+    }
+
+    /// Says why a page does not open, on the echo line: the browser is
+    /// the user's to fix, so the log alone would hide it.
+    fn cannot_open(&self, error: anyhow::Error, cx: &mut Context<Self>) {
+        tracing::error!(error = format!("{error:#}"), "a page does not open");
+        self.frame
+            .echo(format!("page: {error:#}"), StyleClass::SystemImportant, cx);
     }
 
     /// `page:` asks for a page: one the browser has open, by its title,
@@ -213,18 +219,30 @@ fn recent_pages() -> Vec<(PageId, PageMetadata)> {
     pages
 }
 
-/// What the user typed at `page:` as a web address: `https://` when they
-/// named no scheme, and only the web's own schemes.
+/// What the user typed at `page:` as a web address. With no scheme named,
+/// `https://`, except for a host that is this machine or has no dot in its
+/// name (`127.0.0.1:8080`, `localhost:3000`, `intranet/wiki`): those are
+/// local servers, which rarely speak TLS, so `http://`. Only the web's own
+/// schemes open.
 fn typed_url(input: &str) -> Result<Url, String> {
-    let text = match input.contains("://") {
-        true => input.to_owned(),
-        false => format!("https://{input}"),
-    };
-    let url = Url::parse(&text).map_err(|error| error.to_string())?;
-    match url.scheme() {
-        "http" | "https" => Ok(url),
-        scheme => Err(format!("{scheme} is not http or https")),
+    if input.contains("://") {
+        let url = Url::parse(input).map_err(|error| error.to_string())?;
+        return match url.scheme() {
+            "http" | "https" => Ok(url),
+            scheme => Err(format!("{scheme} is not http or https")),
+        };
     }
+    let mut url = Url::parse(&format!("https://{input}")).map_err(|error| error.to_string())?;
+    let local = match url.host() {
+        Some(url::Host::Domain(name)) => !name.contains('.'),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if local {
+        url.set_scheme("http").expect("https becomes http");
+    }
+    Ok(url)
 }
 
 impl rho_frame::System for PageSystem {
@@ -242,12 +260,7 @@ impl rho_frame::System for PageSystem {
         let model = match self.browser.open_page(page, cx) {
             Ok(model) => model,
             Err(error) => {
-                tracing::error!(%error, "the browser does not start");
-                self.frame.echo(
-                    format!("browser: {error:#}"),
-                    StyleClass::SystemImportant,
-                    cx,
-                );
+                self.cannot_open(error, cx);
                 return None;
             }
         };
@@ -271,7 +284,12 @@ impl rho_frame::System for PageSystem {
         true
     }
 
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_dealer::Marks,
+        _cx: &App,
+    ) -> Option<(String, String)> {
         let page = PageId::from_address(address)?;
         Some((title(page), "web".to_owned()))
     }
@@ -297,19 +315,6 @@ impl Surface for PageView {
     fn subject(&self, _cx: &App) -> Subject {
         Subject::Own
     }
-}
-
-fn bind_keys(cx: &mut App) {
-    use gpui::KeyBinding;
-    use rho_frame::keys::Palette;
-    // Under the frame's own context, so the frame's handlers hear them;
-    // a page takes every key that no binding names.
-    let context = format!("{} > RhoBrowser", rho_frame::KEY_CONTEXT);
-    cx.bind_keys([
-        // `ctrl-shift-;` as gpui reads it on Linux: shift makes the key
-        // `:` and is dropped, so `ctrl-shift-;` would never match.
-        KeyBinding::new("ctrl-:", Palette, Some(&context)),
-    ]);
 }
 
 #[cfg(test)]
@@ -368,6 +373,27 @@ mod tests {
         // No `://`, so it reads as a host with a port-like tail, which is
         // no web address rather than script.
         assert!(typed_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn a_typed_local_server_is_plain_http() {
+        for (typed, opened) in [
+            (
+                "127.0.0.1:18080/index.html",
+                "http://127.0.0.1:18080/index.html",
+            ),
+            ("localhost:3000", "http://localhost:3000/"),
+            ("[::1]:8080/a", "http://[::1]:8080/a"),
+            ("intranet/wiki", "http://intranet/wiki"),
+            // A dotted name or an address off this machine stays https.
+            ("example.com:8443/x", "https://example.com:8443/x"),
+            ("10.0.0.5:8080", "https://10.0.0.5:8080/"),
+            ("127.example.com", "https://127.example.com/"),
+            // A scheme the user named is kept either way.
+            ("https://localhost:3000/", "https://localhost:3000/"),
+        ] {
+            assert_eq!(typed_url(typed).unwrap().as_str(), opened, "{typed}");
+        }
     }
 
     #[test]

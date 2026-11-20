@@ -21,14 +21,16 @@ The four pictures are:
 shows: `Chart`
 starts: `Check what is left`
 
-## job Check what is left
+## flow Check what is left
+runs: 2 a week
 day: Keep the work moving.
-when: agents seem slow, or I am about to start many of them
+when: agents seem slow, or the user is about to start many of them
 want: see how much allowance each account has left and when it resets
-so that: I put new work on an account that can take it
-flow:
-1. open the palette and choose `usage… › rate limit · 7d`
-2. read the legend and the lines
-system: asks every attached host when the chart opens, and puts their answers together.
+so that: the user puts new work on an account that can take it
+steps:
+1. the user opens the palette and chooses `usage… › rate limit · 7d`
+2. the user reads the legend and the lines
+system: asks every attached host when the chart opens, and again when a host comes back, and puts their answers together.
 user: which chart, and what to do about it.
-cases: no host attached, where the chart reads `no agent host is attached`; a host slow to answer, where it reads `waiting for the agent hosts' answer`
+cases: no host attached, where the chart reads `no agent host is attached`; no account on any host, where it reads `no accounts on lab`; an account that has read nothing yet, where it reads `no usage yet`; a host slow to answer, where it reads `waiting for the agent hosts' answer`
+reviewed: 2026-11-20 · laptop · reviewer · 3 findings

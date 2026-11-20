@@ -149,8 +149,7 @@ fn run() -> Result<()> {
     // opened here, before anything else: the hosts to attach are in it, and
     // everything that keeps a cache is handed it now. A second rho stops at
     // the door rather than running on with none of its own state.
-    let db = rho_db::client::open_shared(&client_state_dir)
-        .context("open the client database; exit the other rho first")?;
+    let db = rho_db::client::open_shared(&client_state_dir).context("open the client database")?;
     if let Err(error) = rho_journal::init(db.clone(), rho_frame::dealer_policy_snapshot()) {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
@@ -160,6 +159,7 @@ fn run() -> Result<()> {
     }
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
+    let store = db.clone();
     let link = args.link.clone();
     let mut profile = args
         .cpu_profile
@@ -225,8 +225,9 @@ fn run() -> Result<()> {
                 let frame = FrameLink::new(handle);
                 let chat =
                     cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
-                let agents = cx
-                    .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
+                let agents = cx.new(|cx| {
+                    rho_agents_view::AgentsSystem::new(db.clone(), chat.clone(), frame.clone(), cx)
+                });
                 // The chat ranks a thread by the agents still in it and by
                 // the stops they are in, and names them with what they do;
                 // the agents system knows all of it, and a thread on screen
@@ -239,6 +240,7 @@ fn run() -> Result<()> {
                                 Some(rho_chat::ui::Participant {
                                     label: agent.encoded(),
                                     doing: None,
+                                    stopped_because: None,
                                 })
                             },
                             |agents| agents.read(cx).participant(endpoint, agent),
@@ -246,19 +248,16 @@ fn run() -> Result<()> {
                     }));
                     cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });
-                let browser = cx.new(|cx| {
-                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone(), cx)
+                let browser = cx.new(|_| {
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
                 });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
-                let slack =
-                    cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
                     AnySystem::new(notes),
-                    AnySystem::new(slack),
                     AnySystem::new(telemetry),
                 ];
                 let chime = rho_gui::chime::Chime;
@@ -291,6 +290,13 @@ fn run() -> Result<()> {
                 }
             }
         });
+    // The window is gone and everything it ran has written what it keeps.
+    // Settled, the file opens at once on the next start instead of being
+    // repaired as after a crash. Its write lock is never let go, so
+    // nothing still running on another thread commits after it.
+    let closed =
+        futures::executor::block_on(store.settle()).context("close the client database")?;
+    std::mem::forget(closed);
     Ok(())
 }
 

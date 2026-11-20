@@ -9,8 +9,8 @@
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::Surface;
 use rho_frame::keys::{Close, Home, Palette, VerdictMenu};
+use rho_frame::{Mode, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::TerminalInfo;
@@ -108,6 +108,15 @@ impl Surface for TerminalSurface {
         }
         title
     }
+
+    /// Typing while the terminal has the keys, reading once
+    /// `ctrl-shift-n` took them back; a terminal not yet open only reads.
+    fn mode(&self, cx: &App) -> Option<Mode> {
+        Some(match &self.state {
+            State::Open(view) if view.read(cx).is_raw() => Mode::Insert,
+            State::Open(_) | State::Dialing { .. } | State::Failed(_) => Mode::Normal,
+        })
+    }
 }
 
 impl Focusable for TerminalSurface {
@@ -147,9 +156,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         // Raw mode: every unbound key goes to the pty, so the terminal's
         // own chords are ones shells do not see. `ctrl-\ ctrl-n` is vim's
-        // terminal escape; `ctrl-shift-n` the discoverable one.
+        // terminal escape; `ctrl-shift-n` the discoverable one. The palette
+        // chord, `ctrl-shift-;`, is the frame's own.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-;", Palette, Some("RhoTerminal")),
         KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
         // The frame walks history on ctrl-j and ctrl-k; in a shell they are

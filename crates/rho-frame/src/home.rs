@@ -1,14 +1,14 @@
 //! Home: the rooms, the one that wants the user most first.
 //!
 //! A room is a place the user works in: a host's channel they made or
-//! wrote in, a Slack conversation they starred, or one that holds a card
-//! or something for them unread. Each system lists its own
-//! ([`System::rooms`](crate::system::System::rooms)); nothing here
-//! scores anything. A root that is a room only while it holds a card
+//! wrote in, or one that holds a card or something for them unread. Each system
+//! lists its own ([`System::rooms`](crate::system::System::rooms)); nothing
+//! here scores anything. A root that is a room only while it holds a card
 //! ([`Standing::WhileCard`]) is left off while the dealer's hand holds
 //! none in it. A room with a card in the hand goes by that card, in the
 //! hand's order, wearing the card's words; the rest go by what waits in
-//! them, then by when they last moved. The surface is one
+//! them, then by when they last moved. A room the user snoozed says
+//! until when, so a quiet row is not a forgotten one. The surface is one
 //! keyed transcript: a row is an item keyed by its room, so a change
 //! edits that row and leaves the cursor, the scroll, and every other row
 //! alone.
@@ -18,18 +18,20 @@ use std::ops::Range;
 use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Window, div};
+use jiff::Zoned;
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_dealer::Address;
 use rho_dealer::rank::Hand;
+use rho_dealer::{Address, Marks};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
 use crate::surface::{Subject, Surface};
 use crate::system::{RoomRow, Standing};
+use crate::when::until_said;
 
 /// Home's own highlight-key space, clear of the transcript's semantic slots
-/// at zero and Slack's at the top. Buckets grow upwards from here.
+/// at zero. Buckets grow upwards from here.
 const HOME_KEY_BASE: usize = usize::MAX / 3;
 
 /// The most of a room's name a row shows. A note's name is its first
@@ -54,8 +56,9 @@ pub struct RoomLine {
 /// The rooms in Home's order: a room with a card in `hand` by its first
 /// card, in the hand's order; then the rooms something waits in, newest
 /// first; then the rest, newest first. A root that is a room only while
-/// it holds a card is left off without one.
-pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
+/// it holds a card is left off without one. A room without a card that
+/// the user snoozed reads `snoozed · until 05:17` instead of its own words.
+pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand, marks: &Marks, now: &Zoned) -> Vec<RoomLine> {
     let mut lines: Vec<(Option<usize>, bool, u64, RoomLine)> = rooms
         .into_iter()
         .filter_map(|room| {
@@ -65,9 +68,18 @@ pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
             if card.is_none() && room.standing == Standing::WhileCard {
                 return None;
             }
-            let label = match card {
-                Some((_, card)) => card.label.clone(),
-                None => room.waiting.clone(),
+            let snoozed = marks
+                .get(&room.address)
+                .facts()
+                .snooze()
+                .filter(|snooze| snooze.until > now.timestamp());
+            let label = match (card, snoozed) {
+                (Some((_, card)), _) => card.label.clone(),
+                (None, Some(snooze)) => format!(
+                    "snoozed · {}",
+                    until_said(&snooze.until.to_zoned(now.time_zone().clone()), now)
+                ),
+                (None, None) => room.waiting.clone(),
             };
             Some((
                 card.map(|(index, _)| index),
@@ -244,8 +256,9 @@ impl HomeView {
         cx.notify();
     }
 
-    /// Puts the cursor on the first row that stands for something.
-    fn focus_first_row(&mut self, cx: &mut Context<Self>) {
+    /// Puts the cursor on the first row that stands for something: the
+    /// top room, where the user lands each time Home opens.
+    pub(crate) fn focus_first_row(&mut self, cx: &mut Context<Self>) {
         let last = self.transcript.buffer().read(cx).snapshot().max_point().row;
         let row = (0..=last)
             .find(|row| {
@@ -269,8 +282,12 @@ impl HomeView {
     fn items(&self) -> Vec<Item<HomeKey, HomeClass, HomeTarget>> {
         if self.rooms.is_empty() {
             return vec![
-                line(HomeKey::Empty, "no rooms yet", HomeClass::Muted)
-                    .with_lines(vec![HomeTarget::None]),
+                line(
+                    HomeKey::Empty,
+                    "no rooms yet · attach a host from the palette (:)",
+                    HomeClass::Muted,
+                )
+                .with_lines(vec![HomeTarget::None]),
             ];
         }
         let column = column_of(self.rooms.iter().map(|room| room.name.clone()).collect());
@@ -447,6 +464,13 @@ mod tests {
         }
     }
 
+    fn now() -> Zoned {
+        jiff::civil::date(2026, 8, 23)
+            .at(4, 17, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+    }
+
     fn card(address: &str, room: Option<&str>, label: &str) -> Card {
         Card {
             address: Address::new("thread", address),
@@ -482,7 +506,7 @@ mod tests {
             room("c", "1 unread", 30),
             room("d", "mention", 60),
         ];
-        let lines = room_lines(rooms, &hand);
+        let lines = room_lines(rooms, &hand, &Marks::default(), &now());
         let names: Vec<(&str, &str, Option<&str>)> = lines
             .iter()
             .map(|line| {
@@ -530,7 +554,7 @@ mod tests {
                 ..room("deploy 42", "1 unread · 1m", 99)
             },
         ];
-        let names: Vec<String> = room_lines(rooms.clone(), &hand)
+        let names: Vec<String> = room_lines(rooms.clone(), &hand, &Marks::default(), &now())
             .into_iter()
             .map(|line| line.name)
             .collect();
@@ -539,10 +563,63 @@ mod tests {
             cards: Vec::new(),
             next_change: None,
         };
-        let names: Vec<String> = room_lines(rooms, &empty)
+        let names: Vec<String> = room_lines(rooms, &empty, &Marks::default(), &now())
             .into_iter()
             .map(|line| line.name)
             .collect();
         assert_eq!(names, ["worked"]);
+    }
+
+    /// A room the user snoozed says until when, in place of its own words
+    /// and in the same grey, so a quiet row reads as put away rather than
+    /// as nothing; once the snooze is over it has its own words again.
+    #[test]
+    fn a_snoozed_room_says_until_when() {
+        use rho_dealer::Until;
+        use rho_dealer::facts::{Device, Entry, Fact};
+
+        let empty = Hand {
+            cards: Vec::new(),
+            next_change: None,
+        };
+        let mut marks = Marks::default();
+        marks.apply([Entry {
+            device: Device([0; 16]),
+            at: now(),
+            fact: Fact::Snooze {
+                node: Address::new("thread", "random"),
+                until: Until::In(jiff::SignedDuration::from_hours(1)),
+            },
+        }]);
+        let rooms = vec![
+            room("random", "1 unread · 2.4d", 10),
+            room("design", "1 unread · 3m", 20),
+        ];
+        let labels = |now: &Zoned| {
+            room_lines(rooms.clone(), &empty, &marks, now)
+                .into_iter()
+                .map(|line| (line.name, line.label, line.card))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&now()),
+            [
+                ("design".to_owned(), "1 unread · 3m".to_owned(), None),
+                (
+                    "random".to_owned(),
+                    "snoozed · until 05:17".to_owned(),
+                    None
+                ),
+            ],
+            "the snoozed room has no card, so its words are grey like any other"
+        );
+        let later = now()
+            .checked_add(jiff::SignedDuration::from_hours(1))
+            .unwrap();
+        assert_eq!(
+            labels(&later)[1].1,
+            "1 unread · 2.4d",
+            "a snooze that is over says nothing"
+        );
     }
 }

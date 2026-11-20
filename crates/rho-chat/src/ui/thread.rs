@@ -12,7 +12,7 @@ use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Task, Window, div,
 };
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
@@ -22,7 +22,7 @@ use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, Event, ago, when};
+use super::{ChatSystem, Event, ago};
 use crate::{AgentRef, HostChat, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
@@ -127,6 +127,8 @@ impl rho_transcript::Style for Class {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Meta {
     None,
+    /// The message the thread hangs under: the thread's own.
+    Head,
     /// A message under the thread: Enter opens the thread under it.
     Message(MessageId),
     Open(Address),
@@ -151,6 +153,15 @@ enum Focused {
     Composer,
 }
 
+/// A thread the user just started in a channel, which the cursor follows
+/// until it stands in the list: by the id this client gave the message
+/// while it is on its way, then by its own once the host logged it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Follow {
+    Sending(u64),
+    Logged(MessageId),
+}
+
 pub struct ThreadView {
     system: Entity<ChatSystem>,
     thread: ThreadId,
@@ -158,14 +169,16 @@ pub struct ThreadView {
     log: Entity<Editor>,
     composer: Entity<Editor>,
     focused: Focused,
+    follow: Option<Follow>,
     _subscriptions: Vec<Subscription>,
-    /// Reads the thread again each minute while agents are in it: the
-    /// `with` line says for how long each has been doing what it does.
-    _ages: Task<()>,
+    /// Reads the thread again when an age on it next moves: the `with`
+    /// line says for how long each agent has been doing what it does, and
+    /// a channel's list how long ago each thread moved.
+    _ages: Option<Task<()>>,
 }
 
-/// How often the ages on the `with` line move: their unit is the minute.
-const AGES_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the ages in a channel's list move: their unit is the minute.
+const LIST_AGES_EVERY: SignedDuration = SignedDuration::from_secs(60);
 
 impl ThreadView {
     /// The view over `thread` on `system`, which is `entity` as the frame
@@ -230,6 +243,19 @@ impl ThreadView {
         });
         let subscriptions = vec![
             cx.observe(&entity, |this, _, cx| this.refresh(cx)),
+            cx.subscribe(&entity, |this, _, event: &Event, cx| {
+                if let Event::Delivered {
+                    endpoint,
+                    client_id,
+                    message,
+                } = event
+                    && *endpoint == this.thread.host
+                    && this.follow == Some(Follow::Sending(*client_id))
+                {
+                    this.follow = Some(Follow::Logged(*message));
+                    this.refresh(cx);
+                }
+            }),
             cx.subscribe(&composer, |this, composer, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::BufferEdited) {
                     let text = composer.read(cx).text(cx);
@@ -247,38 +273,36 @@ impl ThreadView {
             log,
             composer,
             focused: Focused::Log,
+            follow: None,
             _subscriptions: subscriptions,
-            _ages: cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(AGES_EVERY).await;
-                    let alive = this.update(cx, |view, cx| {
-                        let thread = view.thread;
-                        let with_agents =
-                            view.system.read(cx).chat(thread.host).is_some_and(|chat| {
-                                !chat.members_under(Some(thread.message)).is_empty()
-                            });
-                        if with_agents {
-                            view.refresh(cx);
-                        }
-                    });
-                    if alive.is_err() {
-                        break;
-                    }
-                }
-            }),
+            _ages: None,
         };
         view.transcript.attach(&view.log.clone(), cx);
         let items = items(system, thread, cx);
         view.transcript.reconcile(items, cx);
         if is_root(system, thread) {
-            // The list reads from the top. What is unread in it comes from
-            // the ledger, which is the frame's and is leased while it opens
-            // this: the first rows go without it, and the next draw has it.
+            // The list reads from the top.
             view.cursor_to_first_thread(cx);
-            cx.defer_in(window, |this, _, cx| this.refresh(cx));
         } else {
             view.cursor_to_end(cx);
+            // The system is leased now: its ages are read once it is not.
+            cx.defer_in(window, |this, _, cx| this.schedule_ages(cx));
         }
+        // What is unread and the user's private replies come from the
+        // ledger, which is the frame's and is leased while it opens this:
+        // the rows are read again as soon as that is over, before the
+        // first draw. Not `defer_in`: that runs inside the window's update,
+        // where the frame cannot be read.
+        let this = cx.weak_entity();
+        let list = is_root(system, thread);
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.refresh(cx);
+                if list {
+                    this.cursor_to_first_thread(cx);
+                }
+            });
+        });
         view
     }
 
@@ -295,6 +319,11 @@ impl ThreadView {
         if at_end && !list {
             self.cursor_to_end(cx);
         }
+        if let Some(Follow::Logged(message)) = self.follow
+            && self.cursor_to_thread(message, cx)
+        {
+            self.follow = None;
+        }
         // A draft the system sent on the user's behalf (`send and start`)
         // leaves the composer: its words are in the thread now.
         let draft_gone = self
@@ -305,7 +334,37 @@ impl ThreadView {
         if draft_gone && !self.composer.read(cx).text(cx).is_empty() {
             self.clear_composer(cx);
         }
+        self.schedule_ages(cx);
         cx.notify();
+    }
+
+    /// Reads the thread again when an age it shows next says another.
+    fn schedule_ages(&mut self, cx: &mut Context<Self>) {
+        let now = Timestamp::now();
+        let system = self.system.read(cx);
+        let thread = self.thread;
+        let Some(chat) = system.chat(thread.host) else {
+            self._ages = None;
+            return;
+        };
+        let list = is_root(system, thread) && !chat.members_under(Some(thread.message)).is_empty();
+        let agents = chat
+            .thread(thread.message)
+            .map(|head| head.members.clone())
+            .unwrap_or_default();
+        let next = agents
+            .iter()
+            .filter_map(|agent| system.participant(thread.host, *agent, cx)?.doing)
+            .map(|doing| rho_dealer::curve::age_changes(unix(doing.since), now))
+            .chain(list.then(|| now + LIST_AGES_EVERY))
+            .min();
+        self._ages = next.map(|at| {
+            let wait = std::time::Duration::try_from(now.duration_until(at)).unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| view.refresh(cx));
+            })
+        });
     }
 
     /// Empties the composer without a window: the edit goes to its buffer.
@@ -350,6 +409,26 @@ impl ThreadView {
             .into_iter()
             .find(|link| link.start <= column && column < link.end)
             .and_then(|link| url::Url::parse(&line[link]).ok())
+    }
+
+    /// Puts the cursor on `message`'s line in a root's list; `false` while
+    /// the list does not hold it yet.
+    fn cursor_to_thread(&mut self, message: MessageId, cx: &mut Context<Self>) -> bool {
+        let rows = self.transcript.buffer().read(cx).max_point().row;
+        let Some(row) = (0..=rows)
+            .find(|row| self.transcript.line_meta(*row, cx) == Some(&Meta::Message(message)))
+        else {
+            return false;
+        };
+        self.log.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.change_with(&snapshot, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+            });
+            editor.request_autoscroll(Autoscroll::fit(), cx);
+            cx.notify();
+        });
+        true
     }
 
     /// The first thread of a root's list, if it has one.
@@ -430,11 +509,20 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     if let Some(message) = chat.message(thread.message)
         && !list
     {
-        items.push(message_item(message, Meta::None));
+        items.push(message_item(message, Meta::Head));
         items.extend(private.remove(&thread.message).unwrap_or_default());
     }
     if !head.members.is_empty() {
         items.push(with_line(system, host, &head.members, cx));
+    } else if let Some(reason) = system.failed_start(thread) {
+        // An idea whose agent did not start is not work in progress: it
+        // says so, and why, where the agents would be.
+        let reason = reason.lines().next().unwrap_or_default();
+        items.push(line(
+            Key::Participants,
+            &format!("no agent · did not start: {reason}"),
+            Class::Stopped,
+        ));
     }
     // A root's list starts at its first thread: nothing stands above it
     // to keep a gap from.
@@ -476,7 +564,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
                     _ => "replies",
                 },
                 chat.name(*id).unwrap_or_default(),
-                when(at.0),
+                thread::when(at.0 as i64),
             );
             items.push(
                 line(Key::Fold(*id), &text, Class::Fold).with_lines(vec![Meta::Message(*id)]),
@@ -486,6 +574,11 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     }
     items.extend(pending_items(system, host, thread.message, &mut gap_item));
     without_trailing_gap(items)
+}
+
+/// A time on the host's clock, as the dealer reads one.
+fn unix(at: rho_agent_types::UnixMs) -> Timestamp {
+    Timestamp::from_millisecond(at.0 as i64).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// `with` and each agent of the thread: what to call it, and what it is
@@ -513,15 +606,30 @@ fn with_line(
             .map_or_else(|| agent.encoded(), |participant| participant.label.clone());
         text.push_str(&label);
         styles.push((Class::Participants, start..text.len()));
+        let stopped_because = participant
+            .as_ref()
+            .and_then(|participant| participant.stopped_because.clone());
         if let Some(doing) = participant.and_then(|participant| participant.doing) {
             text.push_str(" · ");
             let state = text.len();
+            // The age a card says of the same agent: one age, one clock.
             text.push_str(&format!(
                 "{} {}",
                 doing.activity.word(),
-                ago(doing.since.0, now)
+                rho_dealer::curve::age(unix(doing.since), now)
             ));
-            let class = match doing.stop(now_ms) {
+            let stop = doing.stop(now_ms);
+            // A failure says why in the host's words, so the user knows what
+            // to do without opening the transcript. One line: the first.
+            if stop.is_some()
+                && let Some(reason) = stopped_because
+                    .as_deref()
+                    .and_then(|reason| reason.lines().next())
+            {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            let class = match stop {
                 Some(_) => Class::Stopped,
                 None => Class::Participants,
             };
@@ -562,10 +670,7 @@ fn private_items(
             .replies_to(&address)
             .into_iter()
             .map(|(note, held)| {
-                let time = held
-                    .written_ms
-                    .map(|ms| when(ms.max(0) as u64))
-                    .unwrap_or_default();
+                let time = held.written_ms.map(thread::when).unwrap_or_default();
                 let header = format!("🔒 you · {time}");
                 let body = held.body.as_deref().unwrap_or_default().trim_end();
                 let text = format!("{header}\n{body}");
@@ -615,11 +720,10 @@ fn pending_items(
     items
 }
 
-/// A root's threads, one line each, the way the Slack list shows
-/// conversations: the name and what waits in it, with the unread ones
-/// first, a mention of the user before a plain unread, and each group
-/// newest first. The words are in the thread; the list is for choosing one.
-/// Without `marks` nothing is known to be unread.
+/// A root's threads, one line each: the name and what waits in it, with the
+/// unread ones first, a mention of the user before a plain unread, and each
+/// group newest first. The words are in the thread; the list is for choosing
+/// one. Without `marks` nothing is known to be unread.
 fn thread_rows(
     system: &ChatSystem,
     chat: &HostChat,
@@ -689,6 +793,25 @@ fn thread_rows(
                 names.push(format!("+{}", agents.len() - 2));
             }
             waiting.push((names.join(", "), Class::Participants));
+            // A thread whose agents have all stopped is not work going on:
+            // say the stop, as the thread's `with` line does.
+            let now_ms = rho_agent_types::UnixMs(now.as_millisecond().max(0) as u64);
+            let stops: Vec<_> = agents
+                .iter()
+                .map(|agent| {
+                    system
+                        .participant(host, *agent, cx)
+                        .and_then(|participant| participant.doing)
+                        .and_then(|doing| doing.stop(now_ms))
+                })
+                .collect();
+            if let Some(Some(stop)) = stops.first()
+                && stops.iter().all(Option::is_some)
+            {
+                waiting.push((stop.word().to_owned(), Class::Stopped));
+            }
+        } else if system.failed_start(thread).is_some() {
+            waiting.push(("did not start".to_owned(), Class::Stopped));
         }
         waiting.push((ago(at.0, now), Class::Time));
         for (index, (word, class)) in waiting.into_iter().enumerate() {
@@ -736,6 +859,9 @@ impl ThreadView {
         if self.composer.read(cx).text(cx).trim().is_empty() {
             return;
         }
+        // The keys go back to the messages, as `escape` takes them: the
+        // next `i` writes a new message, never into this one.
+        self.focus_log(&FocusLog, window, cx);
         let thread = self.thread;
         self.system.update(cx, |_, cx| {
             cx.emit(Event::Idea {
@@ -751,14 +877,22 @@ impl ThreadView {
             return;
         }
         let thread = self.thread;
-        self.system.update(cx, |system, cx| {
-            system.post(thread.host, Some(thread.message), text, Vec::new(), cx);
+        let client_id = self.system.update(cx, |system, cx| {
+            let client_id = system.post(thread.host, Some(thread.message), text, Vec::new(), cx);
             system.set_draft(thread.host, Some(thread.message), String::new());
+            client_id
         });
         self.composer
             .update(cx, |composer, cx| composer.clear(window, cx));
+        self.focus_log(&FocusLog, window, cx);
         self.refresh(cx);
         self.cursor_to_end(cx);
+        // In a channel the message is a new thread: the cursor goes to it in
+        // the list, on its way and then where the list puts it, so `enter`
+        // opens it.
+        if is_root(self.system.read(cx), thread) {
+            self.follow = Some(Follow::Sending(client_id));
+        }
     }
 
     fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {
@@ -790,10 +924,28 @@ impl ThreadView {
                 Some(agent) => AgentRef(agent).address(),
                 None => return,
             },
-            Some(Meta::None) | None => return,
+            Some(Meta::None | Meta::Head) | None => return,
         };
         let frame = self.system.read(cx).frame.clone();
         frame.open(address, cx);
+    }
+}
+
+/// What the point is on, on a line of `thread` that holds `meta`: a
+/// message, or the thread itself on its head. On a line that is no
+/// message, such as a gap, a crumb, or a private reply, it is on nothing
+/// a remark could be under.
+fn line_subject(meta: Option<&Meta>, thread: ThreadId) -> Subject {
+    match meta {
+        Some(Meta::Message(id)) if *id != thread.message => Subject::Address(
+            ThreadId {
+                host: thread.host,
+                message: *id,
+            }
+            .address(),
+        ),
+        Some(Meta::Message(_) | Meta::Head) => Subject::Own,
+        Some(Meta::None | Meta::Open(_) | Meta::Agents(_)) | None => Subject::None,
     }
 }
 
@@ -857,7 +1009,7 @@ fn message_item(message: &rho_agent_types::Message, meta: Meta) -> Item<Key, Cla
         Party::User => "you".to_owned(),
         Party::Agent(agent) => agent.encoded(),
     };
-    let time = when(message.at.0);
+    let time = thread::when(message.at.0 as i64);
     let header = format!("{from} · {time}");
     let mut text = header.clone();
     text.push('\n');
@@ -904,16 +1056,10 @@ impl Surface for ThreadView {
         if let Some(agent) = self.agent_under_cursor(cx) {
             return Subject::Address(AgentRef(agent).address());
         }
-        match self.transcript.line_meta(self.cursor_row(cx), cx) {
-            Some(Meta::Message(id)) if *id != self.thread.message => Subject::Address(
-                ThreadId {
-                    host: self.thread.host,
-                    message: *id,
-                }
-                .address(),
-            ),
-            _ => Subject::Own,
-        }
+        line_subject(
+            self.transcript.line_meta(self.cursor_row(cx), cx),
+            self.thread,
+        )
     }
 
     /// The thread the subject is in, as the dealer counts threads: in a
@@ -1032,6 +1178,37 @@ mod tests {
             },
         ];
         assert_eq!(body(&content), "hello\n[image · image/png]");
+    }
+
+    /// `reply privately` lands on what the point is on: a message, or the
+    /// thread on its head, and nothing on the blank line under `with`.
+    #[test]
+    fn the_point_is_on_a_message_only_on_a_message_line() {
+        let host = EndpointId([7; 32]);
+        let thread = ThreadId {
+            host,
+            message: MessageId(rho_agent_types::ChatSeq(10)),
+        };
+        let child = MessageId(rho_agent_types::ChatSeq(12));
+        assert_eq!(line_subject(Some(&Meta::Head), thread), Subject::Own);
+        assert_eq!(
+            line_subject(Some(&Meta::Message(child)), thread),
+            Subject::Address(
+                ThreadId {
+                    host,
+                    message: child
+                }
+                .address()
+            )
+        );
+        for nothing in [
+            Some(Meta::None),
+            Some(Meta::Open(Address::new("note", "x"))),
+            Some(Meta::Agents(Vec::new())),
+            None,
+        ] {
+            assert_eq!(line_subject(nothing.as_ref(), thread), Subject::None);
+        }
     }
 
     #[test]

@@ -481,7 +481,7 @@ class NewAgent(WorksetCase):
         self.assertEqual(self.state.calls, [("clone", ("https://github.com/org/proj.git", cwd, "abc"))])
         self.assertEqual(self.state.agents[id], {
             "runtime": claude(),
-            "props": {"preset": "engineer", "cwd": cwd},
+            "props": {"preset": "engineer", "cwd": cwd, "repo": "https://github.com/org/proj.git"},
         })
         self.assertEqual(self.state.messages, [])
 

@@ -540,6 +540,7 @@ mod tests {
             .map(|index| {
                 Arc::new(UiBlock::Notice {
                     text: index.to_string(),
+                    times: 1,
                 })
             })
             .collect();
@@ -610,7 +611,10 @@ mod tests {
         let mut fold = empty_state();
         fold.blocks = vec![
             call("reported", UiToolStatus::Reported),
-            Arc::new(UiBlock::Notice { text: "a".into() }),
+            Arc::new(UiBlock::Notice {
+                text: "a".into(),
+                times: 1,
+            }),
             call("open", UiToolStatus::Running),
         ];
         store.set_fold(agent(), fold);

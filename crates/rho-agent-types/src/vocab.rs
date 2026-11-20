@@ -25,6 +25,17 @@ pub struct CallTiming {
     pub timing: ExecTiming,
 }
 
+/// How the cell of a call ended, as its notebook saw it: when, and whether
+/// it failed. The request that answers the call carries it when the cell
+/// had ended by then; one still running is only reported.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CellEnd {
+    pub call: crate::transcript::ExecId,
+    pub at: UnixMs,
+    /// A raise, a failed command, or a cancel.
+    pub failed: bool,
+}
+
 pub type AgentId = PrefixId<AgentIdDomain>;
 
 /// Keys agent-id encoding with the owning database's persisted machine seed.

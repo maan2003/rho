@@ -99,6 +99,18 @@ impl Heard {
             since: self.since,
         }
     }
+
+    /// Why it stopped, in its host's words, while it is stopped by a
+    /// failure: what the user reads to know what to do about it.
+    pub fn stopped_because(&self) -> Option<&str> {
+        use crate::protocol::transcript::InferenceState;
+        match &self.state.inference {
+            InferenceState::Failed { error, .. } | InferenceState::Lost { error, .. } => {
+                Some(error)
+            }
+            _ => None,
+        }
+    }
 }
 
 type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;

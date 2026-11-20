@@ -4,8 +4,7 @@
 //! their devices through the hosts: facts, every one kept, a note's text
 //! among them. The dealer reads them with what every system claims
 //! into the hand Home shows and a pull deals from. A verdict is a fact the
-//! user said; a system may do something of its own about it too (Slack
-//! moves its cursor), and hands back how to undo that.
+//! user said, and undo retracts the fact.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -21,7 +20,6 @@ use rho_window::style::StyleClass;
 
 use crate::frame::Frame;
 use crate::minibuffer::{Candidate, token_start};
-use crate::system::Reversal;
 
 /// Something the user says: a fact, or a note's new text or state.
 #[derive(Clone, Debug)]
@@ -72,20 +70,12 @@ impl Verdict {
     }
 }
 
-/// What `shift-u` takes back: what a verdict said, and what it did
-/// outside the ledger.
+/// What `shift-u` takes back.
 pub struct Undo {
-    /// Which verdict this is, in the order they were taken.
-    pub sequence: u64,
     pub verb: String,
-    /// What takes back what it said.
     pub takeback: Vec<Takeback>,
-    /// The address the verdict was on, dealt again by the undo, and what
-    /// the journal called the verdict. `None` for a batch with no card of
-    /// its own.
-    pub card: Option<(Address, rho_journal::DealerVerdict)>,
-    /// What the systems did about it, undone in order.
-    pub reversals: Vec<Reversal>,
+    pub address: Address,
+    pub verdict: rho_journal::DealerVerdict,
 }
 
 pub struct Attention {
@@ -95,7 +85,6 @@ pub struct Attention {
     pub marks: Marks,
     pub skips: Skips,
     undo: Vec<Undo>,
-    next_undo: u64,
 }
 
 impl Attention {
@@ -112,18 +101,13 @@ impl Attention {
             marks,
             skips: Skips::default(),
             undo: Vec::new(),
-            next_undo: 0,
         };
         (attention, events)
     }
 
-    /// Keeps a verdict for `shift-u`, numbered after every one before it.
-    pub fn push_undo(&mut self, mut undo: Undo) -> u64 {
-        undo.sequence = self.next_undo;
-        self.next_undo += 1;
-        let sequence = undo.sequence;
+    /// Keeps a verdict for `shift-u`.
+    pub fn push_undo(&mut self, undo: Undo) {
         self.undo.push(undo);
-        sequence
     }
 
     pub fn pop_undo(&mut self) -> Option<Undo> {
@@ -264,7 +248,7 @@ impl Frame {
         if let LedgerEvent::SecretMade(secret) = &event {
             self.show_secret(
                 *secret,
-                "write down your secret phrase · enter:",
+                "write down your secret phrase · it pairs your other devices · enter:",
                 window,
                 cx,
             );

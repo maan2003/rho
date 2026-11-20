@@ -55,25 +55,37 @@ impl Layout {
 }
 
 /// A heading and its state in `width`: the state is what the reader acts
-/// on, so it stays whole and the heading is cut at a word.
+/// on, so it is kept and the heading is cut at a word. A state wider than
+/// the line, one that says why at length, takes the line and is cut at a
+/// word itself.
 pub(crate) fn fit_heading(
     path: &str,
     state: &str,
     width: Pixels,
     measure: impl Fn(&str) -> Pixels,
 ) -> (String, String) {
-    let room = (width - HEADER_GUTTER - measure(state)).max(px(0.));
+    let line = (width - HEADER_GUTTER).max(px(0.));
+    if measure(state) > line {
+        return (String::new(), cut_at_word(state, line, &measure));
+    }
+    let room = (line - measure(state)).max(px(0.));
     if measure(path) <= room {
         return (path.to_owned(), state.to_owned());
     }
+    (cut_at_word(path, room, &measure), state.to_owned())
+}
+
+/// `text` cut at the last word that leaves room for an ellipsis.
+fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
     let ellipsis = "…";
     let mut cut = String::new();
-    for (boundary, character) in path.char_indices() {
+    for (boundary, character) in text.char_indices() {
         if !character.is_whitespace() {
             continue;
         }
-        let prefix = path[..boundary]
-            .trim_end_matches(|character: char| character.is_whitespace() || character == '/');
+        let prefix = text[..boundary].trim_end_matches(|character: char| {
+            character.is_whitespace() || character == '/' || character == '·'
+        });
         let candidate = format!("{prefix}{ellipsis}");
         if measure(&candidate) > room {
             break;
@@ -83,7 +95,7 @@ pub(crate) fn fit_heading(
     if cut.is_empty() && measure(ellipsis) <= room {
         cut.push_str(ellipsis);
     }
-    (cut, state.to_owned())
+    cut
 }
 
 /// How wide `text` is drawn in `style`.
@@ -221,8 +233,7 @@ enum Button {
     Back,
     Home,
     Menu,
-    /// The row under the cursor, as `enter` opens it: on Home, or on a
-    /// list that offers `open`.
+    /// Open the room under the cursor, as `enter` does on Home.
     Open,
     Done,
     Mute,
@@ -273,9 +284,8 @@ impl Button {
 struct BarState {
     prompting: bool,
     home: bool,
-    /// The cursor is on a row that opens: on Home, a room; elsewhere,
-    /// a row the surface offers `open` for.
-    row: bool,
+    /// The cursor is on a room on Home.
+    room: bool,
     /// The point is on something a verdict lands on.
     card: bool,
     /// The surface in view offers a `send` row.
@@ -286,7 +296,7 @@ struct BarState {
 /// answer. On Home, opening and the verdicts are buttons over the row
 /// under the cursor, where a tap only puts the cursor, because dealing from
 /// Home is what the phone is for; elsewhere they are one button for the menu,
-/// and the room goes to opening the row a list offers and to sending.
+/// with room left for a send button.
 fn buttons(state: BarState) -> Vec<Button> {
     if state.prompting {
         return vec![Button::Cancel, Button::Enter];
@@ -295,7 +305,7 @@ fn buttons(state: BarState) -> Vec<Button> {
     match state.home {
         true => {
             buttons.push(Button::Menu);
-            if state.row {
+            if state.room {
                 buttons.push(Button::Open);
             }
             if state.card {
@@ -304,9 +314,6 @@ fn buttons(state: BarState) -> Vec<Button> {
         }
         false => {
             buttons.extend([Button::Home, Button::Menu]);
-            if state.row {
-                buttons.push(Button::Open);
-            }
             if state.card {
                 buttons.push(Button::Verdicts);
             }
@@ -338,9 +345,6 @@ fn record_verdict(verdict: PhoneVerdict) {
 
 /// The row a surface offers for sending what is in its composer.
 const SEND_ROW: &str = "send";
-/// The row a list surface offers for opening the row under the cursor,
-/// as `enter` does.
-const OPEN_ROW: &str = "open";
 
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
@@ -548,20 +552,16 @@ impl Frame {
             surface
                 .rows(window, cx)
                 .into_iter()
-                .filter(|row| [SEND_ROW, OPEN_ROW].contains(&row.description.as_str()))
+                .filter(|row| row.description == SEND_ROW)
                 .collect(),
         );
-        let offers = |name: &str| rows.iter().any(|row| row.description == name);
         let home = self.home_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
             home,
-            row: match home {
-                true => self.home.read(cx).cursor_target(cx) != HomeTarget::None,
-                false => offers(OPEN_ROW),
-            },
+            room: home && self.home.read(cx).cursor_target(cx) != HomeTarget::None,
             card: self.card_target(cx).is_some(),
-            send: offers(SEND_ROW),
+            send: !rows.is_empty(),
         };
         let colors = cx.theme().colors();
         let items = buttons(state).into_iter().map(|button| {
@@ -617,9 +617,8 @@ impl Frame {
         match button {
             Button::Back => self.back(window, cx),
             Button::Home => self.toggle_home(window, cx),
-            Button::Menu => self.palette(crate::palette::First::Commands, window, cx),
-            Button::Open if self.home_in_view() => self.open_row(window, cx),
-            Button::Open => run_row(self, OPEN_ROW, window, cx),
+            Button::Menu => self.palette(window, cx),
+            Button::Open => self.open_row(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Done);
@@ -629,7 +628,7 @@ impl Frame {
             Button::Mute => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Mute);
-                    self.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx);
+                    self.verdict(target, Verdict::Mute, "mute".to_owned(), window, cx);
                 }
             }
             // How long is a question, the one the snooze menu asks.
@@ -789,6 +788,18 @@ mod tests {
         assert_eq!(whole, "short");
     }
 
+    /// A stop that says why can be wider than the phone: it takes the line,
+    /// cut at a word, rather than running under the mode word.
+    #[test]
+    fn a_state_wider_than_the_line_is_cut_and_the_heading_gives_way() {
+        let measure = |text: &str| px(text.chars().count() as f32 * 8.);
+        let state = "failed · 0m · The model refused the request: the conte…";
+        let (path, kept) = fit_heading("rho-web / FAILME native try", state, px(360.), measure);
+        assert_eq!(path, "");
+        assert_eq!(kept, "failed · 0m · The model refused the…");
+        assert!(measure(&kept) + HEADER_GUTTER <= px(360.));
+    }
+
     fn touch(phase: TouchPhase, y: f32, milliseconds: u64) -> TouchEvent {
         TouchEvent {
             id: TouchId(1),
@@ -861,7 +872,7 @@ mod tests {
         use Button::*;
         let home = BarState {
             home: true,
-            row: true,
+            room: true,
             card: true,
             ..BarState::default()
         };
@@ -879,7 +890,7 @@ mod tests {
         );
         assert_eq!(
             buttons(BarState {
-                row: false,
+                room: false,
                 card: false,
                 ..home
             }),
@@ -891,13 +902,7 @@ mod tests {
             ..BarState::default()
         };
         assert_eq!(buttons(thread), [Back, Home, Menu, Verdicts, Send]);
-        // A list elsewhere, such as `notes`, opens its row from the bar.
-        let list = BarState {
-            row: true,
-            card: true,
-            ..BarState::default()
-        };
-        assert_eq!(buttons(list), [Back, Home, Menu, Open, Verdicts]);
+        assert_eq!(buttons(BarState::default()), [Back, Home, Menu]);
         assert_eq!(
             buttons(BarState {
                 prompting: true,

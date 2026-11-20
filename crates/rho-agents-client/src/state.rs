@@ -55,6 +55,9 @@ pub enum UiBlock {
     Tool(UiTool),
     Notice {
         text: String,
+        /// How many times in a row it was said: an error a retry hit
+        /// again reads once, with its count.
+        times: u32,
     },
     /// A chat message an input handed the agent. The text is what the
     /// model read; the message itself, its sender and its words, is the
