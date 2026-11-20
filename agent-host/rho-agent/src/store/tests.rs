@@ -1,8 +1,8 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Role, UnixMs,
-    WorksetId, WorksetKind, Wpos,
+    Address, ChatEvent, ChatSeq, ContentPart, Mention, MentionKind, MessageId, Revision, Role,
+    UnixMs, WorksetId, WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
 

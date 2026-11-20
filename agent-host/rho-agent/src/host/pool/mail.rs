@@ -733,10 +733,13 @@ mod tests {
             let held = mail.statuses.lock().unwrap();
             assert_eq!(held.len(), 2);
             assert_eq!(
-                (&*held[&a].text, held[&a].at),
-                ("Runs with SSL", UnixMs(31))
+                (&held[&a].state, held[&a].at),
+                (&StatusText::Written("Runs with SSL".into()), UnixMs(31))
             );
-            assert_eq!((&*held[&b].text, held[&b].at), ("Bisecting", UnixMs(24)));
+            assert_eq!(
+                (&held[&b].state, held[&b].at),
+                (&StatusText::Written("Bisecting".into()), UnixMs(24))
+            );
         }
         mail.set_status(a, owner, String::new(), UnixMs(37))
             .unwrap();
