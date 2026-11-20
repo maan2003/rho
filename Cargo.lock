@@ -14572,6 +14572,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "rho-agent-hosts",
+ "rho-agent-types",
  "rho-frame",
  "rho-rpc",
  "rho-shell-view",

@@ -15,7 +15,7 @@ use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{RuntimeKind, Speaker};
 use crate::protocol::worksets::{AgentEntry, LogEvent};
-use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
+use crate::state::{FailureKind, UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// What an agent is: its directory entry and the kind of workset it is
 /// in. Never what has happened to it.
@@ -54,8 +54,7 @@ impl AgentIdentity {
     /// The chat message the agent was started from, when policy kept it as
     /// `origin`: the thread it works in, and the first thing it read.
     pub fn origin(&self) -> Option<MessageId> {
-        let id = self.prop(props::ORIGIN)?.strip_prefix("chat:")?;
-        Some(MessageId(ChatSeq(id.parse().ok()?)))
+        brief_origin(&self.entry.spec)
     }
 
     /// The repository its workset was made on, as the user named it, when
@@ -181,6 +180,10 @@ pub struct TranscriptFold {
     queue: Vec<(Wpos, UiBlock)>,
     /// The agent stopped on an error and nobody has written since.
     errored: bool,
+    origin: Option<MessageId>,
+    runtime_label: Option<String>,
+    /// The next successful response needs to close the visible error run.
+    after_error: bool,
     /// What the last reply said the context holds, and where it said it.
     context_used: Option<(Wpos, u64)>,
     /// Every reply's usage, summed, and the model the newest one named.
@@ -203,6 +206,15 @@ pub struct FoldDelta {
     pub usage: UiAgentUsage,
 }
 
+fn brief_origin(spec: &crate::protocol::worksets::SpecView) -> Option<MessageId> {
+    let id = spec
+        .props
+        .get(props::ORIGIN)?
+        .trim()
+        .strip_prefix("chat:")?;
+    Some(MessageId(ChatSeq(id.parse().ok()?)))
+}
+
 impl TranscriptFold {
     pub fn new(agent: AgentId, rows: &[(Wpos, LogEvent)]) -> Self {
         let mut fold = Self {
@@ -213,6 +225,9 @@ impl TranscriptFold {
             unanswered: 0,
             queue: Vec::new(),
             errored: false,
+            origin: None,
+            runtime_label: None,
+            after_error: false,
             context_used: None,
             usage: AgentUsageBucket::default(),
             usage_model: String::new(),
@@ -225,6 +240,7 @@ impl TranscriptFold {
     }
 
     fn push(&mut self, told_at: Option<Wpos>, block: UiBlock) {
+        self.after_error |= matches!(block, UiBlock::Failure { .. });
         // The same notice again, such as a retry failing as the last one
         // did, is counted on the one before.
         if let UiBlock::Notice { text, times } = &block
@@ -237,9 +253,15 @@ impl TranscriptFold {
             self.touch(self.blocks.len() - 1);
             return;
         }
-        if let UiBlock::Failure { text, times, at } = &block
+        if let UiBlock::Failure {
+            kind,
+            text,
+            times,
+            at,
+            ..
+        } = &block
             && let Some(last) = self.blocks.last_mut()
-            && matches!(&**last, UiBlock::Failure { text: said, .. } if said == text)
+            && matches!(&**last, UiBlock::Failure { kind: was, text: said, .. } if was == kind && said == text)
         {
             if let UiBlock::Failure {
                 times: said,
@@ -361,6 +383,7 @@ impl TranscriptFold {
                 false => UiToolStatus::Success,
             };
             tool.finished_at = Some(end.at);
+            self.after_error |= end.failed;
         }
     }
 
@@ -400,6 +423,7 @@ impl TranscriptFold {
                         UiToolStatus::Success
                     };
                     tool.finished_at = Some(at);
+                    self.after_error |= failed;
                 }
             }
         }
@@ -429,6 +453,12 @@ impl TranscriptFold {
         true
     }
 
+    fn successful_response(&mut self, pos: Wpos) {
+        if std::mem::take(&mut self.after_error) {
+            self.push(Some(pos), UiBlock::Responded);
+        }
+    }
+
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
         match event {
             LogEvent::CompactionRequested { .. } => {
@@ -454,6 +484,8 @@ impl TranscriptFold {
                 }
                 for input in inputs {
                     match input.message {
+                        // The brief has its own pinned row, not a second read here.
+                        Some(message) if Some(message) == self.origin => {}
                         // A message is still a message: a rewind of the
                         // turn it started does not unsay what was written.
                         Some(message) => self.push(
@@ -488,8 +520,16 @@ impl TranscriptFold {
                     self.answer_calls(timing.as_ref(), output);
                 }
             }
-            LogEvent::MailWritten { message, .. } => {
-                self.push(None, UiBlock::MailWritten { message: *message });
+            LogEvent::MailWritten {
+                message, version, ..
+            } => {
+                self.push(
+                    None,
+                    UiBlock::MailWritten {
+                        message: *message,
+                        version: *version,
+                    },
+                );
             }
             LogEvent::CellEnded { end, .. } => self.end_cell(end),
             LogEvent::CallsEnded { calls, at, .. } => self.report_calls(calls, *at),
@@ -513,6 +553,7 @@ impl TranscriptFold {
                     self.usage.requests += 1;
                     self.usage_model = usage.model.clone();
                 }
+                self.successful_response(pos);
                 for item in items {
                     let mut block = crate::store::block(item);
                     if let UiBlock::Tool(tool) = &mut block {
@@ -532,6 +573,9 @@ impl TranscriptFold {
             }
             // Claude's transcript is mirrored message by message.
             LogEvent::ClaudeMessage { speaker, text, .. } => {
+                if *speaker == Speaker::Assistant {
+                    self.successful_response(pos);
+                }
                 self.push(
                     Some(pos),
                     match speaker {
@@ -562,8 +606,10 @@ impl TranscriptFold {
                 self.push(
                     Some(pos),
                     UiBlock::Failure {
+                        kind: FailureKind::Stopped,
                         text: error.clone(),
                         times: 1,
+                        since: *at,
                         at: *at,
                     },
                 );
@@ -591,8 +637,12 @@ impl TranscriptFold {
                     self.push(
                         Some(pos),
                         UiBlock::Failure {
-                            text: format!("temporary inference error: {error}; retrying"),
+                            kind: FailureKind::Retrying {
+                                runtime: self.runtime_label.clone(),
+                            },
+                            text: error.clone(),
                             times: 1,
+                            since: *at,
                             at: *at,
                         },
                     );
@@ -614,15 +664,23 @@ impl TranscriptFold {
                         self.told_at.push(told);
                     }
                 }
+                self.after_error = self.blocks.iter().rev()
+                    .take_while(|block| !matches!(&***block, UiBlock::Responded))
+                    .any(|block| matches!(&**block, UiBlock::Failure { .. })
+                        || matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Error));
                 self.queue.retain(|(queued_at, ..)| queued_at < to);
                 if self.context_used.is_some_and(|(said_at, _)| said_at >= *to) {
                     self.context_used = None;
                 }
             }
-            LogEvent::WorksetCreated { .. }
-            | LogEvent::Evaluated { .. }
-            | LogEvent::AgentCreated { .. }
-            | LogEvent::AgentChanged { .. } => {}
+            LogEvent::AgentCreated { spec, .. } => {
+                self.origin = brief_origin(spec);
+                self.runtime_label = Some(spec.runtime_label());
+            }
+            LogEvent::AgentChanged { spec, .. } => {
+                self.runtime_label = Some(spec.runtime_label());
+            }
+            LogEvent::WorksetCreated { .. } | LogEvent::Evaluated { .. } => {}
         }
     }
 
@@ -878,7 +936,8 @@ mod tests {
             ),
         ]);
         assert_eq!(state.status, UiAgentStatus::Idle);
-        assert_eq!(state.blocks.len(), 3);
+        assert_eq!(state.blocks.len(), 4);
+        assert!(matches!(*state.blocks[2], UiBlock::Responded));
         assert_eq!(
             *state.blocks[0],
             UiBlock::Delivered {
@@ -890,7 +949,7 @@ mod tests {
         assert_eq!(tool.status, UiToolStatus::Error);
         assert_eq!(tool.output.as_deref(), Some("permission denied"));
         assert_eq!(tool.finished_at, Some(UnixMs(4)));
-        assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
+        assert!(matches!(*state.blocks[3], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
         assert_eq!(state.usage.provider, "sol");
@@ -1220,11 +1279,13 @@ mod tests {
             LogEvent::MailWritten {
                 agent: me(),
                 message: first,
+                version: Some(first.0),
                 at: UnixMs(6),
             },
             LogEvent::MailWritten {
                 agent: me(),
                 message: later,
+                version: Some(later.0),
                 at: UnixMs(6),
             },
             LogEvent::Rewound {
@@ -1237,11 +1298,49 @@ mod tests {
             .blocks
             .iter()
             .filter_map(|block| match &**block {
-                UiBlock::MailWritten { message } => Some(*message),
+                UiBlock::MailWritten { message, .. } => Some(*message),
                 _ => None,
             })
             .collect();
         assert_eq!(messages, [first, later]);
+    }
+
+    #[test]
+    fn a_brief_does_not_reappear_as_a_delivered_mail() {
+        let mut props = rho_agent_types::Props::new();
+        props.insert("origin".into(), "chat:27".into());
+        let spec = crate::protocol::worksets::SpecView {
+            runtime: RuntimeKind::Rho,
+            model: "sol".to_owned(),
+            effort: "low".to_owned(),
+            props,
+        };
+        let input = |number, text: &str| crate::protocol::worksets::InputView {
+            message: Some(MessageId(ChatSeq(number))),
+            text: text.into(),
+            role: rho_agent_types::Role::User,
+        };
+        let state = told(vec![
+            LogEvent::AgentCreated {
+                agent: me(),
+                spec,
+                at: UnixMs(1),
+            },
+            LogEvent::Request {
+                agent: me(),
+                inputs: vec![input(27, "brief"), input(28, "same thread, new mail")],
+                answers: false,
+                compaction: false,
+                timing: None,
+                output: String::new(),
+                at: UnixMs(2),
+            },
+        ]);
+        assert_eq!(state.blocks.len(), 1);
+        assert!(
+            matches!(&*state.blocks[0], UiBlock::Delivered { message, text }
+            if *message == MessageId(ChatSeq(28)) && text == "same thread, new mail")
+        );
     }
 
     #[test]
@@ -1269,13 +1368,17 @@ mod tests {
                     phase: None
                 }),
                 Arc::new(UiBlock::Failure {
-                    text: "temporary inference error: overloaded; retrying".to_owned(),
+                    kind: FailureKind::Retrying { runtime: None },
+                    text: "overloaded".to_owned(),
                     times: 1,
+                    since: UnixMs(2),
                     at: UnixMs(2),
                 }),
                 Arc::new(UiBlock::Failure {
+                    kind: FailureKind::Stopped,
                     text: "quota".to_owned(),
                     times: 1,
+                    since: UnixMs(3),
                     at: UnixMs(3),
                 }),
             ]
@@ -1331,11 +1434,7 @@ mod tests {
             .collect();
         assert_eq!(
             notices,
-            [
-                ("temporary inference error: overloaded; retrying", 3),
-                ("temporary inference error: timed out; retrying", 1),
-                ("temporary inference error: overloaded; retrying", 1),
-            ]
+            [("overloaded", 3), ("timed out", 1), ("overloaded", 1),]
         );
     }
 

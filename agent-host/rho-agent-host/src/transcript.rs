@@ -226,9 +226,14 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             at,
         },
         Event::RewindPending { .. } => return None,
-        Event::MailWritten { agent, message, .. } => LogEvent::MailWritten {
+        Event::MailWritten {
+            agent,
+            message,
+            version,
+        } => LogEvent::MailWritten {
             agent: *agent,
             message: *message,
+            version: *version,
             at,
         },
     })

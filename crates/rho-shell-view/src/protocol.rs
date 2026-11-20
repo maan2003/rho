@@ -6,6 +6,7 @@
 //! structured state; clients project that state into a read-only buffer,
 //! keep their pending input locally, and submit complete commands.
 
+use rho_agent_types::UnixMs;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Most pagers one shell holds paused at once.
@@ -129,7 +130,7 @@ pub struct ShellInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ShellExecutionState {
     Queued,
-    Running,
+    Running { since: UnixMs },
     Finished { status: i32 },
     Failed,
     Cancelled,
@@ -212,6 +213,7 @@ pub enum ShellServerFrame {
     },
     ExecutionStarted {
         execution: u64,
+        since: UnixMs,
         prompt: String,
         cwd: String,
     },

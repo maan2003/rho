@@ -519,7 +519,11 @@ impl AgentMap {
     }
 
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
-        let host = self.host_of_agent(agent_id);
+        self.agent_id_label_on_host(agent_id, self.host_of_agent(agent_id))
+    }
+
+    /// The start receipt names the host before its directory names the agent.
+    pub fn agent_id_label_on_host(&self, agent_id: AgentId, host: Option<HostId>) -> String {
         let counter = host
             .and_then(|h| self.hosts.get(&h))
             .map(|h| h.agent_counter)

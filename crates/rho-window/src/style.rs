@@ -50,6 +50,7 @@ pub enum StyleClass {
     Time,
     AgentMessage,
     AgentLabel,
+    MailSpeaker,
     ShellPrompt,
     ShellCommand,
 }
@@ -86,6 +87,7 @@ impl StyleClass {
             Self::ShellPrompt => 14,
             Self::ShellCommand => 15,
             Self::AgentLabel => 16,
+            Self::MailSpeaker => 17,
         };
         let region_bit = match region {
             Region::History => 0,
@@ -108,11 +110,12 @@ impl StyleClass {
             }
             Self::StatusRunning => (colors.terminal_ansi_cyan.into(), false),
             Self::StatusOk => (colors.terminal_ansi_green.into(), false),
-            Self::StatusError => (colors.terminal_ansi_red.into(), false),
+            Self::StatusError => (failed_color(cx), false),
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
             Self::AgentMessage => (agent_message_color(cx), false),
             Self::AgentLabel => (agent_message_color(cx), false),
+            Self::MailSpeaker => (colors.text_accent.into(), true),
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
         };
@@ -122,6 +125,11 @@ impl StyleClass {
             ..HighlightStyle::default()
         }
     }
+}
+
+/// Work failed, rather than a host becoming unreachable.
+pub fn failed_color(cx: &App) -> Hsla {
+    cx.theme().colors().terminal_ansi_bright_red.into()
 }
 
 pub fn hint_color(cx: &App) -> Hsla {

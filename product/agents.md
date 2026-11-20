@@ -38,13 +38,13 @@ has:
 - many `Desktop`
 - many `mail.Thread`, the one it started from first
 does:
-- open `enter` or a tap on a mail header: from the `mail.Thread` one level down, at the step that wrote the mail as it now reads; when opened by name, a failed agent opens on its last error
+- open `enter` or a tap on a mail header: from the `mail.Thread` one level down, at the step that wrote the mail as it now reads; when opened by name, a retrying or failed agent opens on its last error, otherwise on its newest step
 - open its thread, from the palette as `open its thread`: open the thread it started from
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind; the echo reads `compacted: eng-rb89`
 - new cache key, from the palette: make it start its model's cache afresh; the echo reads `new cache key: eng-rb89`
 - stop agent, from the palette: end its work and keep the transcript; the thread says `stopped by you`, with no new mail.
-- set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent. The echo line confirms the switch.
+- set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent. The echo reads `runtime: eng-ka35 · sol-low (was sol-medium)`.
 - cancel the request, from the palette: stop what it is asking its model now; the echo reads `cancelled: eng-rb89` or `not cancelled: eng-rb89 · it was not asking its model` when there was no request
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.
@@ -69,7 +69,7 @@ does:
 - read `ctrl-shift-n`, or `ctrl-\` then `ctrl-n`: stop typing, to scroll with `j`, `k`, `ctrl-d`, `ctrl-u`, `g g`, and `shift-g`, and to use `:`, `space`, `tab`, and `q`; `/`, `?`, `n`, `N` search and `y` copies as in other text; only `i` or `a` returns to typing
 - scroll with the wheel: move back through old lines, or, when the program in the terminal asks for the wheel, send it the wheel
 
-On the phone, the terminal bar has `esc`, `ctrl`, `tab`, and the four arrows while typing; `ctrl` modifies the next key. Closing a terminal's screen leaves the terminal running on the host. While it connects, the screen reads `connecting to term 0 of …`, and `q` still closes it. A terminal open on two devices is the same terminal; it takes the size of the window the user types in.
+On the phone, the terminal bar has `esc`, `ctrl`, `tab`, the four arrows and `read` while typing; `ctrl` modifies the next key. While reading the bar is `back`, `desk`, `menu`, `search`, `type`. Closing a terminal's screen leaves the terminal running on the host. While it connects, the screen reads `connecting to term 0 of …`, and `q` still closes it. A terminal open on two devices is the same terminal; it takes the size of the window the user types in.
 
 ## concept Shell
 purpose: give the user one line-at-a-time shell beside an agent, with its output as text they can search.
@@ -85,7 +85,7 @@ does:
 - more `alt-enter`, all `alt-a`, stop `alt-q`: answer a long output that the shell holds back, which says `[pager … paused on page … — Alt-Enter more · Alt-A all · Alt-Q stop]`
 - close shell, from the palette on the shell: end the shell on the host; the echo line reads `shell closed`
 
-On the phone, tap the prompt or `write` to type, then `run` or `cancel` to stop typing. Closing the shell's screen leaves the shell running on the host. The agent has one shell, the same on every device. When the shell ends, the prompt reads `[shell exited 0] `; when the host drops, it reads `[shell disconnected] `, and a line that did not reach the host goes back into the line being typed.
+While a command runs, the prompt reads `running · 4s`, counting up. On the phone, tap the prompt or `write` to type, `↑` to recall, and `run` or `cancel` to stop typing. `stop` interrupts the running command, like `ctrl-c`. Closing the shell's screen leaves the shell running on the host. The agent has one shell, the same on every device. When the shell ends, the prompt reads `[shell exited 0] `; when the host drops, it reads `[shell disconnected] `, and a line that did not reach the host goes back into the line being typed.
 
 ## concept Desktop
 purpose: let the user see and use a graphical app that an agent runs, such as a browser or the rho window itself.
@@ -106,11 +106,12 @@ A desktop of a known agent on an attached host is also a place in `window.Palett
 ## screen Agent
 answers: what went wrong, on what brief?
 shows:
-- in the `window.Status line`, the agent, its host and folder, what it is doing, and how many errors it hit
-- the brief first, then the transcript in order: commands in the user's words, with their output folded except on errors
+- in the `window.Status line`, the agent, its host, folder and runtime, what it is doing, and the errors since its last successful step. On a phone the folder and host give way before the agent's name.
+- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands use the user's words, and output is folded except on errors
 keys:
-- `]e`, `[e`: the next or previous error
-- `enter`: open or fold the command's output
+- `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
+- `enter` or a tap on a command: open or fold its output
+- `shift-u`: undo the last verdict without leaving the transcript
 - `space`: `deal.Verdict` on the agent's thread; the transcript stays open
 - `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`
@@ -119,34 +120,31 @@ Built renders: [mail's writing step on the laptop](design/laptop-agent.png) and 
 
 mock:
 ```text
-lab › eng-boqk · /src/clock   waiting                              NOR
-
+lab › eng-ka35 · clock · sol-low   retrying · 12 errors           NOR
 brief
 Fix the clock test that fails one run in five.
-─────────────────────────────────────────────────────────────────────
-[#2 clock › Fix the clock test that fails one run in five.] Mail from the user:
-Fix the clock test that fails one run in five.
-
-ran code: mail.status(2, "Waiting for clarification")… · ok 1s…
-wrote mail #4
+──────────────────────────────────────────────────────────────────
+you · 12:22
+Use a separate clock per test. Keep the change small.
+  set status "Waiting for clarification" · ok 12ms …
+  wrote to you: "Could you clarify which behavior you want me to implement?"
+you · 12:22
+Also check the retry path.
+  can't reach its model sol-low · retrying ×12 · since 12:22
 ```
 
 mock, phone:
 ```text
-lab › eng-boqk · clock  waiting             NOR
-
+eng-ka35 · retrying · 12 errors            NOR
 brief
 Fix the clock test that fails one run in five.
 ──────────────────────────────────────────────
-[#2 clock › Fix the clock test that fails
-one run in five.] Mail from the user:
-Fix the clock test that fails one run in five.
+you · 12:22
+Also check the retry path.
+can't reach its model sol-low · retrying ×12
+· since 12:22
 
-ran code: mail.status(2, "Waiting for
-clarification")… · ok 1s…
-wrote mail #4
-
-      back        done       snooze       more
+      back            error           menu
 ```
 
 ## flow Look into the work

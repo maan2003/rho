@@ -9,7 +9,7 @@
 
 mod thread;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,7 +19,8 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
-    Address as Party, AgentId, ContentPart, Doing, EndpointId, Message, MessageId, ThreadStatus,
+    Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
+    ThreadStatus,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -31,6 +32,7 @@ use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
 use crate::cache::Cache;
+pub use crate::cache::{MailAudience, WrittenMail};
 use crate::fold::HostMail;
 use crate::outbox::Outbox;
 use crate::protocol::Name;
@@ -270,6 +272,44 @@ impl MailSystem {
 
     pub fn host_mail(&self, endpoint: EndpointId) -> Option<&HostMail> {
         self.logs.get(&endpoint)
+    }
+
+    pub fn written_mail(
+        &self,
+        endpoint: EndpointId,
+        writes: &HashSet<(MessageId, Option<ChatSeq>)>,
+    ) -> HashMap<(MessageId, Option<ChatSeq>), WrittenMail> {
+        use rho_agent_types::Revision;
+        let Some(log) = self.host_mail(endpoint) else {
+            return HashMap::new();
+        };
+        let mut result = HashMap::new();
+        let mut historical = HashSet::new();
+        for &(id, version) in writes {
+            let Some(mail) = log.message(id) else {
+                continue;
+            };
+            let current = match mail.revision {
+                Revision::Original => version.unwrap_or(id.0) == id.0,
+                Revision::Edited { seq, .. } => version == Some(seq),
+                Revision::TakenBack { .. } | Revision::Deleted => false,
+            };
+            if current {
+                result.insert(
+                    (id, version),
+                    WrittenMail::from_content(mail.from, &mail.mentions, &mail.content),
+                );
+            } else if let Some(version) = version {
+                historical.insert((id, version));
+            }
+        }
+        result.extend(
+            self.cache
+                .written_mail(endpoint, &historical)
+                .into_iter()
+                .map(|((id, version), written)| ((id, Some(version)), written)),
+        );
+        result
     }
 
     /// The hosts whose logs are held, with their names: those attached

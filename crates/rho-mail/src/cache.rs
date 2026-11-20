@@ -8,10 +8,14 @@
 //! the host still has, so a table whose shape changed is dropped and read
 //! again from the host.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle as _};
-use rho_agent_types::{ChatRecord, ChatSeq, EndpointId, MessageId};
+use rho_agent_types::{
+    Address, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, Mention, MentionKind,
+    MessageId, content_text,
+};
 use rho_db::{RhoDb, Sen, SenValue};
 
 use crate::ThreadId;
@@ -75,6 +79,45 @@ pub struct Cache {
     /// to finish, and the database file stays open until it has.
     sender: Option<mpsc::Sender<Write>>,
     writer: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Which person the transcript should say this mail reached, and its words at
+/// the writing step. These are read from the existing log, not stored again.
+pub struct WrittenMail {
+    pub audience: MailAudience,
+    pub words: String,
+}
+
+pub enum MailAudience {
+    User,
+    Direct,
+    Project,
+    System,
+}
+
+impl WrittenMail {
+    pub(crate) fn from_content(
+        from: Address,
+        mentions: &[Mention],
+        content: &[ContentPart],
+    ) -> Self {
+        let audience = if matches!(from, Address::System { .. } | Address::StartFailed) {
+            MailAudience::System
+        } else if mentions.iter().any(|mention| mention.to == Address::User) {
+            MailAudience::User
+        } else if mentions
+            .iter()
+            .any(|mention| mention.kind == MentionKind::Direct)
+        {
+            MailAudience::Direct
+        } else {
+            MailAudience::Project
+        };
+        Self {
+            audience,
+            words: content_text(content),
+        }
+    }
 }
 
 impl Cache {
@@ -154,6 +197,51 @@ impl Cache {
             .open_table(LOG)
             .range((host.0, 0)..=(host.0, u64::MAX))
             .map(|(_, value)| value.value().into_owned())
+            .collect()
+    }
+
+    pub(crate) fn written_mail(
+        &self,
+        host: EndpointId,
+        writes: &HashSet<(MessageId, ChatSeq)>,
+    ) -> HashMap<(MessageId, ChatSeq), WrittenMail> {
+        if writes.is_empty() {
+            return HashMap::new();
+        }
+        self.flush();
+        let log = self.db.read().open_table(LOG);
+        writes
+            .iter()
+            .filter_map(|&(message, version)| {
+                let record = |seq: ChatSeq| {
+                    log.get((host.0, seq.0))
+                        .map(|value| value.value().into_owned())
+                };
+                let ChatEvent::Posted {
+                    from,
+                    mentions,
+                    content,
+                    ..
+                } = record(message.0)?.event
+                else {
+                    return None;
+                };
+                let words = if version == message.0 {
+                    content
+                } else {
+                    match record(version)?.event {
+                        ChatEvent::Edited {
+                            message: edited,
+                            content,
+                        } if edited == message => content,
+                        _ => return None,
+                    }
+                };
+                Some((
+                    (message, version),
+                    WrittenMail::from_content(from, &mentions, &words),
+                ))
+            })
             .collect()
     }
 
@@ -336,6 +424,37 @@ mod tests {
 
     const H1: EndpointId = EndpointId([1; 32]);
     const H2: EndpointId = EndpointId([2; 32]);
+
+    #[test]
+    fn a_writing_step_uses_its_version_even_when_edits_share_a_clock_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open_on(rho_db::client::open(dir.path()).unwrap()).unwrap();
+        let id = MessageId(ChatSeq(12));
+        let edit = |seq, message, words: &str| ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(31),
+            event: ChatEvent::Edited {
+                message,
+                content: vec![ContentPart::Text { text: words.into() }],
+            },
+        };
+        cache.write_records(
+            H1,
+            vec![
+                record(12),
+                record(13),
+                edit(15, id, "first edit"),
+                edit(16, id, "same clock, different words"),
+                edit(17, MessageId(ChatSeq(13)), "different mail"),
+            ],
+        );
+        let reads = HashSet::from([(id, ChatSeq(12)), (id, ChatSeq(15)), (id, ChatSeq(17))]);
+        let found = cache.written_mail(H1, &reads);
+        assert_eq!(found[&(id, ChatSeq(12))].words, "m12");
+        assert_eq!(found[&(id, ChatSeq(15))].words, "first edit");
+        assert!(!found.contains_key(&(id, ChatSeq(17))));
+        assert!(cache.written_mail(H2, &reads).is_empty());
+    }
 
     #[test]
     fn refreshing_the_copy_leaves_unsent_mail_and_drafts_in_place() {
