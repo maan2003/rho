@@ -13,4 +13,4 @@ does:
 - palette `ctrl-shift-;`: open the palette without the page seeing the keys; see `window.Palette`
 - back `ctrl-k`, forward `ctrl-j`, close `ctrl-shift-backspace`: as on any `window.Screen`; home is reached through the palette, as from an `agents.Desktop`
 
-A link in a message is drawn underlined, in the accent colour. A closed page's tab lives on for ten minutes, so `ctrl-j` brings it back as it was.
+A link in a message is drawn underlined, in the accent colour. Closing a page closes its tab. A tab no screen shows, such as one the browser restored on its own, is closed after ten minutes. A typed address with no scheme opens as `https://`, except a loopback address or a name with no dot, which open as `http://`. With no browser installed, the echo line reads `page: no browser found` and says where the window looks for one.
