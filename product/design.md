@@ -76,7 +76,7 @@ looks: one row of `editor text`; name first in `reading text`, then the quieter 
 states:
 - desk: a subject, card words in `attention` or status in `quiet`, and a project address in `quiet`; a folded row uses the address instead of a subject.
 - project list: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then mention, unread and reply counts, a status if present, and age.
-- prompt or palette: the candidate's name, its `attention` card words or `quiet` status if present, then its `quiet` address or key; query matches use `marked`; the chosen row keeps its fill all the way across.
+- prompt or palette: place rows use the Desk's columns with `row air` between them: subject, `attention` card words or `quiet` status, and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. A command shows its name and its `quiet` key sequence. Query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
 used on: `desk.Desk`, `mail.Project`, and `window.Palette`.
 form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [wrapped unread project row](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
@@ -130,7 +130,7 @@ purpose: ask for a line of text and offer answers without a dialog.
 looks: `editor text` in the `command strip`, question and input first with a `reading inset`, then the candidate rows down the window. The input wraps below a long question on a narrow screen.
 states:
 - blank query: question and any initial answers.
-- typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`.
+- typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`. The Palette shows the selected position and total in `quiet` at the right end of its prompt line.
 - no match: `no match` below the input when a choice is required and none fits.
 - closed: the strip goes away and the keys return.
 used on: `window.Palette` and other questions over `window.Screen`, as in `hosts.Attach a host`.

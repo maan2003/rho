@@ -688,7 +688,7 @@ impl Frame {
             return;
         };
         rho_journal::record(rho_journal::Event::MenuRan {
-            action: format!("{} › {}", open.rows.title, row.description),
+            action: format!("{} › {}", open.rows.title, row.pick.label()),
             count,
         });
         match row.pick {
@@ -699,14 +699,14 @@ impl Frame {
                 open.carried_count = count;
                 cx.notify();
             }
-            Pick::Run(run) => {
+            Pick::Run { run, .. } => {
                 if closes {
                     self.close_menu(window, cx);
                 }
                 run(self, count, window, cx);
                 cx.notify();
             }
-            Pick::Infix(run) => {
+            Pick::Infix { run, .. } => {
                 run(self, count, window, cx);
                 cx.notify();
             }
@@ -734,7 +734,7 @@ impl Frame {
         let rows = self.commands(window, cx);
         let desk_address = Self::desk_address();
         let desk_key = self.screen_binding(&keys::Desk, window, cx);
-        let commands = palette::flatten(&rows, |action| self.screen_binding(action, window, cx));
+        let commands = palette::commands(&rows, |action| self.screen_binding(action, window, cx));
         let mut found = Vec::new();
         for system in &self.systems {
             found.extend(system.find(&self.attention.marks, cx));
@@ -750,8 +750,7 @@ impl Frame {
             .map(|(rank, key)| (key, rank))
             .collect();
         for address in recent {
-            // While on the desk, the command represents Tab's way back.
-            if (self.desk_in_view() && address == &desk_address) || !known.insert(address.clone()) {
+            if !known.insert(address.clone()) {
                 continue;
             }
             if let Some((title, description)) = self
@@ -855,20 +854,8 @@ impl Frame {
             .bound_to(keys::PromptIdea)
             .window_wide(),
             undo,
-            Row::menu("", "hosts", self.hosts_menu()).window_wide(),
+            Row::menu("", self.hosts_menu()).window_wide(),
         ];
-        // Elsewhere the desk is already a recent place (with this key).
-        // On the desk the same action means going back.
-        if self.desk_in_view() || !self.history.holds(&Self::desk_address()) {
-            rows.insert(
-                0,
-                Row::run("", "desk", |frame, window, cx| {
-                    frame.toggle_desk(window, cx)
-                })
-                .bound_to(keys::Desk)
-                .window_wide(),
-            );
-        }
         let phrase = match self.attention.secret() {
             Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
                 frame.show_secret(secret, "your secret phrase · enter:", window, cx)
@@ -1023,8 +1010,7 @@ impl Frame {
         rows.extend(verdict_rows(target.clone()));
         rows.push(Row::menu(
             "s",
-            "snooze",
-            snooze_rows(&target, &card.title, layout == Layout::Phone),
+            snooze_rows(&target, layout == Layout::Phone),
         ));
         push_deal_rows(&mut rows);
         rows
@@ -1432,8 +1418,8 @@ fn push_deal_rows(rows: &mut Rows) {
 }
 
 /// How long `target` sleeps: a unit, and the count typed before it.
-pub(crate) fn snooze_rows(target: &Address, title: &str, phone: bool) -> Rows {
-    let mut snooze = Rows::new(format!("snooze: {title}")).counted();
+pub(crate) fn snooze_rows(target: &Address, phone: bool) -> Rows {
+    let mut snooze = Rows::new("snooze").counted();
     for (key, singular, plural, unit) in [
         ("m", "minute", "minutes", SnoozeUnit::Minutes),
         ("h", "hour", "hours", SnoozeUnit::Hours),
@@ -1504,13 +1490,14 @@ impl Render for Frame {
         if self.desk_in_view() {
             self.sync_desk_idea(layout, cx);
         }
+        let inset = px(2.);
         let frame = div()
             .id("rho-frame")
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .p(px(2.))
+            .p(inset)
             .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .key_context(crate::KEY_CONTEXT)
@@ -1608,6 +1595,15 @@ impl Render for Frame {
                 this.minibuffer_clear(window, cx);
             }))
             .child(self.render_status_line(&text_style, layout, window, cx));
+        let minibuffer = self.minibuffer.as_ref().map(|minibuffer| {
+            minibuffer.render(
+                &text_style,
+                layout,
+                window.viewport_size().width - inset * 2.,
+                window,
+                cx,
+            )
+        });
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
             let bar = self.render_phone_bar(window, cx);
@@ -1615,11 +1611,7 @@ impl Render for Frame {
             return frame
                 .child(body)
                 .children(self.render_idea(&text_style, layout, cx))
-                .children(
-                    self.minibuffer
-                        .as_ref()
-                        .map(|minibuffer| minibuffer.render(&text_style, layout, cx)),
-                )
+                .children(minibuffer)
                 .child(bar)
                 .children(sheet);
         }
@@ -1652,10 +1644,6 @@ impl Render for Frame {
                         )),
                     )
             }))
-            .children(
-                self.minibuffer
-                    .as_ref()
-                    .map(|minibuffer| minibuffer.render(&text_style, layout, cx)),
-            )
+            .children(minibuffer)
     }
 }

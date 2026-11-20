@@ -144,6 +144,11 @@ struct QuoteId {
     first_line: usize,
 }
 
+enum InlineOpen {
+    Quote(QuoteId),
+    Link(url::Url),
+}
+
 impl Meta {
     fn mail(&self) -> Option<MessageId> {
         match *self {
@@ -425,9 +430,8 @@ impl ThreadView {
             .find(|id| incoming(chat.message(*id)))
     }
 
-    /// The web link the cursor is on, if it is on one.
-    fn cursor_link(&self, cx: &App) -> Option<url::Url> {
-        let cursor = self.cursor(cx);
+    /// The web link at a point in the transcript, if there is one.
+    fn link_at(&self, cursor: Point, cx: &App) -> Option<url::Url> {
         let buffer = self.transcript.buffer().read(cx);
         if cursor.row >= draft::start(self.transcript.buffer(), cx).row {
             return None;
@@ -1016,29 +1020,39 @@ impl ThreadView {
         }
     }
 
+    /// A folded quote opens before links; an open quote closes only if
+    /// there is no link under the point. Both take precedence over the mail.
+    fn inline_open(&self, cursor: Point, cx: &App) -> Option<InlineOpen> {
+        let quote = match self.transcript.line_meta(cursor.row, cx) {
+            Some(Meta::Quote(quote)) => Some(*quote),
+            _ => None,
+        };
+        if let Some(quote) = quote
+            && !self.expanded_quotes.contains(&quote)
+        {
+            return Some(InlineOpen::Quote(quote));
+        }
+        self.link_at(cursor, cx)
+            .map(InlineOpen::Link)
+            .or_else(|| quote.map(InlineOpen::Quote))
+    }
+
     /// Enter opens the thing under the point: a quote, link, agent's mail,
     /// tangent or crumb.
     fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
-        let cursor = self.cursor_row(cx);
-        let meta = self.transcript.line_meta(cursor, cx).cloned();
-        if let Some(Meta::Quote(quote)) = meta
-            && !self.expanded_quotes.contains(&quote)
-        {
-            self.toggle_quote(quote, cx);
+        let cursor = self.cursor(cx);
+        if let Some(target) = self.inline_open(cursor, cx) {
+            match target {
+                InlineOpen::Quote(quote) => self.toggle_quote(quote, cx),
+                InlineOpen::Link(url) => self.system.read(cx).frame.clone().open_link(url, cx),
+            }
             return;
         }
-        if let Some(url) = self.cursor_link(cx) {
-            self.system.read(cx).frame.clone().open_link(url, cx);
-            return;
-        }
-        if let Some(Meta::Quote(quote)) = meta {
-            self.toggle_quote(quote, cx);
-            return;
-        }
-        if let Some((agent, mail)) = self.agent_mail(cursor, cx) {
+        if let Some((agent, mail)) = self.agent_mail(cursor.row, cx) {
             self.inspect(agent, mail, cx);
             return;
         }
+        let meta = self.transcript.line_meta(cursor.row, cx).cloned();
         let host = self.thread.host;
         let address = match meta {
             Some(Meta::Thread(id) | Meta::Mail(id)) if id != self.thread.message => {
@@ -1317,14 +1331,20 @@ impl Surface for ThreadView {
                 .host_mail(self.thread.host)
                 .map(|chat| chat.members_under(Some(self.thread.message)))
                 .unwrap_or_default();
+            let cursor = self.cursor(cx);
             let mail = (!self.on_draft(cx))
-                .then(|| self.agent_mail(self.cursor_row(cx), cx))
+                .then(|| self.agent_mail(cursor.row, cx))
                 .flatten();
             if let Some((agent, mail)) = mail {
                 let inspector = this.clone();
-                rows.push(Row::run("enter", "look into the work", move |_, _, cx| {
+                let look = Row::run("enter", "look into the work", move |_, _, cx| {
                     inspector.update(cx, |view, cx| view.inspect(agent, mail.clone(), cx));
-                }));
+                });
+                rows.push(if self.inline_open(cursor, cx).is_none() {
+                    look.bound_to(OpenRow)
+                } else {
+                    look
+                });
             } else {
                 let mut agents: Vec<_> = members
                     .into_iter()

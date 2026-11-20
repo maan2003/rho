@@ -240,6 +240,11 @@ impl MailSystem {
         self.host_mail(thread.host)?.status(thread.message)
     }
 
+    /// A mail thread's subject and project address for a row elsewhere.
+    pub fn thread_name(&self, thread: ThreadId, cx: &App) -> Option<(String, String)> {
+        self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+    }
+
     pub fn project_address(&self, channel: ThreadId) -> Option<String> {
         let alias = &self
             .hosts
@@ -928,8 +933,7 @@ impl System for MailSystem {
         _marks: &rho_dealer::Marks,
         cx: &App,
     ) -> Option<(String, String)> {
-        let thread = self.thread_of(address)?;
-        self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+        self.thread_name(self.thread_of(address)?, cx)
     }
 
     /// A message is read in the thread it was posted under, where a private

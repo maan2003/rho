@@ -5,7 +5,7 @@
 //! record changed ([`Told`]) so a screen refreshes only that. It is the
 //! same fold whether the records come from the disk copy or the host.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ChatSeq, MentionKind, Message, MessageId, Revision,
@@ -294,6 +294,16 @@ impl HostMail {
             .collect()
     }
 
+    /// Who works anywhere under this project, including in its threads.
+    pub fn members_in_project(&self, project: MessageId) -> BTreeSet<AgentId> {
+        self.members
+            .iter()
+            .filter_map(|(&(thread, agent), &joined)| {
+                (joined && self.root_of(thread) == project).then_some(agent)
+            })
+            .collect()
+    }
+
     /// Every agent that joined a thread, with the first it joined: its
     /// own thread.
     pub fn agent_threads(&self) -> impl Iterator<Item = (AgentId, MessageId)> + '_ {
@@ -392,6 +402,39 @@ mod tests {
                 content: vec![ContentPart::Text { text: text.into() }],
             },
         )
+    }
+
+    #[test]
+    fn project_members_include_threads_but_not_another_project_or_left_members() {
+        let mut mail = HostMail::default();
+        for (seq, parent) in [
+            (1, None),
+            (2, None),
+            (3, Some(1)),
+            (4, Some(2)),
+            (5, Some(3)),
+        ] {
+            mail.tell(&posted(seq, parent, Address::User, "work"));
+        }
+        let (a, b, c) = (agent(1), agent(2), agent(3));
+        for (seq, thread, agent) in [(6, 1, a), (7, 3, a), (8, 5, b), (9, 3, c), (10, 4, c)] {
+            mail.tell(&record(
+                seq,
+                ChatEvent::Joined {
+                    thread: id(thread),
+                    agent,
+                },
+            ));
+        }
+        mail.tell(&record(
+            11,
+            ChatEvent::Left {
+                thread: id(3),
+                agent: c,
+            },
+        ));
+        assert_eq!(mail.members_in_project(id(1)), BTreeSet::from([a, b]));
+        assert_eq!(mail.members_in_project(id(2)), BTreeSet::from([c]));
     }
 
     /// A forest told in order: roots, threads under them, replies, a

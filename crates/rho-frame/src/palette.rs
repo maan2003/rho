@@ -13,56 +13,29 @@ use crate::system::Found;
 const LISTED: usize = 100;
 
 pub(crate) struct Entry {
-    label: String,
     also: Vec<String>,
     keys: String,
     pub pick: Pick,
     scope: Scope,
 }
 
-pub(crate) fn flatten(
-    top: &[Row],
+pub(crate) fn commands(
+    rows: &[Row],
     resolve: impl Fn(&dyn gpui::Action) -> Option<String>,
 ) -> Vec<Entry> {
-    fn walk(row: &Row, parent: &str, scope: Scope, keys: String, into: &mut Vec<Entry>) {
-        let label = row.description.trim_end_matches('…');
-        let label = if parent.is_empty() {
-            label.to_owned()
-        } else {
-            format!("{parent} › {label}")
-        };
-        into.push(Entry {
-            label,
+    rows.iter()
+        .map(|row| Entry {
             also: row.also.clone(),
-            keys: keys.clone(),
-            pick: row.pick.clone(),
-            scope,
-        });
-        if let Pick::Menu(menu) = &row.pick {
-            let branch = if parent.is_empty() {
-                menu.title.clone()
-            } else {
-                format!("{parent} › {}", menu.title)
-            };
-            for child in &menu.rows {
-                let path = (!keys.is_empty())
-                    .then(|| format!("{keys} {}", child.key))
-                    .unwrap_or_default();
-                walk(child, &branch, scope, path, into);
+            keys: match &row.shortcut {
+                Some(Shortcut::Menu(keys)) => Some(keys.clone()),
+                Some(Shortcut::Action(action)) => resolve(action.as_ref()),
+                None => None,
             }
-        }
-    }
-    let mut entries = Vec::new();
-    for row in top {
-        let keys = match &row.shortcut {
-            Some(Shortcut::Menu(keys)) => Some(keys.clone()),
-            Some(Shortcut::Action(action)) => resolve(action.as_ref()),
-            None => None,
-        }
-        .unwrap_or_default();
-        walk(row, "", row.scope, keys, &mut entries);
-    }
-    entries
+            .unwrap_or_default(),
+            pick: row.pick.clone(),
+            scope: row.scope,
+        })
+        .collect()
 }
 
 pub(crate) struct Place {
@@ -79,10 +52,17 @@ pub(crate) enum Choice {
     Place(Place),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Group {
+    OtherPlace,
+    CurrentPlace,
+    Command,
+}
+
 impl Choice {
     pub fn name(&self) -> &str {
         match self {
-            Self::Command(entry) => &entry.label,
+            Self::Command(entry) => entry.pick.label().trim_end_matches('…'),
             Self::Place(place) => &place.found.title,
         }
     }
@@ -134,6 +114,14 @@ impl Choice {
             }) => Some((1, 0)),
             Self::Place(_) => None,
             Self::Command(entry) => Some((if entry.scope == Scope::Here { 2 } else { 3 }, 0)),
+        }
+    }
+
+    fn group(&self) -> Group {
+        match self {
+            Self::Place(place) if place.current => Group::CurrentPlace,
+            Self::Place(_) => Group::OtherPlace,
+            Self::Command(_) => Group::Command,
         }
     }
 
@@ -313,6 +301,7 @@ impl Listing {
                 let (score, marks) = choice.matches(&words)?;
                 Some((
                     (
+                        choice.group(),
                         !choice.name().eq_ignore_ascii_case(query),
                         score,
                         choice.query_order(),
@@ -385,7 +374,7 @@ mod tests {
             thread("waiting", "wave@lab", None, false, Some("asks · 1h")),
             thread("recent", "foam@lab", Some(0), false, None),
         ];
-        let rows = flatten(&[Row::run("", "new project", |_, _, _| {})], |_| None);
+        let rows = commands(&[Row::run("", "new project", |_, _, _| {})], |_| None);
         let listing = Listing::new(rows, places);
         assert_eq!(ids(&listing, " "), [4, 0, 3, 5]);
         assert_eq!(ids(&listing, "urrent"), [1]);
@@ -426,35 +415,48 @@ mod tests {
     }
 
     #[test]
-    fn menu_keys_are_only_displayed_with_a_working_opening_sequence() {
-        let menu = Rows::new("start agent").row(Row::run("h", "here…", |_, _, _| {}));
+    fn a_menu_is_one_command_whose_choices_are_not_search_results() {
         let top = [
             Row::menu(
                 "a",
-                "start agent, choosing where and runtime…",
-                menu.clone(),
+                Rows::new("start agent").row(Row::run("h", "here", |_, _, _| {})),
             ),
-            Row::menu("m", "other", menu).bound_to(crate::keys::VerdictMenu),
+            Row::menu(
+                "s",
+                Rows::new("snooze").row(Row::run("m", "minutes", |_, _, _| {})),
+            )
+            .bound_to(crate::keys::VerdictMenu),
         ];
-        let rows = flatten(&top, |_| Some("space".to_owned()));
-        let labels: Vec<_> = rows
-            .iter()
-            .map(|row| (row.label.as_str(), row.keys.as_str()))
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                ("start agent, choosing where and runtime", ""),
-                ("start agent › here", ""),
-                ("other", "space"),
-                ("start agent › here", "space h"),
-            ]
+        let rows = commands(&top, |_| Some("space s".to_owned()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pick.label(), "start agent");
+        assert!(rows[0].keys.is_empty());
+        assert_eq!(rows[1].keys, "space s");
+        assert!(
+            matches!(&rows[1].pick, Pick::Menu(menu) if menu.rows[0].pick.label() == "minutes")
         );
+        let listing = Listing::new(rows, vec![]);
+        assert_eq!(ids(&listing, "snooze"), [1]);
+        assert!(ids(&listing, "minutes").is_empty());
+    }
+
+    #[test]
+    fn commands_follow_places_and_the_current_place_is_last_in_its_group() {
+        let listing = Listing::new(
+            commands(&[Row::run("", "clock", |_, _, _| {})], |_| None),
+            vec![
+                thread("clock", "wave@lab", Some(0), true, Some("asks · 1h")),
+                thread("Broken Clock Test", "ice@lab", None, false, None),
+                thread("Clockwork Build", "reef@lab", None, false, None),
+            ],
+        );
+        assert_eq!(ids(&listing, "clock"), [1, 2, 0, 3]);
+        assert_eq!(ids(&listing, "wave"), [0]);
     }
 
     #[test]
     fn an_exact_command_beats_a_more_specific_command_offered_first() {
-        let rows = flatten(
+        let rows = commands(
             &[
                 Row::run("", "done with this mail", |_, _, _| {}),
                 Row::run("d", "done", |_, _, _| {}),
