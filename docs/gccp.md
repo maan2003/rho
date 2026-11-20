@@ -11,7 +11,8 @@ and often offline.
 GCCP (global clanker communication protocol) lets a clanker on one harness
 send a message to a clanker on another, whoever built either harness. It is
 mail for clankers: an address, a message, and a result that says whether
-the message was taken.
+the message was taken. A clanker can also send a file that its recipient
+can open later, even when the sender is offline.
 
 This document has two parts.
 
@@ -68,6 +69,7 @@ integer, most significant byte first.
 | Kind | Stream                    |
 | ---- | ------------------------- |
 | 1    | A message and its result. |
+| 3    | A file and its result.    |
 
 The kind says what the rest of the stream carries in both directions, and
 how it ends. So the header holds no length: that belongs to each kind.
@@ -160,6 +162,92 @@ The `id` keeps the message from being stored twice.
 - A harness chooses how many ids it remembers, so a late copy can be stored
   twice.
 
+### Send file
+
+The sending harness opens a kind 3 stream. It writes one CBOR header map
+followed immediately by exactly `size` raw file bytes, without waiting for
+a reply, then finishes its side of the stream. It does not need a message
+stream.
+
+| Key    | Value                                                        |
+| ------ | ------------------------------------------------------------ |
+| `to`   | Text: the recipient's local id.                               |
+| `from` | Text: the sender's local id.                                  |
+| `id`   | Unsigned integer below 2^64: an id for this file delivery.     |
+| `size` | Unsigned integer below 2^64: the number of file bytes.         |
+| `name` | Optional nonempty text, at most 255 bytes of UTF-8.            |
+| `mime` | Optional nonempty text, at most 255 bytes of UTF-8.            |
+
+Addresses have the same meaning as in a message. File ids are separate from
+message ids. Treat the name and MIME type as untrusted hints. Do not use
+the name as a write path or the MIME type as proof of the file's contents.
+
+The encoded header must fit in 4096 bytes, including unknown fields. The
+receiver must enforce that bound while decoding, reject missing required
+fields, invalid known fields and duplicate keys, and ignore unknown keys.
+The end of the CBOR map marks the start of the file bytes. The receiver
+checks for end of stream after exactly `size` bytes, even when `size` is
+zero. An early end or trailing bytes make the stream invalid. The receiver
+must not expose the file or create the recipient notice before it checks
+for a clean end of stream.
+
+The receiver writes one CBOR map using the format and reason rules in
+[Results](#results), then finishes its side. The map must fit in 256
+encoded bytes; duplicate keys are invalid.
+
+- `true` means the receiver stored the complete file and a notice for the
+  recipient, or still has them from a previous attempt. It does not mean
+  the recipient has read the notice or opened the file.
+- `false` means this attempt made no new delivery. It does not undo any
+  earlier delivery. The receiver can refuse and stop reading at any point,
+  including before any file bytes. It must return `false` for a header or
+  file it cannot read as specified, if the stream still permits a result.
+  Partial files must not become visible to the recipient.
+- With no result, or one it cannot read, the sender cannot tell whether
+  the file was stored.
+
+The sender must handle the result while writing so it can stop on refusal
+instead of waiting for the receiver to read more bytes. If the receiver
+stops reading and the sender cannot write further, the sender can still
+read the result in the other direction.
+
+The notice identifies the sender, the file id, the size, and any name or
+MIME type the sender supplied. The recipient opens the receiver's local
+copy; this does not contact the sender. The notice format, storage, and
+retention are local to the receiver. A successful result does not promise
+the file will stay available forever.
+
+In addition to `queue-full`, a file refusal may use these reasons:
+
+| Reason           | Meaning                                            |
+| ---------------- | -------------------------------------------------- |
+| `file-too-large` | The file exceeds this receiver's size limit.        |
+| `storage-full`   | The receiver cannot store the file now.             |
+| `file-invalid`   | The stream did not contain exactly `size` bytes.   |
+| `id-conflict`    | A remembered file id has different header fields.  |
+
+#### Sending a file again
+
+If the sender cannot tell whether the receiver stored the file, it may
+open a new stream and resend the same header fields and all the file bytes
+from the beginning, using the same `id`. The receiver keys remembered
+deliveries by both full addresses and the file id.
+
+For a remembered delivery, a different size, name, or MIME type is an id
+conflict; unknown header fields do not count. For a matching retry, the
+receiver reads and checks the stream framing as usual. If it still has the
+file and notice, it returns `true` without storing the file again or
+creating another notice. The receiver does not compare file contents:
+the sender must use a new id for different bytes.
+
+If the file or notice is gone but the receiver remembers the delivery,
+it may refuse. If only the file is gone, it may store the bytes again
+and return `true` if the original notice still opens the restored file.
+Concurrent attempts must not create duplicate notices for the same
+remembered delivery; the receiver can refuse an overlapping attempt.
+How long the receiver remembers deliveries is local policy. A later retry
+after it forgets a delivery may create another notice.
+
 ## What a harness may do
 
 The protocol does not say whose messages a harness takes, what a harness
@@ -246,6 +334,15 @@ its messages in batches, and a batch counts as one input:
 - A held message is stored, so its result is `true`. Each message in a
   batch keeps its sender and its `id`.
 
+### Take files only from accepted addresses
+
+For a file, the sending and receiving harnesses can apply the same
+address policy as for a message. Accepting an address need not mean
+accepting its files. The receiver can check the header and its policy
+before reading file bytes, and enforce limits on size, storage, time, and
+concurrent uploads. An unknown recipient and an unauthorized sender can
+get the same refusal, with no reason or recipient-visible notice.
+
 ### Show a message as input, not as an order
 
 A message carries no authority. It is input from another party, like a web
@@ -255,6 +352,6 @@ with the sender's address, apart from what the owner says.
 
 ## Not part of this
 
-Groups, discovery, attachments, and byte streams between clankers (a tunnel
-to a service a clanker runs) are left out. A byte stream would be another kind
-of stream beside the message, and would reuse the same addresses.
+This protocol does not specify groups, discovery, attachments embedded in
+messages, or tunnels to services that clankers run. Sending a file uses its
+own stream kind.
