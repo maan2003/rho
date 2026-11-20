@@ -421,6 +421,15 @@ impl Mirror {
         iter.next_back().and_then(|(key, _)| ts_of(key.value()))
     }
 
+    /// The newest timestamp held at or before `ts`: where a cutoff falls
+    /// in what the mirror has of a conversation.
+    pub fn newest_at_or_before(&self, scope: &Scope, ts: &Ts) -> Option<Ts> {
+        let txn = self.db.read();
+        let table = txn.open_table(MESSAGES);
+        let mut iter = table.range(scope.prefix().as_str()..=scope.key(ts).as_str());
+        iter.next_back().and_then(|(key, _)| ts_of(key.value()))
+    }
+
     pub fn oldest_ts(&self, scope: &Scope) -> Option<Ts> {
         let txn = self.db.read();
         let table = txn.open_table(MESSAGES);
@@ -1609,12 +1618,17 @@ pub fn unit_scope(model: &Model, unit: &Unit) -> Scope {
 /// and a host measuring what a desk rebuild costs has to be able to reach
 /// the half of it that reads the mirror.
 pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
-    let scope = unit_scope(model, unit);
-    let message = model
+    model
         .unit(unit)
-        .map(|facts| facts.newest.clone())
-        .and_then(|ts| mirror.message(&scope, &ts));
-    message
+        .map(|facts| message_line(model, mirror, unit, &facts.newest))
+        .unwrap_or_default()
+}
+
+/// The first line of one message in a unit, as the mirror holds it now;
+/// empty when the mirror does not hold it.
+pub fn message_line(model: &Model, mirror: &Mirror, unit: &Unit, ts: &Ts) -> String {
+    mirror
+        .message(&unit_scope(model, unit), ts)
         .map(|message| model.render(&message))
         .as_deref()
         .unwrap_or_default()

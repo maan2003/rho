@@ -206,6 +206,22 @@ pub struct MarkPlan {
     pub threads: Vec<(ThreadKey, Ts)>,
 }
 
+impl MarkPlan {
+    /// Every conversation and thread in the plan, with the message it is
+    /// marked read through.
+    pub fn units(&self) -> impl Iterator<Item = (Unit, Ts)> + '_ {
+        let conversations = self
+            .conversations
+            .iter()
+            .map(|(channel, ts)| (Unit::conversation(channel), ts.clone()));
+        let threads = self
+            .threads
+            .iter()
+            .map(|(key, ts)| (Unit::thread(&key.channel, &key.thread_ts), ts.clone()));
+        conversations.chain(threads)
+    }
+}
+
 /// How many completions the composer offers at once. There are thousands of
 /// emoji; a list longer than this is not read, it is scrolled past.
 const SUGGESTION_LIMIT: usize = 20;
@@ -1227,28 +1243,90 @@ impl Model {
     /// before it acts and then act on unchanged. `before` is a cutoff in
     /// epoch seconds; nothing newer than it is ever in here.
     ///
-    /// Conversations are the unread ones only. A conversation with nothing
-    /// unread is not backlog, and marking it would spend a request to change
-    /// nothing.
-    pub fn mark_plan(&self, before: f64) -> MarkPlan {
-        let conversations = self
+    /// Every conversation and followed thread that holds something unread
+    /// from somebody else from before the cutoff, each with the newest
+    /// message at or before it that rho knows of: Slack's own newest, the
+    /// unit's, or what `held` finds in the mirror. A muted conversation is
+    /// left alone, and the threads in it: it never asks, so there is
+    /// nothing in it to catch up on.
+    pub fn mark_plan(&self, before: f64, held: impl Fn(&Unit, &Ts) -> Option<Ts>) -> MarkPlan {
+        let cutoff = Ts::at_epoch_seconds(before);
+        let older = |ts: &Ts| (ts.epoch_seconds() < before).then(|| ts.clone());
+        let newest_known = |unit: &Unit, slack: Option<&Ts>| {
+            [
+                slack.and_then(older),
+                self.units.get(unit).and_then(|facts| {
+                    std::iter::once(&facts.newest)
+                        .chain(&facts.from_others)
+                        .filter_map(older)
+                        .max_by(|left, right| {
+                            left.epoch_seconds().total_cmp(&right.epoch_seconds())
+                        })
+                }),
+                held(unit, &cutoff).and_then(|ts| older(&ts)),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.epoch_seconds().total_cmp(&right.epoch_seconds()))
+        };
+        let behind = |read: Option<&Ts>, ts: &Ts| read.is_none_or(|read| ts.is_newer_than(read));
+        let mut channels = self
             .counts
             .values()
             .filter(|count| count.has_unreads || count.mention_count > 0)
-            .filter_map(|count| {
-                let latest = count.latest.clone()?;
-                (latest.epoch_seconds() < before).then_some((count.channel.clone(), latest))
+            .map(|count| count.channel.clone())
+            .collect::<BTreeSet<_>>();
+        // A unit asking with nothing unread before the cutoff is recent,
+        // and recent is what the reader keeps; one with something older is
+        // backlog whether or not Slack has counted it yet.
+        channels.extend(
+            self.asking
+                .keys()
+                .filter(|unit| unit.thread.is_none())
+                .filter(|unit| {
+                    let read = self.conversation_read.get(&unit.channel);
+                    self.units.get(unit).is_some_and(|facts| {
+                        facts
+                            .from_others
+                            .iter()
+                            .any(|other| older(other).is_some() && behind(read, other))
+                    })
+                })
+                .map(|unit| unit.channel.clone()),
+        );
+        let conversations = channels
+            .into_iter()
+            .filter(|channel| !self.muted.contains(channel))
+            .filter_map(|channel| {
+                let unit = Unit::conversation(&channel);
+                let latest = self
+                    .counts
+                    .get(&channel)
+                    .and_then(|count| count.latest.as_ref());
+                let ts = newest_known(&unit, latest)?;
+                behind(self.conversation_read.get(&channel), &ts).then_some((channel, ts))
             })
             .collect();
         let threads = self
             .units
             .iter()
             .filter_map(|(unit, facts)| {
-                Some((self.key(&unit.channel, unit.thread.as_ref()?), facts))
+                let key = self.key(&unit.channel, unit.thread.as_ref()?);
+                if !self.followed.contains(&key) || self.muted.contains(&unit.channel) {
+                    return None;
+                }
+                let read = self.thread_read.get(&key);
+                // Something from somebody else, unread, from before the
+                // cutoff: the replies the reader has not seen yet.
+                facts
+                    .from_others
+                    .iter()
+                    .chain(&facts.newest_from_other)
+                    .any(|other| older(other).is_some() && behind(read, other))
+                    .then_some(())?;
+                let ts = newest_known(unit, None)?;
+                behind(read, &ts).then_some((key, ts))
             })
-            .filter(|(key, _)| self.followed.contains(key))
-            .filter(|(_, facts)| facts.newest.epoch_seconds() < before)
-            .map(|(key, facts)| (key, facts.newest.clone()))
             .collect();
         MarkPlan {
             conversations,
@@ -1513,6 +1591,11 @@ impl Model {
     /// restart and offline.
     pub fn last_read(&self, channel: &ChannelId) -> Option<&Ts> {
         self.conversation_read.get(channel)
+    }
+
+    /// The newest message Slack says a conversation holds.
+    pub fn latest(&self, channel: &ChannelId) -> Option<&Ts> {
+        self.counts.get(channel)?.latest.as_ref()
     }
 
     /// Marks a thread read, at its own cursor. Slack keeps one per followed
@@ -1894,15 +1977,6 @@ impl Model {
         })
     }
 
-    /// Whether a `mark read before` cutoff closes this unit, and the
-    /// message it closes at: its newest message is older than the cutoff.
-    /// A unit the model has nothing to say about is not closed, which is
-    /// what keeps a cutoff from touching a card the mirror never saw.
-    pub fn closed_by(&self, unit: &Unit, before_epoch_seconds: f64) -> Option<Ts> {
-        let facts = self.units.get(unit)?;
-        (facts.newest.epoch_seconds() < before_epoch_seconds).then(|| facts.newest.clone())
-    }
-
     /// Whether Slack itself would be badging this unit right now, and what
     /// for. This is the one place the question is answered, and it is the
     /// difference between an inbox and a firehose.
@@ -2081,31 +2155,39 @@ mod tests {
             .collect()
     }
 
-    /// The cutoff rule, which used to live in the GUI beside the desk's
-    /// card ids: whether a `mark read before` reaches a unit is a question
-    /// about the unit's newest message, so the crate answers it.
+    /// `mark read before`: what is unread from before the cutoff is
+    /// covered, through the newest message before it, and nothing newer;
+    /// a muted conversation and one already read are not.
     #[test]
-    fn a_cutoff_closes_what_is_older_than_it_and_nothing_it_has_never_seen() {
+    fn a_cutoff_covers_the_unread_before_it_and_nothing_else() {
         let mut model = model();
         model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"));
         model.note_message(&message("C1", "900.0", "U1", "<@ME> again"));
-        let channel = Unit::conversation(&ChannelId("C1".into()));
-        let never_seen = Unit::conversation(&ChannelId("C9".into()));
+        model.note_message(&message("C2", "200.0", "U1", "<@ME> muted"));
+        model.set_muted([ChannelId("C2".into())]);
+        model.note_message(&message("C3", "300.0", "U1", "<@ME> read"));
+        model.mark_read(&ChannelId("C3".into()), &Ts("300.0".into()));
+        let none = |_: &Unit, _: &Ts| None;
         assert_eq!(
-            model.closed_by(&channel, 1_000.0),
-            Some(Ts("900.0".into())),
-            "a unit older than the cutoff is closed at its own newest message"
+            model.mark_plan(1_000.0, none).conversations,
+            vec![(ChannelId("C1".into()), Ts("900.0".into()))],
+            "the whole of C1, and neither the muted nor the read one"
         );
         assert_eq!(
-            model.closed_by(&channel, 500.0),
-            None,
-            "and one whose newest message is newer than the cutoff stays open"
+            model.mark_plan(500.0, none).conversations,
+            vec![(ChannelId("C1".into()), Ts("100.0".into()))],
+            "the mention before the cutoff, and not the one after it"
         );
         assert_eq!(
-            model.closed_by(&never_seen, 1_000.0),
-            None,
-            "a unit the model has nothing to say about is left alone"
+            model
+                .mark_plan(500.0, |unit, _| {
+                    (unit.channel.0 == "C1").then(|| Ts("400.0".into()))
+                })
+                .conversations,
+            vec![(ChannelId("C1".into()), Ts("400.0".into()))],
+            "the newest message the mirror holds before the cutoff"
         );
+        assert!(model.mark_plan(50.0, none).conversations.is_empty());
     }
 
     /// What the host needs to draw a card and what the model can say without

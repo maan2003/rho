@@ -34,7 +34,7 @@ use crate::config::{CredentialStore, Credentials, Paths, WorkspaceName};
 use crate::health::Signal;
 use crate::model::{self, Change, Model, Unit};
 use crate::session::{HandledBefore, Session, SessionEvent, Source};
-use crate::types::{ChannelId, Conversation, ThreadKey, Ts};
+use crate::types::{ChannelId, Conversation, ThreadKey};
 
 gpui::actions!(
     rho_slack,
@@ -565,11 +565,9 @@ pub fn say(
     if matches!(verdict, Verdict::Snooze(_)) {
         return None;
     }
-    let newest = session.model().unit(unit).map(|facts| facts.newest.clone());
-    let before = newest.and_then(|newest| {
-        let before = session.handled_before(unit);
-        session.mark_handled(unit, &newest, cx).then_some(before)
-    });
+    let before = session
+        .newest_in(unit)
+        .and_then(|newest| session.mark_handled(unit, &newest, cx));
     let muted = *verdict == Verdict::Mute;
     if muted {
         set_muted(session, unit, true, cx);
@@ -1042,10 +1040,7 @@ fn prompt_mark_read_before(
             let cutoff = mark_cutoff_text(needle);
             let description = match parse_mark_cutoff(&cutoff, chrono::Local::now()) {
                 Some(before) => {
-                    let plan = counting
-                        .read(cx)
-                        .model()
-                        .mark_plan(before.timestamp() as f64);
+                    let plan = counting.read(cx).mark_plan(before.timestamp() as f64);
                     format!(
                         "{} · {} · enter",
                         plural(plan.conversations.len(), "conversation"),
@@ -1080,37 +1075,14 @@ fn mark_read_before(
         );
         return;
     };
-    let before = cutoff.timestamp() as f64;
-    let model = session.read(cx).model();
-    let plan = model.mark_plan(before);
-    let (conversations, threads) = (plan.conversations.len(), plan.threads.len());
-    // Every unit the plan covers is done at the newest message at or
-    // before the cutoff, so anything that arrived since is still theirs;
-    // a card older than the cutoff that Slack has nothing unread for is
-    // backlog just the same, closed at its own newest.
-    let mut units: Vec<(Unit, Ts)> = plan
-        .conversations
-        .iter()
-        .map(|(channel, ts)| (Unit::conversation(channel), ts.clone()))
-        .chain(
-            plan.threads
-                .iter()
-                .map(|(key, ts)| (Unit::thread(&key.channel, &key.thread_ts), ts.clone())),
-        )
-        .collect();
-    for card in frame.hand().cards.clone() {
-        let Some(SlackAddress::Unit(workspace, unit)) = SlackAddress::from_address(&card.address)
-        else {
-            continue;
-        };
-        if &workspace != model.workspace() || units.iter().any(|(known, _)| *known == unit) {
-            continue;
-        }
-        if let Some(closed) = model.closed_by(&unit, before) {
-            units.push((unit, closed));
-        }
-    }
-    if units.is_empty() {
+    // The plan is the one the count line showed: every unit in it is done
+    // through the newest message before the cutoff, in rho and in Slack,
+    // so anything that arrived since is still theirs.
+    let moved = session.update(cx, |session, cx| {
+        let plan = session.mark_plan(cutoff.timestamp() as f64);
+        session.mark_read_before(&plan, cx)
+    });
+    if moved.is_empty() {
         frame.echo(
             &format!("mark read before {text}: nothing that old"),
             StyleClass::SystemInfo,
@@ -1118,20 +1090,11 @@ fn mark_read_before(
         );
         return;
     }
-    // A unit is done at the cutoff and no further: anything newer is still
-    // the reader's. One whose cursor was past it already is left alone.
-    let moved: Vec<(Unit, Ts, HandledBefore)> = session.update(cx, |session, cx| {
-        session.mark_read_before(plan, cx);
-        units
-            .into_iter()
-            .filter_map(|(unit, ts)| {
-                let before = session.handled_before(&unit);
-                session
-                    .mark_handled(&unit, &ts, cx)
-                    .then_some((unit, ts, before))
-            })
-            .collect()
-    });
+    let threads = moved
+        .iter()
+        .filter(|(unit, _, _)| unit.thread.is_some())
+        .count();
+    let conversations = moved.len() - threads;
     let model = session.read(cx).model();
     let writes: Vec<Write> = moved
         .iter()
@@ -1142,18 +1105,18 @@ fn mark_read_before(
             })
         })
         .collect();
-    let closed = moved.len();
     let undo = session.downgrade();
     frame.say(
         "mark read before".to_owned(),
         writes,
         vec![Box::new(move |cx| {
+            let cards = moved.len();
             let _ = undo.update(cx, |session, cx| {
                 for (unit, _, before) in &moved {
                     session.undo_handled(unit, before, cx);
                 }
             });
-            rho_journal::record(rho_journal::Event::SlackMarkReadBeforeUndone { cards: closed });
+            rho_journal::record(rho_journal::Event::SlackMarkReadBeforeUndone { cards });
         })],
         cx,
     );
@@ -1164,7 +1127,7 @@ fn mark_read_before(
     });
     frame.echo(
         &format!(
-            "marked read before {text}: {} · {} · {closed} closed",
+            "marked read before {text}: {} · {}",
             plural(conversations, "conversation"),
             plural(threads, "thread")
         ),

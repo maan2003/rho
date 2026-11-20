@@ -6,7 +6,7 @@
 //! and no storage: it emits [`SessionEvent`], and the host decides what a
 //! raised thread means for its inbox, its journal, and its lamp.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -383,6 +383,15 @@ pub enum EmojiCache<'a> {
     Failed,
 }
 
+/// Where the muted set is on its way to Slack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutePush {
+    Idle,
+    Sending,
+    /// Sending, and the set has changed since: send again when it lands.
+    SendingThenAgain,
+}
+
 pub struct Session {
     client: Option<Arc<Client>>,
     model: Model,
@@ -445,6 +454,22 @@ pub struct Session {
     /// here changes what rho shows -- the local cursor has already said it,
     /// and this is only the same thing said to Slack.
     outbox: BTreeMap<Unit, Ts>,
+    /// The units whose read mark is on its way to Slack now.
+    pushing: BTreeSet<Unit>,
+    /// The marks rho has sent whose echo has not come back yet. Rho moved
+    /// its own idea of Slack's mark when it said each one, so the echo is
+    /// old news, and worse once an undo has taken the mark back since: the
+    /// model keeps the newer mark, so a late echo would undo the undo.
+    echoes: BTreeMap<Unit, Vec<Ts>>,
+    mute_push: MutePush,
+    /// An undo moved a conversation's read mark back. Slack owns the
+    /// badge, and only Slack can say what is unread above the old mark
+    /// again, so the counts are asked for once the outbox is empty.
+    recount: bool,
+    /// How many read marks this session has sent. Counts asked for before
+    /// a mark went out may hold the cursor that mark replaced, so an answer
+    /// that saw this change is asked for again rather than believed.
+    marks_sent: u64,
     _tasks: Vec<Task<()>>,
 }
 
@@ -489,6 +514,11 @@ impl Session {
             focused: None,
             connected_once: false,
             outbox: BTreeMap::new(),
+            pushing: BTreeSet::new(),
+            echoes: BTreeMap::new(),
+            mute_push: MutePush::Idle,
+            recount: false,
+            marks_sent: 0,
             _tasks: Vec::new(),
         }
     }
@@ -517,6 +547,11 @@ impl Session {
             focused: None,
             connected_once: false,
             outbox: BTreeMap::new(),
+            pushing: BTreeSet::new(),
+            echoes: BTreeMap::new(),
+            mute_push: MutePush::Idle,
+            recount: false,
+            marks_sent: 0,
             _tasks: Vec::new(),
         };
         session.seed_from_mirror();
@@ -808,6 +843,9 @@ impl Session {
                 self.react(&channel, &ts, &user, &name, added);
             }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
+                if self.own_echo(&Unit::conversation(&channel), &ts) {
+                    return;
+                }
                 // Read elsewhere. Only the badge is stale: reading is not a
                 // verdict, so every card stays exactly where it was.
                 self.note_read(&Source::Conversation(channel), &ts);
@@ -818,6 +856,9 @@ impl Session {
                 thread_ts,
                 ts,
             }) => {
+                if self.own_echo(&Unit::thread(&channel, &thread_ts), &ts) {
+                    return;
+                }
                 // A thread read elsewhere. Its own cursor moves and the
                 // conversation around it is left alone: nobody has said
                 // anything about the channel.
@@ -1341,22 +1382,37 @@ impl Session {
         }
     }
 
-    /// The unread counts again, after an outage. Nothing else in the roster
-    /// goes stale off a dropped socket, so nothing else is asked for.
+    /// The unread counts again, after an outage or an undo that moved a
+    /// read mark back. Nothing else in the roster goes stale off a dropped
+    /// socket, so nothing else is asked for.
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let asked_at = self.marks_sent;
         let task = gpui_tokio::Tokio::spawn(cx, async move { client.counts().await });
         self._tasks.push(cx.spawn(async move |this, cx| {
             let Ok(Ok(counts)) = task.await else {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
+                if session.marks_sent != asked_at {
+                    session.recount = true;
+                    session.recount_when_settled(cx);
+                    return;
+                }
                 session.model.set_counts(counts.conversations);
                 cx.notify();
             });
         }));
+    }
+
+    /// Asks for the counts an undo is owed, once no mark is waiting or on
+    /// its way, so the answer is Slack's word after the last of them.
+    fn recount_when_settled(&mut self, cx: &mut Context<Self>) {
+        if self.outbox.is_empty() && self.pushing.is_empty() && std::mem::take(&mut self.recount) {
+            self.refresh_counts(cx);
+        }
     }
 
     /// The open surfaces a message belongs to: its conversation, and the
@@ -1383,22 +1439,59 @@ impl Session {
         cx.emit(SessionEvent::Changed(changes));
     }
 
-    /// Says the reader is done in this unit up to here, and remembers it.
+    /// Says the reader is done in this unit up to here, in rho and in
+    /// Slack, and returns where both stood for an undo; `None` when
+    /// neither moved.
     ///
-    /// rho's own half of the cursor moves at once and on this machine, so
-    /// the card closes whether or not Slack ever hears about it. Telling
-    /// Slack is the caller's, through the outbox: an unconfirmed push is
-    /// stale, not a fault, because the other half of the join already says
-    /// the right thing here.
-    pub fn mark_handled(&mut self, unit: &Unit, ts: &Ts, cx: &mut Context<Self>) -> bool {
-        if !self.model.mark_handled(unit, ts) {
-            return false;
+    /// The two halves move on their own evidence. rho's cursor may be
+    /// there already -- the reader's own reply put it there -- while Slack
+    /// still shows everything since its mark unread, so Slack is told
+    /// whenever its mark is behind, whatever rho's cursor did. A mark
+    /// already past `ts`, read on the phone, is never pulled back to it.
+    ///
+    /// rho's half moves at once and on this machine, so the card closes
+    /// whether or not Slack ever hears about it; Slack's half goes through
+    /// the outbox, where an unconfirmed push is stale, not a fault.
+    pub fn mark_handled(
+        &mut self,
+        unit: &Unit,
+        ts: &Ts,
+        cx: &mut Context<Self>,
+    ) -> Option<HandledBefore> {
+        let handled = self.model.handled_through(unit).cloned();
+        let read = self.model.read_through(unit).cloned();
+        let behind = read.as_ref().is_none_or(|read| ts.is_newer_than(read));
+        // Where an undo puts Slack's mark. One rho never learned goes back
+        // to just before the first message the verdict closed, which is as
+        // unread as every other app needs it to be; with nothing to name
+        // that by, to Slack's own never-read mark.
+        let restore = behind.then(|| {
+            read.clone().unwrap_or_else(|| {
+                self.oldest_from_other_after(unit, handled.as_ref())
+                    .map(|first| just_before(&first))
+                    .unwrap_or_else(Ts::never_read)
+            })
+        });
+        let moved = self.model.mark_handled(unit, ts);
+        if !moved && !behind {
+            return None;
         }
         self.write_handled();
-        self.outbox.insert(unit.clone(), ts.clone());
-        self.drain_outbox(cx);
+        if behind {
+            let source = self.source_of(unit);
+            self.note_read(&source, ts);
+            self.outbox.insert(unit.clone(), ts.clone());
+            self.drain_outbox(cx);
+        } else if let Some(mirror) = self.mirror.as_ref() {
+            // Slack has read this far already: there is nothing to push,
+            // and a start must not push it either.
+            mirror.set_pushed(&scope_of(&self.model.workspace().0, unit), ts);
+        }
         cx.notify();
-        true
+        Some(HandledBefore {
+            handled,
+            read: restore,
+        })
     }
 
     /// Moves Slack's read cursor to immediately before `ts`, and clears
@@ -1482,39 +1575,32 @@ impl Session {
     }
 
     /// Takes the verdict's word back, both halves of it: rho's own cursor
-    /// goes where it stood, and Slack's mark is pushed back to where it
-    /// stood, because rho is what moved it. A mark moving backwards is a
-    /// thing Slack does -- it is what "mark unread" is -- and this is the
-    /// only place rho asks for one.
-    ///
-    /// A unit that had no mark at all goes back to just before the first
-    /// message the verdict closed, which is as unread as Slack can be told
-    /// to make it: every other app shows the ask unread again. The cursor
-    /// is written down too, so a start before Slack answers deals the card.
+    /// goes where it stood, and Slack's mark, when the verdict moved it, is
+    /// pushed back to where it stood, because rho is what moved it. A mark
+    /// moving backwards is a thing Slack does -- it is what "mark unread"
+    /// is -- and an undo and `mark unread` are where rho asks for one.
+    /// The cursor is written down too, so a start before Slack answers
+    /// deals the card.
     pub fn undo_handled(&mut self, unit: &Unit, before: &HandledBefore, cx: &mut Context<Self>) {
         self.outbox.remove(unit);
-        let read = before.read.clone().or_else(|| {
-            self.oldest_from_other_after(unit, before.handled.as_ref())
-                .map(|ts| just_before(&ts))
-        });
         self.model.undo_handled(unit, before.handled.clone());
-        self.model.set_read_through(unit, read.clone());
         self.write_handled();
-        if let Some(read) = read {
+        if let Some(read) = before.read.clone() {
+            self.model.set_read_through(unit, Some(read.clone()));
             if let Some(mirror) = self.mirror.as_ref() {
                 mirror.set_last_read(&scope_of(&self.model.workspace().0, unit), &read);
             }
             self.outbox.insert(unit.clone(), read);
+            self.recount |= unit.thread.is_none();
             self.drain_outbox(cx);
         }
         cx.notify();
     }
 
-    /// Where both halves of a unit's cursor stand, for an undo to put back.
-    pub fn handled_before(&self, unit: &Unit) -> HandledBefore {
-        HandledBefore {
-            handled: self.model.handled_through(unit).cloned(),
-            read: self.model.read_through(unit).cloned(),
+    fn source_of(&self, unit: &Unit) -> Source {
+        match &unit.thread {
+            Some(root) => Source::Thread(self.model.key(&unit.channel, root)),
+            None => Source::Conversation(unit.channel.clone()),
         }
     }
 
@@ -1522,12 +1608,31 @@ impl Session {
     /// One request each, and only for units whose cursor moved, so this
     /// costs the moves rather than the mirror. A failure leaves the unit in
     /// the outbox: nothing local depends on the answer.
+    ///
+    /// One push per unit at a time: a done and the undo a second later are
+    /// two marks on one cursor, and Slack keeps whichever lands last, so
+    /// the undo waits for the done to land.
     fn drain_outbox(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
         let workspace = self.model.workspace().0.clone();
-        for (unit, ts) in std::mem::take(&mut self.outbox) {
+        let ready = self
+            .outbox
+            .keys()
+            .filter(|unit| !self.pushing.contains(*unit))
+            .cloned()
+            .collect::<Vec<_>>();
+        for unit in ready {
+            let Some(ts) = self.outbox.remove(&unit) else {
+                continue;
+            };
+            self.pushing.insert(unit.clone());
+            self.echoes
+                .entry(unit.clone())
+                .or_default()
+                .push(ts.clone());
+            self.marks_sent += 1;
             let client = client.clone();
             let mirror = self.mirror.clone();
             let scope = scope_of(&workspace, &unit);
@@ -1544,19 +1649,46 @@ impl Session {
                     Err(error) => Some(format!("{error}")),
                     Ok(Ok(())) => None,
                 };
-                let _ = this.update(cx, |this, _| match failed {
-                    Some(reason) => {
-                        tracing::warn!(error = %reason, "slack read mark not pushed");
-                        this.outbox.entry(unit).or_insert(ts);
-                    }
-                    None => {
-                        if let Some(mirror) = mirror {
-                            mirror.set_pushed(&scope, &ts);
+                let _ = this.update(cx, |this, cx| {
+                    this.pushing.remove(&unit);
+                    // What was said while this one was on its way, which
+                    // supersedes it whether or not it landed.
+                    let said_since = this.outbox.contains_key(&unit);
+                    match failed {
+                        Some(reason) => {
+                            tracing::warn!(error = %reason, "slack read mark not pushed");
+                            this.own_echo(&unit, &ts);
+                            this.outbox.entry(unit).or_insert(ts);
+                        }
+                        None => {
+                            if let Some(mirror) = mirror {
+                                mirror.set_pushed(&scope, &ts);
+                            }
                         }
                     }
+                    if said_since {
+                        this.drain_outbox(cx);
+                    }
+                    this.recount_when_settled(cx);
                 });
             }));
         }
+    }
+
+    /// Whether a read mark is the echo of one rho sent, which it then
+    /// stops waiting for.
+    fn own_echo(&mut self, unit: &Unit, ts: &Ts) -> bool {
+        let Some(sent) = self.echoes.get_mut(unit) else {
+            return false;
+        };
+        let Some(at) = sent.iter().position(|said| said == ts) else {
+            return false;
+        };
+        sent.remove(at);
+        if sent.is_empty() {
+            self.echoes.remove(unit);
+        }
+        true
     }
 
     /// Puts the units a change moved on disk, and only those.
@@ -2657,12 +2789,31 @@ impl Session {
         muted: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client.clone() else {
+        if self.client.is_none() {
             return;
-        };
+        }
         let channel = unit.channel.clone();
         self.model.set_channel_muted(&channel, muted);
         cx.notify();
+        self.push_muted(cx);
+    }
+
+    /// Sends Slack the muted set the model holds now. One send at a time:
+    /// a mute and its undo a second later are two whole sets, and Slack
+    /// keeps whichever lands last, so the second waits for the first and
+    /// then sends whatever the set is by then.
+    fn push_muted(&mut self, cx: &mut Context<Self>) {
+        match self.mute_push {
+            MutePush::Sending | MutePush::SendingThenAgain => {
+                self.mute_push = MutePush::SendingThenAgain;
+                return;
+            }
+            MutePush::Idle => {}
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.mute_push = MutePush::Sending;
         let wanted = self.model.muted().iter().cloned().collect::<Vec<_>>();
         let task =
             gpui_tokio::Tokio::spawn(cx, async move { client.set_muted_channels(&wanted).await });
@@ -2670,7 +2821,14 @@ impl Session {
             if let Ok(Err(error)) = task.await {
                 tracing::warn!(error = %error, "slack mute failed");
             }
-            let _ = this.update(cx, |_, cx| cx.notify());
+            let _ = this.update(cx, |this, cx| {
+                let again = this.mute_push == MutePush::SendingThenAgain;
+                this.mute_push = MutePush::Idle;
+                if again {
+                    this.push_muted(cx);
+                }
+                cx.notify();
+            });
         }));
     }
 
@@ -2740,41 +2898,60 @@ impl Session {
         }));
     }
 
-    /// Marks the old backlog read: one `conversations.mark` per conversation
-    /// in the plan and one `subscriptions.thread.mark` per thread, which is
-    /// what a person clicking through the same backlog would send. The plan
-    /// is what the count line showed, so nothing newer than the cutoff can
-    /// be touched between showing it and acting.
-    pub fn mark_read_before(&mut self, plan: crate::model::MarkPlan, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
+    /// The newest message rho knows of in a unit: its own facts, what the
+    /// mirror holds of it, and for a conversation the newest Slack counts.
+    /// A done is about everything in the card so far, so this is what it
+    /// marks read through: a channel's card raised by one mention is the
+    /// whole channel, the traffic after the mention included.
+    pub fn newest_in(&self, unit: &Unit) -> Option<Ts> {
+        let workspace = &self.model.workspace().0;
+        let held = self
+            .mirror
+            .as_deref()
+            .and_then(|mirror| mirror.newest_ts(&scope_of(workspace, unit)));
+        let latest = match unit.thread {
+            Some(_) => None,
+            None => self.model.latest(&unit.channel).cloned(),
         };
-        for (channel, ts) in &plan.conversations {
-            self.note_read(&Source::Conversation(channel.clone()), ts);
-        }
-        for (key, ts) in &plan.threads {
-            self.note_read(&Source::Thread(key.clone()), ts);
-        }
-        cx.notify();
-        let task = gpui_tokio::Tokio::spawn(cx, async move {
-            for (channel, ts) in plan.conversations {
-                if let Err(error) = client.mark_read(&channel, &ts).await {
-                    tracing::warn!(error = %error, "slack mark-read failed");
-                }
-            }
-            for (key, ts) in plan.threads {
-                if let Err(error) = client
-                    .mark_thread_read(&key.channel, &key.thread_ts, &ts)
-                    .await
-                {
-                    tracing::warn!(error = %error, "slack thread mark-read failed");
-                }
-            }
-        });
-        self._tasks.push(cx.spawn(async move |this, cx| {
-            let _ = task.await;
-            let _ = this.update(cx, |_, cx| cx.notify());
-        }));
+        [
+            self.model.unit(unit).map(|facts| facts.newest.clone()),
+            held,
+            latest,
+        ]
+        .into_iter()
+        .flatten()
+        .max_by(|left, right| left.epoch_seconds().total_cmp(&right.epoch_seconds()))
+    }
+
+    /// What `mark read before` would cover, as a plan counted before
+    /// anything moves: the model's unread, with the messages the mirror
+    /// holds, so a conversation whose backlog is older than its newest
+    /// message is still marked through the backlog.
+    pub fn mark_plan(&self, before: f64) -> crate::model::MarkPlan {
+        let workspace = self.model.workspace().0.clone();
+        let mirror = self.mirror.as_deref();
+        self.model.mark_plan(before, |unit, cutoff| {
+            mirror?.newest_at_or_before(&scope_of(&workspace, unit), cutoff)
+        })
+    }
+
+    /// Marks the old backlog read: every unit in the plan is done through
+    /// its message, in rho and in Slack, exactly as `d` on each would be.
+    /// One `conversations.mark` per conversation and one
+    /// `subscriptions.thread.mark` per thread, which is what a person
+    /// clicking through the same backlog would send. Returns what moved,
+    /// each with where it stood, for one undo to take all of it back.
+    pub fn mark_read_before(
+        &mut self,
+        plan: &crate::model::MarkPlan,
+        cx: &mut Context<Self>,
+    ) -> Vec<(Unit, Ts, HandledBefore)> {
+        plan.units()
+            .filter_map(|(unit, ts)| {
+                let before = self.mark_handled(&unit, &ts, cx)?;
+                Some((unit, ts, before))
+            })
+            .collect()
     }
 
     /// Dispatches one supported Block Kit message control.
@@ -3665,6 +3842,10 @@ const STARTUP_WINDOW: usize = 200;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandledBefore {
     pub handled: Option<Ts>,
+    /// Slack's read mark before the verdict moved it, or `None` when the
+    /// verdict left it alone because Slack had read that far already. A
+    /// mark rho never learned is just before the first message the verdict
+    /// closed, or [`Ts::never_read`] when rho holds none to name it by.
     pub read: Option<Ts>,
 }
 

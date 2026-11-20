@@ -755,7 +755,7 @@ impl Frame {
             "m",
             "mute",
             on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx)
+                frame.verdict(target, Verdict::Mute, "mute".to_owned(), window, cx)
             }),
         ));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));

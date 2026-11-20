@@ -13,7 +13,7 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 
 use crate::address::SlackAddress;
-use crate::mirror::{Mirror, unit_summary};
+use crate::mirror::{Mirror, message_line, unit_summary};
 use crate::model::{Attention, Model, Unit, reason_text};
 
 fn at_ms(ms: i64) -> Timestamp {
@@ -117,17 +117,27 @@ pub fn claims(
     claims
 }
 
-/// What a unit is called on a card no claim named, and where it is: the
-/// newest words in it, in its conversation.
+/// What a unit is called, and where it is: a conversation by its own
+/// name, and a thread by the first line of the message it hangs from, in
+/// its conversation. Never its newest words, which change with every
+/// message and may be the reader's own reply: this is what the echo line
+/// says a verdict was about, and what Find lists a thread as.
 pub fn name(model: &Model, mirror: Option<&Mirror>, unit: &Unit) -> (String, String) {
     let label = model.label(&unit.channel);
-    let title = match (model.unit(unit), mirror) {
-        (Some(_), Some(mirror)) => unit_summary(model, mirror, unit),
+    let root = match (&unit.thread, mirror) {
+        // The root is held with its replies once the thread has been
+        // opened, and in its conversation before that.
+        (Some(root), Some(mirror)) => match message_line(model, mirror, unit, root) {
+            line if line.is_empty() => {
+                message_line(model, mirror, &Unit::conversation(&unit.channel), root)
+            }
+            line => line,
+        },
         _ => String::new(),
     };
-    match title.is_empty() {
+    match root.is_empty() {
         true => (label, String::new()),
-        false => (title, label),
+        false => (root, label),
     }
 }
 
