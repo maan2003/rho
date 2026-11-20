@@ -24,7 +24,6 @@ The way back keeps the user's earlier screens, as they were left. A screen that 
 Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
 
 ## concept Status line
-status: shows the channel and thread names where those apply, not a project mail address and subject.
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
 principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
 sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
@@ -48,7 +47,7 @@ does:
 When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
 ## screen Palette
-status: built as one prompt; full-text search of mails and notes is not built.
+status: full-text search and the `what waits` rows on an empty query are not built.
 answers: where can the user go, or what can they run, with these words?
 shows:
 - the query in the `Palette` prompt

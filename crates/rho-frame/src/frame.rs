@@ -87,6 +87,19 @@ pub struct Frame {
     _tasks: Vec<Task<()>>,
 }
 
+// The palette and the verdict menu answer the same card with the same words.
+fn verdict_rows(target: Address) -> [Row; 2] {
+    let done = target.clone();
+    [
+        Row::run("d", "done", move |frame, window, cx| {
+            frame.verdict(&done, Verdict::Done, "done".to_owned(), window, cx);
+        }),
+        Row::run("m", "mute", move |frame, window, cx| {
+            frame.verdict(&target, Verdict::Mute, "mute".to_owned(), window, cx);
+        }),
+    ]
+}
+
 impl Frame {
     /// The frame over `systems`, attached to `hosts`. `chime` is what
     /// sounds when a card crosses the chime line.
@@ -713,7 +726,7 @@ impl Frame {
         let commands = palette::flatten(&self.commands(window, cx));
         let mut places = Vec::new();
         for system in &self.systems {
-            places.extend(system.find(&self.attention.marks, cx));
+            places.extend(system.find(&self.attention.marks, self.hand(), cx));
         }
         let listing = Rc::new(palette::Listing::new(commands, places));
         // What the rows on screen are, so the row chosen is a choice and
@@ -774,9 +787,8 @@ impl Frame {
     }
 
     /// The frame's rows, the surface's, and every system's for what is in
-    /// view: what the palette lists. It is a list, not a menu: no key
-    /// opens it, so a row here has no key, and two rows never contend for
-    /// one.
+    /// view: what the palette lists. A row's key hints at the shortcut
+    /// outside the palette; it does not bind a key inside the prompt.
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
         // The window's own rows: the palette lists them after the screen's.
@@ -802,7 +814,17 @@ impl Frame {
         };
         rows.push(phrase.window_wide());
         rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
-        rows.extend(self.current_surface().clone().rows(window, cx));
+        let surface = self.current_surface().clone();
+        rows.extend(surface.rows(window, cx));
+        if !self.desk_in_view()
+            && surface.editor(cx).is_some()
+            && let Some(target) = point.card.clone()
+        {
+            rows.extend(verdict_rows(target).map(|row| {
+                let shortcut = format!("space {}", row.key);
+                row.with_shortcut(shortcut)
+            }));
+        }
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
         }
@@ -861,10 +883,6 @@ impl Frame {
                 window,
                 cx,
             );
-            // A chooser: enter takes the highlighted host.
-            if let Some(minibuffer) = frame.minibuffer_mut() {
-                minibuffer.set_complete_whole_input();
-            }
         }));
         for (index, host) in self.hosts.iter().enumerate().take(9) {
             let id = host.id;
@@ -902,27 +920,7 @@ impl Frame {
         };
         let card = self.card_for(&target, cx);
         let mut rows = Rows::new(card.heading()).counted();
-        let on = |run: fn(&mut Frame, &Address, Option<u32>, &mut Window, &mut Context<Frame>)| {
-            let target = target.clone();
-            move |frame: &mut Frame,
-                  count: Option<u32>,
-                  window: &mut Window,
-                  cx: &mut Context<Frame>| { run(frame, &target, count, window, cx) }
-        };
-        rows.push(Row::counted(
-            "d",
-            "done",
-            on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Done, "done".to_owned(), window, cx)
-            }),
-        ));
-        rows.push(Row::counted(
-            "m",
-            "mute",
-            on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Mute, "mute".to_owned(), window, cx)
-            }),
-        ));
+        rows.extend(verdict_rows(target.clone()));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
         push_deal_rows(&mut rows);
         self.open_menu(rows, window, cx);
@@ -1023,11 +1021,10 @@ impl Frame {
     }
 
     pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut minibuffer) = self.minibuffer.take() else {
+        let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
         let prompt = minibuffer.prompt().to_owned();
-        minibuffer.accept_selected(window, cx);
         let secret = minibuffer.is_secret();
         let (input, submission) = minibuffer.into_submission(cx);
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
@@ -1063,7 +1060,7 @@ impl Frame {
 
     fn minibuffer_select(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.select_by_delta(delta, cx);
+            minibuffer.select_by_delta(delta);
             cx.notify();
         }
     }
@@ -1071,6 +1068,13 @@ impl Frame {
     fn minibuffer_complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = &mut self.minibuffer {
             minibuffer.complete_selected(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn minibuffer_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.clear_input(window, cx);
             cx.notify();
         }
     }
@@ -1438,6 +1442,9 @@ impl Render for Frame {
                     this.minibuffer_complete(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
+                this.minibuffer_clear(window, cx);
+            }))
             .child(self.render_status_line(&text_style, layout, window, cx));
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
@@ -1445,7 +1452,7 @@ impl Render for Frame {
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
                 .child(body)
-                .children(self.render_idea(&text_style, cx))
+                .children(self.render_idea(&text_style, layout, cx))
                 .children(
                     self.minibuffer
                         .as_ref()
@@ -1456,7 +1463,7 @@ impl Render for Frame {
         }
         frame
             .child(div().flex_1().min_h_0().w_full().child(surface.view()))
-            .children(self.render_idea(&text_style, cx))
+            .children(self.render_idea(&text_style, layout, cx))
             // The menu, pinned to the bottom edge and drawn over the buffer
             // rather than in it: nothing reflows, and the point stays where
             // the reader left it.

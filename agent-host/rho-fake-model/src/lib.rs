@@ -870,8 +870,16 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source =
-            format!("mail.send(\"user\", {text:?}, thread={topic}, kind=\"result\")\nend_turn()");
+        let (status, kind) = match state.config.scenario {
+            Scenario::ClarifyingQuestion => (
+                format!("mail.status({topic}, \"Waiting for clarification\")\n"),
+                "ask",
+            ),
+            _ => (String::new(), "result"),
+        };
+        let source = format!(
+            "{status}mail.send(\"user\", {text:?}, thread={topic}, kind={kind:?})\nend_turn()"
+        );
         append_tool_call(
             events,
             state,

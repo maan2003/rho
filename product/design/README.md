@@ -39,7 +39,7 @@ form_way laptop input 'text:start agent, choosing' 'wait:450'
 form_shot laptop prompt     # laptop-prompt.png
 ```
 
-Confirm the prompt's first suggestion, choose `here, in a directory on the host…`, and choose the native runtime below. The fake agent replies in the thread and creates a `result` card. If needed, wait for the result before capturing any card state.
+Confirm the prompt's first suggestion, choose `here, in a directory on the host…`, and choose the native runtime below. The fake agent sets the thread's status and sends an `ask` card. If needed, wait for the ask before capturing any card state.
 
 ```sh
 form_way laptop input 'key:enter' 'wait:650' 'key:h' 'wait:650'

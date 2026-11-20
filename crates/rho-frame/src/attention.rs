@@ -336,6 +336,7 @@ impl Frame {
         );
         if let Some(minibuffer) = self.minibuffer_mut() {
             minibuffer.set_secret();
+            minibuffer.complete_last_word();
             minibuffer.set_input(typed, window, cx);
         }
     }

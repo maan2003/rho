@@ -200,9 +200,6 @@ impl PageSystem {
             window,
             cx,
         );
-        if let Some(minibuffer) = frame.minibuffer_mut() {
-            minibuffer.set_complete_whole_input();
-        }
     }
 }
 
@@ -294,7 +291,7 @@ impl rho_frame::System for PageSystem {
         Some((title(page), "web".to_owned()))
     }
 
-    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _hand: &rho_dealer::rank::Hand, _cx: &App) -> Vec<Found> {
         live_pages()
             .into_iter()
             .map(|(id, metadata)| Found {
