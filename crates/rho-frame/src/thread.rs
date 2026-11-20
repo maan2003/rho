@@ -12,8 +12,11 @@ use gpui::{App, KeyBinding, actions};
 actions!(
     rho_thread,
     [
-        /// Posts what is in the box.
+        /// Posts what is in the box; in a channel on a host, as an idea an
+        /// agent starts from.
         SendMessage,
+        /// Posts what is in the box and starts nothing, in a channel too.
+        SendOnly,
         /// Puts the keyboard in the box.
         FocusComposer,
         /// Puts the keyboard in the messages.
@@ -33,12 +36,17 @@ pub const COMPOSER: &str = "RhoThreadComposer";
 
 /// What the empty box says.
 pub const PLACEHOLDER: &str = "message · ctrl-enter sends";
+/// What the empty box of a channel on a host says, where a message is an
+/// idea an agent starts from.
+pub const CHANNEL_PLACEHOLDER: &str =
+    "idea · ctrl-enter starts an agent · ctrl-shift-enter only sends";
 
 pub(crate) fn bind(cx: &mut App) {
     let screen = format!("{SCREEN} > Editor");
     let composer = format!("{COMPOSER} > Editor && !showing_completions");
     let mut bindings = vec![
         KeyBinding::new("ctrl-enter", SendMessage, Some(&screen)),
+        KeyBinding::new("ctrl-shift-enter", SendOnly, Some(&screen)),
         KeyBinding::new("ctrl-down", FocusComposer, Some(&screen)),
         KeyBinding::new("ctrl-up", FocusLog, Some(&screen)),
         // The box is an input, always in insert: escape is the way back to

@@ -17,12 +17,12 @@ use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
 use rho_dealer::{Address, Addressed as _, Marks};
-use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage};
+use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage, SendOnly};
 use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, ago, when};
+use super::{ChatSystem, Event, ago, when};
 use crate::{AgentRef, HostChat, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
@@ -214,10 +214,15 @@ impl ThreadView {
             editor
         });
         let draft = system.draft(thread.host, Some(thread.message)).to_owned();
+        // In a channel a message is an idea, and an agent starts from it.
+        let placeholder = match is_root(system, thread) {
+            true => thread::CHANNEL_PLACEHOLDER,
+            false => thread::PLACEHOLDER,
+        };
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 10, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.set_placeholder_text(thread::PLACEHOLDER, window, cx);
+            editor.set_placeholder_text(placeholder, window, cx);
             if !draft.is_empty() {
                 editor.set_text(draft, window, cx);
             }
@@ -722,7 +727,25 @@ fn thread_rows(
 }
 
 impl ThreadView {
+    /// In a channel, the idea goes to the agents system, which sends it
+    /// and starts an agent from it; in a thread, the reply goes out.
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
+        if !is_root(self.system.read(cx), self.thread) {
+            return self.send_only(&SendOnly, window, cx);
+        }
+        if self.composer.read(cx).text(cx).trim().is_empty() {
+            return;
+        }
+        let thread = self.thread;
+        self.system.update(cx, |_, cx| {
+            cx.emit(Event::Idea {
+                endpoint: thread.host,
+                parent: thread.message,
+            });
+        });
+    }
+
+    fn send_only(&mut self, _: &SendOnly, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text(cx);
         if text.trim().is_empty() {
             return;
@@ -917,9 +940,25 @@ impl Surface for ThreadView {
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
-        vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
-            this.update(cx, |view, cx| view.send(&SendMessage, window, cx));
-        })]
+        if !is_root(self.system.read(cx), self.thread) {
+            return vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
+                this.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
+            })];
+        }
+        let only = this.clone();
+        let send_only = Row::run("ctrl-shift-enter", "send", move |_, window, cx| {
+            only.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
+        });
+        vec![
+            Row::run(
+                "ctrl-enter",
+                "send and start agent",
+                move |_, window, cx| {
+                    this.update(cx, |view, cx| view.send(&SendMessage, window, cx));
+                },
+            ),
+            send_only,
+        ]
     }
 }
 
@@ -949,6 +988,7 @@ impl Render for ThreadView {
             .flex_col()
             .bg(colors.editor_background)
             .on_action(cx.listener(Self::send))
+            .on_action(cx.listener(Self::send_only))
             .on_action(cx.listener(Self::focus_composer))
             .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::open_row))

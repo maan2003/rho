@@ -38,6 +38,13 @@ use crate::{AgentRef, ThreadId, cards};
 /// agent from a message once the host has logged it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// The user sent the draft under `parent`, a channel, as an idea: the
+    /// agents system says where an agent starts from it, then sends it.
+    /// The draft stays until then.
+    Idea {
+        endpoint: EndpointId,
+        parent: MessageId,
+    },
     /// The host logged a message the user wrote, under the id this client
     /// gave it when it was written.
     Delivered {

@@ -122,15 +122,21 @@ impl AgentsSystem {
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
         rho_desktop_client::ui::bind_keys(cx);
-        let delivered = cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| {
-            if let ChatEvent::Delivered {
+        let delivered = cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
+            ChatEvent::Delivered {
                 endpoint,
                 client_id,
                 message,
-            } = event
-            {
-                this.delivered(*endpoint, *client_id, *message, cx);
-            }
+            } => this.delivered(*endpoint, *client_id, *message, cx),
+            ChatEvent::Idea { endpoint, parent } => start::idea(
+                this,
+                ThreadId {
+                    host: *endpoint,
+                    message: *parent,
+                },
+                cx,
+            ),
+            ChatEvent::Changed { .. } => {}
         });
         Self {
             client,
@@ -910,8 +916,15 @@ impl System for AgentsSystem {
         }
         rows.push(Row::menu(
             "a",
-            "start agent here",
-            start::rows(self, this.clone(), thread, start::Origin::Message, cx),
+            "start agent…",
+            start::rows(
+                self,
+                this.clone(),
+                thread,
+                start::Origin::Message,
+                start::Runtimes::Ask,
+                cx,
+            ),
         ));
         let draft = !self
             .chat
@@ -922,8 +935,15 @@ impl System for AgentsSystem {
         if draft {
             rows.push(Row::menu(
                 "shift-s",
-                "send and start agent",
-                start::rows(self, this, thread, start::Origin::Draft, cx),
+                "send and start agent…",
+                start::rows(
+                    self,
+                    this,
+                    thread,
+                    start::Origin::Draft,
+                    start::Runtimes::Ask,
+                    cx,
+                ),
             ));
         }
         rows
