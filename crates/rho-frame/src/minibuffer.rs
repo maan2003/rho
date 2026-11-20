@@ -324,11 +324,13 @@ impl Minibuffer {
         self.selection_moved = true;
     }
 
-    pub fn select(&mut self, index: usize) {
-        if index < self.candidates.len() {
-            self.selected = index;
-            self.selection_moved = true;
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.candidates.len() {
+            return false;
         }
+        self.selected = index;
+        self.selection_moved = true;
+        true
     }
 
     /// Enter accepts the highlighted candidate, emacs `completing-read`
@@ -414,7 +416,12 @@ impl Minibuffer {
         (input, submission)
     }
 
-    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Frame>) -> AnyElement {
+    pub(crate) fn render(
+        &self,
+        text_style: &gpui::TextStyle,
+        layout: crate::phone::Layout,
+        cx: &Context<Frame>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         // Keep the selection visible: scroll the window, not the list.
         let window_start = self
@@ -422,6 +429,8 @@ impl Minibuffer {
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
         let highlight = !address || self.accepts_selected(cx);
+        let clickable = address
+            || (layout == crate::phone::Layout::Phone && matches!(self.answer, Answer::Row(_)));
         let rows = self
             .candidates
             .iter()
@@ -450,11 +459,13 @@ impl Minibuffer {
                     row = row.bg(colors.element_selected);
                 }
                 let row = row.id(("rho-prompt-candidate", index));
-                if address {
+                if clickable {
                     row.cursor_pointer()
                         .on_click(cx.listener(move |frame, _, window, cx| {
-                            if let Some(prompt) = frame.minibuffer_mut() {
-                                prompt.select(index);
+                            if frame
+                                .minibuffer_mut()
+                                .is_some_and(|prompt| prompt.select(index))
+                            {
                                 frame.minibuffer_confirm(window, cx);
                             }
                             cx.stop_propagation();

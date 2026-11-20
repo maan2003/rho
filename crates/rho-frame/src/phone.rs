@@ -22,8 +22,8 @@ use theme::ActiveTheme as _;
 
 use crate::attention::Verdict;
 use crate::frame::{Frame, snooze_rows};
-use crate::menu::{Pick, Row, Rows};
-use crate::surface::AnySurface;
+use crate::menu::{Pick, Rows};
+use crate::surface::{AnySurface, PhoneSend};
 
 /// The widest window that is laid out as a phone.
 pub(crate) const PHONE_MAX_WIDTH: Pixels = px(600.);
@@ -346,9 +346,6 @@ fn record_verdict(verdict: PhoneVerdict) {
     rho_journal::record(rho_journal::Event::PhoneVerdict { verdict });
 }
 
-/// The row a surface offers for sending what is in its composer.
-const SEND_ROW: &str = "send";
-
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
     /// buffer is never at an end: its touches are its own.
@@ -517,11 +514,36 @@ impl Frame {
         surface: &AnySurface,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let desk_accepts_taps = self.desk_in_view()
+            && self.minibuffer.is_none()
+            && self.menu.is_none()
+            && !self.idea.active();
         let body = div()
             .id("rho-phone-surface")
             .relative()
             .size_full()
-            .child(surface.view());
+            .child(surface.view())
+            .children(desk_accepts_taps.then(|| {
+                // Keep Desk as one editor for its keys and scroll. The
+                // phone translates a click back through its display map.
+                div()
+                    .id("rho-desk-tap")
+                    .absolute()
+                    .inset_0()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        if this.phone.snap.is_none() {
+                            let open = this
+                                .desk
+                                .update(cx, |desk, cx| desk.tap(event.position(), window, cx));
+                            if open {
+                                this.open_row(window, cx);
+                            }
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+            }));
         let body = match self.phone.snap {
             Some(snap) => body
                 .with_animation(
@@ -546,19 +568,8 @@ impl Frame {
     }
 
     /// The bar along the bottom edge.
-    pub(crate) fn render_phone_bar(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let surface = self.current_surface().clone();
-        let rows: Rc<Vec<Row>> = Rc::new(
-            surface
-                .rows(window, cx)
-                .into_iter()
-                .filter(|row| row.description == SEND_ROW)
-                .collect(),
-        );
+    pub(crate) fn render_phone_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let send = self.current_surface().clone().phone_send(cx);
         let desk = self.desk_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
@@ -566,12 +577,12 @@ impl Frame {
             desk,
             row: desk && self.desk.read(cx).cursor_target(cx).is_some(),
             card: self.card_target(cx).is_some(),
-            send: !rows.is_empty(),
+            send: send.is_some(),
         };
         let colors = cx.theme().colors();
         let items = buttons(state).into_iter().map(|button| {
             let (icon, label) = button.face();
-            let rows = rows.clone();
+            let send = send.clone();
             div()
                 .id(button.id())
                 .cursor_pointer()
@@ -586,7 +597,7 @@ impl Frame {
                 .child(div().text_size(px(18.)).child(icon))
                 .child(div().text_size(px(11.)).child(label))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.press(button, &rows, window, cx);
+                    this.press(button, send.as_ref(), window, cx);
                     cx.stop_propagation();
                 }))
         });
@@ -603,22 +614,18 @@ impl Frame {
             .into_any_element()
     }
 
-    fn press(&mut self, button: Button, rows: &[Row], window: &mut Window, cx: &mut Context<Self>) {
+    fn press(
+        &mut self,
+        button: Button,
+        send: Option<&PhoneSend>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A verdict mid-snap would land on the card sliding off.
         if self.phone.snap.is_some() {
             return;
         }
         let target = self.card_target(cx);
-        let run_row =
-            |frame: &mut Self, name: &str, window: &mut Window, cx: &mut Context<Self>| {
-                if let Some(Row {
-                    pick: Pick::Run(run),
-                    ..
-                }) = rows.iter().find(|row| row.description == name)
-                {
-                    run(frame, None, window, cx);
-                }
-            };
         match button {
             Button::Back => self.back(window, cx),
             Button::Desk => self.toggle_desk(window, cx),
@@ -645,7 +652,11 @@ impl Frame {
             }
             Button::Verdicts => self.verdict_menu(window, cx),
             Button::Send if self.idea.active() => self.send_idea(window, cx),
-            Button::Send => run_row(self, SEND_ROW, window, cx),
+            Button::Send => {
+                if let Some(send) = send {
+                    send(window, cx);
+                }
+            }
             Button::Cancel if self.idea.active() && self.minibuffer.is_none() => {
                 self.cancel_idea(window, cx)
             }
