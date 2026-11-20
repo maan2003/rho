@@ -750,7 +750,8 @@ impl Frame {
             .map(|(rank, key)| (key, rank))
             .collect();
         for address in recent {
-            if !known.insert(address.clone()) {
+            // While on the desk, the command represents Tab's way back.
+            if (self.desk_in_view() && address == &desk_address) || !known.insert(address.clone()) {
                 continue;
             }
             if let Some((title, description)) = self
