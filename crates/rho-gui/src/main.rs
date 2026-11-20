@@ -88,6 +88,14 @@ fn apply_text_rendering_mode(cx: &mut App) {
 }
 
 fn main() {
+    // Chrome starts this binary as the browser extension's native host.
+    if rho_browser::native_host::is_invocation(&std::env::args().collect::<Vec<_>>()) {
+        if let Err(error) = rho_browser::native_host::run() {
+            eprintln!("rho browser native host: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     init_tracing();
     if let Err(error) = run() {
         eprintln!("rho-gui: {error:#}");
@@ -238,6 +246,9 @@ fn run() -> Result<()> {
                     }));
                     cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });
+                let browser = cx.new(|cx| {
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone(), cx)
+                });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let slack =
                     cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame.clone(), cx));
@@ -245,6 +256,7 @@ fn run() -> Result<()> {
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
+                    AnySystem::new(browser),
                     AnySystem::new(notes),
                     AnySystem::new(slack),
                     AnySystem::new(telemetry),

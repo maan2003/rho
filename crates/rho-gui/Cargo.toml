@@ -35,6 +35,7 @@ release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view.workspace = true
 rho-agent-hosts = { workspace = true, features = ["client"] }
+rho-browser = { workspace = true, features = ["ui"] }
 rho-chat = { workspace = true, features = ["ui"] }
 rho-slack = { workspace = true, features = ["ui"] }
 rho-db = { workspace = true }

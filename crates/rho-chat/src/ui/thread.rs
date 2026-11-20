@@ -65,10 +65,12 @@ enum Class {
     /// What an agent in the `with` line is doing when it is a stop it did
     /// not choose.
     Stopped,
+    /// A web link in a message: Enter on it opens it as a page.
+    Link,
 }
 
 impl Class {
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
 
     fn slot(self) -> usize {
         match self {
@@ -83,6 +85,7 @@ impl Class {
             Self::Mention => 8,
             Self::Private => 9,
             Self::Stopped => 10,
+            Self::Link => 11,
         }
     }
 }
@@ -104,11 +107,17 @@ impl rho_transcript::Style for Class {
             Self::Mention => (cx.theme().status().warning, Some(gpui::FontWeight::BOLD)),
             Self::Private => (colors.text_muted, None),
             Self::Stopped => (cx.theme().status().warning, None),
+            Self::Link => (colors.text_accent, None),
         };
         HighlightStyle {
             color: Some(color.into()),
             font_weight: weight,
             font_style: matches!(self, Self::Private).then_some(gpui::FontStyle::Italic),
+            underline: matches!(self, Self::Link).then(|| gpui::UnderlineStyle {
+                thickness: gpui::px(1.),
+                color: Some(color.into()),
+                wavy: false,
+            }),
             ..HighlightStyle::default()
         }
     }
@@ -322,6 +331,20 @@ impl ThreadView {
             Some(Meta::Agents(agents)) => agent_at(agents, cursor.column as usize),
             _ => None,
         }
+    }
+
+    /// The web link the cursor is on, if it is on one.
+    fn cursor_link(&self, cx: &App) -> Option<url::Url> {
+        let cursor = self.cursor(cx);
+        let buffer = self.transcript.buffer().read(cx);
+        let start = buffer.point_to_offset(Point::new(cursor.row, 0));
+        let end = buffer.point_to_offset(Point::new(cursor.row, buffer.line_len(cursor.row)));
+        let line: String = buffer.text_for_range(start..end).collect();
+        let column = cursor.column as usize;
+        links(&line)
+            .into_iter()
+            .find(|link| link.start <= column && column < link.end)
+            .and_then(|link| url::Url::parse(&line[link]).ok())
     }
 
     /// The first thread of a root's list, if it has one.
@@ -726,9 +749,15 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Enter on a message opens the thread under it; on a crumb, that; on
-    /// the `with` line, the agent named under the cursor.
+    /// Enter on a web link opens it as a page; elsewhere on a message,
+    /// the thread under it; on a crumb, that; on the `with` line, the
+    /// agent named under the cursor.
     fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(url) = self.cursor_link(cx) {
+            let frame = self.system.read(cx).frame.clone();
+            frame.open_link(url, cx);
+            return;
+        }
         let host = self.thread.host;
         let address = match self.transcript.line_meta(self.cursor_row(cx), cx) {
             Some(Meta::Message(id)) => ThreadId { host, message: *id }.address(),
@@ -748,6 +777,37 @@ fn line(key: Key, text: &str, class: Class) -> Item<Key, Class, Meta> {
     Item::new(key, text.to_owned())
         .with_styles(vec![(class, 0..text.len())])
         .with_lines(vec![Meta::None])
+}
+
+/// Where `text` holds a web link: each `http://` or `https://` up to the
+/// next space, without the punctuation that closes a sentence around it.
+fn links(text: &str) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = text[at..].find("http") {
+        let start = at + offset;
+        let rest = &text[start..];
+        let scheme = ["https://", "http://"]
+            .into_iter()
+            .find(|scheme| rest.starts_with(scheme));
+        let word_start = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric());
+        let Some(scheme) = scheme.filter(|_| word_start) else {
+            at = start + "http".len();
+            continue;
+        };
+        let length = rest
+            .find(|character: char| character.is_whitespace() || character == '<' || character == '>')
+            .unwrap_or(rest.len());
+        let link = rest[..length].trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"', ')', ']', '}']);
+        if link.len() > scheme.len() {
+            found.push(start..start + link.len());
+        }
+        at = start + length.max(scheme.len());
+    }
+    found
 }
 
 /// A message's text, with each picture named.
@@ -776,10 +836,11 @@ fn message_item(message: &rho_agent_types::Message, meta: Meta) -> Item<Key, Cla
     text.push('\n');
     text.push_str(&body(&message.content));
     let lines = text.lines().count().max(1);
-    let styles: Vec<(Class, Range<usize>)> = vec![
+    let mut styles: Vec<(Class, Range<usize>)> = vec![
         (Class::From, 0..from.len()),
         (Class::Time, from.len()..header.len()),
     ];
+    styles.extend(links(&text).into_iter().map(|link| (Class::Link, link)));
     Item::new(Key::Message(message.id), text)
         .with_styles(styles)
         .with_lines(vec![meta; lines])
@@ -902,5 +963,16 @@ mod tests {
             },
         ];
         assert_eq!(body(&content), "hello\n[image · image/png]");
+    }
+
+    #[test]
+    fn a_link_runs_to_the_space_without_the_sentence_around_it() {
+        let text = "see https://github.com/o/r/pull/7. and (http://a.b/c?d=1), not xhttps://no or https:// alone";
+        let found: Vec<&str> = links(text).into_iter().map(|link| &text[link]).collect();
+        assert_eq!(found, ["https://github.com/o/r/pull/7", "http://a.b/c?d=1"]);
+        // A link that ends the text, and two on one line.
+        let text = "https://x.y/a https://x.y/b";
+        let found: Vec<&str> = links(text).into_iter().map(|link| &text[link]).collect();
+        assert_eq!(found, ["https://x.y/a", "https://x.y/b"]);
     }
 }

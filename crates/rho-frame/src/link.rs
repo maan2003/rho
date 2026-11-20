@@ -55,6 +55,11 @@ impl FrameLink {
         self.with(cx, move |frame, window, cx| frame.open(address, window, cx));
     }
 
+    /// Opens a web link the user chose in a message.
+    pub fn open_link(&self, url: url::Url, cx: &mut App) {
+        self.with(cx, move |frame, _, cx| frame.open_link(url, cx));
+    }
+
     pub fn echo(&self, text: impl Into<String>, class: StyleClass, cx: &mut App) {
         let text = text.into();
         self.with(cx, move |frame, _, cx| frame.echo(&text, class, cx));
