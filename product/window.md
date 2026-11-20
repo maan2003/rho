@@ -90,43 +90,45 @@ does:
 
 The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
 
-## job Go to something by name
+## flow Go to something by name
 day: Reach anything.
-when: I know what I want to look at, and it is not the card in front of me
+when: the user knows what they want to look at, and it is not the card in front of them
 want: reach it by typing part of its name
-so that: I never hunt through lists for it
-flow:
-1. `Palette.find`; the `Palette` lists every place, newest first
-2. type part of the name; the list narrows
-3. `Palette.run`; the place fills the window
+so that: the user never hunts through lists for it
+steps:
+1. the user uses `Palette.find`; the `Palette` lists every place, newest first
+2. the user types part of the name; the list narrows
+3. the user chooses the place with `Palette.run`; the place fills the window
 system: keeps every name of every system in one list, and puts the most recently active first.
 user: the words of the name.
-cases: two threads with the same name in different channels; an agent whose workset name I do not remember, only its short code
+cases: two threads with the same name in different channels; an agent whose short code the user remembers, but not its workset name
+reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
-## job Run a command I rarely use
+## flow Run a command I rarely use
 day: Reach anything.
-when: I want something rare, such as a usage chart, renaming a thread, or attaching a host
+when: the user wants something rare, such as a usage chart, renaming a thread, or attaching a host
 want: say its name and run it
-so that: I do not need to remember a key for it
-flow:
-1. open the `Palette` with `:`
-2. type a few letters of the command
-3. `enter`; the command runs, or its `Menu` opens
-4. answer the menu or the `Prompt` that follows
+so that: the user does not need to remember a key for it
+steps:
+1. the user opens the `Palette` with `:`
+2. the user types a few letters of the command
+3. the user presses `enter`; the command runs, or its `Menu` opens
+4. the user answers the menu or the `Prompt` that follows
 system: shows only the commands that fit the screen and the thing under the cursor.
 user: the command's name, and any answer it asks for.
 cases: on the phone, where the list of commands cannot be tapped and the user must type or take the first one
+reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a menu or prompt takes the keys
 when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
 
-## job Report a slow window
+## flow Report a slow window
 day: Keep the work moving.
-when: the window stutters or freezes for a moment, and I want it fixed
+when: the window stutters or freezes for a moment, and the user wants it fixed
 want: send what it was doing to a place an agent can read
-so that: an agent can find the cause without my own words for it
-flow:
-1. open the `Palette` and choose `upload performance report`
+so that: an agent can find the cause without the user having to put it into words
+steps:
+1. the user opens the `Palette` and chooses `upload performance report`
 2. the echo line reads `uploading a … KiB performance report to …`, then `performance report stored on … at …`
 system: keeps a record of the last half minute of how the window drew and what it worked on, all the time; sends it to the attached host whose name comes first.
 user: the moment to send it, soon after the stutter.
