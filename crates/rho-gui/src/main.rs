@@ -160,6 +160,7 @@ fn run() -> Result<()> {
     }
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
+    let store = db.clone();
     let link = args.link.clone();
     let mut profile = args
         .cpu_profile
@@ -291,6 +292,13 @@ fn run() -> Result<()> {
                 }
             }
         });
+    // The window is gone and everything it ran has written what it keeps.
+    // Settled, the file opens at once on the next start instead of being
+    // repaired as after a crash. Its write lock is never let go, so
+    // nothing still running on another thread commits after it.
+    let closed =
+        futures::executor::block_on(store.settle()).context("close the client database")?;
+    std::mem::forget(closed);
     Ok(())
 }
 

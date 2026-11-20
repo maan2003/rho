@@ -406,7 +406,7 @@ impl System for SlackSystem {
     fn claims(
         &self,
         marks: &Marks,
-        now: Timestamp,
+        _now: Timestamp,
         trace: Option<&mut Trace>,
         cx: &App,
     ) -> Vec<Claim> {
@@ -414,7 +414,7 @@ impl System for SlackSystem {
             return Vec::new();
         };
         let session = session.read(cx);
-        cards::claims(session.model(), session.mirror(), marks, now, trace)
+        cards::claims(session.model(), session.mirror(), marks, trace)
     }
 
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {

@@ -441,7 +441,7 @@ impl Frame {
         for system in &self.systems {
             rooms.extend(system.rooms(&self.attention.marks, cx));
         }
-        let lines = room_lines(rooms, hand);
+        let lines = room_lines(rooms, hand, &self.attention.marks, &Zoned::now());
         self.home.update(cx, |home, cx| home.set_rooms(lines, cx));
     }
 }

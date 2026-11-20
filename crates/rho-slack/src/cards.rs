@@ -31,7 +31,6 @@ pub fn claims(
     model: &Model,
     mirror: Option<&Mirror>,
     marks: &Marks,
-    now: Timestamp,
     mut trace: Option<&mut Trace>,
 ) -> Vec<Claim> {
     let mut claims = Vec::new();
@@ -53,14 +52,9 @@ pub fn claims(
             }
             continue;
         }
-        // rho's own clock bounds the age: a doctored timestamp cannot make
-        // a message older than when rho first saw its unit.
-        let since = at_ms(
-            facts
-                .newest
-                .millis()
-                .max(facts.first_seen_ms.min(now.as_millisecond())),
-        );
+        // The age is the ask's: a mention said two days ago reads `2.0d`
+        // however recently rho first heard of it.
+        let since = at_ms(facts.asks_with().millis());
         let waiting = |head_start| Curve::Waiting { head_start, since };
         let people = facts.people.len() + usize::from(!facts.people.contains(model.self_id()));
         let small = people <= curve::SLACK_SMALL_THREAD_PEOPLE;

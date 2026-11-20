@@ -1210,7 +1210,6 @@ struct StoredUnit {
     newest: String,
     newest_from_other: Option<String>,
     newest_from_you: bool,
-    first_seen_ms: i64,
     #[senax(default)]
     people: Vec<String>,
     #[senax(default)]
@@ -1231,7 +1230,6 @@ impl StoredUnit {
             newest: facts.newest.0.clone(),
             newest_from_other: facts.newest_from_other.as_ref().map(|ts| ts.0.clone()),
             newest_from_you: facts.newest_from_you,
-            first_seen_ms: facts.first_seen_ms,
             people: facts.people.iter().map(|user| user.0.clone()).collect(),
             from_others: facts.from_others.iter().map(|ts| ts.0.clone()).collect(),
         }
@@ -1259,7 +1257,6 @@ impl StoredUnit {
                 // run the reader is in the middle of, not about the unit,
                 // so a restart starts it again rather than storing it.
                 others_replied: false,
-                first_seen_ms: self.first_seen_ms,
                 people: self
                     .people
                     .iter()
@@ -1665,7 +1662,6 @@ mod compatibility_tests {
             newest_from_other: Some(cached.ts.clone()),
             newest_from_you: false,
             others_replied: false,
-            first_seen_ms: 42,
             people: Default::default(),
             from_others: Vec::new(),
         };
