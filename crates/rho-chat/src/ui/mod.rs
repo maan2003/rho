@@ -714,10 +714,8 @@ impl System for ChatSystem {
                 .get(&thread.host)
                 .and_then(|chat| chat.name(thread.message))
                 .unwrap_or_default();
-            rows.push(Row::run(
-                "shift-n",
-                "name this thread",
-                move |frame, window, cx| {
+            rows.push(
+                Row::run("shift-n", "name this thread", move |frame, window, cx| {
                     let this = this.clone();
                     let current = current.clone();
                     frame.open_prompt(
@@ -748,8 +746,9 @@ impl System for ChatSystem {
                         window,
                         cx,
                     );
-                },
-            ));
+                })
+                .also("rename"),
+            );
         }
         // A verdict is about the card; about one message of it alone is
         // rare, so it is reached by name from the palette and has no binding.

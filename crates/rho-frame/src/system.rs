@@ -53,7 +53,7 @@ pub enum Standing {
     WhileCard,
 }
 
-/// Something `find` can open.
+/// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub address: Address,
@@ -144,7 +144,7 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
-    /// Everything the system has that `find` lists by title, given what
+    /// Every place of the system's that the palette lists by title, given what
     /// the user has said about its things. Asked with the frame busy, so
     /// the marks are handed in.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {

@@ -9,8 +9,7 @@
 //!
 //! A page takes every key, as a desktop does, so the frame's normal-mode
 //! keys cannot reach the frame from one. Its chords can (`ctrl-k`,
-//! `ctrl-j`, `ctrl-shift-f`, `ctrl-shift-backspace`, and the palette's
-//! `ctrl-shift-;`).
+//! `ctrl-j`, `ctrl-shift-backspace`, and the palette's `ctrl-shift-;`).
 
 mod pages;
 

@@ -45,6 +45,8 @@ pub struct Row {
     pub key: String,
     pub description: String,
     pub value: Option<String>,
+    /// Other words the palette finds the row by.
+    pub also: Vec<String>,
     pub pick: Pick,
     pub scope: Scope,
 }
@@ -59,6 +61,7 @@ impl Row {
             key: key.into(),
             description: description.into(),
             value: None,
+            also: Vec::new(),
             pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
             scope: Scope::Here,
         }
@@ -81,6 +84,7 @@ impl Row {
             key: key.into(),
             description: description.into(),
             value: None,
+            also: Vec::new(),
             pick: Pick::Run(Rc::new(run)),
             scope: Scope::Here,
         }
@@ -96,9 +100,17 @@ impl Row {
             key: key.into(),
             description: description.into(),
             value: Some(value.into()),
+            also: Vec::new(),
             pick: Pick::Infix(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
             scope: Scope::Here,
         }
+    }
+
+    /// The row is found in the palette by `word` too, as a user who does
+    /// not know its name would ask for it: `rename` for `name this thread`.
+    pub fn also(mut self, word: impl Into<String>) -> Self {
+        self.also.push(word.into());
+        self
     }
 
     pub fn menu(key: impl Into<String>, description: impl Into<String>, rows: Rows) -> Self {
@@ -106,6 +118,7 @@ impl Row {
             key: key.into(),
             description: description.into(),
             value: None,
+            also: Vec::new(),
             pick: Pick::Menu(rows),
             scope: Scope::Here,
         }

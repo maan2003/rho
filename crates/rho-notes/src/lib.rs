@@ -29,7 +29,7 @@ pub use list::NotesView;
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Frame, FrameLink, Point, Row, System};
+use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, Row, System};
 use rho_window::style::StyleClass;
 pub use view::NoteView;
 
@@ -139,6 +139,26 @@ fn listed(marks: &Marks, place: impl Fn(&Address) -> Option<String>) -> Vec<List
             note: address.clone(),
             title: note_title(marks, address),
             reply: held.about.as_ref().map(&place),
+        })
+        .collect()
+}
+
+/// Every note as the palette lists it, by the first line `title` reads:
+/// a private reply as one, a note about nothing as a note, each as new as
+/// its last revision.
+fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
+    marks
+        .notes()
+        .filter_map(|(address, held)| {
+            Some(Found {
+                address: address.clone(),
+                title: title(NoteId::from_address(address)?),
+                description: match held.about {
+                    Some(_) => "private reply".to_owned(),
+                    None => "note".to_owned(),
+                },
+                recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
+            })
         })
         .collect()
 }
@@ -302,6 +322,15 @@ impl System for NoteSystem {
             None => note_title(marks, address),
         };
         Some((title, String::new()))
+    }
+
+    /// Every note, by its first line as the user is typing it, for the
+    /// palette.
+    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
+        found(marks, |note| match self.pending.get(&note) {
+            Some(pending) => title_of(&pending.text),
+            None => note_title(marks, &note.address()),
+        })
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
