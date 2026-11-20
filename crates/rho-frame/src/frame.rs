@@ -13,7 +13,7 @@ use gpui::{
 };
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostEvent, HostSpec};
-use rho_dealer::Address;
+use rho_dealer::{Address, Card};
 use rho_ledger::Pairing;
 use rho_window::history::History;
 use rho_window::style::StyleClass;
@@ -116,6 +116,9 @@ impl Frame {
             }
         });
         let menu_keys = cx.intercept_keystrokes(menu_keys);
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            this.report_active_surface(window, cx);
+        });
         let saved_place = place::Saved::load(&db);
         let mut frame = Self {
             db: db.clone(),
@@ -138,7 +141,7 @@ impl Frame {
             search: None,
             phone: Phone::default(),
             place: place::Writer::spawn(db.clone()),
-            _subscriptions: vec![menu_keys],
+            _subscriptions: vec![menu_keys, activation],
             _tasks: Vec::new(),
         };
         let ledger = cx.spawn_in(window, async move |this, cx| {
@@ -316,13 +319,13 @@ impl Frame {
     /// Opens `address`: the system that owns its kind makes the surface,
     /// or the one already made is shown again.
     pub fn open(&mut self, address: Address, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_with(address, rho_journal::SurfaceShowMethod::Open, window, cx);
+        self.open_with(address, None, window, cx);
     }
 
     pub(crate) fn open_with(
         &mut self,
         address: Address,
-        method: rho_journal::SurfaceShowMethod,
+        card: Option<&Card>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -337,9 +340,16 @@ impl Frame {
             };
             self.surfaces.insert(address.clone(), surface);
         }
+        if let Some(card) = card {
+            self.surfaces[&address].clone().show_card(card, window, cx);
+        }
         rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: journal_surface(&address),
-            method,
+            method: if card.is_some() {
+                rho_journal::SurfaceShowMethod::Deal
+            } else {
+                rho_journal::SurfaceShowMethod::Open
+            },
         });
         // Home opens on its top room, the one that wants the user most;
         // only the way back returns to it as it was left.
@@ -457,6 +467,14 @@ impl Frame {
     fn focus_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.current_surface().focus_handle(cx);
         window.focus(&handle, cx);
+        self.report_active_surface(window, cx);
+    }
+
+    fn report_active_surface(&self, window: &Window, cx: &mut Context<Self>) {
+        let active = window.is_window_active().then(|| self.current_address());
+        for system in &self.systems {
+            system.active_surface(active, cx);
+        }
     }
 
     /// The surface for `address` while it is open, for a system that wants
@@ -1040,10 +1058,13 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
-        // The notice gives way to an echo, which answers the key just
-        // pressed; on a phone the two do not fit beside each other.
+        // The notice gives way to an echo. On a phone use the short form
+        // so an unpaired device can still show the card the user must answer.
         let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
-            .then_some("verdicts stay on this device until it is paired");
+            .then_some(match layout {
+                Layout::Desktop => "verdicts stay on this device until it is paired",
+                Layout::Phone => "unpaired",
+            });
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.

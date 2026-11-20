@@ -5,9 +5,8 @@ What `rank` must make of a history. Each row is a scenario test in
 for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
-Home shows **next**, every card by priority until it fades below the
-floor, then the systems' sections. The user answers a card with done,
-mute, snooze or a deadline.
+The deal ranks cards above the floor. A result waits like an ask: it
+does not fade. The user answers waiting mail with a reply or verdict.
 
 ## Threads
 
@@ -19,13 +18,12 @@ each of its cases is the chat's own, in `rho-chat/src/cards.rs`, tested
 there. The rows below are what the dealer makes of a source shaped like
 it, with a stand-in thread that asks and answers.
 
-A card is titled by the thread's name, and its context is its root, the
-channel.
+A card is titled by the thread's subject and the project's address.
 
 | # | History and facts | Card |
 |---|---|---|
 | A1 | An unseen ask | "asks", rises |
-| A2 | An unseen result | "result", below an ask, fades, gone after ~3 days |
+| A2 | An unseen result | "result", rises like an ask, stays until answered |
 | A3 | An unseen fyi | nothing, and it hides no ask or result; the thread is unread on Home |
 | A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
 | A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
@@ -35,7 +33,8 @@ channel.
 | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not chat |
-| A13 | The thread muted, its host gone, or every one of its agents deleted | nothing |
+| A13 | The thread muted | nothing |
+| A14 | A stop mailed by the system bot | one card, as an ask; stays until answered even if the agent moves on |
 
 ## Snoozes
 

@@ -21,7 +21,6 @@ done when: nothing waits and the user's place is on screen as they left it.
 day: Know what wants them, and where they were.
 
 ## concept Card
-status: asks and results come from mentions, and a stop arrives as a mail from the host; a host thread opens at its newest message, not the mail that asks.
 purpose: put a mail that wants the user in reach, without making them look through the whole thread.
 principle: a project asks whether a test can use a separate clock; the deal opens the thread on that mail, the user replies, and its card goes away.
 sees: the `mail.Project` address, the `mail.Thread` subject, and why and since when it waits, such as `asks · 2h`, `result · 8m`, or `failed · 1h`; open, the `mail.Mail` that asks.
@@ -67,7 +66,6 @@ cases: a result from days ago that has not been read; a stop reported as mail; a
 reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a reply settles the card
-status: a host reply reads through its thread; Slack is in the browser rather than mail from the bot.
 when the user replies to a `mail.Mail` that waits, then its `Card` goes away, and the reply goes to whoever wrote the mail.
 
 ## rule opening is not reading

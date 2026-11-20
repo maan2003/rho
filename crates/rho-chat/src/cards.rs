@@ -44,9 +44,8 @@ impl Addressed for AgentRef {
 pub struct Host<'a> {
     pub endpoint: EndpointId,
     pub chat: &'a HostChat,
-    /// The host's name, said before a card's context when the window holds
-    /// more than one host; `None` otherwise.
-    pub name: Option<&'a str>,
+    /// The device's name for the host, used in the project address.
+    pub name: &'a str,
 }
 
 fn unix(ms: u64) -> Timestamp {
@@ -152,7 +151,7 @@ pub fn claims(
         let cursor = format!("{}/{}", mail.id.0.0, newest.id.0.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
         claim.title = chat.name(thread).unwrap_or_default();
-        claim.context = context(host, thread);
+        claim.context = context(host.chat, thread, host.name);
         // The room the thread is in: a snooze on it holds the thread too,
         // and Home ranks the room by the thread's card.
         let root = chat.root_of(thread);
@@ -212,23 +211,15 @@ pub fn worked_in(chat: &HostChat, host: EndpointId, root: MessageId, marks: &Mar
 /// claim named: one the user's own dates brought up.
 pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
     let title = host.chat.name(thread)?;
-    Some((title, context(host, thread)))
+    Some((title, context(host.chat, thread, host.name)))
 }
 
-/// Where a thread is: its root, and its host when the window holds more
-/// than one. A root is in nothing but its host.
-fn context(host: &Host<'_>, thread: MessageId) -> String {
-    let root = host.chat.root_of(thread);
-    let stream = if root == thread {
-        String::new()
-    } else {
-        host.chat.name(root).unwrap_or_default()
-    };
-    match host.name {
-        Some(name) if stream.is_empty() => name.to_owned(),
-        Some(name) => format!("{name}/{stream}"),
-        None => stream,
-    }
+/// Where a thread is: the address of the project above it.
+pub(crate) fn context(chat: &HostChat, thread: MessageId, host_name: &str) -> String {
+    chat.project(chat.root_of(thread)).map_or_else(
+        || host_name.to_owned(),
+        |project| project.address(host_name),
+    )
 }
 
 /// The mail a project card opens on, decoded from its source cursor.
@@ -269,7 +260,6 @@ mod tests {
         marks: Marks,
         skips: Skips,
         now: Zoned,
-        hosts: usize,
     }
 
     fn mins(n: i64) -> SignedDuration {
@@ -292,7 +282,6 @@ mod tests {
                 .parse::<Timestamp>()
                 .unwrap()
                 .to_zoned(jiff::tz::TimeZone::UTC),
-            hosts: 1,
         }
     }
 
@@ -332,7 +321,12 @@ mod tests {
         }
 
         fn root(&mut self) -> MessageId {
-            match self.chat.roots().first() {
+            match self
+                .chat
+                .roots()
+                .iter()
+                .find(|id| self.chat.is_project(**id))
+            {
                 Some(root) => *root,
                 None => self.post(None, Party::User, Vec::new(), "rho"),
             }
@@ -491,7 +485,7 @@ mod tests {
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
-                name: (self.hosts > 1).then_some("laptop"),
+                name: "lab",
             };
             let claims = claims(&host, &self.marks, self.now.timestamp(), None);
             let names = |address: &Address| {
@@ -556,6 +550,12 @@ mod tests {
         };
         assert_eq!(cursor(root).as_deref().and_then(attention_mail), Some(root));
         assert_eq!(cursor(a).as_deref().and_then(attention_mail), Some(ask));
+        w.writes_to(root);
+        assert_eq!(
+            w.hand(),
+            "rho@lab › a · asks · 0m",
+            "the reply settles the standalone ask without clearing an unrelated thread"
+        );
     }
 
     #[test]
@@ -585,7 +585,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
         let first = w.priority(a).unwrap();
         assert!(first >= AGENT_BLOCKED_HEAD_START);
         w.pass(hours(1));
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(card.label, "result · 6.0d");
         assert_eq!(attention_mail(&card.cursor), Some(result));
         w.writes_to(a);
-        assert_eq!(w.hand(), "rho › b · asks · 6.0d");
+        assert_eq!(w.hand(), "rho@lab › b · asks · 6.0d");
     }
 
     #[test]
@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.asks(a);
         w.sends(a, MentionKind::Fyi);
-        assert_eq!(w.hand(), "rho › a · asks · 0m", "an fyi hides no ask");
+        assert_eq!(w.hand(), "rho@lab › a · asks · 0m", "an fyi hides no ask");
     }
 
     #[test]
@@ -644,7 +644,11 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.finishes(a);
         w.works(a);
-        assert_eq!(w.hand(), "rho › a · result · 0m", "and it hides nothing");
+        assert_eq!(
+            w.hand(),
+            "rho@lab › a · result · 0m",
+            "and it hides nothing"
+        );
     }
 
     #[test]
@@ -661,7 +665,7 @@ mod tests {
         w.asks(a);
         assert_eq!(
             w.hand(),
-            "rho › a · asks · 20m",
+            "rho@lab › a · asks · 20m",
             "from the first ask unseen"
         );
         w.finishes(b);
@@ -669,7 +673,7 @@ mod tests {
         w.finishes(b);
         assert_eq!(
             w.hand(),
-            "rho › a · asks · 50m\nrho › b · result · 0m",
+            "rho@lab › a · asks · 50m\nrho@lab › b · result · 0m",
             "from the newest result"
         );
     }
@@ -684,11 +688,11 @@ mod tests {
         w.works(a);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        assert_eq!(w.hand(), "rho › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
         w.writes_to(a);
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
-        assert_eq!(w.hand(), "rho › a · result · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · result · 0m");
     }
 
     #[test]
@@ -700,7 +704,7 @@ mod tests {
         w.writes_to(a);
         w.pass(mins(5));
         w.finishes(a);
-        assert!(w.hand().starts_with("rho › a ·"), "{}", w.hand());
+        assert!(w.hand().starts_with("rho@lab › a ·"), "{}", w.hand());
         assert!(w.priority(a).unwrap() >= CHIME_THRESHOLD);
         // Through a snooze said before the user wrote.
         w.snooze(a, hours(4));
@@ -734,7 +738,7 @@ mod tests {
         w.done_through(a, result);
         assert_eq!(
             w.hand(),
-            "rho › a · asks · 0m",
+            "rho@lab › a · asks · 0m",
             "the ask came after the done"
         );
         w.done(a);
@@ -779,7 +783,7 @@ mod tests {
         );
         assert_eq!(w.hand(), "");
         w.asks(parent);
-        assert_eq!(w.hand(), "rho › parent · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › parent · asks · 0m");
     }
 
     #[test]
@@ -792,7 +796,7 @@ mod tests {
         w.asks(child);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(child));
-        assert_eq!(w.hand(), "rho › child · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › child · asks · 0m");
     }
 
     #[test]
@@ -803,7 +807,10 @@ mod tests {
         let first = w.stop(a, Stop::Failed);
         w.pass(mins(2));
         w.stop(b, Stop::Lost);
-        assert_eq!(w.hand(), "rho › a · failed · 2m\nrho › b · lost · 0m");
+        assert_eq!(
+            w.hand(),
+            "rho@lab › a · failed · 2m\nrho@lab › b · lost · 0m"
+        );
         let card = &w.deal().cards[0];
         assert_eq!(attention_mail(&card.cursor), Some(first));
         w.done(a);
@@ -812,7 +819,7 @@ mod tests {
         w.pass(mins(1));
         let second = w.stop(a, Stop::Stuck);
         w.done_through(a, Seen::Topic(first.0.0));
-        assert_eq!(w.hand(), "rho › a · stuck · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · stuck · 0m");
         assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(second));
     }
 
@@ -832,12 +839,11 @@ mod tests {
     }
 
     #[test]
-    fn a_card_says_its_host_when_there_is_more_than_one() {
+    fn even_a_single_host_card_names_the_project_address() {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        w.hosts = 2;
-        assert_eq!(w.hand(), "laptop/rho › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
         // A message right under the root is a thread of its own.
         let root = w.root();
         let from = Party::Agent(w.agents[&a]);
@@ -854,7 +860,7 @@ mod tests {
         assert!(
             hand.cards
                 .iter()
-                .any(|card| card.heading() == "laptop/rho › at the root"),
+                .any(|card| card.heading() == "rho@lab › at the root"),
             "{hand:?}"
         );
     }
@@ -868,7 +874,7 @@ mod tests {
             by: Until::In(SignedDuration::from_hours(1)),
             lead_days: 1,
         });
-        assert_eq!(w.hand(), "rho › a · deadline · 1d");
+        assert_eq!(w.hand(), "rho@lab › a · deadline · 1d");
     }
 
     /// A channel is the user's when they made it or wrote anywhere in it,

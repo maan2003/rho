@@ -420,6 +420,8 @@ pub struct DealerPolicySnapshot {
     pub queue_floor: f64,
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
+    /// The expiry of result cards in older sessions; zero when expiry is
+    /// disabled.
     pub fyi_reply_pace_days: f64,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,

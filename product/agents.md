@@ -3,7 +3,6 @@
 The agents do the work behind the project's mail. The user goes one level down from the work to see an agent's transcript, terminals, shell, or desktops.
 
 ## bet An agent is labour, not a colleague
-status: agents already have no dashboard, but they appear by name in chat and can be opened and steered from its `with` line.
 instead of: reaching an individually named agent from each thread.
 serves: Keep the work moving.
 because: the user cares about the work, not the worker. The project speaks for the work and an agent is reached only when the user needs to look into it.
@@ -30,7 +29,6 @@ done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Agent
-status: a host thread shows agent names and state on its `with` line and offers their commands from there; the user can also find agents by name.
 purpose: do a piece of the user's work on a host, and let the user inspect what was done if needed.
 principle: an agent works from the user's mail about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.
@@ -103,12 +101,10 @@ does:
 A desktop is also a place in `window.Palette`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
 
 ## screen Agent
-status: the transcript is reached from the host thread's `with` line or by agent name.
 shows: `Agent`, its transcript
 starts: `Steer an agent`, `Work beside an agent`
 
 ## flow Look into the work
-status: the user puts the cursor on the `with` line of a host thread and presses `enter` on an agent to open its transcript at the newest step.
 runs: 15 a day
 day: Keep the work moving.
 when: the user has a result or a report of trouble and wants to see how the work was done
@@ -127,7 +123,6 @@ reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 The historical review was of Look into what an agent did.
 
 ## flow Steer an agent
-status: the same controls are also offered from the host thread's `with` line, and the user writes to the agent there.
 runs: 3 a day
 day: Keep the work moving.
 when: an agent is stuck, going the wrong way, or on the wrong model

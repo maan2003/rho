@@ -76,6 +76,10 @@ pub trait System: Sized + 'static {
         cx: &mut Context<Self>,
     ) -> Option<AnySurface>;
 
+    /// The foreground surface, independent of where an overlay takes keys.
+    /// `None` means that the window is inactive.
+    fn active_surface(&mut self, _address: Option<&Address>, _cx: &mut Context<Self>) {}
+
     /// The streams this system keeps to a host, opened on every connect.
     /// `name` is what the user calls the host, `endpoint` its identity as
     /// far as the client knows before the host answers.
@@ -156,6 +160,7 @@ pub trait System: Sized + 'static {
 trait SystemHandle {
     fn kinds(&self, cx: &App) -> &'static [&'static str];
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface>;
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App);
     fn streams(
         &self,
         host: HostId,
@@ -189,6 +194,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.update(cx, |system, cx| system.open(address, window, cx))
+    }
+
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.update(cx, |system, cx| system.active_surface(address, cx));
     }
 
     fn streams(
@@ -266,6 +275,10 @@ impl AnySystem {
 
     pub fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.0.open(address, window, cx)
+    }
+
+    pub(crate) fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.0.active_surface(address, cx);
     }
 
     pub fn streams(
