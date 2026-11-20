@@ -2,9 +2,9 @@
 //!
 //! A system owns a few kinds of address and everything about them: the
 //! surfaces that open them, the rows a menu offers over them, what of
-//! them wants the user, the rooms Home lists, what `find` finds, and the
-//! streams it keeps to each host. The frame holds systems as a list and asks
-//! each in turn; a system never names another.
+//! them wants the user, the status changes the desk lists, what `find` finds,
+//! and the streams it keeps to each host. The frame holds systems as a list and
+//! asks each in turn; a system never names another.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -19,39 +19,11 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
+use crate::desk::MovingThread;
 use crate::frame::Point;
+use crate::idea::{IdeaMail, IdeaProject};
 use crate::menu::Row;
 use crate::surface::AnySurface;
-
-/// One room: a place the user works in, as the system that holds it lists
-/// it on Home. Home orders the rooms by attention: a room with a card in
-/// the hand goes by that card, the rest by what waits in them and when
-/// they last moved.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoomRow {
-    pub address: Address,
-    pub standing: Standing,
-    pub name: String,
-    /// Where it is: the host's name.
-    pub tag: String,
-    /// What waits in it, in the system's words (`3 unread · 2h`); empty
-    /// when nothing does.
-    pub waiting: String,
-    /// When it last moved, in unix milliseconds; zero when nothing says.
-    pub at: u64,
-}
-
-/// Why a root is on Home. Whether the deal holds a card in it is the
-/// hand's to say, which Home reads; the rest is the system's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Standing {
-    /// The user works in it: they made it or wrote in it, or
-    /// something in it asks them or mentions them unread.
-    Worked,
-    /// Only a place a card can be in: a room while the hand holds one in
-    /// it, and otherwise reached by name alone.
-    WhileCard,
-}
 
 /// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,12 +109,23 @@ pub trait System: Sized + 'static {
         Seen::Whole
     }
 
-    /// The rooms this system has, given what the user has said about its
-    /// things: every root they work in, and every root a card could be in
-    /// as [`Standing::WhileCard`].
-    fn rooms(&self, _marks: &Marks, _cx: &App) -> Vec<RoomRow> {
+    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
         Vec::new()
     }
+
+    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
+        Vec::new()
+    }
+
+    fn idea_project(&self, _address: &Address, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
     /// Every place of the system's that the palette lists by title, given what
     /// the user has said about its things. Asked with the frame busy, so
@@ -182,7 +165,16 @@ trait SystemHandle {
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
-    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread>;
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject>;
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject>;
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App);
+
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
 }
@@ -247,8 +239,24 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).seen(address, cx)
     }
 
-    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
-        self.read(cx).rooms(marks, cx)
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.read(cx).moving_threads(cx)
+    }
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.read(cx).idea_projects(cx)
+    }
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).idea_project(address, cx)
+    }
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).last_idea_project(cx)
+    }
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.update(cx, |system, cx| system.send_idea(mail, cx))
     }
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -326,8 +334,24 @@ impl AnySystem {
         self.0.seen(address, cx)
     }
 
-    pub fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
-        self.0.rooms(marks, cx)
+    pub(crate) fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.0.moving_threads(cx)
+    }
+
+    pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.0.idea_projects(cx)
+    }
+
+    pub(crate) fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.0.idea_project(address, cx)
+    }
+
+    pub(crate) fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.0.last_idea_project(cx)
+    }
+
+    pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.0.send_idea(mail, cx)
     }
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {

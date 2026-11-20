@@ -137,12 +137,17 @@ impl AgentsSystem {
                 client_id,
                 message,
             } => this.delivered(*endpoint, *client_id, *message, cx),
-            ChatEvent::Idea { endpoint, parent } => start::idea(
+            ChatEvent::Idea {
+                endpoint,
+                parent,
+                source,
+            } => start::idea(
                 this,
                 ThreadId {
                     host: *endpoint,
                     message: *parent,
                 },
+                source.clone(),
                 cx,
             ),
             ChatEvent::Changed { .. } => {}
@@ -979,7 +984,7 @@ impl System for AgentsSystem {
                     self,
                     this,
                     thread,
-                    start::Origin::Draft,
+                    start::Origin::Draft(rho_chat::ui::IdeaSource::ChannelDraft),
                     start::Runtimes::Ask,
                     cx,
                 ),

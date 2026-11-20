@@ -152,8 +152,7 @@ pub fn claims(
         let mut claim = Claim::new(address, curve, reason, cursor);
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
-        // The room the thread is in: a snooze on it holds the thread too,
-        // and Home ranks the room by the thread's card.
+        // A snooze or mute on the project holds its threads too.
         let root = chat.root_of(thread);
         if root != thread {
             claim.under = Some(
@@ -174,37 +173,6 @@ pub fn claims(
         claims.push(claim);
     }
     claims
-}
-
-/// Whether the user works in a channel: they made it or wrote in it, or
-/// a mention of them in it is unread. A channel that is neither, such as
-/// one a host posts each deploy as, is a room only while the deal holds a
-/// card in it.
-pub fn worked_in(chat: &HostChat, host: EndpointId, root: MessageId, marks: &Marks) -> bool {
-    let mut stack = vec![root];
-    let mut mentions = Vec::new();
-    while let Some(at) = stack.pop() {
-        stack.extend(chat.children(Some(at)).iter().copied());
-        let Some(message) = chat.message(at) else {
-            continue;
-        };
-        if message.from == Party::User {
-            return true;
-        }
-        if message.mentions(Party::User).is_some() {
-            mentions.push(at);
-        }
-    }
-    // The user wrote nowhere in it, so only a done says how far they have
-    // seen each thread.
-    mentions.into_iter().any(|mention| {
-        let thread = ThreadId {
-            host,
-            message: chat.subthread_of(mention),
-        };
-        let facts = marks.get(&thread.address()).facts();
-        !facts.muted() && facts.seen_topic().is_none_or(|seen| mention.0.0 > seen)
-    })
 }
 
 /// What a thread is called on a card, and where it is, for a thread no
@@ -875,54 +843,5 @@ mod tests {
             lead_days: 1,
         });
         assert_eq!(w.hand(), "rho@lab › a · deadline · 1d");
-    }
-
-    /// A channel is the user's when they made it or wrote anywhere in it,
-    /// or a mention of them in it is unread; a host's root per deploy that
-    /// mentions nobody is not, nor one whose mention is done or muted.
-    #[test]
-    fn a_channel_is_worked_in_by_what_the_user_wrote_or_has_unread() {
-        let mut w = world();
-        let deployer = Party::Agent(AgentId::from_counter(77, &AgentIdDomain(0)).unwrap());
-        let mention = |kind| {
-            vec![Mention {
-                to: Party::User,
-                kind,
-            }]
-        };
-        let worked = |w: &World, root| worked_in(&w.chat, EndpointId([0; 32]), root, &w.marks);
-
-        let made = w.post(None, Party::User, Vec::new(), "tide");
-        assert!(worked(&w, made), "the user made it");
-
-        let deploy = w.post(None, deployer, Vec::new(), "deploy 41");
-        let log = w.post(Some(deploy), deployer, Vec::new(), "built");
-        assert!(!worked(&w, deploy), "a deploy that asks nothing");
-        let deep = w.post(Some(log), deployer, Vec::new(), "pushed");
-        w.post(Some(deep), Party::User, Vec::new(), "thanks");
-        assert!(worked(&w, deploy), "the user wrote deep inside it");
-
-        let noisy = w.post(None, deployer, Vec::new(), "deploy 42");
-        let thread = w.post(Some(noisy), deployer, Vec::new(), "rollout");
-        let fyi = w.post(Some(thread), deployer, mention(MentionKind::Fyi), "fyi");
-        assert!(worked(&w, noisy), "an unread fyi under a thread");
-        w.done_through(thread, Seen::Topic(fyi.0.0 - 1));
-        assert!(
-            worked(&w, noisy),
-            "done through a message before the mention"
-        );
-        w.done(thread);
-        assert!(!worked(&w, noisy), "the mention is done");
-
-        let muted = w.post(None, deployer, Vec::new(), "deploy 43");
-        let inside = w.post(Some(muted), deployer, mention(MentionKind::Ask), "ok?");
-        assert!(worked(&w, muted));
-        w.mute(inside);
-        assert!(!worked(&w, muted), "a muted thread holds nothing unread");
-
-        let asked = w.post(None, deployer, mention(MentionKind::Ask), "deploy 44?");
-        assert!(worked(&w, asked), "the root itself asks");
-        w.done(asked);
-        assert!(!worked(&w, asked));
     }
 }

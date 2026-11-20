@@ -765,6 +765,7 @@ impl ThreadView {
             cx.emit(Event::Idea {
                 endpoint: thread.host,
                 parent: thread.message,
+                source: super::IdeaSource::ChannelDraft,
             });
         });
     }

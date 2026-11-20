@@ -9,7 +9,7 @@
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::keys::{Close, Home, Palette, VerdictMenu};
+use rho_frame::keys::{Close, Desk, Palette, VerdictMenu};
 use rho_frame::{Mode, Surface};
 use theme::ActiveTheme as _;
 
@@ -188,7 +188,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
         KeyBinding::new(":", Palette, Some("RhoTerminalNormal")),
         KeyBinding::new("space", VerdictMenu, Some("RhoTerminalNormal")),
-        KeyBinding::new("tab", Home, Some("RhoTerminalNormal")),
+        KeyBinding::new("tab", Desk, Some("RhoTerminalNormal")),
         KeyBinding::new("q", Close, Some("RhoTerminalNormal")),
     ]);
 }

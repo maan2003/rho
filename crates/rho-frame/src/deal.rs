@@ -17,8 +17,8 @@ use rho_dealer::{Address, Card, Claim};
 use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
+use crate::desk::desk_rows;
 use crate::frame::Frame;
-use crate::home::room_lines;
 use crate::when::{SnoozeUnit, snooze_target};
 
 /// What the echo line says when a pull finds nothing to deal.
@@ -34,7 +34,7 @@ pub(crate) struct Signals {
     /// Ranks again when the hand next changes with nobody touching
     /// anything, such as a card's words saying another age.
     next_change: Option<gpui::Task<()>>,
-    /// The ranking as of the last change: what the status line, Home and
+    /// The ranking as of the last change: what the status line, Desk and
     /// a verdict read. Ranking asks every system for its claims and walks
     /// every host's chat, so it happens once per change, never per draw.
     pub hand: Hand,
@@ -100,7 +100,7 @@ impl Frame {
     }
 
     /// The ranking with everything it weighed, into the journal.
-    fn journal_deal(&self, dealt: Option<&Address>, cx: &gpui::App) {
+    pub(crate) fn journal_deal(&self, dealt: Option<&Address>, cx: &gpui::App) {
         let now = Zoned::now();
         let mut trace = Trace::default();
         let (hand, trace) = self.with_sources(Some(&mut trace), cx, |sources| {
@@ -169,7 +169,6 @@ impl Frame {
             priority: f64::NEG_INFINITY,
             cursor: String::new(),
             skipped: false,
-            room: None,
         }
     }
 
@@ -215,7 +214,7 @@ impl Frame {
     }
 
     /// A verdict on `address`, said in `verb`'s words. The surface showing
-    /// the card closes and the next is dealt; a row on Home stays where
+    /// the card closes and the next is dealt; a row on Desk stays where
     /// the reader is.
     pub fn verdict(
         &mut self,
@@ -295,14 +294,14 @@ impl Frame {
     /// One pull: rank everything, pass over the card in view, and open
     /// the most important of the rest. Nothing is retained, so two pulls
     /// in a row see the same world and the skip is what moves them on.
-    /// With nothing to deal, Home opens and the echo line says so.
+    /// With nothing to deal, Desk opens and the echo line says so.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.deal_next(window, cx) {
             self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
         }
     }
 
-    /// The pull itself: whether a card opened. Empty lands on Home, since
+    /// The pull itself: whether a card opened. Empty lands on Desk, since
     /// there is nothing to deal and the glance is the answer.
     fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let now = Timestamp::now();
@@ -332,7 +331,7 @@ impl Frame {
         // has passed since the last change.
         self.signals.hand = self.rank(cx);
         let Some(card) = self.hand().top(in_view.as_ref()).cloned() else {
-            self.open_home(window, cx);
+            self.open_desk(window, cx);
             return false;
         };
         self.journal_deal(Some(&card.address), cx);
@@ -358,7 +357,7 @@ impl Frame {
         self.verdict(address, Verdict::Snooze(until), said, window, cx);
     }
 
-    /// Schedules one evaluation of the lamp, the chime and Home for the
+    /// Schedules one evaluation of the lamp, the chime and the desk for the
     /// end of this effect cycle, however many changes asked.
     pub fn systems_changed(&mut self, cx: &mut Context<Self>) {
         if self.signals.scheduled {
@@ -376,16 +375,21 @@ impl Frame {
 
     fn evaluate_signals(&mut self, cx: &mut Context<Self>) {
         let hand = self.rank(cx);
-        self.signals.next_change = hand.next_change.map(|at| {
-            // Ranked a moment ago, so a change already due is due now.
-            let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
-                .unwrap_or_default();
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(wait).await;
-                let _ = this.update(cx, |this, cx| this.systems_changed(cx));
-            })
-        });
-        self.refresh_home(&hand, cx);
+        let next_age = self.refresh_desk(&hand, cx);
+        self.signals.next_change = hand
+            .next_change
+            .into_iter()
+            .chain(next_age)
+            .min()
+            .map(|at| {
+                // Ranked a moment ago, so a change already due is due now.
+                let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
+                    .unwrap_or_default();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update(cx, |this, cx| this.systems_changed(cx));
+                })
+            });
         // What the lamp is about is what is *not* in front of the reader:
         // the card they are already reading is not news.
         let in_view = self.card_in_view(cx);
@@ -431,16 +435,29 @@ impl Frame {
         cx.notify();
     }
 
-    /// Home is a window onto the same ranking, rebuilt wherever the dealer
+    /// Desk is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated or the hand changes by itself, never on a timer of
     /// its own.
-    fn refresh_home(&mut self, hand: &Hand, cx: &mut Context<Self>) {
-        let mut rooms = Vec::new();
-        for system in &self.systems {
-            rooms.extend(system.rooms(&self.attention.marks, cx));
-        }
-        let lines = room_lines(rooms, hand, &self.attention.marks, &Zoned::now());
-        self.home.update(cx, |home, cx| home.set_rooms(lines, cx));
+    fn refresh_desk(&mut self, hand: &Hand, cx: &mut Context<Self>) -> Option<Timestamp> {
+        let moving = self
+            .systems
+            .iter()
+            .flat_map(|system| system.moving_threads(cx))
+            .collect();
+        let rows = desk_rows(
+            hand,
+            moving,
+            |address| {
+                self.systems
+                    .iter()
+                    .find_map(|system| system.idea_project(address, cx))
+                    .map(|project| project.name)
+            },
+            Timestamp::now(),
+        );
+        let next_age = rows.next_age;
+        self.desk.update(cx, |desk, cx| desk.set_rows(rows, cx));
+        next_age
     }
 }
 

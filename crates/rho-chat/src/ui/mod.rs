@@ -5,7 +5,8 @@
 //! plugs into the frame as a [`System`] under the `thread` kind: a root
 //! message is a channel, a reply to a root is a thread, and every one of
 //! them opens as a [`ThreadView`]. What of the chat wants the user is
-//! [`crate::cards`]'s to say; Home's rows and `find`'s are made here.
+//! [`crate::cards`]'s to say; its mail projects, moving threads and `find`'s
+//! rows are made here.
 
 mod thread;
 
@@ -25,7 +26,9 @@ use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::attention::Verdict;
-use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, RoomRow, Row, Standing, System};
+use rho_frame::desk::MovingThread;
+use rho_frame::idea::{IdeaMail, IdeaProject};
+use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, Row, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
@@ -38,7 +41,6 @@ use crate::{AgentRef, ThreadId, cards};
 
 /// What the chat tells whoever listens: the agents system starts an
 /// agent from a message once the host has logged it.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The user sent the draft under `parent`, a channel, as an idea: the
     /// agents system says where an agent starts from it, then sends it.
@@ -46,6 +48,7 @@ pub enum Event {
     Idea {
         endpoint: EndpointId,
         parent: MessageId,
+        source: IdeaSource,
     },
     /// The host logged a message the user wrote, under the id this client
     /// gave it when it was written.
@@ -56,6 +59,14 @@ pub enum Event {
     },
     /// A host's forest changed.
     Changed { endpoint: EndpointId },
+}
+
+/// Which box supplied the idea. Each has a separate draft; a first
+/// start's question must not swap one draft for the other.
+#[derive(Clone)]
+pub enum IdeaSource {
+    ChannelDraft,
+    Box(IdeaMail),
 }
 
 /// One attached host: what the user calls it, how to call it, and whose
@@ -89,6 +100,7 @@ pub struct ChatSystem {
     chats: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
+    last_project: Option<ThreadId>,
     view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     /// Threads whose agent did not start from this window, and why, in the
@@ -130,6 +142,7 @@ impl ChatSystem {
         Self {
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
+            last_project: loaded.last_project,
             drafts: loaded
                 .drafts
                 .into_iter()
@@ -384,11 +397,22 @@ impl ChatSystem {
         mentions: Vec<AgentId>,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let project = parent.and_then(|message| {
+            self.project_root(ThreadId {
+                host: endpoint,
+                message,
+            })
+        });
+        if let Some(project) = project {
+            self.last_project = Some(project);
+            self.frame.changed(cx);
+        }
         let content = vec![ContentPart::Text { text }];
         let (id, kept) = self
             .outbox
             .push(endpoint, parent, reply_to, mentions, content);
-        self.cache.write_outbox(endpoint, kept);
+        self.cache
+            .write_outbox(endpoint, kept, project.map(|project| project.message));
         self.send_unsent(endpoint, cx);
         cx.notify();
         id
@@ -422,6 +446,53 @@ impl ChatSystem {
         Some(self.post(endpoint, parent, text, Vec::new(), cx))
     }
 
+    /// Post the selected idea, independent of the box that owns its
+    /// draft. The agent still starts from the logged mail, not its text.
+    pub fn post_idea(
+        &mut self,
+        project: ThreadId,
+        source: &IdeaSource,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        match source {
+            IdeaSource::ChannelDraft => self.send_draft(project.host, Some(project.message), cx),
+            IdeaSource::Box(idea) => {
+                let name = self.project_address(project)?;
+                let id = self.post(
+                    project.host,
+                    Some(project.message),
+                    idea.text.trim().to_owned(),
+                    Vec::new(),
+                    cx,
+                );
+                (idea.sent)(name, cx);
+                Some(id)
+            }
+        }
+    }
+
+    fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
+        let chat = self.chat(thread.host)?;
+        chat.message(thread.message)?;
+        let root = chat.root_of(thread.message);
+        chat.project(root)?;
+        Some(ThreadId {
+            message: root,
+            ..thread
+        })
+    }
+
+    fn idea_project_at(&self, project: ThreadId) -> Option<IdeaProject> {
+        let name = self.project_address(project)?;
+        // The project must be on an attached host. Its cached address and
+        // outbox stay usable while the connection is interrupted.
+        self.link_for(project.host)?;
+        Some(IdeaProject {
+            address: project.address(),
+            name,
+        })
+    }
+
     fn link_for(&self, endpoint: EndpointId) -> Option<Link> {
         self.hosts
             .values()
@@ -445,7 +516,7 @@ impl ChatSystem {
             let _ = this.update(cx, |this, cx| match reply {
                 Ok(message) => {
                     if let Some((client_id, _, kept)) = this.outbox.delivered(endpoint) {
-                        this.cache.write_outbox(endpoint, kept);
+                        this.cache.write_outbox(endpoint, kept, None);
                         cx.emit(Event::Delivered {
                             endpoint,
                             client_id,
@@ -496,12 +567,6 @@ impl ChatSystem {
         (address.kind() == ThreadId::KIND)
             .then(|| ThreadId::parse(address.rest()))
             .flatten()
-    }
-
-    /// How many messages of others in a thread the user has not read:
-    /// those past what they settled through or wrote after.
-    fn unread_in(&self, chat: &HostChat, thread: ThreadId, marks: &Marks) -> usize {
-        self.unread_ids_in(chat, thread, marks).len()
     }
 
     /// The messages of others in a thread the user has not read, newest
@@ -629,7 +694,7 @@ impl System for ChatSystem {
         ))]
     }
 
-    /// The host's rooms and their screens go from the window with it. Its
+    /// The host's threads and their screens go from the window with it. Its
     /// log is a copy the host still has, so the copy goes too and is read
     /// again if the host is attached again; what the user wrote and has
     /// not sent stays for then.
@@ -840,55 +905,63 @@ impl System for ChatSystem {
             .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
     }
 
-    /// Every root on every host, with how many of its threads hold
-    /// something unread and when it last moved: a room when the user
-    /// works in it, and otherwise only while it holds a card.
-    fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
-        let now = Timestamp::now();
-        let mut rows = Vec::new();
-        for (seed, name) in self.hosts() {
-            let Some(chat) = self.chats.get(&seed) else {
-                continue;
-            };
-            for root in chat.roots() {
-                let unread = chat
-                    .children(Some(*root))
-                    .iter()
-                    .filter(|id| {
-                        self.unread_in(
-                            chat,
-                            ThreadId {
-                                host: seed,
-                                message: **id,
-                            },
-                            marks,
-                        ) > 0
+    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
+        self.chats
+            .iter()
+            .flat_map(|(&host, chat)| {
+                chat.statuses().filter_map(move |status| {
+                    let thread = ThreadId {
+                        host,
+                        message: status.thread,
+                    };
+                    let project = self.project_root(thread)?;
+                    (project != thread).then_some(())?;
+                    Some(MovingThread {
+                        thread: thread.address(),
+                        subject: chat.name(thread.message)?,
+                        project: self.project_address(project)?,
+                        status: status.text.clone(),
+                        changed: Timestamp::from_millisecond(status.at.0.try_into().ok()?).ok()?,
                     })
-                    .count();
-                let (_, at) = chat
-                    .newest_in(*root)
-                    .unwrap_or((*root, rho_agent_types::UnixMs(0)));
-                rows.push(RoomRow {
-                    address: ThreadId {
-                        host: seed,
-                        message: *root,
-                    }
-                    .address(),
-                    standing: match cards::worked_in(chat, seed, *root, marks) {
-                        true => Standing::Worked,
-                        false => Standing::WhileCard,
-                    },
-                    name: chat.name(*root).unwrap_or_default(),
-                    tag: name.clone(),
-                    waiting: match unread {
-                        0 => String::new(),
-                        n => format!("{n} unread · {}", ago(at.0, now)),
-                    },
-                    at: at.0,
-                });
-            }
-        }
-        rows
+                })
+            })
+            .collect()
+    }
+
+    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
+        self.chats
+            .iter()
+            .flat_map(|(&host, chat)| {
+                chat.roots().iter().filter_map(move |&message| {
+                    let thread = ThreadId { host, message };
+                    let project = self.idea_project_at(thread)?;
+                    // Like project_named, only show the newest of roots with
+                    // the same address. A contextual default knows its exact
+                    // id.
+                    (self.project_named(&project.name) == Some(thread)).then_some(project)
+                })
+            })
+            .collect()
+    }
+
+    fn idea_project(&self, address: &Address, _cx: &App) -> Option<IdeaProject> {
+        let project = self.project_root(self.thread_of(address)?)?;
+        self.idea_project_at(project)
+    }
+
+    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
+        self.idea_project_at(self.last_project?)
+    }
+
+    fn send_idea(&mut self, mail: IdeaMail, cx: &mut Context<Self>) {
+        let Some(project) = self.thread_of(&mail.project) else {
+            return;
+        };
+        cx.emit(Event::Idea {
+            endpoint: project.host,
+            parent: project.message,
+            source: IdeaSource::Box(mail),
+        });
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {

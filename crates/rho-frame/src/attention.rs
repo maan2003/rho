@@ -3,7 +3,7 @@
 //! What the user says lives in the ledger, which syncs it sealed between
 //! their devices through the hosts: facts, every one kept, a note's text
 //! among them. The dealer reads them with what every system claims
-//! into the hand Home shows and a pull deals from. A verdict is a fact the
+//! into the hand the desk shows and a pull deals from. A verdict is a fact the
 //! user said, and undo retracts the fact.
 
 use std::collections::BTreeSet;

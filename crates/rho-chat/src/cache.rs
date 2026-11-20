@@ -14,6 +14,7 @@ use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{ChatRecord, ChatSeq, EndpointId, MessageId};
 use rho_db::{RhoDb, Sen, SenValue};
 
+use crate::ThreadId;
 use crate::outbox::{Kept, Outgoing};
 
 /// A host in a key: its iroh identity's bytes.
@@ -27,6 +28,7 @@ const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("chat3_cursor");
 const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new("chat3_outbox");
 /// What the user is writing under each parent and has not sent, by host
 /// and the parent's id (zero for a root). Sending moves it to the outbox.
+const LAST_PROJECT: TableDefinition<(), (Host, u64)> = TableDefinition::new("chat_last_project_v1");
 const DRAFTS: TableDefinition<(Host, u64), &str> = TableDefinition::new("chat3_draft");
 
 /// What the copy holds when a client starts.
@@ -35,6 +37,7 @@ pub struct Loaded {
     /// Each host's cursor.
     pub cursors: Vec<(EndpointId, ChatSeq)>,
     pub outbox: Vec<(EndpointId, u64, Outgoing)>,
+    pub last_project: Option<ThreadId>,
     pub drafts: Vec<(EndpointId, Option<MessageId>, String)>,
 }
 
@@ -47,7 +50,7 @@ enum Write {
     },
     /// A host's log is not the one the copy holds: the copy starts over.
     Reset(Host),
-    Outbox(Host, Kept),
+    Outbox(Host, Kept, Option<MessageId>),
     Draft(Host, Option<MessageId>, String),
     Flush(mpsc::SyncSender<()>),
 }
@@ -86,6 +89,7 @@ impl Cache {
             open_or_rebuild(&mut write, CURSOR);
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
+            write.open_table(LAST_PROJECT);
             write.commit();
         });
         let (sender, receiver) = mpsc::channel();
@@ -116,6 +120,13 @@ impl Cache {
                     (EndpointId(host), id, value.value().into_owned())
                 })
                 .collect(),
+            last_project: read.open_table(LAST_PROJECT).get(()).map(|row| {
+                let (host, message) = row.value();
+                ThreadId {
+                    host: EndpointId(host),
+                    message: MessageId(ChatSeq(message)),
+                }
+            }),
             drafts: read
                 .open_table(DRAFTS)
                 .iter()
@@ -173,8 +184,8 @@ impl Cache {
         self.send(Write::Reset(host.0));
     }
 
-    pub fn write_outbox(&self, host: EndpointId, kept: Kept) {
-        self.send(Write::Outbox(host.0, kept));
+    pub fn write_outbox(&self, host: EndpointId, kept: Kept, project: Option<MessageId>) {
+        self.send(Write::Outbox(host.0, kept, project));
     }
 
     /// A draft as it stands; empty drops it.
@@ -270,12 +281,17 @@ fn apply(
             drop(log);
             transaction.open_table(CURSOR).remove(host);
         }
-        Write::Outbox(host, Kept::Put(id, outgoing)) => {
+        Write::Outbox(host, Kept::Put(id, outgoing), project) => {
             transaction
                 .open_table(OUTBOX)
                 .insert((host, id), SenValue::borrowed(&outgoing));
+            if let Some(project) = project {
+                transaction
+                    .open_table(LAST_PROJECT)
+                    .insert((), (host, project.0.0));
+            }
         }
-        Write::Outbox(host, Kept::Gone(id)) => {
+        Write::Outbox(host, Kept::Gone(id), _) => {
             transaction.open_table(OUTBOX).remove((host, id));
         }
         Write::Draft(host, parent, text) => {
@@ -333,9 +349,13 @@ mod tests {
             mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
         };
-        cache.write_outbox(H1, Kept::Put(7, outgoing.clone()));
-        cache.write_outbox(H1, Kept::Put(8, outgoing.clone()));
-        cache.write_outbox(H1, Kept::Gone(8));
+        cache.write_outbox(
+            H1,
+            Kept::Put(7, outgoing.clone()),
+            Some(MessageId(ChatSeq(23))),
+        );
+        cache.write_outbox(H1, Kept::Put(8, outgoing.clone()), None);
+        cache.write_outbox(H1, Kept::Gone(8), None);
         cache.write_draft(H1, None, "a root".into());
         cache.write_draft(H1, Some(MessageId(ChatSeq(2))), "under two".into());
         cache.write_draft(H1, Some(MessageId(ChatSeq(2))), String::new());
@@ -346,6 +366,13 @@ mod tests {
         cursors.sort();
         assert_eq!(cursors, [(H1, ChatSeq(3)), (H2, ChatSeq(1))]);
         assert_eq!(loaded.outbox, [(H1, 7, outgoing.clone())]);
+        assert_eq!(
+            loaded.last_project,
+            Some(ThreadId {
+                host: H1,
+                message: MessageId(ChatSeq(23))
+            })
+        );
         assert_eq!(loaded.drafts, [(H1, None, "a root".to_owned())]);
         assert_eq!(
             cache.load_host(H1),
