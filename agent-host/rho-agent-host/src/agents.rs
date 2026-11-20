@@ -1206,9 +1206,11 @@ mod tests {
                                     agent,
                                     spec: AgentSpec {
                                         runtime: Runtime::Native {
-                                            model: rho_agent::inference::config::InferenceModel::Sol,
+                                            model:
+                                                rho_agent::inference::config::InferenceModel::Sol,
                                             profile: Default::default(),
-                                            cache_key: rho_agent::inference::PromptCacheKey::generate(),
+                                            cache_key:
+                                                rho_agent::inference::PromptCacheKey::generate(),
                                         },
                                         props: [("name".to_owned(), format!("crowded-{created}"))]
                                             .into_iter()

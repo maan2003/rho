@@ -823,9 +823,12 @@ fn links(text: &str) -> Vec<Range<usize>> {
             continue;
         };
         let length = rest
-            .find(|character: char| character.is_whitespace() || character == '<' || character == '>')
+            .find(|character: char| {
+                character.is_whitespace() || character == '<' || character == '>'
+            })
             .unwrap_or(rest.len());
-        let link = rest[..length].trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"', ')', ']', '}']);
+        let link = rest[..length]
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"', ')', ']', '}']);
         if link.len() > scheme.len() {
             found.push(start..start + link.len());
         }

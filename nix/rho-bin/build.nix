@@ -59,9 +59,9 @@ let
   nixLibs = pkgs.lib.attrValues nix.libs;
   nixLibraries = pkgs.closureInfo { rootPaths = nixLibs; };
   # Crates that pass bare `-l` flags rely on the linker search path.
-  libSearchFlags = pkgs.lib.concatMapStringsSep " " (
-    lib: "-L native=${pkgs.lib.getLib lib}/lib"
-  ) (linked ++ nixLibs);
+  libSearchFlags = pkgs.lib.concatMapStringsSep " " (lib: "-L native=${pkgs.lib.getLib lib}/lib") (
+    linked ++ nixLibs
+  );
   # The `rho` package's binaries.
   packages = [
     "rho-cli"

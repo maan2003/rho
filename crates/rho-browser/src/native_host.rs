@@ -649,7 +649,10 @@ mod tests {
             "url": "https://example.com/three",
             "last_accessed_ms": 1_763_500_000_123u64,
         })));
-        assert_eq!(page_metadata(b).unwrap().last_accessed_ms, 1_763_500_000_123);
+        assert_eq!(
+            page_metadata(b).unwrap().last_accessed_ms,
+            1_763_500_000_123
+        );
         assert!(record_page_metadata(&json!({
             "event": "page-metadata",
             "page_id": "00000000-0000-4000-8000-00000000000c",

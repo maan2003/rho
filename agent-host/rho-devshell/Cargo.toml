@@ -9,13 +9,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+bytes.workspace = true
 rho-fs-view.workspace = true
 rho-watch.workspace = true
+rustix = { version = "1", features = ["process"] }
 senax-encoder.workspace = true
-bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rustix = { version = "1", features = ["process"] }
 tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]

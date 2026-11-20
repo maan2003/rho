@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono = "0.4"
 bytes.workspace = true
+chrono = "0.4"
 redb.workspace = true
 rho-db.workspace = true
 rho-devshell.workspace = true
@@ -17,6 +17,6 @@ senax-encoder.workspace = true
 tokio = { workspace = true, features = ["net", "rt"] }
 
 [dev-dependencies]
-serde_json.workspace = true
 rho-watch.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

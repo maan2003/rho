@@ -11,9 +11,7 @@ version.workspace = true
 
 [features]
 # The rows hosts and devices keep logs in.
-store = ["dep:redb", "dep:rho-db"]
 client = [
-  "store",
   "dep:anyhow",
   "dep:bip39",
   "dep:blake3",
@@ -22,7 +20,9 @@ client = [
   "dep:rand",
   "dep:rho-agent-hosts",
   "dep:tokio",
+  "store",
 ]
+store = ["dep:redb", "dep:rho-db"]
 
 [dependencies]
 bytes.workspace = true
@@ -38,9 +38,14 @@ rand = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-db = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"], optional = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "rt",
+  "sync",
+], optional = true }
 
 [dev-dependencies]
+rho-ledger = { path = ".", features = ["client"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
-rho-ledger = { path = ".", features = ["client"] }

@@ -5,22 +5,29 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [features]
+decoder = ["dep:shiguredo_libvpx", "dep:yuv"]
 default = []
 encoder = ["dep:shiguredo_libvpx", "dep:yuv"]
-decoder = ["dep:shiguredo_libvpx", "dep:yuv"]
 iroh = ["moq-tokio/shared-iroh"]
 
 [dependencies]
-rho-desktop-proto = { path = "../rho-desktop-proto" }
 anyhow = "1"
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "net", "time", "macros"] }
 moq-net = { path = "../../vendor/moq/rs/moq-net" }
 moq-tokio = { path = "../../vendor/moq/rs/moq-tokio", default-features = false }
 qmux = { version = "0.5.2", default-features = false, features = ["tcp"] }
+rho-desktop-proto = { path = "../rho-desktop-proto" }
 shiguredo_libvpx = { path = "../../vendor/libvpx-rs", optional = true }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 yuv = { version = "0.8.19", optional = true }
 
 [dev-dependencies]
-rho-rpc = { path = "../rho-rpc" }
 iroh = { workspace = true }
+rho-rpc = { path = "../rho-rpc" }

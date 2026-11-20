@@ -19,7 +19,10 @@ anyhow.workspace = true
 # copy the sampler holds. Keep the version equal to the sampler's.
 blazesym = { version = "0.2.5", features = ["zstd"] }
 dial9-core = "0.5.2"
-dial9-perf-self-profile = { version = "0.5.2", features = ["cpu-profiling", "symbolize-processor"] }
+dial9-perf-self-profile = { version = "0.5.2", features = [
+  "cpu-profiling",
+  "symbolize-processor",
+] }
 dial9-trace-format = "0.5.1"
 flate2 = "1"
 libc.workspace = true
