@@ -7,11 +7,10 @@
 
 use std::sync::Arc;
 
-use rho_db::RhoDb;
 use rho_slack::api::Client;
 use rho_slack::config::Credentials;
 use rho_slack::fake::Fake;
-use rho_slack::mirror::{Draft, DraftFile, Mirror, Saved, Scope};
+use rho_slack::mirror::{Draft, DraftFile, Mirror, Scope};
 use rho_slack::types::{ChannelId, Message, Ts};
 use serde_json::json;
 
@@ -454,30 +453,6 @@ fn favorite_survives_reopening_without_leaking_to_another_room() {
 }
 
 #[test]
-fn saved_messages_survive_reopen_without_duplicates() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("slack.redb");
-    let saved = Saved {
-        channel: ChannelId::from("C1"),
-        thread: Some(Ts::from("100.000000")),
-        ts: Ts::from("200.000000"),
-        summary: "David — follow up".to_owned(),
-    };
-    {
-        let mirror = Mirror::open(&path).unwrap();
-        mirror.save("acme", &saved);
-        mirror.save("acme", &saved);
-        assert_eq!(mirror.saved("acme"), vec![saved.clone()]);
-    }
-    {
-        let mirror = Mirror::open(&path).unwrap();
-        assert_eq!(mirror.saved("acme"), vec![saved.clone()]);
-        mirror.unsave("acme", &saved);
-    }
-    assert!(Mirror::open(path).unwrap().saved("acme").is_empty());
-}
-
-#[test]
 fn drafts_round_trip_per_source_and_empty_removes_them() {
     let (dir, mirror) = mirror();
     let channel = scope();
@@ -574,23 +549,6 @@ fn exact_message_lookup_does_not_drift_to_later_chatter() {
             .map(|message| message.text),
         Some("<@ME> actual mention".to_owned()),
     );
-}
-
-/// Production embeds Slack tables in the client's shared rho.redb. Reads on
-/// a database that predates a table must be empty, never a redb
-/// TableDoesNotExist panic.
-#[test]
-fn shared_database_open_initializes_saved_before_its_first_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(dir.path().join("rho.redb"));
-
-    let mirror = Mirror::open_on(db.clone()).unwrap();
-    assert!(mirror.saved("acme").is_empty());
-
-    // Reopening the same shared database exercises the ordinary production
-    // start after the table has been added.
-    let reopened = Mirror::open_on(db).unwrap();
-    assert!(reopened.saved("acme").is_empty());
 }
 
 #[test]

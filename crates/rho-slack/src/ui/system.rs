@@ -42,12 +42,6 @@ gpui::actions!(
         /// Opens what the cursor is on: a conversation, a thread, a hit, a
         /// file, a link, an app's button.
         OpenRow,
-        /// Rewrites the message under the cursor.
-        EditMessage,
-        /// What to react to the message under the cursor with.
-        React,
-        /// Marks the message under the cursor and what follows it unread.
-        MarkUnread,
         /// The next conversation with something unread.
         NextUnread,
         /// Asks Slack for messages.
@@ -1194,9 +1188,7 @@ pub(super) fn next_unread(
             window,
             cx,
         ),
-        // Nothing narrows the conversations any more, so nothing waits
-        // outside a narrowing either.
-        model::NextUnread::Outside(_) | model::NextUnread::Nothing => {
+        model::NextUnread::Nothing => {
             frame.echo("slack: nothing unread", StyleClass::SystemInfo, cx)
         }
     }
@@ -1220,27 +1212,17 @@ fn bind_keys(cx: &mut App) {
     let mut bindings = Vec::new();
     // Deal mode is not here, so these need no `!VimDeal`: a key means one
     // thing per context.
-    // The thread's own keys are the frame's (`rho_frame::thread`); these
-    // are the ones only a Slack message has.
+    // The thread's own keys are the frame's (`rho_frame::thread`). A Slack
+    // message's own actions are in the `slack` menu, not on letters, so
+    // every vim motion means what it means in any thread.
     for context in rho_frame::normal_contexts("RhoSlackConversation", "") {
         bindings.extend([
-            // On a line that is not one of the user's messages these give the
-            // key back to vim.
-            KeyBinding::new("e", EditMessage, Some(&context)),
-            KeyBinding::new("r", React, Some(&context)),
-            KeyBinding::new("m", MarkUnread, Some(&context)),
+            KeyBinding::new("shift-s", FindMessage, Some(&context)),
+            KeyBinding::new("ctrl-shift-s", FindFile, Some(&context)),
+            KeyBinding::new("ctrl-n", NewMessage, Some(&context)),
+            // `shift-n` and not `n`: `n` is the search the reader just ran.
+            KeyBinding::new("shift-n", NextUnread, Some(&context)),
         ]);
-    }
-    {
-        for context in rho_frame::normal_contexts("RhoSlackConversation", "") {
-            bindings.extend([
-                KeyBinding::new("shift-s", FindMessage, Some(&context)),
-                KeyBinding::new("ctrl-shift-s", FindFile, Some(&context)),
-                KeyBinding::new("ctrl-n", NewMessage, Some(&context)),
-                // `shift-n` and not `n`: `n` is the search the reader just ran.
-                KeyBinding::new("shift-n", NextUnread, Some(&context)),
-            ]);
-        }
     }
     let results = "RhoSlackResults > Editor";
     bindings.extend([
