@@ -653,6 +653,7 @@ fn thread_rows(
             false => Class::Unread,
         };
         let mut styles = vec![(name_class, 0..text.len())];
+        styles.extend(links(&text).into_iter().map(|link| (Class::Link, link)));
         let mut waiting: Vec<(String, Class)> = Vec::new();
         if mentions > 0 {
             waiting.push((format!("@{mentions}"), Class::Mention));
