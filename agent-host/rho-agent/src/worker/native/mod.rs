@@ -1336,6 +1336,7 @@ impl Agent {
                 },
                 archived: self.archived,
                 stale: false,
+                may_change_runtime_kind: false,
             },
             response: self.response(),
             draft: self.draft(),

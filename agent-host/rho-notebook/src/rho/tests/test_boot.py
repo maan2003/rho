@@ -144,7 +144,7 @@ class Init(unittest.TestCase):
         # delivery starts.
         ws.thread.join(5)
         self.assertFalse(ws.thread.is_alive())
-        self.assertEqual(_boot._announced, set())
+        self.assertFalse(_boot._announced)
 
     def test_init_may_await(self):
         ws = self.start("import asyncio\nawait asyncio.sleep(0)\nawaited = True\n")

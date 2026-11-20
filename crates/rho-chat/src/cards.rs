@@ -1,4 +1,5 @@
-//! Each card is a thread's first waiting ask/stop or newest waiting result.
+//! Deal the first waiting mail after the user's reply. When there is no
+//! such mail, the first waiting ask/stop or newest waiting result still waits.
 //! A visible mail is the only source of a claim; a stop remains after its
 //! agent moves on, and no addressed result fades unread. Marks still belong
 //! to the user, and a reply settles the mail that preceded it.
@@ -124,21 +125,29 @@ pub fn claims(
             .iter()
             .copied()
             .rfind(|mail| mail.mentions(Party::User) == Some(MentionKind::Result));
-        let (mail, reason) = match (waiting, result) {
-            (Some(mail), _) => {
-                let reason = match mail.from {
-                    Party::System { stop, .. } => format!("{} · {{age}}", stop.word()),
-                    _ => "asks · {age}".to_owned(),
-                };
-                (mail, reason)
+        // An addressed reply settles only its target. Older unanswered mail
+        // still waits, but the next mail in the conversation is where to land.
+        let next = user_wrote
+            .filter(|reply| reply.id != thread)
+            .and_then(|reply| {
+                unseen.iter().copied().find(|mail| {
+                    mail.id > reply.id
+                        && matches!(
+                            mail.mentions(Party::User),
+                            Some(MentionKind::Ask | MentionKind::Result)
+                        )
+                })
+            });
+        let Some(mail) = next.or(waiting).or(result) else {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.outcome(&address, "no card: nothing unread".to_owned());
             }
-            (None, Some(mail)) => (mail, "result · {age}".to_owned()),
-            (None, None) => {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.outcome(&address, "no card: nothing unread".to_owned());
-                }
-                continue;
-            }
+            continue;
+        };
+        let reason = match (mail.from, mail.mentions(Party::User)) {
+            (Party::System { stop, .. }, _) => format!("{} · {{age}}", stop.word()),
+            (_, Some(MentionKind::Result)) => "result · {age}".to_owned(),
+            _ => "asks · {age}".to_owned(),
         };
         let since = unix(mail.at.0);
         let curve = Curve::Waiting {
@@ -789,6 +798,29 @@ mod tests {
         w.done_through(a, Seen::Topic(first.0.0));
         assert_eq!(w.hand(), "rho@lab › a · stuck · 0m");
         assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(second));
+    }
+
+    #[test]
+    fn a_dealt_thread_continues_after_the_latest_reply_without_losing_older_mail() {
+        let mut w = world();
+        let a = w.agent("a");
+        let older = w.stop(a, Stop::Failed);
+        let answered = w.asks(a);
+        w.answers(a, answered);
+        w.sends(a, MentionKind::Fyi);
+        let next = w.finishes(a);
+        w.pass(mins(3));
+        let newest = w.asks(a);
+
+        let card = &w.deal().cards[0];
+        assert_eq!(attention_mail(&card.cursor), Some(next));
+        assert_eq!(card.label, "result · 3m");
+        w.answers(a, next);
+        // This reply is after the latest ask; it did not answer that ask or
+        // the older stop, and both still wait.
+        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(older));
+        w.answers(a, older);
+        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(newest));
     }
 
     #[test]

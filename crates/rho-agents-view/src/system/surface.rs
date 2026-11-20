@@ -160,36 +160,52 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
         "set runtime…",
         move |frame, window, cx| {
             let system = runtime_system.clone();
-            // An agent keeps its runtime's kind; of that kind, the others.
-            let spec = system.read(cx).registry().agent_spec(agent);
-            let current = spec
-                .as_ref()
-                .map(|spec| format!("{}-{}", spec.model, spec.effort))
-                .unwrap_or_default();
-            let kind = spec.map(|spec| spec.runtime);
-            let current_runtime = current.clone();
+            let (current, choices) = {
+                let system = system.read(cx);
+                let registry = system.registry();
+                let Some(spec) = registry.agent_spec(agent) else {
+                    frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                let current = format!("{}-{}", spec.model, spec.effort);
+                let can_change_kind = registry
+                    .agent_facts(agent)
+                    .runtime
+                    .is_some_and(|heard| heard.state.may_change_runtime_kind);
+                let choices =
+                    switchable(spec.runtime, &current, can_change_kind).collect::<Vec<_>>();
+                (current, choices)
+            };
             frame.open_prompt(
                 format!("runtime ({current}):"),
                 Rc::new(move |_, needle, _| {
-                    switchable(kind, &current_runtime)
-                        .filter(|runtime| runtime.contains(needle))
+                    let needle = needle.to_ascii_lowercase();
+                    choices
+                        .iter()
+                        .filter(|runtime| runtime.contains(&needle))
                         .map(|runtime| Candidate {
-                            value: runtime.to_owned(),
+                            value: runtime.clone(),
                             description: String::new(),
                         })
                         .collect()
                 }),
-                Rc::new(move |frame, input, _, cx| match Runtime::parse(&input) {
-                    Ok(runtime) => system.update(cx, |system, cx| {
-                        system.eval(
-                            agent,
-                            "set runtime",
-                            snippets::set_runtime(agent, &runtime),
-                            None,
-                            cx,
-                        );
-                    }),
-                    Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
+                Rc::new(move |frame, input, _, cx| {
+                    if input.trim().is_empty() {
+                        frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                    match Runtime::parse(&input) {
+                        Ok(runtime) => system.update(cx, |system, cx| {
+                            system.eval(
+                                agent,
+                                "set runtime",
+                                snippets::set_runtime(agent, &runtime),
+                                None,
+                                cx,
+                            );
+                        }),
+                        Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
+                    }
                 }),
                 window,
                 cx,
@@ -225,16 +241,34 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
     rows
 }
 
-/// The runtimes an agent of `kind` running `current` can be set to: those of
-/// its kind but the one it has.
-fn switchable<'a>(
-    kind: Option<RuntimeKind>,
-    current: &'a str,
-) -> impl Iterator<Item = &'static str> + 'a {
-    RUNTIMES.into_iter().filter(move |runtime| {
-        *runtime != current
-            && Runtime::parse(runtime).is_ok_and(|runtime| Some(runtime.kind) == kind)
-    })
+/// The other kind is offered only where no conversation would be lost.
+/// The runtime already in use is not a change.
+fn switchable(
+    kind: RuntimeKind,
+    current: &str,
+    can_change_kind: bool,
+) -> impl Iterator<Item = String> {
+    let other = match kind {
+        RuntimeKind::Claude => RuntimeKind::Rho,
+        RuntimeKind::Rho => RuntimeKind::Claude,
+    };
+    // Keep the usual start choices visible without scrolling, then include
+    // every other supported model and effort.
+    let usual = RUNTIMES.into_iter().filter(move |choice| {
+        Runtime::parse(choice).is_ok_and(|runtime| runtime.kind == kind || can_change_kind)
+    });
+    let all = Runtime::choices(kind)
+        .chain(
+            can_change_kind
+                .then_some(other)
+                .into_iter()
+                .flat_map(Runtime::choices),
+        )
+        .filter(|choice| !RUNTIMES.contains(&choice.as_str()));
+    usual
+        .map(str::to_owned)
+        .chain(all)
+        .filter(move |choice| choice != current)
 }
 
 /// What the echo says once `turns` of the turns of the agent called `label`
@@ -279,14 +313,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_agent_is_offered_only_the_other_runtimes_of_its_kind() {
-        let claude: Vec<_> = switchable(Some(RuntimeKind::Claude), "opus-high").collect();
-        assert_eq!(claude, ["fable-high"]);
-        let rho: Vec<_> = switchable(Some(RuntimeKind::Rho), "sol-high").collect();
-        assert_eq!(
-            rho,
-            ["sol-medium", "terra-medium", "astra-high", "hydrogen-high"]
+    fn runtime_prompt_lists_every_supported_effort_and_model_of_the_current_kind() {
+        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", false).collect();
+        assert_eq!(choices.len(), 19);
+        for choice in ["fable-max", "opus-medium", "sonnet-low", "haiku-xhigh"] {
+            assert!(choices.iter().any(|offered| offered == choice), "{choice}");
+        }
+        assert!(
+            !choices
+                .iter()
+                .any(|choice| choice == "opus-high" || choice == "sol-medium")
         );
-        assert!(switchable(None, "").next().is_none());
+    }
+
+    #[test]
+    fn a_stopped_agent_without_history_can_choose_another_kind() {
+        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", true).collect();
+        assert_eq!(choices.len(), 35);
+        assert!(choices.iter().any(|choice| choice == "terra-xhigh"));
+        assert!(choices.iter().all(|choice| Runtime::parse(choice).is_ok()));
     }
 }

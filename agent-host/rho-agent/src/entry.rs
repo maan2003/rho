@@ -47,6 +47,15 @@ pub enum Notice {
     /// The user cancelled what was in flight: a request, a retry, or a
     /// cell.
     Cancelled,
+    /// The runtime could not launch; mail waits for a change of runtime.
+    StartupFailed(StartupFailure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct StartupFailure {
+    pub error: String,
+    pub since: rho_agent_types::UnixMs,
+    pub runtime: crate::record::Runtime,
 }
 
 /// What one request says, by role.

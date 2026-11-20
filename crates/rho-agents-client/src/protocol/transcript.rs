@@ -70,6 +70,10 @@ pub struct RuntimeState {
     /// build, so fixes since reach it only when the workset restarts.
     #[senax(default)]
     pub stale: bool,
+    /// The stopped agent has not submitted a request, so changing runtime
+    /// kind will not split its provider-owned conversation.
+    #[senax(default)]
+    pub may_change_runtime_kind: bool,
 }
 
 impl RuntimeState {

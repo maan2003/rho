@@ -28,6 +28,7 @@ done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Agent
+status: the thread keeps replies to an agent that cannot launch, but they do not wake it. The user changes its runtime or starts another agent to carry on.
 purpose: do a piece of the user's work on a host, and let the user inspect what was done if needed.
 principle: an agent works from the user's mail about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.
@@ -42,7 +43,7 @@ does:
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind
 - new cache key, from the palette: make it start its model's cache afresh
-- set runtime, from the palette: ask `runtime (current):`, offering only the other runtimes of its kind, one word each, and switch the model it runs on; another kind is refused with `set runtime: an agent keeps its runtime kind`
+- set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent.
 - cancel the request, from the palette: stop what it is asking its model now
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.

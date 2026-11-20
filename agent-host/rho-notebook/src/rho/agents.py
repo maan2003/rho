@@ -43,7 +43,10 @@ class Agent:
 
     def set_spec(self, runtime: dict, props: dict) -> None:
         """Replace the whole spec."""
-        _rho.set_spec(self.id, {"runtime": runtime, "props": props})
+        if _rho.set_spec(self.id, {"runtime": runtime, "props": props}):
+            from . import _boot
+
+            _boot.redeliver_soon(self.id)
 
     def set_runtime(self, runtime: dict) -> None:
         """Replace the runtime; the props stay."""

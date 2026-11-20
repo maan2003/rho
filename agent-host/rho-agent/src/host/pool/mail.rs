@@ -334,7 +334,11 @@ async fn send_stop(
             .first_thread(agent)
             .or_else(|| origin(&read, agent).map(|mail| read.mail_thread(&mail)));
         let Some(thread) = thread else { return };
-        let body = stop_body(&read, agent, stop, &reason);
+        let failed_to_start = read
+            .agent(agent)
+            .and_then(|head| head.startup_failure)
+            .is_some_and(|failure| failure.since == doing.since);
+        let body = stop_body(&read, agent, stop, &reason, failed_to_start);
         (thread, body)
     };
     let mut write = pool.db.write().await;
@@ -350,15 +354,14 @@ async fn send_stop(
     }
 }
 
-fn stop_body(read: &rho_db::ReadTxn, agent: AgentId, stop: Stop, reason: &str) -> String {
-    const MAX_LINES: usize = 5;
-    const MAX_CHARS: usize = 240;
-    let reason_line = rho_agent_types::one_line(reason)
-        .chars()
-        .take(MAX_CHARS)
-        .collect::<String>();
-    let mut body = format!("{} · {reason_line}", stop.word());
-    let mut lines = Vec::new();
+fn stop_body(
+    read: &rho_db::ReadTxn,
+    agent: AgentId,
+    stop: Stop,
+    reason: &str,
+    failed_to_start: bool,
+) -> String {
+    let mut tail = StopTail::default();
     for (_, row) in read.agent_log_before(agent, rho_agent_types::Wpos(u64::MAX), 32) {
         let fragments = match row.event {
             Event::Request { output, inputs, .. } => inputs
@@ -369,10 +372,13 @@ fn stop_body(read: &rho_db::ReadTxn, agent: AgentId, stop: Stop, reason: &str) -
             Event::Step { prose, exec, .. } => [Some(prose), exec].into_iter().flatten().collect(),
             Event::ClaudeReply { text, .. } => vec![text],
             Event::Failed { partial, error, .. } => vec![partial, error.into_owned()],
-            Event::Notice {
-                notice: crate::entry::Notice::Error(error) | crate::entry::Notice::Stopped(error),
-                ..
-            } => vec![error],
+            Event::Notice { notice, .. } => match notice {
+                crate::entry::Notice::Error(error) | crate::entry::Notice::Stopped(error) => {
+                    vec![error]
+                }
+                crate::entry::Notice::StartupFailed(failure) => vec![failure.error],
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         };
         for line in fragments
@@ -380,26 +386,89 @@ fn stop_body(read: &rho_db::ReadTxn, agent: AgentId, stop: Stop, reason: &str) -
             .rev()
             .flat_map(|fragment| fragment.lines().rev())
         {
-            if line.trim().is_empty() {
-                continue;
-            }
-            lines.push(line.chars().take(MAX_CHARS).collect::<String>());
-            if lines.len() == MAX_LINES {
-                break;
+            if !tail.push(line) {
+                return tail.body(stop, reason, failed_to_start);
             }
         }
-        if lines.len() == MAX_LINES {
-            break;
+    }
+    tail.body(stop, reason, failed_to_start)
+}
+
+/// Only the stop mail is abbreviated; the transcript keeps the exact errors.
+#[derive(Default)]
+struct StopTail(Vec<(String, usize)>);
+
+impl StopTail {
+    /// Reads newest to oldest. Count a whole run even at the five-line limit.
+    fn push(&mut self, line: &str) -> bool {
+        const MAX_LINES: usize = 5;
+        let line = line.trim();
+        if line.is_empty() {
+            return true;
+        }
+        if let Some((last, count)) = self.0.last_mut()
+            && last == line
+        {
+            *count += 1;
+        } else if self.0.len() < MAX_LINES {
+            self.0.push((line.to_owned(), 1));
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn body(self, stop: Stop, reason: &str, failed_to_start: bool) -> String {
+        let reason = rho_agent_types::one_line(reason);
+        let mut occurrences = 0;
+        let mut evidence = Vec::new();
+        for (line, count) in self.0.into_iter().rev() {
+            if rho_agent_types::one_line(&line) == reason {
+                occurrences += count;
+            } else {
+                evidence.push(stop_line(&line, count));
+            }
+        }
+        let reason = stop_line(&reason, occurrences);
+        let mut body = format!("{} · {reason}", stop.word());
+        if failed_to_start {
+            body.push_str("\n\nThis agent cannot start. Replies are saved. Change its runtime or start another agent.");
+        }
+        if !evidence.is_empty() {
+            body.push_str("\n\nLast transcript lines:");
+            for line in evidence {
+                body.push_str("\n    ");
+                body.push_str(&line);
+            }
+        }
+        body
+    }
+}
+
+fn stop_line(line: &str, count: usize) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut cleaned = String::new();
+    for word in line.split_whitespace() {
+        if !cleaned.is_empty() {
+            cleaned.push(' ');
+        }
+        let bare = word.trim_start_matches(['\'', '"', '`', '(', '[', '{']);
+        if let Some(path) = bare.strip_prefix('/')
+            && !path.starts_with('/')
+        {
+            let end = bare.trim_end_matches(['\'', '"', '`', ')', ']', '}', ':', ',', ';', '.']);
+            cleaned.push_str(&word[..word.len() - bare.len()]);
+            cleaned.push_str("‹host path›");
+            cleaned.push_str(&bare[end.len()..]);
+        } else {
+            cleaned.push_str(word);
         }
     }
-    if !lines.is_empty() {
-        body.push_str("\n\nLast transcript lines:");
-        for line in lines.into_iter().rev() {
-            body.push_str("\n    ");
-            body.push_str(&line);
-        }
+    let mut line = cleaned.chars().take(MAX_CHARS).collect::<String>();
+    if count > 1 {
+        line.push_str(&format!(" ×{count}"));
     }
-    body
+    line
 }
 
 #[cfg(test)]
@@ -407,6 +476,41 @@ mod tests {
     use rho_agent_types::{AgentIdDomain, ChatSeq};
 
     use super::*;
+
+    #[test]
+    fn stop_mail_folds_the_whole_run_and_does_not_repeat_its_reason() {
+        let mut tail = StopTail::default();
+        for line in [
+            "cargo exited 101",
+            "cargo exited 101",
+            "compiling src/clock.rs",
+            "read /tmp/private/clock.rs: denied",
+            "read /tmp/private/clock.rs: denied",
+            "read /tmp/private/clock.rs: denied",
+            "see https://example.invalid/log",
+            "test started",
+            "test started",
+        ] {
+            assert!(tail.push(line));
+        }
+        assert!(!tail.push("too old"));
+        assert_eq!(
+            tail.body(Stop::Failed, "cargo exited 101", false),
+            "failed · cargo exited 101 ×2\n\nLast transcript lines:\n    test started ×2\n    see https://example.invalid/log\n    read ‹host path›: denied ×3\n    compiling src/clock.rs"
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_explains_recovery_even_without_other_transcript_lines() {
+        let error =
+            "capture Claude mount /tmp/fixture/claude-accounts/default: Operation not permitted";
+        let mut tail = StopTail::default();
+        tail.push(error);
+        assert_eq!(
+            tail.body(Stop::Failed, error, true),
+            "failed · capture Claude mount ‹host path›: Operation not permitted\n\nThis agent cannot start. Replies are saved. Change its runtime or start another agent."
+        );
+    }
 
     #[test]
     fn newest_status_replaces_only_its_own_thread() {

@@ -26,7 +26,7 @@ pub struct Runtime {
 const NATIVE_MODELS: [&str; 4] = ["sol", "terra", "astra", "hydrogen"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
-const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// What the model picker cycles through, first the default. Any other
 /// pair the policy takes can be typed.
@@ -115,6 +115,19 @@ impl Runtime {
             kind,
             model: model.to_owned(),
             effort: effort.to_owned(),
+        })
+    }
+
+    /// All model/effort pairs the host supports, in catalogue order.
+    pub fn choices(kind: RuntimeKind) -> impl Iterator<Item = String> {
+        let (models, efforts) = match kind {
+            RuntimeKind::Rho => (NATIVE_MODELS.as_slice(), NATIVE_EFFORTS.as_slice()),
+            RuntimeKind::Claude => (CLAUDE_MODELS.as_slice(), CLAUDE_EFFORTS.as_slice()),
+        };
+        models.iter().flat_map(move |model| {
+            efforts
+                .iter()
+                .map(move |effort| format!("{model}-{effort}"))
         })
     }
 
@@ -281,7 +294,12 @@ mod tests {
             Runtime::parse(" Opus-High ").unwrap().kind,
             RuntimeKind::Claude
         );
-        assert!(Runtime::parse("opus-low").is_err(), "claude takes no low");
+        assert_eq!(
+            Runtime::parse("opus-low").unwrap().kind,
+            RuntimeKind::Claude
+        );
+        assert_eq!(Runtime::parse("fable-max").unwrap().effort, "max");
+        assert!(Runtime::parse("sol-max").is_err(), "max is Claude-only");
         assert_eq!(
             Runtime::parse("haiku-medium").unwrap(),
             Runtime {

@@ -230,4 +230,4 @@ class AutoWorkset(WorksetCase):
     def test_only_the_agents_it_runs_get_their_messages(self):
         wait_for(lambda: any(a == self.child for a, *_ in self.state.inputs), "delivery to the claude agent")
         self.assertEqual([a for a, *_ in self.state.inputs], [self.child])
-        self.assertEqual(rho._boot._announced, {self.lead, self.dead, self.child})
+        self.assertEqual(set(rho._boot._announced), {self.lead, self.dead, self.child})
