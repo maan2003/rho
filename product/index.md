@@ -54,7 +54,7 @@ Every screen and every flow is judged from the user's side: is there something t
 test: Is there a step in this flow that the system could do or decide on its own instead of the user?
 
 ## value An editor, not an app
-Every screen is text the user moves through with the same keys: the same motions, search, and Vim modes everywhere. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser.
+Every screen is text the user moves through with the same keys: the same selections, motions, search, and Helix modes everywhere, select then act. A prompt line asks, the echo line answers, and a menu at the bottom offers choices. There are no dialogs and no separate places with their own controls. The same keys reach a terminal, a desktop, and a page in the browser.
 test: Does the new screen work with the same keys, motions, and search as every other screen, without a dialog?
 
 ## value Notes are the user's own

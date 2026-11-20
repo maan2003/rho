@@ -6,7 +6,7 @@ inbound world, like Slack. The GUI is the product.
 ## Ideas
 
 - **An editor, not an app.** rho is an editor the way Emacs is one, with
-  Vim keys. Every screen is a buffer and keys do everything. There are
+  Helix keys. Every screen is a buffer and keys do everything. There are
   no modals: the minibuffer asks, the echo line answers, and transients
   offer choices. New UI is built from editor primitives (`rho-window`).
 - **Dealing.** Attention is the scarce resource. Rather than a feed, the
