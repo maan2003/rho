@@ -7,9 +7,8 @@ goal: the user picks up a different project where they left off.
 starts when: the user decides to work on a different project now.
 steps:
 1. the user sees what has moved on the desk, `Glance at what moves`
-2. the user opens the project by name, `window.Go to something by name`
-3. the user opens its work by subject, `window.Go to something by name`
-4. the user picks up the thread, with their draft still there, `mail.Answer a mail`, `mail.Draft`
+2. the user opens the thread by project name and subject in the same query, `window.Go to something by name`
+3. the user picks up the thread, with their draft still there, `mail.Answer a mail`, `mail.Draft`
 done when: the user knows what moved and can carry on where they left off, drafts and all.
 day: Know what wants them, and where they were.
 

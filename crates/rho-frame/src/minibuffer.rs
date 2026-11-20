@@ -12,12 +12,15 @@ use std::rc::Rc;
 use editor::Editor;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, Focusable as _, SharedString, Subscription, Window, div, px,
+    AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, SharedString, StyledText,
+    Subscription, Window, div, px,
 };
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use crate::frame::Frame;
+use crate::menu::Pick;
+use crate::palette::{Choice, Listing, Matched};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -136,27 +139,46 @@ pub type CandidateSource = Rc<dyn Fn(&Frame, &str, &App) -> Vec<Candidate>>;
 /// Receives the typed input (tab-completions applied) after the
 /// minibuffer has closed.
 pub type SubmitHandler = Rc<dyn Fn(&mut Frame, String, &mut Window, &mut Context<Frame>)>;
-/// Receives what the reader chose in a prompt whose rows are its answers,
-/// after the minibuffer has closed.
-pub type ChooseHandler = Rc<dyn Fn(&mut Frame, Chosen, &mut Window, &mut Context<Frame>)>;
-
-/// What enter chose in a prompt whose rows are its answers: a row, which
-/// two rows of the same words cannot confuse, or, when no row fits, the
-/// words typed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Chosen {
-    /// The index of the highlighted row in what the candidate source
-    /// returned last.
-    Row(usize),
-    Typed(String),
-}
-
 /// What a prompt does with enter.
 pub(crate) enum Answer {
-    /// Hands over the line, a highlighted row's words put into it.
-    Text(SubmitHandler),
-    /// Hands over the highlighted row.
-    Row(ChooseHandler),
+    Text {
+        complete: CandidateSource,
+        submit: SubmitHandler,
+        rows: Vec<Candidate>,
+    },
+    Palette {
+        listing: Listing,
+        rows: Vec<Matched>,
+    },
+}
+
+impl Answer {
+    pub(crate) fn text(complete: CandidateSource, submit: SubmitHandler) -> Self {
+        Self::Text {
+            complete,
+            submit,
+            rows: Vec::new(),
+        }
+    }
+
+    pub(crate) fn palette(listing: Listing) -> Self {
+        Self::Palette {
+            listing,
+            rows: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Text { rows, .. } => rows.len(),
+            Self::Palette { rows, .. } => rows.len(),
+        }
+    }
+}
+
+enum Completed {
+    Text(Candidate, usize),
+    Palette(usize),
 }
 
 /// A closed prompt's answer, run once focus is back where it was.
@@ -175,13 +197,12 @@ enum CompletionInput {
 pub struct Minibuffer {
     prompt: SharedString,
     editor: Entity<Editor>,
-    complete: CandidateSource,
     answer: Answer,
     on_cancel: Option<CancelHandler>,
-    candidates: Vec<Candidate>,
+    validate: Option<fn(&str) -> Option<&'static str>>,
     selected: usize,
     completion_input: CompletionInput,
-    completed_selection: Option<(Candidate, usize)>,
+    completed_selection: Option<Completed>,
     /// What is typed here is a credential: the journal keeps none of it.
     secret: bool,
     _edits: Subscription,
@@ -207,7 +228,6 @@ impl Minibuffer {
     pub(crate) fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
-        complete: CandidateSource,
         answer: Answer,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
@@ -235,11 +255,10 @@ impl Minibuffer {
         Self {
             prompt: prompt.into(),
             editor,
-            complete,
             completion_input: CompletionInput::Whole,
             answer,
             on_cancel,
-            candidates: Vec::new(),
+            validate: None,
             selected: 0,
             completed_selection: None,
             secret: false,
@@ -277,17 +296,31 @@ impl Minibuffer {
     /// on open and after every edit.
     pub fn refresh(&mut self, workspace: &Frame, cx: &App) {
         let input = self.input(cx);
-        self.candidates = (self.complete)(workspace, &input, cx);
-        if let Some((candidate, occurrence)) = self.completed_selection.clone()
-            && input == candidate.value
-            && let Some(index) = self
-                .candidates
-                .iter()
-                .enumerate()
-                .filter(|(_, other)| **other == candidate)
-                .nth(occurrence)
-                .map(|(index, _)| index)
-        {
+        let completed_row = match &mut self.answer {
+            Answer::Text { complete, rows, .. } => {
+                *rows = complete(workspace, &input, cx);
+                match &self.completed_selection {
+                    Some(Completed::Text(candidate, occurrence)) if input == candidate.value => {
+                        rows.iter()
+                            .enumerate()
+                            .filter(|(_, other)| *other == candidate)
+                            .nth(*occurrence)
+                            .map(|(index, _)| index)
+                    }
+                    _ => None,
+                }
+            }
+            Answer::Palette { listing, rows } => {
+                *rows = listing.rank(&input);
+                match self.completed_selection {
+                    Some(Completed::Palette(id)) if input == listing.choices[id].name() => {
+                        rows.iter().position(|row| row.index == id)
+                    }
+                    _ => None,
+                }
+            }
+        };
+        if let Some(index) = completed_row {
             self.selected = index;
         } else {
             self.completed_selection = None;
@@ -296,14 +329,14 @@ impl Minibuffer {
     }
 
     pub fn select_by_delta(&mut self, delta: isize) {
-        if !self.candidates.is_empty() {
-            self.selected = (self.selected as isize + delta)
-                .rem_euclid(self.candidates.len() as isize) as usize;
+        let count = self.answer.len() as isize;
+        if count != 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
         }
     }
 
     fn select(&mut self, index: usize) -> bool {
-        if index >= self.candidates.len() {
+        if index >= self.answer.len() {
             return false;
         }
         self.selected = index;
@@ -321,12 +354,24 @@ impl Minibuffer {
     /// Tab: completes the highlighted answer into the prompt without
     /// submitting.
     pub fn complete_selected(&mut self, window: &mut Window, cx: &mut App) {
-        let Some((candidate, occurrence)) = self.selected_candidate() else {
-            return;
+        let value = match &self.answer {
+            Answer::Text { .. } => {
+                let Some((candidate, occurrence)) = self.selected_candidate() else {
+                    return;
+                };
+                let value = self.completed_text(&self.input(cx), &candidate);
+                self.completed_selection = Some(Completed::Text(candidate, occurrence));
+                value
+            }
+            Answer::Palette { listing, rows } => {
+                let Some(row) = rows.get(self.selected) else {
+                    return;
+                };
+                self.completed_selection = Some(Completed::Palette(row.index));
+                listing.choices[row.index].name().to_owned()
+            }
         };
-        let text = self.completed_text(&self.input(cx), &candidate);
-        self.completed_selection = Some((candidate, occurrence));
-        self.set_input(text, window, cx);
+        self.set_input(value, window, cx);
     }
 
     pub(crate) fn clear_input(&mut self, window: &mut Window, cx: &mut App) {
@@ -344,38 +389,81 @@ impl Minibuffer {
         self.completion_input = CompletionInput::Address;
     }
 
-    /// Which row is highlighted, for a caller that needs the row itself
-    /// rather than the text on it.
-    pub fn selected_row(&self) -> usize {
-        self.selected
-    }
-
     pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
-        let candidate = self.candidates.get(self.selected)?.clone();
-        let occurrence = self.candidates[..self.selected]
+        let Answer::Text { rows, .. } = &self.answer else {
+            return None;
+        };
+        let candidate = rows.get(self.selected)?.clone();
+        let occurrence = rows[..self.selected]
             .iter()
             .filter(|other| *other == &candidate)
             .count();
         Some((candidate, occurrence))
     }
 
+    pub fn validate(&mut self, validate: fn(&str) -> Option<&'static str>) {
+        self.validate = Some(validate);
+    }
+
+    pub(crate) fn rejection(&self, cx: &App) -> Option<&'static str> {
+        self.validate.and_then(|validate| validate(&self.input(cx)))
+    }
+
+    pub(crate) fn is_palette(&self) -> bool {
+        matches!(self.answer, Answer::Palette { .. })
+    }
+
+    pub(crate) fn has_answer(&self) -> bool {
+        !self.is_palette() || self.selected < self.answer.len()
+    }
+
+    pub(crate) fn delete_word(&mut self, window: &mut Window, cx: &mut App) {
+        self.editor.update(cx, |editor, cx| {
+            let selection = editor
+                .selections
+                .newest::<multi_buffer::MultiBufferOffset>(&editor.display_snapshot(cx));
+            if selection.is_empty() {
+                let text = editor.text(cx);
+                let start = token_start(text[..selection.start.0].trim_end());
+                let start = multi_buffer::MultiBufferOffset(start);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([start..selection.end]);
+                });
+            }
+            editor.insert("", window, cx);
+        });
+    }
+
     /// Consumes the minibuffer into its input and handler; the caller
     /// invokes the handler after restoring focus.
     pub(crate) fn into_submission(self, cx: &App) -> (String, Submission) {
         let typed = self.input(cx);
-        let candidate = self.candidates.get(self.selected);
-        let input = candidate.map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row));
-        let chosen = match candidate {
-            Some(_) => Chosen::Row(self.selected),
-            None => Chosen::Typed(typed),
+        let input = match &self.answer {
+            Answer::Text { rows, .. } => rows
+                .get(self.selected)
+                .map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row)),
+            Answer::Palette { .. } => typed,
         };
         let submission: Submission = match self.answer {
-            Answer::Text(on_submit) => {
+            Answer::Text { submit, .. } => {
                 let input = input.clone();
-                Box::new(move |frame, window, cx| on_submit(frame, input, window, cx))
+                Box::new(move |frame, window, cx| submit(frame, input, window, cx))
             }
-            Answer::Row(on_choose) => {
-                Box::new(move |frame, window, cx| on_choose(frame, chosen, window, cx))
+            Answer::Palette { listing, rows } => {
+                let index = rows[self.selected].index;
+                let blank = input.trim().is_empty();
+                Box::new(move |frame, window, cx| match &listing.choices[index] {
+                    Choice::Place(place) => match &place.card {
+                        Some(card) if !blank || place.visit.is_none() => {
+                            frame.open_card(card.clone(), window, cx)
+                        }
+                        _ => frame.open(place.found.address.clone(), window, cx),
+                    },
+                    Choice::Command(entry) => match &entry.pick {
+                        Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
+                        Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
+                    },
+                })
             }
         };
         (input, submission)
@@ -393,33 +481,60 @@ impl Minibuffer {
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
-        let clickable =
-            address || (layout == crate::Layout::Phone && matches!(self.answer, Answer::Row(_)));
-        let rows = self
-            .candidates
-            .iter()
-            .enumerate()
-            .skip(window_start)
+        let clickable = address || (layout == crate::Layout::Phone && self.is_palette());
+        let rows = (window_start..self.answer.len())
             .take(VISIBLE_CANDIDATES)
-            .map(|(index, candidate)| {
+            .map(|index| {
                 let selected = index == self.selected;
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .gap_x_2()
-                    .when(layout == crate::Layout::Phone, |row| row.flex_wrap())
-                    .w_full()
-                    .px_2()
-                    .child(div().max_w_full().child(candidate.value.clone()));
-                if !candidate.description.is_empty() {
-                    row = row.child(
-                        div()
-                            .max_w_full()
-                            .text_color(colors.text_muted)
-                            .child(candidate.description.clone()),
-                    );
+                let mut row = div().flex().flex_row().gap_2().w_full().px_2();
+                if let Answer::Palette { listing, rows } = &self.answer {
+                    let matched = &rows[index];
+                    let choice = &listing.choices[matched.index];
+                    let field_colors = [
+                        colors.text,
+                        if choice.attention() {
+                            cx.theme().status().warning
+                        } else {
+                            colors.text_muted
+                        },
+                        colors.text_muted,
+                    ];
+                    for (field, value) in choice.fields().iter().enumerate() {
+                        if value.is_empty() {
+                            continue;
+                        }
+                        let marks = matched.marks[field].iter().cloned().map(|range| {
+                            (
+                                range,
+                                HighlightStyle {
+                                    color: Some(colors.text_accent.into()),
+                                    ..HighlightStyle::default()
+                                },
+                            )
+                        });
+                        let mut part = div().min_w_0().truncate().text_color(field_colors[field]);
+                        if field == 2 {
+                            part = part.flex_none();
+                        }
+                        row = row.child(
+                            part.child(StyledText::new(value.to_string()).with_highlights(marks)),
+                        );
+                    }
+                } else if let Answer::Text { rows, .. } = &self.answer {
+                    let candidate = &rows[index];
+                    row = row
+                        .when(layout == crate::Layout::Phone, |row| row.flex_wrap())
+                        .child(div().max_w_full().child(candidate.value.clone()));
+                    if !candidate.description.is_empty() {
+                        row = row.child(
+                            div()
+                                .max_w_full()
+                                .text_color(colors.text_muted)
+                                .child(candidate.description.clone()),
+                        );
+                    }
                 }
                 if selected {
                     row = row.bg(colors.element_selected);
@@ -443,9 +558,7 @@ impl Minibuffer {
             .collect::<Vec<_>>();
         // A prompt whose rows are its answers says when none answers, so
         // an empty list does not read as one still loading.
-        let no_match = rows.is_empty()
-            && matches!(self.answer, Answer::Row(_))
-            && !self.input(cx).trim().is_empty();
+        let no_match = rows.is_empty() && self.is_palette() && !self.input(cx).trim().is_empty();
         // Input first, candidates beneath it, like emacs completing-read.
         bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")

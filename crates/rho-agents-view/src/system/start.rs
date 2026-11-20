@@ -146,7 +146,10 @@ pub(crate) fn rows(
     // The question an idea asks once: its answer is where the channel's
     // agents work from then on.
     let mut rows = Rows::new(match runtimes {
-        Runtimes::Ask => "start agent",
+        Runtimes::Ask => match origin {
+            Origin::Message => "start agent",
+            Origin::Draft(_) => "send and start agent",
+        },
         Runtimes::Default => "where this channel's agents work",
     });
     let host = read.host_of(thread.host);

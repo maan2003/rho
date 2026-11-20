@@ -9,7 +9,7 @@ use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Pixels,
 use language::Point;
 use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
-use rho_frame::{Row, Surface};
+use rho_frame::Surface;
 use theme::ActiveTheme as _;
 
 use super::paint::{self, Summary};
@@ -246,34 +246,6 @@ impl Surface for UsageSurface {
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
         Some(self.editor.clone())
-    }
-
-    /// The other pictures over the same window, and this picture over the
-    /// other one. Model cost is `k` here rather than the usage menu's `c`,
-    /// which the chat system's rows give to a new channel.
-    fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
-        let here = self.chart;
-        let open = |key: &'static str, chart| super::open_row(self.system.clone(), key, chart);
-        let mut rows: Vec<Row> = Chart::ALL
-            .into_iter()
-            .filter(|chart| *chart != here.chart)
-            .map(|chart| {
-                let key = match chart {
-                    Chart::RateLimit => "r",
-                    Chart::ModelCost => "k",
-                    Chart::UsageShare => "s",
-                    Chart::AgentCost => "a",
-                };
-                let to = UsageChart { chart, ..here };
-                open(key, to)
-            })
-            .collect();
-        let other = UsageChart {
-            days: here.days.other(),
-            ..here
-        };
-        rows.push(open("d", other));
-        rows
     }
 }
 

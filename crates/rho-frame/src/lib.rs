@@ -52,10 +52,9 @@ pub use menu::{Row, Rows};
 pub use minibuffer::{CancelHandler, Candidate, CandidateSource, SubmitHandler};
 pub use phone::Layout;
 pub use rho_agent_types::EndpointId;
-pub use rho_dealer::rank::Hand;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, Mode, Subject, Surface};
-pub use system::{AnySystem, Found, System};
+pub use system::{AnySystem, Found, FoundThread, System};
 
 /// The key context every surface is drawn in. A system binds its keys
 /// under `RhoFrame` for the frame and under `RhoFrame > Editor` for keys

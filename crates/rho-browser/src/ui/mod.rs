@@ -291,13 +291,14 @@ impl rho_frame::System for PageSystem {
         Some((title(page), "web".to_owned()))
     }
 
-    fn find(&self, _marks: &Marks, _hand: &rho_dealer::rank::Hand, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         live_pages()
             .into_iter()
             .map(|(id, metadata)| Found {
                 address: id.address(),
                 title: title(id),
                 description: format!("web · {}", metadata.url),
+                thread: None,
                 recency: metadata.last_accessed_ms,
             })
             .collect()

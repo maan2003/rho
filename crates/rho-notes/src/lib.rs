@@ -30,7 +30,6 @@ use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, Row, System};
-use rho_window::style::StyleClass;
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -38,10 +37,6 @@ const SAVE_AFTER: Duration = Duration::from_millis(700);
 
 /// What a note without a first line is called.
 const UNTITLED: &str = "untitled note";
-
-/// What `reply privately` says with the point on nothing a reply could
-/// be under.
-const NOT_ON_A_MESSAGE: &str = "reply privately: put the cursor on a message";
 
 /// The kind of the one list of every note.
 const NOTES: &str = "notes";
@@ -157,6 +152,7 @@ fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
                     Some(_) => "private reply".to_owned(),
                     None => "note".to_owned(),
                 },
+                thread: None,
                 recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
             })
         })
@@ -239,8 +235,7 @@ fn write(frame: &mut Frame, note: NoteId, text: String, cx: &mut Context<Frame>)
 }
 
 /// `reply privately`: a new note about what the point is on, which the
-/// thread shows under it as the user's own line. On a note it is a note
-/// under that note.
+/// thread shows under it as the user's own line.
 fn reply_privately(
     subject: &Address,
     frame: &mut Frame,
@@ -287,20 +282,18 @@ impl System for NoteSystem {
         Some(AnySurface::new(view))
     }
 
-    /// `reply privately` is listed everywhere, so it is found by name;
-    /// with the point on nothing a reply could be under, it says so rather
-    /// than make a note about nothing.
     fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        let subject = point.subject.clone();
-        rows.push(Row::run(
-            "n",
-            "reply privately",
-            move |frame, window, cx| match &subject {
-                Some(subject) => reply_privately(subject, frame, window, cx),
-                None => frame.echo(NOT_ON_A_MESSAGE, StyleClass::SystemInfo, cx),
-            },
-        ));
+        if point.surface.kind() == rho_chat::ThreadId::KIND
+            && let Some(subject) = point
+                .subject
+                .clone()
+                .filter(|at| at.kind() == rho_chat::ThreadId::KIND)
+        {
+            rows.push(Row::run("", "reply privately", move |frame, window, cx| {
+                reply_privately(&subject, frame, window, cx);
+            }));
+        }
         rows.push(Row::run("w", "new note", make_note));
         // The one door to the notes, on every screen: one of the window's
         // own commands.
@@ -326,7 +319,7 @@ impl System for NoteSystem {
 
     /// Every note, by its first line as the user is typing it, for the
     /// palette.
-    fn find(&self, marks: &Marks, _hand: &rho_dealer::rank::Hand, _cx: &App) -> Vec<Found> {
+    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
         found(marks, |note| match self.pending.get(&note) {
             Some(pending) => title_of(&pending.text),
             None => note_title(marks, &note.address()),

@@ -18,6 +18,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 ] }
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-chat = { workspace = true, features = ["client"] }
 rho-dealer.workspace = true
 rho-frame.workspace = true
 rho-transcript.workspace = true

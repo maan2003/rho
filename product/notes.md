@@ -22,7 +22,7 @@ purpose: let the user keep a remark on a `mail.Mail` in its thread, where only t
 principle: a project mails a result the user doubts; they put the cursor on it and run `reply privately`; a note opens; they type their doubt; back in the thread, it shows under the mail, dim, marked `🔒 you`.
 sees: in the thread, under its message: `🔒 you · time` and the text, dim and slanted.
 does:
-- reply privately, from the palette: start a note about the message under the cursor and open it; on a note, the new note is about that note; with the cursor on no message, the echo line reads `reply privately: put the cursor on a message`
+- reply privately, from the palette: when the cursor is on a mail or thread, start a note about it and open it; the command does not appear on the desk or with nothing under the cursor
 - open `enter` on it in the thread: open the note to edit it
 
 ## screen Notes

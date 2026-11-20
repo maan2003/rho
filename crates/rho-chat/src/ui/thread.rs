@@ -1251,11 +1251,18 @@ impl Surface for ThreadView {
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
+        let has_draft = self.has_draft(cx);
         if !self.is_list(self.system.read(cx)) {
             let send = this.clone();
-            let mut rows = vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
-                send.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
-            })];
+            let mut rows = Vec::new();
+            if has_draft {
+                rows.push(
+                    Row::run("ctrl-enter", "send", move |_, window, cx| {
+                        send.update(cx, |view, cx| view.send(&SendMessage, window, cx));
+                    })
+                    .bound_to(SendMessage),
+                );
+            }
             let system = self.system.read(cx);
             let members = system
                 .chat(self.thread.host)
@@ -1345,16 +1352,23 @@ impl Surface for ThreadView {
                 self.transcript.line_meta(self.cursor_row(cx), cx),
                 Some(Meta::Quote(_) | Meta::Thread(_) | Meta::Open(_))
             ) {
-                rows.push(Row::run("enter", "open", move |_, window, cx| {
-                    this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
-                }));
+                rows.push(
+                    Row::run("enter", "open", move |_, window, cx| {
+                        this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
+                    })
+                    .bound_to(OpenRow),
+                );
             }
             return rows;
+        }
+        if !has_draft {
+            return Vec::new();
         }
         let only = this.clone();
         let send_only = Row::run("ctrl-shift-enter", "send", move |_, window, cx| {
             only.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
-        });
+        })
+        .bound_to(SendOnly);
         vec![
             Row::run(
                 "ctrl-enter",
@@ -1362,7 +1376,8 @@ impl Surface for ThreadView {
                 move |_, window, cx| {
                     this.update(cx, |view, cx| view.send(&SendMessage, window, cx));
                 },
-            ),
+            )
+            .bound_to(SendMessage),
             send_only,
         ]
     }

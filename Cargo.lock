@@ -14469,6 +14469,7 @@ dependencies = [
  "jiff",
  "language",
  "multi_buffer",
+ "rho-chat",
  "rho-dealer",
  "rho-frame",
  "rho-transcript",

@@ -21,14 +21,13 @@ use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ContentPart, Doing, EndpointId, MessageId, ThreadStatus,
-    content_text, one_line,
 };
 use rho_dealer::facts::Seen;
-use rho_dealer::rank::{Hand, Trace};
+use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::desk::MovingThread;
 use rho_frame::idea::{IdeaMail, IdeaProject};
-use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, Row, System};
+use rho_frame::{AnySurface, Candidate, Found, FoundThread, FrameLink, Point, Row, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
@@ -102,6 +101,8 @@ pub struct ChatSystem {
     chats: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
+    // A channel acknowledged by the host before its root arrives on the session.
+    channels_to_open: BTreeSet<ThreadId>,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
@@ -144,6 +145,7 @@ impl ChatSystem {
         Self {
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
+            channels_to_open: BTreeSet::new(),
             last_project: loaded.last_project,
             drafts: loaded
                 .drafts
@@ -330,6 +332,7 @@ impl ChatSystem {
                 }
                 self.cache.write_records(endpoint, records);
                 self.changed(endpoint, cx);
+                self.open_created_channels(endpoint, cx);
             }
             ChatEvent::Statuses { host, statuses } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
@@ -516,26 +519,18 @@ impl ChatSystem {
                 Ok(message) => {
                     if let Some((client_id, outgoing, kept)) = this.outbox.delivered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
-                        if outgoing.parent.is_none() {
-                            let name = one_line(&content_text(&outgoing.content));
-                            let project = crate::protocol::Project {
-                                channel: message,
-                                name,
-                            };
-                            this.frame.echo(
-                                format!(
-                                    "created channel: {}",
-                                    project.address(&this.host_name(endpoint))
-                                ),
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
-                        }
                         cx.emit(Event::Delivered {
                             endpoint,
                             client_id,
                             message,
                         });
+                        if outgoing.parent.is_none() {
+                            this.channels_to_open.insert(ThreadId {
+                                host: endpoint,
+                                message,
+                            });
+                            this.open_created_channels(endpoint, cx);
+                        }
                     }
                     cx.notify();
                     this.send_unsent(endpoint, cx);
@@ -548,6 +543,24 @@ impl ChatSystem {
             });
         })
         .detach();
+    }
+
+    fn open_created_channels(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
+        let ready: Vec<_> = self
+            .channels_to_open
+            .iter()
+            .filter(|thread| thread.host == endpoint)
+            .filter_map(|&thread| Some((thread, self.project_address(thread)?)))
+            .collect();
+        for (thread, project) in ready {
+            self.channels_to_open.remove(&thread);
+            self.frame.open(thread.address(), cx);
+            self.frame.echo(
+                format!("new channel: {project}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
     }
 
     /// One call to a host's chat; `done` hears the answer.
@@ -641,10 +654,7 @@ impl ChatSystem {
             "new channel:",
             Rc::new(|_, _, _| Vec::new()),
             Rc::new(move |_frame, input, _, cx| {
-                let text = input.trim().to_owned();
-                if text.is_empty() {
-                    return;
-                }
+                let text = rho_agent_types::one_line(&input);
                 this.update(cx, |chat, cx| {
                     chat.post(endpoint, None, text, Vec::new(), cx);
                 });
@@ -652,6 +662,13 @@ impl ChatSystem {
             window,
             cx,
         );
+        if let Some(prompt) = frame.minibuffer_mut() {
+            prompt.validate(|text| {
+                text.trim()
+                    .is_empty()
+                    .then_some("new channel: a name is required")
+            });
+        }
     }
 }
 
@@ -718,6 +735,8 @@ impl System for ChatSystem {
             return;
         };
         self.chats.remove(&endpoint);
+        self.channels_to_open
+            .retain(|thread| thread.host != endpoint);
         self.cursors.reset(endpoint);
         self.cache.reset(endpoint);
         self.frame.close_all(
@@ -781,43 +800,45 @@ impl System for ChatSystem {
                 }
             }));
         }
-        // The thread under the point, or, on a line that is no message, the
-        // thread in view.
-        let thread = match &point.subject {
-            Some(subject) => self.thread_of(subject),
-            None => self.thread_of(&point.surface),
-        };
-        if let Some(thread) = thread {
-            let current = self
-                .chats
-                .get(&thread.host)
-                .and_then(|chat| chat.name(thread.message))
-                .unwrap_or_default();
+        // A mail is not necessarily its thread's head. In a thread, the
+        // name belongs to the open thread; in a project, to the selected
+        // thread row. A desk row and a blank line are not rename contexts.
+        let rename = self.thread_of(&point.surface).and_then(|surface| {
+            let at = self.thread_of(point.subject.as_ref()?)?;
+            let chat = self.chats.get(&surface.host)?;
+            let thread = if chat.is_project(surface.message) {
+                at
+            } else {
+                surface
+            };
+            if chat.is_project(thread.message) {
+                return None;
+            }
+            Some((thread, chat.name(thread.message)?))
+        });
+        if let Some((thread, current)) = rename {
             rows.push(
-                Row::run("shift-n", "name this thread", move |frame, window, cx| {
+                Row::run("", "name this thread", move |frame, window, cx| {
                     let this = this.clone();
-                    let current = current.clone();
                     frame.open_prompt(
-                        format!("name ({current}):"),
+                        "name this thread:",
                         Rc::new(|_, _, _| Vec::new()),
                         Rc::new(move |_frame, input, _, cx| {
-                            let name = input.trim().to_owned();
+                            let name = rho_agent_types::one_line(&input);
                             this.update(cx, |chat, cx| {
                                 chat.call(
                                     thread.host,
                                     Name {
                                         thread: thread.message,
-                                        name,
+                                        name: name.clone(),
                                     },
                                     cx,
-                                    |chat, reply, cx| {
-                                        if let Err(error) = reply {
-                                            chat.frame.echo(
-                                                format!("name: {error:#}"),
-                                                StyleClass::SystemInfo,
-                                                cx,
-                                            );
-                                        }
+                                    move |chat, reply, cx| {
+                                        let words = match reply {
+                                            Ok(()) => format!("named: {name}"),
+                                            Err(error) => format!("name: {error:#}"),
+                                        };
+                                        chat.frame.echo(words, StyleClass::SystemInfo, cx);
                                     },
                                 );
                             });
@@ -825,6 +846,12 @@ impl System for ChatSystem {
                         window,
                         cx,
                     );
+                    if let Some(prompt) = frame.minibuffer_mut() {
+                        prompt.set_input(current.clone(), window, cx);
+                        prompt.validate(|text| {
+                            text.trim().is_empty().then_some("name: enter a subject")
+                        });
+                    }
                 })
                 .also("rename"),
             );
@@ -954,49 +981,41 @@ impl System for ChatSystem {
         });
     }
 
-    fn find(&self, _marks: &Marks, hand: &Hand, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         let mut found = Vec::new();
-        for (seed, name) in self.hosts() {
-            let Some(chat) = self.chats.get(&seed) else {
+        for (host, alias) in self.hosts() {
+            let Some(chat) = self.chats.get(&host) else {
                 continue;
             };
-            for &root in chat.roots() {
-                let project = chat.project(root).map(|project| project.address(&name));
-                for &id in std::iter::once(&root).chain(chat.children(Some(root))) {
-                    let thread = ThreadId {
-                        host: seed,
-                        message: id,
-                    };
-                    let address = thread.address();
-                    let (_, at) = chat
-                        .newest_in(id)
-                        .unwrap_or((id, rho_agent_types::UnixMs(0)));
-                    let title = chat.name(id).unwrap_or_default();
-                    let (title, description) = match project.as_deref() {
-                        Some(project) if id == root => (project.to_owned(), "project".to_owned()),
-                        project => {
-                            let detail = hand
-                                .cards
-                                .iter()
-                                .find(|card| card.address == address)
-                                .map(|card| card.label.as_str())
-                                .filter(|label| !label.is_empty())
-                                .or_else(|| self.status(thread).map(|status| status.text.as_str()));
-                            let context = project.unwrap_or(&name);
-                            let description = match detail {
-                                Some(detail) => format!("{context}  {detail}"),
-                                None => context.to_owned(),
-                            };
-                            (title, description)
-                        }
-                    };
-                    found.push(Found {
-                        address,
-                        title,
-                        description,
-                        recency: at.0,
-                    });
+            let mut seen = BTreeSet::new();
+            let ids = chat
+                .roots()
+                .iter()
+                .flat_map(|&root| {
+                    std::iter::once(root).chain(chat.children(Some(root)).iter().copied())
+                })
+                .chain(chat.statuses().map(|status| status.thread));
+            for id in ids.filter(|id| seen.insert(*id)) {
+                let Some(mail) = chat.message(id) else {
+                    continue;
+                };
+                if mail.revision == rho_agent_types::Revision::Deleted {
+                    continue;
                 }
+                let Some(subject) = chat.name(id) else {
+                    continue;
+                };
+                let project = cards::context(chat, id, &alias);
+                let is_project = chat.is_project(id);
+                found.push(Found {
+                    address: ThreadId { host, message: id }.address(),
+                    title: if is_project { project.clone() } else { subject },
+                    description: if is_project { String::new() } else { project },
+                    thread: (!is_project).then(|| FoundThread {
+                        status: chat.status(id).map(|status| status.text.clone()),
+                    }),
+                    recency: chat.newest_in(id).map_or(mail.at.0, |(_, at)| at.0),
+                });
             }
         }
         found
