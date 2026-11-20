@@ -226,8 +226,9 @@ fn run() -> Result<()> {
                 let frame = FrameLink::new(handle);
                 let chat =
                     cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
-                let agents = cx
-                    .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
+                let agents = cx.new(|cx| {
+                    rho_agents_view::AgentsSystem::new(db.clone(), chat.clone(), frame.clone(), cx)
+                });
                 // The chat ranks a thread by the agents still in it and by
                 // the stops they are in, and names them with what they do;
                 // the agents system knows all of it, and a thread on screen
@@ -240,6 +241,7 @@ fn run() -> Result<()> {
                                 Some(rho_chat::ui::Participant {
                                     label: agent.encoded(),
                                     doing: None,
+                                    stopped_because: None,
                                 })
                             },
                             |agents| agents.read(cx).participant(endpoint, agent),

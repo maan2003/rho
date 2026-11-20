@@ -58,6 +58,12 @@ impl AgentIdentity {
         Some(MessageId(ChatSeq(id.parse().ok()?)))
     }
 
+    /// The repository its workset was made on, as the user named it, when
+    /// it was cloned from one.
+    pub fn repository(&self) -> Option<&str> {
+        self.prop(props::REPO)
+    }
+
     /// Whether the user manages the agent: one no other agent made.
     pub fn user_facing(&self) -> bool {
         self.parent().is_none()

@@ -71,6 +71,8 @@ pub struct Participant {
     pub label: String,
     /// `None` while its host has said nothing of it.
     pub doing: Option<Doing>,
+    /// Why it stopped, in its host's words, while a failure stopped it.
+    pub stopped_because: Option<String>,
 }
 
 /// What the chat knows of an agent of the host with this identity, and
@@ -85,6 +87,9 @@ pub struct ChatSystem {
     cursors: Cursors,
     outbox: Outbox,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
+    /// Threads whose agent did not start from this window, and why, in the
+    /// host's words, while this window runs.
+    failed_starts: HashMap<ThreadId, String>,
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
@@ -127,6 +132,7 @@ impl ChatSystem {
                 .map(|(seed, parent, text)| ((seed, parent), text))
                 .collect(),
             cache,
+            failed_starts: HashMap::new(),
             hosts: HashMap::new(),
             chats,
             events,
@@ -135,6 +141,7 @@ impl ChatSystem {
                 Some(Participant {
                     label: agent.encoded(),
                     doing: None,
+                    stopped_because: None,
                 })
             }),
             _pump: pump,
@@ -315,6 +322,18 @@ impl ChatSystem {
         self.send_unsent(endpoint, cx);
         cx.notify();
         id
+    }
+
+    /// The agent asked for in `thread` did not start, for `reason`: the
+    /// thread says so until an agent is in it.
+    pub fn note_failed_start(&mut self, thread: ThreadId, reason: String, cx: &mut Context<Self>) {
+        self.failed_starts.insert(thread, reason);
+        cx.notify();
+    }
+
+    /// Why the agent asked for in `thread` did not start, when it did not.
+    pub fn failed_start(&self, thread: ThreadId) -> Option<&str> {
+        self.failed_starts.get(&thread).map(String::as_str)
     }
 
     /// Posts what the user has written under `parent` and clears the

@@ -117,6 +117,7 @@ def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None,
             raise ValueError(f"no directory name in {repo!r}")
         cwd = os.path.join(workset.root, name)
         workset.clone(repo, cwd, rev)
+        props["repo"] = repo
     elif cwd is None:
         cwd = workset.root
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
