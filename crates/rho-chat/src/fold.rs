@@ -8,7 +8,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, UnixMs, one_line,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, Revision, ThreadStatus,
+    UnixMs, one_line,
 };
 
 /// What one record changed.
@@ -26,7 +27,7 @@ pub enum Told {
         from: Option<MessageId>,
         to: Option<MessageId>,
     },
-    /// A thread's members or name changed.
+    /// A mail's content or a thread's members or name changed.
     Thread(MessageId),
     /// A record that changed nothing.
     Nothing,
@@ -52,6 +53,7 @@ pub struct HostChat {
     /// Each message's children in log order; `None` holds the roots.
     children: BTreeMap<Option<MessageId>, Vec<MessageId>>,
     names: HashMap<MessageId, String>,
+    statuses: BTreeMap<MessageId, ThreadStatus>,
     /// What each agent last said about each thread: joined or left.
     members: BTreeMap<(MessageId, AgentId), bool>,
     /// The first thread each agent joined: its thread, the one it started
@@ -105,6 +107,13 @@ impl HostChat {
                 self.members.insert((*thread, *agent), false);
                 Told::Thread(*thread)
             }
+            ChatEvent::Edited { message, .. } | ChatEvent::Deleted { message } => {
+                let Some(mail) = self.messages.get_mut(message) else {
+                    return Told::Nothing;
+                };
+                mail.apply_revision(&record.event);
+                Told::Thread(self.subthread_of(*message))
+            }
             ChatEvent::Named { thread, name } => {
                 if !self.messages.contains_key(thread) {
                     return Told::Nothing;
@@ -118,6 +127,34 @@ impl HostChat {
                 Told::Thread(*thread)
             }
         }
+    }
+
+    /// Applies the current ephemeral snapshot from the host, never from disk.
+    pub fn set_statuses(&mut self, statuses: Vec<ThreadStatus>) {
+        self.statuses = statuses
+            .into_iter()
+            .map(|status| (status.thread, status))
+            .collect();
+    }
+
+    pub fn status(&self, thread: MessageId) -> Option<&ThreadStatus> {
+        self.statuses.get(&thread)
+    }
+
+    pub fn statuses(&self) -> impl Iterator<Item = &ThreadStatus> {
+        self.statuses.values()
+    }
+
+    /// One root channel by id, with the name used in a project address.
+    pub fn project(&self, channel: MessageId) -> Option<crate::protocol::Project> {
+        let root = self.message(channel)?;
+        if root.parent.is_some() || root.revision == Revision::Deleted {
+            return None;
+        }
+        Some(crate::protocol::Project {
+            channel,
+            name: self.name(channel)?,
+        })
     }
 
     pub fn message(&self, id: MessageId) -> Option<&Message> {
@@ -299,6 +336,7 @@ impl HostChat {
         while let Some(at) = stack.pop() {
             if let Some(message) = self.messages.get(&at)
                 && message.from != Address::User
+                && message.revision != Revision::Deleted
             {
                 found.push(at);
             }
@@ -311,11 +349,10 @@ impl HostChat {
     /// The root whose name is `name`, if there is one.
     pub fn root_named(&self, name: &str) -> Option<MessageId> {
         let wanted = one_line(name);
-        self.roots()
-            .iter()
-            .rev()
-            .copied()
-            .find(|root| self.name(*root).as_deref() == Some(wanted.as_str()))
+        self.roots().iter().rev().copied().find(|root| {
+            self.project(*root)
+                .is_some_and(|project| project.name == wanted)
+        })
     }
 }
 

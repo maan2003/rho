@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use senax_encoder::{Decode, Encode, Pack, Unpack};
+
 use crate::UnixMs;
 
 /// What an agent is doing now, as its host last said.
@@ -44,7 +46,9 @@ pub const STUCK_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// A stop the agent did not choose: what draws the user to its thread
 /// without a word from it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
+)]
 pub enum Stop {
     Failed,
     /// Retrying for [`STUCK_AFTER`] or longer.

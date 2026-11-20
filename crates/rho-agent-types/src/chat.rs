@@ -16,7 +16,7 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::{AgentId, ContentPart, UnixMs};
+use crate::{AgentId, ContentPart, Stop, UnixMs};
 
 /// A position in a host's chat log: dense from one, never reused. Zero is
 /// "before any event".
@@ -47,6 +47,12 @@ pub struct MessageId(pub ChatSeq);
 pub enum Address {
     User,
     Agent(AgentId),
+    /// The host's bot. The stop identity survives even if its agent is deleted.
+    System {
+        agent: AgentId,
+        stop: Stop,
+        since: UnixMs,
+    },
 }
 
 /// What a mention asks of the one it names. A mention of the user is how
@@ -70,7 +76,7 @@ pub struct Mention {
 /// One change to a host's chat.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ChatEvent {
-    /// A message under `parent`, or a root. Its content never changes.
+    /// A message under `parent`, or a root.
     /// Every member of the thread it is posted in, or of a thread above,
     /// receives it, and so does each agent it mentions, never its sender.
     /// Neither posting nor a mention makes anyone a member.
@@ -89,13 +95,37 @@ pub enum ChatEvent {
     },
     /// An agent becomes a member of a thread: it receives every later
     /// message in it and in the threads below it, until it leaves one.
-    Joined { thread: MessageId, agent: AgentId },
+    Joined {
+        thread: MessageId,
+        agent: AgentId,
+    },
     /// An agent stops being a member of a thread and of the threads below
     /// it: it receives only the messages that mention it from here on.
-    Left { thread: MessageId, agent: AgentId },
+    Left {
+        thread: MessageId,
+        agent: AgentId,
+    },
     /// A thread's name. Empty takes a name back: the thread is then shown by
     /// the first line of its message.
-    Named { thread: MessageId, name: String },
+    Named {
+        thread: MessageId,
+        name: String,
+    },
+    Edited {
+        message: MessageId,
+        content: Vec<ContentPart>,
+    },
+    Deleted {
+        message: MessageId,
+    },
+}
+
+/// The current status of a thread, separate from its durable mail.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ThreadStatus {
+    pub thread: MessageId,
+    pub at: UnixMs,
+    pub text: String,
 }
 
 /// One entry of a host's chat log.
@@ -117,6 +147,15 @@ pub struct Message {
     pub from: Address,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
+    pub revision: Revision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Revision {
+    Original,
+    Edited,
+    /// Retains the anchor for replies and old references, but no visible mail.
+    Deleted,
 }
 
 impl Message {
@@ -139,7 +178,23 @@ impl Message {
             from: *from,
             mentions: mentions.clone(),
             content: content.clone(),
+            revision: Revision::Original,
         })
+    }
+
+    pub fn apply_revision(&mut self, event: &ChatEvent) {
+        match event {
+            ChatEvent::Edited { message, content } if *message == self.id => {
+                self.content.clone_from(content);
+                self.revision = Revision::Edited;
+            }
+            ChatEvent::Deleted { message } if *message == self.id => {
+                self.content.clear();
+                self.mentions.clear();
+                self.revision = Revision::Deleted;
+            }
+            _ => {}
+        }
     }
 
     pub fn mentions(&self, address: Address) -> Option<MentionKind> {

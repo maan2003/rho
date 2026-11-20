@@ -1009,6 +1009,7 @@ fn message_item(message: &rho_agent_types::Message, meta: Meta) -> Item<Key, Cla
     let from = match message.from {
         Party::User => "you".to_owned(),
         Party::Agent(agent) => agent.encoded(),
+        Party::System { .. } => "system".to_owned(),
     };
     let time = thread::when(message.at.0 as i64);
     let header = format!("{from} · {time}");
