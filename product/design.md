@@ -43,7 +43,7 @@ The built window puts the work in one editor. The top line tells the user where 
 ## token time
 - echo life · `4 s` · long enough to see the result of the last action before the heading returns.
 - age beat · `1 min` · refresh elapsed ages on the thread and its list without a ticking clock on every row.
-- card age step · nearest minute under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
+- card age step · `now` during the first minute, nearest minute thereafter under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
 - while needed · event-bound, no fixed duration · the signal or open choice stays while it is true or still takes the next action.
 - cut · immediate, no transition · hand the keys or the line to the newly active thing.
 - thumb settle · `180 ms` · finish the phone page move or return it to where it was.
@@ -78,9 +78,9 @@ done: Flaky clock test · nothing waits                                  NOR
 
 ## part Row
 purpose: let the user pick a place, thread, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. A channel row can wrap on the phone. Home pads names into a column and keeps `row air` before words; the channel uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+looks: one row of `editor text`; name first in `reading text`, then the quieter context. The `Desk` sets subjects, card words, and addresses in separate columns, with `row air` between columns; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow desk row puts its words below the subject; a channel row can wrap. The channel uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
 states:
-- Home: a room name, then its host and, if anything waits, the words before the host; a card takes `attention`, a snooze or ordinary unread count takes `quiet`.
+- desk: a subject, card words in `attention` or status in `quiet`, and a project address in `quiet`; a folded row uses the address instead of a subject.
 - channel: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then reply counts, participants, and age as available.
 - prompt or palette: the candidate's name, its `attention` card words or `quiet` status if present, then its `quiet` address or key; query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Home or a channel says there is nothing to open; a prompt with no answers shows just the input.
@@ -172,7 +172,8 @@ start agent › here, in a directory on the host
 purpose: give the thumb the actions that the current place can use.
 looks: one `thumb target` band with a `seam` above and equally wide buttons; each `thumb icon` sits over its `thumb label`, both in `quiet`.
 states:
-- Home with a room: back, menu, and open; with a card, done, mute, snooze, and more too.
+- desk: menu, open, and more; open deals the top card and a tap on a row opens that row.
+- card open: back, done, snooze, more, and send; verdicts land on the open card.
 - reading elsewhere: back, home, menu, and more or send where those act on the work.
 - prompt: only cancel and enter.
 - menu sheet: the sheet takes taps in front of the work and bar.
@@ -194,7 +195,7 @@ states:
 used on: built Home (`desk.Desk`) and open card thread (`mail.Thread`).
 form:
 ```text
-asks · 8m      result · 1.5h      failed · 1.2d
+asks · now     result · 1.5h      failed · 1.2d
 snoozed · until 05:17
 ```
 

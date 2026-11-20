@@ -18,7 +18,7 @@ because: the user only needs what asks for them or returns a result, not each ag
 costs: a failure can still ask for the user when they have nothing to add.
 
 ## journey An idea becomes a merged result
-status: ideas are written in channels, and a result carries no proof yet.
+status: a result carries no designated proof yet.
 goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:

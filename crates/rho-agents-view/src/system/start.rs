@@ -150,7 +150,7 @@ pub(crate) fn rows(
             Origin::Message => "start agent",
             Origin::Draft(_) => "send and start agent",
         },
-        Runtimes::Default => "where this channel's agents work",
+        Runtimes::Default => "where this project's agents work",
     });
     let host = read.host_of(thread.host);
     let known = host

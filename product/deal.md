@@ -53,10 +53,10 @@ when: the user has a few minutes and wants to clear what asks for them
 want: open each thing that needs them and either answer it or say what to do with it
 so that: nothing waits on the user without their knowing
 steps:
-1. the user deals the next `Card`
+1. the user deals the next `Card` (`open` on the phone’s `desk.Desk`)
 2. the user reads the mail where the card opened
 3. the user replies, `mail.Answer a mail`
-   - without a reply, they give `Verdict.done`, `Verdict.snooze` with a time, or `Verdict.mute`
+   - without a reply, they give `Verdict.done`, `Verdict.snooze` with a time, or `Verdict.mute`; on the phone, `done` takes one tap on the open card and deals the next
 4. the user continues until nothing waits and the `desk.Desk` is on screen
 system: orders cards from project mail; asks, results, and stops wait; snoozed cards can come back.
 user: the reply or verdict, and the time for a snooze.

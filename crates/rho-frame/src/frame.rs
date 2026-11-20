@@ -524,9 +524,6 @@ impl Frame {
     }
 
     fn focus_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.desk_in_view() {
-            self.desk.update(cx, |desk, _| desk.reset_tap());
-        }
         let handle = self.current_surface().focus_handle(cx);
         window.focus(&handle, cx);
         self.report_active_surface(window, cx);
@@ -887,7 +884,7 @@ impl Frame {
         if !self.desk_in_view() {
             let opener = self.screen_binding(&keys::VerdictMenu, window, cx);
             rows.extend(
-                self.verdict_rows(cx)
+                self.verdict_rows(Layout::of(window.viewport_size().width), cx)
                     .rows
                     .into_iter()
                     .filter_map(|mut row| {
@@ -985,10 +982,14 @@ impl Frame {
             self.toggle_desk(window, cx);
             return;
         }
-        self.open_menu(self.verdict_rows(cx), window, cx);
+        self.open_menu(
+            self.verdict_rows(Layout::of(window.viewport_size().width), cx),
+            window,
+            cx,
+        );
     }
 
-    fn verdict_rows(&self, cx: &App) -> Rows {
+    fn verdict_rows(&self, layout: Layout, cx: &App) -> Rows {
         let Some(target) = self.card_target(cx) else {
             // With no card here there is nothing to judge, but the deal
             // still goes on: `n` is how the user asks what waits.
@@ -999,7 +1000,11 @@ impl Frame {
         let card = self.card_for(&target, cx);
         let mut rows = Rows::new(card.heading()).counted();
         rows.extend(verdict_rows(target.clone()));
-        rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
+        rows.push(Row::menu(
+            "s",
+            "snooze",
+            snooze_rows(&target, &card.title, layout == Layout::Phone),
+        ));
         push_deal_rows(&mut rows);
         rows
     }
@@ -1394,18 +1399,22 @@ fn push_deal_rows(rows: &mut Rows) {
 }
 
 /// How long `target` sleeps: a unit, and the count typed before it.
-pub(crate) fn snooze_rows(target: &Address) -> Rows {
-    let mut snooze = Rows::new("snooze for").counted();
-    for (key, description, unit) in [
-        ("m", "minutes", SnoozeUnit::Minutes),
-        ("h", "hours", SnoozeUnit::Hours),
-        ("d", "days", SnoozeUnit::Days),
-        ("w", "weeks", SnoozeUnit::Weeks),
+pub(crate) fn snooze_rows(target: &Address, title: &str, phone: bool) -> Rows {
+    let mut snooze = Rows::new(format!("snooze: {title}")).counted();
+    for (key, singular, plural, unit) in [
+        ("m", "minute", "minutes", SnoozeUnit::Minutes),
+        ("h", "hour", "hours", SnoozeUnit::Hours),
+        ("d", "day", "days", SnoozeUnit::Days),
+        ("w", "week", "weeks", SnoozeUnit::Weeks),
     ] {
         let target = target.clone();
         snooze.push(Row::counted(
             key,
-            description,
+            if phone {
+                format!("snooze for 1 {singular}")
+            } else {
+                plural.to_owned()
+            },
             move |frame, count, window, cx| frame.snooze(&target, unit, count, window, cx),
         ));
     }

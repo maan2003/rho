@@ -775,9 +775,10 @@ impl AgentPool {
             let previous = held.get(&agent_id).copied();
             stamp(&mut held, agent_id, &status.runtime, UnixMs::now());
             let now = held[&agent_id];
-            (previous != Some(now)).then_some(now)
+            (previous != Some(now)).then_some((previous, now))
         };
-        if let Some(doing) = changed {
+        if let Some((previous, doing)) = changed {
+            self.activity_changed(agent_id, previous, doing);
             self.observe_stop(agent_id, doing, &status.runtime);
         }
         let shown = self.shown(agent_id, &status);
@@ -1164,6 +1165,11 @@ impl AgentPool {
             }
             write.commit();
         }
+        self.doing
+            .lock()
+            .expect("poison")
+            .retain(|agent, _| !agents.contains(agent));
+        self.agents_left_mail(&agents);
         self.recent
             .lock()
             .expect("poison")

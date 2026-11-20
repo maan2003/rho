@@ -26,7 +26,7 @@ use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::desk::MovingThread;
-use rho_frame::idea::{IdeaMail, IdeaProject};
+use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{AnySurface, Candidate, Found, FoundThread, FrameLink, Point, Row, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
@@ -94,6 +94,25 @@ pub struct Participant {
 /// `None` once it is gone; the agents system answers, the chat only asks.
 pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participant>>;
 
+enum CreatingProject {
+    Posting(EndpointId, u64),
+    Posted(ThreadId),
+}
+
+impl CreatingProject {
+    fn host(&self) -> EndpointId {
+        match self {
+            Self::Posting(host, _) => *host,
+            Self::Posted(thread) => thread.host,
+        }
+    }
+}
+
+enum CreatedProject {
+    Open,
+    AddressDraft(ProjectCreated),
+}
+
 pub struct ChatSystem {
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
@@ -101,8 +120,7 @@ pub struct ChatSystem {
     chats: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
-    // A channel acknowledged by the host before its root arrives on the session.
-    channels_to_open: BTreeSet<ThreadId>,
+    creating_projects: Vec<(CreatingProject, CreatedProject)>,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
@@ -145,7 +163,7 @@ impl ChatSystem {
         Self {
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
-            channels_to_open: BTreeSet::new(),
+            creating_projects: Vec::new(),
             last_project: loaded.last_project,
             drafts: loaded
                 .drafts
@@ -331,8 +349,8 @@ impl ChatSystem {
                     self.cursors.advance(endpoint, last.seq);
                 }
                 self.cache.write_records(endpoint, records);
+                self.finish_project_creation(cx);
                 self.changed(endpoint, cx);
-                self.open_created_channels(endpoint, cx);
             }
             ChatEvent::Statuses { host, statuses } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
@@ -352,6 +370,28 @@ impl ChatSystem {
                 }
             }
         }
+    }
+
+    /// A post receipt and the matching log entry can arrive in either
+    /// order. Act on the address only once this host's chat owns the root.
+    fn finish_project_creation(&mut self, cx: &mut Context<Self>) {
+        let mut pending = std::mem::take(&mut self.creating_projects);
+        pending.retain(|(creation, created)| {
+            if let CreatingProject::Posted(project) = creation
+                && let Some(project) = self.idea_project_at(*project)
+            {
+                let echo = format!("created project: {}", project.name);
+                match created {
+                    CreatedProject::Open => self.frame.open(project.address, cx),
+                    CreatedProject::AddressDraft(created) => created(project, cx),
+                }
+                self.frame.echo(echo, StyleClass::SystemInfo, cx);
+                false
+            } else {
+                true
+            }
+        });
+        self.creating_projects = pending;
     }
 
     fn changed(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
@@ -517,20 +557,19 @@ impl ChatSystem {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
                 Ok(message) => {
-                    if let Some((client_id, outgoing, kept)) = this.outbox.delivered(endpoint) {
+                    if let Some((client_id, _, kept)) = this.outbox.delivered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
+                        for (creation, _) in &mut this.creating_projects {
+                            if matches!(creation, CreatingProject::Posting(host, id) if *host == endpoint && *id == client_id) {
+                                *creation = CreatingProject::Posted(ThreadId { host: endpoint, message });
+                            }
+                        }
+                        this.finish_project_creation(cx);
                         cx.emit(Event::Delivered {
                             endpoint,
                             client_id,
                             message,
                         });
-                        if outgoing.parent.is_none() {
-                            this.channels_to_open.insert(ThreadId {
-                                host: endpoint,
-                                message,
-                            });
-                            this.open_created_channels(endpoint, cx);
-                        }
                     }
                     cx.notify();
                     this.send_unsent(endpoint, cx);
@@ -545,22 +584,19 @@ impl ChatSystem {
         .detach();
     }
 
-    fn open_created_channels(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
-        let ready: Vec<_> = self
-            .channels_to_open
-            .iter()
-            .filter(|thread| thread.host == endpoint)
-            .filter_map(|&thread| Some((thread, self.project_address(thread)?)))
-            .collect();
-        for (thread, project) in ready {
-            self.channels_to_open.remove(&thread);
-            self.frame.open(thread.address(), cx);
-            self.frame.echo(
-                format!("new channel: {project}"),
-                StyleClass::SystemInfo,
-                cx,
-            );
+    fn create_project(
+        &mut self,
+        endpoint: EndpointId,
+        name: String,
+        created: CreatedProject,
+        cx: &mut Context<Self>,
+    ) {
+        if self.link_for(endpoint).is_none() {
+            return;
         }
+        let client = self.post(endpoint, None, name, Vec::new(), cx);
+        self.creating_projects
+            .push((CreatingProject::Posting(endpoint, client), created));
     }
 
     /// One call to a host's chat; `done` hears the answer.
@@ -642,7 +678,7 @@ impl ChatSystem {
         Some(read(&host))
     }
 
-    /// Posts a root on `endpoint`: a new channel.
+    /// Posts a root on `endpoint`: a new project.
     fn prompt_new_root(
         this: Entity<Self>,
         endpoint: EndpointId,
@@ -651,12 +687,12 @@ impl ChatSystem {
         cx: &mut Context<rho_frame::Frame>,
     ) {
         frame.open_prompt(
-            "new channel:",
+            "new project:",
             Rc::new(|_, _, _| Vec::new()),
             Rc::new(move |_frame, input, _, cx| {
                 let text = rho_agent_types::one_line(&input);
                 this.update(cx, |chat, cx| {
-                    chat.post(endpoint, None, text, Vec::new(), cx);
+                    chat.create_project(endpoint, text, CreatedProject::Open, cx);
                 });
             }),
             window,
@@ -666,7 +702,7 @@ impl ChatSystem {
             prompt.validate(|text| {
                 text.trim()
                     .is_empty()
-                    .then_some("new channel: a name is required")
+                    .then_some("new project: a name is required")
             });
         }
     }
@@ -735,8 +771,8 @@ impl System for ChatSystem {
             return;
         };
         self.chats.remove(&endpoint);
-        self.channels_to_open
-            .retain(|thread| thread.host != endpoint);
+        self.creating_projects
+            .retain(|(creation, _)| creation.host() != endpoint);
         self.cursors.reset(endpoint);
         self.cache.reset(endpoint);
         self.frame.close_all(
@@ -760,7 +796,7 @@ impl System for ChatSystem {
             .is_some_and(|subject| subject.kind() == AgentRef::KIND);
         if !hosts.is_empty() && !on_agent {
             let new_root = this.clone();
-            rows.push(Row::run("c", "new channel", move |frame, window, cx| {
+            rows.push(Row::run("c", "new project", move |frame, window, cx| {
                 let hosts = new_root.read(cx).hosts();
                 match hosts.as_slice() {
                     [(seed, _)] => {
@@ -968,6 +1004,25 @@ impl System for ChatSystem {
 
     fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
         self.idea_project_at(self.last_project?)
+    }
+
+    fn idea_project_hosts(&self, _cx: &App) -> Vec<(EndpointId, String)> {
+        self.hosts()
+    }
+
+    fn create_idea_project(
+        &mut self,
+        project: NewIdeaProject,
+        created: ProjectCreated,
+        cx: &mut Context<Self>,
+    ) {
+        let name = project.name().to_owned();
+        self.create_project(
+            project.host,
+            name,
+            CreatedProject::AddressDraft(created),
+            cx,
+        );
     }
 
     fn send_idea(&mut self, mail: IdeaMail, cx: &mut Context<Self>) {

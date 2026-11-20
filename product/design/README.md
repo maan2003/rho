@@ -4,14 +4,43 @@ Captured 2026-11-20 from `d147b654` with rho's headless Wayland compositor and b
 
 ## Run the fixture
 
-From the root of a checkout at `d147b654`, build the GUI, local host, worker, and local fake model in the repo's dev shell:
+In the repo’s dev shell, build the GUI, local host, worker, and fake model.
+Pass the directory with the four built binaries if it is not `target/debug`.
 
 ```sh
 cargo build --locked --offline -p rho-gui -p rho-agent-host -p rho-inference -p rho-fake-model --bins
-bash /path/to/capture.sh /tmp/rho-form-captures
+bash product/design/capture.sh /tmp/rho-form-captures target/debug
 ```
 
-In a checkout that contains these form files, the script is `product/design/capture.sh`; to use a different checkout containing the built binaries, pass its `target/debug` directory as the second argument. The script opens a shell with `form_gui`, `form_way`, and `form_shot`. The host, two client states, and model all use temporary paths and the model listens on loopback. The only attached host, `lab`, is this fixture. Exit the shell to stop the sessions and discard the fixture. The local worker needs the normal agent workset prerequisites.
+The script opens a shell with `form_gui`, `form_way`, and `form_shot`. The host,
+two client states, and model use temporary paths; the model listens on loopback.
+The only attached host, `lab`, is this fixture. Exit the shell to discard the
+fixture. The local worker needs the normal agent workset prerequisites.
+
+**Start a working agent from the desk.** Open the laptop (`form_gui laptop`),
+dismiss the synthetic device phrase with Enter, and press `i`. Type a project
+name such as `tide` and choose `new project tide@lab`. Write the idea and press
+`ctrl-enter`. The first idea for a project asks where its agents work; choose
+`here, in a directory on the host…` (`h`) and enter the fixture’s `$rig/repo`.
+The fixture host uses a temporary policy that translates the normal Claude
+default to `sol-medium`: the real worker can then run against the fake model
+without requiring Claude’s mount overlays. This policy only applies to `lab`;
+there is no change to the product’s default runtime. The idea is still
+posted and starts an agent through the normal application flow.
+
+To control what the agent does, pass `FAKE_SCENARIO` and optional whitespace-
+separated `FAKE_ARGS` (no shell expansion). For example, to keep the agent
+working long enough to see it in `moving` before it replies:
+
+```sh
+FAKE_SCENARIO=slow-trickle FAKE_ARGS='--seed 51' \
+    bash product/design/capture.sh /tmp/rho-moving target/debug
+```
+
+The default is `clarifying-question`. Run `target/debug/rho-fake-model --help`
+for the available scenarios and flags. Injected terminal faults are disabled.
+For the historical Home captures below, use the original checkout at
+`d147b654` and select `sol-medium` explicitly when prompted.
 
 ```sh
 form_gui laptop

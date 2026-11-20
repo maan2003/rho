@@ -359,7 +359,7 @@ fn z1_a_snooze_holds_until_it_ends() {
     w.pass(mins(59));
     assert_eq!(w.hand(), "");
     w.pass(mins(1));
-    assert_eq!(w.hand(), "D1 · asks · 0m");
+    assert_eq!(w.hand(), "D1 · asks · now");
 }
 
 #[test]
@@ -400,7 +400,7 @@ fn z4_a_reply_within_the_hour_of_the_users_message_comes_through_a_snooze() {
     w.works(&a);
     w.pass(mins(30));
     w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 0m");
+    assert_eq!(w.hand(), "a · asks · now");
 
     let b = w.agent("b");
     w.finishes(&b);
@@ -426,7 +426,7 @@ fn z6_every_snooze_is_kept() {
         w.pass(hours(1));
     }
     assert_eq!(w.marks.get(&d).facts().snoozes(), 3);
-    assert_eq!(w.hand(), "D1 · asks · 0m");
+    assert_eq!(w.hand(), "D1 · asks · now");
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn p1_an_old_pile_clears_what_came_before_and_holds_nothing() {
     }
     assert_eq!(
         w.hand(),
-        "D1 · asks · 0m",
+        "D1 · asks · now",
         "the snooze is gone and the pile saw nothing"
     );
     w.pass(hours(3));
@@ -492,7 +492,7 @@ fn t1_an_old_todo_reads_as_a_read() {
     w.pass(hours(24 * 30));
     assert_eq!(w.hand(), "", "nothing on a plate rises");
     w.asks(&a);
-    assert_eq!(w.hand(), "a · asks · 0m", "a newer ask still deals");
+    assert_eq!(w.hand(), "a · asks · now", "a newer ask still deals");
 }
 
 // Deadlines
@@ -565,7 +565,7 @@ fn x1_a_node_is_one_card_at_its_strongest() {
             lead_days: 3,
         },
     );
-    assert_eq!(w.hand(), "a · asks · 0m");
+    assert_eq!(w.hand(), "a · asks · now");
 }
 
 #[test]
@@ -615,14 +615,11 @@ fn x3_the_hand_says_when_it_next_changes() {
     w.snooze(&d, hours(1));
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + hours(1)));
     w.pass(hours(1));
-    // Back from its snooze, it counts from the snooze's end: `0m` until it
-    // says `1m` half a minute on.
-    assert_eq!(w.deal().cards[0].label, "asks · 0m");
+    // Back from its snooze, it counts from the snooze's end: `now` for
+    // the first minute.
+    assert_eq!(w.deal().cards[0].label, "asks · now");
     let back = w.now.timestamp();
-    assert_eq!(
-        w.deal().next_change,
-        Some(back + SignedDuration::from_secs(30))
-    );
+    assert_eq!(w.deal().next_change, Some(back + mins(1)));
     w.pass(hours(2));
     assert_eq!(w.deal().cards[0].label, "asks · 2.0h");
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + mins(3)));

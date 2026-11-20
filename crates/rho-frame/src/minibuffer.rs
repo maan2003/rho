@@ -524,10 +524,13 @@ impl Minibuffer {
                     }
                 } else if let Answer::Text { rows, .. } = &self.answer {
                     let candidate = &rows[index];
-                    row = row
-                        .when(layout == crate::Layout::Phone, |row| row.flex_wrap())
-                        .child(div().max_w_full().child(candidate.value.clone()));
-                    if !candidate.description.is_empty() {
+                    row = row.when(layout == crate::Layout::Phone, |row| row.flex_wrap());
+                    let new_project = address && candidate.description == crate::idea::NEW_PROJECT;
+                    if new_project {
+                        row = row.child(div().max_w_full().child(candidate.description.clone()));
+                    }
+                    row = row.child(div().max_w_full().child(candidate.value.clone()));
+                    if !new_project && !candidate.description.is_empty() {
                         row = row.child(
                             div()
                                 .max_w_full()
