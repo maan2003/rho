@@ -110,6 +110,10 @@ impl Attention {
         self.undo.push(undo);
     }
 
+    pub(crate) fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
     pub fn pop_undo(&mut self) -> Option<Undo> {
         self.undo.pop()
     }

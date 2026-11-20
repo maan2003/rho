@@ -311,6 +311,18 @@ impl Frame {
         }
     }
 
+    /// On Desk, Space deals immediately if there is a card. If the deal
+    /// is empty, it still gives the last verdict a route to Undo.
+    pub(crate) fn desk_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.deal_next(window, cx) {
+            if self.attention.can_undo() {
+                self.verdict_menu(window, cx);
+            } else {
+                self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
+            }
+        }
+    }
+
     /// The pull itself: whether a card opened. Empty lands on Desk, since
     /// there is nothing to deal and the glance is the answer.
     fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {

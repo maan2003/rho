@@ -1551,7 +1551,7 @@ impl Render for Frame {
             .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
             .on_action(cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
                 if this.desk_in_view() {
-                    this.pull_card(window, cx);
+                    this.desk_space(window, cx);
                 } else {
                     this.verdict_menu(window, cx);
                 }
