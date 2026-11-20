@@ -18,7 +18,8 @@ use tokio::sync::Notify;
 use crate::Image;
 use crate::runtime::{Build, Inbox, Input, Message};
 use crate::source::{
-    Header, Kind, SessionId, Source, SourceFacts, SourceId, SourceUpdate, State, StreamProgress,
+    EndedLogs, Header, Kind, PROCESS_ENDED_LOGS, SessionId, Source, SourceFacts, SourceId,
+    SourceUpdate, State, StreamProgress,
 };
 
 /// How much of one cell's own output a report carries.
@@ -45,6 +46,8 @@ pub(crate) struct Shared {
     pub(crate) next_id: AtomicU64,
     pub(crate) sources: Mutex<BTreeMap<SourceId, Arc<Source>>>,
     pub(crate) retention: Mutex<()>,
+    /// The scope whose ended-command log cap this notebook's commands share.
+    pub(crate) ended_logs: &'static EndedLogs,
     /// Cell ids in the order they started, to tell old sources from new.
     cells: Mutex<Vec<SourceId>>,
     checkin: Mutex<std::time::Duration>,
@@ -193,12 +196,26 @@ impl Notebook {
         wake: Arc<Notify>,
         on_start: Option<OnStart>,
     ) -> Result<Self, String> {
-        tokio::task::spawn_blocking(move || Self::new_blocking(shell, exports, wake, on_start))
-            .await
-            .map_err(|error| format!("notebook startup task failed: {error}"))?
+        Self::sharing(&PROCESS_ENDED_LOGS, shell, exports, wake, on_start).await
+    }
+
+    /// A notebook whose ended commands' logs count against `ended_logs`.
+    pub(crate) async fn sharing(
+        ended_logs: &'static EndedLogs,
+        shell: ShellTools,
+        exports: Vec<Export>,
+        wake: Arc<Notify>,
+        on_start: Option<OnStart>,
+    ) -> Result<Self, String> {
+        tokio::task::spawn_blocking(move || {
+            Self::new_blocking(ended_logs, shell, exports, wake, on_start)
+        })
+        .await
+        .map_err(|error| format!("notebook startup task failed: {error}"))?
     }
 
     fn new_blocking(
+        ended_logs: &'static EndedLogs,
         shell: ShellTools,
         exports: Vec<Export>,
         wake: Arc<Notify>,
@@ -214,6 +231,7 @@ impl Notebook {
             next_id: AtomicU64::new(1),
             sources: Mutex::default(),
             retention: Mutex::default(),
+            ended_logs,
             cells: Mutex::default(),
             checkin: Mutex::new(std::time::Duration::from_secs(120)),
             shell: shell.clone(),
@@ -229,6 +247,17 @@ impl Notebook {
             on_start,
         )?;
         Ok(Self { shared })
+    }
+
+    /// Command logs this notebook still holds a file open for.
+    #[cfg(test)]
+    pub(crate) fn open_logs(&self) -> usize {
+        let sources = self.shared.sources.lock().unwrap();
+        (sources.values())
+            .filter(|source| {
+                (source.state.lock().unwrap().log.as_ref()).is_some_and(|log| log.file.is_some())
+            })
+            .count()
     }
 
     /// Run `code` as a new cell.

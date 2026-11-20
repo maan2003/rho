@@ -684,9 +684,12 @@ impl Process {
     }
 }
 
-/// The worker this agent host starts: the one beside its own executable, as
-/// installed, or else the one on `PATH`.
+/// The worker this agent host starts: the one `RHO_AGENT_WORKER` names, else
+/// the one beside its own executable, as installed, or else the one on `PATH`.
 fn worker_program() -> std::io::Result<std::path::PathBuf> {
+    if let Some(program) = std::env::var_os("RHO_AGENT_WORKER") {
+        return Ok(program.into());
+    }
     let sibling = std::env::current_exe()?.with_file_name("rho-agent-worker");
     Ok(if sibling.is_file() {
         sibling
