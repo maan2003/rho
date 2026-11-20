@@ -648,6 +648,7 @@ mod tests {
             [
                 "a8f02c31->b5082aa5",
                 "b5082aa5->d8e4c62f",
+                "d8e4c62f->9f7265ce",
                 "e41b7c2a->a8f02c31"
             ]
         );
