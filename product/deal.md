@@ -21,7 +21,7 @@ day: Know what wants them, and where they were.
 ## concept Card
 purpose: hand the user the one thing that wants them most, so they never scan a list.
 principle: an agent's message in a thread asks the user something; the thread becomes a card; the user presses `space` then `n`, and the thread opens; they answer it and say done; the next card opens.
-sees: where it is and its name, such as `rho › claude-tool-prompt-audit`; why it wants the user and since when, such as `asks · 2h`, `result · 5h ago`, `failed · 1h`, or `unread in @Barbara Liskov · needs reply · 0m`; then the thing itself, open on screen.
+sees: where it is and its name, such as `rho › claude-tool-prompt-audit`; why it wants the user and since when, such as `asks · 2h`, `result · 5h ago`, `failed · 1h`, or `unread · needs reply · 0m`, the room being in the heading already; then the thing itself, open on screen.
 has:
 - one `chat.Thread`: an agent's thread that wants the user, or a Slack conversation or thread that Slack would badge for them
 does:

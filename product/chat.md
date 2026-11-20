@@ -67,11 +67,11 @@ The list of threads in a channel puts the threads with a mention of the user fir
 
 A thread shows what each of its agents is doing. The `with` line reads each agent with its state and age, such as `with eng-q9tz · working 12m, eng-kjhi · failed 1h`, refreshed each minute, and with the cursor on that line the palette offers that agent's steering commands, so the user steers from the thread.
 
-A Slack conversation is a thread whose messages are what was said in a Slack channel, group, or direct message, with the Slack thread under each message folded beneath it. Its name is such as `#design-24`, `@Barbara Liskov`, or the names of a group. It also shows a line for each new day and a `new` line above the first unread message; older messages load as the user scrolls up to `older messages not loaded`. A message being sent shows `sending…` under the box; one that failed shows `send failed · Enter retries`.
+A Slack conversation is a thread whose messages are what was said in a Slack channel, group, or direct message, with the Slack thread under each message folded beneath it. Its name is such as `#design-24`, `@Barbara Liskov`, or the names of a group. It also shows a line for each new day and a centred `— new —` rule above the first message from someone else that the user has not dealt with, where the cursor lands when it opens; a link is underlined, and a link's preview shows its site and title with the rest behind `Show more ↓`; older messages load as the user scrolls up to `older messages not loaded`. A message being sent shows `sending…` under the box; one that failed shows `send failed · Enter retries`.
 
 ## concept Message
 purpose: carry one thing said in a thread, by the user, an agent, or someone in Slack.
-sees: who wrote it, `you`, the agent's long code such as `q9tz45g2bcvs`, or a Slack writer's initials, and when, such as `06:16` today or `Fri 2 Oct 07:27` before; then its text, with lists, bold, code, emoji, and links drawn; a picture is named as `[image · image/png]`; a Slack message's reactions, such as `🎉 1`, and its files; under it, `↳ 2 replies · name · time` when it has replies.
+sees: who wrote it, `you`, the agent's long code such as `q9tz45g2bcvs`, or a Slack writer's name, and when, such as `06:16` today or `Fri 2 Oct 07:27` before; then its text, with lists, bold, code, emoji, and links drawn; a picture is named as `[image · image/png]`; a Slack message's reactions, such as `🎉 1`, and its files; under it, `↳ 2 replies · name · time` when it has replies.
 does:
 - open its replies `enter`: open the thread under this message
 - start an agent from it: as `agents.Start an agent from a message`

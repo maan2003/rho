@@ -19,12 +19,12 @@ does:
 - close and deal `ctrl-shift-j`: close this screen and deal the next card
 - home `tab`: go to `home.Home`; on Home, go back to the screen before
 
-Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of rooms the same way they move through a thread or a chart's numbers.
+Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of rooms the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
 
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
 principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
-sees: where the user is: the room and the thing under the cursor, and when that thing is a card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
+sees: where the user is: the room and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Vim mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
 
 The lamp is the only thing outside the user's place that pulls at them. When a card rises past a higher line, the window also chimes once.
 
