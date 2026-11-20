@@ -38,7 +38,7 @@ rho-rpc.workspace = true
 rho-tool-shell.workspace = true
 rho-watch.workspace = true
 rho-web-search.workspace = true
-rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "stdio"] }
 rustix-openpty.workspace = true
 rustls.workspace = true
 senax-encoder = { workspace = true, features = ["raw_value", "uuid"] }

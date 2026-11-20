@@ -15,6 +15,7 @@ pub mod entry;
 pub mod heap;
 pub mod log;
 mod papercut;
+mod process_tree;
 pub mod record;
 pub mod store;
 #[cfg(test)]
