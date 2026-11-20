@@ -580,7 +580,14 @@ impl ClaudeLoop {
             let settled = (initial_runtime.is_working() && !current.is_working())
                 || (self.execution_generation != initial_execution_generation
                     && !current.is_working());
-            if settled && let InferenceState::Failed { error } = &current.inference {
+            // A failure the loop was not working towards, such as Claude
+            // Code not starting, is a stop all the same: the transcript says
+            // why. Each failure has its own time, so one already told is not
+            // told again.
+            let failed_anew = current.inference != initial_runtime.inference;
+            if (settled || failed_anew)
+                && let InferenceState::Failed { error, .. } = &current.inference
+            {
                 self.notice(Notice::Stopped(error.clone())).await?;
             }
             if settled && std::mem::take(&mut self.ended) {
@@ -657,6 +664,10 @@ impl ClaudeLoop {
                 self.compact_wanted = false;
                 self.give_back_following().await?;
                 self.cancelling = busy;
+                let cell_ran = self
+                    .python
+                    .as_ref()
+                    .is_some_and(|host| host.running_tasks() > 0);
                 self.cancel_python().await?;
                 self.waiting.quiet();
                 if busy && self.process.is_some() {
@@ -680,6 +691,9 @@ impl ClaudeLoop {
                 self.stream_items.clear();
                 self.response_id = None;
                 self.set_kind(InferenceState::Idle);
+                if busy || cell_ran {
+                    self.notice(Notice::Cancelled).await?;
+                }
                 self.recover_pending_rewind().await?;
             }
             ClaudeControl::Rewind { turns, reply } => {
@@ -763,7 +777,7 @@ impl ClaudeLoop {
             return Ok(());
         }
         let host = self.python.as_mut().expect("a call is open");
-        let failed = host.latest_failed();
+        let failed = host.latest_end().is_some_and(|end| end.failed);
         let pending = host.take_pending().expect("a call is open");
         let items = composed.result.iter().map(mcp_item).collect();
         let ends_turn = turn.is_some() || ends_turn_for_compact;
@@ -1715,6 +1729,18 @@ impl ClaudeLoop {
     /// and acts on the answer. A working model with no call open hears it at
     /// its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
+        if let Some(end) = self
+            .python
+            .as_mut()
+            .and_then(python_host::PythonHost::take_end)
+        {
+            self.host
+                .append(Event::CellEnded {
+                    agent: self.agent_id,
+                    end,
+                })
+                .await?;
+        }
         // A model waiting in its call would never get to the command.
         if self.compact_wanted && self.waiting_in_call() {
             return self.request(vec![RequestNotice::NothingNew]).await;
@@ -1993,6 +2019,7 @@ impl ClaudeLoop {
         self.stream_items.clear();
         self.set_kind(InferenceState::Failed {
             error: error.to_string(),
+            since: Some(UnixMs::now()),
         });
         Ok(())
     }
@@ -2411,12 +2438,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             agent.status().runtime.inference,
-            InferenceState::Failed {
-                error: explanation.to_owned(),
-            }
-        );
+            InferenceState::Failed { error, since: Some(_) } if error == explanation
+        ));
         assert!(
             host.history()
                 .await
@@ -2512,7 +2537,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let InferenceState::Failed { error } = agent.status().runtime.inference else {
+        let InferenceState::Failed { error, .. } = agent.status().runtime.inference else {
             panic!("the agent failed");
         };
         assert_eq!(
@@ -2532,12 +2557,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             agent.status().runtime.inference,
-            InferenceState::Failed {
-                error: "Overloaded".to_owned()
-            }
-        );
+            InferenceState::Failed { error, since: Some(_) } if error == "Overloaded"
+        ));
     }
 
     #[test]

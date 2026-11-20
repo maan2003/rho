@@ -132,7 +132,7 @@ pub fn block_visible(block: &UiBlock) -> bool {
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageDraft { text, .. }
-        | UiBlock::Notice { text }
+        | UiBlock::Notice { text, .. }
         | UiBlock::Status { text }
         | UiBlock::Delivered { text, .. } => !text.is_empty(),
     }
@@ -334,15 +334,16 @@ pub fn render_block_with_agent_labels(
             // grammar over it, so it keeps a plain buffer of its own.
             inlay = push_tool_spans(&mut spans, tool, now_ms);
         }
-        UiBlock::Notice { text } => {
+        UiBlock::Notice { text, times } => {
             if text.is_empty() {
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            let mut text = text.clone();
-            if !text.ends_with('\n') {
-                text.push('\n');
+            let mut text = text.trim_end_matches('\n').to_owned();
+            if *times > 1 {
+                text.push_str(&format!(" ×{times}"));
             }
+            text.push('\n');
             spans.push(Span::new(text, StyleClass::SystemInfo));
         }
         UiBlock::Status { text } => {
@@ -521,12 +522,8 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
         for (label, start, end) in phases {
             let Some(start) = start else { continue };
             if let Some(end) = end {
-                let millis = end.0.saturating_sub(start.0);
-                let value = if millis < 1000 {
-                    format!("{millis}ms")
-                } else {
-                    format_tool_duration(Duration::from_millis(millis))
-                };
+                let value =
+                    format_tool_duration(Duration::from_millis(end.0.saturating_sub(start.0)));
                 spans.push(Span::new(format!(" {label} {value}"), StyleClass::Time));
             } else if timing.handed_off_at.is_none() && tool.status == UiToolStatus::Running {
                 spans.push(Span::new(format!(" {label}"), StyleClass::Time));
@@ -585,19 +582,27 @@ fn tool_status_class(status: UiToolStatus) -> StyleClass {
     }
 }
 
+/// How long a call ran, or has run while it still runs: a running one
+/// counts only once it reaches a second, a finished one says even a moment.
 pub fn tool_duration_at(tool: &UiTool, now_ms: u64) -> Option<Duration> {
     let started_at = tool.started_at?.0;
-    let finished_at = tool
-        .finished_at
-        .map(|finished_at| finished_at.0)
-        .or_else(|| (tool.status == UiToolStatus::Running).then_some(now_ms))?;
-    let duration = Duration::from_millis(finished_at.saturating_sub(started_at));
-    (Duration::from_secs(1) <= duration).then_some(duration)
+    match tool.finished_at {
+        Some(finished_at) => Some(Duration::from_millis(
+            finished_at.0.saturating_sub(started_at),
+        )),
+        None => {
+            let duration = Duration::from_millis(now_ms.saturating_sub(started_at));
+            (tool.status == UiToolStatus::Running && Duration::from_secs(1) <= duration)
+                .then_some(duration)
+        }
+    }
 }
 
 pub fn format_tool_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    if seconds < 60 {
+    if seconds == 0 {
+        format!("{}ms", duration.as_millis())
+    } else if seconds < 60 {
         format!("{seconds}s")
     } else {
         format!("{}m{}s", seconds / 60, seconds % 60)
@@ -982,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_duration_suppresses_subsecond_values() {
+    fn a_running_tool_counts_from_a_second_and_a_finished_one_says_a_moment() {
         let mut running = tool(UiToolStatus::Running);
         running.started_at = Some(UnixMs(1_000));
         assert_eq!(tool_duration_at(&running, 1_999), None);
@@ -991,10 +996,12 @@ mod tests {
             Some(Duration::from_secs(1))
         );
 
-        let mut finished = tool(UiToolStatus::Success);
+        let mut finished = tool(UiToolStatus::Error);
         finished.started_at = Some(UnixMs(1_000));
-        finished.finished_at = Some(UnixMs(1_999));
-        assert_eq!(tool_duration_at(&finished, 10_000), None);
+        finished.finished_at = Some(UnixMs(1_240));
+        let mut spans = Vec::new();
+        assert_eq!(push_tool_spans(&mut spans, &finished, 10_000), None);
+        assert_eq!(text_of(&spans), "$ echo ok error 240ms\n");
     }
 
     #[test]
@@ -1057,9 +1064,11 @@ mod tests {
             UiBlock::Tool(tool(UiToolStatus::Running)),
             UiBlock::Notice {
                 text: "notice".to_owned(),
+                times: 1,
             },
             UiBlock::Notice {
                 text: String::new(),
+                times: 1,
             },
             UiBlock::Delivered {
                 message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
@@ -1079,6 +1088,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_notice_said_again_reads_once_with_its_count() {
+        let notice = |times| UiBlock::Notice {
+            text: "The server is overloaded".to_owned(),
+            times,
+        };
+        let text = |block: &UiBlock| {
+            text_of(&render_block_with_agent_labels(block, None, 0, &|_| "a".to_owned()).spans)
+        };
+        assert_eq!(text(&notice(1)), "The server is overloaded\n");
+        assert_eq!(text(&notice(3)), "The server is overloaded ×3\n");
+    }
+
     #[test]
     fn exec_timing_names_provider_phases_not_python_duration() {
         let mut exec = tool(UiToolStatus::Success);

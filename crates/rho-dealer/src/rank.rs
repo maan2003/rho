@@ -415,6 +415,8 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         if let Some((_, gone)) = skip {
             steps.push(gone);
         }
+        // Its words say how long it has waited: they move on by themselves.
+        steps.push(part.curve.label_changes(at));
         let (title, context) = named
             .remove(&address)
             .unwrap_or_else(|| name(sources, &address));

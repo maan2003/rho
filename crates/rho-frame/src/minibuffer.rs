@@ -65,9 +65,16 @@ impl Echo {
         &self.text
     }
 
+    /// The echo is one line in the status line's place: of a text of
+    /// several, such as an error a host sent, the first.
     pub fn new(text: &str, class: StyleClass, dismiss: gpui::Task<()>) -> Self {
         Self {
-            text: text.to_owned(),
+            text: text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim_end()
+                .to_owned(),
             class,
             _dismiss: dismiss,
         }
@@ -232,6 +239,11 @@ impl Minibuffer {
 
     pub fn input(&self, cx: &App) -> String {
         self.editor.read(cx).text(cx)
+    }
+
+    /// The line the answer is typed in.
+    pub(crate) fn editor(&self) -> &Entity<Editor> {
+        &self.editor
     }
 
     /// The prompt's change handler, if it set one. Cloned rather than

@@ -2224,6 +2224,7 @@ mod tests {
             }),
             Arc::new(UiBlock::Notice {
                 text: "connection lost".into(),
+                times: 1,
             }),
         ];
         {

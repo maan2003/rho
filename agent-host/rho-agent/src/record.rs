@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use rho_agent_types::transcript::ExecId;
 use rho_agent_types::{
-    AgentId, CallTiming, ContentPart, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
+    AgentId, CallTiming, CellEnd, ContentPart, MessageId, Props, Role, UnixMs, WorksetKind, Wpos,
 };
 use senax_encoder::{Decode, Encode};
 use uuid::Uuid;
@@ -59,6 +59,9 @@ pub enum Event<'a> {
         /// How the call this request answers went.
         timing: Option<CallTiming>,
     },
+    /// The cell of the agent's call ended: whether a request answers the
+    /// call or the turn ended with it, this is how it went.
+    CellEnded { agent: AgentId, end: CellEnd },
 
     /// Every row of this agent from `to` up to here is no longer its history.
     Rewound { agent: AgentId, to: Wpos },
@@ -132,6 +135,7 @@ impl Event<'_> {
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
             | Self::Request { agent, .. }
+            | Self::CellEnded { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::Notice { agent, .. }

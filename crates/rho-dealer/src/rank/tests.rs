@@ -779,10 +779,29 @@ fn x3_the_hand_says_when_it_next_changes() {
     w.snooze(&d, hours(1));
     assert_eq!(w.deal().next_change, Some(w.now.timestamp() + hours(1)));
     w.pass(hours(1));
-    assert_eq!(w.deal().next_change, None);
+    // Back from its snooze, it counts from the snooze's end: `0m` until it
+    // says `1m` half a minute on.
+    assert_eq!(w.deal().cards[0].label, "unread in @u1 · needs reply · 0m");
+    let back = w.now.timestamp();
+    assert_eq!(
+        w.deal().next_change,
+        Some(back + SignedDuration::from_secs(30))
+    );
+    w.pass(hours(2));
+    assert_eq!(
+        w.deal().cards[0].label,
+        "unread in @u1 · needs reply · 2.0h"
+    );
+    assert_eq!(w.deal().next_change, Some(w.now.timestamp() + mins(3)));
     let cursor = w.deal().cards[0].cursor.clone();
-    w.skips.skip(d, cursor, w.now.timestamp());
-    assert_eq!(w.deal().next_change, Some(w.now.timestamp() + SKIP_HOLD));
+    let skipped = w.now.timestamp();
+    w.skips.skip(d, cursor, skipped);
+    w.pass(SKIP_HOLD - SignedDuration::from_secs(10));
+    assert_eq!(
+        w.deal().next_change,
+        Some(skipped + SKIP_HOLD),
+        "the skip runs out first"
+    );
 }
 
 #[test]

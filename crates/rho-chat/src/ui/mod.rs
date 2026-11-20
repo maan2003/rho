@@ -474,12 +474,14 @@ impl ChatSystem {
         let name = self.host_name(endpoint);
         let alive = |agent: AgentId| self.participant(endpoint, agent, cx).is_some();
         let doing = |agent: AgentId| self.participant(endpoint, agent, cx)?.doing;
+        let reason = |agent: AgentId| self.participant(endpoint, agent, cx)?.stopped_because;
         let host = cards::Host {
             endpoint,
             chat,
             name: self.many_hosts().then_some(name.as_str()),
             alive: &alive,
             doing: &doing,
+            reason: &reason,
         };
         Some(read(&host))
     }

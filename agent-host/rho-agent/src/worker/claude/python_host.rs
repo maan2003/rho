@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use rho_agent_types::UnixMs;
 use rho_agent_types::transcript::ExecId;
+use rho_agent_types::{CellEnd, UnixMs};
 use rho_claude::mcp::{reply, text_item, tool_result};
 use rho_notebook::{CellHandle, Notebook};
 use serde_json::Value;
@@ -48,6 +48,8 @@ pub(crate) struct PythonHost {
     notify: Arc<Notify>,
     pending: Option<PendingExec>,
     latest: Option<(ExecId, CellHandle)>,
+    /// The transcript has been told how the latest cell ended.
+    end_told: bool,
     /// The model has been told the latest cell finished.
     progress: Progress,
     /// The user stopped the agent, or its requests failed, at this time,
@@ -62,6 +64,7 @@ impl PythonHost {
             notify,
             pending: None,
             latest: None,
+            end_told: false,
             progress: Progress::default(),
             stopped: None,
         }
@@ -102,6 +105,7 @@ impl PythonHost {
         }
         self.notebook.reset_checkin();
         self.latest = Some((exec_id.clone(), self.notebook.run(source)));
+        self.end_told = false;
         self.progress.told_returned = false;
         self.progress.last_response = Some(now);
         self.progress.prose = 0;
@@ -227,12 +231,23 @@ impl PythonHost {
         }
     }
 
-    /// Whether the open call's cell raised.
-    pub(crate) fn latest_failed(&self) -> bool {
-        self.latest
-            .as_ref()
-            .and_then(|(_, cell)| cell.facts().finished)
-            .is_some_and(|end| end.failed)
+    /// How the open call's cell ended, once it has.
+    pub(crate) fn latest_end(&self) -> Option<CellEnd> {
+        let (call, cell) = self.latest.as_ref()?;
+        let end = cell.facts().finished?;
+        Some(CellEnd {
+            call: call.clone(),
+            at: end.at,
+            failed: end.failed,
+        })
+    }
+
+    /// How the latest cell ended, once: the turn may end with it, so no
+    /// request need follow to say so.
+    pub(crate) fn take_end(&mut self) -> Option<CellEnd> {
+        let end = self.latest_end().filter(|_| !self.end_told)?;
+        self.end_told = true;
+        Some(end)
     }
 
     /// What the notebook has to say, which it forgets once taken.
@@ -310,7 +325,9 @@ mod tests {
         assert_eq!(settle(&mut host).await, Wake::Returned);
         let text = host.report().unwrap().render().text;
         assert!(text.contains("ran"), "{text}");
-        assert!(!host.latest_failed());
+        let end = host.latest_end().expect("the cell ended");
+        assert!(!end.failed);
+        assert_eq!(end.call.as_str(), "call");
         assert_eq!(host.take_pending().unwrap().exec_id.as_str(), "call");
         assert!(host.can_admit());
         // Told once: the finished cell does not wake the model again.

@@ -101,6 +101,11 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             timing: timing.clone(),
             at,
         },
+        Event::CellEnded { agent, end } => LogEvent::CellEnded {
+            agent: *agent,
+            end: end.clone(),
+            at,
+        },
         Event::Rewound { agent, to } => LogEvent::Rewound {
             agent: *agent,
             to: *to,
@@ -131,6 +136,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
                 error: error.clone(),
                 at,
             },
+            Notice::Cancelled => LogEvent::Cancelled { agent: *agent, at },
             // The runtime state says these.
             Notice::Archived | Notice::FreshNotebook => return None,
         },

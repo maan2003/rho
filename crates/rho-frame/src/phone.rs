@@ -55,25 +55,37 @@ impl Layout {
 }
 
 /// A heading and its state in `width`: the state is what the reader acts
-/// on, so it stays whole and the heading is cut at a word.
+/// on, so it is kept and the heading is cut at a word. A state wider than
+/// the line, one that says why at length, takes the line and is cut at a
+/// word itself.
 pub(crate) fn fit_heading(
     path: &str,
     state: &str,
     width: Pixels,
     measure: impl Fn(&str) -> Pixels,
 ) -> (String, String) {
-    let room = (width - HEADER_GUTTER - measure(state)).max(px(0.));
+    let line = (width - HEADER_GUTTER).max(px(0.));
+    if measure(state) > line {
+        return (String::new(), cut_at_word(state, line, &measure));
+    }
+    let room = (line - measure(state)).max(px(0.));
     if measure(path) <= room {
         return (path.to_owned(), state.to_owned());
     }
+    (cut_at_word(path, room, &measure), state.to_owned())
+}
+
+/// `text` cut at the last word that leaves room for an ellipsis.
+fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
     let ellipsis = "…";
     let mut cut = String::new();
-    for (boundary, character) in path.char_indices() {
+    for (boundary, character) in text.char_indices() {
         if !character.is_whitespace() {
             continue;
         }
-        let prefix = path[..boundary]
-            .trim_end_matches(|character: char| character.is_whitespace() || character == '/');
+        let prefix = text[..boundary].trim_end_matches(|character: char| {
+            character.is_whitespace() || character == '/' || character == '·'
+        });
         let candidate = format!("{prefix}{ellipsis}");
         if measure(&candidate) > room {
             break;
@@ -83,7 +95,7 @@ pub(crate) fn fit_heading(
     if cut.is_empty() && measure(ellipsis) <= room {
         cut.push_str(ellipsis);
     }
-    (cut, state.to_owned())
+    cut
 }
 
 /// How wide `text` is drawn in `style`.
@@ -787,6 +799,18 @@ mod tests {
         // Room enough, nothing is cut.
         let (whole, _) = fit_heading("short", state, px(360.), measure);
         assert_eq!(whole, "short");
+    }
+
+    /// A stop that says why can be wider than the phone: it takes the line,
+    /// cut at a word, rather than running under the mode word.
+    #[test]
+    fn a_state_wider_than_the_line_is_cut_and_the_heading_gives_way() {
+        let measure = |text: &str| px(text.chars().count() as f32 * 8.);
+        let state = "failed · 0m · The model refused the request: the conte…";
+        let (path, kept) = fit_heading("rho-web / FAILME native try", state, px(360.), measure);
+        assert_eq!(path, "");
+        assert_eq!(kept, "failed · 0m · The model refused the…");
+        assert!(measure(&kept) + HEADER_GUTTER <= px(360.));
     }
 
     fn touch(phase: TouchPhase, y: f32, milliseconds: u64) -> TouchEvent {
