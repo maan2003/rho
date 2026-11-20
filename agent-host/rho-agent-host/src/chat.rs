@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use rho_agent::store::{Appended, ChatRead as _};
 use rho_agent_types::ChatSeq;
-use rho_chat::protocol::{ClientFrame, Leave, Name, Open, Post, Reparent, Request, ServerFrame};
+use rho_chat::protocol::{
+    ClientFrame, Leave, Name, Open, Post, Project, Reparent, Request, ResolveProject, ServerFrame,
+};
 use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, write_frame};
 use tokio::sync::{broadcast, mpsc};
@@ -69,6 +71,7 @@ where
         feed,
         follow_rx,
     ));
+    let mut view = services.pool.mail_view();
     let result = loop {
         let frame =
             match rho_rpc::protocol::read_frame_optional::<_, ClientFrame>(&mut reader).await {
@@ -80,6 +83,7 @@ where
             ClientFrame::Follow { since } => {
                 let _ = follow_tx.send(since);
             }
+            ClientFrame::View { thread } => view.set(thread),
         }
     };
     follower.abort();
@@ -97,13 +101,33 @@ async fn follow(
     mut asks: mpsc::UnboundedReceiver<ChatSeq>,
 ) {
     let mut sent: Option<ChatSeq> = None;
+    let mut status_changed = services.pool.watch_thread_statuses();
+    let mut send_statuses = true;
     loop {
         if let Some(sent) = sent.as_mut()
             && !send_from(&services.db, &outgoing_tx, sent).await
         {
             return;
         }
+        if sent.is_some() && send_statuses {
+            status_changed.borrow_and_update();
+            if outgoing_tx
+                .send(ServerFrame::Statuses {
+                    statuses: services.pool.thread_statuses(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            send_statuses = false;
+        }
         tokio::select! {
+            changed = status_changed.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                send_statuses = true;
+            }
             appended = feed.recv() => match appended {
                 Ok(Appended::Chat(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Ok(Appended::Row { .. } | Appended::WorksetDeleted(_)) => {}
@@ -162,6 +186,18 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     match request {
+        Request::ResolveProject(call) => {
+            respond(writer, call, |ResolveProject { name }| async move {
+                let name = rho_agent_types::one_line(&name);
+                anyhow::ensure!(!name.is_empty(), "a project needs a name");
+                Ok(services
+                    .db
+                    .read()
+                    .project_named(&name)
+                    .map(|channel| Project { channel, name }))
+            })
+            .await
+        }
         Request::Post(call) => {
             respond(
                 writer,

@@ -925,6 +925,14 @@ impl Agent {
             .await?;
         }
         self.tell_cell_end().await?;
+        if !quiet
+            && let Some(notice) = self
+                .host
+                .cold_notice(taken.inputs.iter().filter_map(|input| input.message).max())
+                .await?
+        {
+            notices.push(notice);
+        }
         self.log(Event::Request {
             agent: self.agent_id,
             output: taken.output,

@@ -142,6 +142,25 @@ pub(crate) enum PyRequest {
     },
     /// The addresses the agent accepted.
     ExternalContacts(rho_agent_types::AgentId),
+    Status {
+        agent: rho_agent_types::AgentId,
+        thread: rho_agent_types::MessageId,
+        text: String,
+    },
+    Edit {
+        agent: rho_agent_types::AgentId,
+        message: rho_agent_types::MessageId,
+        content: Vec<rho_agent_types::ContentPart>,
+    },
+    Delete {
+        agent: rho_agent_types::AgentId,
+        message: rho_agent_types::MessageId,
+    },
+    Search {
+        query: String,
+        project: Option<rho_agent_types::MessageId>,
+        limit: u64,
+    },
 }
 
 #[derive(Encode, Decode)]
@@ -156,6 +175,7 @@ pub(crate) enum PyReply {
     ExternalContacts(Vec<crate::store::GccpContact>),
     Done,
     Error(String),
+    Search(Vec<crate::store::MailHit>),
 }
 
 #[derive(Encode, Decode)]

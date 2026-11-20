@@ -7,7 +7,9 @@
 //! [`rho_agent_types::ChatEvent`]: the vocabulary is the host's, this is
 //! only how it crosses the wire.
 
-use rho_agent_types::{AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId};
+use rho_agent_types::{
+    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ThreadStatus,
+};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -38,6 +40,8 @@ rho_rpc::calls! {
         Leave(Leave) -> ();
         /// Names a thread; an empty name takes the name back.
         Name(Name) -> ();
+        /// Looks up the project part of `project@host`. The GUI owns host aliases.
+        ResolveProject(ResolveProject) -> Option<Project>;
     }
 }
 
@@ -72,12 +76,34 @@ pub struct Name {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ResolveProject {
+    pub name: String,
+}
+
+/// A project is a channel. An address combines its name with the client's
+/// alias for the host, not the host's machine or endpoint name.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct Project {
+    pub channel: MessageId,
+    pub name: String,
+}
+
+impl Project {
+    pub fn address(&self, host_alias: &str) -> String {
+        format!("{}@{host_alias}", self.name)
+    }
+}
+
 /// What a client says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
     /// After [`ServerFrame::Hello`]: the newest event this client holds
     /// (zero for none). The host sends every later one, then each new one.
     Follow { since: ChatSeq },
+    /// The one thread currently open on this session; `None` on leaving it.
+    /// Closing the session also removes its open thread.
+    View { thread: Option<MessageId> },
 }
 
 /// What a host says on its session.
@@ -90,6 +116,9 @@ pub enum ServerFrame {
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Chat { records: Vec<ChatRecord> },
+    /// Full replacement snapshot; an omitted thread has no status. This is
+    /// not part of the chat log and carries no cursor.
+    Statuses { statuses: Vec<ThreadStatus> },
 }
 
 #[cfg(test)]
