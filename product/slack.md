@@ -41,6 +41,7 @@ rho works with one workspace at a time: the first one registered. A second one r
 A short drop of the connection says nothing. After a long one, or when Slack keeps refusing, the echo line says what is wrong, such as `slack: connection lost`. When rho has caught up on what it missed, the echo line reads `slack: caught up`.
 
 ## flow Answer Slack
+runs: 50 a day
 day: Answer the world.
 when: someone in Slack needs the user
 want: read what the person said and reply, without leaving the window
@@ -56,6 +57,7 @@ cases: the reply is in a thread under a message; the user reads it in another Sl
 reviewed: 2026-11-20 · laptop · reviewer · 6 findings
 
 ## flow Find something said in Slack
+runs: 2 a day
 day: Answer the world.
 when: the user remembers something was said or shared in Slack
 want: search for it
@@ -70,6 +72,7 @@ user: the words.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Catch up after time away
+runs: 1 a week
 day: Answer the world.
 when: the user comes back to a workspace after days, with hundreds of old unread messages
 want: say that everything before a time is read
@@ -83,6 +86,7 @@ user: the time.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Connect a Slack workspace
+runs: 1 a year
 day: Answer the world.
 when: the user sets up a new device, or Slack has changed their token
 want: give rho the workspace's token and cookie

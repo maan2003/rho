@@ -51,6 +51,7 @@ A verdict is about the card: the thread or conversation it stands for, and every
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
 ## flow Clear what waits
+runs: 50 a day
 day: Know what wants them, and where they were.
 when: the user has a few free minutes
 want: see each thing that asks for the user, and answer it

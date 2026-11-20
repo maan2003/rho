@@ -91,6 +91,7 @@ does:
 The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
 
 ## flow Go to something by name
+runs: 20 a day
 day: Reach anything.
 when: the user knows what they want to look at, and it is not the card in front of them
 want: reach it by typing part of its name
@@ -105,6 +106,7 @@ cases: two threads with the same name in different channels; an agent whose shor
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## flow Run a command I rarely use
+runs: 2 a day
 day: Reach anything.
 when: the user wants something rare, such as a usage chart, renaming a thread, or attaching a host
 want: say its name and run it
@@ -123,6 +125,7 @@ reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
 
 ## flow Report a slow window
+runs: 1 a month
 day: Keep the work moving.
 when: the window stutters or freezes for a moment, and the user wants it fixed
 want: send what it was doing to a place an agent can read

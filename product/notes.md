@@ -33,6 +33,7 @@ shows: `Note`
 starts: `Write something down`
 
 ## flow Write something down
+runs: 2 a week
 day: Keep their own memory.
 when: something comes to mind that the user must not forget
 want: write it down at once, without choosing where it goes
@@ -47,6 +48,7 @@ cases: the same note open on the laptop and the phone at once, where the newest 
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Reply privately
+runs: 2 a week
 day: Keep their own memory.
 when: a message in a thread needs a remark that is for the user only
 want: write it beside the message

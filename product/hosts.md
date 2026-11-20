@@ -62,6 +62,7 @@ sees: until it is paired, the echo line saying that its verdicts stay on this de
 A device is paired once it holds the user's secret phrase; see `Pair this device`. The first device ever makes the phrase.
 
 ## flow Pair this device
+runs: 1 a quarter
 day: Know what wants them, and where they were.
 when: the user sets up a new device, or their first one
 want: have this device hold the user's secret phrase
@@ -77,6 +78,7 @@ cases: the user never pairs a device, and it keeps its own verdicts for good; th
 reviewed: 2026-11-20 · laptop · reviewer · ok
 
 ## flow Attach a host
+runs: 1 a month
 day: Keep the work moving.
 when: the user sets up a new device, or has a new host
 want: have the window reach the host and show its threads and agents
@@ -94,6 +96,7 @@ cases: the phone, where typing the way to reach a host by thumb is long and a li
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Know my hosts are reachable
+runs: 1 a week
 day: Keep the work moving.
 when: something seems quiet
 want: know whether a host has dropped

@@ -35,6 +35,7 @@ With no rooms, Home reads `no rooms yet · attach a host or register a Slack wor
 The rooms go in this order: first the rooms that hold a card, in the order the deal would hand them; then the rooms with something unread, newest first; then every other room, newest first. With no room at all, Home reads `no rooms yet`.
 
 ## flow Glance at what waits
+runs: 30 a day
 day: Know what wants them, and where they were.
 when: the user has a moment and wants to know if anything needs them
 want: see, in one look, which rooms want the user and how much

@@ -22,6 +22,7 @@ shows: `Chart`
 starts: `Check what is left`
 
 ## flow Check what is left
+runs: 2 a week
 day: Keep the work moving.
 when: agents seem slow, or the user is about to start many of them
 want: see how much allowance each account has left and when it resets

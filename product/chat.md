@@ -158,6 +158,7 @@ The last line is the box; the cursor lands in the messages, on the newest one. A
 When a Slack conversation opens while it asks for the user, the cursor lands on the oldest message from someone else that the user has not dealt with.
 
 ## flow Answer an agent
+runs: 50 a day
 day: Keep the work moving.
 when: an agent asked the user something, or told them it is done
 want: read what it said and reply in its thread
@@ -174,6 +175,7 @@ cases: the host is away while the user writes; the agent that asked is gone
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Start a thread
+runs: 12 a day
 day: Turn ideas into work.
 when: the user has a new piece of work or a question
 want: write it once in the right channel and have it become a thread

@@ -105,6 +105,7 @@ shows: `Agent`, its transcript
 starts: `Look into what an agent did`, `Steer an agent`, `Work beside an agent`
 
 ## flow Start an agent from a message
+runs: 12 a day
 day: Turn ideas into work.
 when: the user has an idea, or a message in a thread is work they want an agent to do
 want: have an agent at work on it, in the right place, with nothing asked that the product can know
@@ -121,6 +122,7 @@ cases: more than nine agents on the host, where only nine can be joined from the
 reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## flow Look into what an agent did
+runs: 15 a day
 day: Keep the work moving.
 when: an agent says it is done, or has been quiet too long
 want: see what it actually did
@@ -135,6 +137,7 @@ cases: the agent is `retrying` after errors from its model
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
 ## flow Steer an agent
+runs: 3 a day
 day: Keep the work moving.
 when: an agent is stuck, going the wrong way, or on the wrong model
 want: change its course without starting over
@@ -148,6 +151,7 @@ user: which change, and what to tell it.
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
 ## flow Work beside an agent
+runs: 3 a day
 day: Reach anything.
 when: the user wants to check or fix something in an agent's workset with their own hands
 want: open its terminal, its shell, or its desktop
@@ -165,6 +169,7 @@ reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 when an `Agent` starts from a `chat.Message`, then it joins that message's `chat.Thread` and reads the message before anything else.
 
 ## flow Approve a push or a fetch
+runs: 3 a day
 day: Keep the work moving.
 when: an agent pushes a branch to, or fetches from, a repository that needs the user's ssh login
 want: see exactly where it goes and what it pushes, and say yes or no
