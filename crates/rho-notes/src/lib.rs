@@ -8,9 +8,8 @@
 //! typed and not yet written. The machine never writes a note's text:
 //! every revision this crate says is a buffer's text as the user left it.
 //!
-//! Notes live apart from the work: no note is a room on Home or a place
-//! in `find`. Their one door is the command `notes`, which opens
-//! [`NotesView`], every note by its first line, the last written first.
+//! Notes stay off Desk. The `notes` command opens [`NotesView`], where the
+//! user can find or start a note without sending their words anywhere.
 //!
 //! Addresses are `note:<id>`
 //! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)), and the list
@@ -22,9 +21,11 @@ pub(crate) mod list;
 mod view;
 
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Subscription, Task, Window};
+use gpui::{App, AppContext as _, Context, EventEmitter, Subscription, Task, Window};
+use jiff::Timestamp;
 pub use list::NotesView;
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
@@ -65,9 +66,19 @@ impl Addressed for NoteId {
     }
 }
 
-/// The text a note's surface edits: its body.
+/// The current text; a deletion leaves older revisions in the ledger,
+/// but presents an empty editor until the user restores or writes text.
+fn revision_of<'a>(marks: &'a Marks, address: &Address) -> &'a str {
+    let held = marks.get(address);
+    if held.deleted {
+        ""
+    } else {
+        held.body.as_deref().unwrap_or_default()
+    }
+}
+
 fn text_of(marks: &Marks, note: NoteId) -> String {
-    marks.get(&note.address()).body.clone().unwrap_or_default()
+    revision_of(marks, &note.address()).to_owned()
 }
 
 /// What a note with `text` is called: its first line, or [`UNTITLED`].
@@ -80,16 +91,26 @@ fn title_of(text: &str) -> String {
 
 /// What a note is called, as written: its first line.
 fn note_title(marks: &Marks, note: &Address) -> String {
-    title_of(marks.get(note).body.as_deref().unwrap_or_default())
+    title_of(revision_of(marks, note))
 }
 
 /// The note's new revision, when the text the user left in its buffer
 /// is not what the ledger already says.
 fn write_for(marks: &Marks, note: NoteId, text: String) -> Option<Write> {
-    (text_of(marks, note) != text).then_some(Write::Note {
+    if revision_of(marks, &note.address()) == text {
+        return None;
+    }
+    // Keep the same identity and the older revision. A subsequent editor
+    // undo writes the restored text at this address, superseding the deletion.
+    let (body, deleted) = if text.is_empty() {
+        (None, Some(true))
+    } else {
+        (Some(text), None)
+    };
+    Some(Write::Note {
         note: note.0,
-        body: Some(text),
-        deleted: None,
+        body,
+        deleted,
     })
 }
 
@@ -107,35 +128,73 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
-/// A note as `notes` lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Listed {
-    note: Address,
-    title: String,
-    /// For a private reply: where it shows, by the name of the thread
-    /// that shows the message it is under, when that can be named.
-    reply: Option<Option<String>>,
+/// The mail's words and the thread's title can be different.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplyContext {
+    mail: Option<String>,
+    thread: Option<String>,
 }
 
-/// Every note, about something or about nothing, by its first line: the
-/// one last written first. `place` names where a reply about an address
-/// shows.
-fn listed(marks: &Marks, place: impl Fn(&Address) -> Option<String>) -> Vec<Listed> {
-    let mut notes: Vec<_> = marks.notes().collect();
-    notes.sort_by_key(|(address, held)| {
-        (
-            std::cmp::Reverse(held.written_ms.or(held.created_ms)),
-            *address,
-        )
-    });
-    notes
-        .into_iter()
-        .map(|(address, held)| Listed {
-            note: address.clone(),
-            title: note_title(marks, address),
-            reply: held.about.as_ref().map(&place),
+/// A visible row, derived from the latest ledger revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Listed {
+    note: NoteId,
+    title: String,
+    preview: String,
+    written: Timestamp,
+    reply: Option<ReplyContext>,
+}
+
+/// Match every typed term across the entire body, in any order, without
+/// requiring a word to be finished before the list narrows.
+fn listed(marks: &Marks, query: &str, place: impl Fn(&Address) -> ReplyContext) -> Vec<Listed> {
+    let query = query.to_lowercase();
+    let mut notes: Vec<_> = marks
+        .notes()
+        .filter_map(|(address, held)| {
+            let note = NoteId::from_address(address)?;
+            let body = held.body.as_deref()?;
+            if !query.is_empty() {
+                let folded = body.to_lowercase();
+                if !query.split_whitespace().all(|term| folded.contains(term)) {
+                    return None;
+                }
+            }
+            Some(Listed {
+                note,
+                title: title_of(body),
+                preview: excerpt(body.lines().skip(1).flat_map(str::split_whitespace)),
+                written: Timestamp::from_millisecond(held.written_ms?).ok()?,
+                reply: held.about.as_ref().map(&place),
+            })
         })
-        .collect()
+        .collect();
+    notes.sort_by_key(|listed| (std::cmp::Reverse(listed.written), listed.note.0));
+    notes
+}
+
+/// Keep just a few words of context, with a bound even for a pasted URL.
+fn excerpt<'a>(words: impl Iterator<Item = &'a str>) -> String {
+    let mut result = String::new();
+    const MAX_CHARS: usize = 52;
+    for (index, word) in words.enumerate() {
+        let used = result.chars().count();
+        let separator = usize::from(index != 0);
+        if index == 7 || used + separator + word.chars().count() > MAX_CHARS {
+            if index == 0 {
+                result.extend(word.chars().take(MAX_CHARS - 1));
+            } else if used == MAX_CHARS {
+                result.pop();
+            }
+            result.push('…');
+            break;
+        }
+        if index != 0 {
+            result.push(' ');
+        }
+        result.push_str(word);
+    }
+    result
 }
 
 /// Every note as the palette lists it, by the first line `title` reads:
@@ -165,11 +224,19 @@ struct Pending {
     _save: Task<()>,
 }
 
+/// Reads the first line of the mail a private reply is about, at its owner.
+pub type MailExcerpt = Rc<dyn Fn(&Address, &App) -> Option<String>>;
+
+pub(crate) struct NoteViewed(NoteId);
+
 pub struct NoteSystem {
     frame: FrameLink,
+    mail_excerpt: Option<MailExcerpt>,
     pending: HashMap<NoteId, Pending>,
     _quit: Subscription,
 }
+
+impl EventEmitter<NoteViewed> for NoteSystem {}
 
 impl NoteSystem {
     pub fn new(frame: FrameLink, cx: &mut Context<Self>) -> Self {
@@ -190,12 +257,18 @@ impl NoteSystem {
             }
             std::future::ready(())
         });
-        list::bind_keys(cx);
+        // Override the frame's in-buffer search after its defaults are bound.
+        cx.defer(list::bind_keys);
         Self {
             frame,
+            mail_excerpt: None,
             pending: HashMap::new(),
             _quit: quit,
         }
+    }
+
+    pub fn set_mail_excerpt(&mut self, read: MailExcerpt) {
+        self.mail_excerpt = Some(read);
     }
 
     /// The current text when another surface starts editing this note.
@@ -254,10 +327,18 @@ fn new_note(frame: &mut Frame, about: Option<&Address>, cx: &mut Context<Frame>)
     note
 }
 
-/// `new note`: a note about nothing, opened to type into.
-fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
+/// Opens a newly minted note ready to write. `text` is the exact query
+/// the user submitted to start one, or empty for the new-note action.
+fn start_note(frame: &mut Frame, text: String, window: &mut Window, cx: &mut Context<Frame>) {
     let note = new_note(frame, None, cx);
     frame.open(note.address(), window, cx);
+    if let Ok(view) = frame.current_surface().view().downcast::<NoteView>() {
+        view.update(cx, |view, cx| view.begin(text, window, cx));
+    }
+}
+
+fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
+    start_note(frame, String::new(), window, cx);
 }
 
 impl System for NoteSystem {
@@ -282,6 +363,12 @@ impl System for NoteSystem {
         Some(AnySurface::new(view))
     }
 
+    fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
+        if let Some(note) = address.and_then(NoteId::from_address) {
+            cx.emit(NoteViewed(note));
+        }
+    }
+
     fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
         rows.push(Row::run("w", "new note", make_note));
@@ -289,7 +376,13 @@ impl System for NoteSystem {
         // own commands.
         rows.push(
             Row::run("shift-w", "notes", |frame, window, cx| {
-                frame.open(notes_address(), window, cx)
+                let note = NoteId::from_address(frame.current_address());
+                frame.open(notes_address(), window, cx);
+                if let Some(note) = note
+                    && let Ok(list) = frame.current_surface().view().downcast::<NotesView>()
+                {
+                    list.update(cx, |list, cx| list.return_to(note, cx));
+                }
             })
             .window_wide(),
         );
