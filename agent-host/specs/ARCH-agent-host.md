@@ -47,10 +47,12 @@ which model, how messages reach them, and workset setup.
 
 Each workset has one append-only log keyed by `(WorksetId, wpos)`, dense from
 zero. A record is its time and one typed event; events about an agent carry
-its `AgentId`. The workset process is the only writer of its log after
-creation. Agent heads and the workset head are projections committed with each
-append. So is an index of each agent's rows, `(AgentId, wpos)`: a workset
-holds many agents, and reading one of them must not cost the others' rows.
+its `AgentId`. The workset process writes its runtime history. The host
+records the exact step that posted or edited agent mail or posted stop mail.
+It appends the message ID in the same transaction; the words stay in the chat
+log. Agent heads and the workset head are projections committed with each
+append. So is an index of each agent's rows, `(AgentId, wpos)`: a workset holds
+many agents, and reading one of them must not cost the others' rows.
 Deleting a workset deletes its log, heads and process; it is the only
 deletion.
 

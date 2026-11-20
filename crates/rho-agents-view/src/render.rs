@@ -115,7 +115,9 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. }
         | UiBlock::MessageDraft { .. }
         | UiBlock::Tool(_)
-        | UiBlock::Notice { .. } => BlockKind::Response { working: true },
+        | UiBlock::MailWritten { .. }
+        | UiBlock::Notice { .. }
+        | UiBlock::Failure { .. } => BlockKind::Response { working: true },
         UiBlock::Status { .. } => BlockKind::QueuedUser,
     }
 }
@@ -128,11 +130,12 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
 pub fn block_visible(block: &UiBlock) -> bool {
     match block {
         UiBlock::Reasoning { .. } => false,
-        UiBlock::Tool(_) => true,
+        UiBlock::Tool(_) | UiBlock::MailWritten { .. } => true,
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageDraft { text, .. }
         | UiBlock::Notice { text, .. }
+        | UiBlock::Failure { text, .. }
         | UiBlock::Status { text }
         | UiBlock::Delivered { text, .. } => !text.is_empty(),
     }
@@ -334,7 +337,7 @@ pub fn render_block_with_agent_labels(
             // grammar over it, so it keeps a plain buffer of its own.
             inlay = push_tool_spans(&mut spans, tool, now_ms);
         }
-        UiBlock::Notice { text, times } => {
+        UiBlock::Notice { text, times } | UiBlock::Failure { text, times, .. } => {
             if text.is_empty() {
                 return invisible(kind);
             }
@@ -344,7 +347,20 @@ pub fn render_block_with_agent_labels(
                 text.push_str(&format!(" ×{times}"));
             }
             text.push('\n');
-            spans.push(Span::new(text, StyleClass::SystemInfo));
+            spans.push(Span::new(
+                text,
+                if matches!(block, UiBlock::Failure { .. }) {
+                    StyleClass::StatusError
+                } else {
+                    StyleClass::SystemInfo
+                },
+            ));
+        }
+        UiBlock::MailWritten { message } => {
+            spans.push(Span::new(
+                format!("wrote mail #{}\n", message.0.0),
+                StyleClass::SystemInfo,
+            ));
         }
         UiBlock::Status { text } => {
             if text.is_empty() {
@@ -500,9 +516,10 @@ fn next_tab_stop(column: usize) -> usize {
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<InlaySpec> {
-    let (label, class) = tool_label(&tool.name, &tool.arguments, tool.format);
+    let (source, class) = tool_label(&tool.name, &tool.arguments, tool.format);
+    let label = tool_heading(tool, &source);
     spans.push(Span::new(label, class));
-    spans.push(Span::new(" ", StyleClass::ToolDetail));
+    spans.push(Span::new(" · ", StyleClass::ToolDetail));
     let status = tool_status_label(tool.status);
     spans.push(Span::new(status, tool_status_class(tool.status)));
 
@@ -557,7 +574,121 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     if !spans.last().is_some_and(|span| span.text.ends_with('\n')) {
         spans.push(Span::new("\n", StyleClass::Default));
     }
+    if let Some(detail) = tool_detail(tool, &source) {
+        spans.push(Span::new(detail, StyleClass::Default));
+        spans.push(Span::new("\n", StyleClass::Default));
+    }
     timer
+}
+
+fn mail_preview(source: &str) -> Option<String> {
+    // This is a preview of a literal, not an interpretation of Python.
+    // Do not speculate about dynamic recipients or bodies.
+    let args = source.trim_start().strip_prefix("mail.send(")?.trim_start();
+    let body = args
+        .strip_prefix("\"user\"")
+        .or_else(|| args.strip_prefix("'user'"))?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start();
+    literal_argument(body)
+}
+
+fn literal_argument(body: &str) -> Option<String> {
+    let quote = body.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let end = body[1..]
+        .char_indices()
+        .scan(false, |escape, (at, c)| {
+            let terminator = !*escape && c == quote;
+            *escape = !*escape && c == '\\';
+            Some(terminator.then_some(at + 2))
+        })
+        .flatten()
+        .next()?;
+    if !body[end..].trim_start().starts_with([',', ')']) {
+        return None;
+    }
+    let literal = &body[..end];
+    if quote == '"' {
+        serde_json::from_str::<String>(literal).ok()
+    } else {
+        Some(
+            literal[1..literal.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\n", "\n"),
+        )
+    }
+}
+
+fn python_shell_command(source: &str) -> Option<String> {
+    let source = source.trim_start();
+    let args = source
+        .strip_prefix("await command(")
+        .or_else(|| source.strip_prefix("command("))?;
+    literal_argument(args.trim_start())
+}
+
+fn tool_heading(tool: &UiTool, source: &str) -> String {
+    let native = matches!(tool.name.as_str(), "exec" | "mcp__py__exec");
+    if native && let Some(mail) = mail_preview(source) {
+        let verb = match tool.status {
+            UiToolStatus::Error | UiToolStatus::Cancelled => "tried to write to you",
+            UiToolStatus::Running => "writing to you",
+            _ => "wrote to you",
+        };
+        return format!("{verb}: {}", preview(&mail));
+    }
+    if native && let Some(shell) = python_shell_command(source) {
+        return format!("$ {}", preview(&shell));
+    }
+    if native && source.trim() == "end_turn()" {
+        return "ended the turn".into();
+    }
+    if native {
+        return format!("ran code: {}", preview(source));
+    }
+    preview(source)
+}
+
+fn preview(text: &str) -> String {
+    let mut lines = text.trim().lines();
+    let line = lines.next().unwrap_or_default();
+    let mut result = line.chars().take(100).collect::<String>();
+    if result.len() < line.len() || lines.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+fn tool_detail(tool: &UiTool, source: &str) -> Option<String> {
+    let mut detail = Vec::new();
+    if matches!(tool.name.as_str(), "exec" | "mcp__py__exec")
+        && let Some(mail) = mail_preview(source)
+        && preview(&mail) != mail
+    {
+        detail.push(mail);
+    } else if let Some(shell) = python_shell_command(source) {
+        if preview(&shell) != shell {
+            detail.push(shell);
+        }
+    } else if (source.contains('\n') || source.chars().count() > 100)
+        && mail_preview(source).is_none()
+    {
+        detail.push(source.to_owned());
+    }
+    if let Some(output) = tool.output.as_deref().or(tool.error.as_deref()) {
+        detail.push(output.trim_end().to_owned());
+    } else if tool.status == UiToolStatus::Error {
+        detail.push("the host recorded no output".into());
+    }
+    (!detail.is_empty()).then(|| {
+        detail
+            .join("\n")
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 fn tool_status_label(status: UiToolStatus) -> &'static str {
@@ -943,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_draft_and_its_source_both_show() {
+    fn a_host_draft_and_its_step_both_show_in_user_words() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
         exec.arguments = "mail.send('user', 'Hello', thread=2, kind='fyi')".into();
@@ -962,10 +1093,38 @@ mod tests {
         assert_eq!(drafted.spans[0].class, StyleClass::AgentLabel);
         assert_eq!(drafted.spans[1].class, StyleClass::Default);
         let sourced = render(&source, None, 0, &label);
-        assert!(
-            text_of(&sourced.spans).contains("mail.send('user', 'Hello', thread=2, kind='fyi')")
+        assert_eq!(text_of(&sourced.spans), "writing to you: Hello · …\n");
+    }
+
+    #[test]
+    fn a_literal_notebook_shell_command_reads_as_a_shell_prompt() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.name = "exec".into();
+        exec.format = ArgumentsFormat::Text;
+        exec.arguments = r#"await command("printf '%s' \"the clock\"")"#.into();
+        exec.output = Some("the clock".into());
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &exec, 3_500);
+        assert_eq!(
+            text_of(&spans),
+            "$ printf '%s' \"the clock\" · ok\n  the clock\n"
         );
-        assert!(!text_of(&sourced.spans).contains("writing"));
+        assert_eq!(
+            python_shell_command("await command('test ' + filename)"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_command_keeps_its_output_with_its_heading() {
+        let mut failed = tool(UiToolStatus::Error);
+        failed.output = Some("500 samples\nFAIL: clock jumped backward\n".to_owned());
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &failed, 7_000);
+        assert_eq!(
+            text_of(&spans),
+            "$ echo ok · error\n  500 samples\n  FAIL: clock jumped backward\n"
+        );
     }
 
     #[test]
@@ -974,7 +1133,7 @@ mod tests {
         reported.started_at = Some(UnixMs(1_000));
         let mut spans = Vec::new();
         assert_eq!(push_tool_spans(&mut spans, &reported, 10_000), None);
-        assert_eq!(text_of(&spans), "$ echo ok reported\n");
+        assert_eq!(text_of(&spans), "$ echo ok · reported\n");
     }
 
     #[test]
@@ -985,7 +1144,7 @@ mod tests {
         let mut spans = Vec::new();
         let timer = push_tool_spans(&mut spans, &finished, 10_000);
         assert_eq!(timer, None);
-        assert_eq!(text_of(&spans), "$ echo ok ok 2s\n");
+        assert_eq!(text_of(&spans), "$ echo ok · ok 2s\n");
     }
 
     #[test]
@@ -1003,7 +1162,10 @@ mod tests {
         finished.finished_at = Some(UnixMs(1_240));
         let mut spans = Vec::new();
         assert_eq!(push_tool_spans(&mut spans, &finished, 10_000), None);
-        assert_eq!(text_of(&spans), "$ echo ok error 240ms\n");
+        assert_eq!(
+            text_of(&spans),
+            "$ echo ok · error 240ms\n  the host recorded no output\n"
+        );
     }
 
     #[test]
@@ -1014,7 +1176,7 @@ mod tests {
         let timer = push_tool_spans(&mut spans, &running, 3_500);
         let timer = timer.expect("running tool with start time should have a timer");
         assert_eq!(spans[timer.span_index].text, "");
-        assert_eq!(text_of(&spans), "$ echo ok …\n");
+        assert_eq!(text_of(&spans), "$ echo ok · …\n");
     }
 
     #[test]

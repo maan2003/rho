@@ -8,7 +8,7 @@ use rho_agent::log::AgentUsageBucket;
 use rho_agent::record::{AgentSpec, Event, Record, Runtime};
 use rho_agent_types::{ContentPart, Role};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
-use rho_agents_client::protocol::worksets::{InputView, LogEvent, SpecView};
+use rho_agents_client::protocol::worksets::{CallView, InputView, LogEvent, SpecView};
 
 /// An agent's spec as a reader needs it.
 pub fn spec_view(spec: &AgentSpec) -> SpecView {
@@ -99,6 +99,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             answers: !compose(true, notices, output, inputs).result.is_empty(),
             compaction: *compact,
             timing: timing.clone(),
+            output: content_text(output),
             at,
         },
         Event::CellEnded { agent, end } => LogEvent::CellEnded {
@@ -205,7 +206,11 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             agent: *agent,
             calls: results
                 .iter()
-                .map(|result| result.call.as_str().to_owned())
+                .map(|result| CallView {
+                    id: result.call.as_str().to_owned(),
+                    output: result.output.clone(),
+                    failed: result.failed,
+                })
                 .collect(),
             at,
         },
@@ -221,6 +226,11 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             at,
         },
         Event::RewindPending { .. } => return None,
+        Event::MailWritten { agent, message } => LogEvent::MailWritten {
+            agent: *agent,
+            message: *message,
+            at,
+        },
     })
 }
 

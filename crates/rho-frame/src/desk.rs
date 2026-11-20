@@ -403,6 +403,20 @@ impl DeskView {
         cx.stop_propagation();
     }
 
+    pub(crate) fn visible_cards(&self, cx: &mut App) -> Vec<Address> {
+        let visible = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.multi_buffer_visible_range(&snapshot, cx)
+        });
+        let end = visible.end.row + u32::from(visible.end.column > 0);
+        (visible.start.row..end.max(visible.start.row + 1))
+            .filter_map(|row| match self.transcript.line_meta(row, cx) {
+                Some(DeskTarget::Card(address)) => Some(address.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn cursor_target(&self, cx: &App) -> Option<DeskTarget> {
         let editor = self.editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);

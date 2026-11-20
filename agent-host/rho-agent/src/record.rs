@@ -117,15 +117,13 @@ pub enum Event<'a> {
         agent: AgentId,
         rewind: Option<ClaudeRewind>,
     },
+    /// Mail this agent (or the host on its behalf) posted or edited in this
+    /// transaction. Its words live in the chat log; this marks its exact
+    /// transcript step.
+    MailWritten { agent: AgentId, message: MessageId },
 }
 
 impl Event<'_> {
-    /// A request that carried something a person typed: where a rewind can go.
-    pub fn carries_a_person(&self) -> bool {
-        matches!(self, Self::Request { inputs, .. }
-            if inputs.iter().any(|input| input.role == Role::User))
-    }
-
     /// The agent the event is about; `None` for a workset event.
     pub fn agent(&self) -> Option<AgentId> {
         match self {
@@ -144,7 +142,8 @@ impl Event<'_> {
             | Self::ClaudeReply { agent, .. }
             | Self::ClaudeResults { agent, .. }
             | Self::ClaudeCompacted { agent, .. }
-            | Self::RewindPending { agent, .. } => Some(*agent),
+            | Self::RewindPending { agent, .. }
+            | Self::MailWritten { agent, .. } => Some(*agent),
         }
     }
 }
@@ -164,6 +163,9 @@ pub struct Input {
 pub struct CallResult {
     pub call: ExecId,
     pub output: String,
+    /// Older rows have the text, but not whether Claude reported failure.
+    #[senax(default)]
+    pub failed: Option<bool>,
 }
 
 /// What an agent is: the loop that runs it, and what Python says about it.

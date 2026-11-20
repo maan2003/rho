@@ -239,6 +239,8 @@ fn run() -> Result<()> {
                             || {
                                 Some(rho_chat::ui::Participant {
                                     label: agent.encoded(),
+                                    runtime: None,
+                                    created_at: None,
                                     doing: None,
                                     stopped_because: None,
                                 })

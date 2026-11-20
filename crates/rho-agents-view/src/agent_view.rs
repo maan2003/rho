@@ -81,7 +81,6 @@ impl HistoryWant {
 
 pub struct AgentModel {
     transcript: TranscriptModel,
-    multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript cropped flush when the
     /// turn is closed. Every editor over this model reads it.
     document_multi_buffer: Entity<MultiBuffer>,
@@ -132,7 +131,6 @@ impl AgentModel {
         );
         Self {
             transcript,
-            multi_buffer,
             document_multi_buffer,
             initial_load_started: false,
             initial_load_ready: false,
@@ -264,6 +262,23 @@ impl AgentModel {
             self.go_to_store_point(&editor, point, window, cx);
         }
         editor
+    }
+
+    pub(crate) fn errors(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+        self.transcript.error_points()
+    }
+
+    pub(crate) fn mail_point(&self, mail: &rho_agent_types::Message) -> Option<StorePoint> {
+        self.transcript.mail_point(mail)
+    }
+
+    pub(crate) fn tool_output_ranges(
+        &self,
+        cx: &App,
+    ) -> Vec<(String, bool, std::ops::Range<multi_buffer::Anchor>)> {
+        self.transcript.tool_output_ranges(cx)
     }
 
     /// How much of the transcript is composed nowhere yet, in blocks.
@@ -462,7 +477,7 @@ impl AgentModel {
             return false;
         };
         let Some(anchor) = self
-            .multi_buffer
+            .document_multi_buffer
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(anchor)
@@ -528,6 +543,7 @@ impl AgentModel {
         }
         self.transcript
             .sync(state, summary, now_ms, agent_label, cx);
+        cx.notify();
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {

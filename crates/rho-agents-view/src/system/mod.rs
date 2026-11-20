@@ -128,6 +128,7 @@ impl AgentsSystem {
                 }
             }
         });
+        AgentSurface::bind_keys(cx);
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
         rho_desktop_client::ui::bind_keys(cx);
@@ -150,6 +151,33 @@ impl AgentsSystem {
                 source.clone(),
                 cx,
             ),
+            ChatEvent::Inspect { agent, mail } => {
+                let agent = *agent;
+                let mail = mail.clone();
+                let system = cx.weak_entity();
+                this.frame.with(cx, move |frame, window, cx| {
+                    let Some(system) = system.upgrade() else {
+                        return;
+                    };
+                    if system.read(cx).registry.mirrored(agent).is_none() {
+                        frame.echo(
+                            "the agent's transcript is not available",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                        return;
+                    }
+                    frame.open(AgentRef(agent).address(), window, cx);
+                    if let Some(surface) = system
+                        .read(cx)
+                        .surfaces
+                        .get(&agent)
+                        .and_then(WeakEntity::upgrade)
+                    {
+                        surface.update(cx, |surface, cx| surface.inspect(mail, window, cx));
+                    }
+                });
+            }
             ChatEvent::Changed { .. } | ChatEvent::DraftSent(_) => {}
         });
         Self {
@@ -184,19 +212,30 @@ impl AgentsSystem {
     /// of what they do.
     pub fn participant(&self, endpoint: EndpointId, agent: AgentId) -> Option<Participant> {
         match self.host_of(endpoint) {
-            Some(_) => self.registry.mirrored(agent).map(|_| {
-                let heard = self.registry.agent_facts(agent).runtime;
-                Participant {
-                    label: self.registry.agent_display_label(agent),
-                    doing: heard.as_ref().map(|heard| heard.doing()),
-                    stopped_because: heard
-                        .as_ref()
-                        .and_then(|heard| heard.stopped_because())
-                        .map(str::to_owned),
-                }
-            }),
+            Some(host) => self
+                .registry
+                .mirrored(agent)
+                .filter(|entry| entry.host == host)
+                .map(|entry| {
+                    let heard = self.registry.agent_facts(agent).runtime;
+                    Participant {
+                        label: self.registry.agent_display_label(agent),
+                        runtime: Some(format!(
+                            "{}-{}",
+                            entry.identity.entry.spec.model, entry.identity.entry.spec.effort
+                        )),
+                        created_at: Some(entry.identity.entry.created_at),
+                        doing: heard.as_ref().map(|heard| heard.doing()),
+                        stopped_because: heard
+                            .as_ref()
+                            .and_then(|heard| heard.stopped_because())
+                            .map(str::to_owned),
+                    }
+                }),
             None => Some(Participant {
                 label: agent.encoded(),
+                runtime: None,
+                created_at: None,
                 doing: None,
                 stopped_because: None,
             }),
@@ -253,13 +292,27 @@ impl AgentsSystem {
                     self.land(agent_id, TranscriptFrame::Folded(delta), cx);
                 }
             }
-            ModelMsg::Read { agent_id } => {
+            ModelMsg::Read {
+                agent_id,
+                inspection,
+            } => {
                 if !self.transcripts.is_open(&agent_id) {
                     return;
                 }
                 let rows = self.client.read_transcript(agent_id);
                 if let Some(state) = self.transcripts.reread(agent_id, &rows) {
                     self.land(agent_id, TranscriptFrame::Fold(state), cx);
+                }
+                if let Some(mail) = inspection
+                    && let Some(surface) = self.surfaces.get(&agent_id).cloned()
+                {
+                    self.frame.with(cx, move |_, window, cx| {
+                        if let Some(surface) = surface.upgrade() {
+                            surface.update(cx, |surface, cx| {
+                                surface.read_inspection(mail, window, cx);
+                            });
+                        }
+                    });
                 }
             }
             ModelMsg::Runtime {
@@ -381,6 +434,14 @@ impl AgentsSystem {
 
     /// Opens an agent's transcript from the disk copy, with the runtime
     /// state already heard. Answers whether it was opened now.
+    pub(super) fn read_for_inspection(&self, agent: AgentId, mail: MessageId) -> bool {
+        let Some(host) = self.registry.host_of_agent(agent) else {
+            return false;
+        };
+        self.client.inspect_mail(host, agent, mail);
+        true
+    }
+
     fn seed(&mut self, agent: AgentId) -> bool {
         if self.transcripts.is_open(&agent) || self.registry.agent_workset(agent).is_none() {
             return false;
@@ -598,6 +659,28 @@ impl AgentsSystem {
         ))
     }
 
+    fn agent_thread(&self, agent: AgentId, cx: &App) -> Option<ThreadId> {
+        let mirrored = self.registry.mirrored(agent)?;
+        let host = self.registry.host_endpoint(mirrored.host)?;
+        let chat = self.chat.read(cx).chat(host)?;
+        let message = chat.agent_thread(agent).or_else(|| {
+            mirrored
+                .identity
+                .origin()
+                .map(|origin| chat.thread_of(origin))
+        })?;
+        Some(ThreadId { host, message })
+    }
+
+    fn brief(&self, agent: AgentId, cx: &App) -> Option<String> {
+        let mirrored = self.registry.mirrored(agent)?;
+        let host = self.registry.host_endpoint(mirrored.host)?;
+        let chat = self.chat.read(cx).chat(host)?;
+        let origin = mirrored.identity.origin()?;
+        let brief = chat.message(origin)?.text();
+        (!brief.trim().is_empty()).then_some(brief)
+    }
+
     fn open_transcript(
         &mut self,
         agent: AgentId,
@@ -606,7 +689,12 @@ impl AgentsSystem {
     ) -> AnySurface {
         let model = self.loaded_model(agent, cx);
         let system = cx.entity();
-        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, window, cx));
+        let failed = self
+            .registry
+            .agent_facts(agent)
+            .runtime
+            .is_some_and(|heard| heard.state.activity() == rho_agent_types::Activity::Failed);
+        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, failed, window, cx));
         self.surfaces.insert(agent, surface.downgrade());
         self._subscriptions
             .push(cx.observe_release(&surface, move |this, _, cx| {
@@ -638,7 +726,9 @@ impl AgentsSystem {
             return Vec::new();
         }
         let this = cx.entity();
-        let mut rows = Vec::new();
+        let mut rows = vec![Row::run("space", "verdicts", |_, window, cx| {
+            window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
+        })];
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
@@ -886,9 +976,19 @@ impl System for AgentsSystem {
             return Some(AnySurface::new(surface));
         }
         let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
-        self.registry.mirrored(agent)?;
+        let system = cx.weak_entity();
+        let related = move |cx: &App| {
+            system
+                .upgrade()?
+                .read(cx)
+                .agent_thread(agent, cx)
+                .map(|thread| thread.address())
+        };
+        if !matches!(part, Part::Desktop(_)) {
+            self.registry.mirrored(agent)?;
+        }
         let surface = match part {
-            Part::Transcript => return Some(self.open_transcript(agent, window, cx)),
+            Part::Transcript => self.open_transcript(agent, window, cx),
             Part::Terminal(terminal) => {
                 let (link, id, label) = self.workset_of(agent)?;
                 AnySurface::new(
@@ -900,11 +1000,32 @@ impl System for AgentsSystem {
                 AnySurface::new(cx.new(|cx| ShellSurface::new(link, id, label, window, cx)))
             }
             Part::Desktop(name) => {
-                let (link, id, label) = self.workset_of(agent)?;
+                let Some((link, id, label)) = self.workset_of(agent) else {
+                    let surface = cx.new(|cx| {
+                        DesktopSurface::unavailable(
+                            agent.encoded(),
+                            name,
+                            "the agent's host is not attached",
+                            cx,
+                        )
+                    });
+                    return Some(AnySurface::new(surface).with_related_card(related));
+                };
+                if !self.desktops_of(agent).contains(&name) {
+                    let surface = cx.new(|cx| {
+                        DesktopSurface::unavailable(
+                            label,
+                            name,
+                            "the agent no longer runs this desktop",
+                            cx,
+                        )
+                    });
+                    return Some(AnySurface::new(surface).with_related_card(related));
+                }
                 AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
             }
         };
-        Some(surface)
+        Some(surface.with_related_card(related))
     }
 
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
@@ -1032,17 +1153,26 @@ impl System for AgentsSystem {
                 recency: self.registry.agent_last_active(agent).map_or(0, |at| at.0),
             }
         });
-        let desktops = self.sessions.values().flatten().filter_map(|session| {
-            let agent = AgentId::from_encoded(&session.agent).ok()?;
-            let (title, host) = self.label(agent);
-            Some(Found {
-                address: AgentAddress::desktop(agent, session.name.clone())?.address(),
-                title: format!("{title} · desktop {}", session.name),
-                description: host,
-                thread: None,
-                recency: 0,
-            })
-        });
+        let desktops = self
+            .sessions
+            .iter()
+            .flat_map(|(host, sessions)| sessions.iter().map(move |session| (*host, session)))
+            .filter_map(|(host_id, session)| {
+                let agent = AgentId::from_encoded(&session.agent).ok()?;
+                if self.registry.host_of_agent(agent) != Some(host_id)
+                    || !self.links.contains_key(&host_id)
+                {
+                    return None;
+                }
+                let (title, host) = self.label(agent);
+                Some(Found {
+                    address: AgentAddress::desktop(agent, session.name.clone())?.address(),
+                    title: format!("{title} · desktop {}", session.name),
+                    description: host,
+                    thread: None,
+                    recency: 0,
+                })
+            });
         agents
             .chain(desktops)
             .chain(UsageChart::all().map(|chart| Found {

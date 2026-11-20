@@ -245,7 +245,8 @@ impl Frame {
             skip_until: None,
         });
         let said = format!("{verb}: {called}");
-        if self.card_in_view(cx).as_ref() != Some(address) {
+        if self.current_surface().inspects_card() || self.card_in_view(cx).as_ref() != Some(address)
+        {
             self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
             return;
@@ -393,12 +394,23 @@ impl Frame {
         // What the lamp is about is what is *not* in front of the reader:
         // the card they are already reading is not news.
         let in_view = self.card_in_view(cx);
-        let top = hand
-            .cards
-            .iter()
-            .find(|card| Some(&card.address) != in_view.as_ref());
+        let visible = if self.desk_in_view() {
+            self.desk.update(cx, |desk, cx| desk.visible_cards(cx))
+        } else {
+            Vec::new()
+        };
+        let top = hand.cards.iter().find(|card| {
+            Some(&card.address) != in_view.as_ref() && !visible.contains(&card.address)
+        });
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| journal_card(&card.address));
+        // Scrolling can uncover a card and light the lamp, but it cannot
+        // raise the card's priority and must not ring again.
+        let chime_card = hand
+            .cards
+            .iter()
+            .find(|card| Some(&card.address) != in_view.as_ref())
+            .map(|card| (card.priority, journal_card(&card.address)));
         self.signals.hand = hand;
         let lamp_on =
             max_priority.is_some_and(|priority| priority >= rho_dealer::curve::LAMP_THRESHOLD);
@@ -413,8 +425,9 @@ impl Frame {
                 card: card.clone(),
             });
         }
-        let chime_above =
-            max_priority.is_some_and(|priority| priority >= rho_dealer::curve::CHIME_THRESHOLD);
+        let chime_above = chime_card
+            .as_ref()
+            .is_some_and(|(priority, _)| *priority >= rho_dealer::curve::CHIME_THRESHOLD);
         if !self.signals.initialized {
             self.signals.initialized = true;
             self.signals.chime_above = chime_above;
@@ -423,7 +436,7 @@ impl Frame {
         }
         if chime_above
             && !self.signals.chime_above
-            && let (Some(priority), Some(card)) = (max_priority, card)
+            && let Some((priority, card)) = chime_card
         {
             (self.chime)();
             rho_journal::record(rho_journal::Event::ChimeRing {

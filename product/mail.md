@@ -63,6 +63,7 @@ purpose: carry a brief, an ask, or a result in the voice of the project, and let
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the user or the project's address as sender, the time, the words, what the mail quotes, `edited` after an edit, and proof on a result.
 does:
+- look into the work `enter` or a tap on the header: open the `agents.Agent` that wrote the mail at the step that produced its current words; a failed stop opens its error
 - reply: send the user's words to whoever wrote the mail
 - edit or delete: agents may change or take back their own mails, except that mail the user has answered stays as it was
 - reply privately: keep a remark beside this mail, as in `notes.Reply privately`
@@ -103,6 +104,7 @@ states:
 - error: the thread is unavailable; wording not agreed
 - full: the asking mail in view, with history and the draft tail reachable in the same buffer
 keys:
+- `enter` on an agent's mail: `Mail.look into the work`
 - `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
 - visual selection then `enter`: `Draft.quote`
 - `space`: `deal.Verdict`, anywhere in Normal mode

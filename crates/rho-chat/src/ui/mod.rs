@@ -20,7 +20,7 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
-    Address as Party, AgentId, ContentPart, Doing, EndpointId, MessageId, ThreadStatus,
+    Address as Party, AgentId, ContentPart, Doing, EndpointId, Message, MessageId, ThreadStatus,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -58,6 +58,8 @@ pub enum Event {
         client_id: u64,
         message: MessageId,
     },
+    /// The user opened the transcript from one of its mails.
+    Inspect { mail: Message, agent: AgentId },
     /// A host's forest changed.
     Changed { endpoint: EndpointId },
 }
@@ -84,6 +86,8 @@ struct Slot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
     pub label: String,
+    pub runtime: Option<String>,
+    pub created_at: Option<rho_agent_types::UnixMs>,
     /// `None` while its host has said nothing of it.
     pub doing: Option<Doing>,
     /// Why it stopped, in its host's words, while a failure stopped it.
@@ -180,6 +184,8 @@ impl ChatSystem {
             participants: Rc::new(|_, agent, _| {
                 Some(Participant {
                     label: agent.encoded(),
+                    runtime: None,
+                    created_at: None,
                     doing: None,
                     stopped_because: None,
                 })

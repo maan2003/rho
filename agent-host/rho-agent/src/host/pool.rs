@@ -1069,11 +1069,18 @@ impl AgentPool {
     }
 
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
-    pub async fn cancel(&self, agent: AgentId) -> anyhow::Result<()> {
-        if let Some(client) = self.get(agent).await {
+    pub async fn cancel(&self, agent: AgentId) -> anyhow::Result<bool> {
+        let Some(client) = self.get(agent).await else {
+            return Ok(false);
+        };
+        let asking = matches!(
+            client.status().runtime.inference,
+            InferenceState::Responding | InferenceState::Retrying { .. }
+        );
+        if asking {
             client.control(Control::Cancel).await?;
         }
-        Ok(())
+        Ok(asking)
     }
 
     /// Stop each workset's process and erase it: its log, heads, usage,
@@ -1382,6 +1389,16 @@ impl AgentPool {
                 } else {
                     write.post(at, parent, message, None)?
                 };
+                write.append(
+                    workset,
+                    &Record {
+                        at,
+                        event: Event::MailWritten {
+                            agent: sender,
+                            message: id,
+                        },
+                    },
+                )?;
                 write.commit();
                 self.wake_receivers(id, Some(workset));
                 if !direct {
@@ -1405,7 +1422,15 @@ impl AgentPool {
             } => {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
-                write.edit(UnixMs::now(), agent, message, content)?;
+                let at = UnixMs::now();
+                write.edit(at, agent, message, content)?;
+                write.append(
+                    workset,
+                    &Record {
+                        at,
+                        event: Event::MailWritten { agent, message },
+                    },
+                )?;
                 write.commit();
                 PyReply::Done
             }

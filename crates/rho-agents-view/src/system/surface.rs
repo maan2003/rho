@@ -1,27 +1,37 @@
 //! The surface over one agent's transcript.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use editor::Editor;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
-use rho_agent_types::AgentId;
+use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
+use rho_agent_types::{Activity, AgentId, Message, MessageId};
 use rho_agents_client::protocol::transcript::{RuntimeKind, RuntimeState};
 use rho_agents_client::protocol::worksets::Cancel;
 use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
-use rho_chat::ThreadId;
 use rho_frame::{Addressed as _, Candidate, Row, Subject, Surface};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use super::AgentsSystem;
-use crate::agent_view::AgentModel;
+use crate::agent_view::{AgentModel, AgentModelEvent};
+
+gpui::actions!(rho_agent, [NextError, PreviousError, ToggleOutput]);
+
+enum Inspect {
+    Reading(Message),
+    Ready(Message),
+}
 
 pub struct AgentSurface {
     system: Entity<AgentsSystem>,
     agent: AgentId,
     editor: Entity<Editor>,
-    _model: Entity<AgentModel>,
+    model: Entity<AgentModel>,
+    inspect_mail: Option<Inspect>,
+    default_landing: bool,
+    folded_calls: HashSet<String>,
 }
 
 impl AgentSurface {
@@ -29,17 +39,85 @@ impl AgentSurface {
         system: Entity<AgentsSystem>,
         agent: AgentId,
         model: Entity<AgentModel>,
+        failed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
         cx.observe(&system, |_, _, cx| cx.notify()).detach();
-        Self {
+        cx.observe_in(&model, window, |this, _, window, cx| {
+            this.update_folds(window, cx)
+        })
+        .detach();
+        cx.subscribe_in(
+            &model,
+            window,
+            |this, _, event: &AgentModelEvent, window, cx| {
+                this.update_folds(window, cx);
+                if matches!(event, AgentModelEvent::Loaded) {
+                    let mut landed = false;
+                    if matches!(&this.inspect_mail, Some(Inspect::Ready(_))) {
+                        landed = this.finish_inspection(window, cx);
+                    }
+                    if !landed
+                        && this.inspect_mail.is_none()
+                        && this.default_landing
+                        && this
+                            .runtime(cx)
+                            .is_some_and(|state| state.activity() == Activity::Failed)
+                    {
+                        this.jump_error(None, false, window, cx);
+                    }
+                    this.default_landing = false;
+                    this.model
+                        .update(cx, |model, cx| model.place_pending_point(window, cx));
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        let ready = model.read(cx).initial_load_ready();
+        let mut this = Self {
             system,
             agent,
             editor,
-            _model: model,
+            model,
+            inspect_mail: None,
+            default_landing: !ready,
+            folded_calls: HashSet::new(),
+        };
+        if ready {
+            this.update_folds(window, cx);
+            if failed {
+                this.jump_error(None, false, window, cx);
+            }
         }
+        this
+    }
+
+    fn title_with_folder(&self, compact: bool, cx: &App) -> String {
+        let system = self.system.read(cx);
+        let registry = system.registry();
+        let label = if compact {
+            registry.agent_id_label(self.agent)
+        } else {
+            registry.agent_display_label(self.agent)
+        };
+        let title = registry
+            .host_of_agent(self.agent)
+            .map_or(label.clone(), |host| {
+                format!("{} › {label}", registry.host_name(host))
+            });
+        registry
+            .working_directory(self.agent)
+            .map_or(title.clone(), |directory| {
+                let folder = if compact {
+                    directory.file_name().unwrap_or(directory.as_str())
+                } else {
+                    directory.as_str()
+                };
+                format!("{title} · {folder}")
+            })
     }
 
     fn runtime(&self, cx: &App) -> Option<RuntimeState> {
@@ -51,30 +129,169 @@ impl AgentSurface {
             .map(|heard| heard.state)
     }
 
-    /// The line over the transcript: who, where, and what it is doing.
-    fn header(&self, cx: &App) -> String {
-        let system = self.system.read(cx);
-        let registry = system.registry();
-        let mut words = vec![registry.agent_display_label(self.agent)];
-        if let Some(host) = registry.host_of_agent(self.agent) {
-            words.push(registry.host_name(host).to_owned());
+    pub(super) fn inspect(&mut self, mail: Message, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .system
+            .read(cx)
+            .read_for_inspection(self.agent, mail.id)
+        {
+            self.inspect_mail = Some(Inspect::Reading(mail));
+        } else {
+            self.inspect_mail = Some(Inspect::Ready(mail));
+            if self.model.read(cx).initial_load_ready() {
+                self.finish_inspection(window, cx);
+            }
         }
-        if let Some(directory) = registry.working_directory(self.agent) {
-            words.push(directory.to_string());
+    }
+
+    pub(super) fn read_inspection(
+        &mut self,
+        id: MessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(&self.inspect_mail, Some(Inspect::Reading(mail)) if mail.id == id)
+            && let Some(Inspect::Reading(mail)) = self.inspect_mail.take()
+        {
+            self.inspect_mail = Some(Inspect::Ready(mail));
+            if self.model.read(cx).initial_load_ready() {
+                self.finish_inspection(window, cx);
+            }
         }
-        if let Some(state) = self.runtime(cx) {
-            words.push(state.activity().word().to_owned());
+    }
+
+    fn finish_inspection(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(Inspect::Ready(mail)) = self.inspect_mail.take() else {
+            return false;
+        };
+        let Some(point) = self.model.read(cx).mail_point(&mail) else {
+            self.system.read(cx).frame.clone().echo(
+                "this transcript does not record where the mail was sent",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return false;
+        };
+        self.model.update(cx, |model, cx| {
+            model.go_to_store_point(&self.editor, point, window, cx)
+        });
+        true
+    }
+
+    fn jump_error(
+        &self,
+        current: Option<usize>,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = self.model.read(cx);
+        let point = if forward {
+            model
+                .errors()
+                .map(|(point, _, _)| point)
+                .find(|point| current.is_none_or(|cur| point.block > cur))
+        } else {
+            model
+                .errors()
+                .rev()
+                .map(|(point, _, _)| point)
+                .find(|point| current.is_none_or(|cur| point.block < cur))
+        };
+        if let Some(point) = point {
+            self.model.update(cx, |model, cx| {
+                model.go_to_store_point(&self.editor, point, window, cx)
+            });
         }
-        words.join(" · ")
+    }
+
+    fn move_error(&self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .model
+            .read(cx)
+            .store_point(&self.editor, cx)
+            .map(|point| point.block);
+        self.jump_error(current, forward, window, cx);
+    }
+
+    fn update_folds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ranges = self.model.read(cx).tool_output_ranges(cx);
+        let mut fold = Vec::new();
+        let mut unfold = Vec::new();
+        for (id, error, range) in ranges {
+            if error {
+                if self.folded_calls.remove(&id) {
+                    unfold.push(range);
+                }
+            } else if self.folded_calls.insert(id) {
+                fold.push(range);
+            }
+        }
+        if !fold.is_empty() || !unfold.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.unfold_ranges(&unfold, false, false, cx);
+                editor.fold_ranges(fold, false, window, cx);
+            });
+        }
+    }
+
+    fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
+        use multi_buffer::ToPoint as _;
+        let ranges = self.model.read(cx).tool_output_ranges(cx);
+        self.editor.update(cx, |editor, cx| {
+            let snap = editor.buffer().read(cx).snapshot(cx);
+            let row = editor.selections.newest_anchor().head().to_point(&snap).row;
+            if let Some((_, _, range)) = ranges
+                .into_iter()
+                .find(|(_, _, range)| range.start.to_point(&snap).row == row)
+            {
+                let folded = editor
+                    .display_snapshot(cx)
+                    .folds_in_range(range.clone())
+                    .next()
+                    .is_some();
+                if folded {
+                    editor.unfold_ranges(&[range], false, false, cx);
+                } else {
+                    editor.fold_ranges(vec![range], false, window, cx);
+                }
+            }
+        });
+    }
+
+    pub(super) fn bind_keys(cx: &mut App) {
+        for context in rho_frame::normal_contexts("RhoAgent", " && vim_operator == none") {
+            cx.bind_keys([
+                KeyBinding::new("] e", NextError, Some(&context)),
+                KeyBinding::new("[ e", PreviousError, Some(&context)),
+                KeyBinding::new("enter", ToggleOutput, Some(&context)),
+            ]);
+        }
     }
 }
 
 impl Surface for AgentSurface {
     fn title(&self, cx: &App) -> String {
-        self.system
+        self.title_with_folder(false, cx)
+    }
+
+    fn phone_title(&self, cx: &App) -> String {
+        self.title_with_folder(true, cx)
+    }
+
+    fn status(&self, cx: &App) -> Option<String> {
+        let activity = self.runtime(cx)?.activity().word();
+        let errors = self
+            .model
             .read(cx)
-            .registry()
-            .agent_display_label(self.agent)
+            .errors()
+            .map(|(_, times, _)| times)
+            .sum::<u32>();
+        Some(match errors {
+            0 => activity.to_owned(),
+            1 => format!("{activity} · 1 error"),
+            _ => format!("{activity} · {errors} errors"),
+        })
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -88,20 +305,7 @@ impl Surface for AgentSurface {
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let agent = self.agent;
         let mut rows = steer_rows(self.system.clone(), agent);
-        let origin = {
-            let system = self.system.read(cx);
-            let registry = system.registry();
-            registry
-                .mirrored(agent)
-                .and_then(|mirrored| mirrored.identity.origin())
-                .and_then(|message| {
-                    let host = registry.host_of_agent(agent)?;
-                    Some(ThreadId {
-                        host: registry.host_endpoint(host)?,
-                        message,
-                    })
-                })
-        };
+        let origin = self.system.read(cx).agent_thread(agent, cx);
         if let Some(thread) = origin {
             rows.push(Row::run(
                 "o",
@@ -143,13 +347,13 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
             "compact context",
             "c",
             Rc::new(move |_| snippets::compact(agent)),
-            |_, _| None,
+            |_, label| Some(format!("compacted: {label}")),
         ),
         eval(
             "new cache key",
             "k",
             Rc::new(move |_| snippets::new_cache_key(agent)),
-            |_, _| None,
+            |_, label| Some(format!("new cache key: {label}")),
         ),
     ];
     // Read when chosen, not here: the palette asks for rows while this
@@ -200,7 +404,10 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                                 agent,
                                 "set runtime",
                                 snippets::set_runtime(agent, &runtime),
-                                None,
+                                Some(format!(
+                                    "set runtime: {}",
+                                    system.registry().agent_display_label(agent)
+                                )),
                                 cx,
                             );
                         }),
@@ -226,14 +433,27 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                 );
                 return;
             };
+            use rho_agents_client::protocol::worksets::CancelResult;
             let reply = agents.call(Cancel { agent });
+            let label = system.registry().agent_display_label(agent);
             let link = system.frame.clone();
             cx.spawn(async move |_, cx| {
-                if let Err(error) = reply.await {
-                    cx.update(|cx| {
-                        link.echo(format!("{error:#}"), StyleClass::SystemImportant, cx)
-                    });
-                }
+                let result = reply.await;
+                cx.update(|cx| match result {
+                    Ok(CancelResult::WasAsking) => {
+                        link.echo(format!("cancelled: {label}"), StyleClass::SystemInfo, cx)
+                    }
+                    Ok(CancelResult::NoRequest) => link.echo(
+                        format!("not cancelled: {label} · it was not asking its model"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                    Err(error) => link.echo(
+                        format!("cancel the request: {error:#}"),
+                        StyleClass::SystemImportant,
+                        cx,
+                    ),
+                });
             })
             .detach();
         },
@@ -290,20 +510,31 @@ impl Focusable for AgentSurface {
 impl Render for AgentSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
+        let brief = self.system.read(cx).brief(self.agent, cx);
         div()
             .key_context("RhoAgent")
+            .on_action(
+                cx.listener(|this, _: &NextError, window, cx| this.move_error(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousError, window, cx| {
+                    this.move_error(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(Self::toggle_output))
             .size_full()
             .flex()
             .flex_col()
-            .child(
+            .children(brief.map(|brief| {
                 div()
+                    .flex_none()
                     .px_2()
                     .py_1()
-                    .text_color(colors.text_muted)
                     .border_b_1()
-                    .border_color(colors.border)
-                    .child(self.header(cx)),
-            )
+                    .border_color(colors.border_variant)
+                    .child(div().text_color(colors.text_muted).child("brief"))
+                    .child(div().line_clamp(4).child(brief))
+            }))
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
 }

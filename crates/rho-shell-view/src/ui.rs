@@ -14,8 +14,8 @@ use theme::ActiveTheme as _;
 
 use crate::protocol::PagerAction;
 use crate::{
-    ShellEof, ShellInterrupt, ShellModel, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    ShellSubmit, channel,
+    ShellEof, ShellInterrupt, ShellModel, ShellNext, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    ShellPrevious, ShellRecall, ShellSubmit, ShellWrite, channel,
 };
 
 /// What a shell surface stands on.
@@ -107,6 +107,49 @@ impl ShellSurface {
         }
     }
 
+    fn begin_write(&mut self, _: &ShellWrite, window: &mut Window, cx: &mut Context<Self>) {
+        let State::Open { model, editor } = &self.state else {
+            return;
+        };
+        model.update(cx, |model, cx| model.go_to_input(editor, window, cx));
+        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    fn recall_step(&mut self, previous: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let State::Open { model, editor } = &self.state else {
+            return;
+        };
+        model.update(cx, |model, cx| {
+            model.recall_step(previous, cx);
+            model.go_to_input(editor, window, cx);
+        });
+    }
+
+    fn recall_at_cursor(&mut self, _: &ShellRecall, window: &mut Window, cx: &mut Context<Self>) {
+        if let State::Open { model, editor } = &self.state
+            && model.update(cx, |model, cx| model.recall_at_cursor(editor, cx))
+        {
+            self.begin_write(&ShellWrite, window, cx);
+        }
+    }
+
+    fn tap_prompt(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let State::Open { model, editor } = &self.state
+            && let Some(anchor) = rho_frame::phone_editor_tap(editor.read(cx), event, window)
+            && model.read(cx).is_draft(anchor, cx)
+        {
+            self.begin_write(&ShellWrite, window, cx);
+            cx.stop_propagation();
+        }
+    }
+
     fn pager(&mut self, action: PagerAction, cx: &mut Context<Self>) {
         if let Some(model) = self.model() {
             model.read(cx).pager_action(action);
@@ -117,6 +160,29 @@ impl ShellSurface {
 impl Surface for ShellSurface {
     fn title(&self, _cx: &App) -> String {
         format!("{} · shell", self.label)
+    }
+
+    fn phone_tools(&self, typing: bool, _cx: &App) -> Vec<rho_frame::PhoneTool> {
+        if !matches!(self.state, State::Open { .. }) {
+            return Vec::new();
+        }
+        use rho_frame::PhoneTool;
+        if typing {
+            vec![
+                PhoneTool::new("↵", "run", |window, cx| {
+                    window.dispatch_action(Box::new(ShellSubmit), cx)
+                }),
+                PhoneTool::new("×", "cancel", |window, cx| {
+                    if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                        window.dispatch_action(action, cx);
+                    }
+                }),
+            ]
+        } else {
+            vec![PhoneTool::new("✎", "write", |window, cx| {
+                window.dispatch_action(Box::new(ShellWrite), cx)
+            })]
+        }
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -144,6 +210,18 @@ impl Render for ShellSurface {
             .size_full()
             .bg(colors.editor_background)
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::begin_write))
+            .on_action(cx.listener(Self::recall_at_cursor))
+            .on_action(
+                cx.listener(|this, _: &ShellPrevious, window, cx| {
+                    this.recall_step(true, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShellNext, window, cx| this.recall_step(false, window, cx)),
+            )
+            .id("rho-shell")
+            .capture_any_mouse_down(cx.listener(Self::tap_prompt))
             .on_action(cx.listener(Self::interrupt))
             .on_action(cx.listener(Self::eof))
             .on_action(
@@ -181,6 +259,10 @@ pub fn bind_keys(cx: &mut App) {
     let insert = "RhoShell > Editor && vim_mode == insert";
     cx.bind_keys([
         KeyBinding::new("enter", ShellSubmit, Some(insert)),
+        KeyBinding::new("up", ShellPrevious, Some(insert)),
+        KeyBinding::new("ctrl-p", ShellPrevious, Some(insert)),
+        KeyBinding::new("down", ShellNext, Some(insert)),
+        KeyBinding::new("ctrl-n", ShellNext, Some(insert)),
         KeyBinding::new("ctrl-c", ShellInterrupt, Some(insert)),
         KeyBinding::new("ctrl-d", ShellEof, Some(insert)),
         KeyBinding::new("alt-enter", ShellPagerMore, Some("RhoShell > Editor")),
@@ -189,4 +271,10 @@ pub fn bind_keys(cx: &mut App) {
         // Before the shell is attached there is no editor: `q` still closes.
         KeyBinding::new("q", Close, Some("RhoShellNote")),
     ]);
+    for context in rho_frame::normal_contexts("RhoShell", " && vim_operator == none") {
+        cx.bind_keys([
+            KeyBinding::new("i", ShellWrite, Some(&context)),
+            KeyBinding::new("enter", ShellRecall, Some(&context)),
+        ]);
+    }
 }

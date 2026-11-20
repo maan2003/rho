@@ -35,11 +35,51 @@ pub enum Mode {
     Insert,
 }
 
+/// One surface-specific key on the phone's keyboard bar.
+#[derive(Clone)]
+pub struct PhoneTool {
+    pub icon: &'static str,
+    pub label: &'static str,
+    pub active: bool,
+    run: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl PhoneTool {
+    pub fn new(
+        icon: &'static str,
+        label: &'static str,
+        run: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon,
+            label,
+            active: false,
+            run: Rc::new(run),
+        }
+    }
+
+    pub(crate) fn press(&self, window: &mut Window, cx: &mut App) {
+        (self.run)(window, cx);
+    }
+}
+
 /// A view the frame can show. Its address is the frame's to know; the
 /// surface says what it is called, what it is a buffer of, and what the
 /// point is on.
 pub trait Surface: Render + Focusable + Sized + 'static {
     fn title(&self, cx: &App) -> String;
+
+    fn phone_title(&self, cx: &App) -> String {
+        self.title(cx)
+    }
+
+    fn status(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
+    fn phone_tools(&self, _typing: bool, _cx: &App) -> Vec<PhoneTool> {
+        Vec::new()
+    }
 
     /// The editor the surface is a buffer of, when it is one: what vim,
     /// search and the chrome's text style read.
@@ -96,6 +136,9 @@ trait SurfaceHandle {
     fn view(&self) -> AnyView;
     fn entity_id(&self) -> EntityId;
     fn title(&self, cx: &App) -> String;
+    fn phone_title(&self, cx: &App) -> String;
+    fn status(&self, cx: &App) -> Option<String>;
+    fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool>;
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subject(&self, cx: &App) -> Subject;
@@ -119,6 +162,18 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn title(&self, cx: &App) -> String {
         self.read(cx).title(cx)
+    }
+
+    fn phone_title(&self, cx: &App) -> String {
+        self.read(cx).phone_title(cx)
+    }
+
+    fn status(&self, cx: &App) -> Option<String> {
+        self.read(cx).status(cx)
+    }
+
+    fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool> {
+        self.read(cx).phone_tools(typing, cx)
     }
 
     fn editor(&self, cx: &App) -> Option<Entity<Editor>> {
@@ -163,12 +218,26 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 }
 
 /// A surface of any type, as the frame holds it.
+type RelatedCard = Rc<dyn Fn(&App) -> Option<Address>>;
+
 #[derive(Clone)]
-pub struct AnySurface(Rc<dyn SurfaceHandle>);
+pub struct AnySurface(Rc<dyn SurfaceHandle>, Option<RelatedCard>);
 
 impl AnySurface {
     pub fn new<S: Surface>(entity: Entity<S>) -> Self {
-        Self(Rc::new(entity))
+        Self(Rc::new(entity), None)
+    }
+
+    /// The screen is for inspecting another place's card, not for leaving
+    /// the screen when that card is settled. `None` means there is no such
+    /// place.
+    pub fn with_related_card(mut self, find: impl Fn(&App) -> Option<Address> + 'static) -> Self {
+        self.1 = Some(Rc::new(find));
+        self
+    }
+
+    pub fn inspects_card(&self) -> bool {
+        self.1.is_some()
     }
 
     pub fn view(&self) -> AnyView {
@@ -181,6 +250,18 @@ impl AnySurface {
 
     pub fn title(&self, cx: &App) -> String {
         self.0.title(cx)
+    }
+
+    pub(crate) fn phone_title(&self, cx: &App) -> String {
+        self.0.phone_title(cx)
+    }
+
+    pub fn status(&self, cx: &App) -> Option<String> {
+        self.0.status(cx)
+    }
+
+    pub(crate) fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool> {
+        self.0.phone_tools(typing, cx)
     }
 
     pub fn editor(&self, cx: &App) -> Option<Entity<Editor>> {
@@ -200,7 +281,10 @@ impl AnySurface {
     }
 
     pub fn card(&self, cx: &App) -> Subject {
-        self.0.card(cx)
+        self.1.as_ref().map_or_else(
+            || self.0.card(cx),
+            |find| find(cx).map_or(Subject::None, Subject::Address),
+        )
     }
 
     pub(crate) fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>> {

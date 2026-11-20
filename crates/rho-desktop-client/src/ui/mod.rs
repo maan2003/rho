@@ -37,6 +37,16 @@ pub struct DesktopSurface {
 }
 
 impl DesktopSurface {
+    pub fn unavailable(label: String, name: String, reason: &str, cx: &mut Context<Self>) -> Self {
+        Self {
+            agent: label.clone(),
+            label,
+            name,
+            state: State::Failed(reason.into()),
+            focus: cx.focus_handle(),
+        }
+    }
+
     /// Dials desktop `name` of `agent` (its encoded id) over `link`, the
     /// agent's host. `label` is what the title calls the agent.
     pub fn new(
@@ -135,6 +145,7 @@ pub fn bind_keys(cx: &mut App) {
         // frame's own chord, `ctrl-shift-;`, which no application sees.
         KeyBinding::new(":", Palette, Some("RhoDesktopNote")),
         KeyBinding::new("space", VerdictMenu, Some("RhoDesktopNote")),
+        KeyBinding::new("space", VerdictMenu, Some("RhoDesktop")),
         KeyBinding::new("q", Close, Some("RhoDesktopNote")),
     ]);
 }

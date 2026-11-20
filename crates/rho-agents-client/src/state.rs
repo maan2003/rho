@@ -53,6 +53,11 @@ pub enum UiBlock {
         text: String,
     },
     Tool(UiTool),
+    /// The point where a specific piece of mail was written. The mail remains
+    /// in the thread even if the model's turn is rewound.
+    MailWritten {
+        message: rho_agent_types::MessageId,
+    },
     Notice {
         text: String,
         /// How many times in a row it was said: an error a retry hit
@@ -70,6 +75,11 @@ pub enum UiBlock {
     /// just above the draft: the status bar is too narrow to hold it.
     Status {
         text: String,
+    },
+    Failure {
+        text: String,
+        times: u32,
+        at: UnixMs,
     },
 }
 
@@ -89,7 +99,7 @@ pub enum UiAgentStatus {
         outstanding_calls: usize,
     },
     /// The turn failed permanently; the error text is the trailing unsealed
-    /// [`UiBlock::Notice`].
+    /// [`UiBlock::Failure`].
     Error,
 }
 

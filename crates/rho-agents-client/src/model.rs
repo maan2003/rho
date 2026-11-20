@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_hosts::HostStream;
-use rho_agent_types::{AgentId, EndpointId, WorksetId, WorksetKind, Wpos};
+use rho_agent_types::{AgentId, EndpointId, MessageId, WorksetId, WorksetKind, Wpos};
 
 use crate::HostId;
 use crate::fold::{AgentIdentity, MirroredAgent};
@@ -51,7 +51,11 @@ pub enum ModelMsg {
     /// A followed agent's workset log is read to its end and on disk. The
     /// transcript is the disk copy now ([`AgentsClient::read_transcript`]);
     /// the read's pages are not handed up one by one.
-    Read { agent_id: AgentId },
+    Read {
+        agent_id: AgentId,
+        /// The mail whose inspection requested a new read, if any.
+        inspection: Option<MessageId>,
+    },
     /// What an agent's runtime is doing, for every agent.
     Runtime {
         agent_id: AgentId,
@@ -99,6 +103,11 @@ pub enum ModelCommand {
     DetachHost(HostId),
     /// The agents whose rows the main thread wants, replaced wholesale.
     Follow(BTreeSet<AgentId>),
+    InspectMail {
+        host: HostId,
+        agent: AgentId,
+        mail: MessageId,
+    },
 }
 
 /// What reaches the model, in the order the main thread and the
@@ -119,6 +128,7 @@ enum AgentRows {
     /// workset's follow pushes meanwhile wait for the read's end.
     Reading {
         read: ReadId,
+        inspection: Option<MessageId>,
         heard: Vec<(Wpos, LogEvent)>,
     },
     /// Read: its rows come as its workset's follow pushes them, from
@@ -194,10 +204,10 @@ impl HostModel {
 
     /// Reads an agent's log from where the copy stands to its end; the
     /// stream's opening reads an agent followed before it.
-    fn read(&mut self, agent: AgentId) {
+    fn read(&mut self, agent: AgentId, inspection: Option<MessageId>) -> bool {
         let (Some(commands), true) = (self.commands.as_ref(), self.open) else {
             self.agents.insert(agent, AgentRows::Unread);
-            return;
+            return false;
         };
         let read = ReadId(self.next_read);
         self.next_read += 1;
@@ -206,18 +216,23 @@ impl HostModel {
             agent,
             AgentRows::Reading {
                 read,
+                inspection,
                 heard: Vec::new(),
             },
         );
+        true
     }
 }
 
 /// A followed agent's log read to its end, or as far as it could be: its
 /// transcript is its disk copy now.
-fn read_ended(host: HostId, agent_id: AgentId) -> Vec<ModelEvent> {
+fn read_ended(host: HostId, agent_id: AgentId, inspection: Option<MessageId>) -> Vec<ModelEvent> {
     vec![ModelEvent {
         host,
-        msg: ModelMsg::Read { agent_id },
+        msg: ModelMsg::Read {
+            agent_id,
+            inspection,
+        },
     }]
 }
 
@@ -276,6 +291,15 @@ impl Model {
                     self.refollow(host);
                 }
                 Vec::new()
+            }
+            ModelCommand::InspectMail { host, agent, mail } => {
+                if self.hosts.get_mut(&host).is_some_and(|slot| {
+                    slot.agents.contains_key(&agent) && slot.read(agent, Some(mail))
+                }) {
+                    Vec::new()
+                } else {
+                    read_ended(host, agent, Some(mail))
+                }
             }
         }
     }
@@ -384,8 +408,14 @@ impl Model {
                 if !slot.reads(agent, read) {
                     return Vec::new();
                 }
-                slot.agents.insert(agent, AgentRows::Unread);
-                read_ended(host, agent)
+                let Some(AgentRows::Reading {
+                    heard, inspection, ..
+                }) = slot.agents.insert(agent, AgentRows::Unread)
+                else {
+                    unreachable!("the agent is being read");
+                };
+                crate::cache::write_rows(agent, heard);
+                read_ended(host, agent, inspection)
             }
         }
     }
@@ -429,7 +459,10 @@ impl Model {
                 slot.follow_worksets();
             }
         }
-        let Some(AgentRows::Reading { heard, .. }) = slot.agents.remove(&agent) else {
+        let Some(AgentRows::Reading {
+            heard, inspection, ..
+        }) = slot.agents.remove(&agent)
+        else {
             unreachable!("the agent is being read");
         };
         let heard = heard
@@ -439,7 +472,7 @@ impl Model {
         let next = heard.last().map_or(end, |(pos, _)| pos.next());
         crate::cache::write_rows(agent, heard);
         slot.agents.insert(agent, AgentRows::Live { next });
-        read_ended(host, agent)
+        read_ended(host, agent, inspection)
     }
 
     /// An agents stream that has opened, and whether it is the database
@@ -490,7 +523,11 @@ impl Model {
         slot.worksets.clear();
         let agents = slot.agents.keys().copied().collect::<Vec<_>>();
         for agent in agents {
-            slot.read(agent);
+            let inspection = match slot.agents.get(&agent) {
+                Some(AgentRows::Reading { inspection, .. }) => *inspection,
+                _ => None,
+            };
+            slot.read(agent, inspection);
         }
         slot.follow_worksets();
     }
@@ -517,7 +554,7 @@ impl Model {
         slot.worksets
             .retain(|workset, _| worksets.contains(workset));
         for agent in needed.keys().filter(|agent| !held.contains(agent)) {
-            slot.read(*agent);
+            slot.read(*agent, None);
         }
         slot.follow_worksets();
     }
@@ -780,6 +817,12 @@ impl AgentsClient {
         self.command(ModelCommand::Follow(agents));
     }
 
+    /// Read after hearing about this mail. The chat and agent streams can
+    /// arrive in either order, but a fresh read sees the host's atomic write.
+    pub fn inspect_mail(&self, host: HostId, agent: AgentId, mail: MessageId) {
+        self.command(ModelCommand::InspectMail { host, agent, mail });
+    }
+
     /// Everything the disk copy holds of an agent's transcript: its rows,
     /// oldest first. The copy may trail what was just heard by a queued
     /// write; this waits for it.
@@ -955,6 +998,7 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -967,7 +1011,7 @@ mod tests {
                 ModelMsg::Rows { agent_id, rows } => {
                     Some((*agent_id, Some(rows.iter().map(|(pos, _)| pos.0).collect())))
                 }
-                ModelMsg::Read { agent_id } => Some((*agent_id, None)),
+                ModelMsg::Read { agent_id, .. } => Some((*agent_id, None)),
                 _ => None,
             })
             .collect()
@@ -992,6 +1036,51 @@ mod tests {
             rows,
         }
         .into()
+    }
+
+    #[test]
+    fn mail_inspection_waits_for_a_read_that_started_after_it_was_requested() {
+        let mut model = model();
+        let (stream, commands) = AgentStream::new(HOST, futures_mpsc::unbounded().0);
+        model.command(ModelCommand::HostCommands {
+            host: HOST,
+            commands,
+        });
+        model.ingest(HOST, hello());
+        model.ingest(HOST, directory(&[(agent(1), workset(1))]));
+        model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
+        said(&stream);
+
+        let mail = MessageId(rho_agent_types::ChatSeq(29));
+        let out = model.command(ModelCommand::InspectMail {
+            host: HOST,
+            agent: agent(1),
+            mail,
+        });
+        assert!(out.is_empty());
+        assert_eq!(
+            said(&stream),
+            [format!("ReadLog {} 0 #1", agent(1).encoded())]
+        );
+
+        // A result from the in-flight original follow cannot settle the newer
+        // request, even when the destination transcript's agent is the same.
+        let obsolete = model.ingest(
+            HOST,
+            page(agent(1), 0, Vec::new(), LogNext::Follow(Wpos(3))),
+        );
+        assert!(obsolete.is_empty());
+        let partial = model.ingest(HOST, page(agent(1), 1, Vec::new(), LogNext::Page(Wpos(3))));
+        assert!(partial.is_empty());
+        let current = model.ingest(
+            HOST,
+            page(agent(1), 1, Vec::new(), LogNext::Follow(Wpos(8))),
+        );
+        assert!(matches!(
+            current.as_slice(),
+            [ModelEvent { msg: ModelMsg::Read { agent_id, inspection: Some(found) }, .. }]
+                if *agent_id == agent(1) && *found == mail
+        ));
     }
 
     /// Following an agent reads its own log to the end, then asks the host

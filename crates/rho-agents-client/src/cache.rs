@@ -29,18 +29,20 @@ const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_
 const AGENTS: TableDefinition<AgentId, Sen<StoredAgent>> = TableDefinition::new("gui_agent_v1");
 /// The rows of each agent whose transcript was opened, by position.
 const ROWS: TableDefinition<(AgentId, u64), Sen<LogEvent>> =
-    TableDefinition::new("gui_agent_rows_v2");
+    TableDefinition::new("gui_agent_rows_v3");
 
 /// Copies of the chat this crate kept when the worksets session carried
-/// it, and the host cursor that counted in it. Copies only, so they go.
+/// it, the host cursor that counted in it, and transcript rows whose old
+/// call-result shape cannot decode. Copies only, so they go.
 /// The user's unsent messages and drafts (`gui_chat_outbox_v1`,
 /// `gui_topic_draft_v1`) have no other copy and are left where they are.
-const RETIRED: [&str; 5] = [
+const RETIRED: [&str; 6] = [
     "gui_chat_host_v1",
     "gui_chat_v1",
     "gui_chat_message_v1",
     "gui_chat_agent_v2",
     "gui_chat_where_v1",
+    "gui_agent_rows_v2",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -486,8 +488,45 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(1),
         }
+    }
+
+    #[test]
+    fn upgrading_retires_only_the_incompatible_transcript_copy() {
+        const OLD: TableDefinition<(AgentId, u64), &[u8]> =
+            TableDefinition::new("gui_agent_rows_v2");
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(dir.path()).unwrap();
+        let a = agent_id(1);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut write = db.write().await;
+            write
+                .open_table(OLD)
+                .insert((a, 28), b"old call row".as_slice());
+            write
+                .open_table(AGENTS)
+                .insert(a, SenValue::borrowed(&stored(a, "fern", workset(1))));
+            write.commit();
+        });
+        let mirror = Mirror::open_on(db.clone()).unwrap();
+        assert!(
+            mirror
+                .load()
+                .agents
+                .iter()
+                .any(|agent| agent.identity.agent_id() == a)
+        );
+        assert_eq!(mirror.rows_next(a), Wpos::ZERO);
+        assert!(
+            mirror.read_rows(a).is_empty(),
+            "the host can fill the new copy from zero"
+        );
+        assert!(!db.read().has_table(OLD.name()));
     }
 
     /// What the copy reads back is what it was told: each host's database,

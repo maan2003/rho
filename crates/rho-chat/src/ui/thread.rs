@@ -977,7 +977,47 @@ impl ThreadView {
         }
     }
 
-    /// Enter opens the thing under the point: a quote, link, tangent or crumb.
+    fn agent_mail(&self, row: u32, cx: &App) -> Option<(rho_agent_types::AgentId, Message)> {
+        let system = self.system.read(cx);
+        if self.is_list(system) {
+            return None;
+        }
+        let id = self.transcript.line_meta(row, cx)?.mail()?;
+        let mail = system.chat(self.thread.host)?.message(id)?;
+        let agent = match mail.from {
+            Party::Agent(agent) | Party::System { agent, .. } => agent,
+            Party::User => return None,
+        };
+        Some((agent, mail.clone()))
+    }
+
+    fn inspect(&self, agent: rho_agent_types::AgentId, mail: Message, cx: &mut Context<Self>) {
+        self.system
+            .update(cx, |_, cx| cx.emit(Event::Inspect { mail, agent }));
+    }
+
+    fn tap_mail_header(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.read(cx);
+        let Some(anchor) = rho_frame::phone_editor_tap(editor, event, window) else {
+            return;
+        };
+        let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
+        if let Some((agent, mail)) = self.agent_mail(row, cx)
+            && self.item_row(&Key::Message(mail.id), cx) == Some(row)
+        {
+            self.inspect(agent, mail, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
+    /// Enter opens the thing under the point: a quote, link, agent's mail,
+    /// tangent or crumb.
     fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
         let cursor = self.cursor_row(cx);
         let meta = self.transcript.line_meta(cursor, cx).cloned();
@@ -993,6 +1033,10 @@ impl ThreadView {
         }
         if let Some(Meta::Quote(quote)) = meta {
             self.toggle_quote(quote, cx);
+            return;
+        }
+        if let Some((agent, mail)) = self.agent_mail(cursor, cx) {
+            self.inspect(agent, mail, cx);
             return;
         }
         let host = self.thread.host;
@@ -1276,84 +1320,84 @@ impl Surface for ThreadView {
                 .chat(self.thread.host)
                 .map(|chat| chat.members_under(Some(self.thread.message)))
                 .unwrap_or_default();
-            let mut agents: Vec<_> = members
-                .into_iter()
-                .filter_map(|id| {
-                    let participant = system.participant(self.thread.host, id, cx)?;
-                    let state = participant.doing.map(|doing| doing.activity.word());
-                    Some((id, participant.label, state))
-                })
-                .collect();
-            // The prompt groups the choices by their state, then by name.
-            agents.sort_by(|a, b| (a.2, &a.1, a.0).cmp(&(b.2, &b.1, b.0)));
-            match agents.as_slice() {
-                [] => {}
-                [(id, _, _)] => {
-                    let agent = AgentRef(*id).address();
+            let mail = (!self.on_draft(cx))
+                .then(|| self.agent_mail(self.cursor_row(cx), cx))
+                .flatten();
+            if let Some((agent, mail)) = mail {
+                let inspector = this.clone();
+                rows.push(Row::run("enter", "look into the work", move |_, _, cx| {
+                    inspector.update(cx, |view, cx| view.inspect(agent, mail.clone(), cx));
+                }));
+            } else {
+                let mut agents: Vec<_> = members
+                    .into_iter()
+                    .filter_map(|id| Some((id, system.participant(self.thread.host, id, cx)?)))
+                    .collect();
+                agents.sort_by_key(|(id, participant)| {
+                    (std::cmp::Reverse(participant.created_at), *id)
+                });
+                if !agents.is_empty() {
+                    let choices: Vec<_> = agents
+                        .iter()
+                        .map(|(id, participant)| {
+                            let name = &participant.label;
+                            let value = if agents
+                                .iter()
+                                .filter(|(_, other)| other.label == *name)
+                                .count()
+                                > 1
+                            {
+                                format!("{name} · {}", id.encoded())
+                            } else {
+                                name.clone()
+                            };
+                            let description = participant
+                                .runtime
+                                .iter()
+                                .map(String::as_str)
+                                .chain(participant.doing.map(|doing| doing.activity.word()))
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            (value, description, AgentRef(*id).address())
+                        })
+                        .collect();
                     rows.push(Row::run(
                         "",
                         "look into the work",
                         move |frame, window, cx| {
-                            frame.open(agent.clone(), window, cx);
+                            let suggestions = choices.clone();
+                            let choices = choices.clone();
+                            frame.open_prompt(
+                                "look into the work:",
+                                Rc::new(move |_, query, _| {
+                                    let query = query.to_lowercase();
+                                    suggestions
+                                        .iter()
+                                        .filter(|(name, description, _)| {
+                                            name.to_lowercase().contains(&query)
+                                                || description.contains(&query)
+                                        })
+                                        .map(|(name, description, _)| Candidate {
+                                            value: name.clone(),
+                                            description: description.clone(),
+                                        })
+                                        .collect()
+                                }),
+                                Rc::new(move |frame, input, window, cx| {
+                                    if let Some((_, _, address)) =
+                                        choices.iter().find(|(name, _, _)| name == input.trim())
+                                    {
+                                        frame.open(address.clone(), window, cx);
+                                    } else {
+                                        frame.echo("no such agent", StyleClass::SystemInfo, cx);
+                                    }
+                                }),
+                                window,
+                                cx,
+                            );
                         },
                     ));
                 }
-                _ => rows.push(Row::run(
-                    "",
-                    "look into the work",
-                    move |frame, window, cx| {
-                        // Host labels need not be unique. Only duplicate labels
-                        // gain an id in the chooser so each choice routes
-                        // exactly.
-                        let choices: Vec<_> = agents
-                            .iter()
-                            .map(|(id, name, state)| {
-                                let value =
-                                    if agents.iter().filter(|(_, other, _)| other == name).count()
-                                        > 1
-                                    {
-                                        format!("{name} · {}", id.encoded())
-                                    } else {
-                                        name.clone()
-                                    };
-                                (
-                                    value,
-                                    state.unwrap_or("state unknown"),
-                                    AgentRef(*id).address(),
-                                )
-                            })
-                            .collect();
-                        let suggestions = choices.clone();
-                        frame.open_prompt(
-                            "look into the work:",
-                            Rc::new(move |_, query, _| {
-                                let query = query.to_lowercase();
-                                suggestions
-                                    .iter()
-                                    .filter(|(name, state, _)| {
-                                        name.to_lowercase().contains(&query)
-                                            || state.contains(&query)
-                                    })
-                                    .map(|(name, state, _)| Candidate {
-                                        value: name.clone(),
-                                        description: (*state).to_owned(),
-                                    })
-                                    .collect()
-                            }),
-                            Rc::new(move |frame, input, window, cx| {
-                                if let Some((_, _, address)) =
-                                    choices.iter().find(|(name, _, _)| name == input.trim())
-                                {
-                                    frame.open(address.clone(), window, cx);
-                                } else {
-                                    frame.echo("no such agent", StyleClass::SystemInfo, cx);
-                                }
-                            }),
-                            window,
-                            cx,
-                        );
-                    },
-                )),
             }
             // The thumb's Open action mirrors Enter, including on a quote.
             if matches!(
@@ -1426,6 +1470,7 @@ impl Render for ThreadView {
             // selection is disabled. Capture the draft's pointer down
             // before it; GPUI also routes a completed tap this way.
             .capture_any_mouse_down(cx.listener(Self::tap_tail))
+            .capture_any_mouse_down(cx.listener(Self::tap_mail_header))
             .child(self.editor.clone())
     }
 }
