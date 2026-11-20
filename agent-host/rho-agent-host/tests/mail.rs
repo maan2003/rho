@@ -231,16 +231,32 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     }
     write_frame(&mut stream, &ClientFrame::View { thread: None }).await?;
     rustix::process::kill_process(worker, rustix::process::Signal::KILL)?;
-    let stopped = wait_for_mail(&mut stream, |row| {
-        matches!(
-            row.event, ChatEvent::Posted {
-                parent: Some(parent),
-                from: Address::System { agent: stopped, stop: Stop::Lost, .. },
-                ..
-            } if parent == thread && stopped == agent
-        )
-    })
-    .await?;
+    let mut stop_mail = None;
+    let mut status_cleared = false;
+    let stopped = loop {
+        match read_frame(&mut stream).await? {
+            ServerFrame::Chat { records } => {
+                stop_mail = stop_mail.or_else(|| {
+                    records.into_iter().find(|row| {
+                        matches!(
+                            row.event, ChatEvent::Posted {
+                                parent: Some(parent),
+                                from: Address::System { agent: stopped, stop: Stop::Lost, .. },
+                                ..
+                            } if parent == thread && stopped == agent
+                        )
+                    })
+                });
+            }
+            ServerFrame::Statuses { statuses } => {
+                status_cleared = !statuses.iter().any(|status| status.thread == thread);
+            }
+            ServerFrame::Hello { .. } => {}
+        }
+        if status_cleared && let Some(mail) = stop_mail.take() {
+            break mail;
+        }
+    };
     let ChatEvent::Posted {
         mentions, content, ..
     } = stopped.event
@@ -292,7 +308,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
         }]
     );
     Ok(format!(
-        "mail wire: project {}, fake model result #{}, status, edit/delete #{}, lost stop #{}, and addressed reply #{}",
+        "mail wire: project {}, fake model result #{}, status set/cleared, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
 }

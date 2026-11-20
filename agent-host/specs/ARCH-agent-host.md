@@ -120,7 +120,8 @@ those two messages; a name anyone gives wins over it, before or after. Nothing r
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
 
-A thread's current status is host memory, sent outside the log. The GUI
+A thread's current status is host memory, sent outside the log. A stop
+clears that status only if the stopped agent wrote the current line. The GUI
 reports thread focus without changing its verdict; an open thread or a
 user reply keeps it warm. Once a thread cools, the next model request can
 carry a one-time writing notice without initiating a request of its own.

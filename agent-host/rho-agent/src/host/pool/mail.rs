@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use rho_agent_types::{Address, AgentId, Doing, Message, MessageId, Stop, UnixMs};
+use rho_agent_types::{Address, AgentId, Doing, Message, MessageId, Stop, ThreadStatus, UnixMs};
 use tokio::sync::watch;
 
 use super::AgentPool;
@@ -16,14 +16,26 @@ const COLD_AFTER: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Default)]
 pub(super) struct Mail {
-    statuses: Mutex<BTreeMap<MessageId, rho_agent_types::ThreadStatus>>,
+    statuses: Mutex<BTreeMap<MessageId, Status>>,
     status_changed: watch::Sender<()>,
     presence: Mutex<Presence>,
     retry_checks: Mutex<HashMap<AgentId, tokio::task::JoinHandle<()>>>,
 }
 
+struct Status {
+    owner: AgentId,
+    at: UnixMs,
+    text: String,
+}
+
 impl Mail {
-    fn set_status(&self, thread: MessageId, text: String, at: UnixMs) -> anyhow::Result<()> {
+    fn set_status(
+        &self,
+        thread: MessageId,
+        owner: AgentId,
+        text: String,
+        at: UnixMs,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             !text.contains(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}']),
             "status is one line"
@@ -39,10 +51,32 @@ impl Mail {
                 return Ok(());
             }
         } else {
-            held.insert(thread, rho_agent_types::ThreadStatus { thread, at, text });
+            held.insert(thread, Status { owner, at, text });
         }
         self.status_changed.send_replace(());
         Ok(())
+    }
+
+    fn clear_stopped_status(&self, agent: AgentId) {
+        let mut held = self.statuses.lock().expect("poison");
+        let before = held.len();
+        held.retain(|_, status| status.owner != agent);
+        if held.len() != before {
+            self.status_changed.send_replace(());
+        }
+    }
+
+    fn status_snapshot(&self) -> Vec<ThreadStatus> {
+        self.statuses
+            .lock()
+            .expect("poison")
+            .iter()
+            .map(|(&thread, status)| ThreadStatus {
+                thread,
+                at: status.at,
+                text: status.text.clone(),
+            })
+            .collect()
     }
 }
 
@@ -127,14 +161,8 @@ impl AgentPool {
         self.mail.status_changed.subscribe()
     }
 
-    pub fn thread_statuses(&self) -> Vec<rho_agent_types::ThreadStatus> {
-        self.mail
-            .statuses
-            .lock()
-            .expect("poison")
-            .values()
-            .cloned()
-            .collect()
+    pub fn thread_statuses(&self) -> Vec<ThreadStatus> {
+        self.mail.status_snapshot()
     }
 
     pub(super) fn set_thread_status(
@@ -153,7 +181,7 @@ impl AgentPool {
             "you are not in thread #{}",
             thread.0.0
         );
-        self.mail.set_status(thread, text, UnixMs::now())
+        self.mail.set_status(thread, agent, text, UnixMs::now())
     }
 
     pub(super) fn user_visited(&self, message: MessageId) {
@@ -216,6 +244,7 @@ impl AgentPool {
         };
         let weak = Arc::downgrade(self);
         if let Some(stop) = doing.stop(now) {
+            self.mail.clear_stopped_status(agent);
             tokio::spawn(send_stop(weak, agent, doing, stop, reason));
         } else if let Some(deadline) = doing.stuck_at() {
             let check = tokio::spawn(async move {
@@ -223,9 +252,11 @@ impl AgentPool {
                 let Some(pool) = weak.upgrade() else { return };
                 {
                     let mut checks = pool.mail.retry_checks.lock().expect("poison");
-                    if pool.doing.lock().expect("poison").get(&agent) != Some(&doing) {
+                    let current = pool.doing.lock().expect("poison");
+                    if current.get(&agent) != Some(&doing) {
                         return;
                     }
+                    pool.mail.clear_stopped_status(agent);
                     // Leave the write alone if the next status comes just
                     // after this deadline; never remove a newer timer.
                     checks.remove(&agent);
@@ -348,7 +379,7 @@ fn stop_body(read: &rho_db::ReadTxn, agent: AgentId, stop: Stop, reason: &str) -
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::ChatSeq;
+    use rho_agent_types::{AgentIdDomain, ChatSeq};
 
     use super::*;
 
@@ -356,16 +387,21 @@ mod tests {
     fn newest_status_replaces_only_its_own_thread() {
         let mail = Mail::default();
         let mut changed = mail.status_changed.subscribe();
+        let owner = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let a = MessageId(ChatSeq(7));
         let b = MessageId(ChatSeq(9));
-        mail.set_status(a, "Read the logs".into(), UnixMs(15))
+        mail.set_status(a, owner, "Read the logs".into(), UnixMs(15))
             .unwrap();
-        mail.set_status(b, "Bisecting".into(), UnixMs(24)).unwrap();
-        mail.set_status(a, "Runs with SSL".into(), UnixMs(31))
+        mail.set_status(b, owner, "Bisecting".into(), UnixMs(24))
+            .unwrap();
+        mail.set_status(a, owner, "Runs with SSL".into(), UnixMs(31))
             .unwrap();
         assert!(changed.has_changed().unwrap());
         changed.borrow_and_update();
-        assert!(mail.set_status(a, "one\ntwo".into(), UnixMs(33)).is_err());
+        assert!(
+            mail.set_status(a, owner, "one\ntwo".into(), UnixMs(33))
+                .is_err()
+        );
         assert!(!changed.has_changed().unwrap());
         {
             let held = mail.statuses.lock().unwrap();
@@ -376,11 +412,49 @@ mod tests {
             );
             assert_eq!((&*held[&b].text, held[&b].at), ("Bisecting", UnixMs(24)));
         }
-        mail.set_status(a, String::new(), UnixMs(37)).unwrap();
+        mail.set_status(a, owner, String::new(), UnixMs(37))
+            .unwrap();
         assert!(changed.has_changed().unwrap());
         let held = mail.statuses.lock().unwrap();
         assert_eq!(held.keys().copied().collect::<Vec<_>>(), [b]);
         assert!(Mail::default().statuses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stop_clears_only_status_still_owned_by_the_stopped_agent() {
+        let mail = Mail::default();
+        let a = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+        let b = AgentId::from_counter(2, &AgentIdDomain(0)).unwrap();
+        let thread = MessageId(ChatSeq(7));
+        let mut changed = mail.status_changed.subscribe();
+
+        mail.set_status(thread, a, "Checking the clock".into(), UnixMs(31))
+            .unwrap();
+        changed.borrow_and_update();
+        mail.clear_stopped_status(a);
+        assert!(mail.status_snapshot().is_empty());
+        assert!(changed.has_changed().unwrap());
+
+        mail.set_status(thread, a, "Retrying the check".into(), UnixMs(35))
+            .unwrap();
+        mail.set_status(thread, b, "Verifying the result".into(), UnixMs(40))
+            .unwrap();
+        changed.borrow_and_update();
+        mail.clear_stopped_status(a);
+        assert_eq!(
+            mail.status_snapshot(),
+            [ThreadStatus {
+                thread,
+                at: UnixMs(40),
+                text: "Verifying the result".into(),
+            }]
+        );
+        assert!(!changed.has_changed().unwrap());
+
+        mail.set_status(thread, b, "Writing the proof".into(), UnixMs(46))
+            .unwrap();
+        assert_eq!(mail.status_snapshot()[0].text, "Writing the proof");
+        assert!(changed.has_changed().unwrap());
     }
 
     #[test]
