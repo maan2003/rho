@@ -152,7 +152,7 @@ impl Layered {
                 ..
             }) => UiAgentStatus::Retrying { at: *at },
             Some(RuntimeState {
-                inference: InferenceState::Failed { .. },
+                inference: InferenceState::Failed { .. } | InferenceState::Lost { .. },
                 ..
             }) => UiAgentStatus::Error,
             Some(RuntimeState {

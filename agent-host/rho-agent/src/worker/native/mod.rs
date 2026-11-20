@@ -42,7 +42,8 @@ use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
 struct Backoff {
-    since: tokio::time::Instant,
+    /// When the streak's first failure came.
+    since: UnixMs,
     previous: u64,
     delay: u64,
     at: UnixMs,
@@ -53,15 +54,15 @@ impl Backoff {
     const WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
 
     fn failed(previous: Option<Self>, error: String) -> Self {
-        let (since, previous, delay) =
-            previous.map_or((tokio::time::Instant::now(), 0, 1), |last| {
-                (
-                    last.since,
-                    last.delay,
-                    (last.previous + last.delay).min(30 * 60),
-                )
-            });
-        let remaining = Self::WINDOW.saturating_sub(since.elapsed());
+        let (since, previous, delay) = previous.map_or((UnixMs::now(), 0, 1), |last| {
+            (
+                last.since,
+                last.delay,
+                (last.previous + last.delay).min(30 * 60),
+            )
+        });
+        let elapsed = Duration::from_millis(UnixMs::now().saturating_duration_since(since));
+        let remaining = Self::WINDOW.saturating_sub(elapsed);
         Self {
             since,
             previous,
@@ -69,6 +70,10 @@ impl Backoff {
             at: UnixMs::now() + Duration::from_secs(delay).min(remaining),
             error,
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(UnixMs::now().saturating_duration_since(self.since))
     }
 }
 /// Responses Lite's automatic provider-compaction threshold for the GPT-6
@@ -423,7 +428,7 @@ impl Agent {
             // before deciding whether its completion warrants a wake.
             self.drain_outbox().await?;
             if let Some(backoff) = &self.backoff
-                && backoff.since.elapsed() >= Backoff::WINDOW
+                && backoff.elapsed() >= Backoff::WINDOW
             {
                 self.fail(format!(
                     "Provider retry window exhausted: {}",
@@ -1265,6 +1270,7 @@ impl Agent {
             InferenceState::Retrying {
                 at: backoff.at,
                 error: backoff.error.clone(),
+                since: backoff.since,
             }
         } else if self.responding {
             InferenceState::Responding

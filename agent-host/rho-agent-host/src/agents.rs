@@ -372,11 +372,12 @@ async fn follow(
                 return;
             }
         }
-        for (agent_id, status) in changed {
+        for (agent_id, rho_agent::host::pool::Shown { status, since }) in changed {
             if outgoing_tx
                 .send(ServerFrame::Status {
                     agent_id,
                     state: status.runtime.clone(),
+                    since,
                 })
                 .is_err()
             {

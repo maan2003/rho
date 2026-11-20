@@ -10,12 +10,12 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Window, div,
+    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Task, Window, div,
 };
 use jiff::Timestamp;
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_agent_types::{Address as Party, ContentPart, EndpointId, MessageId};
+use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
 use rho_dealer::{Address, Addressed as _, Marks};
 use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
@@ -61,10 +61,13 @@ enum Class {
     Mention,
     /// A private reply: the user's own, seen by no agent.
     Private,
+    /// What an agent in the `with` line is doing when it is a stop it did
+    /// not choose.
+    Stopped,
 }
 
 impl Class {
-    const COUNT: usize = 10;
+    const COUNT: usize = 11;
 
     fn slot(self) -> usize {
         match self {
@@ -78,6 +81,7 @@ impl Class {
             Self::Unread => 7,
             Self::Mention => 8,
             Self::Private => 9,
+            Self::Stopped => 10,
         }
     }
 }
@@ -98,6 +102,7 @@ impl rho_transcript::Style for Class {
             Self::Unread => (colors.text, Some(gpui::FontWeight::BOLD)),
             Self::Mention => (cx.theme().status().warning, Some(gpui::FontWeight::BOLD)),
             Self::Private => (colors.text_muted, None),
+            Self::Stopped => (cx.theme().status().warning, None),
         };
         HighlightStyle {
             color: Some(color.into()),
@@ -115,6 +120,19 @@ enum Meta {
     /// A message under the thread: Enter opens the thread under it.
     Message(MessageId),
     Open(Address),
+    /// The `with` line: where on it each agent is named, in order.
+    Agents(Vec<(Range<usize>, AgentId)>),
+}
+
+/// The agent of the `with` line under `column`: the one named there, or
+/// the nearest before it, or the first.
+fn agent_at(agents: &[(Range<usize>, AgentId)], column: usize) -> Option<AgentId> {
+    agents
+        .iter()
+        .rev()
+        .find(|(span, _)| span.start <= column)
+        .or(agents.first())
+        .map(|(_, agent)| *agent)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,7 +149,13 @@ pub struct ThreadView {
     composer: Entity<Editor>,
     focused: Focused,
     _subscriptions: Vec<Subscription>,
+    /// Reads the thread again each minute while agents are in it: the
+    /// `with` line says for how long each has been doing what it does.
+    _ages: Task<()>,
 }
+
+/// How often the ages on the `with` line move: their unit is the minute.
+const AGES_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ThreadView {
     /// The view over `thread` on `system`, which is `entity` as the frame
@@ -209,6 +233,24 @@ impl ThreadView {
             composer,
             focused: Focused::Log,
             _subscriptions: subscriptions,
+            _ages: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(AGES_EVERY).await;
+                    let alive = this.update(cx, |view, cx| {
+                        let thread = view.thread;
+                        let with_agents =
+                            view.system.read(cx).chat(thread.host).is_some_and(|chat| {
+                                !chat.members_under(Some(thread.message)).is_empty()
+                            });
+                        if with_agents {
+                            view.refresh(cx);
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }),
         };
         view.transcript.attach(&view.log.clone(), cx);
         let items = items(system, thread, cx);
@@ -263,14 +305,22 @@ impl ThreadView {
     }
 
     fn cursor_row(&self, cx: &App) -> u32 {
+        self.cursor(cx).row
+    }
+
+    fn cursor(&self, cx: &App) -> Point {
         let editor = self.log.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        editor
-            .selections
-            .newest_anchor()
-            .head()
-            .to_point(&snapshot)
-            .row
+        editor.selections.newest_anchor().head().to_point(&snapshot)
+    }
+
+    /// The agent of the `with` line under the cursor, when it is there.
+    fn agent_under_cursor(&self, cx: &App) -> Option<AgentId> {
+        let cursor = self.cursor(cx);
+        match self.transcript.line_meta(cursor.row, cx) {
+            Some(Meta::Agents(agents)) => agent_at(agents, cursor.column as usize),
+            _ => None,
+        }
     }
 
     /// The first thread of a root's list, if it has one.
@@ -355,29 +405,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
         items.extend(private.remove(&thread.message).unwrap_or_default());
     }
     if !head.members.is_empty() {
-        // A gone agent keeps its place under its id: the thread was its.
-        let names = head
-            .members
-            .iter()
-            .map(|agent| {
-                system
-                    .agent_label(host, *agent, cx)
-                    .unwrap_or_else(|| agent.encoded())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        items.push(
-            line(
-                Key::Participants,
-                &format!("with {names}"),
-                Class::Participants,
-            )
-            .with_lines(vec![
-                head.members
-                    .first()
-                    .map_or(Meta::None, |agent| Meta::Open(AgentRef(*agent).address())),
-            ]),
-        );
+        items.push(with_line(system, host, &head.members, cx));
     }
     // A root's list starts at its first thread: nothing stands above it
     // to keep a gap from.
@@ -429,6 +457,52 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     }
     items.extend(pending_items(system, host, thread.message, &mut gap_item));
     without_trailing_gap(items)
+}
+
+/// `with` and each agent of the thread: what to call it, and what it is
+/// doing and for how long, as `eng-q9tz · working 12m`. A gone agent keeps
+/// its place under its id: the thread was its.
+fn with_line(
+    system: &ChatSystem,
+    host: EndpointId,
+    members: &[AgentId],
+    cx: &App,
+) -> Item<Key, Class, Meta> {
+    let now = Timestamp::now();
+    let now_ms = rho_agent_types::UnixMs(now.as_millisecond().max(0) as u64);
+    let mut text = "with ".to_owned();
+    let mut styles = vec![(Class::Participants, 0..text.len())];
+    let mut agents = Vec::new();
+    for (index, agent) in members.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        let start = text.len();
+        let participant = system.participant(host, *agent, cx);
+        let label = participant
+            .as_ref()
+            .map_or_else(|| agent.encoded(), |participant| participant.label.clone());
+        text.push_str(&label);
+        styles.push((Class::Participants, start..text.len()));
+        if let Some(doing) = participant.and_then(|participant| participant.doing) {
+            text.push_str(" · ");
+            let state = text.len();
+            text.push_str(&format!(
+                "{} {}",
+                doing.activity.word(),
+                ago(doing.since.0, now)
+            ));
+            let class = match doing.stop(now_ms) {
+                Some(_) => Class::Stopped,
+                None => Class::Participants,
+            };
+            styles.push((class, state..text.len()));
+        }
+        agents.push((start..text.len(), *agent));
+    }
+    Item::new(Key::Participants, text)
+        .with_styles(styles)
+        .with_lines(vec![Meta::Agents(agents)])
 }
 
 /// A gap stands between rows, never after the last: a row with nothing on
@@ -651,13 +725,17 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Enter on a message opens the thread under it; on a crumb or a
-    /// participant, that.
+    /// Enter on a message opens the thread under it; on a crumb, that; on
+    /// the `with` line, the agent named under the cursor.
     fn open_row(&mut self, _: &OpenRow, _window: &mut Window, cx: &mut Context<Self>) {
         let host = self.thread.host;
         let address = match self.transcript.line_meta(self.cursor_row(cx), cx) {
             Some(Meta::Message(id)) => ThreadId { host, message: *id }.address(),
             Some(Meta::Open(address)) => address.clone(),
+            Some(Meta::Agents(_)) => match self.agent_under_cursor(cx) {
+                Some(agent) => AgentRef(agent).address(),
+                None => return,
+            },
             Some(Meta::None) | None => return,
         };
         let frame = self.system.read(cx).frame.clone();
@@ -727,11 +805,15 @@ impl Surface for ThreadView {
     }
 
     /// The message under the point, as the thread it anchors: any message
-    /// is what an agent starts from or a name goes on. The thread itself
-    /// from its head, the composer, or nothing in particular.
+    /// is what an agent starts from or a name goes on. On the `with` line,
+    /// the agent named under the point, which the palette steers. The
+    /// thread itself from its head, the composer, or nothing in particular.
     fn subject(&self, cx: &App) -> Subject {
         if self.focused == Focused::Composer {
             return Subject::Own;
+        }
+        if let Some(agent) = self.agent_under_cursor(cx) {
+            return Subject::Address(AgentRef(agent).address());
         }
         match self.transcript.line_meta(self.cursor_row(cx), cx) {
             Some(Meta::Message(id)) if *id != self.thread.message => Subject::Address(

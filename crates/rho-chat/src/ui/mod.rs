@@ -18,7 +18,7 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
+use rho_agent_types::{Address as Party, AgentId, ContentPart, Doing, EndpointId, MessageId};
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
@@ -31,7 +31,7 @@ use crate::fold::HostChat;
 use crate::outbox::Outbox;
 use crate::protocol::Name;
 use crate::stream::{ChatEvent, ChatStream, Cursors};
-use crate::{ThreadId, cards};
+use crate::{AgentRef, ThreadId, cards};
 
 gpui::actions!(
     rho_chat,
@@ -70,9 +70,18 @@ struct Slot {
     endpoint: Option<EndpointId>,
 }
 
-/// What to call an agent of the host with this identity, and `None`
-/// once it is gone; the agents system answers, the chat only asks.
-pub type AgentLabel = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<String>>;
+/// An agent of a thread as the agents system tells the chat: what to
+/// call it, and what it is doing as its host last said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Participant {
+    pub label: String,
+    /// `None` while its host has said nothing of it.
+    pub doing: Option<Doing>,
+}
+
+/// What the chat knows of an agent of the host with this identity, and
+/// `None` once it is gone; the agents system answers, the chat only asks.
+pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participant>>;
 
 pub struct ChatSystem {
     cache: Cache,
@@ -84,9 +93,9 @@ pub struct ChatSystem {
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     events: UnboundedSender<ChatEvent>,
     frame: FrameLink,
-    /// Whether an agent still exists on a host, and its label; the agents
-    /// system knows.
-    agent_label: AgentLabel,
+    /// Whether an agent still exists on a host, its label, and what it is
+    /// doing; the agents system knows.
+    participants: Participants,
     _pump: Task<()>,
 }
 
@@ -129,22 +138,75 @@ impl ChatSystem {
             chats,
             events,
             frame,
-            agent_label: Rc::new(|_, agent, _| Some(agent.encoded())),
+            participants: Rc::new(|_, agent, _| {
+                Some(Participant {
+                    label: agent.encoded(),
+                    doing: None,
+                })
+            }),
             _pump: pump,
         }
     }
 
-    /// Tells the chat which agents still exist and what to call them: a
-    /// thread whose agents are all gone raises no card, and a thread's
-    /// participants read by label.
-    pub fn set_agent_label(&mut self, agent_label: AgentLabel) {
-        self.agent_label = agent_label;
+    /// Tells the chat which agents still exist, what to call them, and
+    /// what they are doing: a thread whose agents are all gone raises no
+    /// card, one whose agent stopped unbidden raises one, and a thread's
+    /// participants read by label and state.
+    pub fn set_participants(&mut self, participants: Participants) {
+        self.participants = participants;
+    }
+
+    /// An agent of the host with `endpoint`, `None` once it is gone.
+    pub fn participant(
+        &self,
+        endpoint: EndpointId,
+        agent: AgentId,
+        cx: &App,
+    ) -> Option<Participant> {
+        (self.participants)(endpoint, agent, cx)
     }
 
     /// The label of an agent of the host with `endpoint`, `None` once
     /// it is gone.
     pub fn agent_label(&self, endpoint: EndpointId, agent: AgentId, cx: &App) -> Option<String> {
-        (self.agent_label)(endpoint, agent, cx)
+        self.participant(endpoint, agent, cx)
+            .map(|participant| participant.label)
+    }
+
+    /// The user steered an agent that is doing `doing`: the stop it is
+    /// in, if any, is seen, and its thread's card for it goes. What else
+    /// waits in the thread still waits. The agents system tells what the
+    /// agent does, as it is the one steering.
+    pub fn steered(&self, endpoint: EndpointId, agent: AgentId, doing: Doing, cx: &mut App) {
+        let now = rho_agent_types::UnixMs::now();
+        if doing.stop(now).is_none() {
+            return;
+        }
+        let Some(thread) = self
+            .chats
+            .get(&endpoint)
+            .and_then(|chat| chat.agent_thread(agent))
+        else {
+            return;
+        };
+        let node = ThreadId {
+            host: endpoint,
+            message: thread,
+        }
+        .address();
+        self.frame.with(cx, move |frame, _, cx| {
+            let message = frame.marks().get(&node).facts().seen_topic().unwrap_or(0);
+            let seen = Seen::Thread {
+                message,
+                stopped: doing.since.0,
+            };
+            frame.write_marks(
+                vec![rho_frame::attention::Write::Fact(
+                    rho_dealer::facts::Fact::Read { node, seen },
+                )],
+                cx,
+            );
+        });
     }
 
     pub fn chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
@@ -398,12 +460,14 @@ impl ChatSystem {
     ) -> Option<R> {
         let chat = self.chats.get(&endpoint)?;
         let name = self.host_name(endpoint);
-        let alive = |agent: AgentId| self.agent_label(endpoint, agent, cx).is_some();
+        let alive = |agent: AgentId| self.participant(endpoint, agent, cx).is_some();
+        let doing = |agent: AgentId| self.participant(endpoint, agent, cx)?.doing;
         let host = cards::Host {
             endpoint,
             chat,
             name: self.many_hosts().then_some(name.as_str()),
             alive: &alive,
+            doing: &doing,
         };
         Some(read(&host))
     }
@@ -484,7 +548,13 @@ impl System for ChatSystem {
         let this = cx.entity();
         let mut rows = Vec::new();
         let hosts = self.hosts();
-        if !hosts.is_empty() {
+        // On an agent in a thread's `with` line the palette is the
+        // agent's, whose `c` compacts its context.
+        let on_agent = point
+            .subject
+            .as_ref()
+            .is_some_and(|subject| subject.kind() == AgentRef::KIND);
+        if !hosts.is_empty() && !on_agent {
             let new_root = this.clone();
             rows.push(Row::run("c", "new channel", move |frame, window, cx| {
                 let hosts = new_root.read(cx).hosts();
@@ -604,14 +674,32 @@ impl System for ChatSystem {
         cx.notify();
     }
 
-    fn seen(&self, address: &Address, _cx: &App) -> Seen {
+    /// Through its newest message, and through the stops its agents are
+    /// in when any is: a done on a stop's card sees the stop.
+    fn seen(&self, address: &Address, cx: &App) -> Seen {
         let Some(thread) = self.thread_of(address) else {
             return Seen::Whole;
         };
-        self.chats
+        let Some((newest, _)) = self
+            .chats
             .get(&thread.host)
             .and_then(|chat| chat.newest_in(thread.message))
-            .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
+        else {
+            return Seen::Whole;
+        };
+        let stopped = self
+            .with_host(thread.host, cx, |host| {
+                cards::stops(host, Timestamp::now()).remove(&thread.message)
+            })
+            .flatten()
+            .and_then(|stops| stops.iter().map(|stop| stop.since.0).max());
+        match stopped {
+            Some(stopped) => Seen::Thread {
+                message: newest.0.0,
+                stopped,
+            },
+            None => Seen::Topic(newest.0.0),
+        }
     }
 
     /// Every root on every host, a room each: how many of its threads hold

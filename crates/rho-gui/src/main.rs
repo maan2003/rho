@@ -219,16 +219,24 @@ fn run() -> Result<()> {
                     cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
                 let agents = cx
                     .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
-                // The chat ranks a thread by the agents still in it and
-                // names them; the agents system knows both.
-                let labels = agents.downgrade();
-                chat.update(cx, |chat, _| {
-                    chat.set_agent_label(Rc::new(move |endpoint, agent, cx| {
-                        labels.upgrade().map_or_else(
-                            || Some(agent.encoded()),
-                            |agents| agents.read(cx).agent_label(endpoint, agent),
+                // The chat ranks a thread by the agents still in it and by
+                // the stops they are in, and names them with what they do;
+                // the agents system knows all of it, and a thread on screen
+                // reads again when it moves.
+                let participants = agents.downgrade();
+                chat.update(cx, |chat, cx| {
+                    chat.set_participants(Rc::new(move |endpoint, agent, cx| {
+                        participants.upgrade().map_or_else(
+                            || {
+                                Some(rho_chat::ui::Participant {
+                                    label: agent.encoded(),
+                                    doing: None,
+                                })
+                            },
+                            |agents| agents.read(cx).participant(endpoint, agent),
                         )
-                    }))
+                    }));
+                    cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let slack =

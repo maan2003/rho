@@ -56,6 +56,8 @@ pub enum ModelMsg {
     Runtime {
         agent_id: AgentId,
         state: RuntimeState,
+        /// When it started doing what `state` says, on its host's clock.
+        since: rho_agent_types::UnixMs,
     },
     /// The live tail of an agent the window focuses.
     Live { agent_id: AgentId, live: Live },
@@ -360,9 +362,17 @@ impl Model {
                     }
                     event(ModelMsg::Live { agent_id, live })
                 }
-                ServerFrame::Status { agent_id, state } => vec![ModelEvent {
+                ServerFrame::Status {
+                    agent_id,
+                    state,
+                    since,
+                } => vec![ModelEvent {
                     host,
-                    msg: ModelMsg::Runtime { agent_id, state },
+                    msg: ModelMsg::Runtime {
+                        agent_id,
+                        state,
+                        since,
+                    },
                 }],
                 // Nothing here asks for a detail body: the transcript
                 // draws a call's line and never its output.

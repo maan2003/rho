@@ -184,6 +184,9 @@ pub enum ServerFrame {
     Status {
         agent_id: AgentId,
         state: RuntimeState,
+        /// When the agent started doing what `state` says it does, on the
+        /// host's clock: what its age on every device counts from.
+        since: UnixMs,
     },
     QuotaUsage {
         summaries: Vec<super::QuotaSummary>,

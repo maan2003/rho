@@ -28,15 +28,15 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{AgentId, EndpointId, MessageId};
+use rho_agent_types::{AgentId, EndpointId, MessageId, UnixMs};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
 use rho_agents_client::quota::Quotas;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
-use rho_agents_client::{AgentMap, now_ms};
-use rho_chat::ui::{ChatSystem, Event as ChatEvent};
+use rho_agents_client::{AgentMap, Heard, now_ms};
+use rho_chat::ui::{ChatSystem, Event as ChatEvent, Participant};
 use rho_chat::{AgentRef, ThreadId};
 use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
@@ -79,6 +79,10 @@ pub struct AgentsSystem {
     /// the message: started once the host has logged it.
     starting: HashMap<(EndpointId, u64), start::Plan>,
     timer: Option<Task<()>>,
+    /// When each retrying agent turns stuck, which no host frame says, and
+    /// the wake that ranks the deal again at the first of them.
+    stuck: HashMap<AgentId, UnixMs>,
+    stuck_wake: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -143,6 +147,8 @@ impl AgentsSystem {
             frame,
             starting: HashMap::new(),
             timer: None,
+            stuck: HashMap::new(),
+            stuck_wake: None,
             _tasks: vec![pump, desktops_pump],
             _subscriptions: vec![delivered],
         }
@@ -152,16 +158,24 @@ impl AgentsSystem {
         &self.registry
     }
 
-    /// What the chat calls an agent of the host with this identity, and
-    /// `None` once the agent is gone. A host not attached keeps every
-    /// agent of its threads, by id.
-    pub fn agent_label(&self, endpoint: EndpointId, agent: AgentId) -> Option<String> {
+    /// What the chat calls an agent of the host with this identity and
+    /// what it is doing, and `None` once the agent is gone. A host not
+    /// attached keeps every agent of its threads, by id, saying nothing
+    /// of what they do.
+    pub fn participant(&self, endpoint: EndpointId, agent: AgentId) -> Option<Participant> {
         match self.host_of(endpoint) {
-            Some(_) => self
-                .registry
-                .mirrored(agent)
-                .map(|_| self.registry.agent_display_label(agent)),
-            None => Some(agent.encoded()),
+            Some(_) => self.registry.mirrored(agent).map(|_| Participant {
+                label: self.registry.agent_display_label(agent),
+                doing: self
+                    .registry
+                    .agent_facts(agent)
+                    .runtime
+                    .map(|heard| heard.doing()),
+            }),
+            None => Some(Participant {
+                label: agent.encoded(),
+                doing: None,
+            }),
         }
     }
 
@@ -224,11 +238,16 @@ impl AgentsSystem {
                     self.land(agent_id, TranscriptFrame::Fold(state), cx);
                 }
             }
-            ModelMsg::Runtime { agent_id, state } => {
+            ModelMsg::Runtime {
+                agent_id,
+                state,
+                since,
+            } => {
                 if self.transcripts.state(&agent_id).is_some() {
                     self.land(agent_id, TranscriptFrame::Runtime(state.clone()), cx);
                 }
-                if self.registry.set_runtime(agent_id, state) {
+                if self.registry.set_runtime(agent_id, Heard { state, since }) {
+                    self.watch_stuck(agent_id, cx);
                     self.changed(cx);
                 }
             }
@@ -338,9 +357,9 @@ impl AgentsSystem {
         if !self.transcripts.seed(agent, &rows) {
             return false;
         }
-        if let Some(state) = self.registry.agent_facts(agent).runtime {
+        if let Some(heard) = self.registry.agent_facts(agent).runtime {
             self.transcripts
-                .apply(agent, TranscriptFrame::Runtime(state));
+                .apply(agent, TranscriptFrame::Runtime(heard.state));
         }
         true
     }
@@ -427,6 +446,61 @@ impl AgentsSystem {
                 }
             }
             let _ = this.update(cx, |this, _| this.timer = None);
+        }));
+    }
+
+    /// The user steered `agent`: the chat counts the stop it is in as
+    /// seen.
+    pub(crate) fn steered(&self, agent: AgentId, cx: &mut Context<Self>) {
+        let (Some(endpoint), Some(heard)) = (
+            self.registry
+                .host_of_agent(agent)
+                .and_then(|host| self.registry.host_endpoint(host)),
+            self.registry.agent_facts(agent).runtime,
+        ) else {
+            return;
+        };
+        let doing = heard.doing();
+        self.chat
+            .update(cx, |chat, cx| chat.steered(endpoint, agent, doing, cx));
+    }
+
+    /// Keeps when `agent` turns stuck, if it is retrying and not stuck
+    /// yet, and wakes at the first such moment to rank the deal again:
+    /// nothing from the host marks it.
+    fn watch_stuck(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        let now = UnixMs::now();
+        let stuck_at = self
+            .registry
+            .agent_facts(agent)
+            .runtime
+            .and_then(|heard| heard.doing().stuck_at())
+            .filter(|at| *at > now);
+        match stuck_at {
+            Some(at) => self.stuck.insert(agent, at),
+            None => self.stuck.remove(&agent),
+        };
+        self.stuck.retain(|_, at| *at > now);
+        let Some(first) = self.stuck.values().min().copied() else {
+            self.stuck_wake = None;
+            return;
+        };
+        let wait = std::time::Duration::from_millis(first.saturating_duration_since(now));
+        self.stuck_wake = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                let now = UnixMs::now();
+                let turned: Vec<AgentId> = this
+                    .stuck
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(agent, _)| *agent)
+                    .collect();
+                for agent in turned {
+                    this.watch_stuck(agent, cx);
+                }
+                this.changed(cx);
+            });
         }));
     }
 
@@ -818,6 +892,16 @@ impl System for AgentsSystem {
             return self.agent_rows(here, cx);
         }
         let mut rows = vec![Row::menu("shift-u", "usage…", usage::menu(this.clone()))];
+        // On an agent in a thread's `with` line: the agent is steered from
+        // there as from its transcript.
+        if let Some(AgentAddress {
+            agent,
+            part: Part::Transcript,
+        }) = point.subject.as_ref().and_then(AgentAddress::from_address)
+            && self.registry.mirrored(agent).is_some()
+        {
+            rows.extend(surface::steer_rows(this.clone(), agent));
+        }
         let Some(thread) = self.thread_at(point, cx) else {
             return rows;
         };
@@ -865,7 +949,11 @@ impl System for AgentsSystem {
             Found {
                 address: AgentRef(agent).address(),
                 title,
-                description: match facts.runtime.as_ref().map(surface::status_word) {
+                description: match facts
+                    .runtime
+                    .as_ref()
+                    .map(|heard| heard.state.activity().word())
+                {
                     Some(word) => format!("{host} · {word}"),
                     None => host,
                 },

@@ -171,9 +171,11 @@ pub enum Fact {
         label: uuid::Uuid,
         host: Option<String>,
     },
-    /// Marked read this far. Older builds wrote it and none writes it
-    /// now: done is how the user says they read a topic. It still counts
-    /// as seen, and takes nothing back. Later still than `Host`.
+    /// Seen this far, taking nothing back. Older builds wrote it for
+    /// "marked read"; done is how the user says they read a topic now.
+    /// Steering an agent writes it: the user has seen the stop the agent
+    /// is in, and what else waits in its thread still waits. Later still
+    /// than `Host`.
     Read {
         node: Address,
         seen: Seen,
@@ -230,9 +232,14 @@ pub enum Seen {
     Slack(String),
     /// A note: there is nothing more to see.
     Whole,
-    /// A chat topic, through this message. Last: entries decode by variant
-    /// order.
+    /// A chat topic, through this message. Entries decode by variant
+    /// order, so a new one goes after it.
     Topic(u64),
+    /// A chat thread, through this message, and through every stop its
+    /// agents were in that began by `stopped`, in unix milliseconds on
+    /// the host's clock: a stop is no message, so the instant its host
+    /// gave it is where it stands. Last: entries decode by variant order.
+    Thread { message: u64, stopped: u64 },
 }
 
 /// A snooze in force or past: when it was said and when it ends.
@@ -287,7 +294,18 @@ impl<'a> Facts<'a> {
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
-                Seen::Topic(id) => Some(*id),
+                Seen::Topic(id) | Seen::Thread { message: id, .. } => Some(*id),
+                _ => None,
+            })
+            .max()
+    }
+
+    /// When the newest stop of a thread's agents the user had seen began:
+    /// a stop that began later is news.
+    pub fn seen_stopped(self) -> Option<u64> {
+        self.seen()
+            .filter_map(|seen| match seen {
+                Seen::Thread { stopped, .. } => Some(*stopped),
                 _ => None,
             })
             .max()
