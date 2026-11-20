@@ -302,10 +302,12 @@ impl Minibuffer {
         }
     }
 
-    pub fn select(&mut self, index: usize) {
-        if index < self.candidates.len() {
-            self.selected = index;
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.candidates.len() {
+            return false;
         }
+        self.selected = index;
+        true
     }
 
     fn completed_text(&self, input: &str, candidate: &Candidate) -> String {
@@ -379,7 +381,7 @@ impl Minibuffer {
         (input, submission)
     }
 
-    pub fn render(
+    pub(crate) fn render(
         &self,
         text_style: &gpui::TextStyle,
         layout: crate::Layout,
@@ -391,6 +393,8 @@ impl Minibuffer {
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
+        let clickable =
+            address || (layout == crate::Layout::Phone && matches!(self.answer, Answer::Row(_)));
         let rows = self
             .candidates
             .iter()
@@ -421,11 +425,13 @@ impl Minibuffer {
                     row = row.bg(colors.element_selected);
                 }
                 let row = row.id(("rho-prompt-candidate", index));
-                if address {
+                if clickable {
                     row.cursor_pointer()
                         .on_click(cx.listener(move |frame, _, window, cx| {
-                            if let Some(prompt) = frame.minibuffer_mut() {
-                                prompt.select(index);
+                            if frame
+                                .minibuffer_mut()
+                                .is_some_and(|prompt| prompt.select(index))
+                            {
                                 frame.minibuffer_confirm(window, cx);
                             }
                             cx.stop_propagation();

@@ -14,6 +14,7 @@ done when: the user knows what moved and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
+status: on the phone, a tap selects a waiting or moving row; a second tap on it or `open` opens it.
 purpose: show what wants the user, what has moved, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting and a test run under `moving`, and writes a new idea to `tide@lab`.
 sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status` that aren't waiting, newest status change first, then `and N more` for the rest; an idea box addressed to a `mail.Project`, with completion.
@@ -22,8 +23,10 @@ does:
 - deal `space`: open the first waiting card
 - open a row `enter`: open the selected card or thread
 - write an idea: address and send a new idea, as `mail.Write an idea`
+- narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
 
 ## screen Desk
+status: narrowing to one project is not built; the old channel screen still exists in its place.
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits

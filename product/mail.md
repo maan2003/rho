@@ -118,32 +118,6 @@ Running the tests with a separate clock
 reply
 ```
 
-## screen Project
-status: built as a channel with a list of threads and a box that can start an agent; the rows show mentions, unread counts and agent names, not a single status for the work.
-answers: what work is in this project?
-shows:
-- the `Project` address
-- each `Thread` by subject, with its `deal.Card` words or, when nothing waits, its `Status`
-states:
-- empty: the project address and no threads
-- loading: the project's threads are not yet available; wording not agreed
-- partial: the threads that are available; wording not agreed
-- error: the project is unavailable; wording not agreed
-- full: the address and its threads
-keys:
-- `enter`: open the selected `Thread`
-- `:`: `window.Palette`
-- `ctrl-k`, `tab`, `q`: `window.Screen`
-starts: `Write an idea`, `Answer a mail`, `window.Go to something by name`
-mock:
-```text
-tide@lab                                                                    NOR
-
-Flaky clock test                                               asks · 2h
-Cache eviction tests                                           Running the tests
-Release notes                                                  Checking the links
-```
-
 ## flow Answer a mail
 status: a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
 runs: 100 a day
@@ -182,6 +156,12 @@ reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 The historical review above was of Start a thread. Start an agent from a message was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
+
+## rule the project's last mail is live
+status: not built; agents send a new mail for each change.
+when: the project has written a mail that the user has not answered
+then: that mail is live: the project edits it as the work changes, and the user sees `edited`; a new mail comes only when the live one has been answered, or for a different question, which is a tangent. An answered mail is frozen.
+why: a thread of ten mails that each supersede the last is a feed; one live mail is a state the user can read in one look.
 
 ## rule a cold mail stands alone
 when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; cold `Mail` stands alone by quoting rather than repeating, and warm mail is short.

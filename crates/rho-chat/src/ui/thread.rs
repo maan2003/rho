@@ -18,6 +18,7 @@ use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
+use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage, SendOnly};
 use rho_frame::{Candidate, Layout, Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
@@ -1072,6 +1073,19 @@ impl Surface for ThreadView {
             return Subject::Own;
         }
         self.subject(cx)
+    }
+
+    fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {
+        let this = cx.entity();
+        Some(Rc::new(move |window, cx| {
+            this.update(cx, |view, cx| {
+                if view.composer.read(cx).text(cx).trim().is_empty() {
+                    view.focus_composer(&FocusComposer, window, cx);
+                } else {
+                    view.send_only(&SendOnly, window, cx);
+                }
+            });
+        }))
     }
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {

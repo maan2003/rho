@@ -515,6 +515,9 @@ impl Frame {
     }
 
     fn focus_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.desk_in_view() {
+            self.desk.update(cx, |desk, _| desk.reset_tap());
+        }
         let handle = self.current_surface().focus_handle(cx);
         window.focus(&handle, cx);
         self.report_active_surface(window, cx);
@@ -1445,7 +1448,7 @@ impl Render for Frame {
             .child(self.render_status_line(&text_style, layout, window, cx));
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
-            let bar = self.render_phone_bar(window, cx);
+            let bar = self.render_phone_bar(cx);
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
                 .child(body)

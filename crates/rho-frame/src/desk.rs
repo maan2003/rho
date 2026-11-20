@@ -17,6 +17,7 @@ use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_dealer::Address;
 use rho_dealer::rank::Hand;
 use rho_transcript::{Item, Transcript};
+use text::{Bias, ToPoint as _};
 use theme::ActiveTheme as _;
 
 use crate::phone::Layout;
@@ -184,6 +185,8 @@ pub(crate) struct DeskView {
     rows: DeskRows,
     layout: DeskLayout,
     text_system: Arc<WindowTextSystem>,
+    /// A row selected by tap, not just the cursor left by the keys.
+    tapped: Option<DeskTarget>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -262,6 +265,7 @@ impl DeskView {
             rows: DeskRows::default(),
             layout,
             text_system: window.text_system().clone(),
+            tapped: None,
         };
         view.transcript.attach(&view.editor.clone(), cx);
         // The empty desk still answers what waits.
@@ -283,6 +287,50 @@ impl DeskView {
         self.transcript.line_meta(row, cx).cloned()
     }
 
+    pub(crate) fn reset_tap(&mut self) {
+        self.tapped = None;
+    }
+
+    /// True on the second tap on the same selected card or thread. Both
+    /// display lines of a compact row have the same target.
+    pub(crate) fn tap(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let editor = self.editor.read(cx);
+        let hit = editor
+            .buffer_location_for_window_position(position, Bias::Left)
+            .and_then(|(anchor, _, _)| {
+                let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
+                let target = self.transcript.line_meta(row, cx)?.clone();
+                let key = self.transcript.key_at_row(row, cx)?;
+                let start = self.transcript.range_of(key)?.start;
+                let row = start
+                    .to_point(&self.transcript.buffer().read(cx).snapshot())
+                    .row;
+                Some((row, target))
+            });
+        let Some((row, target)) = hit else {
+            self.reset_tap();
+            return false;
+        };
+        let open = self.tapped.as_ref() == Some(&target)
+            && self.cursor_target(cx).as_ref() == Some(&target);
+        self.tapped = (!open).then_some(target);
+        if !open {
+            self.editor.update(cx, |editor, cx| {
+                let point = Point::new(row, 0);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([point..point]);
+                });
+            });
+            window.focus(&self.editor.focus_handle(cx), cx);
+        }
+        open
+    }
+
     pub(crate) fn set_rows(&mut self, rows: DeskRows, cx: &mut Context<Self>) {
         if rows == self.rows {
             return;
@@ -297,6 +345,7 @@ impl DeskView {
     }
 
     pub(crate) fn focus_first_row(&mut self, cx: &mut Context<Self>) {
+        self.reset_tap();
         let row = if !self.rows.waiting.is_empty() {
             1
         } else if !self.rows.moving.is_empty() {
@@ -577,6 +626,7 @@ impl Render for DeskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = DeskLayout::read(&self.editor, window, cx);
         if layout != self.layout {
+            self.reset_tap();
             self.layout = layout;
             self.transcript.reconcile(self.items(), cx);
         }

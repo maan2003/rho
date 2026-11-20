@@ -9,6 +9,9 @@ use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
 
+/// The action under Send on the phone bar, when a surface has a box.
+pub type PhoneSend = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// What a verdict, a note or `file` pressed over the surface lands on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
@@ -71,6 +74,10 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// frame already holds the screen in history.
     fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    fn phone_send(&mut self, _cx: &mut Context<Self>) -> Option<PhoneSend> {
+        None
+    }
+
     /// The surface's own rows for the palette, for what is in view.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
@@ -89,6 +96,7 @@ trait SurfaceHandle {
     fn heading(&self, cx: &App) -> Option<String>;
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
 }
 
 impl<S: Surface> SurfaceHandle for Entity<S> {
@@ -134,6 +142,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
         self.update(cx, |surface, cx| surface.rows(window, cx))
+    }
+
+    fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
+        self.update(cx, |surface, cx| surface.phone_send(cx))
     }
 }
 
@@ -184,6 +196,10 @@ impl AnySurface {
 
     pub(crate) fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
         self.0.show_card(card, window, cx);
+    }
+
+    pub(crate) fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
+        self.0.phone_send(cx)
     }
 
     pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {

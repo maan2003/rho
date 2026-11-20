@@ -10,7 +10,7 @@ costs: what has no place yet is reached through a terminal, the browser, or an a
 
 ## concept Screen
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
-principle: the user opens a `mail.Project`, then one of its threads; `Screen.back` returns to the project exactly as they left it.
+principle: the user opens a `mail.Thread` from the desk; `Screen.back` returns to the desk exactly as they left it, narrowed or not.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
 does:
 - back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
@@ -21,7 +21,7 @@ does:
 
 The way back keeps the user's earlier screens, as they were left. A screen that can no longer open is passed over. Returning after more than ten minutes opens the desk; see `desk.a cold return opens the desk`.
 
-Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
+Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
 
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
@@ -35,7 +35,7 @@ When a host drops, the line names it and says `reconnecting · 12s` in red, coun
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
-status: one prompt lists the screen's commands, places and notes; there is no full-text search across mail and notes yet, and no `what waits` rows on an empty query.
+status: one prompt lists the screen's commands, places and notes, and the user can tap a row on the phone to choose it; there is no full-text search across mail and notes yet, and no `what waits` rows on an empty query.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
 sees: best matches first as the user types; with nothing typed, the screen's commands first, then recent places, then what waits. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its `mail.Status` or, when it waits, its `deal.Card` words. Commands show their keys where they have them.
@@ -99,6 +99,7 @@ A prompt for a secret, such as the phrase that pairs devices, shows what is type
 A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
 ## concept Phone bar
+status: in a thread, `send` opens the empty reply box for typing or sends a written reply.
 purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
@@ -143,7 +144,7 @@ steps:
 4. the user answers the menu or the `Prompt` that follows
 system: shows only the commands that fit the screen and the thing under the cursor.
 user: the command's name, and any answer it asks for.
-cases: on the phone, where the list of commands cannot be tapped and the user must type or take the first one
+cases: on the phone, tapping a command below the first row
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a menu or prompt takes the keys
