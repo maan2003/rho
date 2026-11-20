@@ -69,10 +69,6 @@ impl World {
         self.now = self.now.checked_add(by).unwrap();
     }
 
-    fn ms(&self) -> i64 {
-        self.now.timestamp().as_millisecond()
-    }
-
     fn next_ts(&mut self) -> Ts {
         // Seconds with a sequence in the micros, so two messages in one
         // second are still two.
@@ -104,7 +100,7 @@ impl World {
             edited: false,
             reactions: Vec::new(),
         };
-        self.slack.note_message(&message, self.ms());
+        self.slack.note_message(&message);
         ts
     }
 
@@ -188,7 +184,7 @@ impl World {
     }
 
     fn deal(&self) -> Hand {
-        let claims = claims(&self.slack, None, &self.marks, self.now.timestamp(), None);
+        let claims = claims(&self.slack, None, &self.marks, None);
         let names = |address: &Address| {
             self.names
                 .get(address)
@@ -264,7 +260,7 @@ fn s1_a_card_says_why_in_the_conversation_s_name() {
     let mut w = world();
     w.dm("D1", "U1");
     assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
-    let claim = claims(&w.slack, None, &w.marks, w.now.timestamp(), None).remove(0);
+    let claim = claims(&w.slack, None, &w.marks, None).remove(0);
     assert_eq!(claim.context, "@u1", "the card is where it is");
     assert_eq!(claim.under, None, "a conversation hangs under nothing");
 }
@@ -351,7 +347,7 @@ fn a_claim_s_cursor_is_its_newest_message() {
     let mut w = world();
     w.dm("D1", "U1");
     let newest = w.post("D1", None, "U1", "again");
-    let claim = claims(&w.slack, None, &w.marks, w.now.timestamp(), None).remove(0);
+    let claim = claims(&w.slack, None, &w.marks, None).remove(0);
     assert_eq!(claim.cursor, newest.0);
     assert_eq!(
         claim.others.len(),

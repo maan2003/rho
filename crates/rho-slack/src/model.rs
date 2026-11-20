@@ -125,9 +125,6 @@ pub struct UnitFacts {
     /// a single message is sitting unanswered, so a channel's card is
     /// lowered again by this.
     pub others_replied: bool,
-    /// When rho first saw this unit, so a card's age is rho's own clock and
-    /// cannot be moved by a doctored message timestamp.
-    pub first_seen_ms: i64,
     /// Everyone rho has seen write in the unit, the user included: how many
     /// people a thread is a conversation between.
     pub people: BTreeSet<UserId>,
@@ -140,6 +137,13 @@ pub struct UnitFacts {
 pub const FROM_OTHERS_KEPT: usize = 32;
 
 impl UnitFacts {
+    /// The message the unit asks with, whose age is the card's: the newest
+    /// one from somebody else that concerns the reader. A unit nobody else
+    /// has written in asks with nothing, and counts from its newest.
+    pub fn asks_with(&self) -> &Ts {
+        self.newest_from_other.as_ref().unwrap_or(&self.newest)
+    }
+
     pub fn waiting(&self) -> Waiting {
         match self.newest_from_you {
             true => Waiting::OnThem,
@@ -183,9 +187,6 @@ pub struct UnitCard {
     pub attention: Option<Attention>,
     pub waiting: Waiting,
     pub wait_days: f64,
-    /// When rho first saw this unit, in milliseconds. What a card is raised
-    /// at, which is not the same as when its newest message landed.
-    pub first_seen_ms: i64,
     /// The newest message; a change here is what re-raises the card.
     pub newest: Ts,
     /// Where a dealt card lands the reader: the oldest message from someone
@@ -339,6 +340,12 @@ pub struct Model {
     /// channel read that nobody has looked at.
     conversation_read: BTreeMap<ChannelId, Ts>,
     thread_read: BTreeMap<ThreadKey, Ts>,
+    /// The conversations whose read cursor is still the one the last run
+    /// wrote down, which Slack has not answered for yet this run. Slack
+    /// owns the cursor, and it moves backwards while rho is off -- an undo
+    /// told it, a "mark unread" in another app -- so its first answer
+    /// replaces the carried one rather than joining it.
+    carried_read: BTreeSet<ChannelId>,
     /// How far the reader has said they are done in each unit, in rho's own
     /// words. Slack's read mark says the same thing in Slack's, and what
     /// has been dealt with is the later of the two: reading on the phone
@@ -464,6 +471,7 @@ impl Model {
             muted: BTreeSet::new(),
             conversation_read: BTreeMap::new(),
             thread_read: BTreeMap::new(),
+            carried_read: BTreeSet::new(),
             handled: BTreeMap::new(),
             handled_edits: Vec::new(),
             order: BTreeMap::new(),
@@ -768,17 +776,20 @@ impl Model {
 
     /// Slack's unread bookkeeping, replacing what rho held.
     ///
-    /// The cursor that comes with it is evidence like any other and goes
-    /// through the one rule, so an answer prepared before rho's own mark
-    /// reached the server cannot walk the unread rule back over messages
-    /// the reader has been through. A reconnect asks for this again, and
-    /// re-badging a conversation the reader read a second ago is the whole
-    /// of "mark read does not stick".
+    /// The first cursor this run replaces the one carried from the last
+    /// run, whichever way it moved. After that, the cursor that comes with
+    /// it is evidence like any other and goes through the one rule, so an
+    /// answer prepared before rho's own mark reached the server cannot
+    /// walk the unread rule back over messages the reader has been through. A
+    /// reconnect asks for this again, and re-badging a conversation the
+    /// reader read a second ago is the whole of "mark read does not stick".
     pub fn set_counts(&mut self, counts: impl IntoIterator<Item = ConversationCount>) {
         for count in counts {
             let (channel, cursor) = (count.channel.clone(), count.last_read.clone());
             self.counts.insert(channel.clone(), count);
-            if let Some(cursor) = cursor {
+            if self.carried_read.remove(&channel) {
+                self.set_read_through(&Unit::conversation(&channel), cursor);
+            } else if let Some(cursor) = cursor {
                 self.mark_read(&channel, &cursor);
             }
             // The badge against whichever cursor won, because the one rho
@@ -883,7 +894,7 @@ impl Model {
     ///
     /// Deduplication is the ordinary one: a DM the socket or the feed has
     /// already accounted for is not raised twice.
-    pub fn unread_dms(&mut self, now_ms: i64) -> Vec<Change> {
+    pub fn unread_dms(&mut self) -> Vec<Change> {
         let unread = self
             .counts
             .values()
@@ -901,7 +912,7 @@ impl Model {
             .collect::<Vec<_>>();
         unread
             .iter()
-            .filter_map(|item| self.note_activity(item, now_ms))
+            .filter_map(|item| self.note_activity(item))
             .collect()
     }
 
@@ -1372,12 +1383,21 @@ impl Model {
         }
     }
 
-    /// Slack's mark, back where it stood before rho pushed it. The one
-    /// place a read mark moves backwards, and only ever by exactly as much
-    /// as this rho moved it: a verdict pushed the mark, the undo takes the
-    /// verdict back, and Slack is told the same thing. Whatever Slack says
-    /// afterwards is the truth again, monotonic from here.
-    pub fn undo_read(&mut self, unit: &Unit, before: Option<Ts>) {
+    /// Where the reader read to in a conversation in the last run, before
+    /// Slack has said anything in this one: the unread rule is in place
+    /// at once, and Slack's first answer replaces it (see `carried_read`).
+    pub fn carry_read(&mut self, channel: &ChannelId, ts: &Ts) {
+        if self.mark_read(channel, ts) {
+            self.carried_read.insert(channel.clone());
+        }
+    }
+
+    /// Slack's mark, put exactly where it is, backwards too: where it
+    /// stood before rho pushed it, when an undo takes the push back, or
+    /// where Slack first says it is over a cursor the last run carried.
+    /// Whatever Slack says afterwards is the truth again, monotonic from
+    /// here.
+    pub fn set_read_through(&mut self, unit: &Unit, before: Option<Ts>) {
         match &unit.thread {
             Some(root) => {
                 let key = self.key(&unit.channel, root);
@@ -1651,7 +1671,7 @@ impl Model {
 
     /// Takes one message, from either source. Returns what it changed, or
     /// nothing at all when it is channel traffic or a duplicate.
-    pub fn note_message(&mut self, message: &Message, now_ms: i64) -> Option<Change> {
+    pub fn note_message(&mut self, message: &Message) -> Option<Change> {
         let unit = self.unit_for(&message.channel, message.thread_ts.as_ref());
         let from_you = message.user.as_ref() == Some(&self.self_id);
         let reason = self.reason_for(message, &unit, from_you)?;
@@ -1667,20 +1687,13 @@ impl Model {
         {
             return None;
         }
-        self.record(
-            unit,
-            reason,
-            &message.ts,
-            from_you,
-            message.user.as_ref(),
-            now_ms,
-        )
+        self.record(unit, reason, &message.ts, from_you, message.user.as_ref())
     }
 
     /// Takes one activity-feed entry. The feed says *that* something
     /// happened; the message body arrives separately, so a thread raised
     /// from the feed carries no summary until it is loaded.
-    pub fn note_activity(&mut self, item: &ActivityItem, now_ms: i64) -> Option<Change> {
+    pub fn note_activity(&mut self, item: &ActivityItem) -> Option<Change> {
         let reason = match item.kind {
             ActivityKind::Mention => Reason::Mention,
             ActivityKind::ThreadReply => Reason::Thread,
@@ -1691,7 +1704,7 @@ impl Model {
             return None;
         }
         let unit = self.unit_for(&item.channel, item.thread_ts.as_ref());
-        self.record(unit, reason, &item.ts, false, None, now_ms)
+        self.record(unit, reason, &item.ts, false, None)
     }
 
     /// Why this message obliges the user, or `None` when it is nothing to
@@ -1792,7 +1805,6 @@ impl Model {
         ts: &Ts,
         from_you: bool,
         author: Option<&UserId>,
-        now_ms: i64,
     ) -> Option<Change> {
         let existing = self.units.get(&unit);
         // An out-of-order arrival (a feed page after the socket already had
@@ -1806,7 +1818,6 @@ impl Model {
             return None;
         }
         let was_waiting = existing.map(UnitFacts::waiting);
-        let first_seen_ms = existing.map_or(now_ms, |facts| facts.first_seen_ms);
         // A second voice while the first was still waiting. Cleared with
         // the attention itself, so this counts the current run and not the
         // history of the room.
@@ -1849,7 +1860,6 @@ impl Model {
                 newest_from_other,
                 newest_from_you: from_you,
                 others_replied,
-                first_seen_ms,
                 people,
                 from_others,
             },
@@ -1878,7 +1888,6 @@ impl Model {
             attention: self.attention(unit),
             waiting: facts.waiting(),
             wait_days: wait_days(facts, now_ms),
-            first_seen_ms: facts.first_seen_ms,
             newest: facts.newest.clone(),
             newest_from_other: facts.newest_from_other.clone(),
             others_replied: facts.others_replied,
@@ -2036,9 +2045,9 @@ fn unit_of(key: &ThreadKey) -> Unit {
     Unit::thread(&key.channel, &key.thread_ts)
 }
 
-/// How long the unit has been waiting, counted from the newest message.
+/// How long the unit has been waiting: the age of the message it asks with.
 fn wait_days(facts: &UnitFacts, now_ms: i64) -> f64 {
-    let since = now_ms.saturating_sub(facts.newest.millis().max(facts.first_seen_ms.min(now_ms)));
+    let since = now_ms.saturating_sub(facts.asks_with().millis());
     (since as f64 / 86_400_000.0).max(0.0)
 }
 
@@ -2078,8 +2087,8 @@ mod tests {
     #[test]
     fn a_cutoff_closes_what_is_older_than_it_and_nothing_it_has_never_seen() {
         let mut model = model();
-        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"), 0);
-        model.note_message(&message("C1", "900.0", "U1", "<@ME> again"), 0);
+        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"));
+        model.note_message(&message("C1", "900.0", "U1", "<@ME> again"));
         let channel = Unit::conversation(&ChannelId("C1".into()));
         let never_seen = Unit::conversation(&ChannelId("C9".into()));
         assert_eq!(
@@ -2103,12 +2112,16 @@ mod tests {
     /// the mirror: everything but the title, which needs the words the
     /// mirror holds and is filled by the session.
     #[test]
-    fn a_card_carries_when_it_was_first_seen_and_leaves_the_title_to_the_session() {
+    fn a_card_is_as_old_as_its_mention_and_leaves_the_title_to_the_session() {
         let mut model = model();
-        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"), 7 * DAY);
+        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"));
         let unit = Unit::conversation(&ChannelId("C1".into()));
         let card = model.card(&unit, 7 * DAY).expect("a mention is a card");
-        assert_eq!(card.first_seen_ms, 7 * DAY, "raised when it was first seen");
+        assert!(
+            (card.wait_days - (7.0 - 100.0 / 86_400.0)).abs() < 1e-6,
+            "waiting since the mention was said, not since rho saw it: {}",
+            card.wait_days
+        );
         assert_eq!(card.conversation, "#design");
         assert_eq!(card.attention, Some(Attention::Mentioned));
         assert!(
@@ -2128,7 +2141,7 @@ mod tests {
             unread: true,
         };
         assert!(matches!(
-            model.note_activity(&item, 0),
+            model.note_activity(&item),
             Some(Change::Raised(_))
         ));
         let unit = Unit::conversation(&ChannelId("C1".into()));
@@ -2142,7 +2155,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            model.note_message(&message, 0),
+            model.note_message(&message),
             None,
             "the feed already counted this timestamp"
         );
@@ -2305,7 +2318,7 @@ mod tests {
         let mut model = model();
         let design = ChannelId("C1".into());
         assert_eq!(
-            model.note_message(&message("C1", "100", "U1", "shipping today"), 0),
+            model.note_message(&message("C1", "100", "U1", "shipping today")),
             Some(Change::Raised(Unit::conversation(&design))),
             "traffic in a channel is a unit of its own"
         );
@@ -2336,7 +2349,7 @@ mod tests {
 
         // A second voice in the same run: the room is being answered
         // without the reader, which is what puts the card lower still.
-        model.note_message(&message("C1", "101", "U2", "on it"), 0);
+        model.note_message(&message("C1", "101", "U2", "on it"));
         assert!(model.cards(0)[0].others_replied);
 
         // Slack's cursor moving past it is what ends the asking, from
@@ -2353,12 +2366,12 @@ mod tests {
     fn chatter_after_a_mention_leaves_the_mention_where_it_is() {
         let mut model = model();
         let day = 86_400_000;
-        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"));
         let raised = model.cards(2 * day)[0].clone();
         assert_eq!(raised.attention, Some(Attention::Mentioned));
 
         assert_eq!(
-            model.note_message(&message("C1", "500", "U2", "unrelated"), 2 * day),
+            model.note_message(&message("C1", "500", "U2", "unrelated")),
             None,
             "chatter is nothing to a unit that is already theirs by name"
         );
@@ -2376,7 +2389,7 @@ mod tests {
     fn a_mention_read_in_another_client_stops_asking() {
         let mut model = model();
         let design = ChannelId("C1".into());
-        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"));
         assert_eq!(
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::Mentioned)
@@ -2392,7 +2405,7 @@ mod tests {
 
         // And a later mention asks again: the cursor is a place, not a
         // verdict on the channel.
-        model.note_message(&message("C1", "200", "U1", "<@ME> still?"), 0);
+        model.note_message(&message("C1", "200", "U1", "<@ME> still?"));
         assert_eq!(
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::Mentioned)
@@ -2413,7 +2426,7 @@ mod tests {
         let mut model = model();
         let design = ChannelId("C1".into());
         let unit = Unit::conversation(&design);
-        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"));
         assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
 
         assert!(model.mark_handled(&unit, &Ts("100".into())));
@@ -2422,14 +2435,14 @@ mod tests {
 
         // A history page under the cursor, and the same message again from
         // the feed. Neither is news, and neither moves the cursor back.
-        model.note_message(&message("C1", "50", "U1", "earlier still"), 0);
-        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        model.note_message(&message("C1", "50", "U1", "earlier still"));
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"));
         assert_eq!(model.attention(&unit), None);
         assert!(!model.mark_handled(&unit, &Ts("50".into())));
         assert_eq!(model.handled_through(&unit), Some(&Ts("100".into())));
 
         // Somebody writing past it is news, and only that.
-        model.note_message(&message("C1", "200", "U1", "<@ME> still?"), 0);
+        model.note_message(&message("C1", "200", "U1", "<@ME> still?"));
         assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
 
         // And the undo puts the cursor back where the verdict found it, so
@@ -2451,7 +2464,7 @@ mod tests {
         let mut model = model();
         let design = ChannelId("C1".into());
         model.follow(&design, &Ts("100".into()));
-        model.note_message(&reply("C1", "150", "100", "U1", "one more thing"), 0);
+        model.note_message(&reply("C1", "150", "100", "U1", "one more thing"));
         let key = model.key(&design, &Ts("100".into()));
         let unit = Unit::thread(&design, &Ts("100".into()));
         assert_eq!(model.attention(&unit), Some(Attention::FollowedThread));
@@ -2476,7 +2489,7 @@ mod tests {
     #[test]
     fn a_muted_conversation_asks_for_nothing() {
         let mut model = model();
-        model.note_message(&message("D1", "100", "U1", "lunch?"), 0);
+        model.note_message(&message("D1", "100", "U1", "lunch?"));
         assert_eq!(
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::DirectMessage)
@@ -2496,12 +2509,12 @@ mod tests {
     fn a_mention_in_a_noisy_channel_still_reads_as_a_mention() {
         let mut model = model();
         let design = ChannelId("C1".into());
-        model.note_message(&message("C1", "100", "U1", "shipping today"), 0);
+        model.note_message(&message("C1", "100", "U1", "shipping today"));
         assert_eq!(
             model.attention(&Unit::conversation(&design)),
             Some(Attention::ChannelTraffic)
         );
-        model.note_message(&message("C1", "200", "U1", "<@ME> can you look?"), 0);
+        model.note_message(&message("C1", "200", "U1", "<@ME> can you look?"));
         assert_eq!(
             model.attention(&Unit::conversation(&design)),
             Some(Attention::Mentioned)
@@ -2601,18 +2614,18 @@ mod tests {
             assert_eq!(kept, asked, "{at}");
         };
 
-        model.note_message(&message("C1", "100", "U1", "hey <@ME>"), 0);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME>"));
         agrees(&model, "a mention arrives");
-        model.note_message(&message("D1", "110", "U1", "lunch?"), 0);
+        model.note_message(&message("D1", "110", "U1", "lunch?"));
         agrees(&model, "a direct message arrives");
         model.follow(&design, &Ts("100".into()));
-        model.note_message(&reply("C1", "120", "100", "U1", "and?"), 0);
+        model.note_message(&reply("C1", "120", "100", "U1", "and?"));
         agrees(&model, "a followed thread gets a reply");
         model.mark_read(&design, &Ts("100".into()));
         agrees(&model, "the channel is read");
         model.mark_thread_read(&model.key(&design, &Ts("100".into())), &Ts("120".into()));
         agrees(&model, "the thread is read at its own cursor");
-        model.note_message(&message("C1", "200", "U1", "unrelated"), 0);
+        model.note_message(&message("C1", "200", "U1", "unrelated"));
         agrees(&model, "ordinary traffic lands in the channel");
         model.set_muted([design.clone()]);
         agrees(&model, "and then muted");
@@ -2643,25 +2656,25 @@ mod tests {
         let mut model = model();
         let design = Unit::conversation(&ChannelId("C1".into()));
         assert_eq!(
-            model.note_message(&message("C1", "100", "U1", "shipping today"), 0),
+            model.note_message(&message("C1", "100", "U1", "shipping today")),
             Some(Change::Raised(design.clone()))
         );
         assert_eq!(model.attention(&design), Some(Attention::ChannelTraffic));
         // A mention is louder.
         assert_eq!(
-            model.note_message(&message("C1", "101", "U1", "hey <@ME> look"), 0),
+            model.note_message(&message("C1", "101", "U1", "hey <@ME> look")),
             Some(Change::Updated(design.clone()))
         );
         // A DM is.
         assert!(matches!(
-            model.note_message(&message("D1", "102", "U1", "hello"), 0),
+            model.note_message(&message("D1", "102", "U1", "hello")),
             Some(Change::Raised(_))
         ));
         assert_eq!(model.attention(&design), Some(Attention::Mentioned));
         // A reply in a thread the user never touched raises no thread: it
         // is the room's traffic, filed against the room.
         assert_eq!(
-            model.note_message(&reply("C1", "104", "103", "U1", "and another"), 0),
+            model.note_message(&reply("C1", "104", "103", "U1", "and another")),
             None,
             "and it does not touch the mention that is already standing"
         );
@@ -2679,7 +2692,7 @@ mod tests {
         let mut followed = model();
         followed.set_followed([(ChannelId("C1".into()), Ts("500".into()), None)]);
         assert!(matches!(
-            followed.note_message(&reply("C1", "501", "500", "U1", "any update?"), 0),
+            followed.note_message(&reply("C1", "501", "500", "U1", "any update?")),
             Some(Change::Raised(_))
         ));
 
@@ -2693,14 +2706,14 @@ mod tests {
         let mut stranger = model();
         let room = Unit::conversation(&ChannelId("C1".into()));
         assert_eq!(
-            stranger.note_message(&reply("C1", "601", "600", "U1", "any update?"), 0),
+            stranger.note_message(&reply("C1", "601", "600", "U1", "any update?")),
             Some(Change::Raised(room.clone()))
         );
         assert_eq!(stranger.attention(&room), Some(Attention::ChannelTraffic));
         stranger.follow(&ChannelId("C1".into()), &Ts("700".into()));
         stranger.unfollow(&ChannelId("C1".into()), &Ts("700".into()));
         assert_eq!(
-            stranger.note_message(&reply("C1", "701", "700", "U1", "any update?"), 0),
+            stranger.note_message(&reply("C1", "701", "700", "U1", "any update?")),
             Some(Change::Updated(room)),
             "the room, not the thread"
         );
@@ -2718,7 +2731,7 @@ mod tests {
         // that knew the thread was the user's — was dropped as a duplicate.
         let mut poisoned = model();
         assert_eq!(
-            poisoned.note_message(&reply("C1", "801", "800", "U1", "any update?"), 0),
+            poisoned.note_message(&reply("C1", "801", "800", "U1", "any update?")),
             Some(Change::Raised(Unit::conversation(&ChannelId("C1".into())))),
             "as the room's traffic, which is not what the feed knows"
         );
@@ -2730,7 +2743,7 @@ mod tests {
             unread: true,
         };
         assert!(matches!(
-            poisoned.note_activity(&item, 0),
+            poisoned.note_activity(&item),
             Some(Change::Updated(_))
         ));
         assert_eq!(
@@ -2744,10 +2757,10 @@ mod tests {
         let mut live_first = model();
         live_first.set_followed([(ChannelId("C1".into()), Ts("800".into()), None)]);
         assert!(matches!(
-            live_first.note_message(&reply("C1", "801", "800", "U1", "any update?"), 0),
+            live_first.note_message(&reply("C1", "801", "800", "U1", "any update?")),
             Some(Change::Raised(_))
         ));
-        assert_eq!(live_first.note_activity(&item, 0), None);
+        assert_eq!(live_first.note_activity(&item), None);
         assert_eq!(owed(&live_first, 0).len(), 1);
     }
 
@@ -2764,10 +2777,7 @@ mod tests {
             })],
             ..message("C1", "200", "U1", "")
         };
-        assert!(matches!(
-            model.note_message(&here, 0),
-            Some(Change::Raised(_))
-        ));
+        assert!(matches!(model.note_message(&here), Some(Change::Raised(_))));
 
         let other = Message {
             blocks: vec![json!({
@@ -2778,7 +2788,7 @@ mod tests {
             })],
             ..message("C1", "201", "U1", "")
         };
-        assert_eq!(model.note_message(&other, 0), None);
+        assert_eq!(model.note_message(&other), None);
     }
 
     #[test]
@@ -2792,16 +2802,16 @@ mod tests {
             unread: true,
         };
         assert!(matches!(
-            model.note_activity(&item, 0),
+            model.note_activity(&item),
             Some(Change::Raised(_))
         ));
         // The same event arriving over the websocket changes nothing.
         assert_eq!(
-            model.note_message(&message("C1", "300", "U1", "hey <@ME>"), 0),
+            model.note_message(&message("C1", "300", "U1", "hey <@ME>")),
             None
         );
         // And a repeat poll of the same feed page changes nothing either.
-        assert_eq!(model.note_activity(&item, 0), None);
+        assert_eq!(model.note_activity(&item), None);
         assert_eq!(owed(&model, 0).len(), 1);
     }
 
@@ -2810,7 +2820,7 @@ mod tests {
         let mut model = model();
         let now = 10 * DAY;
         assert!(matches!(
-            model.note_message(&message("D1", "400", "U1", "any update?"), now),
+            model.note_message(&message("D1", "400", "U1", "any update?")),
             Some(Change::Raised(_))
         ));
         let key = Unit::conversation(&ChannelId("D1".into()));
@@ -2820,7 +2830,7 @@ mod tests {
         // Answering is not a verdict: the thread is still tracked, the ball
         // is theirs, and the card the dealer builds says so.
         assert_eq!(
-            model.note_message(&reply("D1", "401", "400", "ME", "tomorrow"), now),
+            model.note_message(&reply("D1", "401", "400", "ME", "tomorrow")),
             Some(Change::Replied(key.clone()))
         );
         assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnThem);
@@ -2828,7 +2838,7 @@ mod tests {
 
         // Their answer brings it back, keyed on the newer message.
         assert_eq!(
-            model.note_message(&reply("D1", "402", "400", "U1", "thanks!"), now),
+            model.note_message(&reply("D1", "402", "400", "U1", "thanks!")),
             Some(Change::Raised(key.clone()))
         );
         let card = model.card(&key, now).unwrap();
@@ -2844,10 +2854,10 @@ mod tests {
     fn a_channel_of_mentions_and_a_busy_dm_are_each_one_card() {
         let mut model = model();
         for ts in ["100", "101", "102"] {
-            model.note_message(&message("C1", ts, "U1", "hey <@ME> look"), 0);
+            model.note_message(&message("C1", ts, "U1", "hey <@ME> look"));
         }
         for ts in ["200", "201", "202", "203", "204"] {
-            model.note_message(&message("D1", ts, "U1", "ping"), 0);
+            model.note_message(&message("D1", ts, "U1", "ping"));
         }
         assert_eq!(
             model.tracked(),
@@ -2873,11 +2883,11 @@ mod tests {
     #[test]
     fn no_source_can_lower_what_the_mirror_has_already_said() {
         let mut model = model();
-        model.note_message(&message("D1", "500", "U1", "the newest"), 0);
+        model.note_message(&message("D1", "500", "U1", "the newest"));
 
         // A history page loading under the card.
         assert_eq!(
-            model.note_message(&message("D1", "300", "U1", "older"), 0),
+            model.note_message(&message("D1", "300", "U1", "older")),
             None
         );
         // A feed poll repeating an older item after a reconnect.
@@ -2888,7 +2898,7 @@ mod tests {
             kind: ActivityKind::DirectMessage,
             unread: true,
         };
-        assert_eq!(model.note_activity(&stale, 0), None);
+        assert_eq!(model.note_activity(&stale), None);
         // And what Slack says is unread when rho starts again.
         model.set_counts([ConversationCount {
             channel: ChannelId("D1".into()),
@@ -2898,7 +2908,7 @@ mod tests {
             latest: Some(Ts("450".into())),
             last_read: None,
         }]);
-        assert!(model.unread_dms(0).is_empty());
+        assert!(model.unread_dms().is_empty());
 
         let facts = model
             .unit(&Unit::conversation(&ChannelId("D1".into())))
@@ -2913,11 +2923,11 @@ mod tests {
     #[test]
     fn your_reply_flips_the_word_and_not_what_closes_the_card() {
         let mut model = model();
-        model.note_message(&message("D1", "600", "U1", "any update?"), 0);
+        model.note_message(&message("D1", "600", "U1", "any update?"));
         let unit = Unit::conversation(&ChannelId("D1".into()));
         assert_eq!(model.unit(&unit).unwrap().waiting(), Waiting::OnYou);
 
-        model.note_message(&message("D1", "601", "ME", "tomorrow"), 0);
+        model.note_message(&message("D1", "601", "ME", "tomorrow"));
         let facts = model.unit(&unit).unwrap();
         assert_eq!(facts.waiting(), Waiting::OnThem);
         assert_eq!(facts.newest, Ts("601".into()));
@@ -2932,10 +2942,7 @@ mod tests {
     fn wait_days_count_from_the_newest_message() {
         let mut model = model();
         let sent_ms = 100 * DAY;
-        model.note_message(
-            &message("D1", &format!("{}", sent_ms / 1000), "U1", "ping"),
-            sent_ms,
-        );
+        model.note_message(&message("D1", &format!("{}", sent_ms / 1000), "U1", "ping"));
         let now = sent_ms + 2 * DAY;
         let card = &owed(&model, now)[0];
         assert!((card.wait_days - 2.0).abs() < 0.01, "{}", card.wait_days);
@@ -2945,8 +2952,8 @@ mod tests {
     #[test]
     fn an_out_of_order_page_cannot_walk_a_thread_backwards() {
         let mut model = model();
-        model.note_message(&message("D1", "500", "U1", "first"), 0);
-        model.note_message(&reply("D1", "502", "500", "ME", "answered"), 0);
+        model.note_message(&message("D1", "500", "U1", "first"));
+        model.note_message(&reply("D1", "502", "500", "ME", "answered"));
         // A feed poll arriving late with the older reply must not undo the
         // done verdict the newer one recorded.
         let stale = ActivityItem {
@@ -2956,7 +2963,7 @@ mod tests {
             kind: ActivityKind::ThreadReply,
             unread: true,
         };
-        assert_eq!(model.note_activity(&stale, 0), None);
+        assert_eq!(model.note_activity(&stale), None);
         let key = Unit::conversation(&ChannelId("D1".into()));
         assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnThem);
     }
@@ -2973,7 +2980,7 @@ mod tests {
     #[test]
     fn reading_elsewhere_clears_the_badge_and_stops_the_asking() {
         let mut model = model();
-        model.note_message(&message("D1", "600", "U1", "ping"), 0);
+        model.note_message(&message("D1", "600", "U1", "ping"));
         let key = Unit::conversation(&ChannelId("D1".into()));
         assert_eq!(owed(&model, 0).len(), 1);
 
@@ -2987,7 +2994,7 @@ mod tests {
         assert!(owed(&model, 0).is_empty());
 
         // And the next thing they say asks again.
-        model.note_message(&message("D1", "700", "U1", "still there?"), 0);
+        model.note_message(&message("D1", "700", "U1", "still there?"));
         assert_eq!(owed(&model, 0).len(), 1);
     }
 
@@ -3163,7 +3170,7 @@ mod tests {
         // is addressed to them, the way a one-to-one is.
         let key = Unit::conversation(&ChannelId("G1".into()));
         assert_eq!(
-            model.note_message(&message("G1", "200", "U1", "are you both free?"), 0),
+            model.note_message(&message("G1", "200", "U1", "are you both free?")),
             Some(Change::Raised(key.clone()))
         );
         assert_eq!(model.unit(&key).unwrap().reason, Reason::DirectMessage);
@@ -3189,14 +3196,14 @@ mod tests {
                 last_read: None,
             },
         ]);
-        let raised = model.unread_dms(0);
+        let raised = model.unread_dms();
         assert_eq!(
             raised,
             vec![Change::Raised(Unit::conversation(&ChannelId("D1".into())))],
             "the DM is raised and the channel is not"
         );
         assert!(
-            model.unread_dms(0).is_empty(),
+            model.unread_dms().is_empty(),
             "a second roster fetch raises nothing again"
         );
     }

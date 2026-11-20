@@ -713,7 +713,7 @@ impl Session {
                 // nowhere else: the feed never carries one. Raised here,
                 // once the conversations are known, because whether a
                 // channel is a DM is a fact about the roster.
-                let raised = session.model.unread_dms(now_ms());
+                let raised = session.model.unread_dms();
                 for change in &raised {
                     if let Change::Raised(key) | Change::Updated(key) = change {
                         session.prefetch_ping(&key.clone(), cx);
@@ -776,7 +776,7 @@ impl Session {
                 cx.emit(SessionEvent::Connected);
             }
             Wire::Frame(WsEvent::Message(message)) => {
-                self.receive(*message, now, cx);
+                self.receive(*message, cx);
             }
             Wire::Frame(WsEvent::Edited(message)) => {
                 self.edit(*message);
@@ -908,7 +908,7 @@ impl Session {
                 self.resync_tail(cx);
                 let mut changes = Vec::new();
                 for item in &items {
-                    if let Some(change) = self.model.note_activity(item, now) {
+                    if let Some(change) = self.model.note_activity(item) {
                         changes.push(change);
                     }
                 }
@@ -931,7 +931,7 @@ impl Session {
         cx.notify();
     }
 
-    fn receive(&mut self, message: Message, now: i64, cx: &mut Context<Self>) {
+    fn receive(&mut self, message: Message, cx: &mut Context<Self>) {
         // The real thing takes the local copy's place, whichever arrives
         // first: Slack echoes a sent message down the socket as well as
         // answering the post with it.
@@ -946,7 +946,7 @@ impl Session {
         // workspace, and `note_message` answers only about cards.
         self.learn_names(std::slice::from_ref(&message), cx);
         self.model.note_counts(&message);
-        let change = self.model.note_message(&message, now);
+        let change = self.model.note_message(&message);
         self.route(&message);
         self.announce(change.into_iter().collect(), cx);
     }
@@ -1421,16 +1421,9 @@ impl Session {
                     .last()
                     .map(|message| message.ts.clone())
             })
-            .unwrap_or_else(|| {
-                let micros = (ts.epoch_seconds() * 1_000_000.0) as i64 - 1;
-                Ts(format!(
-                    "{}.{:06}",
-                    micros.div_euclid(1_000_000),
-                    micros.rem_euclid(1_000_000)
-                ))
-            });
+            .unwrap_or_else(|| just_before(ts));
         self.model.undo_handled(&unit, Some(before.clone()));
-        self.model.undo_read(&unit, Some(before.clone()));
+        self.model.set_read_through(&unit, Some(before.clone()));
         if let Some(mirror) = self.mirror.as_ref() {
             mirror.set_last_read(&self.scope(source), &before);
         }
@@ -1494,15 +1487,23 @@ impl Session {
     /// thing Slack does -- it is what "mark unread" is -- and this is the
     /// only place rho asks for one.
     ///
-    /// A unit that had no mark at all cannot be un-marked: there is no
-    /// message to name it by. The card still comes back here, on rho's own
-    /// half, which is what the reader pressed undo about.
+    /// A unit that had no mark at all goes back to just before the first
+    /// message the verdict closed, which is as unread as Slack can be told
+    /// to make it: every other app shows the ask unread again. The cursor
+    /// is written down too, so a start before Slack answers deals the card.
     pub fn undo_handled(&mut self, unit: &Unit, before: &HandledBefore, cx: &mut Context<Self>) {
         self.outbox.remove(unit);
+        let read = before.read.clone().or_else(|| {
+            self.oldest_from_other_after(unit, before.handled.as_ref())
+                .map(|ts| just_before(&ts))
+        });
         self.model.undo_handled(unit, before.handled.clone());
-        self.model.undo_read(unit, before.read.clone());
+        self.model.set_read_through(unit, read.clone());
         self.write_handled();
-        if let Some(read) = before.read.clone() {
+        if let Some(read) = read {
+            if let Some(mirror) = self.mirror.as_ref() {
+                mirror.set_last_read(&scope_of(&self.model.workspace().0, unit), &read);
+            }
             self.outbox.insert(unit.clone(), read);
             self.drain_outbox(cx);
         }
@@ -2203,7 +2204,6 @@ impl Session {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
-                let now = now_ms();
                 let mut changes = Vec::new();
                 let mut fetched = Vec::new();
                 let mut reached_oldest = false;
@@ -2249,7 +2249,7 @@ impl Session {
                     // A loaded page is how rho learns that the user answered
                     // a thread from the Slack app: their own reply here is
                     // the same done verdict it would be live.
-                    match session.model.note_message(message, now) {
+                    match session.model.note_message(message) {
                         Some(change) => changes.push(change),
                         // Already counted from the feed, which carries no
                         // body: this is where the card gets its summary.
@@ -3551,7 +3551,7 @@ impl Session {
             reactions: Vec::new(),
         };
         let key = self.model.key(&message.channel, &message.thread_root());
-        self.receive(message, now_ms(), cx);
+        self.receive(message, cx);
         cx.emit(SessionEvent::Replied(key));
     }
 
@@ -3706,9 +3706,9 @@ pub fn seed_handled_cursors(model: &mut Model, mirror: &Mirror) -> BTreeMap<Unit
 /// The unread rule is drawn from this cursor, so without it a conversation
 /// opened during the first seconds of a start — or opened at all while
 /// offline — shows no rule and reads as though none of it had ever been
-/// seen. Slack's own cursor overtakes this the moment `client.counts`
-/// answers and cannot walk it backwards, so the mirror is a head start and
-/// never a second opinion.
+/// seen. Slack's own cursor replaces this the moment `client.counts`
+/// answers, backwards too, so the mirror is a head start and never a
+/// second opinion.
 ///
 /// Conversations only: which threads are followed is Slack's list, and it
 /// arrives carrying each thread's own cursor, so there is nothing here for
@@ -3717,7 +3717,7 @@ pub fn seed_read_cursors(model: &mut Model, mirror: &Mirror) {
     let workspace = model.workspace().0.clone();
     for channel in model.conversations() {
         if let Some(ts) = mirror.last_read(&Scope::conversation(&workspace, &channel)) {
-            model.mark_read(&channel, &ts);
+            model.carry_read(&channel, &ts);
         }
     }
 }
@@ -3744,10 +3744,6 @@ pub fn restore_units(model: &mut Model, mirror: &Mirror) {
 /// instead, one row per unit. The one time a start may reach this is a
 /// mirror written before the units table existed, which pays it once and
 /// then records that it has. Calling it at boot would put the cost back.
-/// A replayed message is evidence about when it was said, not about now.
-/// `note_message` takes the time a unit was first seen, and the mirror is
-/// handing over history: the time to hand it is the message's own, or every
-/// card derived here reads as having waited no time at all.
 pub fn derive_units(model: &mut Model, mirror: &Mirror) {
     let workspace = model.workspace().0.clone();
     let mut scopes = mirror
@@ -3763,8 +3759,7 @@ pub fn derive_units(model: &mut Model, mirror: &Mirror) {
     );
     for scope in scopes {
         for message in mirror.newest_chunk(&scope, STARTUP_WINDOW) {
-            let said_at = message.ts.millis();
-            model.note_message(&message, said_at);
+            model.note_message(&message);
         }
     }
 }
@@ -3849,6 +3844,16 @@ fn take_pending_interaction(pending: &mut HashSet<String>, token: &str) -> bool 
     pending.remove(token)
 }
 
+/// The instant before `ts`: a mark there leaves `ts` itself unread.
+fn just_before(ts: &Ts) -> Ts {
+    let micros = (ts.epoch_seconds() * 1_000_000.0) as i64 - 1;
+    Ts(format!(
+        "{}.{:06}",
+        micros.div_euclid(1_000_000),
+        micros.rem_euclid(1_000_000)
+    ))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3913,7 +3918,6 @@ mod tests {
                 newest_from_other: Some(Ts("300.0".into())),
                 newest_from_you: false,
                 others_replied: false,
-                first_seen_ms: 1_000,
                 people: Default::default(),
                 from_others: Vec::new(),
             },
@@ -3927,7 +3931,6 @@ mod tests {
 
         restore_units(&mut model, &mirror);
         assert_eq!(model.tracked(), vec![unit.clone()]);
-        assert_eq!(model.unit(&unit).unwrap().first_seen_ms, 1_000);
         assert_eq!(
             model.attention(&unit),
             Some(crate::model::Attention::Mentioned),
@@ -3937,16 +3940,13 @@ mod tests {
         // The feed replaying what the row already holds does not raise it
         // twice: the row's timestamps are marked seen when it is installed.
         assert_eq!(
-            model.note_activity(
-                &crate::api::ActivityItem {
-                    channel: ChannelId("C1".into()),
-                    ts: Ts("300.0".into()),
-                    thread_ts: None,
-                    kind: crate::api::ActivityKind::Mention,
-                    unread: true,
-                },
-                0
-            ),
+            model.note_activity(&crate::api::ActivityItem {
+                channel: ChannelId("C1".into()),
+                ts: Ts("300.0".into()),
+                thread_ts: None,
+                kind: crate::api::ActivityKind::Mention,
+                unread: true,
+            }),
             None
         );
     }
@@ -4083,8 +4083,7 @@ mod tests {
         );
 
         // The second connect derives again over the same history. It must
-        // not restart the clock either: `record` keeps the first_seen it
-        // already has, and the first one it had is now the right one.
+        // not restart the clock either: the age is the message's own.
         derive_units(&mut model, &mirror);
         let card = model.card(&unit, now).unwrap();
         assert!(
@@ -4104,7 +4103,7 @@ mod tests {
         let scope = Scope::conversation("T1", &ChannelId("C1".into()));
         let mention = mentioning("100.0", "U1", "<@U9> can you look?");
         mirror.insert_messages(&scope, std::slice::from_ref(&mention));
-        model.note_message(&mentioning("100.0", "U1", "hey <@ME> look"), 0);
+        model.note_message(&mentioning("100.0", "U1", "hey <@ME> look"));
         let unit = Unit::conversation(&ChannelId("C1".into()));
 
         assert_eq!(
@@ -4131,8 +4130,8 @@ mod tests {
         let mention = mentioning("100.0", "U1", "hey <@ME> actual mention");
         let chatter = mentioning("200.0", "U1", "ordinary later chatter");
         mirror.insert_messages(&scope, &[mention.clone(), chatter.clone()]);
-        model.note_message(&mention, 0);
-        model.note_message(&chatter, 0);
+        model.note_message(&mention);
+        model.note_message(&chatter);
         let unit = Unit::conversation(&ChannelId("C1".into()));
 
         assert_eq!(
@@ -4156,7 +4155,7 @@ mod tests {
         for ts in ["100.0", "200.0", "300.0"] {
             let message = mentioning(ts, "U1", "hey <@ME> look");
             mirror.insert_messages(&scope, std::slice::from_ref(&message));
-            model.note_message(&message, 0);
+            model.note_message(&message);
         }
         mirror.insert_messages(&scope, &[mentioning("250.0", "ME", "on it")]);
         let unit = Unit::conversation(&ChannelId("C1".into()));
@@ -4485,6 +4484,62 @@ mod tests {
             model.last_read(&ChannelId("C1".into())),
             Some(&Ts("700.0".into())),
             "a stale answer does not move the rule backwards"
+        );
+    }
+
+    /// The cursor the last run wrote down is a guess about Slack's, and
+    /// Slack's moves backwards while rho is off: an undo told it, or a
+    /// "mark unread" in another app. Its first answer replaces the guess,
+    /// so the mention above it asks again; only after that is the cursor
+    /// held against stale answers.
+    #[test]
+    fn slack_s_first_answer_takes_a_carried_cursor_back() {
+        let (_dir, mirror, mut model) = seeded();
+        mirror.put_conversations(
+            "T1",
+            &[crate::types::Conversation {
+                id: ChannelId("C1".into()),
+                kind: crate::types::ConversationKind::Channel,
+                name: "design".into(),
+                user: None,
+                members: Vec::new(),
+            }],
+        );
+        model.note_message(&mentioning("600.0", "U1", "<@ME> can you look?"));
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+        mirror.set_last_read(
+            &Scope::conversation("T1", &ChannelId("C1".into())),
+            &Ts("700.0".into()),
+        );
+        seed_read_cursors(&mut model, &mirror);
+        assert_eq!(model.attention(&unit), None, "read past it, last run");
+
+        let count = |last_read: &str| crate::api::ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 1,
+            unread_count: 1,
+            latest: Some(Ts("600.0".into())),
+            last_read: Some(Ts(last_read.into())),
+        };
+        model.set_counts([count("500.0")]);
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("500.0".into())),
+            "Slack says it is read to before the mention"
+        );
+        assert_eq!(
+            model.attention(&unit),
+            Some(crate::model::Attention::Mentioned),
+            "so the mention asks again"
+        );
+
+        model.mark_read(&ChannelId("C1".into()), &Ts("600.0".into()));
+        model.set_counts([count("500.0")]);
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("600.0".into())),
+            "a later answer is held against what this run has seen"
         );
     }
 

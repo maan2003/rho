@@ -267,7 +267,7 @@ async fn the_feed_poll_dedupes_against_the_websocket() {
     let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
     model.set_self(rho_slack::UserId("ME".into()));
     assert!(matches!(
-        model.note_activity(&items[0], 0),
+        model.note_activity(&items[0]),
         Some(Change::Raised(_))
     ));
     // The same mention arriving over the socket raises nothing further.
@@ -276,7 +276,7 @@ async fn the_feed_poll_dedupes_against_the_websocket() {
         &ChannelId("C1".into()),
     )
     .unwrap();
-    assert_eq!(model.note_message(&message, 0), None);
+    assert_eq!(model.note_message(&message), None);
     assert_eq!(owed(&model, 0).len(), 1);
 }
 
@@ -356,7 +356,7 @@ async fn a_thread_loads_and_a_reply_is_sent_into_it() {
         .unwrap()
         .messages
     {
-        model.note_message(&message, 0);
+        model.note_message(&message);
     }
     let unit = rho_slack::model::Unit::thread(&ChannelId("C1".into()), &Ts("500.0".into()));
     assert_eq!(model.unit(&unit).unwrap().waiting(), Waiting::OnThem);
@@ -483,7 +483,7 @@ async fn the_follow_list_comes_from_slack_and_the_socket_keeps_it_current() {
     let mut raised = 0;
     while raised < 2 {
         if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
-            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+            && let Some(Change::Raised(_)) = model.note_message(&message)
         {
             raised += 1;
         }
@@ -865,7 +865,6 @@ async fn marking_the_backlog_touches_only_what_is_older_than_the_cutoff() {
                 &ChannelId(channel.into()),
             )
             .unwrap(),
-            0,
         );
     }
 
@@ -943,7 +942,7 @@ async fn ignoring_a_thread_travels_both_ways() {
     let mut raised = 0;
     while raised < 2 {
         if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
-            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+            && let Some(Change::Raised(_)) = model.note_message(&message)
         {
             raised += 1;
         }
@@ -1007,7 +1006,7 @@ async fn ignoring_a_thread_travels_both_ways() {
     fake.live_reply("C2", "600.0", "U1", "still there?");
     loop {
         if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
-            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+            && let Some(Change::Raised(_)) = model.note_message(&message)
         {
             break;
         }
@@ -1045,7 +1044,6 @@ async fn undoing_a_discard_follows_the_thread_again() {
             &ChannelId("C1".into()),
         )
         .unwrap(),
-        0,
     );
     assert_eq!(owed(&model, 0).len(), 1);
 
@@ -1351,7 +1349,7 @@ async fn a_dm_unread_at_startup_raises_a_card() {
     model.add_conversations(client.conversations().await.unwrap());
     model.set_counts(client.counts().await.unwrap().conversations);
 
-    let raised = model.unread_dms(0);
+    let raised = model.unread_dms();
     let channels = raised
         .iter()
         .map(|change| match change {
@@ -1371,7 +1369,7 @@ async fn a_dm_unread_at_startup_raises_a_card() {
         assert_eq!(model.card(key, 0).unwrap().waiting, Waiting::OnYou);
     }
     assert!(
-        model.unread_dms(0).is_empty(),
+        model.unread_dms().is_empty(),
         "a reconnect does not raise them again"
     );
 }
@@ -1711,7 +1709,7 @@ async fn only_what_slack_would_badge_is_handed_over() {
             .await
             .unwrap();
         for message in &history.messages {
-            model.note_message(message, 0);
+            model.note_message(message);
         }
     }
 

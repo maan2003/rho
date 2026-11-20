@@ -122,7 +122,7 @@ fn main() -> anyhow::Result<()> {
 
     let noted_at = Instant::now();
     for step in 0..runs as usize {
-        std::hint::black_box(model.note_message(&arriving(step), 1_900_100_000));
+        std::hint::black_box(model.note_message(&arriving(step)));
     }
     let noted = noted_at.elapsed() / runs;
 
