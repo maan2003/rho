@@ -13,6 +13,13 @@ use rho_chat::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject
 use rho_rpc::protocol::client::{call, connect};
 use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
 
+// The test doubles as the worker under this name, so the agent runs the
+// same build's worker protocol without a prebuilt binary in target/debug.
+const WORKER: &str = "rho-agent-worker";
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 struct Host(Child);
 
 impl Drop for Host {
@@ -22,7 +29,24 @@ impl Drop for Host {
     }
 }
 
-#[tokio::test]
+fn main() -> anyhow::Result<()> {
+    // `worker_main` creates its own runtime and must run before this one.
+    if std::env::args_os()
+        .next()
+        .is_some_and(|program| Path::new(&program).ends_with(WORKER))
+    {
+        return rho_inference::worker_main();
+    }
+    // Expose the single case to nextest, like terminal_stream.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return Ok(());
+    }
+    tokio::runtime::Runtime::new()?.block_on(mail_through_a_real_host_and_fake_model())
+}
+
 async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
     let rig = tempfile::tempdir()?;
     let root = rig.path();
@@ -47,11 +71,8 @@ async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
     config.distribution.disconnect_bps = 0;
     let model = rho_fake_model::FakeModel::start(config).await?;
     let host_binary = Path::new(env!("CARGO_BIN_EXE_rho-agent-host"));
-    let worker = host_binary.with_file_name("rho-agent-worker");
-    anyhow::ensure!(
-        worker.is_file(),
-        "build rho-agent-host and rho-inference --bin rho-agent-worker first"
-    );
+    let worker = root.join(WORKER);
+    std::os::unix::fs::symlink(std::env::current_exe()?, &worker)?;
     let mut host = Host(
         Command::new(host_binary)
             .arg("--runtime-dir")
@@ -270,7 +291,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
         }]
     );
     Ok(format!(
-        "mail wire: project {}, fake model result #{}, status, edit/delete #{} lost stop #{}, and addressed reply #{}",
+        "mail wire: project {}, fake model result #{}, status, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
 }
