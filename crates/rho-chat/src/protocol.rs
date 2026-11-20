@@ -52,6 +52,8 @@ pub struct Post {
     pub client_id: u64,
     /// The thread it goes in; none starts a root.
     pub parent: Option<MessageId>,
+    /// The mail this answers, if any; it need not be the parent.
+    pub reply_to: Option<MessageId>,
     /// Agents the message reaches whether or not they are members. It
     /// does not make them members.
     pub mentions: Vec<AgentId>,
@@ -176,6 +178,7 @@ mod tests {
                     at: UnixMs(5),
                     event: ChatEvent::Posted {
                         parent: Some(MessageId(ChatSeq(2))),
+                        reply_to: None,
                         from: Address::Agent(agent),
                         mentions: vec![Mention {
                             to: Address::User,
@@ -218,6 +221,7 @@ mod tests {
                     at: UnixMs(29),
                     event: ChatEvent::Posted {
                         parent: Some(MessageId(ChatSeq(7))),
+                        reply_to: None,
                         from: Address::System {
                             agent,
                             stop: Stop::Stuck,
@@ -237,7 +241,8 @@ mod tests {
         round_trips(Open::Request(
             Post {
                 client_id: 7,
-                parent: None,
+                parent: Some(MessageId(ChatSeq(2))),
+                reply_to: Some(MessageId(ChatSeq(4))),
                 mentions: vec![agent],
                 content: vec![ContentPart::Text {
                     text: "root".into(),

@@ -582,6 +582,7 @@ mod tests {
                 None,
                 NewMessage {
                     from: Address::User,
+                    reply_to: None,
                     mentions: Vec::new(),
                     content: vec![ContentPart::Text {
                         text: "Legacy channel".into(),
@@ -596,6 +597,7 @@ mod tests {
                 Some(first),
                 NewMessage {
                     from: Address::Agent(agent),
+                    reply_to: None,
                     mentions: Vec::new(),
                     content: vec![ContentPart::Text {
                         text: "Legacy body".into(),

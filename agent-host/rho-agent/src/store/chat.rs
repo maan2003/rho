@@ -49,6 +49,7 @@ const ROOT: u64 = 0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMessage {
     pub from: Address,
+    pub reply_to: Option<MessageId>,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
 }
@@ -545,50 +546,21 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         id.0.0
     );
     if original.mentions(Address::User) == Some(MentionKind::Ask) {
-        // An answer remains an answer even if either mail is moved later.
-        // Follow the ask's location as it was when each reply was posted.
-        let mut thread = original.parent;
-        let mut is_reply = thread.is_some_and(|parent| {
-            log.get(parent.0.0).is_some_and(|row| {
-                matches!(
-                    row.value().into_owned().event,
-                    ChatEvent::Posted {
-                        parent: Some(_),
-                        ..
-                    }
-                )
-            })
-        });
+        // An explicit answer doesn't depend on either mail's current
+        // parent. Older clients could also reply directly under a mail.
         for (_, row) in log.range(id.0.0 + 1..) {
-            match row.value().into_owned().event {
-                ChatEvent::Reparented { message, parent } if message == id => {
-                    thread = parent;
-                    is_reply = thread.is_some_and(|parent| {
-                        log.get(parent.0.0).is_some_and(|row| {
-                            matches!(
-                                row.value().into_owned().event,
-                                ChatEvent::Posted {
-                                    parent: Some(_),
-                                    ..
-                                }
-                            )
-                        })
-                    });
-                }
-                ChatEvent::Reparented { message, parent } if Some(message) == thread => {
-                    is_reply = parent.is_some();
-                }
-                ChatEvent::Posted {
-                    from: Address::User,
-                    parent,
-                    ..
-                } if parent == Some(id) || (is_reply && parent == thread) => {
-                    anyhow::bail!(
-                        "you cannot change ask #{}: the user already answered it",
-                        id.0.0
-                    );
-                }
-                _ => {}
+            if let ChatEvent::Posted {
+                from: Address::User,
+                parent,
+                reply_to,
+                ..
+            } = row.value().into_owned().event
+                && reply_to.or(parent) == Some(id)
+            {
+                anyhow::bail!(
+                    "you cannot change ask #{}: the user already answered it",
+                    id.0.0
+                );
             }
         }
     }
@@ -624,11 +596,16 @@ impl ChatWrite for WriteTxn {
         anyhow::ensure!(has_content(&message.content), "a message needs content");
         let NewMessage {
             from,
+            reply_to,
             mentions,
             content,
         } = message;
+        if let Some(reply_to) = reply_to {
+            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
+        }
         let event = ChatEvent::Posted {
             parent,
+            reply_to,
             from,
             mentions,
             content,
@@ -689,6 +666,7 @@ impl ChatWrite for WriteTxn {
             Some(thread),
             NewMessage {
                 from: sender,
+                reply_to: None,
                 mentions: vec![Mention {
                     to: Address::User,
                     kind: MentionKind::Ask,

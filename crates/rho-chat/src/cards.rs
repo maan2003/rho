@@ -3,7 +3,7 @@
 //! agent moves on, and no addressed result fades unread. Marks still belong
 //! to the user, and a reply settles the mail that preceded it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use jiff::Timestamp;
 use rho_agent_types::{
@@ -64,6 +64,7 @@ pub fn claims(
     // of the user in log order, and the newest message the user wrote in
     // it. Ranking happens on every change, and a host's chat is long.
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
+    let mut answered = HashSet::new();
     for message in chat.messages() {
         let mentioned = message.mentions(Party::User).is_some();
         let from_user = message.from == Party::User;
@@ -75,8 +76,12 @@ pub fn claims(
             thread.mentions.push(message);
         }
         if from_user {
-            // Replying is the ordinary verdict on this thread.
             thread.user_wrote = Some(message);
+            if let Some(mail) = message.reply_to {
+                answered.insert(mail);
+            } else {
+                thread.plain_user_mail = Some(message.id);
+            }
         }
     }
     let mut claims = Vec::new();
@@ -91,11 +96,13 @@ pub fn claims(
         let seen = facts
             .seen_topic()
             .map(|seen| MessageId(ChatSeq(seen)))
-            .max(user_wrote.map(|message| message.id));
+            .max(messages.plain_user_mail);
         let unseen = messages
             .mentions
             .into_iter()
-            .filter(|message| seen.is_none_or(|seen| message.id > seen))
+            .filter(|message| {
+                !answered.contains(&message.id) && seen.is_none_or(|seen| message.id > seen)
+            })
             .collect::<Vec<_>>();
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
@@ -225,6 +232,7 @@ pub fn attention_mail(cursor: &str) -> Option<MessageId> {
 struct ThreadMessages<'a> {
     mentions: Vec<&'a Message>,
     user_wrote: Option<&'a Message>,
+    plain_user_mail: Option<MessageId>,
 }
 
 #[cfg(test)]
@@ -305,6 +313,7 @@ mod tests {
         ) -> MessageId {
             self.record(ChatEvent::Posted {
                 parent,
+                reply_to: None,
                 from,
                 mentions,
                 content: vec![ContentPart::Text { text: text.into() }],
@@ -395,6 +404,18 @@ mod tests {
 
         fn writes_to(&mut self, thread: MessageId) {
             self.post(Some(thread), Party::User, Vec::new(), "go on");
+        }
+
+        fn answers(&mut self, thread: MessageId, mail: MessageId) {
+            self.record(ChatEvent::Posted {
+                parent: Some(thread),
+                reply_to: Some(mail),
+                from: Party::User,
+                mentions: Vec::new(),
+                content: vec![ContentPart::Text {
+                    text: "answer".into(),
+                }],
+            });
         }
 
         fn tell(&mut self, fact: Fact) {
@@ -535,6 +556,28 @@ mod tests {
             "rho@lab › a · asks · 0m",
             "the reply settles the standalone ask without clearing an unrelated thread"
         );
+    }
+
+    #[test]
+    fn an_addressed_reply_does_not_settle_other_mail() {
+        let mut w = world();
+        let a = w.agent("a");
+        let first = w.asks(a);
+        let second = w.asks(a);
+        let result = w.finishes(a);
+        let trigger = |w: &World| {
+            w.deal()
+                .cards
+                .first()
+                .and_then(|card| attention_mail(&card.cursor))
+        };
+        assert_eq!(trigger(&w), Some(first));
+        w.answers(a, second);
+        assert_eq!(trigger(&w), Some(first));
+        w.answers(a, first);
+        assert_eq!(trigger(&w), Some(result));
+        w.writes_to(a);
+        assert_eq!(trigger(&w), None);
     }
 
     #[test]

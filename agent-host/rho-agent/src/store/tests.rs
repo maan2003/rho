@@ -285,6 +285,7 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
 fn said(from: Address, text: &str) -> NewMessage {
     NewMessage {
         from,
+        reply_to: None,
         mentions: Vec::new(),
         content: vec![ContentPart::Text { text: text.into() }],
     }
@@ -707,7 +708,8 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         to: Address::User,
         kind: MentionKind::Ask,
     });
-    let ask = write.post(at, Some(thread), asked, None).unwrap();
+    let ask = write.post(at, Some(thread), asked.clone(), None).unwrap();
+    let spare_ask = write.post(at, Some(thread), asked, None).unwrap();
     let revised = said(Address::Agent(a), "Which monotonic clock?").content;
     write
         .post(
@@ -725,8 +727,19 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
             .contains("own mail")
     );
     write.edit(at, a, ask, revised.clone()).unwrap();
+    write
+        .post(at, Some(thread), said(Address::User, "I'm back"), None)
+        .unwrap();
     let answer = write
-        .post(at, Some(thread), said(Address::User, "Use mock time"), None)
+        .post(
+            at,
+            Some(thread),
+            NewMessage {
+                reply_to: Some(ask),
+                ..said(Address::User, "Use mock time")
+            },
+            None,
+        )
         .unwrap();
     write.reparent(at, answer, Some(other)).unwrap();
     write.reparent(at, ask, Some(other)).unwrap();
@@ -734,6 +747,8 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         .edit(at, a, ask, said(Address::Agent(a), "Ship it").content)
         .unwrap_err();
     assert!(err.to_string().contains("already answered"));
+    // Another ask by the same writer in the same thread is still editable.
+    write.edit(at, a, spare_ask, revised.clone()).unwrap();
     assert!(
         write
             .delete(at, a, ask)
@@ -770,6 +785,9 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
 
     let read = db.read();
     let ask = read.message(ask).unwrap();
+    let answer = read.message(answer).unwrap();
+    assert_eq!(answer.reply_to, Some(ask.id));
+    assert_eq!(answer.parent, Some(other));
     assert_eq!(ask.text(), "Which monotonic clock?");
     assert_eq!(ask.revision, Revision::Edited);
     assert_eq!(ask.mentions(Address::User), Some(MentionKind::Ask));

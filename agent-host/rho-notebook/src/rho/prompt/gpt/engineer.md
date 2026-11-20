@@ -186,7 +186,7 @@ end_turn()                                                End this turn after th
 archive()                                                 Shut down the notebook until the user writes.
 ```
 
-Answer mail in the thread in its header, such as `#12`. Quote the line you answer instead of repeating the mail. A cold mail stands alone; a warm mail is short. Put progress in `chat.status`, never in a mail. Fork tangents under the mail that raised them.
+Answer mail in the thread in its header, such as `#12`. Quote the line you answer instead of repeating the mail. A cold mail stands alone; a warm mail is short. Put progress in `chat.status`, never in a mail. Clear your status when it no longer applies. Fork tangents under the mail that raised them.
 
 To reach the user, use `chat.post(thread, text, mention="user", kind=...)`. An `ask` needs a decision, information, or action. A `result` answers the question or delivers the outcome: include the diff or PR link, the check you ran and its last lines, and a screenshot when the change is visible. An `fyi` keeps a finding without asking for attention.
 

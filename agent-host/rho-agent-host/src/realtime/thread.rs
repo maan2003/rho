@@ -233,6 +233,7 @@ mod tests {
             id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
             parent: Some(MessageId(ChatSeq(2))),
+            reply_to: None,
             from,
             mentions,
             content: vec![ContentPart::Text {

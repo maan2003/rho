@@ -1,6 +1,6 @@
 //! Mail state that is deliberately not in the chat log.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ struct Presence(HashMap<MessageId, Visit>);
 struct Visit {
     last: UnixMs,
     open: usize,
-    warned: HashSet<AgentId>,
+    warned: bool,
 }
 
 impl Presence {
@@ -60,30 +60,27 @@ impl Presence {
         let visit = self.0.entry(thread).or_insert_with(|| Visit {
             last: now,
             open: 0,
-            warned: HashSet::new(),
+            warned: false,
         });
         if now > visit.last {
             visit.last = now;
-            visit.warned.clear();
+            visit.warned = false;
         }
         visit
     }
 
-    fn cold(
-        &mut self,
-        thread: MessageId,
-        agent: AgentId,
-        now: UnixMs,
-        last: UnixMs,
-    ) -> Option<u64> {
+    fn cold(&mut self, thread: MessageId, now: UnixMs, last: UnixMs) -> Option<u64> {
         let visit = self.0.entry(thread).or_insert_with(|| Visit {
             last,
             open: 0,
-            warned: HashSet::new(),
+            warned: false,
         });
         let age = now.0.saturating_sub(visit.last.0);
-        (visit.open == 0 && age > COLD_AFTER.as_millis() as u64 && visit.warned.insert(agent))
-            .then_some(age / 60_000)
+        if visit.open != 0 || age <= COLD_AFTER.as_millis() as u64 || visit.warned {
+            return None;
+        }
+        visit.warned = true;
+        Some(age / 60_000)
     }
 }
 
@@ -194,7 +191,7 @@ impl AgentPool {
             read.last_user_mail(thread).unwrap_or(anchor.at)
         };
         presence
-            .cold(thread, agent, now, last)
+            .cold(thread, now, last)
             .map(|minutes| (thread, minutes))
     }
 
@@ -351,7 +348,7 @@ fn stop_body(read: &rho_db::ReadTxn, agent: AgentId, stop: Stop, reason: &str) -
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ChatSeq};
+    use rho_agent_types::ChatSeq;
 
     use super::*;
 
@@ -387,52 +384,31 @@ mod tests {
     }
 
     #[test]
-    fn cold_notice_is_once_per_agent_and_return_to_a_thread_not_once_per_request() {
+    fn cold_notice_is_once_per_thread_and_resets_after_a_return() {
         let mut presence = Presence::default();
-        let a = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
-        let b = AgentId::from_counter(2, &AgentIdDomain(0)).unwrap();
         let thread = MessageId(ChatSeq(11));
         let elsewhere = MessageId(ChatSeq(12));
         let first = UnixMs(23);
         let edge = first + COLD_AFTER;
-        assert_eq!(presence.cold(thread, a, edge, first), None);
-        assert_eq!(
-            presence.cold(thread, a, UnixMs(edge.0 + 1), first),
-            Some(10)
-        );
-        assert_eq!(
-            presence.cold(thread, a, UnixMs(edge.0 + 183_000), first),
-            None
-        );
-        assert_eq!(
-            presence.cold(thread, b, UnixMs(edge.0 + 183_000), first),
-            Some(13)
-        );
+        assert_eq!(presence.cold(thread, edge, first), None);
+        assert_eq!(presence.cold(thread, UnixMs(edge.0 + 1), first), Some(10));
+        assert_eq!(presence.cold(thread, UnixMs(edge.0 + 183_000), first), None);
 
         let opened = UnixMs(edge.0 + 200_000);
         presence.warm(thread, opened).open += 2;
         let leaves = UnixMs(opened.0 + 1_200_000);
         presence.warm(thread, leaves).open -= 1;
         assert_eq!(
-            presence.cold(
-                thread,
-                a,
-                leaves + COLD_AFTER + Duration::from_secs(10),
-                first
-            ),
+            presence.cold(thread, leaves + COLD_AFTER + Duration::from_secs(10), first),
             None
         );
-        assert_eq!(presence.cold(elsewhere, a, leaves, first), Some(33));
+        assert_eq!(presence.cold(elsewhere, leaves, first), Some(33));
         let last_left = UnixMs(leaves.0 + 700_000);
         presence.warm(thread, last_left).open -= 1;
-        assert_eq!(
-            presence.cold(thread, a, last_left + COLD_AFTER, first),
-            None
-        );
+        assert_eq!(presence.cold(thread, last_left + COLD_AFTER, first), None);
         assert_eq!(
             presence.cold(
                 thread,
-                a,
                 last_left + COLD_AFTER + Duration::from_millis(1),
                 first
             ),
