@@ -56,9 +56,11 @@ impl BrowserRuntime {
         let executable = std::env::current_exe().context("resolve rho-gui executable")?;
         write_installation(&brave_config, &extension, &executable)?;
         let bridge = Bridge::bind(socket_path.to_owned())?;
-        let software_shm = matches!(render, BrowserRenderConfig::SoftwareShmQa);
-        let compositor = BrowserCompositor::launch(render)?;
-        let session = compositor.open(BrowserWindow, (1280, 720))?;
+        let software_shm = matches!(render, BrowserRenderConfig::SoftwareShm);
+        let compositor = BrowserCompositor::launch(render).context(CannotDraw)?;
+        let session = compositor
+            .open(BrowserWindow, (1280, 720))
+            .context(CannotDraw)?;
 
         let mut command = Command::new(&browser);
         // The Nix Brave wrapper supplies the first two, but Chromium honors
@@ -186,6 +188,18 @@ impl BrowserRuntime {
         });
     }
 }
+
+/// Could not start the display side of an embedded page.
+#[derive(Debug)]
+pub(crate) struct CannotDraw;
+
+impl std::fmt::Display for CannotDraw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("start embedded browser display")
+    }
+}
+
+impl std::error::Error for CannotDraw {}
 
 /// No browser to launch: what was looked for, and where.
 #[derive(Debug)]
