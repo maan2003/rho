@@ -14,6 +14,7 @@ done when: the user knows what moved and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
+status: on the phone, a tap selects a waiting or moving row; a second tap on it or `open` opens it.
 purpose: show what wants the user, what has moved, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting and a test run under `moving`, and writes a new idea to `tide@lab`.
 sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status` that aren't waiting, newest status change first, then `and N more` for the rest; an idea box addressed to a `mail.Project`, with completion.
