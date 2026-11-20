@@ -246,8 +246,8 @@ fn run() -> Result<()> {
                     }));
                     cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });
-                let browser = cx.new(|cx| {
-                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone(), cx)
+                let browser = cx.new(|_| {
+                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
                 });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let slack =

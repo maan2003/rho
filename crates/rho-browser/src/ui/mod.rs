@@ -8,9 +8,8 @@
 //!
 //! A page takes every key, as a desktop does, so the frame's normal-mode
 //! keys cannot reach the frame from one. Its chords can (`ctrl-k`,
-//! `ctrl-j`, `ctrl-shift-f`, `ctrl-shift-backspace`), and the palette is
-//! bound here on `ctrl-shift-;` (`ctrl-:` as gpui reads it), the chord a
-//! desktop opens it with.
+//! `ctrl-j`, `ctrl-shift-f`, `ctrl-shift-backspace`, and the palette's
+//! `ctrl-shift-;`).
 
 mod pages;
 
@@ -61,8 +60,7 @@ impl PageSystem {
     /// The browser keeps its state under `state_dir`, the GUI's own state
     /// directory, and talks to its extension over a socket there: one
     /// GUI per state directory, which the browser's lock already says.
-    pub fn new(state_dir: PathBuf, frame: FrameLink, cx: &mut Context<Self>) -> Self {
-        bind_keys(cx);
+    pub fn new(state_dir: PathBuf, frame: FrameLink) -> Self {
         let socket = state_dir.join("rho-browser.sock");
         Self {
             browser: Browser::new(state_dir, socket),
@@ -297,19 +295,6 @@ impl Surface for PageView {
     fn subject(&self, _cx: &App) -> Subject {
         Subject::Own
     }
-}
-
-fn bind_keys(cx: &mut App) {
-    use gpui::KeyBinding;
-    use rho_frame::keys::Palette;
-    // Under the frame's own context, so the frame's handlers hear them;
-    // a page takes every key that no binding names.
-    let context = format!("{} > RhoBrowser", rho_frame::KEY_CONTEXT);
-    cx.bind_keys([
-        // `ctrl-shift-;` as gpui reads it on Linux: shift makes the key
-        // `:` and is dropped, so `ctrl-shift-;` would never match.
-        KeyBinding::new("ctrl-:", Palette, Some(&context)),
-    ]);
 }
 
 #[cfg(test)]
