@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::EndpointId;
 use rho_dealer::facts::Seen;
-use rho_dealer::rank::{Hand, Trace};
+use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
@@ -31,8 +31,17 @@ pub struct Found {
     pub address: Address,
     pub title: String,
     pub description: String,
-    /// When it last moved, for ordering; zero when nothing says.
+    /// A thread and its current status (if any), shown before its project
+    /// address.
+    pub thread: Option<FoundThread>,
+    /// When it last moved, for ordering unvisited places; zero when nothing
+    /// says.
     pub recency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundThread {
+    pub status: Option<String>,
 }
 
 pub trait System: Sized + 'static {
@@ -128,9 +137,8 @@ pub trait System: Sized + 'static {
     fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
     /// Every place of the system's that the palette lists by title. The
-    /// frame passes the marks and current hand so a row can show what
-    /// waits without ranking it again.
-    fn find(&self, _marks: &Marks, _hand: &Hand, _cx: &App) -> Vec<Found> {
+    /// frame joins them with the current hand and visit history.
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         Vec::new()
     }
 
@@ -175,7 +183,7 @@ trait SystemHandle {
 
     fn send_idea(&self, mail: IdeaMail, cx: &mut App);
 
-    fn find(&self, marks: &Marks, hand: &Hand, cx: &App) -> Vec<Found>;
+    fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
 }
 
@@ -259,8 +267,8 @@ impl<S: System> SystemHandle for Entity<S> {
         self.update(cx, |system, cx| system.send_idea(mail, cx))
     }
 
-    fn find(&self, marks: &Marks, hand: &Hand, cx: &App) -> Vec<Found> {
-        self.read(cx).find(marks, hand, cx)
+    fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
+        self.read(cx).find(marks, cx)
     }
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
@@ -354,8 +362,8 @@ impl AnySystem {
         self.0.send_idea(mail, cx)
     }
 
-    pub fn find(&self, marks: &Marks, hand: &Hand, cx: &App) -> Vec<Found> {
-        self.0.find(marks, hand, cx)
+    pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
+        self.0.find(marks, cx)
     }
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {

@@ -16,13 +16,10 @@ mod surface;
 
 use std::collections::{BTreeMap, HashMap};
 
-use gpui::Entity;
 use rho_agents_client::HostId;
 use rho_agents_client::protocol::{AgentCostSeries, AgentUsageSeries};
-use rho_frame::{Addressed, Row, Rows};
+use rho_frame::Addressed;
 pub use surface::UsageSurface;
-
-use crate::system::AgentsSystem;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -58,16 +55,6 @@ impl Chart {
             Self::ModelCost => "model cost",
             Self::UsageShare => "model usage share",
             Self::AgentCost => "GPT agent cost",
-        }
-    }
-
-    /// The key that picks it in a menu: shifted for the longer window.
-    fn letter(self) -> &'static str {
-        match self {
-            Self::RateLimit => "r",
-            Self::ModelCost => "c",
-            Self::UsageShare => "s",
-            Self::AgentCost => "a",
         }
     }
 }
@@ -132,7 +119,7 @@ impl Addressed for UsageChart {
 }
 
 impl UsageChart {
-    /// Every chart, in the order the menu offers them.
+    /// Every chart, in Palette order.
     pub fn all() -> impl Iterator<Item = Self> {
         Chart::ALL.into_iter().flat_map(|chart| {
             [Days::Seven, Days::Thirty]
@@ -144,14 +131,6 @@ impl UsageChart {
     /// `rate limit · 7d`.
     pub fn title(self) -> String {
         format!("{} · {}d", self.chart.title(), self.days.count())
-    }
-
-    /// The key that picks it in the usage menu.
-    pub fn key(self) -> String {
-        match self.days {
-            Days::Seven => self.chart.letter().to_owned(),
-            Days::Thirty => format!("shift-{}", self.chart.letter()),
-        }
     }
 
     /// What every host is asked for to draw it, now.
@@ -170,32 +149,6 @@ impl UsageChart {
             },
         }
     }
-}
-
-/// `shift-u`: every chart, in the two windows worth looking at.
-pub(crate) fn menu(system: Entity<AgentsSystem>) -> Rows {
-    let mut rows = Rows::new("usage");
-    for chart in UsageChart::all() {
-        rows.push(open_row(system.clone(), chart.key(), chart));
-    }
-    rows
-}
-
-/// A row that shows `chart`. A chart already open draws what it holds, so
-/// the hosts are asked again for what is now; a chart opened afresh asks
-/// as it opens.
-pub(crate) fn open_row(
-    system: Entity<AgentsSystem>,
-    key: impl Into<String>,
-    chart: UsageChart,
-) -> Row {
-    Row::run(key, chart.title(), move |frame, window, cx| {
-        let address = chart.address();
-        if frame.surface(&address).is_some() {
-            system.update(cx, |system, cx| system.ask(chart, cx));
-        }
-        frame.open(address, window, cx);
-    })
 }
 
 /// What a chart asks every host for.

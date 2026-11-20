@@ -43,14 +43,21 @@ pub enum Scope {
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
-    /// A top-level palette hint when this command has a real shortcut.
-    pub(crate) shortcut: Option<String>,
     pub description: String,
     pub value: Option<String>,
     /// Other words the palette finds the row by.
     pub also: Vec<String>,
     pub pick: Pick,
     pub scope: Scope,
+    pub(crate) shortcut: Option<Shortcut>,
+}
+
+#[derive(Clone)]
+pub(crate) enum Shortcut {
+    /// A binding to resolve in the screen's actual key context.
+    Action(Rc<dyn gpui::Action>),
+    /// A sequence beginning with a resolved binding into a real menu.
+    Menu(String),
 }
 
 impl Row {
@@ -61,25 +68,24 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),
             pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
             scope: Scope::Here,
+            shortcut: None,
         }
-    }
-
-    /// Show the keys reaching this action from outside the palette.
-    pub(crate) fn with_shortcut(mut self, keys: String) -> Self {
-        self.shortcut = Some(keys);
-        self
     }
 
     /// The row is one of the window's own commands, on every screen: the
     /// palette lists it after the screen's.
     pub fn window_wide(mut self) -> Self {
         self.scope = Scope::Window;
+        self
+    }
+
+    pub fn bound_to(mut self, action: impl gpui::Action) -> Self {
+        self.shortcut = Some(Shortcut::Action(Rc::new(action)));
         self
     }
 
@@ -91,12 +97,12 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),
             pick: Pick::Run(Rc::new(run)),
             scope: Scope::Here,
+            shortcut: None,
         }
     }
 
@@ -108,12 +114,12 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            shortcut: None,
             description: description.into(),
             value: Some(value.into()),
             also: Vec::new(),
             pick: Pick::Infix(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
             scope: Scope::Here,
+            shortcut: None,
         }
     }
 
@@ -127,12 +133,12 @@ impl Row {
     pub fn menu(key: impl Into<String>, description: impl Into<String>, rows: Rows) -> Self {
         Self {
             key: key.into(),
-            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),
             pick: Pick::Menu(rows),
             scope: Scope::Here,
+            shortcut: None,
         }
     }
 }

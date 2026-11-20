@@ -53,7 +53,7 @@ use surface::AgentSurface;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::transcript::{TranscriptFrame, Transcripts};
-use crate::usage::{self, Request, Usage, UsageChart, UsageMoved, UsageSurface};
+use crate::usage::{Request, Usage, UsageChart, UsageMoved, UsageSurface};
 
 /// Every kind the system opens: agents, and the usage charts
 /// (`SPEC-usage-addresses`).
@@ -883,7 +883,6 @@ impl System for AgentsSystem {
         if let Some(chart) = UsageChart::from_address(address) {
             let system = cx.entity();
             let surface = cx.new(|cx| UsageSurface::new(system, chart, window, cx));
-            self.ask(chart, cx);
             return Some(AnySurface::new(surface));
         }
         let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
@@ -906,6 +905,12 @@ impl System for AgentsSystem {
             }
         };
         Some(surface)
+    }
+
+    fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
+        if let Some(chart) = address.and_then(UsageChart::from_address) {
+            self.ask(chart, cx);
+        }
     }
 
     fn streams(
@@ -938,10 +943,7 @@ impl System for AgentsSystem {
         if let Some(here) = AgentAddress::from_address(&point.surface) {
             return self.agent_rows(here, cx);
         }
-        // Usage is offered on every screen, so it is the window's, as
-        // `home` and `quit` are, and comes after the screen's own commands.
-        let mut rows =
-            vec![Row::menu("shift-u", "usage…", usage::menu(this.clone())).window_wide()];
+        let mut rows = Vec::new();
         // On an agent in a thread's `with` line: the agent is steered from
         // there as from its transcript.
         if let Some(AgentAddress {
@@ -960,7 +962,7 @@ impl System for AgentsSystem {
         }
         rows.push(Row::menu(
             "a",
-            "start agent, choosing where and runtime…",
+            "start agent, choosing where and runtime",
             start::rows(
                 self,
                 this.clone(),
@@ -979,7 +981,7 @@ impl System for AgentsSystem {
         if draft {
             rows.push(Row::menu(
                 "shift-s",
-                "send and start agent, choosing where and runtime…",
+                "send and start agent, choosing where and runtime",
                 start::rows(
                     self,
                     this,
@@ -1011,7 +1013,7 @@ impl System for AgentsSystem {
         })
     }
 
-    fn find(&self, _marks: &Marks, _hand: &rho_frame::Hand, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         let agents = self.registry.known_agents().copied().map(|agent| {
             let (title, host) = self.label(agent);
             let facts = self.registry.agent_facts(agent);
@@ -1026,6 +1028,7 @@ impl System for AgentsSystem {
                     Some(word) => format!("{host} · {word}"),
                     None => host,
                 },
+                thread: None,
                 recency: self.registry.agent_last_active(agent).map_or(0, |at| at.0),
             }
         });
@@ -1036,6 +1039,7 @@ impl System for AgentsSystem {
                 address: AgentAddress::desktop(agent, session.name.clone())?.address(),
                 title: format!("{title} · desktop {}", session.name),
                 description: host,
+                thread: None,
                 recency: 0,
             })
         });
@@ -1043,8 +1047,9 @@ impl System for AgentsSystem {
             .chain(desktops)
             .chain(UsageChart::all().map(|chart| Found {
                 address: chart.address(),
-                title: chart.title(),
-                description: "usage".to_owned(),
+                title: format!("usage › {}", chart.title()),
+                description: String::new(),
+                thread: None,
                 recency: 0,
             }))
             .collect()

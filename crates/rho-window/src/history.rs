@@ -59,6 +59,7 @@ struct Entry<K, S> {
     /// comparing two entries' `order` says which side of the cursor an
     /// entry is on without walking to find out.
     order: u64,
+    visited: u64,
 }
 
 /// The reader's history: one list across every context, with a cursor.
@@ -77,6 +78,7 @@ pub struct History<K, S> {
     /// question, not this machine's.
     cursor_forgotten: bool,
     next_order: u64,
+    visit: u64,
     length: usize,
     /// How many live entries are behind the cursor: how many times back can
     /// be pressed. Kept rather than counted, because counting is a walk.
@@ -95,6 +97,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
                 prev: None,
                 next: None,
                 order: 0,
+                visited: 0,
             })],
             free: Vec::new(),
             newest: 0,
@@ -102,6 +105,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             live,
             cursor_forgotten: false,
             next_order: 1,
+            visit: 0,
             length: 1,
             behind: 0,
         }
@@ -143,6 +147,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             self.entry_mut(cursor).surface = surface;
             self.cursor_forgotten = false;
             self.live.insert(key, cursor);
+            self.note_visit();
             return;
         }
         if let Some(slot) = self.live.remove(&key) {
@@ -171,12 +176,14 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             prev: Some(newest),
             next: None,
             order,
+            visited: self.visit,
         });
         self.entry_mut(newest).next = Some(slot);
         self.newest = slot;
         self.live.insert(key, slot);
         self.length += 1;
         self.cursor = slot;
+        self.note_visit();
         self.behind = self.length - 1;
         if leaving_is_dead {
             // `unlink` takes the step off `behind` itself: the entry being
@@ -272,8 +279,24 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             .map(|slot| &self.entry(slot).key)
     }
 
-    /// Move the cursor to a neighbour, taking the entry it was on out of the
-    /// list if that entry has been forgotten.
+    /// Places in order of visits, most recent first, excluding the one in view.
+    pub fn recent(&self) -> Vec<&K> {
+        let mut visited: Vec<_> = self
+            .live
+            .values()
+            .copied()
+            .filter(|slot| *slot != self.cursor)
+            .map(|slot| self.entry(slot))
+            .collect();
+        visited.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.visited));
+        visited.into_iter().map(|entry| &entry.key).collect()
+    }
+
+    fn note_visit(&mut self) {
+        self.visit += 1;
+        self.entry_mut(self.cursor).visited = self.visit;
+    }
+
     /// Move the cursor to a neighbour, taking the entry it was on out of
     /// the list if that entry has been forgotten. Says whether it did.
     fn step_to(&mut self, slot: usize) -> bool {
@@ -281,6 +304,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         let dead = self.cursor_forgotten;
         self.cursor_forgotten = false;
         self.cursor = slot;
+        self.note_visit();
         if dead {
             // The cursor has already moved, so the list still holds the
             // neighbour it moved to and this cannot empty it.
@@ -551,6 +575,22 @@ mod tests {
         assert_eq!(history.forward().copied(), Some(3));
         assert_eq!((history.behind(), history.ahead()), (2, 0));
         assert_eq!(back_keys(&history), ["a", "home"]);
+    }
+
+    #[test]
+    fn recent_tracks_visits_not_navigation_order() {
+        let mut history = history();
+        history.show("a", 1);
+        history.show("b", 2);
+        history.show("c", 3);
+        history.back();
+        history.back();
+        assert_eq!(history.recent(), [&"b", &"c", &"home"]);
+        history.back();
+        history.forward();
+        assert_eq!(history.recent(), [&"home", &"b", &"c"]);
+        history.forget(&"b");
+        assert_eq!(history.recent(), [&"home", &"c"]);
     }
 
     #[test]

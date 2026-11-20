@@ -814,6 +814,10 @@ fn thread_rows(
 }
 
 impl ThreadView {
+    fn on_draft(&self, cx: &App) -> bool {
+        self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row
+    }
+
     fn has_draft(&self, cx: &App) -> bool {
         !self.draft.read(cx).text().trim().is_empty()
     }
@@ -966,7 +970,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
+        if self.on_draft(cx) {
             window.dispatch_action(Box::new(editor::actions::Redo), cx);
         } else {
             window.dispatch_action(Box::new(rho_frame::keys::UndoVerdict), cx);
@@ -1216,7 +1220,7 @@ impl Surface for ThreadView {
     /// A mail under the point anchors a tangent; the draft belongs to the
     /// whole thread rather than to any particular row.
     fn subject(&self, cx: &App) -> Subject {
-        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
+        if self.on_draft(cx) {
             return Subject::Own;
         }
         line_subject(
@@ -1236,6 +1240,10 @@ impl Surface for ThreadView {
         self.subject(cx)
     }
 
+    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (!self.on_draft(cx)).then(|| Box::new(RedoDraftOrUndoVerdict) as Box<dyn gpui::Action>)
+    }
+
     fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {
         let this = cx.entity();
         Some(Rc::new(move |window, cx| {
@@ -1251,11 +1259,18 @@ impl Surface for ThreadView {
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
+        let has_draft = self.has_draft(cx);
         if !self.is_list(self.system.read(cx)) {
             let send = this.clone();
-            let mut rows = vec![Row::run("ctrl-enter", "send", move |_, window, cx| {
-                send.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
-            })];
+            let mut rows = Vec::new();
+            if has_draft {
+                rows.push(
+                    Row::run("ctrl-enter", "send", move |_, window, cx| {
+                        send.update(cx, |view, cx| view.send(&SendMessage, window, cx));
+                    })
+                    .bound_to(SendMessage),
+                );
+            }
             let system = self.system.read(cx);
             let members = system
                 .chat(self.thread.host)
@@ -1345,16 +1360,23 @@ impl Surface for ThreadView {
                 self.transcript.line_meta(self.cursor_row(cx), cx),
                 Some(Meta::Quote(_) | Meta::Thread(_) | Meta::Open(_))
             ) {
-                rows.push(Row::run("enter", "open", move |_, window, cx| {
-                    this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
-                }));
+                rows.push(
+                    Row::run("enter", "open", move |_, window, cx| {
+                        this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
+                    })
+                    .bound_to(OpenRow),
+                );
             }
             return rows;
+        }
+        if !has_draft {
+            return Vec::new();
         }
         let only = this.clone();
         let send_only = Row::run("ctrl-shift-enter", "send", move |_, window, cx| {
             only.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
-        });
+        })
+        .bound_to(SendOnly);
         vec![
             Row::run(
                 "ctrl-enter",
@@ -1362,7 +1384,8 @@ impl Surface for ThreadView {
                 move |_, window, cx| {
                     this.update(cx, |view, cx| view.send(&SendMessage, window, cx));
                 },
-            ),
+            )
+            .bound_to(SendMessage),
             send_only,
         ]
     }

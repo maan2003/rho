@@ -82,7 +82,7 @@ looks: one row of `editor text`; name first in `reading text`, then the quieter 
 states:
 - Home: a room name, then its host and, if anything waits, the words before the host; a card takes `attention`, a snooze or ordinary unread count takes `quiet`.
 - channel: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then reply counts, participants, and age as available.
-- prompt or palette: the candidate's name and optional `quiet` explanation or key; the chosen row keeps its fill all the way across.
+- prompt or palette: the candidate's name, its `attention` card words or `quiet` status if present, then its `quiet` address or key; query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Home or a channel says there is nothing to open; a prompt with no answers shows just the input.
 used on: built Home (`desk.Desk`), channel (`mail.Project`), and the command and find prompts (`window.Palette`).
 form:
@@ -157,15 +157,15 @@ looks: `editor text` in the `command strip`, question and input first with a `re
 states:
 - blank query: question and any initial answers.
 - typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`.
-- no match: question and input only.
+- no match: `no match` below the input when a choice is required and none fits.
 - closed: the strip goes away and the keys return.
 used on: `window.Palette` and other questions over `window.Screen`, as in `hosts.Attach a host`.
 form:
 ```text
-command: start agent, choosing
-start agent, choosing where and runtime…
-start agent, choosing where and runtime… › new workset on a repository…  n
-start agent, choosing where and runtime… › here, in a directory on the host…  h
+command: start agent
+start agent, choosing where and runtime
+start agent › new workset on a repository
+start agent › here, in a directory on the host
 ```
 
 ## part Phone bar

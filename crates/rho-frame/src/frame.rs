@@ -1,6 +1,5 @@
 //! The frame entity: the window's root view.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,15 +24,15 @@ use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::desk::{DeskTarget, DeskView};
 use crate::idea::IdeaBox;
-use crate::menu::{OpenMenu, Pick, Row, Rows};
+use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
-    Answer, CancelHandler, Candidate, CandidateSource, ChooseHandler, Chosen, Echo, Minibuffer,
-    SubmitHandler, bottom_strip,
+    Answer, CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler,
+    bottom_strip,
 };
 use crate::phone::{Layout, Phone};
 use crate::search::Search;
 use crate::surface::{AnySurface, Mode, Subject, Surface as _};
-use crate::system::AnySystem;
+use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
 use crate::{keys, palette, place};
 
@@ -66,6 +65,7 @@ pub struct Frame {
     pub(crate) desk: Entity<DeskView>,
     pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
+    last_palette_query: Option<String>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
@@ -170,6 +170,7 @@ impl Frame {
             desk,
             idea,
             minibuffer: None,
+            last_palette_query: None,
             menu: None,
             menu_focus: cx.focus_handle(),
             overlay_return: None,
@@ -727,91 +728,147 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// The palette: every command and every place by name, found by the
-    /// starts of their words, with a command's keys or a place's where
-    /// beside it. A command that is a menu opens it as a transient.
+    /// The Palette joins the catalogue to the actual dealt cards and the
+    /// places this window has visited. It does not infer a card from mail.
     pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let commands = palette::flatten(&self.commands(window, cx));
-        let mut places = Vec::new();
+        let rows = self.commands(window, cx);
+        let desk_address = Self::desk_address();
+        let desk_key = self.screen_binding(&keys::Desk, window, cx);
+        let commands = palette::flatten(&rows, |action| self.screen_binding(action, window, cx));
+        let mut found = Vec::new();
         for system in &self.systems {
-            places.extend(system.find(&self.attention.marks, self.hand(), cx));
+            found.extend(system.find(&self.attention.marks, cx));
         }
-        let listing = Rc::new(palette::Listing::new(commands, places));
-        // What the rows on screen are, so the row chosen is a choice and
-        // not words two rows may share.
-        let shown: Rc<RefCell<Vec<usize>>> = Rc::default();
-        let complete = {
-            let listing = listing.clone();
-            let shown = shown.clone();
-            Rc::new(move |_: &Frame, input: &str, _: &App| {
-                let ranked = listing.rank(input.trim());
-                let candidates = ranked
-                    .iter()
-                    .map(|index| {
-                        let choice = &listing.choices[*index];
-                        Candidate {
-                            value: choice.name().to_owned(),
-                            description: choice.beside().to_owned(),
-                        }
-                    })
-                    .collect();
-                *shown.borrow_mut() = ranked;
-                candidates
+
+        let mut known: std::collections::HashSet<_> =
+            found.iter().map(|place| place.address.clone()).collect();
+        let recent = self.history.recent();
+        let visits: HashMap<_, _> = recent
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(rank, key)| (key, rank))
+            .collect();
+        for address in recent {
+            // While on the desk, the command represents Tab's way back.
+            if (self.desk_in_view() && address == &desk_address) || !known.insert(address.clone()) {
+                continue;
+            }
+            if let Some((title, description)) = self
+                .surfaces
+                .get(address)
+                .map(|surface| (surface.title(cx), String::new()))
+                .or_else(|| self.name_of(address, cx))
+            {
+                found.push(Found {
+                    address: address.clone(),
+                    title,
+                    description,
+                    thread: None,
+                    recency: 0,
+                });
+            }
+        }
+
+        for card in &self.hand().cards {
+            if known.insert(card.address.clone()) {
+                found.push(Found {
+                    address: card.address.clone(),
+                    title: card.title.clone(),
+                    description: card.context.clone(),
+                    thread: None,
+                    recency: 0,
+                });
+            }
+        }
+        let cards: HashMap<_, _> = self
+            .hand()
+            .cards
+            .iter()
+            .enumerate()
+            .map(|(rank, card)| (&card.address, (rank, card)))
+            .collect();
+        // Preserve the deal's own order among waiting places on blank input.
+        found.sort_by_key(|place| {
+            cards
+                .get(&place.address)
+                .map_or(usize::MAX, |(rank, _)| *rank)
+        });
+        let places = found
+            .into_iter()
+            .map(|found| palette::Place {
+                visit: visits.get(&found.address).copied(),
+                current: self.current_address() == &found.address,
+                shortcut: if found.address == desk_address {
+                    desk_key.clone()
+                } else {
+                    None
+                },
+                card: cards.get(&found.address).map(|(_, card)| (*card).clone()),
+                found,
             })
-        };
-        let choose = Rc::new(
-            move |frame: &mut Frame,
-                  chosen: Chosen,
-                  window: &mut Window,
-                  cx: &mut Context<Frame>| {
-                let row = match chosen {
-                    Chosen::Row(row) => shown.borrow().get(row).copied(),
-                    Chosen::Typed(input) => {
-                        // A name that fits nothing may still be an address.
-                        match Address::parse(input.trim()) {
-                            Some(address) => frame.open(address, window, cx),
-                            None => frame.echo(
-                                &format!("nothing called {}", input.trim()),
-                                StyleClass::SystemInfo,
-                                cx,
-                            ),
-                        }
-                        return;
-                    }
-                };
-                match row.map(|row| &listing.choices[row]) {
-                    Some(palette::Choice::Place(found)) => {
-                        frame.open(found.address.clone(), window, cx)
-                    }
-                    Some(palette::Choice::Command(entry)) => match &entry.pick {
-                        Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
-                        Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
-                    },
-                    None => {}
-                }
-            },
+            .collect();
+        self.open_minibuffer(
+            ":",
+            Answer::palette(palette::Listing::new(commands, places)),
+            None,
+            window,
+            cx,
         );
-        self.open_chooser(":", complete, choose, window, cx);
     }
 
-    /// The frame's rows, the surface's, and every system's for what is in
-    /// view: what the palette lists. A row's key hints at the shortcut
-    /// outside the palette; it does not bind a key inside the prompt.
+    fn screen_binding(
+        &self,
+        action: &dyn gpui::Action,
+        window: &Window,
+        cx: &App,
+    ) -> Option<String> {
+        let focus = window.focused(cx)?;
+        window
+            .bindings_for_action_in(action, &focus)
+            .last()
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(|key| key.unparse())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+    }
+
+    /// The frame's rows, the surface's, and each system's for the point.
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
-        // The window's own rows: the palette lists them after the screen's.
+        let mut undo = Row::run("", "undo", |frame, window, cx| {
+            frame.undo_verdict(window, cx);
+        })
+        .window_wide();
+        undo.shortcut = self
+            .current_surface()
+            .undo_verdict_action(cx)
+            .map(|action| Shortcut::Action(Rc::from(action)));
         let mut rows = vec![
-            Row::run("", "desk", |frame, window, cx| frame.open_desk(window, cx)).window_wide(),
             Row::run("", "write an idea", |frame, window, cx| {
                 frame.prompt_idea(window, cx)
             })
+            .bound_to(keys::PromptIdea)
             .window_wide(),
-            Row::run("", "undo", |frame, window, cx| {
-                frame.undo_verdict(window, cx)
-            })
-            .window_wide(),
+            undo,
             Row::menu("", "hosts", self.hosts_menu()).window_wide(),
         ];
+        // Elsewhere the desk is already a recent place (with this key).
+        // On the desk the same action means going back.
+        if self.desk_in_view() || !self.history.holds(&Self::desk_address()) {
+            rows.insert(
+                0,
+                Row::run("", "desk", |frame, window, cx| {
+                    frame.toggle_desk(window, cx)
+                })
+                .bound_to(keys::Desk)
+                .window_wide(),
+            );
+        }
         let phrase = match self.attention.secret() {
             Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
                 frame.show_secret(secret, "your secret phrase · enter:", window, cx)
@@ -824,17 +881,27 @@ impl Frame {
         rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
         let surface = self.current_surface().clone();
         rows.extend(surface.rows(window, cx));
-        if !self.desk_in_view()
-            && surface.editor(cx).is_some()
-            && let Some(target) = point.card.clone()
-        {
-            rows.extend(verdict_rows(target).map(|row| {
-                let shortcut = format!("space {}", row.key);
-                row.with_shortcut(shortcut)
-            }));
-        }
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
+        }
+        if !self.desk_in_view() {
+            let opener = self.screen_binding(&keys::VerdictMenu, window, cx);
+            rows.extend(
+                self.verdict_rows(cx)
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut row| {
+                        // The window-wide undo is the same verdict and has its
+                        // own key.
+                        if row.key == "u" {
+                            return None;
+                        }
+                        row.shortcut = opener
+                            .as_ref()
+                            .map(|key| Shortcut::Menu(format!("{key} {}", row.key)));
+                        Some(row)
+                    }),
+            );
         }
         rows
     }
@@ -918,20 +985,23 @@ impl Frame {
             self.toggle_desk(window, cx);
             return;
         }
+        self.open_menu(self.verdict_rows(cx), window, cx);
+    }
+
+    fn verdict_rows(&self, cx: &App) -> Rows {
         let Some(target) = self.card_target(cx) else {
             // With no card here there is nothing to judge, but the deal
             // still goes on: `n` is how the user asks what waits.
             let mut rows = Rows::new("no card here").counted();
             push_deal_rows(&mut rows);
-            self.open_menu(rows, window, cx);
-            return;
+            return rows;
         };
         let card = self.card_for(&target, cx);
         let mut rows = Rows::new(card.heading()).counted();
         rows.extend(verdict_rows(target.clone()));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
         push_deal_rows(&mut rows);
-        self.open_menu(rows, window, cx);
+        rows
     }
 
     pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -963,31 +1033,16 @@ impl Frame {
     ) {
         self.open_minibuffer(
             prompt,
-            complete,
-            Answer::Text(on_submit),
+            Answer::text(complete, on_submit),
             on_cancel,
             window,
             cx,
         );
     }
 
-    /// A prompt whose rows are its answers: enter hands `on_choose` the
-    /// highlighted row, so rows of the same words stay apart.
-    pub(crate) fn open_chooser(
-        &mut self,
-        prompt: impl Into<gpui::SharedString>,
-        complete: CandidateSource,
-        on_choose: ChooseHandler,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_minibuffer(prompt, complete, Answer::Row(on_choose), None, window, cx);
-    }
-
     fn open_minibuffer(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
-        complete: CandidateSource,
         answer: Answer,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
@@ -1002,8 +1057,7 @@ impl Frame {
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer =
-            Minibuffer::open(prompt, &text_style, complete, answer, on_cancel, window, cx);
+        let mut minibuffer = Minibuffer::open(prompt, &text_style, answer, on_cancel, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         // The strip is single-occupancy; a stale message after the prompt
@@ -1029,12 +1083,24 @@ impl Frame {
     }
 
     pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(minibuffer) = self.minibuffer.take() else {
+        let Some(minibuffer) = self.minibuffer.as_ref() else {
             return;
         };
+        if !minibuffer.has_answer() {
+            return;
+        }
+        if let Some(reason) = minibuffer.rejection(cx) {
+            self.echo(reason, StyleClass::SystemInfo, cx);
+            return;
+        }
+        let minibuffer = self.minibuffer.take().expect("the prompt is open");
+        let is_palette = minibuffer.is_palette();
         let prompt = minibuffer.prompt().to_owned();
         let secret = minibuffer.is_secret();
         let (input, submission) = minibuffer.into_submission(cx);
+        if is_palette && !input.trim().is_empty() {
+            self.last_palette_query = Some(input.clone());
+        }
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
             input: match secret {
@@ -1051,6 +1117,12 @@ impl Frame {
         let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
+        if minibuffer.is_palette() {
+            let input = minibuffer.input(cx);
+            if !input.trim().is_empty() {
+                self.last_palette_query = Some(input);
+            }
+        }
         rho_journal::record(rho_journal::Event::MinibufferCancelled {
             prompt: minibuffer.prompt().to_owned(),
             input: match minibuffer.is_secret() {
@@ -1071,6 +1143,20 @@ impl Frame {
             minibuffer.select_by_delta(delta);
             cx.notify();
         }
+    }
+
+    fn minibuffer_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.minibuffer.as_mut() else {
+            return;
+        };
+        if prompt.is_palette() {
+            if let Some(query) = self.last_palette_query.clone() {
+                prompt.set_input(query, window, cx);
+            }
+        } else {
+            prompt.select_by_delta(-1);
+        }
+        cx.notify();
     }
 
     fn minibuffer_complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1461,6 +1547,16 @@ impl Render for Frame {
             .on_action(cx.listener(|this, _: &keys::MinibufferPrevious, _, cx| {
                 this.minibuffer_select(-1, cx)
             }))
+            .on_action(cx.listener(|this, _: &keys::MinibufferUp, window, cx| {
+                this.minibuffer_up(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
+                    if let Some(prompt) = &mut this.minibuffer {
+                        prompt.delete_word(window, cx);
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &keys::MinibufferComplete, window, cx| {
                     this.minibuffer_complete(window, cx)

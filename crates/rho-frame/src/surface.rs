@@ -4,7 +4,9 @@
 use std::rc::Rc;
 
 use editor::Editor;
-use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window};
+use gpui::{
+    Action, AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window,
+};
 use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
@@ -62,6 +64,12 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         self.subject(cx)
     }
 
+    /// The key action that undoes a verdict here. A draft can give the same
+    /// keys a different meaning without advertising them for a verdict.
+    fn undo_verdict_action(&self, _cx: &App) -> Option<Box<dyn Action>> {
+        Some(Box::new(crate::keys::UndoVerdict))
+    }
+
     /// What the status line calls the surface while it is the card in
     /// view. By default the card's own heading; a surface that knows where
     /// the point is in it, such as the message under the cursor, says that
@@ -93,6 +101,7 @@ trait SurfaceHandle {
     fn subject(&self, cx: &App) -> Subject;
     fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
+    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>>;
     fn heading(&self, cx: &App) -> Option<String>;
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
@@ -130,6 +139,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn card(&self, cx: &App) -> Subject {
         self.read(cx).card(cx)
+    }
+
+    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>> {
+        self.read(cx).undo_verdict_action(cx)
     }
 
     fn heading(&self, cx: &App) -> Option<String> {
@@ -188,6 +201,10 @@ impl AnySurface {
 
     pub fn card(&self, cx: &App) -> Subject {
         self.0.card(cx)
+    }
+
+    pub(crate) fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>> {
+        self.0.undo_verdict_action(cx)
     }
 
     pub fn heading(&self, cx: &App) -> Option<String> {

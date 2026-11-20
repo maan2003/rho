@@ -43,6 +43,8 @@ actions!(
         MinibufferCancel,
         MinibufferNext,
         MinibufferPrevious,
+        MinibufferUp,
+        MinibufferDeleteWord,
         MinibufferComplete,
         MinibufferClear,
     ]
@@ -152,7 +154,12 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-n", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
-        KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("up", MinibufferUp, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new(
+            "ctrl-w",
+            MinibufferDeleteWord,
+            Some("RhoMinibuffer > Editor"),
+        ),
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-u", MinibufferClear, Some("RhoMinibuffer > Editor")),
     ]);

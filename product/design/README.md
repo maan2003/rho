@@ -19,11 +19,11 @@ form_way laptop tree        # wait for a focused 1300×850 rho-gui window
 form_way laptop key enter   # dismiss the initial synthetic device phrase without capturing it
 sleep 1
 form_way laptop input 'text::' 'wait:450'
-form_way laptop key enter   # new channel is the first suggestion
+form_way laptop input 'text:new channel' 'wait:300' 'key:enter'
 sleep .7
 form_way laptop input 'text:clock' 'wait:300' 'key:enter'
 sleep 1
-form_way laptop key enter   # open clock from Home
+# Creating a channel opens it on current builds. On d147b654, open clock from Home here.
 sleep .5
 form_way laptop input 'key:i' 'wait:300' \
   'text:Fix the clock test that fails one run in five.' 'wait:300' 'key:ctrl+shift+enter'
