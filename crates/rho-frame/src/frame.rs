@@ -842,14 +842,10 @@ impl Frame {
     /// The frame's rows, the surface's, and each system's for the point.
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
-        let mut undo = Row::run("", "undo", |frame, window, cx| {
+        let undo = Row::run("", "undo", |frame, window, cx| {
             frame.undo_verdict(window, cx);
         })
         .window_wide();
-        undo.shortcut = self
-            .current_surface()
-            .undo_verdict_action(cx)
-            .map(|action| Shortcut::Action(Rc::from(action)));
         let mut rows = vec![
             Row::run("", "write an idea", |frame, window, cx| {
                 frame.prompt_idea(window, cx)
@@ -1570,17 +1566,16 @@ impl Render for Frame {
             .on_action(
                 cx.listener(|this, _: &keys::CancelIdea, window, cx| this.cancel_idea(window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &keys::RedoIdeaOrUndoVerdict, window, cx| {
-                    if this.desk.read(cx).on_draft(cx) {
-                        this.active_editor(cx).update(cx, |editor, cx| {
-                            editor.redo(&editor::actions::Redo, window, cx);
-                        });
-                    } else {
-                        this.undo_verdict(window, cx);
-                    }
-                }),
-            )
+            .on_action(cx.listener(|this, _: &keys::RedoEdit, window, cx| {
+                let surface = this.current_surface();
+                if surface.edits_at_point(cx)
+                    && let Some(editor) = surface.editor(cx)
+                {
+                    editor.update(cx, |editor, cx| {
+                        editor.redo(&editor::actions::Redo, window, cx);
+                    });
+                }
+            }))
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
             .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
                 this.search(false, window, cx)
@@ -1594,11 +1589,6 @@ impl Render for Frame {
             .on_action(cx.listener(|this, _: &keys::SearchPrevious, window, cx| {
                 this.search_again(true, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &keys::UndoVerdict, window, cx| {
-                    this.undo_verdict(window, cx)
-                }),
-            )
             .on_action(
                 cx.listener(|this, _: &keys::MinibufferConfirm, window, cx| {
                     this.minibuffer_confirm(window, cx)

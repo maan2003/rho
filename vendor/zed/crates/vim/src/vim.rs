@@ -648,6 +648,19 @@ pub fn enter_normal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut 
     })
 }
 
+/// Starts writing in an application-owned editor, even before its first render.
+pub fn enter_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        if vim.mode != Mode::Insert {
+            vim.insert_before(&normal::InsertBefore, window, cx);
+        }
+    });
+    true
+}
+
 /// Whether a modal editor is accepting Insert-mode input.
 pub fn editor_in_insert_mode(editor: &Entity<Editor>, cx: &App) -> bool {
     editor

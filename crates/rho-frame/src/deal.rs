@@ -4,7 +4,7 @@
 //! The frame holds no queue. Every pull ranks the world as it stands
 //! (`rho_dealer::rank`) over the claims every system makes, passes over
 //! the card in view, and opens the top of the rest. A verdict is a fact
-//! in the ledger, said once and synced; `shift-u` takes the last one
+//! in the ledger, said once and synced; `space u` takes the last one
 //! back by retracting that fact.
 
 use std::collections::BTreeSet;
@@ -271,7 +271,7 @@ impl Frame {
         }
     }
 
-    /// `shift-u`: the last verdict, taken back.
+    /// `space u`: the last verdict, taken back.
     pub fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(undo) = self.attention.pop_undo() else {
             self.echo("nothing to undo", StyleClass::SystemInfo, cx);

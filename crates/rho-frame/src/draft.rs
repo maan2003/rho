@@ -157,25 +157,36 @@ pub fn focus(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let focus = editor.focus_handle(cx);
-    window.focus(&focus, cx);
     let tail = start(history, cx);
-    editor.update(cx, |editor, cx| {
-        editor.change_selections(Default::default(), window, cx, |selections| {
-            selections.select_ranges([tail..tail]);
-        });
-    });
-    let insert = cx
-        .build_action("vim::InsertBefore", None)
-        .expect("vim is initialised before a draft opens");
-    focus.dispatch_action(insert.as_ref(), window, cx);
-    if let Some(anchor) = position {
+    let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+    let start = snapshot.anchor_after(tail);
+    focus_writing_at(editor, start, position.unwrap_or(start), window, cx);
+}
+
+/// Starts Insert at an exact anchor, whether it is in a note or in a tail
+/// below read-only text. `start` gives Vim an editable point for entering
+/// Insert; the final anchor can be at the very end of a line.
+pub fn focus_writing_at(
+    editor: &Entity<Editor>,
+    start: Anchor,
+    at: Anchor,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.focus(&editor.focus_handle(cx), cx);
+    let place = |anchor, window: &mut Window, cx: &mut App| {
         editor.update(cx, |editor, cx| {
             editor.change_selections(Default::default(), window, cx, |selections| {
                 selections.select_anchor_ranges([anchor..anchor]);
             });
         });
-    }
+    };
+    place(start, window, cx);
+    vim::enter_insert_mode(editor, window, cx);
+    place(at, window, cx);
+    editor.update(cx, |editor, cx| {
+        editor.request_autoscroll(editor::scroll::Autoscroll::fit(), cx);
+    });
 }
 
 #[cfg(test)]

@@ -24,9 +24,7 @@ use rho_agent_types::{
 };
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
-use rho_frame::thread::{
-    self, OpenRow, QuoteSelection, RedoDraftOrUndoVerdict, SendMessage, SendOnly,
-};
+use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage, SendOnly};
 use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
 use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
@@ -1042,19 +1040,6 @@ impl ThreadView {
             .echo(confirmation, StyleClass::SystemInfo, cx);
     }
 
-    fn redo_draft_or_undo_verdict(
-        &mut self,
-        _: &RedoDraftOrUndoVerdict,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.on_draft(cx) {
-            window.dispatch_action(Box::new(editor::actions::Redo), cx);
-        } else {
-            window.dispatch_action(Box::new(rho_frame::keys::UndoVerdict), cx);
-        }
-    }
-
     fn agent_mail(&self, row: u32, cx: &App) -> Option<(rho_agent_types::AgentId, Message)> {
         let system = self.system.read(cx);
         if self.is_list(system) {
@@ -1383,8 +1368,8 @@ impl Surface for ThreadView {
         self.subject(cx)
     }
 
-    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn gpui::Action>> {
-        (!self.on_draft(cx)).then(|| Box::new(RedoDraftOrUndoVerdict) as Box<dyn gpui::Action>)
+    fn edits_at_point(&self, cx: &App) -> bool {
+        self.on_draft(cx)
     }
 
     fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {
@@ -1567,7 +1552,6 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::send_only))
             .on_action(cx.listener(Self::open_row))
             .on_action(cx.listener(Self::quote_selection))
-            .on_action(cx.listener(Self::redo_draft_or_undo_verdict))
             // The editor consumes text mouse-down even when its native
             // selection is disabled. Capture the draft's pointer down
             // before it; GPUI also routes a completed tap this way.
