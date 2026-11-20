@@ -4,13 +4,15 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Hsla, PathBuilder, Pixels, Point, TextStyle, Window, canvas, div,
-    point, px, rgb,
+    AnyElement, App, Bounds, Hsla, PathBuilder, Pixels, Point, TextAlign, TextStyle, Window,
+    canvas, div, fill, point, px, rgb, size,
 };
 use rho_agents_client::usage::{
-    AgentCostSummary, ChartPoint, CostSummary, Legend, QuotaSummary, SeriesColor, ShareSummary,
+    AgentCostSummary, ChartPoint, CostSummary, DayMark, Legend, MODEL_BANDS, QuotaSummary,
+    SeriesColor, ShareSummary, dollars,
 };
 use theme::ActiveTheme as _;
 
@@ -18,9 +20,8 @@ use theme::ActiveTheme as _;
 /// other and the picture says nothing, so a short window scrolls instead.
 const MIN_CHART_HEIGHT: Pixels = px(220.);
 
-/// What the chart is not allowed to use: the frame's chrome, the header's
-/// lines (title, totals and legend) and the day labels under the chart.
-const CHART_CHROME: Pixels = px(150.);
+/// The band reserved under the picture for day labels.
+const FOOTER_HEIGHT: Pixels = px(22.);
 
 /// What the block paints: already the size of the picture.
 pub(super) enum Summary {
@@ -39,26 +40,29 @@ impl Summary {
             Summary::Quota(quota) => &quota.legend,
             Summary::Cost(cost) => &cost.legend,
             Summary::Share(share) => &share.legend,
-            Summary::AgentCost(_) => &[],
+            Summary::AgentCost(cost) => &cost.legend,
+        }
+    }
+
+    pub(super) fn has_picture(&self) -> bool {
+        match self {
+            Self::Quota(quota) => !quota.lines.is_empty(),
+            Self::Cost(cost) => cost.total > 0.0,
+            Self::Share(share) => !share.legend.is_empty(),
+            Self::AgentCost(cost) => !cost.curves[0].is_empty(),
         }
     }
 }
 
-/// How many points the chart can show: the window's width, since the chart
-/// spans it. An overestimate by the gutter's width costs a few points and
-/// never a coarser line.
-pub(super) fn columns_for(window: &Window) -> usize {
-    f32::from(window.viewport_size().width).max(1.0) as usize
-}
-
-/// How tall to draw the chart: what the screen has left under the header.
-pub(super) fn height_for(window: &Window) -> Pixels {
-    (window.viewport_size().height - CHART_CHROME).max(MIN_CHART_HEIGHT)
+/// Height including the footer, rounded down to whole editor lines: the
+/// editor gives a block an integral number of lines of space.
+pub(super) fn height_for(available: Pixels, line_height: Pixels, header_rows: u32) -> Pixels {
+    (line_height * ((available / line_height).floor() - header_rows as f32)).max(MIN_CHART_HEIGHT)
 }
 
 pub(super) fn backfill_note(approximate: bool) -> &'static str {
     if approximate {
-        " · includes approximate backfill"
+        " · includes estimates for older requests"
     } else {
         ""
     }
@@ -100,6 +104,7 @@ pub(super) fn chart_block(
 /// the next label as well as these — a label that wants its series' colour
 /// still says so and wins, because a child overrides its parent.
 fn render_chart(summary: &Summary, height: Pixels, text_style: &TextStyle, cx: &App) -> AnyElement {
+    let height = height - FOOTER_HEIGHT;
     let chart = match summary {
         Summary::Quota(quota) => render_quota(quota, height, cx),
         Summary::Cost(cost) => render_cost(cost, height, cx),
@@ -130,12 +135,12 @@ fn render_quota(summary: &QuotaSummary, height: Pixels, cx: &App) -> AnyElement 
             axis_row(
                 height,
                 ["100%", "50%", "0%"].into_iter().map(str::to_owned),
-                summary.days,
+                &summary.midnights,
                 canvas(
                     move |_, _, _| {},
                     move |bounds, _, window, _| {
-                        for x in &midnights {
-                            paint_column(*x, bounds, grid, window);
+                        for mark in &midnights {
+                            paint_column(mark.x, bounds, grid, window);
                         }
                         for percent in (0..=100).step_by(10) {
                             paint_row(1.0 - percent as f32 / 100.0, bounds, grid, window);
@@ -156,15 +161,17 @@ fn render_quota(summary: &QuotaSummary, height: Pixels, cx: &App) -> AnyElement 
 }
 
 fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
-    let bands = [
-        color_of(SeriesColor::Fable, cx),
-        color_of(SeriesColor::Gpt, cx),
-        color_of(SeriesColor::Astra, cx),
-        color_of(SeriesColor::Opus, cx),
-        color_of(SeriesColor::Terra, cx),
-    ];
-    let columns = summary.columns.clone();
-    let max = summary.max;
+    let bands = MODEL_BANDS.map(|(_, color)| color_of(color, cx));
+    let columns = summary
+        .columns
+        .iter()
+        .map(|(x, dollars)| {
+            (
+                *x,
+                dollars.map(|value| 1.0 - (value / summary.total) as f32),
+            )
+        })
+        .collect::<Vec<_>>();
     let midnights = summary.midnights.clone();
     let grid = grid_color(cx);
     div()
@@ -174,22 +181,16 @@ fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
             axis_row(
                 height,
                 [
-                    format!("${:.2}", summary.total),
-                    format!("${:.2}", summary.total / 2.0),
+                    dollars(summary.total),
+                    dollars(summary.total / 2.0),
                     "$0".to_owned(),
                 ]
                 .into_iter(),
-                summary.days,
+                &summary.midnights,
                 canvas(
                     move |_, _, _| {},
                     move |bounds, _, window, _| {
-                        let stacked = columns
-                            .iter()
-                            .map(|(x, dollars)| {
-                                (*x, dollars.map(|value| 1.0 - (value / max) as f32))
-                            })
-                            .collect::<Vec<_>>();
-                        paint_bands(&stacked, bands, bounds, window);
+                        paint_bands(&columns, bands, bounds, window);
                         paint_usage_grid(&midnights, bounds, grid, window);
                     },
                 )
@@ -202,14 +203,7 @@ fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
 }
 
 fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement {
-    let bands = [
-        color_of(SeriesColor::Fable, cx),
-        color_of(SeriesColor::Gpt, cx),
-        color_of(SeriesColor::Astra, cx),
-        color_of(SeriesColor::Opus, cx),
-        color_of(SeriesColor::Terra, cx),
-        color_of(SeriesColor::Luna, cx),
-    ];
+    let bands = MODEL_BANDS.map(|(_, color)| color_of(color, cx));
     let columns = summary
         .columns
         .iter()
@@ -223,8 +217,8 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
         .child(
             axis_row(
                 height,
-                ["full", "½", "0%"].into_iter().map(str::to_owned),
-                summary.days,
+                ["more", "", "less"].into_iter().map(str::to_owned),
+                &summary.midnights,
                 canvas(
                     move |_, _, _| {},
                     move |bounds, _, window, _| {
@@ -241,74 +235,47 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
 }
 
 fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> AnyElement {
-    let curves = [SeriesColor::P50, SeriesColor::P90, SeriesColor::P99]
-        .map(|color| color_of(color, cx))
-        .into_iter()
+    let curves = summary
+        .legend
+        .iter()
+        .map(|entry| color_of(entry.color, cx))
         .zip(summary.curves.clone())
         .collect::<Vec<_>>();
     let midnights = summary.midnights.clone();
     let rows = summary.grid.clone();
     let grid = grid_color(cx);
-    let mut labels = div().relative().h(height).w(px(44.));
-    if let Some(latest) = summary.latest_y {
-        for (index, (name, color)) in [
-            ("p50", SeriesColor::P50),
-            ("p90", SeriesColor::P90),
-            ("p99", SeriesColor::P99),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            // Against the chart's own height, less the line's own, so a
-            // label at the bottom is still beside its curve.
-            let top = (latest[index] * (f32::from(height) - 12.0)).max(0.0);
-            labels = labels.child(
-                div()
-                    .absolute()
-                    .top(px(top))
-                    .text_color(color_of(color, cx))
-                    .child(name),
-            );
-        }
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_start()
-        .child(
-            axis_row(
-                height,
-                summary.ticks.clone().into_iter(),
-                summary.days,
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        for y in &rows {
-                            paint_row(*y, bounds, grid, window);
-                        }
-                        for x in &midnights {
-                            paint_column(*x, bounds, grid, window);
-                        }
-                        for (color, curve) in &curves {
-                            paint_curve(curve, bounds, *color, window);
-                        }
-                    },
-                )
-                .size_full()
-                .into_any_element(),
-            )
-            .flex_1(),
+    axis_row(
+        height,
+        summary.ticks.clone().into_iter(),
+        &summary.midnights,
+        canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, _| {
+                for y in &rows {
+                    paint_row(*y, bounds, grid, window);
+                }
+                for mark in &midnights {
+                    paint_column(mark.x, bounds, grid, window);
+                }
+                // The three costs can coincide (e.g. one agent). Give
+                // typical cost the foreground in that case.
+                for (color, curve) in curves.iter().rev() {
+                    paint_curve(curve, bounds, *color, window);
+                }
+            },
         )
-        .child(labels)
-        .into_any_element()
+        .size_full()
+        .into_any_element(),
+    )
+    .into_any_element()
 }
 
 /// A chart with its axes: the value labels down the left, the chart itself,
-/// and how far back the left edge is under it.
+/// and the named days under it.
 fn axis_row(
     height: Pixels,
     labels: impl Iterator<Item = String>,
-    days: u64,
+    midnights: &[DayMark],
     chart: AnyElement,
 ) -> gpui::Div {
     div()
@@ -341,16 +308,59 @@ fn axis_row(
                 .flex()
                 .flex_col()
                 .child(div().w_full().h(height).child(chart))
-                .child(
-                    div()
-                        .mt_1()
-                        .flex()
-                        .w_full()
-                        .justify_between()
-                        .child(format!("−{days}d"))
-                        .child("now"),
-                ),
+                .child(day_axis(midnights)),
         )
+}
+
+fn day_axis(midnights: &[DayMark]) -> impl IntoElement {
+    // Seven weekday names fit across the phone. Over a month, label
+    // every fifth midnight and leave the intervening grid lines intact.
+    let month = midnights.len() > 7;
+    let stride = if month { 5 } else { 1 };
+    let labels = midnights
+        .iter()
+        .step_by(stride)
+        .filter_map(|mark| {
+            let date = DateTime::<Utc>::from_timestamp_millis(mark.at_ms as i64)?;
+            Some((
+                mark.x,
+                date.format(if month { "%b %-d" } else { "%a" }).to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let mut after_previous = bounds.left();
+            for (x, label) in labels {
+                let run = style.to_run(label.len());
+                let line = window
+                    .text_system()
+                    .shape_line(label.into(), font_size, &[run], None);
+                if line.width() > bounds.size.width {
+                    continue;
+                }
+                let x = (bounds.left() + bounds.size.width * x - line.width() / 2.)
+                    .clamp(bounds.left(), bounds.right() - line.width());
+                if x >= after_previous {
+                    let _ = line.paint(
+                        point(x, bounds.top()),
+                        bounds.size.height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                    after_previous = x + line.width() + px(4.);
+                }
+            }
+        },
+    )
+    .mt_1()
+    .w_full()
+    .h(FOOTER_HEIGHT - px(8.))
 }
 
 pub(super) fn color_of(color: SeriesColor, cx: &App) -> Hsla {
@@ -434,12 +444,17 @@ fn paint_bands<const N: usize>(
     }
 }
 
-fn paint_usage_grid(midnights: &[f32], bounds: Bounds<Pixels>, grid: Hsla, window: &mut Window) {
+fn paint_usage_grid(
+    midnights: &[DayMark],
+    bounds: Bounds<Pixels>,
+    grid: Hsla,
+    window: &mut Window,
+) {
     for step in 0..=4 {
         paint_row(step as f32 / 4.0, bounds, grid, window);
     }
-    for x in midnights {
-        paint_column(*x, bounds, grid, window);
+    for mark in midnights {
+        paint_column(mark.x, bounds, grid, window);
     }
 }
 
@@ -480,7 +495,7 @@ fn paint_curve(points: &[ChartPoint], bounds: Bounds<Pixels>, color: Hsla, windo
         Vec::<Point<Pixels>>::new(),
         |mut points, point| {
             if let Some(previous) = points.last_mut()
-                && point.x <= previous.x
+                && point.x.floor() <= previous.x.floor()
             {
                 *previous = point;
             } else {
@@ -492,6 +507,23 @@ fn paint_curve(points: &[ChartPoint], bounds: Bounds<Pixels>, color: Hsla, windo
     let Some(first) = points.first().copied() else {
         return;
     };
+    if points.len() == 1 {
+        let r = px(2.)
+            .min(bounds.size.width / 2.)
+            .min(bounds.size.height / 2.);
+        let origin = point(
+            (first.x - r).clamp(bounds.left(), bounds.right() - r * 2.),
+            (first.y - r).clamp(bounds.top(), bounds.bottom() - r * 2.),
+        );
+        window.paint_quad(fill(
+            Bounds {
+                origin,
+                size: size(r * 2., r * 2.),
+            },
+            color,
+        ));
+        return;
+    }
     let mut builder = PathBuilder::stroke(px(2.));
     builder.move_to(first);
     if points.len() == 2 {

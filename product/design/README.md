@@ -15,6 +15,10 @@ The script opens a shell with `form_gui`, `form_way`, and `form_shot`. The host,
 
 `FAKE_SCENARIO` defaults to `clarifying-question`. `FAKE_ARGS` is an optional whitespace-separated argument list (no shell expansion); `rho-fake-model --help` lists the choices. Terminal faults are disabled. The fixture policy translates the default Claude runtime to `sol-medium` on `lab` only. The real worker runs against the fake model without Claude's mount overlays.
 
+For the Chart, add `--report-allowance` to `FAKE_ARGS` to have the model report
+66% left with a reset in five days on a Responses WebSocket turn. Leave it off
+to see spend without an allowance. Before any work, the spending charts are empty.
+
 ### Put a clock idea to work
 
 Run these steps in the fixture shell, on either scenario. After `form_gui`, use `form_way laptop tree` and wait for the focused `rho-gui` window. Dismiss the synthetic device phrase with Enter; do not capture the phrase.

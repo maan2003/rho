@@ -20,6 +20,9 @@ struct Args {
     /// Disable injected terminal faults for throughput/proof runs.
     #[arg(long)]
     no_faults: bool,
+    /// Report a weekly allowance on Responses WebSocket turns.
+    #[arg(long)]
+    report_allowance: bool,
     /// Sequential tool exchanges in the real-tool-rounds scenario.
     #[arg(long, default_value_t = rho_fake_model::REAL_TOOL_ROUNDS)]
     rounds: usize,
@@ -32,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     config.bind = args.bind;
     config.scenario = args.scenario;
     config.real_tool_rounds = args.rounds;
+    config.report_allowance = args.report_allowance;
     if args.wall_clock_timing || args.scenario == Scenario::SlowTrickle {
         config.timing.mode = TimingMode::Timed;
     }
