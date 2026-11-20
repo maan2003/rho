@@ -599,7 +599,7 @@ impl Frame {
                         match Address::parse(input.trim()) {
                             Some(address) => frame.open(address, window, cx),
                             None => frame.echo(
-                                &format!("no command {input:?}"),
+                                &format!("nothing called {}", input.trim()),
                                 StyleClass::SystemInfo,
                                 cx,
                             ),

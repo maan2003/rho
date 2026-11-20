@@ -400,7 +400,7 @@ impl Minibuffer {
         let window_start = self
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
-        let rows = self
+        let mut rows = self
             .candidates
             .iter()
             .enumerate()
@@ -430,6 +430,14 @@ impl Minibuffer {
                 row
             })
             .collect::<Vec<_>>();
+        // A prompt whose rows are its answers says when none answers, so
+        // an empty list does not read as one still loading.
+        if rows.is_empty()
+            && matches!(self.answer, Answer::Row(_))
+            && !self.input(cx).trim().is_empty()
+        {
+            rows.push(div().px_2().text_color(colors.text_muted).child("no match"));
+        }
         // Input first, candidates beneath it, like emacs completing-read.
         bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")
