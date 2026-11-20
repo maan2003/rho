@@ -440,14 +440,8 @@ impl Agent {
                 ))
                 .await?;
             }
-            let decision = if let Some(backoff) = &self.backoff {
-                if backoff.at <= UnixMs::now() {
-                    Decision::Now(Wake::Prose)
-                } else {
-                    Decision::Later(Some(backoff.at))
-                }
-            } else {
-                wake::decide(&self.facts(), UnixMs::now())
+            let Some(decision) = self.wake_decision(UnixMs::now()) else {
+                continue; // Drain a newer notebook signal before acting.
             };
             let recheck = match decision {
                 Decision::Now(why) => {
@@ -479,6 +473,22 @@ impl Agent {
                 () = sleep => {}
             }
         }
+    }
+
+    fn wake_decision(&self, now: UnixMs) -> Option<Decision> {
+        let decision = if let Some(backoff) = &self.backoff {
+            if backoff.at <= now {
+                Decision::Now(Wake::Prose)
+            } else {
+                Decision::Later(Some(backoff.at))
+            }
+        } else {
+            wake::decide(&self.facts(), now)
+        };
+        // A notebook can enqueue end_turn() after the initial drain but
+        // before we read that the cell returned (or shortened its check-in).
+        // Do not wake on those facts before applying the earlier signal.
+        self.outbox.is_empty().then_some(decision)
     }
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {

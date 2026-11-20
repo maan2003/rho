@@ -404,17 +404,55 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
 }
 
 #[tokio::test]
+async fn a_cell_return_and_its_checkin_wait_for_the_earlier_end_turn_signal() {
+    let harness = Harness::new().await;
+    let (_handle, mut agent) = harness.load().await;
+    let code = "end_turn()\nset_max_wait(1)".to_owned();
+    let cell = agent.notebook().await.unwrap().run(code.clone());
+    wait_for("the cell to return", || cell.facts().finished.is_some()).await;
+    agent.cell = Some(Latest {
+        cell,
+        call: Call::new("call_1", code),
+        published: true,
+        end_told: true,
+    });
+    let now = UnixMs::now();
+    agent.progress.last_response = Some(now);
+
+    // Emulate the notebook returning just after the loop drained its outbox.
+    // Without the later check, either automatic wake would start a new turn.
+    let past_checkin = now + Duration::from_secs(2);
+    for (already_told, at, otherwise) in [
+        (false, now, Wake::Returned),
+        (true, past_checkin, Wake::Checkin),
+    ] {
+        agent.progress.told_returned = already_told;
+        assert_eq!(wake::decide(&agent.facts(), at), Decision::Now(otherwise));
+        assert_eq!(agent.wake_decision(at), None);
+    }
+
+    agent.drain_outbox().await.unwrap();
+    assert!(agent.awaiting);
+    assert_eq!(
+        agent.wake_decision(past_checkin),
+        Some(Decision::Later(None))
+    );
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_ended_turn_wakes_only_for_news() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
+    let release = harness.root.join("ci-green");
     script
-        .then(
-            "import asyncio\nasync def watch():\n    await asyncio.sleep(2)\n    notify('ci green')\nasyncio.create_task(watch())\nset_max_wait(1)\nend_turn()",
-        )
+        .then(&format!(
+            "import asyncio\nfrom pathlib import Path\nasync def watch():\n    while not Path({release:?}).exists():\n        await asyncio.sleep(0.02)\n    notify('ci green')\nasyncio.create_task(watch())\nend_turn()\nset_max_wait(1)",
+        ))
         .then("end_turn()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "watch ci").await;
-    requests(&script, 1).await;
+    wait_for("the turn to end", || handle.status().runtime.awaiting_human).await;
 
     // Neither the cell returning nor the requested check-in wakes it.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -423,6 +461,7 @@ async fn an_ended_turn_wakes_only_for_news() {
     assert_eq!(state.checkin_at, None);
     assert!(state.awaiting_human);
 
+    std::fs::File::create(release).unwrap();
     let second = requests(&script, 2).await;
     assert!(
         told(&second[1]).contains("ci green"),
@@ -687,7 +726,7 @@ async fn waiting_never_checks_in_and_archive_revival_has_a_fresh_notebook() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script
-        .then("remembered = 41\nset_max_wait(1)\nend_turn()")
+        .then("remembered = 41\nend_turn()\nset_max_wait(1)")
         .then("human.send('archiving', kind='result')\narchive()")
         .then("human.send(str('remembered' in globals()), kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
@@ -1306,7 +1345,10 @@ async fn cold_load_and_queued_boundary_keep_the_request_after_a_compaction() {
 async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
-    script.then("import asyncio\nasyncio.create_task(asyncio.sleep(1))\nend_turn()");
+    let release = harness.root.join("task-finished");
+    script.then(&format!(
+        "import asyncio\nfrom pathlib import Path\nasync def watch():\n    while not Path({release:?}).exists():\n        await asyncio.sleep(0.02)\nasyncio.create_task(watch())\nend_turn()",
+    ));
     let (handle, _task) = harness.start(&script).await;
 
     say(&handle, "hi").await;
@@ -1314,6 +1356,7 @@ async fn an_agent_that_ended_its_turn_can_be_retired_once_its_tasks_finish() {
         .until("the wait", |_| handle.status().runtime.awaiting_human)
         .await;
     assert!(handle.retire().await.is_err(), "its task is still running");
+    std::fs::File::create(release).unwrap();
     harness
         .until("the task to finish", |_| handle.status().settled())
         .await;
