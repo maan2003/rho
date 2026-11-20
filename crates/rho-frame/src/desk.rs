@@ -338,7 +338,9 @@ impl DeskView {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
                     show_active_line_background: true,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                    // An arrival can scroll the new row out of the way
+                    // while writing, even when the whole Desk fits.
+                    sizing_behavior: SizingBehavior::FullOverscrollMargin,
                 },
                 multi_buffer.clone(),
                 None,

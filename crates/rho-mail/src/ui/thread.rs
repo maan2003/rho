@@ -226,7 +226,9 @@ impl ThreadView {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
                     show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                    // A new mail can scroll above a draft caret even when
+                    // the whole thread fits in the viewport.
+                    sizing_behavior: SizingBehavior::FullOverscrollMargin,
                 },
                 multi_buffer,
                 None,

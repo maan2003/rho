@@ -678,6 +678,10 @@ impl Editor {
 
     pub(crate) fn scroll_beyond_last_line(&self, cx: &App) -> ScrollBeyondLastLine {
         match self.mode {
+            EditorMode::Full {
+                sizing_behavior: SizingBehavior::FullOverscrollMargin,
+                ..
+            } => ScrollBeyondLastLine::OnePage,
             EditorMode::Minimap { .. }
             | EditorMode::Full {
                 sizing_behavior: SizingBehavior::Default,
