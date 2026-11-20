@@ -1043,7 +1043,7 @@ impl Frame {
 
     fn minibuffer_select(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.select_by_delta(delta);
+            minibuffer.select_by_delta(delta, cx);
             cx.notify();
         }
     }

@@ -277,12 +277,22 @@ impl Minibuffer {
         }
     }
 
-    pub fn select_by_delta(&mut self, delta: isize) {
+    pub fn select_by_delta(&mut self, delta: isize, cx: &App) {
         if self.candidates.is_empty() {
             return;
         }
         let len = self.candidates.len() as isize;
-        self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
+        // An untouched address has no highlighted suggestion: the first
+        // move lands on the first or last row, not the second one.
+        let from = if matches!(self.completion_input, CompletionInput::Address)
+            && !self.accepts_selected(cx)
+            && delta > 0
+        {
+            -1
+        } else {
+            self.selected as isize
+        };
+        self.selected = (from + delta).rem_euclid(len) as usize;
         self.selection_moved = true;
     }
 
@@ -369,6 +379,8 @@ impl Minibuffer {
         let window_start = self
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
+        let address = matches!(self.completion_input, CompletionInput::Address);
+        let highlight = !address || self.accepts_selected(cx);
         let rows = self
             .candidates
             .iter()
@@ -376,7 +388,7 @@ impl Minibuffer {
             .skip(window_start)
             .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
-                let selected = index == self.selected;
+                let selected = highlight && index == self.selected;
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
                 let mut row = div()
@@ -397,7 +409,7 @@ impl Minibuffer {
                     row = row.bg(colors.element_selected);
                 }
                 let row = row.id(("rho-prompt-candidate", index));
-                if matches!(self.completion_input, CompletionInput::Address) {
+                if address {
                     row.cursor_pointer()
                         .on_click(cx.listener(move |frame, _, window, cx| {
                             if let Some(prompt) = frame.minibuffer_mut() {
