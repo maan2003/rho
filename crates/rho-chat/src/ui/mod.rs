@@ -33,20 +33,6 @@ use crate::protocol::Name;
 use crate::stream::{ChatEvent, ChatStream, Cursors};
 use crate::{ThreadId, cards};
 
-gpui::actions!(
-    rho_chat,
-    [
-        /// Sends what is in the composer.
-        SendMessage,
-        /// Puts the keyboard in the composer.
-        FocusComposer,
-        /// Puts the keyboard in the messages.
-        FocusLog,
-        /// Opens what the cursor is on: a subthread, a participant.
-        OpenRow,
-    ]
-);
-
 /// What the chat tells whoever listens: the agents system starts an
 /// agent from a message once the host has logged it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +101,6 @@ impl ChatSystem {
                 }
             }
         });
-        bind_keys(cx);
         Self {
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
@@ -692,25 +677,6 @@ impl System for ChatSystem {
         }
         found
     }
-}
-
-fn bind_keys(cx: &mut App) {
-    use gpui::KeyBinding;
-    let mut bindings = vec![
-        KeyBinding::new("ctrl-enter", SendMessage, Some("RhoThread > Editor")),
-        KeyBinding::new("ctrl-down", FocusComposer, Some("RhoThread > Editor")),
-        KeyBinding::new("ctrl-up", FocusLog, Some("RhoThread > Editor")),
-        // The composer is an input, always in insert: escape is the way back
-        // to the log, where the vim keys are.
-        KeyBinding::new("escape", FocusLog, Some("RhoThreadComposer > Editor")),
-    ];
-    for context in rho_frame::normal_contexts("RhoThreadLog", "") {
-        bindings.extend([
-            KeyBinding::new("i", FocusComposer, Some(&context)),
-            KeyBinding::new("enter", OpenRow, Some(&context)),
-        ]);
-    }
-    cx.bind_keys(bindings);
 }
 
 /// How long ago, in the deal bar's units.

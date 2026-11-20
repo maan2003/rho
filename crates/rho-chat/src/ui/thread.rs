@@ -17,11 +17,12 @@ use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, ContentPart, EndpointId, MessageId};
 use rho_dealer::{Address, Addressed as _, Marks};
+use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage};
 use rho_frame::{Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, FocusComposer, FocusLog, OpenRow, SendMessage, ago, when};
+use super::{ChatSystem, ago, when};
 use crate::{AgentRef, HostChat, ThreadId};
 
 /// This surface's highlight-key space, clear of the others'.
@@ -183,7 +184,7 @@ impl ThreadView {
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 10, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.set_placeholder_text("message · ctrl-enter sends", window, cx);
+            editor.set_placeholder_text(thread::PLACEHOLDER, window, cx);
             if !draft.is_empty() {
                 editor.set_text(draft, window, cx);
             }
@@ -773,7 +774,7 @@ impl Render for ThreadView {
         }
         let colors = cx.theme().colors();
         div()
-            .key_context("RhoThread")
+            .key_context(thread::SCREEN)
             .size_full()
             .flex()
             .flex_col()
@@ -784,14 +785,14 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::open_row))
             .child(
                 div()
-                    .key_context("RhoThreadLog")
+                    .key_context(thread::LOG)
                     .flex_1()
                     .min_h_0()
                     .child(self.log.clone()),
             )
             .child(
                 div()
-                    .key_context("RhoThreadComposer")
+                    .key_context(thread::COMPOSER)
                     .flex_none()
                     .w_full()
                     .border_t_1()

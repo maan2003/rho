@@ -84,4 +84,5 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
     ]);
     cx.bind_keys(bindings);
+    crate::thread::bind(cx);
 }
