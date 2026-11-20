@@ -54,9 +54,26 @@ pub(crate) enum Choice {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Group {
+    ExactCommand,
+    ExactPlace,
+    CommandAtWordStarts,
     OtherPlace,
     CurrentPlace,
-    Command,
+    OtherCommand,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Strength {
+    ExactName,
+    WordStarts,
+    Fuzzy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Hit {
+    WholeWord,
+    WordStart,
+    InsideWord,
 }
 
 impl Choice {
@@ -117,11 +134,14 @@ impl Choice {
         }
     }
 
-    fn group(&self) -> Group {
-        match self {
-            Self::Place(place) if place.current => Group::CurrentPlace,
-            Self::Place(_) => Group::OtherPlace,
-            Self::Command(_) => Group::Command,
+    fn group(&self, strength: Strength) -> Group {
+        match (self, strength) {
+            (Self::Place(place), _) if place.current => Group::CurrentPlace,
+            (Self::Place(_), Strength::ExactName) => Group::ExactPlace,
+            (Self::Place(_), _) => Group::OtherPlace,
+            (Self::Command(_), Strength::ExactName) => Group::ExactCommand,
+            (Self::Command(_), Strength::WordStarts) => Group::CommandAtWordStarts,
+            (Self::Command(_), Strength::Fuzzy) => Group::OtherCommand,
         }
     }
 
@@ -158,7 +178,11 @@ impl Choice {
         }
     }
 
-    fn matches(&self, words: &[String]) -> Option<(usize, [Vec<Range<usize>>; 3])> {
+    fn matches(
+        &self,
+        query: &str,
+        words: &[&str],
+    ) -> Option<(Strength, usize, [Vec<Range<usize>>; 3])> {
         let fields = self.fields();
         let folded = fields.map(Folded::new);
         let aliases: Vec<_> = self
@@ -168,7 +192,9 @@ impl Choice {
             .collect();
         let mut marks: [Vec<Range<usize>>; 3] = Default::default();
         let mut score = 0;
+        let mut command_at_word_starts = matches!(self, Self::Command(_));
         for word in words {
+            let mut name_hit = None;
             let (quality, field, range) = folded
                 .iter()
                 // Command key hints are metadata, not words to match.
@@ -177,12 +203,17 @@ impl Choice {
                 .enumerate()
                 .filter_map(|(field, text)| {
                     let (quality, range) = text.find(word)?;
+                    if field == 0 {
+                        name_hit = Some(quality);
+                    }
                     Some((quality, field, range))
                 })
                 .min_by_key(|(quality, field, _)| (*quality, *field))?;
             // Whole words before prefixes before substrings; a name
             // match beats an equally good match in the words beside it.
-            score += quality * 2 + usize::from(field != 0 && field < 3);
+            score += quality as usize * 2 + usize::from(field != 0 && field < 3);
+            // The command's displayed name, not an alias, earns priority.
+            command_at_word_starts &= name_hit.is_some_and(|hit| hit != Hit::InsideWord);
             if let Some(ranges) = marks.get_mut(field)
                 && (!self.has_keys() || field == 0)
             {
@@ -203,7 +234,14 @@ impl Choice {
             }
             *ranges = merged;
         }
-        Some((score, marks))
+        let strength = if folded[0].text == query {
+            Strength::ExactName
+        } else if command_at_word_starts {
+            Strength::WordStarts
+        } else {
+            Strength::Fuzzy
+        };
+        Some((strength, score, marks))
     }
 }
 
@@ -232,7 +270,7 @@ impl Folded {
         folded
     }
 
-    fn find(&self, word: &str) -> Option<(usize, Range<usize>)> {
+    fn find(&self, word: &str) -> Option<(Hit, Range<usize>)> {
         self.text
             .char_indices()
             .filter(|(start, _)| self.text[*start..].starts_with(word))
@@ -241,9 +279,9 @@ impl Folded {
                 let boundary_before = !self.text[..start].ends_with(char::is_alphanumeric);
                 let boundary_after = !self.text[end..].starts_with(char::is_alphanumeric);
                 let quality = match (boundary_before, boundary_after) {
-                    (true, true) => 0,
-                    (true, false) => 1,
-                    (false, _) => 2,
+                    (true, true) => Hit::WholeWord,
+                    (true, false) => Hit::WordStart,
+                    (false, _) => Hit::InsideWord,
                 };
                 (
                     quality,
@@ -274,8 +312,8 @@ impl Listing {
     }
 
     pub fn rank(&self, query: &str) -> Vec<Matched> {
-        let query = query.trim();
-        let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        let query = query.trim().to_lowercase();
+        let words: Vec<_> = query.split_whitespace().collect();
         if words.is_empty() {
             let mut rows: Vec<_> = self
                 .choices
@@ -298,11 +336,11 @@ impl Listing {
             .iter()
             .enumerate()
             .filter_map(|(index, choice)| {
-                let (score, marks) = choice.matches(&words)?;
+                let (strength, score, marks) = choice.matches(&query, &words)?;
                 Some((
                     (
-                        choice.group(),
-                        !choice.name().eq_ignore_ascii_case(query),
+                        choice.group(strength),
+                        strength,
                         score,
                         choice.query_order(),
                         index,
@@ -444,7 +482,7 @@ mod tests {
     #[test]
     fn commands_follow_places_and_the_current_place_is_last_in_its_group() {
         let listing = Listing::new(
-            commands(&[Row::run("", "clock", |_, _, _| {})], |_| None),
+            commands(&[Row::run("", "repair fastclock", |_, _, _| {})], |_| None),
             vec![
                 thread("clock", "wave@lab", Some(0), true, Some("asks · 1h")),
                 thread("Broken Clock Test", "ice@lab", None, false, None),
@@ -453,6 +491,38 @@ mod tests {
         );
         assert_eq!(ids(&listing, "clock"), [1, 2, 0, 3]);
         assert_eq!(ids(&listing, "wave"), [0]);
+    }
+
+    #[test]
+    fn a_command_at_word_starts_beats_a_note_matching_inside_renewal() {
+        let mut renewal = thread("Ask about the lease renewal", "note", Some(0), false, None);
+        renewal.found.thread = None;
+        let listing = Listing::new(
+            commands(&[Row::run("", "new note", |_, _, _| {})], |_| None),
+            vec![renewal, thread("New notebook", "local", None, false, None)],
+        );
+        assert_eq!(ids(&listing, "new note"), [2, 1, 0]);
+        assert_eq!(ids(&listing, "ne no"), [2, 1, 0]);
+        assert_eq!(ids(&listing, "ew ote"), [1, 0, 2]);
+    }
+
+    #[test]
+    fn a_whole_place_name_beats_a_command_that_merely_contains_it() {
+        let listing = Listing::new(
+            commands(
+                &[
+                    Row::run("", "new note", |_, _, _| {}),
+                    Row::run("", "renew key", |_, _, _| {}),
+                ],
+                |_| None,
+            ),
+            vec![
+                thread("Note", "local", None, false, None),
+                thread("New", "workspace", None, false, None),
+            ],
+        );
+        assert_eq!(ids(&listing, "NOTE"), [0, 2]);
+        assert_eq!(ids(&listing, "new"), [1, 2, 3]);
     }
 
     #[test]
