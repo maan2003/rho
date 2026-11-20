@@ -40,7 +40,7 @@ purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
 sees: best matches first as the user types; with nothing typed, the screen's commands first, then recent places, then what waits. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its `mail.Status` or, when it waits, its `deal.Card` words. Commands show their keys where they have them.
 does:
-- open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a box the user is typing in: open the same prompt; the place under it does not see the keys
+- open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a draft the user is typing: open the same prompt; the place under it does not see the keys
 - search: match places and commands by name and search the full text of mail and notes; optional prefixes narrow the search
 - run `enter`: open the chosen place or run the chosen command; a command that is a `Menu` opens that menu
 
@@ -104,7 +104,7 @@ purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
 - on `desk.Desk`: the bar reaches the desk's actions by thumb; the exact buttons are not agreed
-- on any other screen: `back`, `home`, `menu`, `more` while the cursor is on something a verdict can land on, and `send` when the screen has a message box
+- on any other screen: `back`, `home`, `menu`, `more` while the cursor is on something a verdict can land on, and `send` when the screen has a `design.Draft tail`
 - while a prompt is open: `cancel` and `enter`
 does:
 - flick up from the end of a screen: forward, and from the newest screen deal the next card, as `Screen.forward` does

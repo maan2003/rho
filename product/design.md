@@ -30,15 +30,15 @@ The built window puts the work in one editor. The top line tells the user where 
 - top line · `26 px` · keep the heading and mode in a shallow fixed band.
 - same band gap · `12 px` · separate the heading from its card words and separate the notices at the right.
 - reading inset · `8 px` · keep the edge of window controls off the frame.
-- seam width · `1 px` · divide the box, top line, and phone controls without adding a panel.
-- composer breath · `4 px` above and below · make the place for writing distinct from the last message.
+- seam width · `1 px` · divide the idea box, top line, and phone controls without adding a panel.
+- composer breath · `4 px` above and below · give the desk's idea box room to breathe.
 - command strip breath · `2 px` above and below · keep prompt and menu close to the text rhythm.
 - thumb target · `56 px` high · an action the thumb can hit at the bottom edge or in a menu sheet.
 - narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop menu grid.
 - row air · two text spaces · leave space between a row name and its words.
 - menu column · four rows, then the next column across · find choices without spending the whole screen's height.
 - prompt answers · up to eight visible rows · keep the answer being considered in sight without making a second screen.
-- box size · one to ten editor lines · use only the height of the words being written until a long draft needs to scroll.
+- box size · one to ten editor lines · give the idea box only the height of the words being written until a long idea needs to scroll.
 
 ## token time
 - echo life · `4 s` · long enough to see the result of the last action before the heading returns.
@@ -119,19 +119,18 @@ form:
 A separate clock per test should do it.
 ```
 
-## part Box
-status: the empty thread box says `reply`; the desk's idea box names the chosen project. Laptop hints show the send key; phone hints omit it.
-purpose: give the user somewhere to write without leaving the work they were reading.
-looks: `editor text` below a `seam` with a `reading inset` and `composer breath`; it shares the reading surface and grows to `box size`.
+## part Draft tail
+purpose: let the user answer what they were reading without leaving the buffer.
+looks: one line in `quiet` after the last mail and any status, with a divider and the recipient, plus the send key on laptop; the draft is ordinary `editor text` immediately below it on the same reading surface.
 states:
-- empty thread: `quiet` says `message · ctrl-enter sends`.
-- empty channel: `quiet` says `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`; the end can clip on a phone.
-- writing: the cursor and draft replace the hint; the mode word says `INS`.
-- after send: the box clears, the point returns to the messages, and the words on their way are marked in the history, not in the box.
-used on: built channel (`mail.Project`) and host thread (`mail.Thread`).
+- empty: the separator stays visible with a blank editor line below it.
+- writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
+- after send: the new mail is above the separator, marked while it is on its way; the tail is empty.
+used on: `mail.Thread` and the built channel (`mail.Project`).
 form:
 ```text
-message · ctrl-enter sends
+── reply to tide@lab · ctrl-enter / send
+Yes, use a separate clock.
 ```
 
 ## part Menu
@@ -229,4 +228,4 @@ when a `Row` in Home has a waiting card, then `Card's words` take the place of t
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.
 
 ## rule the menu leaves the work where it is
-when a `Menu` opens, then the `Row` or `Box` behind it keeps its point and the choices take the keys.
+when a `Menu` opens, then the `Row` or `Draft tail` behind it keeps its point and the choices take the keys.

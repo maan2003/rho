@@ -47,14 +47,14 @@ does:
 ## concept Thread
 purpose: keep one piece of work and the whole exchange about it together.
 principle: the user writes to `tide@lab` about a flaky test; the project asks about the test and later sends the result in the same thread, whatever agents did the work.
-sees: its subject and project; on a row, what waits or its `Status` if nothing waits; open, its mails in order, with history reached by scrolling and the status pinned above the reply box.
+sees: its subject and project; on a row, what waits or its `Status` if nothing waits; open, its mails in order, with history reached by scrolling and the status just above the draft separator.
 has:
 - many `Mail`
 - many `Thread`, each a tangent under a mail
-- one `Draft` in the reply box
+- one `Draft` at the end of the thread
 does:
 - open: from a `deal.Card`, land on the mail that asks; otherwise open the thread by subject
-- reply: write in the box and send with `Mail.reply`
+- reply: write at the end of the thread and send with `Mail.reply`
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
@@ -77,12 +77,15 @@ does:
 - update: the agents working in the thread set its status
 
 ## concept Draft
-status: a draft is kept on the device it was written on only.
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
-principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on another of their devices, they open the first thread, and the half-written answer is in its box.
-sees: the text in the thread's reply box, as it was left.
+principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still below the separator, even after a restart.
+sees: the unsent text below the separator, as it was left.
+does:
+- edit `i`, `A`, `o` at the tail, or tap the tail: write in place; `escape` returns to Normal with the cursor still in the draft
+- quote `enter` on a visual selection in a mail: add those lines to the draft with `> ` in front
+- send `ctrl-enter`, or `send` on the phone bar: move the words into the history and leave an empty draft
 
-A thread has one draft. Sending the mail ends that draft.
+A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
 status: the deal lands on the first waiting mail after the latest reply when there is one. An older unanswered mail still waits.
@@ -90,18 +93,19 @@ answers: what is this piece of work waiting for from the user?
 shows:
 - the asking `Mail` at the cursor when a `deal.Card` opens, with any quoted text or result proof
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words when it waits
-- other `Mail` in order, with history reached by scrolling
-- `Status` pinned immediately above the reply box and its `Draft`
+- other `Mail` in order, readable and copyable with the same motions and search as the `Draft`, but not editable
+- `Status`, then a quiet separator naming the recipient and send key, then the `Draft`, all in the same buffer
 - a `notes.Private reply` beside the mail it answers; tangents open as their own `Thread`, not folded into the main history
 states:
-- empty: the opening mail and the reply box; a thread begins with a mail
+- empty: the opening mail and a blank line below the separator; a thread begins with a mail
 - loading: the thread's mail is not yet available; wording not agreed
 - partial: only the available mail; wording not agreed
 - error: the thread is unavailable; wording not agreed
-- full: the asking mail in view, history above it, status above the reply box
+- full: the asking mail in view, with history and the draft tail reachable in the same buffer
 keys:
-- `i`: write the reply; `ctrl-enter`: send it
-- `space`: `deal.Verdict`
+- `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
+- visual selection then `enter`: `Draft.quote`
+- `space`: `deal.Verdict`, anywhere in Normal mode
 - `:`: `window.Palette`
 - `ctrl-k`, `tab`, `q`: `window.Screen`
 starts: `Answer a mail`, `agents.Look into the work`, `notes.Reply privately`
@@ -117,7 +121,8 @@ tide@lab · 09:52
 The mock clock is shared between tests. Is a separate clock per test enough?
 
 Running the tests with a separate clock
-reply
+── reply to tide@lab · ctrl-enter / send
+Yes, use a separate clock.
 ```
 
 ## flow Answer a mail
@@ -130,7 +135,7 @@ so that: the person or project that needs the user's words gets them, and the ma
 steps:
 1. the user reads the mail the deal opened
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
-2. the user writes an answer in the thread's reply box
+2. the user writes and edits an answer in the `Draft` at the tail of the thread
 3. the user sends the answer with `Mail.reply`; the reply settles the card
 system: opens the asking mail, keeps the `Draft` if the user leaves, and sends the reply to whoever wrote the mail.
 user: the words of the answer, or done when there are none.
