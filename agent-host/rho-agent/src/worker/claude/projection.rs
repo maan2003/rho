@@ -225,7 +225,7 @@ pub(super) fn results_row(
         let OutputContent::ToolResult {
             tool_use_id,
             content,
-            ..
+            is_error,
         } = content
         else {
             continue;
@@ -235,6 +235,7 @@ pub(super) fn results_row(
             results.push(CallResult {
                 call,
                 output: result_text(content)?,
+                failed: Some(is_error.unwrap_or(false)),
             });
         }
     }
@@ -344,6 +345,7 @@ mod tests {
             vec![CallResult {
                 call: ExecId::try_from("toolu_refused").unwrap(),
                 output: "boom".into(),
+                failed: Some(true),
             }]
         );
         let answered = user(json!({"role": "user", "content": [

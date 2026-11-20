@@ -29,7 +29,11 @@ gpui::actions!(
         ShellEof,
         ShellPagerMore,
         ShellPagerAll,
-        ShellPagerQuit
+        ShellPagerQuit,
+        ShellPrevious,
+        ShellNext,
+        ShellRecall,
+        ShellWrite
     ]
 );
 
@@ -55,6 +59,7 @@ pub struct ShellModel {
     host_prompt: String,
     display_prompt: String,
     shell_state: crate::protocol::ShellState,
+    recalled: Option<(u64, String)>,
     _read_task: gpui::Task<()>,
 }
 
@@ -128,6 +133,7 @@ impl ShellModel {
             submitting: false,
             host_prompt: "> ".to_owned(),
             display_prompt: "> ".to_owned(),
+            recalled: None,
             shell_state: crate::protocol::ShellState::default(),
             _read_task: read_task,
         }
@@ -200,6 +206,7 @@ impl ShellModel {
         }) {
             Ok(()) => {
                 self.submitting = true;
+                self.recalled = None;
                 self.input_buffer.update(cx, |buffer, cx| {
                     let len = buffer.len();
                     buffer.edit([(0..len, "")], None, cx);
@@ -238,6 +245,111 @@ impl ShellModel {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
         }
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn is_draft(&self, anchor: multi_buffer::Anchor, cx: &gpui::App) -> bool {
+        matches!(anchor, multi_buffer::Anchor::Max)
+            || anchor.buffer_id() == Some(self.input_buffer.read(cx).remote_id())
+    }
+
+    #[cfg(feature = "ui")]
+    fn replace_input(&self, text: &str, cx: &mut Context<Self>) {
+        self.input_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), text)], None, cx);
+        });
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn go_to_input(
+        &self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.input_end)
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn recall_step(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if self.exited || self.disconnected || self.submitting {
+            return;
+        }
+        let old = self.recalled.as_ref().map(|(id, _)| *id);
+        let executions =
+            visible_executions(&self.shell_state).filter(|execution| !execution.command.is_empty());
+        let target = if previous {
+            executions
+                .rev()
+                .find(|execution| old.is_none_or(|id| execution.execution < id))
+        } else {
+            let Some(old) = old else {
+                return;
+            };
+            executions
+                .into_iter()
+                .find(|execution| execution.execution > old)
+        };
+        if let Some(target) = target {
+            let command = target.command.clone();
+            let id = target.execution;
+            let draft = self
+                .recalled
+                .take()
+                .map(|(_, draft)| draft)
+                .unwrap_or_else(|| self.input_text(cx));
+            self.recalled = Some((id, draft));
+            self.replace_input(&command, cx);
+        } else if !previous && let Some((_, draft)) = self.recalled.take() {
+            self.replace_input(&draft, cx);
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn recall_at_cursor(
+        &mut self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.exited || self.disconnected || self.submitting {
+            return false;
+        }
+        use text::ToOffset as _;
+        let head = editor.read(cx).selections.newest_anchor().head();
+        let transcript = self.transcript_buffer.read(cx);
+        let offset = if matches!(head, multi_buffer::Anchor::Min) {
+            0
+        } else if head.buffer_id() == Some(transcript.remote_id()) {
+            head.text_anchor_in(&transcript.snapshot())
+                .to_offset(transcript)
+        } else {
+            return false;
+        };
+        let Some(execution) = command_at_offset(&self.shell_state, offset) else {
+            return false;
+        };
+        let command = execution.command.clone();
+        let id = execution.execution;
+        let draft = self
+            .recalled
+            .take()
+            .map(|(_, draft)| draft)
+            .unwrap_or_else(|| self.input_text(cx));
+        self.recalled = Some((id, draft));
+        self.replace_input(&command, cx);
+        true
     }
 
     pub fn interrupt(&mut self) {
@@ -468,13 +580,7 @@ impl ShellModel {
             0,
             &self.shell_state.terminal_output,
         );
-        for execution in &self.shell_state.executions {
-            if matches!(
-                execution.state,
-                crate::protocol::ShellExecutionState::Queued
-            ) {
-                continue;
-            }
+        for execution in visible_executions(&self.shell_state) {
             let prompt_start = transcript.len();
             transcript.push_str(&execution.prompt);
             styles.push((StyleClass::ShellPrompt, prompt_start..transcript.len()));
@@ -847,6 +953,36 @@ fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle
     }
 }
 
+/// A queued command has no row yet and cannot be selected or recalled.
+fn visible_executions(
+    shell: &crate::protocol::ShellState,
+) -> impl DoubleEndedIterator<Item = &crate::protocol::ShellExecution> {
+    shell.executions.iter().filter(|execution| {
+        !matches!(
+            execution.state,
+            crate::protocol::ShellExecutionState::Queued
+        )
+    })
+}
+
+#[cfg(feature = "ui")]
+fn command_at_offset(
+    shell: &crate::protocol::ShellState,
+    offset: usize,
+) -> Option<&crate::protocol::ShellExecution> {
+    let mut start = shell.terminal_output.len();
+    for execution in visible_executions(shell) {
+        let end = start + execution.prompt.len() + execution.command.len();
+        if !execution.command.is_empty() && (start..=end).contains(&offset) {
+            return Some(execution);
+        }
+        // A command always ends in a newline; its output need not. The
+        // last bytes of output can share a row with a later command.
+        start = end + 1 + execution.output.len();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +992,42 @@ mod tests {
             foreground: Some(ShellColor::Indexed(index)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recall_targets_command_not_output_even_on_the_same_row() {
+        use crate::protocol::{ShellExecution, ShellExecutionState, ShellState};
+        let execution = |execution, command: &str, output: &str, state| ShellExecution {
+            execution,
+            command: command.to_owned(),
+            prompt: "> ".into(),
+            cwd: "/src".into(),
+            output: output.to_owned(),
+            styles: Vec::new(),
+            state,
+        };
+        let shell = ShellState {
+            terminal_output: "λ\n".into(),
+            executions: [
+                execution(
+                    4,
+                    "show",
+                    "done",
+                    ShellExecutionState::Finished { status: 0 },
+                ),
+                execution(7, "queued", "", ShellExecutionState::Queued),
+                execution(12, "again", "", ShellExecutionState::Running),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // The projection is `λ\n> show\ndone> again\n`.
+        for offset in [0, 10, 13] {
+            assert!(command_at_offset(&shell, offset).is_none());
+        }
+        assert_eq!(command_at_offset(&shell, 5).unwrap().execution, 4);
+        assert_eq!(command_at_offset(&shell, 14).unwrap().execution, 12);
     }
 
     #[test]

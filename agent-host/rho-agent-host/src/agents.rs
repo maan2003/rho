@@ -566,7 +566,12 @@ where
         }
         Request::Cancel(call) => {
             respond(writer, call, |Cancel { agent }| async move {
-                services.pool.cancel(agent).await
+                use rho_agents_client::protocol::worksets::CancelResult;
+                Ok(if services.pool.cancel(agent).await? {
+                    CancelResult::WasAsking
+                } else {
+                    CancelResult::NoRequest
+                })
             })
             .await
         }
@@ -1143,6 +1148,7 @@ mod tests {
                         answers: true,
                         compaction: false,
                         timing: None,
+                        output: String::new(),
                         at: UnixMs(1),
                     }
                 ),

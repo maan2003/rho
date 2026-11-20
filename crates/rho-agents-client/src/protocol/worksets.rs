@@ -39,7 +39,7 @@ rho_rpc::calls! {
         Eval(Eval) -> EvalResult;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
-        Cancel(Cancel) -> ();
+        Cancel(Cancel) -> CancelResult;
         /// End everything in the agent's shared workset, replace its worker
         /// with the host's current build, and reload the agent.
         RestartWorkset(RestartWorkset) -> ();
@@ -114,6 +114,12 @@ pub struct CreatedWorkset {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Cancel {
     pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum CancelResult {
+    WasAsking,
+    NoRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -285,6 +291,9 @@ pub enum LogEvent {
         compaction: bool,
         /// How the call it answers went.
         timing: Option<rho_agent_types::CallTiming>,
+        /// Text the notebook reported for the call it answers.
+        #[senax(default)]
+        output: String,
         at: UnixMs,
     },
     /// The cell of the agent's call ended, whether or not a request answers it.
@@ -296,7 +305,7 @@ pub enum LogEvent {
     /// Claude Code says these calls came back, with no request to answer them.
     CallsEnded {
         agent: AgentId,
-        calls: Vec<String>,
+        calls: Vec<CallView>,
         at: UnixMs,
     },
     Replied {
@@ -336,6 +345,18 @@ pub enum LogEvent {
         agent: AgentId,
         at: UnixMs,
     },
+    MailWritten {
+        agent: AgentId,
+        message: MessageId,
+        at: UnixMs,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CallView {
+    pub id: String,
+    pub output: String,
+    pub failed: Option<bool>,
 }
 
 impl LogEvent {
@@ -354,7 +375,8 @@ impl LogEvent {
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
             | Self::Cancelled { at, .. }
-            | Self::ClaudeMessage { at, .. } => *at,
+            | Self::ClaudeMessage { at, .. }
+            | Self::MailWritten { at, .. } => *at,
         }
     }
 
@@ -373,7 +395,8 @@ impl LogEvent {
             | Self::Failed { agent, .. }
             | Self::Stopped { agent, .. }
             | Self::Cancelled { agent, .. }
-            | Self::ClaudeMessage { agent, .. } => Some(*agent),
+            | Self::ClaudeMessage { agent, .. }
+            | Self::MailWritten { agent, .. } => Some(*agent),
         }
     }
 }
@@ -422,6 +445,7 @@ mod tests {
                     answers: true,
                     compaction: false,
                     timing: None,
+                    output: "printed line".into(),
                     at: UnixMs(7),
                 },
             )],

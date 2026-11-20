@@ -38,13 +38,13 @@ has:
 - many `Desktop`
 - many `mail.Thread`, the one it started from first
 does:
-- open: from the `mail.Thread` one level down, as in `Look into the work`; its screen, `Agent`, opens at its newest step
+- open `enter` or a tap on a mail header: from the `mail.Thread` one level down, at the step that wrote the mail as it now reads; when opened by name, a failed agent opens on its last error
 - open its thread, from the palette as `open its thread`: open the thread it started from
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
-- compact context, from the palette: shorten what it holds in mind
-- new cache key, from the palette: make it start its model's cache afresh
-- set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent.
-- cancel the request, from the palette: stop what it is asking its model now
+- compact context, from the palette: shorten what it holds in mind; the echo reads `compacted: eng-rb89`
+- new cache key, from the palette: make it start its model's cache afresh; the echo reads `new cache key: eng-rb89`
+- set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent. The echo line confirms the switch.
+- cancel the request, from the palette: stop what it is asking its model now; the echo reads `cancelled: eng-rb89` or `not cancelled: eng-rb89 · it was not asking its model` when there was no request
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.
 
@@ -65,10 +65,10 @@ does:
 - type: every key goes to the terminal, `ctrl-j` and `ctrl-k` too
 - paste `ctrl-shift-v`: type what is on the clipboard
 - palette `ctrl-shift-;`: open the palette while typing, as from any place; see `window.Palette`
-- read `ctrl-shift-n`, or `ctrl-\` then `ctrl-n`: stop typing, to scroll with `j`, `k`, `ctrl-d`, `ctrl-u`, `g g`, and `shift-g`, and to use `:`, `space`, `tab`, and `q`; `i`, `a`, or `enter` returns to typing
+- read `ctrl-shift-n`, or `ctrl-\` then `ctrl-n`: stop typing, to scroll with `j`, `k`, `ctrl-d`, `ctrl-u`, `g g`, and `shift-g`, and to use `:`, `space`, `tab`, and `q`; `/`, `?`, `n`, `N` search and `y` copies as in other text; only `i` or `a` returns to typing
 - scroll with the wheel: move back through old lines, or, when the program in the terminal asks for the wheel, send it the wheel
 
-Closing a terminal's screen leaves the terminal running on the host. While it connects, the screen reads `connecting to term 0 of …`, and `q` still closes it. A terminal open on two devices is the same terminal; it takes the size of the window the user types in.
+On the phone, the terminal bar has `esc`, `ctrl`, `tab`, and the four arrows while typing; `ctrl` modifies the next key. Closing a terminal's screen leaves the terminal running on the host. While it connects, the screen reads `connecting to term 0 of …`, and `q` still closes it. A terminal open on two devices is the same terminal; it takes the size of the window the user types in.
 
 ## concept Shell
 purpose: give the user one line-at-a-time shell beside an agent, with its output as text they can search.
@@ -77,13 +77,14 @@ sees: at the top, the agent's name and `shell`; every command run so far, with i
 does:
 - shell, from the palette on any of the agent's screens: open the agent's shell, starting it when none runs
 - write `i`: type the next command; `escape` goes back to the output
+- recall `up` or `ctrl-p`, `down` or `ctrl-n` while typing: put the previous or next command on the input line; `enter` on an earlier command recalls that command without running it
 - run `enter`, while typing: run the line; the prompt reads `[sending] ` until the host has it
 - interrupt `ctrl-c`, while typing: stop the command that runs
 - end input `ctrl-d`, while typing on an empty line: tell the command there is no more input
 - more `alt-enter`, all `alt-a`, stop `alt-q`: answer a long output that the shell holds back, which says `[pager … paused on page … — Alt-Enter more · Alt-A all · Alt-Q stop]`
 - close shell, from the palette on the shell: end the shell on the host; the echo line reads `shell closed`
 
-Closing the shell's screen leaves the shell running on the host. The agent has one shell, the same on every device. When the shell ends, the prompt reads `[shell exited 0] `; when the host drops, it reads `[shell disconnected] `, and a line that did not reach the host goes back into the line being typed.
+On the phone, tap the prompt or `write` to type, then `run` or `cancel` to stop typing. Closing the shell's screen leaves the shell running on the host. The agent has one shell, the same on every device. When the shell ends, the prompt reads `[shell exited 0] `; when the host drops, it reads `[shell disconnected] `, and a line that did not reach the host goes back into the line being typed.
 
 ## concept Desktop
 purpose: let the user see and use a graphical app that an agent runs, such as a browser or the rho window itself.
@@ -91,18 +92,40 @@ principle: an agent runs the window it is testing on a desktop of its own; the u
 sees: the app, live, scaled to fit the window; at the top, the agent's name, `desktop`, and the desktop's name; `connecting to desktop … of …` while it opens; while drawing, a line along the bottom with `DRAW`, `u undo`, `y copy`, and `esc live`.
 does:
 - desktop…, from the palette on any of the agent's screens: open the agent's desktop, or, with more than one, ask `desktop:` and open the one chosen; the row shows only when the agent runs one
-- every key, click, and wheel: goes to the app on the desktop
+- verdict `space`: open `deal.Verdict` on the agent's thread without leaving the desktop
+- other keys, clicks, and wheel: go to the app on the desktop
 - palette `ctrl-shift-;`: open the palette without the app seeing the keys; see `window.Palette`
 - draw on this frame, from the palette: hold the picture still; dragging draws red lines on it
 - undo `u`, while drawing: take back the last line
 - copy `y`, while drawing: put the picture, with its lines, on the clipboard; the bottom line reads `Annotation copied`
 - back to live `escape` or `ctrl-g`, while drawing, or `back to live` from the palette: drop the lines and show the app live again
 
-A desktop is also a place in `window.Palette`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
+A desktop of a known agent on an attached host is also a place in `window.Palette`, as the agent's name and `desktop` and its name. Only a host reached over the network shows a desktop. From a host on this machine, the screen says that the live view needs a host reached over the network. When the window loses the keyboard, every key and button held on the desktop is let go.
 
 ## screen Agent
-shows: `Agent`, its transcript
+answers: what went wrong, on what brief?
+shows:
+- in the `window.Status line`, the agent, its host and folder, what it is doing, and how many errors it hit
+- the brief first, then the transcript in order: commands in the user's words, with their output folded except on errors
+keys:
+- `]e`, `[e`: the next or previous error
+- `enter`: open or fold the command's output
+- `space`: `deal.Verdict` on the agent's thread; the transcript stays open
+- `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`
+mock:
+```text
+lab › eng-boqk · /src/clock                     failed · 1 error     NOR
+
+brief
+Fix the clock test that fails one run in five.
+
+$ git status · ok 15ms …
+$ cargo test clock · error 1s
+  src/clock.rs:42:5: clock_ticks failed 1 of 5 runs
+  cargo exited 101
+wrote to you: Could you clarify which clock to use? · ok 10ms …
+```
 
 ## flow Look into the work
 runs: 15 a day
@@ -112,7 +135,8 @@ want: see what actually happened without making agent activity part of the threa
 so that: the user can trust the result or understand where the work is stuck
 steps:
 1. the user opens the work's `mail.Thread`
-2. the user goes one level down to the `Agent` transcript
+2. the user presses `enter` on the mail or taps its header to go one level down to the `Agent` transcript
+   - away from an agent's mail, `look into the work` asks which agent, newest first and with its runtime
 3. the user reads what the agent ran and what came back
 4. the user goes back to the thread with `window.Screen.back`
 system: keeps the transcript with the work it explains.

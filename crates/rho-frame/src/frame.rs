@@ -124,10 +124,12 @@ impl Frame {
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let desk_editor = desk.read(cx).editor(cx).expect("Desk is an editor");
         let desk_selection = cx.subscribe(&desk_editor, |frame, _, event, cx| {
-            if frame.desk_in_view()
-                && matches!(event, editor::EditorEvent::SelectionsChanged { .. })
-            {
-                cx.notify();
+            if frame.desk_in_view() {
+                match event {
+                    editor::EditorEvent::SelectionsChanged { .. } => cx.notify(),
+                    editor::EditorEvent::ScrollPositionChanged { .. } => frame.systems_changed(cx),
+                    _ => {}
+                }
             }
         });
         let desk_address = Self::desk_address();
@@ -527,6 +529,7 @@ impl Frame {
         let handle = self.current_surface().focus_handle(cx);
         window.focus(&handle, cx);
         self.report_active_surface(window, cx);
+        self.systems_changed(cx);
     }
 
     fn report_active_surface(&self, window: &Window, cx: &mut Context<Self>) {
@@ -982,6 +985,16 @@ impl Frame {
             self.toggle_desk(window, cx);
             return;
         }
+        let inspecting = self.current_surface().inspects_card();
+        let target = self.card_target(cx);
+        if inspecting
+            && !target
+                .as_ref()
+                .is_some_and(|target| self.hand().cards.iter().any(|card| &card.address == target))
+        {
+            self.echo("nothing waits here", StyleClass::SystemInfo, cx);
+            return;
+        }
         self.open_menu(
             self.verdict_rows(Layout::of(window.viewport_size().width), cx),
             window,
@@ -990,7 +1003,10 @@ impl Frame {
     }
 
     fn verdict_rows(&self, layout: Layout, cx: &App) -> Rows {
-        let Some(target) = self.card_target(cx) else {
+        let inspecting = self.current_surface().inspects_card();
+        let Some(target) = self.card_target(cx).filter(|target| {
+            !inspecting || self.hand().cards.iter().any(|card| &card.address == target)
+        }) else {
             // With no card here there is nothing to judge, but the deal
             // still goes on: `n` is how the user asks what waits.
             let mut rows = Rows::new("no card here").counted();
@@ -998,7 +1014,12 @@ impl Frame {
             return rows;
         };
         let card = self.card_for(&target, cx);
-        let mut rows = Rows::new(card.heading()).counted();
+        let mut rows = Rows::new(if inspecting {
+            card.title.clone()
+        } else {
+            card.heading()
+        })
+        .counted();
         rows.extend(verdict_rows(target.clone()));
         rows.push(Row::menu(
             "s",
@@ -1275,9 +1296,21 @@ impl Frame {
                     .child(div().text_color(status.warning).child(label))
                     .into_any_element()
             }
-            (None, None) => div()
-                .child(fit(&surface.title(cx), "").0)
-                .into_any_element(),
+            (None, None) => {
+                let status = surface.status(cx).unwrap_or_default();
+                let title = match layout {
+                    Layout::Desktop => surface.title(cx),
+                    Layout::Phone => surface.phone_title(cx),
+                };
+                let (title, status) = fit(&title, &status);
+                div()
+                    .flex()
+                    .gap_3()
+                    .min_w_0()
+                    .child(div().truncate().child(title))
+                    .children((!status.is_empty()).then(|| div().flex_none().child(status)))
+                    .into_any_element()
+            }
         };
         // A host that is away outranks the notice, which is cut first when
         // the line is short.
@@ -1330,7 +1363,7 @@ impl Frame {
 
     /// The mode the keys are in. The minibuffer and global idea strip
     /// always type; the mode indicator follows the active surface editor.
-    fn mode(&self, window: &Window, cx: &App) -> String {
+    pub(crate) fn mode(&self, window: &Window, cx: &App) -> String {
         let idea = self.idea_editor();
         if idea
             .as_ref()
@@ -1577,7 +1610,7 @@ impl Render for Frame {
             .child(self.render_status_line(&text_style, layout, window, cx));
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
-            let bar = self.render_phone_bar(cx);
+            let bar = self.render_phone_bar(window, cx);
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
                 .child(body)

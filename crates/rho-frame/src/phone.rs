@@ -53,6 +53,26 @@ impl Layout {
     }
 }
 
+/// Hit-test a phone editor against its painted layout. Capture this press
+/// before the editor handles selection. The platform synthesizes a mouse
+/// press for a recognized touch tap, not for a pan.
+pub fn phone_editor_tap(
+    editor: &editor::Editor,
+    event: &gpui::MouseDownEvent,
+    window: &Window,
+) -> Option<multi_buffer::Anchor> {
+    if Layout::of(window.viewport_size().width) != Layout::Phone
+        || event.button != MouseButton::Left
+        || event.click_count != 1
+        || event.modifiers.modified()
+    {
+        return None;
+    }
+    editor
+        .buffer_location_for_window_position(event.position, text::Bias::Left)
+        .map(|(anchor, _, _)| anchor)
+}
+
 /// A heading and its state in `width`: the state is what the reader acts
 /// on, so it is kept and the heading is cut at a word. A state wider than
 /// the line, one that says why at length, takes the line and is cut at a
@@ -557,14 +577,27 @@ impl Frame {
     }
 
     /// The bar along the bottom edge.
-    pub(crate) fn render_phone_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let send = self.current_surface().clone().phone_send(cx);
-        let desk = self.desk_in_view();
+    pub(crate) fn render_phone_bar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let surface = self.current_surface().clone();
+        let send = surface.phone_send(cx);
+        let prompting = self.minibuffer.is_some();
+        let composing_idea = self.idea_here(cx);
+        let tools = if prompting || composing_idea {
+            Vec::new()
+        } else {
+            surface.phone_tools(self.mode(window, cx).contains("insert"), cx)
+        };
         let state = BarState {
-            prompting: self.minibuffer.is_some(),
-            composing_idea: self.idea_here(cx),
-            desk,
-            card: self.phone_card(cx).is_some(),
+            prompting,
+            composing_idea,
+            desk: self.desk_in_view(),
+            // Working in a terminal or shell keeps the navigation bar and
+            // its Palette; that still offers the same related verdicts.
+            card: tools.is_empty() && self.phone_card(cx).is_some(),
             send: send.is_some(),
         };
         let colors = cx.theme().colors();
@@ -589,6 +622,33 @@ impl Frame {
                     cx.stop_propagation();
                 }))
         });
+        let tools = tools.into_iter().map(|tool| {
+            let color = if tool.active {
+                colors.text_accent
+            } else {
+                colors.text_muted
+            };
+            div()
+                .id(tool.label)
+                .cursor_pointer()
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .text_color(color)
+                .child(div().text_size(px(18.)).child(tool.icon))
+                .child(div().text_size(px(11.)).child(tool.label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.phone.snap.is_none() {
+                        tool.press(window, cx);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+        });
         div()
             .id("rho-phone-bar")
             .flex_none()
@@ -598,7 +658,7 @@ impl Frame {
             .items_stretch()
             .border_t_1()
             .border_color(colors.border_variant)
-            .children(items)
+            .children(items.chain(tools))
             .into_any_element()
     }
 

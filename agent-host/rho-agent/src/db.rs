@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "b5082aa5";
+const CURRENT_AGENT_DB_FORMAT: &str = "d8e4c62f";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
@@ -62,7 +62,9 @@ const MIGRATIONS: &[Migration] = &[
     ("e41b7c2a", "a8f02c31", crate::store::migrate_mail),
     // Old postings retain their encoding; only the new Direct kind needs
     // the newer reader.
-    ("a8f02c31", CURRENT_AGENT_DB_FORMAT, |_| {}),
+    ("a8f02c31", "b5082aa5", |_| {}),
+    // Existing rows decode unchanged. An old host cannot decode MailWritten.
+    ("b5082aa5", CURRENT_AGENT_DB_FORMAT, |_| {}),
 ];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
@@ -638,7 +640,14 @@ mod tests {
             .map(|(_, hop)| hop.unwrap())
             .collect();
         hops.sort();
-        assert_eq!(hops, ["a8f02c31->b5082aa5", "e41b7c2a->a8f02c31"]);
+        assert_eq!(
+            hops,
+            [
+                "a8f02c31->b5082aa5",
+                "b5082aa5->d8e4c62f",
+                "e41b7c2a->a8f02c31"
+            ]
+        );
     }
 
     /// A savepoint recorded for a hop this build does not know goes when

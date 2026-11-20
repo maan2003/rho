@@ -50,10 +50,10 @@ pub use keys::normal_contexts;
 pub use link::FrameLink;
 pub use menu::{Row, Rows};
 pub use minibuffer::{CancelHandler, Candidate, CandidateSource, SubmitHandler};
-pub use phone::Layout;
+pub use phone::{Layout, phone_editor_tap};
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
-pub use surface::{AnySurface, Mode, Subject, Surface};
+pub use surface::{AnySurface, Mode, PhoneTool, Subject, Surface};
 pub use system::{AnySystem, Found, FoundThread, System};
 
 /// The key context every surface is drawn in. A system binds its keys

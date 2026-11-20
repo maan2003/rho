@@ -1219,7 +1219,8 @@ impl ClaudeLoop {
             ":rewind is only available while idle or errored; use :cancel first"
         );
         let rows = self.host.history().await?;
-        let (to, sent) = rewind_point(&rows, turns).context("nothing to rewind")?;
+        let (to, sent) =
+            rewind_point(&rows, turns).context("no recorded model turn can be rewound")?;
         let root = self.root.clone();
         let (source_session_id, messages) = if self.pending_rewind {
             match self.start_mode {
@@ -2229,25 +2230,24 @@ enum ClaudeLoopEvent {
 }
 
 /// Where a rewind of `turns` goes: the position of the `turns`-th last
-/// request that carried a person's input (the first one, when there are
-/// fewer), and the session lines handed over from there on, oldest first.
-/// `None` with no person's input to go back to.
+/// request handed over as a new Claude turn. A request that only answers
+/// a pending call has no session line and cannot start another turn.
 fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uuid>)> {
-    let people: Vec<usize> = rows
+    let handed_off: Vec<_> = rows
         .iter()
-        .enumerate()
-        .filter(|(_, (_, record))| record.event.carries_a_person())
-        .map(|(index, _)| index)
-        .collect();
-    let index = *people.get(people.len().saturating_sub(turns as usize))?;
-    let sent = rows[index..]
-        .iter()
-        .filter_map(|(_, record)| match &record.event {
-            Event::Request { turn, .. } => *turn,
+        .filter_map(|(pos, record)| match &record.event {
+            Event::Request {
+                turn: Some(turn), ..
+            } => Some((*pos, *turn)),
             _ => None,
         })
         .collect();
-    Some((rows[index].0, sent))
+    let index = handed_off.len().saturating_sub(turns as usize);
+    let (pos, _) = *handed_off.get(index)?;
+    Some((
+        pos,
+        handed_off[index..].iter().map(|(_, turn)| *turn).collect(),
+    ))
 }
 
 /// Where a session forked to forget the user message `uuid` and all after
@@ -2638,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rewind_counts_only_peoples_inputs_and_lists_the_turns_from_there() {
+    fn a_rewind_follows_session_handoffs_not_the_input_role() {
         let a = agent(1);
         let (first, message, second, third) = (
             Uuid::new_v4(),
@@ -2657,14 +2657,14 @@ mod tests {
         assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), vec![second, third])));
         assert_eq!(
             rewind_point(&rows, 3),
-            Some((Wpos(1), vec![first, message, second, third]))
+            Some((Wpos(3), vec![message, second, third]))
         );
         assert_eq!(
             rewind_point(&rows, 9),
-            rewind_point(&rows, 3),
+            Some((Wpos(1), vec![first, message, second, third])),
             "more turns than there are go back to the first"
         );
-        assert_eq!(rewind_point(&rows[1..3], 1), None);
+        assert_eq!(rewind_point(&rows[2..3], 1), None);
     }
 
     #[test]

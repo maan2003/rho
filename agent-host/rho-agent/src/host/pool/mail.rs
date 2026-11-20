@@ -10,8 +10,8 @@ use rho_agent_types::{
 use tokio::sync::watch;
 
 use super::AgentPool;
-use crate::record::Event;
-use crate::store::{MailRead as _, MailWrite as _, StoreRead as _};
+use crate::record::{Event, Record};
+use crate::store::{MailRead as _, MailWrite as _, StoreRead as _, StoreWrite as _};
 use crate::{InferenceState, RuntimeState};
 
 const COLD_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -400,18 +400,20 @@ async fn send_stop(
     reason: String,
 ) {
     let Some(pool) = weak.upgrade() else { return };
-    let (thread, body) = {
+    let (workset, thread, body) = {
         let read = pool.db.read();
+        let Some(head) = read.agent(agent) else {
+            return;
+        };
         let thread = read
             .first_thread(agent)
             .or_else(|| origin(&read, agent).map(|mail| read.mail_thread(&mail)));
         let Some(thread) = thread else { return };
-        let failed_to_start = read
-            .agent(agent)
-            .and_then(|head| head.startup_failure)
+        let failed_to_start = head
+            .startup_failure
             .is_some_and(|failure| failure.since == doing.since);
         let body = stop_body(&read, agent, stop, &reason, failed_to_start);
-        (thread, body)
+        (head.workset, thread, body)
     };
     let mut write = pool.db.write().await;
     let sender = Address::System {
@@ -419,7 +421,22 @@ async fn send_stop(
         stop,
         since: doing.since,
     };
-    match write.post_stop(UnixMs::now(), thread, sender, body) {
+    let at = UnixMs::now();
+    let result = write
+        .post_stop(at, thread, sender, body)
+        .and_then(|message| {
+            if let Some(message) = message {
+                write.append(
+                    workset,
+                    &Record {
+                        at,
+                        event: Event::MailWritten { agent, message },
+                    },
+                )?;
+            }
+            Ok(message)
+        });
+    match result {
         Ok(Some(_)) => write.commit(),
         Ok(None) => {}
         Err(error) => eprintln!("rho-agent: post stop of {}: {error:#}", agent.encoded()),

@@ -23,17 +23,7 @@ use crate::protocol::{
 
 gpui::actions!(
     rho_terminal,
-    [
-        TerminalPaste,
-        TerminalNormalMode,
-        TerminalRawMode,
-        TerminalScrollLineUp,
-        TerminalScrollLineDown,
-        TerminalScrollHalfPageUp,
-        TerminalScrollHalfPageDown,
-        TerminalScrollTop,
-        TerminalScrollBottom,
-    ]
+    [TerminalPaste, TerminalNormalMode, TerminalRawMode,]
 );
 
 /// Client-side scrollback retention; the agent host replays up to its own cap.
@@ -115,13 +105,11 @@ impl TerminalModel {
 pub struct TerminalView {
     model: Entity<TerminalModel>,
     focus_handle: FocusHandle,
-    /// Raw mode forwards keystrokes to the pty; normal mode releases the
-    /// keyboard to rho bindings.
-    raw: bool,
     /// Whole lines scrolled up into history; 0 pins to the live screen.
     scroll_offset: usize,
     /// `history_appended` as of the last observe, for offset preservation.
     seen_history: u64,
+    phone_ctrl: Rc<Cell<bool>>,
     /// One terminal line in pixels, for wheel-delta conversion.
     line_height_px: Rc<Cell<f32>>,
     /// Paint-time cell geometry for mouse-report coordinates.
@@ -131,7 +119,11 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(model: Entity<TerminalModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Entity<TerminalModel>,
+        phone_ctrl: Rc<Cell<bool>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let seen_history = model.read(cx).history_appended;
         let model_changed = cx.observe(&model, |view, model, cx| {
             let (appended, limit) = {
@@ -149,9 +141,9 @@ impl TerminalView {
         Self {
             model,
             focus_handle: cx.focus_handle(),
-            raw: true,
             scroll_offset: 0,
             seen_history,
+            phone_ctrl,
             line_height_px: Rc::new(Cell::new(16.0)),
             cell_width_px: Rc::new(Cell::new(8.0)),
             grid_origin_px: Rc::new(Cell::new((0.0, 0.0))),
@@ -160,16 +152,13 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.raw {
-            return;
-        }
         let ks = &event.keystroke;
         if ks.modifiers.platform {
             return;
         }
         let keystroke = TermKeystroke {
             key: ks.key.clone(),
-            ctrl: ks.modifiers.control,
+            ctrl: ks.modifiers.control | self.phone_ctrl.replace(false),
             alt: ks.modifiers.alt,
             shift: ks.modifiers.shift,
             key_char: ks.key_char.clone(),
@@ -195,27 +184,6 @@ impl TerminalView {
         }
     }
 
-    fn enter_normal_mode(
-        &mut self,
-        _: &crate::TerminalNormalMode,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.raw = false;
-        cx.notify();
-    }
-
-    fn enter_raw_mode(
-        &mut self,
-        _: &crate::TerminalRawMode,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.raw = true;
-        self.scroll_offset = 0;
-        cx.notify();
-    }
-
     fn scroll_lines(&mut self, delta: isize, cx: &mut Context<Self>) {
         let limit = self.model.read(cx).screen.scrollback.len() as isize;
         let offset = (self.scroll_offset as isize + delta).clamp(0, limit) as usize;
@@ -225,22 +193,44 @@ impl TerminalView {
         }
     }
 
-    /// Whether the keys are typed into the terminal, rather than moving
-    /// through it; the status line's mode word says which.
-    pub fn is_raw(&self) -> bool {
-        self.raw
+    #[cfg(feature = "ui")]
+    pub(crate) fn reading_text(&self, cx: &gpui::App) -> (String, usize) {
+        let screen = &self.model.read(cx).screen;
+        let physical = screen
+            .scrollback
+            .iter()
+            .map(|item| match item {
+                ScrollbackItem::Line(row) => reading_row(row),
+                ScrollbackItem::Gap(lost) => (format!("· · · {lost} lines lost · · ·"), false),
+            })
+            .chain(screen.rows.iter().map(reading_row))
+            .collect::<Vec<_>>();
+        join_reading_rows(physical, self.scroll_offset)
     }
 
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+    #[cfg(feature = "ui")]
+    pub(crate) fn show_live(&mut self, cx: &mut Context<Self>) {
+        self.scroll_offset = 0;
+        cx.notify();
     }
 
     pub fn model(&self) -> &Entity<TerminalModel> {
         &self.model
     }
 
-    fn half_page(&self, cx: &Context<Self>) -> isize {
-        (self.model.read(cx).screen.rows.len() as isize / 2).max(1)
+    #[cfg(feature = "ui")]
+    pub(crate) fn phone_key(&mut self, key: &str, ctrl: bool, cx: &mut Context<Self>) {
+        self.scroll_offset = 0;
+        self.model
+            .read(cx)
+            .send(TermClientFrame::Keystroke(TermKeystroke {
+                key: key.to_owned(),
+                key_char: None,
+                ctrl,
+                alt: false,
+                shift: false,
+            }));
+        cx.notify();
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -257,7 +247,7 @@ impl TerminalView {
                 model.screen.rows.len(),
             )
         };
-        if self.raw && application_scroll && lines != 0 {
+        if application_scroll && lines != 0 {
             let (origin_x, origin_y) = self.grid_origin_px.get();
             let col = ((f32::from(event.position.x) - origin_x) / self.cell_width_px.get().max(1.0))
                 .floor()
@@ -400,7 +390,7 @@ impl Render for TerminalView {
             rows.push(match line {
                 VisibleLine::Row { row, cursor } => {
                     let cursor = if focused { cursor } else { None };
-                    row_element(row, cursor, self.raw, &text_style, &palette)
+                    row_element(row, cursor, &text_style, &palette)
                 }
                 VisibleLine::Gap(lost) => div()
                     .h(line_height)
@@ -423,38 +413,8 @@ impl Render for TerminalView {
         div()
             .id("rho-terminal")
             .track_focus(&self.focus_handle)
-            .key_context(if self.raw {
-                "RhoTerminal"
-            } else {
-                "RhoTerminalNormal"
-            })
+            .key_context("RhoTerminal")
             .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::enter_normal_mode))
-            .on_action(cx.listener(Self::enter_raw_mode))
-            .on_action(
-                cx.listener(|this, _: &crate::TerminalScrollLineDown, _, cx| {
-                    this.scroll_lines(-1, cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollLineUp, _, cx| {
-                this.scroll_lines(1, cx);
-            }))
-            .on_action(
-                cx.listener(|this, _: &crate::TerminalScrollHalfPageDown, _, cx| {
-                    this.scroll_lines(-this.half_page(cx), cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::TerminalScrollHalfPageUp, _, cx| {
-                    this.scroll_lines(this.half_page(cx), cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollTop, _, cx| {
-                this.scroll_lines(isize::MAX / 2, cx);
-            }))
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollBottom, _, cx| {
-                this.scroll_lines(isize::MIN / 2, cx);
-            }))
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .size_full()
@@ -663,19 +623,63 @@ fn cell_highlight(cell: &TermCell, palette: &Palette<'_>) -> HighlightStyle {
     style
 }
 
+#[cfg(feature = "ui")]
+fn reading_row(row: &TermRow) -> (String, bool) {
+    let wrapped = row
+        .cells
+        .last()
+        .is_some_and(|cell| cell.flags & TermCellFlags::WRAPLINE != 0);
+    let mut text = String::new();
+    for cell in &row.cells {
+        if cell.flags & TermCellFlags::WIDE_SPACER != 0 {
+            continue;
+        }
+        if cell.flags & TermCellFlags::HIDDEN != 0 {
+            text.push(' ');
+        } else {
+            text.push(cell.c);
+            if let Some(extra) = &cell.extra {
+                text.push_str(extra);
+            }
+        }
+    }
+    if !wrapped {
+        text.truncate(text.trim_end().len());
+    }
+    (text, wrapped)
+}
+
+#[cfg(feature = "ui")]
+fn join_reading_rows(physical: Vec<(String, bool)>, scroll_offset: usize) -> (String, usize) {
+    let target = physical.len().saturating_sub(1 + scroll_offset);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut row = 0;
+    for (index, (part, wrapped)) in physical.into_iter().enumerate() {
+        if index == target {
+            row = lines.len();
+        }
+        line.push_str(&part);
+        if !wrapped {
+            lines.push(std::mem::take(&mut line));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    (lines.join("\n"), row.min(lines.len().saturating_sub(1)))
+}
+
 fn row_element(
     row: &TermRow,
     cursor_col: Option<u16>,
-    raw: bool,
     text_style: &TextStyle,
     palette: &Palette<'_>,
 ) -> AnyElement {
-    // Normal mode dims the cursor: the keyboard is rho's, not the pty's.
-    let cursor_bg = if raw {
-        palette.foreground
-    } else {
-        palette.foreground.opacity(0.5)
-    };
+    let cursor_bg = palette.foreground;
     let mut text = String::new();
     let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut push_run = |range: Range<usize>, style: HighlightStyle| match runs.last_mut() {
@@ -762,6 +766,42 @@ fn probably_produces_bytes(ks: &TermKeystroke) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn terminal_reading_preserves_characters_and_joins_soft_wraps() {
+        let cell = |c, extra: Option<&str>, flags| TermCell {
+            c,
+            extra: extra.map(str::to_owned),
+            flags,
+            ..Default::default()
+        };
+        let first = TermRow {
+            cells: vec![
+                cell('猫', Some("\u{20dd}"), TermCellFlags::WIDE),
+                cell(' ', None, TermCellFlags::WIDE_SPACER),
+                cell(' ', None, TermCellFlags::WRAPLINE),
+            ],
+        };
+        let second = TermRow {
+            cells: vec![
+                cell('a', None, 0),
+                cell('x', None, TermCellFlags::HIDDEN),
+                cell('b', None, 0),
+                cell(' ', None, 0),
+            ],
+        };
+        let physical = vec![
+            ("older".into(), false),
+            reading_row(&first),
+            reading_row(&second),
+            ("".into(), false),
+        ];
+        assert_eq!(
+            join_reading_rows(physical, 2),
+            ("older\n猫\u{20dd} a b".into(), 1)
+        );
+    }
 
     fn rgba(red: f32, green: f32, blue: f32) -> gpui::Rgba {
         gpui::Rgba {

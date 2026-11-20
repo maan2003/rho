@@ -19,6 +19,7 @@ mod tests;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use rho_agent_types::transcript::ExecId;
 use rho_agent_types::{AgentId, CellEnd, ContentPart, MessageId, Role, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
@@ -598,7 +599,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Branch history before the `turns`-th last input from the user. What
+    /// Branch history before the `turns`-th last turn started by mail. A
+    /// model request with no preceding mail can be the first turn. What
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`); the notebook, its globals and
     /// anything it did are not rewound.
@@ -611,13 +613,7 @@ impl Agent {
         self.drain_outbox().await?;
         self.flush().await?;
         let rows = self.host.history().await?;
-        let people = rows
-            .iter()
-            .filter(|(_, record)| record.event.carries_a_person())
-            .map(|(pos, _)| *pos)
-            .collect::<Vec<_>>();
-        anyhow::ensure!(!people.is_empty(), "nothing to rewind");
-        let to = people[people.len().saturating_sub(turns as usize)];
+        let to = rewind_point(&rows, turns).context("the agent has not made a model request")?;
         self.host
             .append(Event::Rewound {
                 agent: self.agent_id,
@@ -1389,6 +1385,28 @@ impl Agent {
         })
         .await
     }
+}
+
+/// A turn starts with the first request, new inputs, or a scheduled check-in.
+/// Requests sent to finish an open call are not separate turns.
+fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<Wpos> {
+    let mut boundaries = Vec::new();
+    for (pos, row) in rows {
+        if let Event::Request {
+            inputs, notices, ..
+        } = &row.event
+        {
+            if boundaries.is_empty()
+                || !inputs.is_empty()
+                || notices.contains(&RequestNotice::Checkin)
+            {
+                boundaries.push(*pos);
+            }
+        }
+    }
+    boundaries
+        .get(boundaries.len().saturating_sub(turns as usize))
+        .copied()
 }
 
 /// The inference session for a spec's model and profile, and the name its

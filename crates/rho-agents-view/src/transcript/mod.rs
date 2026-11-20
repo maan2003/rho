@@ -1259,6 +1259,45 @@ impl TranscriptModel {
         (buffers, records)
     }
 
+    pub(crate) fn error_points(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+        error_points(&self.blocks)
+    }
+
+    pub(crate) fn mail_point(&self, mail: &rho_agent_types::Message) -> Option<StorePoint> {
+        mail_point(&self.blocks, mail)
+    }
+
+    pub(crate) fn tool_output_ranges(
+        &self,
+        cx: &gpui::App,
+    ) -> Vec<(String, bool, Range<multi_buffer::Anchor>)> {
+        let doc = self.document_multi_buffer.read(cx).snapshot(cx);
+        self.records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let UiBlock::Tool(tool) = &*self.blocks[self.block_of(index)] else {
+                    return None;
+                };
+                let text = record.text.trim_end_matches('\n');
+                // Separators can put an empty line before a command.
+                let begin = text.find(|c: char| c != '\n')?;
+                let end_of_heading = begin + text[begin..].find('\n')?;
+                let buffer = record.buffer.read(cx);
+                let start = record.range.start.to_offset(buffer);
+                let lo = doc.anchor_in_excerpt(buffer.anchor_after(start + end_of_heading))?;
+                let hi = doc.anchor_in_excerpt(buffer.anchor_before(start + text.len()))?;
+                Some((
+                    tool.id.clone(),
+                    tool.status == rho_agents_client::state::UiToolStatus::Error,
+                    lo..hi,
+                ))
+            })
+            .collect()
+    }
+
     /// Where a point in an attached editor sits in the store: which block,
     /// and how far into it. A buffer offset does not survive a transcript
     /// whose history is composed on demand; this does. Costs the buffer it
@@ -1612,6 +1651,60 @@ pub struct StorePoint {
 /// The first block of the last `rows` rows of `blocks[..end]`, never fewer
 /// than one block. Rendering a block to count its rows is cheap beside
 /// laying it out, and what this bounds is what gets laid out.
+fn error_points(
+    blocks: &[Arc<UiBlock>],
+) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+    blocks.iter().enumerate().filter_map(|(block, value)| {
+        let (times, at) = match &**value {
+            UiBlock::Failure { times, at, .. } => (*times, Some(at.0)),
+            UiBlock::Tool(tool) if tool.status == rho_agents_client::state::UiToolStatus::Error => {
+                (1, tool.finished_at.or(tool.started_at).map(|at| at.0))
+            }
+            _ => return None,
+        };
+        Some((StorePoint { block, offset: 0 }, times, at))
+    })
+}
+
+fn mail_point(blocks: &[Arc<UiBlock>], mail: &rho_agent_types::Message) -> Option<StorePoint> {
+    use rho_agent_types::Address;
+    let written = blocks.iter().rposition(
+        |item| matches!(&**item, UiBlock::MailWritten { message } if *message == mail.id),
+    );
+    if let Address::System { since, stop, .. } = mail.from {
+        if stop == rho_agent_types::Stop::Failed {
+            // A stop is posted after the runtime writes why it stopped.
+            let error = error_points(blocks).rev().find(|(point, _, at)| {
+                written.is_none_or(|written| point.block < written)
+                    && at.is_some_and(|at| at >= since.0 && at <= mail.at.0)
+            });
+            if let Some((point, _, _)) = error {
+                return Some(point);
+            }
+        }
+        return written.map(|block| StorePoint { block, offset: 0 });
+    }
+    if let Some(block) = written {
+        return Some(StorePoint { block, offset: 0 });
+    }
+
+    if mail.revision != rho_agent_types::Revision::Original {
+        return None;
+    }
+    // Older transcripts lack the send event. Jump only when the recorded
+    // cell overlaps the send, not merely to the latest unrelated command.
+    let mut overlapping = blocks.iter().enumerate().filter_map(|(block, item)| {
+        let UiBlock::Tool(tool) = &**item else {
+            return None;
+        };
+        let start = tool.started_at?;
+        let end = tool.finished_at?;
+        (start <= mail.at && mail.at <= end).then_some(StorePoint { block, offset: 0 })
+    });
+    let only = overlapping.next()?;
+    overlapping.next().is_none().then_some(only)
+}
+
 fn tail_start(
     blocks: &[Arc<UiBlock>],
     end: usize,
@@ -2204,11 +2297,60 @@ mod tests {
             format: ArgumentsFormat::Text,
             preview: None,
             status: UiToolStatus::Reported,
-            output: Some("not downloaded by these views".into()),
+            output: Some("checking clock state".into()),
             error: None,
             started_at: None,
             finished_at: None,
         }))
+    }
+
+    #[test]
+    fn mail_lands_on_the_latest_write_or_the_failure_of_its_own_run() {
+        use rho_agent_types::{
+            Address, AgentId, ChatSeq, Message, MessageId, Revision, Stop, UnixMs,
+        };
+
+        let agent = AgentId::from_counter(15, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let id = MessageId(ChatSeq(19));
+        let mut mail = Message {
+            id,
+            at: UnixMs(32),
+            parent: None,
+            reply_to: None,
+            from: Address::Agent(agent),
+            mentions: Vec::new(),
+            content: Vec::new(),
+            revision: Revision::Edited,
+        };
+        let mark = |message| Arc::new(UiBlock::MailWritten { message });
+        let failure = |at| {
+            Arc::new(UiBlock::Failure {
+                text: "fixture failure".into(),
+                times: 1,
+                at: UnixMs(at),
+            })
+        };
+        let blocks = [
+            mark(id),
+            failure(12), // Before this run.
+            failure(24),
+            mark(id),    // The edit, or the system stop when framed as that mail.
+            failure(32), // Same millisecond but after the host posted.
+            mark(MessageId(ChatSeq(103))), // Mail in a later step.
+        ];
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(3));
+        mail.from = Address::System {
+            agent,
+            since: UnixMs(20),
+            stop: Stop::Failed,
+        };
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(2));
+        mail.from = Address::System {
+            agent,
+            since: UnixMs(25),
+            stop: Stop::Failed,
+        };
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(3));
     }
 
     #[test]
@@ -2244,10 +2386,9 @@ mod tests {
             assert!(text.contains("connection lost"), "{text}");
             assert!(text.contains("please investigate"), "{text}");
             assert!(text.contains("I found the cause"), "{text}");
-            assert!(text.contains("print('checking') reported"), "{text}");
             assert!(
-                !text.contains("not downloaded"),
-                "do not start rendering output bodies"
+                text.contains("ran code: print('checking') · reported\n  checking clock state\n"),
+                "{text}"
             );
         }
     }

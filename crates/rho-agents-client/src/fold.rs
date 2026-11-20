@@ -237,6 +237,22 @@ impl TranscriptFold {
             self.touch(self.blocks.len() - 1);
             return;
         }
+        if let UiBlock::Failure { text, times, at } = &block
+            && let Some(last) = self.blocks.last_mut()
+            && matches!(&**last, UiBlock::Failure { text: said, .. } if said == text)
+        {
+            if let UiBlock::Failure {
+                times: said,
+                at: latest,
+                ..
+            } = Arc::make_mut(last)
+            {
+                *said += times;
+                *latest = *at;
+            }
+            self.touch(self.blocks.len() - 1);
+            return;
+        }
         // The queue is drawn after the blocks, so a block landing moves
         // every queued row along with it.
         self.touch(self.blocks.len());
@@ -291,7 +307,11 @@ impl TranscriptFold {
     /// Each reported call is marked reported, its task still running.
     /// A request answered what was open: every call since the last one that
     /// did. A call Rho refused ended on its own, and one cut off went with it.
-    fn answer_calls(&mut self, timing: Option<&rho_agent_types::CallTiming>) {
+    fn answer_calls(&mut self, timing: Option<&rho_agent_types::CallTiming>, output: &str) {
+        let reported = (self.unanswered..self.blocks.len()).rev().find(|&index| {
+            matches!(&*self.blocks[index], UiBlock::Tool(tool)
+                if timing.is_none_or(|timing| tool.id == timing.call.as_str()))
+        });
         for index in self.unanswered..self.blocks.len() {
             if matches!(&*self.blocks[index], UiBlock::Tool(_)) {
                 self.report_block(index);
@@ -302,6 +322,9 @@ impl TranscriptFold {
                     && tool.id == timing.call.as_str()
                 {
                     tool.timing = timing.timing;
+                }
+                if Some(index) == reported && !output.is_empty() {
+                    tool.output = Some(output.to_owned());
                 }
             }
         }
@@ -354,14 +377,30 @@ impl TranscriptFold {
         }
     }
 
-    fn report_calls(&mut self, calls: &[String]) {
-        for id in calls {
-            if let Some(index) = self
+    fn report_calls(&mut self, calls: &[crate::protocol::worksets::CallView], at: UnixMs) {
+        for call in calls {
+            let Some(index) = self
                 .blocks
                 .iter()
-                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id))
-            {
-                self.report_block(index);
+                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == call.id))
+            else {
+                continue;
+            };
+            self.report_block(index);
+            if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+                if !call.output.is_empty() {
+                    tool.output = Some(call.output.clone());
+                }
+                if tool.status == UiToolStatus::Reported
+                    && let Some(failed) = call.failed
+                {
+                    tool.status = if failed {
+                        UiToolStatus::Error
+                    } else {
+                        UiToolStatus::Success
+                    };
+                    tool.finished_at = Some(at);
+                }
             }
         }
     }
@@ -407,6 +446,7 @@ impl TranscriptFold {
                 answers,
                 compaction,
                 timing,
+                output,
                 ..
             } => {
                 if !inputs.is_empty() {
@@ -445,11 +485,14 @@ impl TranscriptFold {
                     );
                 }
                 if *answers {
-                    self.answer_calls(timing.as_ref());
+                    self.answer_calls(timing.as_ref(), output);
                 }
             }
+            LogEvent::MailWritten { message, .. } => {
+                self.push(None, UiBlock::MailWritten { message: *message });
+            }
             LogEvent::CellEnded { end, .. } => self.end_cell(end),
-            LogEvent::CallsEnded { calls, .. } => self.report_calls(calls),
+            LogEvent::CallsEnded { calls, at, .. } => self.report_calls(calls, *at),
             LogEvent::Replied {
                 items,
                 compacted,
@@ -512,15 +555,16 @@ impl TranscriptFold {
                     },
                 );
             }
-            LogEvent::Stopped { error, .. } => {
+            LogEvent::Stopped { error, at, .. } => {
                 self.errored = true;
                 // A call the agent never answered is over too.
                 self.cancel_running();
                 self.push(
                     Some(pos),
-                    UiBlock::Notice {
+                    UiBlock::Failure {
                         text: error.clone(),
                         times: 1,
+                        at: *at,
                     },
                 );
             }
@@ -531,6 +575,7 @@ impl TranscriptFold {
                 text,
                 error,
                 retrying,
+                at,
                 ..
             } => {
                 if !text.is_empty() {
@@ -545,9 +590,10 @@ impl TranscriptFold {
                 if *retrying {
                     self.push(
                         Some(pos),
-                        UiBlock::Notice {
+                        UiBlock::Failure {
                             text: format!("temporary inference error: {error}; retrying"),
                             times: 1,
+                            at: *at,
                         },
                     );
                 }
@@ -609,7 +655,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
-    use crate::protocol::worksets::InputView;
+    use crate::protocol::worksets::{CallView, InputView};
     use crate::state::UiTool;
 
     fn agent(n: u64) -> AgentId {
@@ -645,6 +691,7 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -656,6 +703,7 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -808,7 +856,11 @@ mod tests {
             ),
             LogEvent::CallsEnded {
                 agent: me(),
-                calls: vec!["call-1".to_owned()],
+                calls: vec![CallView {
+                    id: "call-1".to_owned(),
+                    output: "permission denied".to_owned(),
+                    failed: Some(true),
+                }],
                 at: UnixMs(4),
             },
             replied(
@@ -835,7 +887,9 @@ mod tests {
             }
         );
         let tool = only_tool(&state);
-        assert_eq!(tool.status, UiToolStatus::Reported);
+        assert_eq!(tool.status, UiToolStatus::Error);
+        assert_eq!(tool.output.as_deref(), Some("permission denied"));
+        assert_eq!(tool.finished_at, Some(UnixMs(4)));
         assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
@@ -870,6 +924,7 @@ mod tests {
             answers,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -967,7 +1022,11 @@ mod tests {
             &mut fold,
             LogEvent::CallsEnded {
                 agent: me(),
-                calls: vec!["refused".to_owned()],
+                calls: vec![CallView {
+                    id: "refused".to_owned(),
+                    output: String::new(),
+                    failed: None,
+                }],
                 at: UnixMs(3),
             },
         );
@@ -1113,6 +1172,7 @@ mod tests {
             answers: true,
             compaction: true,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         };
         let notices = |state: UiAgentState| {
@@ -1153,6 +1213,38 @@ mod tests {
     /// What the model said before its request failed stays on screen:
     /// a retry says so after it, a final failure is the stop's notice.
     #[test]
+    fn separately_sent_mail_survives_a_rewind_of_the_model_turn() {
+        let first = MessageId(rho_agent_types::ChatSeq(91));
+        let later = MessageId(rho_agent_types::ChatSeq(24));
+        let result = told(vec![
+            LogEvent::MailWritten {
+                agent: me(),
+                message: first,
+                at: UnixMs(6),
+            },
+            LogEvent::MailWritten {
+                agent: me(),
+                message: later,
+                at: UnixMs(6),
+            },
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(1),
+                at: UnixMs(8),
+            },
+        ]);
+        let messages: Vec<_> = result
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::MailWritten { message } => Some(*message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, [first, later]);
+    }
+
+    #[test]
     fn a_failed_request_keeps_what_was_said() {
         let state = told(vec![
             LogEvent::Failed {
@@ -1176,13 +1268,15 @@ mod tests {
                     text: "half an answer".to_owned(),
                     phase: None
                 }),
-                Arc::new(UiBlock::Notice {
+                Arc::new(UiBlock::Failure {
                     text: "temporary inference error: overloaded; retrying".to_owned(),
                     times: 1,
+                    at: UnixMs(2),
                 }),
-                Arc::new(UiBlock::Notice {
+                Arc::new(UiBlock::Failure {
                     text: "quota".to_owned(),
                     times: 1,
+                    at: UnixMs(3),
                 }),
             ]
         );
@@ -1231,7 +1325,7 @@ mod tests {
             .blocks
             .iter()
             .map(|block| match &**block {
-                UiBlock::Notice { text, times } => (text.as_str(), *times),
+                UiBlock::Failure { text, times, .. } => (text.as_str(), *times),
                 other => panic!("{other:?}"),
             })
             .collect();
