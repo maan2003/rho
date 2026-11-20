@@ -113,6 +113,11 @@ form_shot phone desk
 
 The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show work under `moving`, with only subject, project, and latest words.
 
+## Inspect an outcome mail and a transcript with full commands
+
+Run `FAKE_SCENARIO=real-tool-rounds FAKE_ARGS='--seed 899421 --rounds 2' bash product/design/capture.sh /tmp/rho-form-proof target/debug`.
+Use **Put a clock idea to work** with `Run the clock acceptance checks.` for the idea. When the result waits, deal it with `space` and capture [proof](laptop-proof.png). Press `enter` on the project's words for the [transcript](laptop-agent.png). The command source, including each last shell argument, and the successful output are visible without opening a fold.
+
 ## What the renders expose
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.

@@ -215,7 +215,7 @@ impl TermCellFlags {
     pub const WRAPLINE: u16 = 1 << 9;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum TermColor {
     /// Default foreground.
     Foreground,

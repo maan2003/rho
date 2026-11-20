@@ -6,9 +6,10 @@
 //! terminal when it opens and drops the attachment when it closes, and the
 //! terminal keeps running on the host.
 
-use editor::{Editor, SelectionEffects};
+use editor::{Editor, EditorElement, HighlightKey, SelectionEffects};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
+use multi_buffer::MultiBufferOffset;
 use rho_agent_hosts::Link;
 use rho_frame::keys::{Close, Desk, Palette, SearchForward, VerdictMenu};
 use rho_frame::{Mode, Surface};
@@ -104,14 +105,29 @@ impl TerminalSurface {
             return;
         };
         self.phone_ctrl.set(false);
-        let (text, row) = view.read(cx).reading_text(cx);
+        let reading = view.read(cx).reading_text(cx);
         let reader = cx.new(|cx| {
-            let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+            let buffer = cx.new(|cx| language::Buffer::local(reading.text, cx));
             let mut editor = Editor::for_buffer(buffer, None, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor.set_read_only(true);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            for (group, (style, ranges)) in reading.painted.into_iter().enumerate() {
+                editor.highlight_text(
+                    HighlightKey::SyntaxTreeView(group),
+                    ranges
+                        .into_iter()
+                        .map(|range| {
+                            snapshot.anchor_after(MultiBufferOffset(range.start))
+                                ..snapshot.anchor_before(MultiBufferOffset(range.end))
+                        })
+                        .collect(),
+                    style,
+                    cx,
+                );
+            }
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
-                let point = language::Point::new(row as u32, 0);
+                let point = language::Point::new(reading.row as u32, 0);
                 selections.select_ranges([point..point]);
             });
             editor
@@ -222,7 +238,16 @@ impl Render for TerminalSurface {
                     .on_action(cx.listener(Self::read))
                     .on_action(cx.listener(Self::type_again))
                     .child(if let Some(reader) = &self.reader {
-                        reader.clone().into_any_element()
+                        let background = colors.terminal_background.into();
+                        let foreground = colors.terminal_foreground.into();
+                        let style = reader.update(cx, |editor, cx| {
+                            let mut style = editor.style(cx).clone();
+                            style.background = background;
+                            style.text.color = foreground;
+                            style.text.font_family = ".ZedMono".into();
+                            style
+                        });
+                        EditorElement::new(reader, style).into_any_element()
                     } else {
                         view.clone().into_any_element()
                     });

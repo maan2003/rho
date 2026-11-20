@@ -9,7 +9,6 @@ because: the user cares about the work, not the worker. The project speaks for t
 costs: the user goes one level down to see what a particular agent did.
 
 ## bet Trust by inspection
-status: the transcript, terminal, shell and desktop are built; the result does not yet carry proof.
 instead of: agents that report what they did, which the user believes.
 serves: Keep the work moving.
 because: the user does not edit code by hand and must still know whether a result is right; the result mail carries proof, the transcript shows how the work was done, and the terminal, shell, and desktop let the user stand beside the agent.
@@ -109,10 +108,9 @@ A desktop of a known agent on an attached host is also a place in `window.Palett
 answers: what went wrong, on what brief?
 shows:
 - in the `window.Status line`, the agent, its host, folder and runtime, what it is doing, and the errors since its last successful step. On a phone the folder and host give way before the agent's name.
-- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands show their whole line, wrapped rather than cut, and output is folded except on errors; nothing the agent was given is shortened, since this screen is for finding out what happened
+- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands show their whole line, wrapped rather than cut, and output stays open; nothing the agent was given is shortened, since this screen is for finding out what happened
 keys:
 - `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
-- `enter` or a tap on a command: open or fold its output
 - `space` then `u`: undo the last verdict without leaving the transcript
 - `space`: `deal.Verdict` on the agent's thread; the transcript stays open
 - `ctrl-k`: `window.Screen.back`

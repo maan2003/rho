@@ -1017,8 +1017,8 @@ fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest)
     match state.config.scenario {
         Scenario::RealToolRounds => {
             format!(
-                "Verified {} sequential real shell commands and their outputs.",
-                state.config.real_tool_rounds
+                "Verified {rounds} sequential shell commands.\n\n## proof\nThe last command exited with code 0:\n\nrho-e2e-step-{rounds}:ok",
+                rounds = state.config.real_tool_rounds
             )
         }
         Scenario::ClarifyingQuestion => {

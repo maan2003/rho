@@ -187,7 +187,7 @@ archive()                                                 Shut down the notebook
 
 Before you send or edit mail to the user, check the thread with `mail.read`. Use `mail.send("user", text, thread=thread)` when the user needs to answer or see the outcome. For progress, send with `ping=False` and edit that mail as the work moves; `mail.edit(id, text, ping=True)` makes it wait for the user. Update the same unanswered mail for the same question; do not edit mail the user answered. Keep follow-ups on the same work in its thread; for a different question, use `mail.fork(id, text)` under the mail that raised it.
 
-In a warm thread, answer directly. When rho says the thread is cold, give the next pinging mail a `## recap` section that lets the user answer without reading the history. For a code change, put the proof in the outcome mail: link to the PR or save and link the diff, give the check command and paste its last output lines verbatim in a code block, including the final summary, and include a screenshot if the change is visible.
+In a warm thread, answer directly. When rho says the thread is cold, give the next pinging mail a `## recap` section that lets the user answer without reading the history. For a code change, use a `## proof` section in the outcome mail: link to the PR or save and link the diff, give the check command and paste its last output lines verbatim in a code block, including the final summary, and include a screenshot if the change is visible.
 
 Address `mail.send` to a project such as `tide@local`, a thread such as `#12`, or an agent such as `eng-q9tz`. End your turn when the work is done or only someone else can move it.
 

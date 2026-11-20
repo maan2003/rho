@@ -178,6 +178,16 @@ pub const THREAD_COLD_AFTER: std::time::Duration = std::time::Duration::from_sec
 /// that let the user answer a cold thread without its history. It runs to
 /// the next heading of the same or a higher level, or to the end.
 pub fn recap_section(text: &str) -> Option<std::ops::Range<usize>> {
+    mail_section(text, "recap")
+}
+
+/// Designated evidence in an outcome mail. Unlike a recap it stays
+/// visible even if the thread is warm.
+pub fn proof_section(text: &str) -> Option<std::ops::Range<usize>> {
+    mail_section(text, "proof")
+}
+
+fn mail_section(text: &str, name: &str) -> Option<std::ops::Range<usize>> {
     let mut start = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -185,7 +195,7 @@ pub fn recap_section(text: &str) -> Option<std::ops::Range<usize>> {
         let level = trimmed.chars().take_while(|c| *c == '#').count();
         let heading = (1..=2).contains(&level) && trimmed[level..].starts_with(' ');
         match start {
-            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case("recap") => {
+            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case(name) => {
                 start = Some(offset);
             }
             Some(start) if heading => return Some(start..offset),
@@ -440,6 +450,18 @@ mod tests {
         assert_eq!(recap_section("#recap\nno"), None);
         assert_eq!(recap_section("##recap\nno"), None);
         assert_eq!(recap_section("plain words about a recap"), None);
+    }
+
+    #[test]
+    fn proof_starts_at_its_own_heading_and_does_not_consume_the_recap() {
+        let text =
+            "Proof in the prose\n## Proof\nTests passed\n### Output\nok\n## recap\nWhat to do";
+        assert_eq!(
+            &text[proof_section(text).unwrap()],
+            "## Proof\nTests passed\n### Output\nok\n"
+        );
+        assert_eq!(&text[recap_section(text).unwrap()], "## recap\nWhat to do");
+        assert!(proof_section("## proofreading\nno").is_none());
     }
 
     #[test]

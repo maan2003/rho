@@ -14594,6 +14594,7 @@ dependencies = [
  "futures",
  "gpui",
  "language",
+ "multi_buffer",
  "rho-agent-hosts",
  "rho-frame",
  "rho-rpc",
