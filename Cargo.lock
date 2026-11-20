@@ -14181,23 +14181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-fake-slack"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures-util",
- "reqwest 0.13.5",
- "rho-slack",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.30.0",
-]
-
-[[package]]
 name = "rho-files"
 version = "0.1.0"
 dependencies = [
@@ -14312,7 +14295,6 @@ dependencies = [
  "rho-journal",
  "rho-notes",
  "rho-profiling",
- "rho-slack",
  "rho-window",
  "rodio",
  "rust-embed",
@@ -14596,47 +14578,6 @@ dependencies = [
  "text",
  "theme",
  "tokio",
-]
-
-[[package]]
-name = "rho-slack"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chrono",
- "editor",
- "emojis",
- "futures",
- "gpui",
- "gpui_tokio",
- "image",
- "jiff",
- "language",
- "multi_buffer",
- "project",
- "rand 0.10.3",
- "redb",
- "reqwest 0.13.5",
- "rho-db",
- "rho-dealer",
- "rho-frame",
- "rho-journal",
- "rho-slack",
- "rho-transcript",
- "rho-window",
- "rustls",
- "senax-encoder",
- "serde",
- "serde_json",
- "tempfile",
- "text",
- "theme",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing",
- "ui",
- "url",
 ]
 
 [[package]]

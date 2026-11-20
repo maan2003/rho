@@ -153,9 +153,9 @@ mod tests {
         assert_eq!(note.kind(), "note");
         assert!(note.as_note().is_some());
         assert_eq!(Address::parse(note.key()), Some(note.clone()));
-        let slack = Address::new("slack", "T1/C2/1700000000.000100");
-        assert_eq!(slack.rest(), "T1/C2/1700000000.000100");
-        assert_eq!(Address::parse(slack.key()).as_ref(), Some(&slack));
+        let thread = Address::new("thread", "27/318");
+        assert_eq!(thread.rest(), "27/318");
+        assert_eq!(Address::parse(thread.key()).as_ref(), Some(&thread));
         assert_eq!(
             Address::parse("gadget:1").map(|a| a.kind().to_owned()),
             Some("gadget".into())
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(Address::parse("nothing"), None);
         assert_eq!(Address::parse(":rest"), None);
         assert_eq!(Address::parse("a:b|c"), None);
-        assert!(!slack.is_minted() && note.is_minted());
+        assert!(!thread.is_minted() && note.is_minted());
     }
 
     #[test]

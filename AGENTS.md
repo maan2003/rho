@@ -16,8 +16,7 @@ inbound world, like Slack. The GUI is the product.
 
 ## Shape
 
-- `rho-gui` stands alone. It keeps its own database, runs Slack itself,
-  and syncs the desk. It is usually remote, on a laptop or a phone.
+- `rho-gui` stands alone. It keeps its own database and syncs the desk. It is usually remote, on a laptop or a phone.
 - Agent hosts are machines the GUI attaches to. Everything only they
   build lives in `agent-host/`, which has its own `AGENTS.md`.
 - `crates/` holds the GUI and what both sides share. The GUI reaches a
@@ -29,7 +28,7 @@ inbound world, like Slack. The GUI is the product.
 
 - Everything the GUI shows is untrusted: Slack, transcripts, model
   output. Nothing displayed acts without the user.
-- It holds the Slack token and the key it authenticates to hosts with.
+- It holds the key it authenticates to hosts with.
 
 ## Working here
 
