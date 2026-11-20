@@ -1225,7 +1225,9 @@ impl Frame {
             false => colors.terminal_ansi_bright_cyan,
         };
         let mode = mode_word(&mode);
-        let lamp = self.signals.lamp_on.then_some("●");
+        // Signal evaluation is deferred. Desk must not paint the lamp
+        // from the previous screen while that update is still pending.
+        let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
         let unwell = self.unwell_hosts();
         let surface = self.current_surface();
         let phone_titles = match layout {
