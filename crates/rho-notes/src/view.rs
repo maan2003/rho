@@ -15,7 +15,7 @@ use rho_frame::draft::focus_writing_at;
 use rho_frame::{FrameLink, Surface, phone_editor_tap};
 use theme::ActiveTheme as _;
 
-use crate::{NoteId, NoteSystem, text_of, title_of};
+use crate::{NoteId, NoteSystem, title_of};
 
 /// Sets a buffer's whole text, when it differs.
 fn set_text(buffer: &Entity<Buffer>, text: &str, cx: &mut App) {
@@ -121,7 +121,11 @@ impl NoteView {
                 editor.set_text(text, window, cx);
             });
         }
-        self.focus_writing(None, window, cx);
+        // The editor's new-entity observer attaches Vim at the end of the
+        // opening update, so start Insert after it has run.
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_writing(None, window, cx);
+        });
     }
 
     fn focus_writing(&self, at: Option<Anchor>, window: &mut Window, cx: &mut App) {
@@ -147,10 +151,12 @@ impl NoteView {
     /// Brings the surface up to the marks unless the user is typing.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let note = self.note;
-        let Some(text) = self.frame.read(cx, |frame, _| text_of(frame.marks(), note)) else {
+        let Some(text) = self.frame.read(cx, |frame, cx| {
+            self.system.read(cx).text(frame.marks(), note)
+        }) else {
             return;
         };
-        if !self.system.read(cx).typing(note) && self.synced.as_ref() != Some(&text) {
+        if self.synced.as_ref() != Some(&text) {
             set_text(&self.body, &text, cx);
             self.synced = Some(text);
         }

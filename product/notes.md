@@ -52,15 +52,16 @@ keys:
 mock:
 ```text
 notes                                                                      NOR
-find or start:
-  Ask Priya about the lease renewal  before Friday bring the signed copy  · now
+find or start: words from a note
+  Ask Priya about the lease renewal  Bring the signed copy before Friday  · now
   Check whether the brief was too vague  ↳ Could you clarify which behavior… · 4m
 ```
 ```text
 notes                              NOR
-find or start:
+find or start: words from a note
   Ask Priya about the lease renewal
-  before Friday bring the signed… · now
+  Bring the signed copy before Friday
+  · now
   Check whether the brief was too
   vague  ↳ Could you clarify which…
   · 4m
@@ -88,7 +89,14 @@ mock:
 ```text
 Ask Priya about the lease renewal                                         INS
 Ask Priya about the lease renewal
-before Friday bring the signed copy
+Bring the signed copy before Friday
+```
+```text
+Ask Priya about the lease renewal  INS
+Ask Priya about the lease renewal
+Bring the signed copy before Friday
+
+       back        desk        menu
 ```
 starts: `Write something down`
 
@@ -102,7 +110,7 @@ steps:
 1. the user chooses `new note`; an empty note opens in Insert
 2. the user types; the first line becomes its title
 3. the user presses `escape`
-4. the user presses `tab` to leave; the note is at the top of `Notes`
+4. the user presses `tab` to leave; they find the note at the top the next time they open `Notes`
 system: keeps the text without a save step, and lists the note in `Notes` by when it was last written.
 user: every word of it.
 cases: the same note open on the laptop and the phone at once, where the newest text wins and text being typed is not replaced

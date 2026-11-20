@@ -417,7 +417,7 @@ pub(crate) fn row(listed: &Listed, now: Timestamp) -> (String, Vec<(Class, Range
             (None, None) => text.push_str("private reply"),
         }
     }
-    text.push_str("  ·\u{a0}");
+    text.push_str("  · ");
     text.push_str(&rho_dealer::curve::age(listed.written, now));
     styles.push((Class::Muted, muted..text.len()));
     (text, styles)

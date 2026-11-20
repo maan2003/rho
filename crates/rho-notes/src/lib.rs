@@ -257,7 +257,8 @@ impl NoteSystem {
             }
             std::future::ready(())
         });
-        list::bind_keys(cx);
+        // Override the frame's in-buffer search after its defaults are bound.
+        cx.defer(list::bind_keys);
         Self {
             frame,
             mail_excerpt: None,

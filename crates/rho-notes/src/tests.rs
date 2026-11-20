@@ -285,7 +285,7 @@ fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
     let (text, styles) = list::row(&listed, now);
     assert_eq!(
         text,
-        "  verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  ·\u{a0}7m"
+        "  verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  · 7m"
     );
     assert_eq!(&text[styles[0].1.clone()], "verify on CI too");
     assert_eq!(styles[1].0, list::Class::Muted);
@@ -299,7 +299,7 @@ fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
     listed.reply = None;
     assert_eq!(
         list::row(&listed, now).0,
-        "  verify on CI too  it failed last night  ·\u{a0}7m"
+        "  verify on CI too  it failed last night  · 7m"
     );
 }
 
