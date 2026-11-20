@@ -1,7 +1,8 @@
 //! An editor over read-only history followed by a writable draft. The last
 //! history row is the separator; the next row belongs to the draft buffer.
 
-use editor::{Anchor, Bias, Editor};
+use editor::display_map::{DisplaySnapshot, ToDisplayPoint as _};
+use editor::{Anchor, Bias, Editor, RowExt as _};
 use gpui::{App, AppContext as _, Context, Entity, Focusable, Pixels, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
@@ -64,6 +65,64 @@ pub fn on_tail(editor: &Editor, history: &Entity<Buffer>, cx: &App) -> bool {
         >= start(history, cx).row
 }
 
+/// A visible Insert caret before the history above it changes.
+pub struct WritingCaret {
+    anchor: Anchor,
+    screen_y: f64,
+}
+
+impl WritingCaret {
+    pub fn capture(
+        editor: &Entity<Editor>,
+        history: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Option<Self> {
+        if !vim::editor_in_insert_mode(editor, cx) || !on_tail(editor.read(cx), history, cx) {
+            return None;
+        }
+        editor.update(cx, |editor, cx| {
+            let anchor = editor.selections.newest_anchor().head();
+            let scroll = editor.scroll_position(cx);
+            let display = editor.display_snapshot(cx);
+            let screen_y = Self::row_y(anchor, &display) - display.row_y(scroll.y);
+            (0. <= screen_y && screen_y < editor.visible_line_count()?)
+                .then_some(Self { anchor, screen_y })
+        })
+    }
+
+    /// Re-anchor the viewport after the mutation. Its normal top-of-screen
+    /// anchor would keep the history in place instead of the draft.
+    pub fn restore(self, editor: &Entity<Editor>, cx: &mut App) {
+        let editor = editor.clone();
+        // Reconciliation may run outside the window update to read the
+        // frame. Only the scroll adjustment requires the window.
+        cx.defer(move |cx| {
+            cx.with_window(editor.entity_id(), |window, cx| {
+                if !editor.read(cx).is_focused(window) || !vim::editor_in_insert_mode(&editor, cx) {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    if editor.selections.newest_anchor().head() != self.anchor {
+                        return;
+                    }
+                    let mut position = editor.scroll_position(cx);
+                    let display = editor.display_snapshot(cx);
+                    let top = (Self::row_y(self.anchor, &display) - self.screen_y).max(0.);
+                    if (display.row_y(position.y) - top).abs() > 0.01 {
+                        position.y = display.row_at_y(top);
+                        editor.set_scroll_position(position, window, cx);
+                    }
+                });
+            });
+        });
+    }
+
+    fn row_y(anchor: Anchor, display: &DisplaySnapshot) -> f64 {
+        display.row_y(anchor.to_display_point(display).row().as_f64())
+    }
+}
+
+/// Where a pointer landed in the editable tail.
 pub enum Hit {
     Separator,
     Text(Anchor),

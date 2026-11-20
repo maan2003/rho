@@ -337,7 +337,11 @@ impl ThreadView {
             &self.expanded_quotes,
             cx,
         );
+        let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
         self.transcript.reconcile(items, cx);
+        if let Some(writing) = writing {
+            writing.restore(&self.editor, cx);
+        }
         if let Some(Follow::Logged(message)) = self.follow
             && self.cursor_to_item(&Key::Thread(message), Autoscroll::fit(), cx)
         {
