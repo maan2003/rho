@@ -41,7 +41,6 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
-use rho_agent_types::AgentId;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
@@ -49,7 +48,7 @@ use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::render::{self, BlockKind, RenderedBlock, block_kind, block_visible};
+use crate::render::{self, BlockKind, Label, Labels, RenderedBlock, block_kind, block_visible};
 use crate::visualization::Visualization;
 
 mod store;
@@ -87,9 +86,9 @@ pub struct TranscriptModel {
     /// `records` and `buffers` cover the head and then `blocks[uncomposed..]`,
     /// so composition grows from both ends and the gap closes in the middle.
     uncomposed: usize,
-    /// What other agents' messages are labelled, kept so history composed
+    /// Captions from the agent directory and mail, kept so history composed
     /// later reads the same as history composed at open.
-    agent_labels: HashMap<AgentId, String>,
+    labels: Labels,
     records: Vec<BlockRecord>,
     /// First record of the live turn as of the last sync. Records before it
     /// carry their highlights in the history region, records from it onward
@@ -145,7 +144,7 @@ pub(crate) struct PreparedInitialTranscript {
     /// The first block the opening tail composes; everything before it is
     /// history the reader has not asked for yet.
     first_block: usize,
-    agent_labels: HashMap<AgentId, String>,
+    labels: Labels,
     chunks: Vec<PreparedChunk>,
 }
 
@@ -226,7 +225,7 @@ impl TranscriptModel {
             gap_remaining: Arc::new(AtomicUsize::new(0)),
             head: 0,
             uncomposed: 0,
-            agent_labels: HashMap::new(),
+            labels: Labels::new(),
             records: Vec::new(),
             turn_boundary: 0,
             buffers: Vec::new(),
@@ -247,9 +246,9 @@ impl TranscriptModel {
     pub(crate) fn prepare_initial(
         state: UiAgentState,
         now_ms: u64,
-        agent_labels: HashMap<AgentId, String>,
+        labels: Labels,
     ) -> PreparedInitialTranscript {
-        let label = |id: AgentId| agent_labels.get(&id).cloned().unwrap_or_default();
+        let label = |name| labels.get(&name).cloned().unwrap_or_default();
         let visible = state
             .blocks
             .iter()
@@ -273,7 +272,7 @@ impl TranscriptModel {
             state,
             visible,
             first_block,
-            agent_labels,
+            labels,
             chunks,
         }
     }
@@ -297,7 +296,7 @@ impl TranscriptModel {
         self.visible = prepared.visible;
         self.head = 0;
         self.uncomposed = prepared.first_block;
-        self.agent_labels = prepared.agent_labels;
+        self.labels = prepared.labels;
         let mut installed = Vec::with_capacity(prepared.chunks.len());
         for (chunk, (reservation, text_buffer)) in prepared.chunks.into_iter().zip(text_buffers) {
             let buffer = cx.insert_entity(reservation, |cx| {
@@ -420,12 +419,12 @@ impl TranscriptModel {
     }
 
     /// Applies a state change bounded by `summary`.
-    pub fn sync<V: 'static>(
+    pub(crate) fn sync<V: 'static>(
         &mut self,
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
+        labels: &impl Fn(HashSet<Label>, &gpui::App) -> Labels,
         cx: &mut Context<V>,
     ) {
         self.turn_open = rho_agents_client::store::turn_open(state.status);
@@ -436,7 +435,7 @@ impl TranscriptModel {
             self.apply_to_attachments(now_ms, &empty, &empty, false, None, cx);
             return;
         };
-        self.remember_blocks(state, first_changed_block, agent_label);
+        self.remember_blocks(state, first_changed_block, labels, cx);
 
         if first_changed_block < self.uncomposed {
             // The change is under what is composed, so what is composed no
@@ -901,9 +900,18 @@ impl TranscriptModel {
             .any(InlayRecord::ticks)
     }
 
-    /// The label another agent's messages are rendered under.
-    fn label(&self, id: AgentId) -> String {
-        self.agent_labels.get(&id).cloned().unwrap_or_default()
+    fn label(&self, name: Label) -> String {
+        self.labels.get(&name).cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn unresolved_mail(&self) -> impl Iterator<Item = (usize, Label)> + '_ {
+        self.blocks.iter().enumerate().filter_map(|(block, value)| {
+            let label = Label::for_block(value)?;
+            if matches!(label, Label::Agent(_)) {
+                return None;
+            }
+            (!self.labels.contains_key(&label)).then_some((block, label))
+        })
     }
 
     /// Keeps the model's own block list current at the cost of what
@@ -913,16 +921,21 @@ impl TranscriptModel {
         &mut self,
         state: &UiAgentState,
         first_changed: usize,
-        agent_label: &impl Fn(AgentId) -> String,
+        labels: &impl Fn(HashSet<Label>, &gpui::App) -> Labels,
+        cx: &gpui::App,
     ) {
         let first_changed = first_changed.min(self.blocks.len()).min(state.blocks.len());
         self.blocks.truncate(first_changed);
         self.visible.truncate(first_changed);
-        for block in &state.blocks[first_changed..] {
+        let changed = &state.blocks[first_changed..];
+        let needed = changed
+            .iter()
+            .filter_map(|block| Label::for_block(block))
+            .filter(|name| matches!(name, Label::Agent(_)) || !self.labels.contains_key(name))
+            .collect();
+        self.labels.extend(labels(needed, cx));
+        for block in changed {
             self.visible.push(block_visible(block));
-            if let UiBlock::MessageDraft { from, .. } = &**block {
-                self.agent_labels.insert(*from, agent_label(*from));
-            }
             self.blocks.push(block.clone());
         }
     }
@@ -1257,6 +1270,60 @@ impl TranscriptModel {
             });
         }
         (buffers, records)
+    }
+
+    pub(crate) fn current_errors(&self) -> u32 {
+        current_errors(&self.blocks)
+    }
+
+    pub(crate) fn newest_step(&self) -> Option<StorePoint> {
+        self.visible
+            .iter()
+            .rposition(|shown| *shown)
+            .map(|block| StorePoint { block, offset: 0 })
+    }
+
+    pub(crate) fn block_at(&self, index: usize) -> Option<&Arc<UiBlock>> {
+        self.blocks.get(index)
+    }
+
+    pub(crate) fn error_points(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+        error_points(&self.blocks)
+    }
+
+    pub(crate) fn mail_point(&self, mail: &rho_agent_types::Message) -> Option<StorePoint> {
+        mail_point(&self.blocks, mail)
+    }
+
+    pub(crate) fn tool_output_ranges(
+        &self,
+        cx: &gpui::App,
+    ) -> Vec<(String, bool, Range<multi_buffer::Anchor>)> {
+        let doc = self.document_multi_buffer.read(cx).snapshot(cx);
+        self.records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                let UiBlock::Tool(tool) = &*self.blocks[self.block_of(index)] else {
+                    return None;
+                };
+                let text = record.text.trim_end_matches('\n');
+                // Separators can put an empty line before a command.
+                let begin = text.find(|c: char| c != '\n')?;
+                let end_of_heading = begin + text[begin..].find('\n')?;
+                let buffer = record.buffer.read(cx);
+                let start = record.range.start.to_offset(buffer);
+                let lo = doc.anchor_in_excerpt(buffer.anchor_after(start + end_of_heading))?;
+                let hi = doc.anchor_in_excerpt(buffer.anchor_before(start + text.len()))?;
+                Some((
+                    tool.id.clone(),
+                    tool.status == rho_agents_client::state::UiToolStatus::Error,
+                    lo..hi,
+                ))
+            })
+            .collect()
     }
 
     /// Where a point in an attached editor sits in the store: which block,
@@ -1612,12 +1679,90 @@ pub struct StorePoint {
 /// The first block of the last `rows` rows of `blocks[..end]`, never fewer
 /// than one block. Rendering a block to count its rows is cheap beside
 /// laying it out, and what this bounds is what gets laid out.
+fn error_points(
+    blocks: &[Arc<UiBlock>],
+) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+    blocks.iter().enumerate().filter_map(|(block, value)| {
+        let (times, at) = match &**value {
+            UiBlock::Failure { times, at, .. } => (*times, Some(at.0)),
+            UiBlock::Tool(tool) if tool.status == rho_agents_client::state::UiToolStatus::Error => {
+                (1, tool.finished_at.or(tool.started_at).map(|at| at.0))
+            }
+            _ => return None,
+        };
+        Some((StorePoint { block, offset: 0 }, times, at))
+    })
+}
+
+fn current_errors(blocks: &[Arc<UiBlock>]) -> u32 {
+    let last_ok = blocks.iter().rposition(|block| match &**block {
+        UiBlock::Responded => true,
+        UiBlock::Tool(tool) => tool.status == rho_agents_client::state::UiToolStatus::Success,
+        _ => false,
+    });
+    error_points(&blocks[last_ok.map_or(0, |block| block + 1)..])
+        .map(|(_, times, _)| times)
+        .sum()
+}
+
+fn mail_point(blocks: &[Arc<UiBlock>], mail: &rho_agent_types::Message) -> Option<StorePoint> {
+    use rho_agent_types::Address;
+    let (version, _) = mail.version();
+    let written = blocks
+        .iter()
+        .rposition(|item| {
+            matches!(&**item,
+                UiBlock::MailWritten { message, version: Some(recorded) }
+                    if *message == mail.id && *recorded == version
+            )
+        })
+        .or_else(|| {
+            blocks.iter().rposition(|item| {
+                matches!(&**item,
+                    UiBlock::MailWritten { message, version: None } if *message == mail.id
+                )
+            })
+        });
+    if let Address::System { since, stop, .. } = mail.from {
+        if stop == rho_agent_types::Stop::Failed {
+            // A stop is posted after the runtime writes why it stopped.
+            let error = error_points(blocks).rev().find(|(point, _, at)| {
+                written.is_none_or(|written| point.block < written)
+                    && at.is_some_and(|at| at >= since.0 && at <= mail.at.0)
+            });
+            if let Some((point, _, _)) = error {
+                return Some(point);
+            }
+        }
+        return written.map(|block| StorePoint { block, offset: 0 });
+    }
+    if let Some(block) = written {
+        return Some(StorePoint { block, offset: 0 });
+    }
+
+    if mail.revision != rho_agent_types::Revision::Original {
+        return None;
+    }
+    // Older transcripts lack the send event. Jump only when the recorded
+    // cell overlaps the send, not merely to the latest unrelated command.
+    let mut overlapping = blocks.iter().enumerate().filter_map(|(block, item)| {
+        let UiBlock::Tool(tool) = &**item else {
+            return None;
+        };
+        let start = tool.started_at?;
+        let end = tool.finished_at?;
+        (start <= mail.at && mail.at <= end).then_some(StorePoint { block, offset: 0 })
+    });
+    let only = overlapping.next()?;
+    overlapping.next().is_none().then_some(only)
+}
+
 fn tail_start(
     blocks: &[Arc<UiBlock>],
     end: usize,
     rows: usize,
     now_ms: u64,
-    label: &impl Fn(AgentId) -> String,
+    label: &impl Fn(Label) -> String,
 ) -> usize {
     let mut counted = 0;
     let mut start = end;
@@ -1644,7 +1789,7 @@ fn head_end(
     end: usize,
     rows: usize,
     now_ms: u64,
-    label: &impl Fn(AgentId) -> String,
+    label: &impl Fn(Label) -> String,
 ) -> usize {
     let mut counted = 0;
     let mut at = start;
@@ -1669,7 +1814,7 @@ fn render_chunks(
     visible: &[bool],
     range: Range<usize>,
     now_ms: u64,
-    label: &impl Fn(AgentId) -> String,
+    label: &impl Fn(Label) -> String,
 ) -> Vec<PreparedChunk> {
     let mut prev = visible[..range.start]
         .iter()
@@ -2204,11 +2349,102 @@ mod tests {
             format: ArgumentsFormat::Text,
             preview: None,
             status: UiToolStatus::Reported,
-            output: Some("not downloaded by these views".into()),
+            output: Some("checking clock state".into()),
             error: None,
             started_at: None,
             finished_at: None,
         }))
+    }
+
+    #[test]
+    fn mail_lands_on_the_latest_write_or_the_failure_of_its_own_run() {
+        use rho_agent_types::{
+            Address, AgentId, ChatSeq, Message, MessageId, Revision, Stop, UnixMs,
+        };
+
+        let agent = AgentId::from_counter(15, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let id = MessageId(ChatSeq(19));
+        let mut mail = Message {
+            id,
+            at: UnixMs(32),
+            parent: None,
+            reply_to: None,
+            from: Address::Agent(agent),
+            mentions: Vec::new(),
+            content: Vec::new(),
+            revision: Revision::Edited {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+            },
+        };
+        let mark = |message| {
+            Arc::new(UiBlock::MailWritten {
+                message,
+                version: None,
+            })
+        };
+        let failure = |at| {
+            Arc::new(UiBlock::Failure {
+                kind: rho_agents_client::state::FailureKind::Stopped,
+                since: UnixMs(at),
+                text: "fixture failure".into(),
+                times: 1,
+                at: UnixMs(at),
+            })
+        };
+        let blocks = [
+            mark(id),
+            failure(12), // Before this run.
+            failure(24),
+            mark(id),    // The edit, or the system stop when framed as that mail.
+            failure(32), // Same millisecond but after the host posted.
+            mark(MessageId(ChatSeq(103))), // Mail in a later step.
+        ];
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(3));
+        mail.from = Address::System {
+            agent,
+            since: UnixMs(20),
+            stop: Stop::Failed,
+        };
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(2));
+        mail.from = Address::System {
+            agent,
+            since: UnixMs(25),
+            stop: Stop::Failed,
+        };
+        assert_eq!(super::mail_point(&blocks, &mail).map(|p| p.block), Some(3));
+    }
+
+    #[test]
+    fn only_errors_after_recovery_count_but_older_errors_are_navigable() {
+        use rho_agent_types::UnixMs;
+        let failed = |times| {
+            Arc::new(UiBlock::Failure {
+                kind: rho_agents_client::state::FailureKind::Retrying { runtime: None },
+                since: UnixMs(4),
+                at: UnixMs(18),
+                text: "connecting to the model".into(),
+                times,
+            })
+        };
+        let mut blocks = vec![
+            failed(12),
+            Arc::new(UiBlock::AssistantMessage {
+                text: "partial reply".into(),
+                phase: None,
+            }),
+        ];
+        assert_eq!(super::current_errors(&blocks), 12);
+        blocks.push(Arc::new(UiBlock::Responded));
+        assert_eq!(super::current_errors(&blocks), 0);
+        blocks.push(failed(2));
+        assert_eq!(super::current_errors(&blocks), 2);
+        assert_eq!(
+            super::error_points(&blocks)
+                .map(|(_, times, _)| times)
+                .collect::<Vec<_>>(),
+            [12, 2]
+        );
     }
 
     #[test]
@@ -2224,6 +2460,7 @@ mod tests {
             }),
             Arc::new(UiBlock::Notice {
                 text: "connection lost".into(),
+                times: 1,
             }),
         ];
         {
@@ -2243,10 +2480,9 @@ mod tests {
             assert!(text.contains("connection lost"), "{text}");
             assert!(text.contains("please investigate"), "{text}");
             assert!(text.contains("I found the cause"), "{text}");
-            assert!(text.contains("print('checking') reported"), "{text}");
             assert!(
-                !text.contains("not downloaded"),
-                "do not start rendering output bodies"
+                text.contains("ran code: print('checking') · reported\n  checking clock state\n"),
+                "{text}"
             );
         }
     }

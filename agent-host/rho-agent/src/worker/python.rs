@@ -368,13 +368,18 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(compact, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(thread_status, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(edit_message, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(delete_message, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_mail, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(project_named, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(reparent, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(name, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(resolve_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(agent_handle, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_address, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_accept, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(external_send, &module)?)?;
@@ -404,17 +409,10 @@ fn agent_id(text: &str) -> PyResult<AgentId> {
         .map_err(|_| PyValueError::new_err(format!("not an agent id: {text:?}")))
 }
 
-fn address(text: &str) -> PyResult<Address> {
-    if text == "user" {
-        Ok(Address::User)
-    } else {
-        agent_id(text).map(Address::Agent)
-    }
-}
-
 fn address_text(address: Address) -> String {
     match address {
         Address::User => "user".to_owned(),
+        Address::System { .. } | Address::StartFailed => "system".to_owned(),
         Address::Agent(agent) => agent.encoded().to_string(),
     }
 }
@@ -638,7 +636,7 @@ fn agents(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 }
 
 #[pyfunction]
-fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()> {
+fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<bool> {
     let agent = agent_id(agent)?;
     let current = all_agents(py)?
         .into_iter()
@@ -646,8 +644,17 @@ fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()
         .map(|(_, spec)| spec)
         .ok_or_else(|| PyValueError::new_err(format!("no agent {}", agent.encoded())))?;
     let spec = spec_from_py(&spec, Some(&current))?;
+    let changes_kind =
+        std::mem::discriminant(&current.runtime) != std::mem::discriminant(&spec.runtime);
+    if changes_kind {
+        permissions::admits(
+            &PERMISSIONS.fix(),
+            matches!(spec.runtime, Runtime::Native { .. }),
+        )
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+    }
     match PyHost::block(py, PyRequest::SetSpec { agent, spec })? {
-        PyReply::Done => Ok(()),
+        PyReply::Done => Ok(changes_kind),
         _ => Err(unexpected()),
     }
 }
@@ -715,27 +722,33 @@ fn new_cache_key(py: Python<'_>, agent: &str) -> PyResult<()> {
     control(py, agent, Control::CacheKey)
 }
 
-fn mentions(py_mentions: Option<Vec<(String, String)>>) -> PyResult<Vec<Mention>> {
-    py_mentions
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(to, kind)| {
-            let kind = match kind.as_str() {
-                "ask" => MentionKind::Ask,
-                "result" => MentionKind::Result,
-                "fyi" => MentionKind::Fyi,
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "a mention's kind is one of \"ask\", \"result\" or \"fyi\"",
-                    ));
-                }
-            };
-            Ok(Mention {
-                to: address(&to)?,
-                kind,
-            })
-        })
-        .collect()
+fn recipient(to: Option<&str>, kind: Option<&str>) -> PyResult<Vec<Mention>> {
+    let mention = match (to, kind) {
+        (None, None) => return Ok(Vec::new()),
+        (Some("user"), Some("ask")) => Mention {
+            to: Address::User,
+            kind: MentionKind::Ask,
+        },
+        (Some("user"), Some("result")) => Mention {
+            to: Address::User,
+            kind: MentionKind::Result,
+        },
+        (Some("user"), Some("fyi")) => Mention {
+            to: Address::User,
+            kind: MentionKind::Fyi,
+        },
+        (Some("user"), _) => {
+            return Err(PyValueError::new_err(
+                "mail to the user needs kind: ask, result, or fyi",
+            ));
+        }
+        (Some(agent), None) => Mention {
+            to: Address::Agent(agent_id(agent)?),
+            kind: MentionKind::Direct,
+        },
+        _ => return Err(PyValueError::new_err("only mail to the user takes a kind")),
+    };
+    Ok(vec![mention])
 }
 
 /// The content of an agent's message, refused when it mentions the user in
@@ -757,44 +770,124 @@ fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPa
     Ok(vec![ContentPart::Text { text }])
 }
 
-/// Post `text` under `parent`, or as a root; `mentions` are `(address,
-/// kind)` pairs.
+type SentMail = (u64, Option<(u64, String)>);
+
+/// Put mail in its project or thread. For a directed agent, the host
+/// determines the conversation; `parent` must be unset.
 #[pyfunction]
-#[pyo3(signature = (sender, parent, text, *, mentions = None))]
-fn post(
+#[pyo3(signature = (sender, parent, text, *, to = None, kind = None, reply_to = None))]
+fn send_mail(
     py: Python<'_>,
     sender: &str,
     parent: Option<u64>,
     text: String,
-    mentions: Option<Vec<(String, String)>>,
-) -> PyResult<u64> {
+    to: Option<&str>,
+    kind: Option<&str>,
+    reply_to: Option<u64>,
+) -> PyResult<SentMail> {
     let sender = agent_id(sender)?;
-    let mentions = self::mentions(mentions)?;
+    let mentions = recipient(to, kind)?;
     let content = message_content(text, &mentions)?;
-    let request = PyRequest::Post {
+    let request = PyRequest::SendMail {
         sender,
         parent: parent.map(|seq| MessageId(ChatSeq(seq))),
+        reply_to: reply_to.map(|seq| MessageId(ChatSeq(seq))),
         mentions,
         content,
     };
     match PyHost::block(py, request)? {
-        PyReply::Seq(seq) => Ok(seq.0),
+        PyReply::SentMail { id, unanswered } => Ok((
+            id.0.0,
+            unanswered.map(|(message, author)| (message.0.0, author.encoded().to_string())),
+        )),
         _ => Err(unexpected()),
     }
 }
 
-/// Mail `text` from `sender` to another agent of this host, as it is: the
-/// caller writes the whole text, and the other agent holds it once this
-/// returns.
 #[pyfunction]
-fn mail(py: Python<'_>, sender: &str, to: &str, text: String) -> PyResult<()> {
-    let request = PyRequest::Mail {
-        sender: agent_id(sender)?,
-        to: agent_id(to)?,
-        text,
-    };
-    match PyHost::block(py, request)? {
+fn thread_status(py: Python<'_>, agent: &str, thread: u64, text: String) -> PyResult<()> {
+    match PyHost::block(
+        py,
+        PyRequest::Status {
+            agent: agent_id(agent)?,
+            thread: MessageId(ChatSeq(thread)),
+            text,
+        },
+    )? {
         PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn edit_message(py: Python<'_>, agent: &str, id: u64, text: String) -> PyResult<()> {
+    let message = MessageId(ChatSeq(id));
+    let agent = agent_id(agent)?;
+    let PyReply::Messages(existing) = PyHost::block(py, PyRequest::Message(message))? else {
+        return Err(unexpected());
+    };
+    let existing = existing
+        .first()
+        .ok_or_else(|| PyValueError::new_err(format!("no message #{id}")))?;
+    if existing.from != Address::Agent(agent) {
+        return Err(PyValueError::new_err("you can only change your own mail"));
+    }
+    let content = message_content(text, &existing.mentions)?;
+    match PyHost::block(
+        py,
+        PyRequest::Edit {
+            agent,
+            message,
+            content,
+        },
+    )? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn delete_message(py: Python<'_>, agent: &str, id: u64) -> PyResult<()> {
+    match PyHost::block(
+        py,
+        PyRequest::Delete {
+            agent: agent_id(agent)?,
+            message: MessageId(ChatSeq(id)),
+        },
+    )? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn search_mail(
+    py: Python<'_>,
+    query: String,
+    project: Option<u64>,
+    limit: u64,
+) -> PyResult<Py<PyAny>> {
+    match PyHost::block(
+        py,
+        PyRequest::Search {
+            query,
+            project: project.map(|id| MessageId(ChatSeq(id))),
+            limit,
+        },
+    )? {
+        PyReply::Search(hits) => {
+            let list = PyList::empty(py);
+            for hit in hits {
+                let entry = PyDict::new(py);
+                entry.set_item("project", hit.project.0.0)?;
+                entry.set_item("thread", hit.thread.0.0)?;
+                entry.set_item("message", hit.message.0.0)?;
+                entry.set_item("subject", hit.subject)?;
+                entry.set_item("excerpt", hit.excerpt)?;
+                list.append(entry)?;
+            }
+            Ok(list.into_any().unbind())
+        }
         _ => Err(unexpected()),
     }
 }
@@ -804,6 +897,15 @@ fn mail(py: Python<'_>, sender: &str, to: &str, text: String) -> PyResult<()> {
 fn resolve_agent(py: Python<'_>, prefix: &str) -> PyResult<String> {
     match PyHost::block(py, PyRequest::ResolveAgent(prefix.to_owned()))? {
         PyReply::Agent(agent) => Ok(agent.encoded().to_string()),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The full address of a local agent, even in another workset.
+#[pyfunction]
+fn agent_handle(py: Python<'_>, agent: &str) -> PyResult<Option<String>> {
+    match PyHost::block(py, PyRequest::AgentHandle(agent_id(agent)?))? {
+        PyReply::Handle(handle) => Ok(handle),
         _ => Err(unexpected()),
     }
 }
@@ -866,6 +968,15 @@ fn external_contacts(py: Python<'_>, agent: &str) -> PyResult<Py<PyAny>> {
             }
             Ok(out.into_any().unbind())
         }
+        _ => Err(unexpected()),
+    }
+}
+
+/// The newest local project with this name.
+#[pyfunction]
+fn project_named(py: Python<'_>, name: String) -> PyResult<Option<u64>> {
+    match PyHost::block(py, PyRequest::ProjectNamed(name))? {
+        PyReply::Project(project) => Ok(project.map(|id| id.0.0)),
         _ => Err(unexpected()),
     }
 }
@@ -992,6 +1103,7 @@ fn message_to_py<'py>(
     out.set_item("id", message.id.0.0)?;
     out.set_item("at", message.at.0)?;
     out.set_item("parent", message.parent.map(|parent| parent.0.0))?;
+    out.set_item("reply_to", message.reply_to.map(|id| id.0.0))?;
     out.set_item("sender", address_text(message.from))?;
     let mentions = message
         .mentions
@@ -1003,12 +1115,21 @@ fn message_to_py<'py>(
                     MentionKind::Ask => "ask",
                     MentionKind::Result => "result",
                     MentionKind::Fyi => "fyi",
+                    MentionKind::Direct => "direct",
                 },
             )
         })
         .collect::<Vec<_>>();
     out.set_item("mentions", mentions)?;
     out.set_item("text", text(&message.content))?;
+    out.set_item(
+        "edited",
+        matches!(message.revision, rho_agent_types::Revision::Edited { .. }),
+    )?;
+    out.set_item(
+        "deleted",
+        message.revision == rho_agent_types::Revision::Deleted,
+    )?;
     Ok(out)
 }
 

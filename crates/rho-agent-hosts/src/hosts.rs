@@ -20,8 +20,8 @@ pub enum HostStatus {
     /// Dialing, or connected but still waiting for the first `Ready`.
     Connecting,
     Online,
-    /// The transport has gone quiet but the same connection may still
-    /// recover.
+    /// Not answering for this long: the connection has gone quiet and may
+    /// still recover, or it dropped and the window is dialing again.
     Recovering(Duration),
     Disconnected(String),
 }
@@ -31,12 +31,13 @@ impl HostStatus {
         matches!(self, Self::Online | Self::Recovering(_))
     }
 
-    /// One word for listings, where the host's name carries the subject.
+    /// The state in the user's words, for wherever the host's name
+    /// carries the subject: `online`, `reconnecting · 12s`.
     pub fn label(&self) -> String {
         match self {
             Self::Connecting => "connecting".to_owned(),
             Self::Online => "online".to_owned(),
-            Self::Recovering(elapsed) => format!("recovering {}s", elapsed.as_secs()),
+            Self::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
             Self::Disconnected(reason) => format!("disconnected · {reason}"),
         }
     }

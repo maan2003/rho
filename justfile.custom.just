@@ -22,7 +22,7 @@ profile-agent-host OUTPUT="rho-agent-host-profile.bin" *ARGS="":
 check-split:
   #!/usr/bin/env bash
   set -euo pipefail
-  gui='^(gpui|rho-gui|rho-window|rho-slack|rho-transcript|rho-agents-view|rho-journal) |^rho-[a-z-]+ feature "client"'
+  gui='^(gpui|rho-gui|rho-window|rho-transcript|rho-agents-view|rho-journal|rho-browser|rho-browser-wayland) |^rho-[a-z-]+ feature "client"'
   status=0
   for manifest in agent-host/*/Cargo.toml; do
     package=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$manifest" | head -n1)

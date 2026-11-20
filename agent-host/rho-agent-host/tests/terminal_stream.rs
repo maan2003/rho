@@ -14,7 +14,22 @@ use rho_terminal::protocol::{
     WireScreen,
 };
 
+// As the worker this binary stands in for.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// The worker the host starts is this binary under this name, so it speaks
+/// this build's protocol, not that of one installed or left in the target
+/// directory.
+const WORKER: &str = "rho-agent-worker";
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .next()
+        .is_some_and(|program| std::path::Path::new(&program).ends_with(WORKER))
+    {
+        return rho_inference::worker_main();
+    }
     // These namespace-first binaries cannot use libtest, but nextest still
     // needs a libtest-compatible listing to run and time each binary.
     if std::env::args().any(|arg| arg == "--list") {
@@ -31,12 +46,15 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let state_dir = tempfile::tempdir()?;
+    let worker = state_dir.path().join(WORKER);
+    std::os::unix::fs::symlink(std::env::current_exe()?, &worker)?;
     // Keep the agent host's state (redb, sockets) away from the user's real
     // one, and give its terminals a shell that exists in a view.
     // SAFETY: top of main; no other threads exist yet.
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.path());
         std::env::set_var("SHELL", "bash");
+        std::env::set_var("RHO_AGENT_WORKER", &worker);
     }
     let result = tokio::runtime::Runtime::new()?
         .block_on(terminal_survives_detach_and_echoes(state_dir.path()));
@@ -115,6 +133,15 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     )
     .await?;
     wait_for_line(&mut stream, "e2e-done").await?;
+
+    // The terminal starts where the agent works, in its clone, not at the
+    // root of its workset.
+    write_frame(
+        &mut stream,
+        &TermClientFrame::Input(b"echo \"cwd=\"\"$PWD:end\"\r".to_vec()),
+    )
+    .await?;
+    wait_for_line(&mut stream, "cwd=/src/repo:end").await?;
 
     // The listing sees the running terminal.
     let list = rho_rpc::protocol::client::call(
@@ -243,9 +270,10 @@ async fn create_agent(
     if let Some(text) = message {
         rho_rpc::protocol::client::call(
             paths,
-            rho_chat::protocol::Post {
+            rho_mail::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,
+                reply_to: None,
                 mentions: vec![agent],
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: text.to_owned(),

@@ -113,11 +113,12 @@ def on_notebook(agent, ns):
 
     class Human:
         def send(self, text, kind):
-            mentions = [] if kind == "status" else [("user", kind)]
+            address = {} if kind == "status" else {"to": "user", "kind": kind}
             if thread:
-                _rho.post(agent.id, thread[0], text, mentions=mentions)
+                _rho.send_mail(agent.id, thread[0], text, **address)
             else:
-                thread.append(_rho.post(agent.id, None, text, mentions=mentions))
+                message, _unanswered = _rho.send_mail(agent.id, None, text, **address)
+                thread.append(message)
     ns["human"] = Human()
 
 hooks.on_notebook = on_notebook
@@ -135,7 +136,7 @@ static AGENTS: std::sync::LazyLock<
 /// answer its `_rho` calls from the store `agent` was registered with.
 pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
     use crate::ipc::workset::{PyReply, PyRequest};
-    use crate::store::{ChatWrite as _, NewMessage, StoreRead as _};
+    use crate::store::{MailWrite as _, NewMessage, StoreRead as _};
     AGENTS.lock().expect("poison").insert(agent, db.clone());
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     STARTED.get_or_init(|| {
@@ -172,9 +173,10 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                                 .collect(),
                         )
                     }
-                    PyRequest::Post {
+                    PyRequest::SendMail {
                         sender,
                         parent,
+                        reply_to,
                         mentions,
                         content,
                     } => {
@@ -182,18 +184,22 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         let mut write = db.write().await;
                         let message = NewMessage {
                             from: rho_agent_types::Address::Agent(sender),
+                            reply_to,
                             mentions,
                             content,
                         };
                         match write.post(rho_agent_types::UnixMs::now(), parent, message, None) {
                             Ok(id) => {
                                 write.commit();
-                                PyReply::Seq(id.0)
+                                PyReply::SentMail {
+                                    id,
+                                    unanswered: None,
+                                }
                             }
                             Err(error) => PyReply::Error(format!("{error:#}")),
                         }
                     }
-                    _ => PyReply::Error("tests answer only agents and chat".into()),
+                    _ => PyReply::Error("tests answer only agents and mail".into()),
                 })
             })
         });

@@ -648,6 +648,14 @@ pub fn enter_normal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut 
     })
 }
 
+/// Whether a modal editor is accepting Insert-mode input.
+pub fn editor_in_insert_mode(editor: &Entity<Editor>, cx: &App) -> bool {
+    editor
+        .read(cx)
+        .addon::<VimAddon>()
+        .is_some_and(|addon| addon.entity.read(cx).mode == Mode::Insert)
+}
+
 /// Returns whether an application-owned editor is still in a Deal mode.
 pub fn editor_in_deal_mode(editor: &Entity<Editor>, cx: &App) -> bool {
     editor

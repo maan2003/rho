@@ -70,6 +70,10 @@ pub struct RuntimeState {
     /// build, so fixes since reach it only when the workset restarts.
     #[senax(default)]
     pub stale: bool,
+    /// The stopped agent has not submitted a request, so changing runtime
+    /// kind will not split its provider-owned conversation.
+    #[senax(default)]
+    pub may_change_runtime_kind: bool,
 }
 
 impl RuntimeState {
@@ -78,6 +82,21 @@ impl RuntimeState {
             self.inference,
             InferenceState::Responding | InferenceState::Retrying { .. }
         ) || (!self.archived && self.running_tasks > 0)
+    }
+
+    /// What it is doing, in the word every screen says: the host stamps
+    /// when it started on this, and a client says it.
+    pub fn activity(&self) -> rho_agent_types::Activity {
+        use rho_agent_types::Activity;
+        match &self.inference {
+            InferenceState::Lost { .. } => Activity::Lost,
+            InferenceState::Failed { .. } => Activity::Failed,
+            InferenceState::Retrying { .. } => Activity::Retrying,
+            _ if self.awaiting_human => Activity::Waiting,
+            _ if self.is_working() => Activity::Working,
+            _ if self.archived => Activity::Archived,
+            _ => Activity::Idle,
+        }
     }
 }
 
@@ -89,9 +108,23 @@ pub enum InferenceState {
     Retrying {
         at: UnixMs,
         error: String,
+        /// When the first of these failures came: the runtime keeps one
+        /// streak across its attempts, including when an attempt is in flight.
+        since: UnixMs,
     },
     Failed {
         error: String,
+        /// When it failed. A failure the user retried into another can reach
+        /// the host as one status, so the time is the runtime's to say; none
+        /// from a runtime built before it said one.
+        since: Option<UnixMs>,
+    },
+    /// The process the agent ran in ended without a word: its host lost
+    /// it. Only the host says this, never the runtime itself.
+    Lost {
+        error: String,
+        /// When its host lost it.
+        since: Option<UnixMs>,
     },
 }
 

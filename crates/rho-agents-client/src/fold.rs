@@ -15,7 +15,7 @@ use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{RuntimeKind, Speaker};
 use crate::protocol::worksets::{AgentEntry, LogEvent};
-use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
+use crate::state::{FailureKind, UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// What an agent is: its directory entry and the kind of workset it is
 /// in. Never what has happened to it.
@@ -54,8 +54,13 @@ impl AgentIdentity {
     /// The chat message the agent was started from, when policy kept it as
     /// `origin`: the thread it works in, and the first thing it read.
     pub fn origin(&self) -> Option<MessageId> {
-        let id = self.prop(props::ORIGIN)?.strip_prefix("chat:")?;
-        Some(MessageId(ChatSeq(id.parse().ok()?)))
+        brief_origin(&self.entry.spec)
+    }
+
+    /// The repository its workset was made on, as the user named it, when
+    /// it was cloned from one.
+    pub fn repository(&self) -> Option<&str> {
+        self.prop(props::REPO)
     }
 
     /// Whether the user manages the agent: one no other agent made.
@@ -84,7 +89,7 @@ impl AgentIdentity {
             WorksetKind::Isolated => camino::Utf8Path::new("/src"),
             WorksetKind::Host { cwd } => cwd.as_path(),
         };
-        let cwd = self.prop(props::CWD).map_or(start, camino::Utf8Path::new);
+        let cwd = rho_agent_types::agent_cwd(&self.entry.spec.props).unwrap_or(start);
         Place {
             cwd: cwd.to_owned(),
             workset: match self.kind {
@@ -175,6 +180,10 @@ pub struct TranscriptFold {
     queue: Vec<(Wpos, UiBlock)>,
     /// The agent stopped on an error and nobody has written since.
     errored: bool,
+    origin: Option<MessageId>,
+    runtime_label: Option<String>,
+    /// The next successful response needs to close the visible error run.
+    after_error: bool,
     /// What the last reply said the context holds, and where it said it.
     context_used: Option<(Wpos, u64)>,
     /// Every reply's usage, summed, and the model the newest one named.
@@ -197,6 +206,15 @@ pub struct FoldDelta {
     pub usage: UiAgentUsage,
 }
 
+fn brief_origin(spec: &crate::protocol::worksets::SpecView) -> Option<MessageId> {
+    let id = spec
+        .props
+        .get(props::ORIGIN)?
+        .trim()
+        .strip_prefix("chat:")?;
+    Some(MessageId(ChatSeq(id.parse().ok()?)))
+}
+
 impl TranscriptFold {
     pub fn new(agent: AgentId, rows: &[(Wpos, LogEvent)]) -> Self {
         let mut fold = Self {
@@ -207,6 +225,9 @@ impl TranscriptFold {
             unanswered: 0,
             queue: Vec::new(),
             errored: false,
+            origin: None,
+            runtime_label: None,
+            after_error: false,
             context_used: None,
             usage: AgentUsageBucket::default(),
             usage_model: String::new(),
@@ -219,6 +240,41 @@ impl TranscriptFold {
     }
 
     fn push(&mut self, told_at: Option<Wpos>, block: UiBlock) {
+        self.after_error |= matches!(block, UiBlock::Failure { .. });
+        // The same notice again, such as a retry failing as the last one
+        // did, is counted on the one before.
+        if let UiBlock::Notice { text, times } = &block
+            && let Some(last) = self.blocks.last_mut()
+            && matches!(&**last, UiBlock::Notice { text: said, .. } if said == text)
+        {
+            if let UiBlock::Notice { times: said, .. } = Arc::make_mut(last) {
+                *said += times;
+            }
+            self.touch(self.blocks.len() - 1);
+            return;
+        }
+        if let UiBlock::Failure {
+            kind,
+            text,
+            times,
+            at,
+            ..
+        } = &block
+            && let Some(last) = self.blocks.last_mut()
+            && matches!(&**last, UiBlock::Failure { kind: was, text: said, .. } if was == kind && said == text)
+        {
+            if let UiBlock::Failure {
+                times: said,
+                at: latest,
+                ..
+            } = Arc::make_mut(last)
+            {
+                *said += times;
+                *latest = *at;
+            }
+            self.touch(self.blocks.len() - 1);
+            return;
+        }
         // The queue is drawn after the blocks, so a block landing moves
         // every queued row along with it.
         self.touch(self.blocks.len());
@@ -273,38 +329,102 @@ impl TranscriptFold {
     /// Each reported call is marked reported, its task still running.
     /// A request answered what was open: every call since the last one that
     /// did. A call Rho refused ended on its own, and one cut off went with it.
-    fn answer_calls(&mut self, timing: Option<&rho_agent_types::CallTiming>) {
+    fn answer_calls(&mut self, timing: Option<&rho_agent_types::CallTiming>, output: &str) {
+        let reported = (self.unanswered..self.blocks.len()).rev().find(|&index| {
+            matches!(&*self.blocks[index], UiBlock::Tool(tool)
+                if timing.is_none_or(|timing| tool.id == timing.call.as_str()))
+        });
         for index in self.unanswered..self.blocks.len() {
             if matches!(&*self.blocks[index], UiBlock::Tool(_)) {
                 self.report_block(index);
-                if let (Some(timing), UiBlock::Tool(tool)) =
-                    (timing, Arc::make_mut(&mut self.blocks[index]))
+                let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) else {
+                    continue;
+                };
+                if let Some(timing) = timing
                     && tool.id == timing.call.as_str()
                 {
                     tool.timing = timing.timing;
+                }
+                if Some(index) == reported && !output.is_empty() {
+                    tool.output = Some(output.to_owned());
                 }
             }
         }
         self.unanswered = self.blocks.len();
     }
 
+    /// A call whose cell ended or was cancelled stays so once reported.
     fn report_block(&mut self, index: usize) {
         self.touch(index);
-        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
+            && !matches!(
+                tool.status,
+                UiToolStatus::Success | UiToolStatus::Error | UiToolStatus::Cancelled
+            )
+        {
             tool.status = UiToolStatus::Reported;
-            tool.started_at = None;
             tool.finished_at = None;
         }
     }
 
-    fn report_calls(&mut self, calls: &[String]) {
-        for id in calls {
-            if let Some(index) = self
+    /// The call's cell ended: `ok` or `error`, and how long it ran. One the
+    /// user cancelled stays cancelled.
+    fn end_cell(&mut self, end: &rho_agent_types::CellEnd) {
+        let Some(index) = self.blocks.iter().rposition(|block| {
+            matches!(&**block, UiBlock::Tool(tool)
+                if tool.id == end.call.as_str() && tool.status != UiToolStatus::Cancelled)
+        }) else {
+            return;
+        };
+        self.touch(index);
+        if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+            tool.status = match end.failed {
+                true => UiToolStatus::Error,
+                false => UiToolStatus::Success,
+            };
+            tool.finished_at = Some(end.at);
+            self.after_error |= end.failed;
+        }
+    }
+
+    /// Every call still running is over. Only a running one is copied out
+    /// of its sharing.
+    fn cancel_running(&mut self) {
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
+                && let UiBlock::Tool(tool) = Arc::make_mut(block)
+            {
+                tool.status = UiToolStatus::Cancelled;
+                self.dirty_from = Some(self.dirty_from.map_or(index, |held| held.min(index)));
+            }
+        }
+    }
+
+    fn report_calls(&mut self, calls: &[crate::protocol::worksets::CallView], at: UnixMs) {
+        for call in calls {
+            let Some(index) = self
                 .blocks
                 .iter()
-                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id))
-            {
-                self.report_block(index);
+                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == call.id))
+            else {
+                continue;
+            };
+            self.report_block(index);
+            if let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index]) {
+                if !call.output.is_empty() {
+                    tool.output = Some(call.output.clone());
+                }
+                if tool.status == UiToolStatus::Reported
+                    && let Some(failed) = call.failed
+                {
+                    tool.status = if failed {
+                        UiToolStatus::Error
+                    } else {
+                        UiToolStatus::Success
+                    };
+                    tool.finished_at = Some(at);
+                    self.after_error |= failed;
+                }
             }
         }
     }
@@ -333,6 +453,12 @@ impl TranscriptFold {
         true
     }
 
+    fn successful_response(&mut self, pos: Wpos) {
+        if std::mem::take(&mut self.after_error) {
+            self.push(Some(pos), UiBlock::Responded);
+        }
+    }
+
     fn tell_row(&mut self, pos: Wpos, event: &LogEvent) {
         match event {
             LogEvent::CompactionRequested { .. } => {
@@ -341,6 +467,7 @@ impl TranscriptFold {
                     pos,
                     UiBlock::Notice {
                         text: "compacting context".to_owned(),
+                        times: 1,
                     },
                 ));
             }
@@ -349,6 +476,7 @@ impl TranscriptFold {
                 answers,
                 compaction,
                 timing,
+                output,
                 ..
             } => {
                 if !inputs.is_empty() {
@@ -356,6 +484,8 @@ impl TranscriptFold {
                 }
                 for input in inputs {
                     match input.message {
+                        // The brief has its own pinned row, not a second read here.
+                        Some(message) if Some(message) == self.origin => {}
                         // A message is still a message: a rewind of the
                         // turn it started does not unsay what was written.
                         Some(message) => self.push(
@@ -370,6 +500,7 @@ impl TranscriptFold {
                             Some(pos),
                             UiBlock::Notice {
                                 text: input.text.clone(),
+                                times: 1,
                             },
                         ),
                     }
@@ -381,14 +512,27 @@ impl TranscriptFold {
                         Some(pos),
                         UiBlock::Notice {
                             text: "compacting context".to_owned(),
+                            times: 1,
                         },
                     );
                 }
                 if *answers {
-                    self.answer_calls(timing.as_ref());
+                    self.answer_calls(timing.as_ref(), output);
                 }
             }
-            LogEvent::CallsEnded { calls, .. } => self.report_calls(calls),
+            LogEvent::MailWritten {
+                message, version, ..
+            } => {
+                self.push(
+                    None,
+                    UiBlock::MailWritten {
+                        message: *message,
+                        version: *version,
+                    },
+                );
+            }
+            LogEvent::CellEnded { end, .. } => self.end_cell(end),
+            LogEvent::CallsEnded { calls, at, .. } => self.report_calls(calls, *at),
             LogEvent::Replied {
                 items,
                 compacted,
@@ -409,6 +553,7 @@ impl TranscriptFold {
                     self.usage.requests += 1;
                     self.usage_model = usage.model.clone();
                 }
+                self.successful_response(pos);
                 for item in items {
                     let mut block = crate::store::block(item);
                     if let UiBlock::Tool(tool) = &mut block {
@@ -421,12 +566,16 @@ impl TranscriptFold {
                         Some(pos),
                         UiBlock::Notice {
                             text: "compacted".to_owned(),
+                            times: 1,
                         },
                     );
                 }
             }
             // Claude's transcript is mirrored message by message.
             LogEvent::ClaudeMessage { speaker, text, .. } => {
+                if *speaker == Speaker::Assistant {
+                    self.successful_response(pos);
+                }
                 self.push(
                     Some(pos),
                     match speaker {
@@ -440,21 +589,28 @@ impl TranscriptFold {
                     },
                 );
             }
-            LogEvent::Stopped { error, .. } => {
-                self.errored = true;
-                // A call the agent never answered is over too. Only a
-                // running one is copied out of its sharing.
-                for block in &mut self.blocks {
-                    if matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Running)
-                        && let UiBlock::Tool(tool) = Arc::make_mut(block)
-                    {
-                        tool.status = UiToolStatus::Cancelled;
-                    }
-                }
+            LogEvent::Cancelled { .. } => {
+                self.cancel_running();
                 self.push(
                     Some(pos),
                     UiBlock::Notice {
+                        text: "you cancelled the request".to_owned(),
+                        times: 1,
+                    },
+                );
+            }
+            LogEvent::Stopped { error, at, .. } => {
+                self.errored = true;
+                // A call the agent never answered is over too.
+                self.cancel_running();
+                self.push(
+                    Some(pos),
+                    UiBlock::Failure {
+                        kind: FailureKind::Stopped,
                         text: error.clone(),
+                        times: 1,
+                        since: *at,
+                        at: *at,
                     },
                 );
             }
@@ -465,6 +621,7 @@ impl TranscriptFold {
                 text,
                 error,
                 retrying,
+                at,
                 ..
             } => {
                 if !text.is_empty() {
@@ -479,8 +636,14 @@ impl TranscriptFold {
                 if *retrying {
                     self.push(
                         Some(pos),
-                        UiBlock::Notice {
-                            text: format!("temporary inference error: {error}; retrying"),
+                        UiBlock::Failure {
+                            kind: FailureKind::Retrying {
+                                runtime: self.runtime_label.clone(),
+                            },
+                            text: error.clone(),
+                            times: 1,
+                            since: *at,
+                            at: *at,
                         },
                     );
                 }
@@ -501,15 +664,23 @@ impl TranscriptFold {
                         self.told_at.push(told);
                     }
                 }
+                self.after_error = self.blocks.iter().rev()
+                    .take_while(|block| !matches!(&***block, UiBlock::Responded))
+                    .any(|block| matches!(&**block, UiBlock::Failure { .. })
+                        || matches!(&**block, UiBlock::Tool(tool) if tool.status == UiToolStatus::Error));
                 self.queue.retain(|(queued_at, ..)| queued_at < to);
                 if self.context_used.is_some_and(|(said_at, _)| said_at >= *to) {
                     self.context_used = None;
                 }
             }
-            LogEvent::WorksetCreated { .. }
-            | LogEvent::Evaluated { .. }
-            | LogEvent::AgentCreated { .. }
-            | LogEvent::AgentChanged { .. } => {}
+            LogEvent::AgentCreated { spec, .. } => {
+                self.origin = brief_origin(spec);
+                self.runtime_label = Some(spec.runtime_label());
+            }
+            LogEvent::AgentChanged { spec, .. } => {
+                self.runtime_label = Some(spec.runtime_label());
+            }
+            LogEvent::WorksetCreated { .. } | LogEvent::Evaluated { .. } => {}
         }
     }
 
@@ -542,7 +713,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::transcript::{ArgumentsFormat, Item, Usage};
-    use crate::protocol::worksets::InputView;
+    use crate::protocol::worksets::{CallView, InputView};
     use crate::state::UiTool;
 
     fn agent(n: u64) -> AgentId {
@@ -578,6 +749,7 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -589,6 +761,7 @@ mod tests {
             answers: true,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
     }
@@ -741,7 +914,11 @@ mod tests {
             ),
             LogEvent::CallsEnded {
                 agent: me(),
-                calls: vec!["call-1".to_owned()],
+                calls: vec![CallView {
+                    id: "call-1".to_owned(),
+                    output: "permission denied".to_owned(),
+                    failed: Some(true),
+                }],
                 at: UnixMs(4),
             },
             replied(
@@ -759,7 +936,8 @@ mod tests {
             ),
         ]);
         assert_eq!(state.status, UiAgentStatus::Idle);
-        assert_eq!(state.blocks.len(), 3);
+        assert_eq!(state.blocks.len(), 4);
+        assert!(matches!(*state.blocks[2], UiBlock::Responded));
         assert_eq!(
             *state.blocks[0],
             UiBlock::Delivered {
@@ -768,8 +946,10 @@ mod tests {
             }
         );
         let tool = only_tool(&state);
-        assert_eq!(tool.status, UiToolStatus::Reported);
-        assert!(matches!(*state.blocks[2], UiBlock::AssistantMessage { .. }));
+        assert_eq!(tool.status, UiToolStatus::Error);
+        assert_eq!(tool.output.as_deref(), Some("permission denied"));
+        assert_eq!(tool.finished_at, Some(UnixMs(4)));
+        assert!(matches!(*state.blocks[3], UiBlock::AssistantMessage { .. }));
         assert_eq!(state.usage.total.output_tokens, 12);
         assert_eq!(state.usage.total.requests, 2);
         assert_eq!(state.usage.provider, "sol");
@@ -803,8 +983,84 @@ mod tests {
             answers,
             compaction: false,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         }
+    }
+
+    fn cell_ended(call: &str, at: u64, failed: bool) -> LogEvent {
+        LogEvent::CellEnded {
+            agent: me(),
+            end: rho_agent_types::CellEnd {
+                call: rho_agent_types::transcript::ExecId::try_from(call).unwrap(),
+                at: UnixMs(at),
+                failed,
+            },
+            at: UnixMs(at + 1),
+        }
+    }
+
+    /// A cell that ended says how and how long it ran, whether a request
+    /// answered it first, after, or never (the turn ended with it). A
+    /// request does not undo it; one still running when answered is only
+    /// reported, and a cancelled one stays cancelled.
+    #[test]
+    fn a_call_says_how_its_cell_ended_and_how_long_it_ran() {
+        use UiToolStatus::{Cancelled, Error, Reported, Success};
+        let mut fold = TranscriptFold::new(
+            me(),
+            &[
+                // Ended, then answered.
+                (Wpos(0), replied(vec![call("one")], None, None, 1_000)),
+                (Wpos(1), cell_ended("one", 1_240, false)),
+                (Wpos(2), request_answering(true, 1_300)),
+                // Answered while running, then ended.
+                (Wpos(3), replied(vec![call("two")], None, None, 2_000)),
+                (Wpos(4), request_answering(true, 2_100)),
+                (Wpos(5), cell_ended("two", 9_000, true)),
+                // Ended the turn: no request follows.
+                (Wpos(6), replied(vec![call("three")], None, None, 10_000)),
+                (Wpos(7), cell_ended("three", 10_050, false)),
+                // Answered, still running.
+                (Wpos(8), replied(vec![call("four")], None, None, 11_000)),
+                (Wpos(9), request_answering(true, 11_100)),
+            ],
+        );
+        assert_eq!(tool_statuses(&fold), [Success, Error, Success, Reported]);
+        let times: Vec<_> = fold
+            .state()
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some((tool.started_at, tool.finished_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            times,
+            [
+                (Some(UnixMs(1_000)), Some(UnixMs(1_240))),
+                (Some(UnixMs(2_000)), Some(UnixMs(9_000))),
+                (Some(UnixMs(10_000)), Some(UnixMs(10_050))),
+                (Some(UnixMs(11_000)), None),
+            ]
+        );
+        // An end that names no call ends nothing; a cancelled call stays so.
+        fold.tell(Wpos(10), &cell_ended("nine", 11_500, false));
+        assert_eq!(tool_statuses(&fold), [Success, Error, Success, Reported]);
+        fold.tell(Wpos(11), &replied(vec![call("five")], None, None, 12_000));
+        fold.tell(
+            Wpos(12),
+            &LogEvent::Cancelled {
+                agent: me(),
+                at: UnixMs(12_100),
+            },
+        );
+        fold.tell(Wpos(13), &cell_ended("five", 12_200, true));
+        assert_eq!(
+            tool_statuses(&fold),
+            [Success, Error, Success, Reported, Cancelled]
+        );
     }
 
     /// A request that answers closes every call since the last one that did,
@@ -825,7 +1081,11 @@ mod tests {
             &mut fold,
             LogEvent::CallsEnded {
                 agent: me(),
-                calls: vec!["refused".to_owned()],
+                calls: vec![CallView {
+                    id: "refused".to_owned(),
+                    output: String::new(),
+                    failed: None,
+                }],
                 at: UnixMs(3),
             },
         );
@@ -971,6 +1231,7 @@ mod tests {
             answers: true,
             compaction: true,
             timing: None,
+            output: String::new(),
             at: UnixMs(at),
         };
         let notices = |state: UiAgentState| {
@@ -1011,6 +1272,78 @@ mod tests {
     /// What the model said before its request failed stays on screen:
     /// a retry says so after it, a final failure is the stop's notice.
     #[test]
+    fn separately_sent_mail_survives_a_rewind_of_the_model_turn() {
+        let first = MessageId(rho_agent_types::ChatSeq(91));
+        let later = MessageId(rho_agent_types::ChatSeq(24));
+        let result = told(vec![
+            LogEvent::MailWritten {
+                agent: me(),
+                message: first,
+                version: Some(first.0),
+                at: UnixMs(6),
+            },
+            LogEvent::MailWritten {
+                agent: me(),
+                message: later,
+                version: Some(later.0),
+                at: UnixMs(6),
+            },
+            LogEvent::Rewound {
+                agent: me(),
+                to: Wpos(1),
+                at: UnixMs(8),
+            },
+        ]);
+        let messages: Vec<_> = result
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::MailWritten { message, .. } => Some(*message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, [first, later]);
+    }
+
+    #[test]
+    fn a_brief_does_not_reappear_as_a_delivered_mail() {
+        let mut props = rho_agent_types::Props::new();
+        props.insert("origin".into(), "chat:27".into());
+        let spec = crate::protocol::worksets::SpecView {
+            runtime: RuntimeKind::Rho,
+            model: "sol".to_owned(),
+            effort: "low".to_owned(),
+            props,
+        };
+        let input = |number, text: &str| crate::protocol::worksets::InputView {
+            message: Some(MessageId(ChatSeq(number))),
+            text: text.into(),
+            role: rho_agent_types::Role::User,
+        };
+        let state = told(vec![
+            LogEvent::AgentCreated {
+                agent: me(),
+                spec,
+                at: UnixMs(1),
+            },
+            LogEvent::Request {
+                agent: me(),
+                inputs: vec![input(27, "brief"), input(28, "same thread, new mail")],
+                answers: false,
+                compaction: false,
+                timing: None,
+                output: String::new(),
+                at: UnixMs(2),
+            },
+        ]);
+        assert_eq!(state.blocks.len(), 1);
+        assert!(
+            matches!(&*state.blocks[0], UiBlock::Delivered { message, text }
+            if *message == MessageId(ChatSeq(28)) && text == "same thread, new mail")
+        );
+    }
+
+    #[test]
     fn a_failed_request_keeps_what_was_said() {
         let state = told(vec![
             LogEvent::Failed {
@@ -1034,13 +1367,74 @@ mod tests {
                     text: "half an answer".to_owned(),
                     phase: None
                 }),
-                Arc::new(UiBlock::Notice {
-                    text: "temporary inference error: overloaded; retrying".to_owned()
+                Arc::new(UiBlock::Failure {
+                    kind: FailureKind::Retrying { runtime: None },
+                    text: "overloaded".to_owned(),
+                    times: 1,
+                    since: UnixMs(2),
+                    at: UnixMs(2),
                 }),
-                Arc::new(UiBlock::Notice {
-                    text: "quota".to_owned()
+                Arc::new(UiBlock::Failure {
+                    kind: FailureKind::Stopped,
+                    text: "quota".to_owned(),
+                    times: 1,
+                    since: UnixMs(3),
+                    at: UnixMs(3),
                 }),
             ]
+        );
+    }
+
+    /// A cancel is said where it happened, and ends the call that ran.
+    #[test]
+    fn a_cancel_is_said_and_ends_what_ran() {
+        let state = told(vec![
+            replied(vec![call("long")], None, None, 1),
+            LogEvent::Cancelled {
+                agent: me(),
+                at: UnixMs(2),
+            },
+        ]);
+        assert_eq!(only_tool(&state).status, UiToolStatus::Cancelled);
+        assert_eq!(
+            *state.blocks[1],
+            UiBlock::Notice {
+                text: "you cancelled the request".to_owned(),
+                times: 1,
+            }
+        );
+        assert_ne!(state.status, UiAgentStatus::Error, "a cancel is no failure");
+    }
+
+    /// A retry that fails as the one before did reads once, counted; a
+    /// different error, or the same after something else, reads again.
+    #[test]
+    fn the_same_error_again_is_counted_on_one_line() {
+        let failed = |error: &str, at: u64| LogEvent::Failed {
+            agent: me(),
+            text: String::new(),
+            error: error.to_owned(),
+            retrying: true,
+            at: UnixMs(at),
+        };
+        let state = told(vec![
+            failed("overloaded", 1),
+            failed("overloaded", 2),
+            failed("overloaded", 3),
+            failed("timed out", 4),
+            failed("overloaded", 5),
+        ]);
+        let notices: Vec<_> = state
+            .blocks
+            .iter()
+            .map(|block| match &**block {
+                UiBlock::Failure { text, times, .. } => (text.as_str(), *times),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [("overloaded", 3), ("timed out", 1), ("overloaded", 1),]
         );
     }
 

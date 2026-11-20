@@ -21,11 +21,11 @@ use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
-mod chat;
 pub mod debug;
 mod desktop;
 mod gccp;
 mod host;
+mod mail;
 mod realtime;
 mod secret_store;
 mod transcript;
@@ -1286,10 +1286,14 @@ impl Services {
         Ok(resolved)
     }
 
-    /// Where the agent works: its workset's root.
+    /// Where the agent works, as it sees it: its own directory, else its
+    /// workset's root. A terminal or shell beside it starts there.
     fn cwd_of(&self, agent: AgentId) -> anyhow::Result<Utf8PathBuf> {
         let read = self.db.read();
         let head = read.agent(agent).context("no such agent")?;
+        if let Some(cwd) = rho_agent_types::agent_cwd(&head.spec.props) {
+            return Ok(cwd.to_owned());
+        }
         let workset = read.workset(head.workset).context("no such workset")?;
         Ok(rho_agent::host::pool::workset_root(&workset.kind))
     }
@@ -1312,7 +1316,7 @@ where
         Protocol::Agents => anyhow::bail!("the agents protocol is now the worksets protocol"),
         Protocol::Ledger => anyhow::bail!("the old ledger protocol is no longer supported"),
         Protocol::Worksets => agents::serve(services, open.unpack()?, reader, writer).await,
-        Protocol::Chat => chat::serve(services, open.unpack()?, reader, writer).await,
+        Protocol::Mail => mail::serve(services, open.unpack()?, reader, writer).await,
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,

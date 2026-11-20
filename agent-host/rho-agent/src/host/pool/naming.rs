@@ -14,7 +14,7 @@ use std::time::Duration;
 use rho_agent_types::{MessageId, UnixMs};
 
 use super::AgentPool;
-use crate::store::{ChatRead as _, ChatWrite as _};
+use crate::store::{MailRead as _, MailWrite as _};
 
 const INSTRUCTIONS: &str = "You name chat threads. The input is the first two messages of a \
 thread. Answer with a name for the thread: at most six words that say what it is about, in \

@@ -93,11 +93,6 @@ pub enum NodeIdentity {
     Page {
         uuid: [u8; 16],
     },
-    Slack {
-        workspace: String,
-        channel: String,
-        thread: Option<String>,
-    },
     PullRequest {
         repo: String,
         number: u64,
@@ -112,9 +107,7 @@ pub enum NodeIdentity {
         machine_seed: u64,
         topic: u64,
     },
-    /// Anything with an address, by its key: `thread:<seed>/<id>`,
-    /// `slack:<workspace>/<channel>`. Later than every typed variant, so
-    /// their records still decode.
+    /// Anything with an address, by its key, such as `thread:<seed>/<id>`.
     Address {
         key: String,
     },
@@ -269,24 +262,11 @@ pub enum SurfaceIdentity {
     ZulipNarrow {
         label: String,
     },
-    SlackList,
-    SlackConversation {
-        thread: SlackThread,
-    },
     Image {
         title: String,
     },
     Dashboard,
     Usage,
-    /// The places one Slack search found. The query is the identity: two
-    /// searches are the same surface drawn twice, and the journal should say
-    /// which one the reader was reading.
-    SlackSearch {
-        query: String,
-    },
-    SlackInventory {
-        name: String,
-    },
     /// One topic, by its host's database and its id there.
     Topic {
         machine_seed: u64,
@@ -295,36 +275,6 @@ pub enum SurfaceIdentity {
     /// The streams and their topics. Last: journals decode by variant
     /// order.
     Topics,
-}
-
-/// Who ignored the thread: this rho, or Slack telling rho that another
-/// client did.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum IgnoredBy {
-    Rho,
-    Slack,
-}
-
-/// A Slack thread as the journal names it: the workspace and conversation a
-/// person would recognise, plus the thread's own key so two threads in one
-/// conversation stay distinct.
-#[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-pub struct SlackThread {
-    pub workspace: String,
-    pub conversation: String,
-    pub thread: String,
 }
 
 #[derive(
@@ -470,18 +420,9 @@ pub struct DealerPolicySnapshot {
     pub queue_floor: f64,
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
+    /// The expiry of result cards in older sessions; zero when expiry is
+    /// disabled.
     pub fyi_reply_pace_days: f64,
-    pub thread_reply_head_start: f64,
-    /// Where a channel's own unread traffic starts, and what being
-    /// answered by somebody else takes off it. Added after the first
-    /// journals were written, so a session recorded before the channel
-    /// curve existed decodes with both at zero, which is what it had.
-    #[senax(default)]
-    #[serde(default)]
-    pub channel_traffic_head_start: f64,
-    #[senax(default)]
-    #[serde(default)]
-    pub channel_answered_drop: f64,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,
@@ -546,60 +487,6 @@ pub enum Event {
     AgentSelected {
         agent_id: Option<String>,
     },
-    /// The Slack session came up, went away, gave a thread a node, or
-    /// carried the user's own reply. The thread is named, not numbered:
-    /// the record has to be readable a month later.
-    SlackConnected {
-        workspace: String,
-    },
-    SlackDisconnected {
-        workspace: String,
-        reason: String,
-    },
-    /// Retired: nothing writes this. A thread that starts to matter needs
-    /// no node -- a Slack unit is a virtual node and rho writes nothing on
-    /// attention -- so the event it recorded no longer happens. The
-    /// variant stays because a journal already on disk decodes by variant
-    /// order, and taking one out of the middle would misread every file
-    /// that has one.
-    SlackThreadBound {
-        thread: SlackThread,
-        node_id: NodeIdentity,
-    },
-    SlackReplied {
-        thread: SlackThread,
-    },
-    /// The thread stopped being the user's: `x` here, which tells Slack, or
-    /// an unfollow in another client, which Slack tells rho.
-    SlackThreadIgnored {
-        thread: SlackThread,
-        by: IgnoredBy,
-    },
-    /// The old backlog marked read in one go: the cutoff the user gave and
-    /// how much it touched. The verdicts it wrote are undone as a batch,
-    /// which is what `SlackMarkReadBeforeUndone` records; the marking
-    /// itself is Slack's state and is not reversed.
-    SlackMarkedReadBefore {
-        cutoff: String,
-        conversations: usize,
-        threads: usize,
-    },
-    SlackMarkReadBeforeUndone {
-        cards: usize,
-    },
-    /// The reader rewrote something they had already sent: `e` (or `up` on
-    /// an empty composer) and then `enter`, which is `chat.update` on
-    /// Slack's side.
-    SlackMessageEdited {
-        conversation: String,
-        ts: String,
-    },
-    /// A picture sent with a message: `files.getUploadURLExternal` and
-    /// `files.completeUploadExternal` on Slack's side.
-    SlackFileSent {
-        conversation: String,
-        bytes: u64,
-    },
     MinibufferOpened {
         prompt: String,
     },
@@ -630,8 +517,7 @@ pub enum Event {
         skip_until: Option<String>,
         occurred_at: String,
     },
-    /// A local verdict reversal. External effects initiated by the original
-    /// verdict (for example, marking a Slack thread read) are not reversed.
+    /// A verdict retracted by the user.
     VerdictUndone {
         card: DealerCardIdentity,
         verdict: DealerVerdict,
@@ -686,8 +572,8 @@ pub enum Event {
         reason: String,
         occurred_at: String,
     },
-    /// One key the user pressed while talking to an agent or on Slack, as
-    /// GPUI resolved it: what it was bound to and where it landed.
+    /// One key the user pressed, as GPUI resolved it: what it was bound to
+    /// and where it landed.
     Key {
         key: String,
         text: Option<String>,
@@ -730,11 +616,6 @@ pub enum Event {
         y: f32,
         clicks: usize,
         surface: Option<SurfaceIdentity>,
-    },
-    /// What Slack changed about a unit that wants the user: raised, a newer
-    /// message, answered, or let go in another client.
-    SlackChanged {
-        change: String,
     },
 }
 
@@ -799,15 +680,6 @@ impl Event {
             Self::OverviewOpened => "overview_opened",
             Self::AgentOpened { .. } => "agent_opened",
             Self::AgentSelected { .. } => "agent_selected",
-            Self::SlackConnected { .. } => "slack_connected",
-            Self::SlackDisconnected { .. } => "slack_disconnected",
-            Self::SlackThreadBound { .. } => "slack_thread_bound",
-            Self::SlackReplied { .. } => "slack_replied",
-            Self::SlackThreadIgnored { .. } => "slack_thread_ignored",
-            Self::SlackMarkedReadBefore { .. } => "slack_marked_read_before",
-            Self::SlackMarkReadBeforeUndone { .. } => "slack_mark_read_before_undone",
-            Self::SlackMessageEdited { .. } => "slack_message_edited",
-            Self::SlackFileSent { .. } => "slack_file_sent",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",
@@ -828,7 +700,6 @@ impl Event {
             Self::AgentChanged { .. } => "agent_changed",
             Self::MenuRan { .. } => "menu_ran",
             Self::Click { .. } => "click",
-            Self::SlackChanged { .. } => "slack_changed",
         }
     }
 }
@@ -1049,6 +920,18 @@ pub fn dump(
     // Exclusively: the journal is tables in the client's one database, and
     // a GUI holding it is a GUI whose rows are still being written.
     let db = rho_db::client::open(state_dir)?;
+    let read = db.read();
+    let needs_scrub = read.has_table(STORED_EVENTS.name()) && !read.has_table(SCRUBBED.name());
+    drop(read);
+    if needs_scrub {
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(async {
+                let mut write = db.write().await;
+                scrub_secret_inputs(&mut write);
+                write.commit();
+            });
+    }
     dump_db(&db, kind, output)
 }
 
@@ -1176,23 +1059,21 @@ mod tests {
         assert!(error.to_string().contains("exit the GUI"));
     }
 
-    /// A journal written before the channel curve existed still decodes.
-    /// The fields are new, so the run that wrote those bytes had no
-    /// channel curve, and zero is exactly what it had.
+    /// A session recorded with the retired channel policy still decodes.
     #[test]
-    fn a_policy_written_before_the_channel_curve_still_decodes() {
+    fn a_policy_with_retired_fields_still_decodes() {
         use bytes::BytesMut;
         use senax_encoder::{Decoder as _, Encoder as _};
 
-        /// The struct as it stood before the two channel fields, so this
-        /// is the shape of the bytes already on disk and not a mock of it.
         #[derive(senax_encoder::Encode)]
-        struct WithoutTheChannelCurve {
+        struct OldPolicy {
             queue_floor: f64,
             blocked_reply_head_start: f64,
             blocked_reply_slope_per_day: f64,
             fyi_reply_pace_days: f64,
             thread_reply_head_start: f64,
+            channel_traffic_head_start: f64,
+            channel_answered_drop: f64,
             skip_cooldown_minutes: i64,
             lamp_threshold: f64,
             chime_threshold: f64,
@@ -1201,12 +1082,14 @@ mod tests {
         }
 
         let mut buffer = BytesMut::new();
-        WithoutTheChannelCurve {
+        OldPolicy {
             queue_floor: -1.0,
             blocked_reply_head_start: 1.0,
             blocked_reply_slope_per_day: 12.0,
             fyi_reply_pace_days: 3.0,
             thread_reply_head_start: 1.1,
+            channel_traffic_head_start: 0.1,
+            channel_answered_drop: 0.4,
             skip_cooldown_minutes: 15,
             lamp_threshold: 2.0,
             chime_threshold: 3.0,
@@ -1218,9 +1101,8 @@ mod tests {
 
         let mut bytes = buffer.freeze();
         let policy = DealerPolicySnapshot::decode(&mut bytes).unwrap();
-        assert_eq!(policy.thread_reply_head_start, 1.1);
-        assert_eq!(policy.channel_traffic_head_start, 0.0);
-        assert_eq!(policy.channel_answered_drop, 0.0);
+        assert_eq!(policy.fyi_reply_pace_days, 3.0);
+        assert_eq!(policy.skip_cooldown_minutes, 15);
     }
 
     #[test]
@@ -1235,9 +1117,6 @@ mod tests {
                 blocked_reply_head_start: 2.0,
                 blocked_reply_slope_per_day: 3.0,
                 fyi_reply_pace_days: 4.0,
-                thread_reply_head_start: 5.0,
-                channel_traffic_head_start: 11.0,
-                channel_answered_drop: 12.0,
                 skip_cooldown_minutes: 6,
                 lamp_threshold: 7.0,
                 chime_threshold: 8.0,
@@ -1428,9 +1307,8 @@ mod tests {
                 write.commit();
             });
         }
-        let journal = Journal::open(dir.path()).unwrap();
         let mut output = Vec::new();
-        journal.dump(None, &mut output).unwrap();
+        dump(dir.path(), None, &mut output).unwrap();
         let dumped = String::from_utf8(output).unwrap();
         assert!(!dumped.contains("xoxc-1"), "{dumped}");
         assert!(!dumped.contains("cookie\""), "{dumped}");

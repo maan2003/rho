@@ -170,41 +170,44 @@ impl Log {
 /// process's descriptor limit.
 const ENDED_LOGS_KEPT: usize = 1000;
 
-/// Ended commands that still hold a log file, oldest end first.
-struct EndedLogs {
+/// A scope of ended commands that still hold a log file, oldest end first.
+/// Every notebook in the process shares [`PROCESS_ENDED_LOGS`]; a test gives
+/// its notebooks a scope of their own.
+pub(crate) struct EndedLogs {
     kept: usize,
-    ended: VecDeque<Weak<Source>>,
+    ended: Mutex<VecDeque<Weak<Source>>>,
 }
 
-static ENDED_LOGS: Mutex<EndedLogs> = Mutex::new(EndedLogs {
-    kept: ENDED_LOGS_KEPT,
-    ended: VecDeque::new(),
-});
+pub(crate) static PROCESS_ENDED_LOGS: EndedLogs = EndedLogs::keeping(ENDED_LOGS_KEPT);
 
-/// `job` has ended: retain its log, and discard the logs of the oldest ended
-/// commands past the process-wide cap, whichever notebook started them.
-pub(crate) fn retain_ended(job: &Arc<Source>) {
-    let mut logs = ENDED_LOGS.lock().unwrap();
-    // Logs that a notebook's 50 MB limit or its end let go of hold nothing.
-    logs.ended.retain(|source| {
-        source.upgrade().is_some_and(|source| {
-            (source.state.lock().unwrap().log.as_ref()).is_some_and(|log| log.file.is_some())
-        })
-    });
-    logs.ended.push_back(Arc::downgrade(job));
-    while logs.ended.len() > logs.kept {
-        let oldest = logs.ended.pop_front().expect("longer than the cap");
-        if let Some(source) = oldest.upgrade()
-            && let Some(log) = source.state.lock().unwrap().log.as_mut()
-        {
-            log.discard();
+impl EndedLogs {
+    pub(crate) const fn keeping(kept: usize) -> Self {
+        Self {
+            kept,
+            ended: Mutex::new(VecDeque::new()),
         }
     }
-}
 
-#[cfg(test)]
-pub(crate) fn keep_ended_logs(kept: usize) {
-    ENDED_LOGS.lock().unwrap().kept = kept;
+    /// `job` has ended: retain its log, and discard the logs of the oldest
+    /// ended commands past the cap, whichever notebook started them.
+    pub(crate) fn retain(&self, job: &Arc<Source>) {
+        let mut ended = self.ended.lock().unwrap();
+        // Logs that a notebook's 50 MB limit or its end let go of hold nothing.
+        ended.retain(|source| {
+            source.upgrade().is_some_and(|source| {
+                (source.state.lock().unwrap().log.as_ref()).is_some_and(|log| log.file.is_some())
+            })
+        });
+        ended.push_back(Arc::downgrade(job));
+        while ended.len() > self.kept {
+            let oldest = ended.pop_front().expect("longer than the cap");
+            if let Some(source) = oldest.upgrade()
+                && let Some(log) = source.state.lock().unwrap().log.as_mut()
+            {
+                log.discard();
+            }
+        }
+    }
 }
 
 impl State {

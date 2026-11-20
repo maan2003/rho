@@ -53,8 +53,20 @@ pub enum UiBlock {
         text: String,
     },
     Tool(UiTool),
+    /// The point where a specific piece of mail was written. The mail remains
+    /// in the thread even if the model's turn is rewound.
+    MailWritten {
+        message: rho_agent_types::MessageId,
+        version: Option<rho_agent_types::ChatSeq>,
+    },
+    /// A model response completed, even if it had no visible text.
+    /// This starts a fresh span of steps that can fail.
+    Responded,
     Notice {
         text: String,
+        /// How many times in a row it was said: an error a retry hit
+        /// again reads once, with its count.
+        times: u32,
     },
     /// A chat message an input handed the agent. The text is what the
     /// model read; the message itself, its sender and its words, is the
@@ -68,6 +80,19 @@ pub enum UiBlock {
     Status {
         text: String,
     },
+    Failure {
+        kind: FailureKind,
+        text: String,
+        times: u32,
+        since: UnixMs,
+        at: UnixMs,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum FailureKind {
+    Retrying { runtime: Option<String> },
+    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -86,7 +111,7 @@ pub enum UiAgentStatus {
         outstanding_calls: usize,
     },
     /// The turn failed permanently; the error text is the trailing unsealed
-    /// [`UiBlock::Notice`].
+    /// [`UiBlock::Failure`].
     Error,
 }
 

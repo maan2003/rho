@@ -1,6 +1,6 @@
 //! The agents protocol
 //! ([ARCH-agent-host](../../../../agent-host/specs/ARCH-agent-host.md)):
-//! worksets and the agent directory. Chat is its own protocol (`rho-chat`).
+//! worksets and the agent directory. Mail is its own protocol (`rho-mail`).
 //!
 //! The session ([`Open::Session`]) carries the directory, the rows of the
 //! worksets a client follows, and the live tails of the agents it looks at.
@@ -39,7 +39,7 @@ rho_rpc::calls! {
         Eval(Eval) -> EvalResult;
         /// Stops the agent's current request and cells. Typed, because it
         /// must work while the workset's Python is stuck.
-        Cancel(Cancel) -> ();
+        Cancel(Cancel) -> CancelResult;
         /// End everything in the agent's shared workset, replace its worker
         /// with the host's current build, and reload the agent.
         RestartWorkset(RestartWorkset) -> ();
@@ -58,6 +58,11 @@ rho_rpc::calls! {
         /// Answered with the accounts as they stand after the switch.
         SetClaudeAccount(super::SetClaudeAccount) -> super::ClaudeAccountList;
         SetAuthAccountEnabled(super::SetAuthAccountEnabled) -> ();
+        /// Start from a posted idea; if refused before an agent exists, the
+        /// host leaves stop mail in the thread before answering with the error.
+        StartFromMail(StartFromMail) -> AgentId;
+        RewindAgent(RewindAgent) -> RewoundAgent;
+        StopAgent(StopAgent) -> ();
     }
 }
 
@@ -74,6 +79,36 @@ pub struct Eval {
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct StartFromMail {
+    pub origin: MessageId,
+    pub launch: MailLaunch,
+    /// The initiating window's label for the host, only for diagnostic text.
+    pub host_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum MailLaunch {
+    New(CreateWorkset),
+    Existing(Eval),
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RewindAgent {
+    pub agent: AgentId,
+    pub turns: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RewoundAgent {
+    pub taken_back: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct StopAgent {
+    pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct EvalResult {
     /// What the code printed.
     pub output: String,
@@ -81,6 +116,27 @@ pub struct EvalResult {
     pub error: Option<String>,
     /// The first agent the code created, if it created one.
     pub agent: Option<AgentId>,
+}
+
+impl EvalResult {
+    /// What the code raised, in the exception's own words: the last line of
+    /// its traceback, without the exception's type, such as `an agent keeps
+    /// its runtime kind` of `RuntimeError: an agent keeps its runtime kind`.
+    pub fn raised(&self) -> Option<&str> {
+        let traceback = self.error.as_deref()?;
+        let last = traceback
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or(traceback);
+        let words = last.split_once(": ").filter(|(kind, _)| {
+            !kind.is_empty()
+                && kind
+                    .chars()
+                    .all(|char| char.is_alphanumeric() || char == '_' || char == '.')
+        });
+        Some(words.map_or(last, |(_, words)| words.trim()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -93,6 +149,12 @@ pub struct CreatedWorkset {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Cancel {
     pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum CancelResult {
+    WasAsking,
+    NoRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -184,6 +246,9 @@ pub enum ServerFrame {
     Status {
         agent_id: AgentId,
         state: RuntimeState,
+        /// When the agent started doing what `state` says it does, on the
+        /// host's clock: what its age on every device counts from.
+        since: UnixMs,
     },
     QuotaUsage {
         summaries: Vec<super::QuotaSummary>,
@@ -215,6 +280,12 @@ pub struct SpecView {
     pub model: String,
     pub effort: String,
     pub props: Props,
+}
+
+impl SpecView {
+    pub fn runtime_label(&self) -> String {
+        format!("{}-{}", self.model, self.effort)
+    }
 }
 
 /// One thing a request carried, with its body left as text.
@@ -261,12 +332,21 @@ pub enum LogEvent {
         compaction: bool,
         /// How the call it answers went.
         timing: Option<rho_agent_types::CallTiming>,
+        /// Text the notebook reported for the call it answers.
+        #[senax(default)]
+        output: String,
+        at: UnixMs,
+    },
+    /// The cell of the agent's call ended, whether or not a request answers it.
+    CellEnded {
+        agent: AgentId,
+        end: rho_agent_types::CellEnd,
         at: UnixMs,
     },
     /// Claude Code says these calls came back, with no request to answer them.
     CallsEnded {
         agent: AgentId,
-        calls: Vec<String>,
+        calls: Vec<CallView>,
         at: UnixMs,
     },
     Replied {
@@ -301,6 +381,26 @@ pub enum LogEvent {
         text: String,
         at: UnixMs,
     },
+    /// The user cancelled what the agent had in flight.
+    Cancelled {
+        agent: AgentId,
+        at: UnixMs,
+    },
+    MailWritten {
+        agent: AgentId,
+        message: MessageId,
+        /// An old host log row may not identify which revision it wrote.
+        #[senax(default)]
+        version: Option<rho_agent_types::ChatSeq>,
+        at: UnixMs,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CallView {
+    pub id: String,
+    pub output: String,
+    pub failed: Option<bool>,
 }
 
 impl LogEvent {
@@ -311,13 +411,16 @@ impl LogEvent {
             | Self::AgentCreated { at, .. }
             | Self::AgentChanged { at, .. }
             | Self::Request { at, .. }
+            | Self::CellEnded { at, .. }
             | Self::CompactionRequested { at, .. }
             | Self::CallsEnded { at, .. }
             | Self::Replied { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
-            | Self::ClaudeMessage { at, .. } => *at,
+            | Self::Cancelled { at, .. }
+            | Self::ClaudeMessage { at, .. }
+            | Self::MailWritten { at, .. } => *at,
         }
     }
 
@@ -328,13 +431,16 @@ impl LogEvent {
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
             | Self::Request { agent, .. }
+            | Self::CellEnded { agent, .. }
             | Self::CompactionRequested { agent, .. }
             | Self::CallsEnded { agent, .. }
             | Self::Replied { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::Stopped { agent, .. }
-            | Self::ClaudeMessage { agent, .. } => Some(*agent),
+            | Self::Cancelled { agent, .. }
+            | Self::ClaudeMessage { agent, .. }
+            | Self::MailWritten { agent, .. } => Some(*agent),
         }
     }
 }
@@ -383,6 +489,7 @@ mod tests {
                     answers: true,
                     compaction: false,
                     timing: None,
+                    output: "printed line".into(),
                     at: UnixMs(7),
                 },
             )],
@@ -399,6 +506,17 @@ mod tests {
             }
             .into(),
         ));
+        round_trips(Open::Request(
+            StartFromMail {
+                origin: MessageId(rho_agent_types::ChatSeq(29)),
+                launch: MailLaunch::Existing(Eval {
+                    workset: WorksetId([3; 6]),
+                    code: "new_agent()".into(),
+                }),
+                host_label: "lab".into(),
+            }
+            .into(),
+        ));
         round_trips(Open::Request(Cancel { agent }.into()));
         round_trips(Open::Request(
             AgentLog {
@@ -412,5 +530,33 @@ mod tests {
             error: None,
             agent: Some(agent),
         }));
+    }
+
+    fn raising(error: Option<&str>) -> EvalResult {
+        EvalResult {
+            output: String::new(),
+            error: error.map(str::to_owned),
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn what_code_raised_is_the_exception_in_its_own_words() {
+        let traceback = "Traceback (most recent call last):\n  File \"<eval>\", line 1, in <module>\n  File \"/policy/rho.py\", line 80, in set_runtime\n    raise RuntimeError(\"an agent keeps its runtime kind\")\nRuntimeError: an agent keeps its runtime kind\n";
+        assert_eq!(
+            raising(Some(traceback)).raised(),
+            Some("an agent keeps its runtime kind")
+        );
+        // A message that itself holds `: ` keeps all of it.
+        assert_eq!(
+            raising(Some("rho.errors.Refused: model: unknown, try sol-high")).raised(),
+            Some("model: unknown, try sol-high")
+        );
+        // A message with no exception type is said as it is.
+        assert_eq!(
+            raising(Some("the workset is closed: try later")).raised(),
+            Some("the workset is closed: try later")
+        );
+        assert_eq!(raising(None).raised(), None);
     }
 }

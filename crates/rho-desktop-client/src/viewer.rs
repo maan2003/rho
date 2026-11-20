@@ -645,7 +645,7 @@ pub fn open(
             "desktop IO task started"
         );
         let rho_agent_hosts::Dialer::Iroh { connection, media } = dialer else {
-            anyhow::bail!("the live Wayland viewer requires an Iroh host");
+            anyhow::bail!("live view needs a host reached over the network");
         };
         open_stream(connection, media, agent, session, started).await
     })

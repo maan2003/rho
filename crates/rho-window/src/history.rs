@@ -38,11 +38,12 @@
 //! unlinked the moment they step off.
 //!
 //! And no forward step is ever lost by the machine on its own. Opening
-//! something new while the cursor is in the middle does what the old
-//! workspace history did: it appends at the end and moves the cursor there,
-//! leaving what was ahead of the reader behind them, reachable by going
-//! back. It does not truncate. That is a deliberate restoration, not an
-//! invention.
+//! something new while the cursor is in the middle appends at the end and
+//! moves the cursor there; the entry the reader opened it from goes to the
+//! end first, just behind the new one, so back returns to the screen the
+//! reader was on, not to whatever happened to be ahead of it. What was
+//! ahead of the reader stays in the list, behind them, reachable by going
+//! back. It does not truncate.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -58,6 +59,7 @@ struct Entry<K, S> {
     /// comparing two entries' `order` says which side of the cursor an
     /// entry is on without walking to find out.
     order: u64,
+    visited: u64,
 }
 
 /// The reader's history: one list across every context, with a cursor.
@@ -76,6 +78,7 @@ pub struct History<K, S> {
     /// question, not this machine's.
     cursor_forgotten: bool,
     next_order: u64,
+    visit: u64,
     length: usize,
     /// How many live entries are behind the cursor: how many times back can
     /// be pressed. Kept rather than counted, because counting is a walk.
@@ -94,6 +97,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
                 prev: None,
                 next: None,
                 order: 0,
+                visited: 0,
             })],
             free: Vec::new(),
             newest: 0,
@@ -101,6 +105,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             live,
             cursor_forgotten: false,
             next_order: 1,
+            visit: 0,
             length: 1,
             behind: 0,
         }
@@ -142,6 +147,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             self.entry_mut(cursor).surface = surface;
             self.cursor_forgotten = false;
             self.live.insert(key, cursor);
+            self.note_visit();
             return;
         }
         if let Some(slot) = self.live.remove(&key) {
@@ -155,6 +161,12 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         let leaving = self.cursor;
         let leaving_is_dead = self.cursor_forgotten;
         self.cursor_forgotten = false;
+        if !leaving_is_dead {
+            // Back from what opens now is where the reader opened it from,
+            // so the entry being left goes to the end first. What was ahead
+            // of it stays where it was, now behind the reader.
+            self.move_to_newest(leaving);
+        }
         let order = self.next_order;
         self.next_order += 1;
         let newest = self.newest;
@@ -164,12 +176,14 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             prev: Some(newest),
             next: None,
             order,
+            visited: self.visit,
         });
         self.entry_mut(newest).next = Some(slot);
         self.newest = slot;
         self.live.insert(key, slot);
         self.length += 1;
         self.cursor = slot;
+        self.note_visit();
         self.behind = self.length - 1;
         if leaving_is_dead {
             // `unlink` takes the step off `behind` itself: the entry being
@@ -265,8 +279,24 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             .map(|slot| &self.entry(slot).key)
     }
 
-    /// Move the cursor to a neighbour, taking the entry it was on out of the
-    /// list if that entry has been forgotten.
+    /// Places in order of visits, most recent first, excluding the one in view.
+    pub fn recent(&self) -> Vec<&K> {
+        let mut visited: Vec<_> = self
+            .live
+            .values()
+            .copied()
+            .filter(|slot| *slot != self.cursor)
+            .map(|slot| self.entry(slot))
+            .collect();
+        visited.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.visited));
+        visited.into_iter().map(|entry| &entry.key).collect()
+    }
+
+    fn note_visit(&mut self) {
+        self.visit += 1;
+        self.entry_mut(self.cursor).visited = self.visit;
+    }
+
     /// Move the cursor to a neighbour, taking the entry it was on out of
     /// the list if that entry has been forgotten. Says whether it did.
     fn step_to(&mut self, slot: usize) -> bool {
@@ -274,6 +304,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         let dead = self.cursor_forgotten;
         self.cursor_forgotten = false;
         self.cursor = slot;
+        self.note_visit();
         if dead {
             // The cursor has already moved, so the list still holds the
             // neighbour it moved to and this cannot empty it.
@@ -304,6 +335,32 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         if slot != pivot && order < self.entry(pivot).order {
             self.behind -= 1;
         }
+    }
+
+    /// Take `slot` from where it stands and link it as the newest entry.
+    /// The list keeps its length; only the order of `slot` moves.
+    fn move_to_newest(&mut self, slot: usize) {
+        if slot == self.newest {
+            return;
+        }
+        let (prev, next) = {
+            let entry = self.entry(slot);
+            (entry.prev, entry.next)
+        };
+        let next = next.expect("an entry that is not the newest has one after it");
+        if let Some(prev) = prev {
+            self.entry_mut(prev).next = Some(next);
+        }
+        self.entry_mut(next).prev = prev;
+        let newest = self.newest;
+        self.entry_mut(newest).next = Some(slot);
+        let order = self.next_order;
+        self.next_order += 1;
+        let entry = self.entry_mut(slot);
+        entry.prev = Some(newest);
+        entry.next = None;
+        entry.order = order;
+        self.newest = slot;
     }
 
     fn alloc(&mut self, entry: Entry<K, S>) -> usize {
@@ -406,10 +463,10 @@ mod tests {
         assert_eq!(history.back(), None);
     }
 
-    /// What the old workspace history did, restored deliberately: a new
-    /// open with the cursor in the middle appends at the end and takes the
-    /// cursor there. It does not truncate, so what was ahead is still
-    /// reachable — by going back, which is where it now is.
+    /// A new open with the cursor in the middle appends at the end and
+    /// takes the cursor there, with the entry it was opened from just
+    /// behind it: back is the screen before. Nothing is truncated, so what
+    /// was ahead is still reachable, by going back past it.
     #[test]
     fn opening_with_the_cursor_in_the_middle_appends_and_never_truncates() {
         let mut history = history();
@@ -426,10 +483,30 @@ mod tests {
         assert!(history.at_newest());
         assert_eq!(
             back_keys(&history),
-            ["c", "b", "a", "home"],
-            "b and c were ahead of the reader and are now behind them"
+            ["a", "c", "b", "home"],
+            "back goes to a, where d was opened from; b and c were ahead and are now behind"
         );
         assert_eq!(history.len(), 5);
+        assert_eq!((history.behind(), history.ahead()), (4, 0));
+        assert_eq!(history.back().copied(), Some(1));
+        assert_eq!(forward_keys(&history), ["d"]);
+    }
+
+    /// Two private remarks from one thread: the reader opens a note from
+    /// the thread, goes back, opens a second note. Back from the second is
+    /// the thread, not the first note.
+    #[test]
+    fn back_from_a_second_open_is_where_it_was_opened_from() {
+        let mut history = history();
+        history.show("thread", 1);
+        history.show("note one", 2);
+        history.back();
+        history.show("note two", 3);
+        assert_eq!(history.back().copied(), Some(1));
+        assert_eq!(*history.current_key(), "thread");
+        assert_eq!(history.back().copied(), Some(2));
+        assert_eq!(history.back().copied(), Some(0));
+        assert_eq!(history.back(), None);
     }
 
     #[test]
@@ -501,6 +578,22 @@ mod tests {
     }
 
     #[test]
+    fn recent_tracks_visits_not_navigation_order() {
+        let mut history = history();
+        history.show("a", 1);
+        history.show("b", 2);
+        history.show("c", 3);
+        history.back();
+        history.back();
+        assert_eq!(history.recent(), [&"b", &"c", &"home"]);
+        history.back();
+        history.forward();
+        assert_eq!(history.recent(), [&"home", &"b", &"c"]);
+        history.forget(&"b");
+        assert_eq!(history.recent(), [&"home", &"c"]);
+    }
+
+    #[test]
     fn the_counts_say_how_far_each_way_goes() {
         let mut history = history();
         assert_eq!((history.behind(), history.ahead()), (0, 0));
@@ -552,7 +645,7 @@ mod tests {
         assert_eq!((history.behind(), history.ahead()), (1, 1));
         history.show("home", 7);
         assert_eq!(*history.current(), 7);
-        assert_eq!(back_keys(&history), ["b", "a"]);
+        assert_eq!(back_keys(&history), ["a", "b"]);
         assert_eq!((history.behind(), history.ahead()), (2, 0));
     }
 

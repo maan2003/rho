@@ -1800,7 +1800,11 @@ mod tests {
                 "user-attachments/other/1/a.tar.gz",
                 Value::Null,
             ),
-            (Method::GET, "fedibtc/fedi/files/1/a.tar.gz", Value::Null),
+            (
+                Method::GET,
+                "octocat/hello-world/files/1/a.tar.gz",
+                Value::Null,
+            ),
             (
                 Method::PUT,
                 "repos/acme/widget/pulls/7/update-branch",

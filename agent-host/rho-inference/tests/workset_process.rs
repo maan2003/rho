@@ -212,6 +212,7 @@ async fn create(
         pool.post_user(
             client_id(),
             None,
+            None,
             agents.clone(),
             vec![rho_agent_types::ContentPart::Text {
                 text: text.to_owned(),
@@ -307,7 +308,7 @@ async fn failing_init() {
     };
     let error = format!("{error:#}");
     assert!(error.contains("init-canary"), "{error}");
-    assert!(error.contains("no agent of the workset starts"), "{error}");
+    assert!(error.contains("the host's init.py failed"), "{error}");
     let error = format!("{:#}", pool.eval(id, "1".to_owned()).await.unwrap_err());
     assert!(error.contains("init-canary"), "{error}");
 
@@ -457,6 +458,7 @@ async fn streaming_crash() {
     );
     pool.post_user(
         client_id(),
+        None,
         None,
         vec![id],
         vec![rho_agent_types::ContentPart::Text {

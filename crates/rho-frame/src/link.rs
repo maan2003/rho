@@ -55,6 +55,11 @@ impl FrameLink {
         self.with(cx, move |frame, window, cx| frame.open(address, window, cx));
     }
 
+    /// Opens a web link the user chose in a message.
+    pub fn open_link(&self, url: url::Url, cx: &mut App) {
+        self.with(cx, move |frame, _, cx| frame.open_link(url, cx));
+    }
+
     pub fn echo(&self, text: impl Into<String>, class: StyleClass, cx: &mut App) {
         let text = text.into();
         self.with(cx, move |frame, _, cx| frame.echo(&text, class, cx));
@@ -66,10 +71,17 @@ impl FrameLink {
         });
     }
 
-    /// What the frame draws from a system changed: its claims, its Home
+    /// What the frame draws from a system changed: its claims, its Desk
     /// sections, its channels.
     pub fn changed(&self, cx: &mut App) {
         self.with(cx, |frame, _, cx| frame.systems_changed(cx));
+    }
+
+    /// Closes every open surface whose address `which` picks.
+    pub fn close_all(&self, which: impl Fn(&Address) -> bool + 'static, cx: &mut App) {
+        self.with(cx, move |frame, window, cx| {
+            frame.close_all(which, window, cx)
+        });
     }
 
     pub fn close(&self, address: Address, cx: &mut App) {

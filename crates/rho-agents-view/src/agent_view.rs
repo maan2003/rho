@@ -5,20 +5,21 @@
 //! when content or chrome changes, so the model persists for the session
 //! while editors come and go with surfaces.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Subscription, Task, WeakEntity, Window};
+use gpui::{App, Context, Entity, EntityId, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
-use rho_agent_types::AgentId;
 use rho_agents_client::now_ms;
-use rho_agents_client::state::UiAgentState;
+use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::FrameSummary;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
+use crate::render::{Label, Labels};
 use crate::transcript::{FillEdge, StorePoint, TranscriptModel};
 
 /// How much history one composition step takes on, in buffer rows.
@@ -81,7 +82,6 @@ impl HistoryWant {
 
 pub struct AgentModel {
     transcript: TranscriptModel,
-    multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript cropped flush when the
     /// turn is closed. Every editor over this model reads it.
     document_multi_buffer: Entity<MultiBuffer>,
@@ -114,6 +114,8 @@ pub enum AgentModelEvent {
     Loaded,
     /// The history the reader asked for is composed; nothing is waiting.
     HistoryComposed,
+    /// Rebuilt chunks invalidated a point; restore its logical step.
+    RestorePoints(Vec<(EntityId, StorePoint)>),
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
@@ -132,7 +134,6 @@ impl AgentModel {
         );
         Self {
             transcript,
-            multi_buffer,
             document_multi_buffer,
             initial_load_started: false,
             initial_load_ready: false,
@@ -158,10 +159,10 @@ impl AgentModel {
 
     /// Starts the one asynchronous bulk load. Normal streamed updates
     /// remain synchronous after this reaches Ready.
-    pub fn start_initial_load(
+    pub(crate) fn start_initial_load(
         &mut self,
         state: UiAgentState,
-        agent_labels: HashMap<AgentId, String>,
+        labels: Labels,
         now_ms: u64,
         cx: &mut Context<Self>,
     ) {
@@ -172,7 +173,7 @@ impl AgentModel {
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
-                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, agent_labels) })
+                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, labels) })
                 .await;
             let reservations = (0..prepared.buffer_count())
                 .map(|_| cx.reserve_entity::<Buffer>())
@@ -264,6 +265,35 @@ impl AgentModel {
             self.go_to_store_point(&editor, point, window, cx);
         }
         editor
+    }
+
+    pub(crate) fn unresolved_mail(&self) -> impl Iterator<Item = (usize, Label)> + '_ {
+        self.transcript.unresolved_mail()
+    }
+
+    pub(crate) fn current_errors(&self) -> u32 {
+        self.transcript.current_errors()
+    }
+
+    pub(crate) fn newest_step(&self) -> Option<StorePoint> {
+        self.transcript.newest_step()
+    }
+
+    pub(crate) fn errors(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (StorePoint, u32, Option<u64>)> + '_ {
+        self.transcript.error_points()
+    }
+
+    pub(crate) fn mail_point(&self, mail: &rho_agent_types::Message) -> Option<StorePoint> {
+        self.transcript.mail_point(mail)
+    }
+
+    pub(crate) fn tool_output_ranges(
+        &self,
+        cx: &App,
+    ) -> Vec<(String, bool, std::ops::Range<multi_buffer::Anchor>)> {
+        self.transcript.tool_output_ranges(cx)
     }
 
     /// How much of the transcript is composed nowhere yet, in blocks.
@@ -462,7 +492,7 @@ impl AgentModel {
             return false;
         };
         let Some(anchor) = self
-            .multi_buffer
+            .document_multi_buffer
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(anchor)
@@ -510,12 +540,12 @@ impl AgentModel {
     /// Shows what moved in the agent's state. Until the bulk load is
     /// ready it is held, and the first sync after `Loaded` (with
     /// [`FrameSummary::nothing`] if nothing else moved) shows it.
-    pub fn sync(
+    pub(crate) fn sync(
         &mut self,
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
+        labels: &impl Fn(HashSet<Label>, &gpui::App) -> Labels,
         cx: &mut Context<Self>,
     ) {
         let summary = self
@@ -526,8 +556,48 @@ impl AgentModel {
             self.pending_sync = Some(summary);
             return;
         }
-        self.transcript
-            .sync(state, summary, now_ms, agent_label, cx);
+        let rewrite = summary.first_changed_block == Some(0);
+        let points = if summary.first_changed_block.is_some() {
+            self.live_editors()
+                .into_iter()
+                .filter_map(|editor| self.store_point(&editor, cx).map(|point| (editor, point)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        // A rewind can remove blocks and shift the indices of delivered mail.
+        // A surviving block keeps its Arc, even when the rebuilt text buffer
+        // no longer owns the editor's old anchor.
+        let remapped = if rewrite && !points.is_empty() {
+            let survivors = state
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (Arc::as_ptr(block), index))
+                .collect::<HashMap<_, _>>();
+            points
+                .iter()
+                .map(|(_, point)| {
+                    remap_point(*point, &survivors, |at| self.transcript.block_at(at))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.transcript.sync(state, summary, now_ms, labels, cx);
+        let changed = points
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (editor, old))| {
+                let point = remapped.get(index).copied().unwrap_or(Some(old))?;
+                (self.store_point(&editor, cx) != Some(point))
+                    .then_some((editor.entity_id(), point))
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            cx.emit(AgentModelEvent::RestorePoints(changed));
+        }
+        cx.notify();
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {
@@ -536,5 +606,65 @@ impl AgentModel {
 
     pub fn has_timers(&self) -> bool {
         self.transcript.has_timers()
+    }
+}
+
+/// If the step went away, keep the point on the nearest surviving step before
+/// it.
+fn remap_point<'a>(
+    point: StorePoint,
+    survivors: &HashMap<*const UiBlock, usize>,
+    old: impl Fn(usize) -> Option<&'a Arc<UiBlock>>,
+) -> Option<StorePoint> {
+    (0..=point.block).rev().find_map(|block| {
+        let old = old(block)?;
+        if !crate::render::block_visible(old) {
+            return None;
+        }
+        let index = *survivors.get(&Arc::as_ptr(old))?;
+        Some(StorePoint {
+            block: index,
+            offset: if block == point.block {
+                point.offset
+            } else {
+                0
+            },
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rewind_preserves_the_surviving_step_not_the_old_index() {
+        let row = |text: &str| Arc::new(UiBlock::UserMessage { text: text.into() });
+        let old = [
+            row("origin"),
+            row("removed"),
+            row("delivered"),
+            row("removed"),
+        ];
+        let survivors = HashMap::from([(Arc::as_ptr(&old[0]), 0), (Arc::as_ptr(&old[2]), 1)]);
+        let remap = |block| {
+            remap_point(StorePoint { block, offset: 3 }, &survivors, |at| {
+                old.get(at)
+            })
+        };
+        assert_eq!(
+            remap(2),
+            Some(StorePoint {
+                block: 1,
+                offset: 3
+            })
+        );
+        assert_eq!(
+            remap(3),
+            Some(StorePoint {
+                block: 1,
+                offset: 0
+            })
+        );
     }
 }

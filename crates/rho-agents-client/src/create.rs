@@ -10,6 +10,7 @@ use camino::Utf8PathBuf;
 use rho_agent_hosts::{HostId, Hosts};
 use rho_agent_types::{MessageId, WorksetId, WorksetKind};
 
+use crate::fold::AgentIdentity;
 use crate::protocol::worksets::{CreateWorkset, Eval};
 use crate::snippets::{self, Function, Runtime};
 
@@ -87,6 +88,27 @@ impl Start {
             }),
         }
     }
+}
+
+/// Where the next agent of a project works, when the project has said:
+/// beside the newest agent started from one of its messages, in its
+/// workset and directory. A project is a project, so its agents share a
+/// workset; the first one's start, asked once, is what the project
+/// remembers, and a later start elsewhere moves it. `in_channel` says
+/// whether a message is under the project. `None` for a project no agent
+/// has started from yet.
+pub fn project_start<'a>(
+    agents: impl IntoIterator<Item = &'a AgentIdentity>,
+    in_channel: impl Fn(MessageId) -> bool,
+) -> Option<Start> {
+    let newest = agents
+        .into_iter()
+        .filter(|agent| agent.origin().is_some_and(&in_channel))
+        .max_by_key(|agent| agent.entry.created_at)?;
+    Some(Start::Join {
+        workset: newest.entry.workset,
+        cwd: newest.place().cwd,
+    })
 }
 
 /// Whether text names a repository to clone rather than a place on a
@@ -505,5 +527,62 @@ mod tests {
             };
             assert!(code.contains("origin=\"chat:41\""), "{start:?}: {code}");
         }
+    }
+
+    fn started_from(
+        counter: u64,
+        workset: &str,
+        cwd: &str,
+        origin: Option<u64>,
+        created_at: u64,
+    ) -> AgentIdentity {
+        let agent =
+            rho_agent_types::AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(7))
+                .unwrap();
+        let mut props = rho_agent_types::Props::new();
+        props.insert(rho_agent_types::props::CWD.into(), cwd.into());
+        if let Some(origin) = origin {
+            props.insert(
+                rho_agent_types::props::ORIGIN.into(),
+                format!("chat:{origin}"),
+            );
+        }
+        let mut identity =
+            AgentIdentity::for_test(agent, props, rho_agent_types::UnixMs(created_at));
+        identity.entry.workset = workset.parse().unwrap();
+        identity
+    }
+
+    /// A project's next agent goes beside the one started from it last,
+    /// whatever order the map lists them in; agents of other channels and
+    /// agents started from no message do not count.
+    #[test]
+    fn a_channel_works_where_its_newest_agent_does() {
+        // Messages 10..20 are under the project.
+        let in_channel = |message: MessageId| (10..20).contains(&message.0.0);
+        let agents = [
+            started_from(1, "aaaaaaaaaaaa", "/src/old", Some(11), 100),
+            started_from(2, "bbbbbbbbbbbb", "/src/rho", Some(12), 300),
+            started_from(3, "cccccccccccc", "/src/elsewhere", Some(30), 900),
+            started_from(4, "dddddddddddd", "/src/nothing", None, 950),
+            started_from(5, "eeeeeeeeeeee", "/src/mid", Some(13), 200),
+        ];
+        assert_eq!(
+            project_start(&agents, in_channel),
+            Some(Start::Join {
+                workset: "bbbbbbbbbbbb".parse().unwrap(),
+                cwd: "/src/rho".into(),
+            })
+        );
+    }
+
+    /// A project no agent started from has not said where: the start asks.
+    #[test]
+    fn a_channel_without_agents_has_not_said() {
+        let agents = [
+            started_from(1, "aaaaaaaaaaaa", "/src/rho", Some(30), 100),
+            started_from(2, "bbbbbbbbbbbb", "/src/rho", None, 200),
+        ];
+        assert_eq!(project_start(&agents, |message| message.0.0 < 20), None);
     }
 }

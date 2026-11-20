@@ -1,3 +1,7 @@
+# Vendored subtrees keep their upstream formatting (AGENTS.md: they are
+# first-class code, but fixes there stay mergeable with upstream).
+excludes = ["crates/senax-encoder/*", "vendor/*"]
+
 [formatter.nix]
 command = "nixfmt"
 includes = ["*.nix"]

@@ -10,46 +10,46 @@ rust-version.workspace = true
 # unprefixed_malloc routes CPython and other C allocations through jemalloc
 # too; glibc keeps freed memory in per-thread arenas instead of returning it.
 # Profiling samples allocations from the start, so SIGUSR1 can dump the heap.
-tikv-jemallocator = { version = "0.7", features = [
-  "profiling",
-  "unprefixed_malloc_on_supported_platforms",
-] }
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
 clap.workspace = true
 dirs.workspace = true
 fnv.workspace = true
-jiff.workspace = true
-notify.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+jiff.workspace = true
+notify.workspace = true
 rand.workspace = true
-rho-agent-types.workspace = true
-rho-agent.workspace = true
-rho-web-search.workspace = true
-rho-db.workspace = true
 redb.workspace = true
+reqwest.workspace = true
+rho-agent.workspace = true
+rho-agent-types.workspace = true
+rho-db.workspace = true
+rho-web-search.workspace = true
 rustls.workspace = true
 senax-encoder = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
+tikv-jemallocator = { version = "0.7", features = [
+  "profiling",
+  "unprefixed_malloc_on_supported_platforms",
+] }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
-reqwest.workspace = true
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-rho-rpc.workspace = true
-rho-terminal.workspace = true
-rho-shell-view.workspace = true
-rustix = { version = "1", features = ["process"] }
-rho-fs-view.workspace = true
-rho-claude.workspace = true
 camino.workspace = true
+rho-claude.workspace = true
+rho-fs-view.workspace = true
+rho-rpc.workspace = true
+rho-shell-view.workspace = true
+rho-terminal.workspace = true
+rustix = { version = "1", features = ["process"] }
 
-tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

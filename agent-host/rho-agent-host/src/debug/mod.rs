@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rho_agent::record::Runtime;
-use rho_agent::store::{ChatRead as _, StoreRead as _};
+use rho_agent::store::{MailRead as _, StoreRead as _};
 use rho_agent_hosts::protocol::DebugReport;
 use rho_db::RhoDb;
 use rho_inference::Accounts;
@@ -205,9 +205,10 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                         .with_context(|| format!("agent id {agent}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let call = rho_chat::protocol::Post {
+            let call = rho_mail::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(thread))),
+                reply_to: None,
                 mentions,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
             };
@@ -236,9 +237,10 @@ async fn start_debug_thread(
     agent: rho_agent_types::AgentId,
     text: String,
 ) -> anyhow::Result<rho_agent_types::MessageId> {
-    let call = rho_chat::protocol::Post {
+    let call = rho_mail::protocol::Post {
         client_id: uuid::Uuid::new_v4().as_u64_pair().0,
         parent: None,
+        reply_to: None,
         mentions: vec![agent],
         content: vec![rho_agent_types::ContentPart::Text { text }],
     };
@@ -682,7 +684,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             rows += page.len();
         }
     }
-    let chat = read.chat_head().0;
+    let chat = read.mail_head().0;
 
     let mut output = String::new();
     writeln!(output, "source: {}", snapshot.source.display())?;

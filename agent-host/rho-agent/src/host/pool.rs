@@ -6,6 +6,7 @@
 //! about worksets, agents and chat; the pool holds only what runs.
 
 mod gccp;
+mod mail;
 mod naming;
 
 use std::collections::{HashMap, HashSet};
@@ -15,8 +16,9 @@ use anyhow::Context as _;
 pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
+pub use mail::MailView;
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role, UnixMs,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, UnixMs,
     WorksetKind,
 };
 use rho_db::RhoDb;
@@ -24,7 +26,6 @@ use rho_fs_view::{Layout, WorksetId, Worksets};
 use tokio::sync::Mutex;
 
 use super::AgentClient;
-use crate::AgentStatus;
 use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
 use crate::ipc::protocol::Control;
@@ -32,8 +33,9 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, GccpWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
+    GccpWrite as _, MailRead as _, MailWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
 };
+use crate::{AgentStatus, InferenceState, RuntimeState};
 
 /// How many agents stay loaded. Past this the least recently used one
 /// that is settled and nobody is looking at is dropped; its log is the
@@ -81,6 +83,10 @@ pub struct AgentPool {
     live: std::sync::Mutex<HashSet<AgentId>>,
     /// Every GUI connection's statuses still to send.
     statuses: std::sync::Mutex<Vec<std::sync::Weak<Statuses>>>,
+    /// What each agent is doing as its status last said, and since when:
+    /// the one clock every device reads an agent's age by.
+    doing: std::sync::Mutex<HashMap<AgentId, rho_agent_types::Doing>>,
+    mail: mail::Mail,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -100,13 +106,21 @@ pub struct AgentPool {
 /// per agent and never falls behind.
 #[derive(Default)]
 pub struct Statuses {
-    unsent: std::sync::Mutex<HashMap<AgentId, Arc<AgentStatus>>>,
+    unsent: std::sync::Mutex<HashMap<AgentId, Shown>>,
     changed: tokio::sync::Notify,
+}
+
+/// A loaded agent's status as a connection is told it, and since when the
+/// agent has been doing what the status says.
+#[derive(Clone, Debug)]
+pub struct Shown {
+    pub status: Arc<AgentStatus>,
+    pub since: UnixMs,
 }
 
 impl Statuses {
     /// Every status not yet taken.
-    pub fn take(&self) -> HashMap<AgentId, Arc<AgentStatus>> {
+    pub fn take(&self) -> HashMap<AgentId, Shown> {
         std::mem::take(&mut *self.unsent.lock().expect("poison"))
     }
 
@@ -115,10 +129,43 @@ impl Statuses {
         self.changed.notified().await;
     }
 
-    fn put(&self, agent_id: AgentId, status: Arc<AgentStatus>) {
-        self.unsent.lock().expect("poison").insert(agent_id, status);
+    fn put(&self, agent_id: AgentId, shown: Shown) {
+        self.unsent.lock().expect("poison").insert(agent_id, shown);
         self.changed.notify_one();
     }
+}
+
+/// When the agent started what `runtime` says it does: `now`, unless its
+/// last status said it was doing it already. A retry streak keeps the
+/// start its runtime gives: its attempts show as working in between.
+fn stamp(
+    doing: &mut HashMap<AgentId, rho_agent_types::Doing>,
+    agent_id: AgentId,
+    runtime: &RuntimeState,
+    now: UnixMs,
+) -> UnixMs {
+    let activity = runtime.activity();
+    let held = doing.entry(agent_id).or_insert(rho_agent_types::Doing {
+        activity,
+        since: now,
+    });
+    if held.activity != activity {
+        *held = rho_agent_types::Doing {
+            activity,
+            since: now,
+        };
+    }
+    // The runtime knows when a streak or a stop began; the host only when
+    // it heard of it, and two stops can reach it as one.
+    let said = match runtime.inference {
+        InferenceState::Retrying { since, .. } => Some(since),
+        InferenceState::Failed { since, .. } | InferenceState::Lost { since, .. } => since,
+        _ => None,
+    };
+    if let Some(since) = said {
+        held.since = since;
+    }
+    held.since
 }
 
 /// What code the GUI ran printed, its traceback if it raised, and the
@@ -128,6 +175,53 @@ pub struct Evaluated {
     pub output: String,
     pub error: Option<String>,
     pub agent: Option<AgentId>,
+}
+
+/// Why a requested host directory cannot be used. Callers may describe
+/// it with the name the user gave this host.
+#[derive(Debug)]
+pub struct HostDirectoryError {
+    path: camino::Utf8PathBuf,
+    reason: DirectoryProblem,
+}
+
+#[derive(Debug)]
+enum DirectoryProblem {
+    Relative,
+    Missing,
+    NotDirectory,
+    Unreadable(std::io::Error),
+}
+
+impl std::fmt::Display for HostDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = &self.path;
+        match &self.reason {
+            DirectoryProblem::Relative => write!(f, "{path} is not an absolute path"),
+            DirectoryProblem::Missing => write!(f, "{path} does not exist"),
+            DirectoryProblem::NotDirectory => write!(f, "{path} is not a directory"),
+            DirectoryProblem::Unreadable(error) => write!(f, "cannot read {path}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for HostDirectoryError {}
+
+fn check_host_directory(path: &camino::Utf8Path) -> Result<(), HostDirectoryError> {
+    let reason = if !path.is_absolute() {
+        DirectoryProblem::Relative
+    } else {
+        match std::fs::metadata(path) {
+            Ok(info) if info.is_dir() => return Ok(()),
+            Ok(_) => DirectoryProblem::NotDirectory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirectoryProblem::Missing,
+            Err(error) => DirectoryProblem::Unreadable(error),
+        }
+    };
+    Err(HostDirectoryError {
+        path: path.to_owned(),
+        reason,
+    })
 }
 
 impl AgentPool {
@@ -160,6 +254,8 @@ impl AgentPool {
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
             statuses: std::sync::Mutex::new(Vec::new()),
+            doing: std::sync::Mutex::new(HashMap::new()),
+            mail: mail::Mail::default(),
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             first_agent: std::sync::Mutex::default(),
@@ -638,7 +734,7 @@ impl AgentPool {
     /// The live set is the union over connections; a loaded agent entering
     /// it is told again with its response body, and one leaving it is told
     /// without from its next status on.
-    pub async fn set_live_wants(&self, connection: u64, wants: HashSet<AgentId>) {
+    pub async fn set_live_wants(self: &Arc<Self>, connection: u64, wants: HashSet<AgentId>) {
         let union = {
             let mut live_wants = self.live_wants.lock().expect("poison");
             if wants.is_empty() {
@@ -672,7 +768,7 @@ impl AgentPool {
 
     /// Tells every connection a loaded agent's status: once it is loaded,
     /// and again with its response body once it is live.
-    fn tell_status(&self, agent_id: AgentId, agent: &AgentClient) {
+    fn tell_status(self: &Arc<Self>, agent_id: AgentId, agent: &AgentClient) {
         self.status_changed(agent_id, agent.status_cell());
     }
 
@@ -715,12 +811,24 @@ impl AgentPool {
     /// It is read under the connections' lock, so of two calls racing, the
     /// later never puts an older status.
     pub(crate) fn status_changed(
-        &self,
+        self: &Arc<Self>,
         agent_id: AgentId,
         status: &tokio::sync::watch::Sender<AgentStatus>,
     ) {
         let mut watchers = self.statuses.lock().expect("poison");
-        let shown = self.shown(agent_id, &status.borrow());
+        let status = status.borrow();
+        let changed = {
+            let mut held = self.doing.lock().expect("poison");
+            let previous = held.get(&agent_id).copied();
+            stamp(&mut held, agent_id, &status.runtime, UnixMs::now());
+            let now = held[&agent_id];
+            (previous != Some(now)).then_some((previous, now))
+        };
+        if let Some((previous, doing)) = changed {
+            self.activity_changed(agent_id, previous, doing);
+            self.observe_stop(agent_id, doing, &status.runtime);
+        }
+        let shown = self.shown(agent_id, &status);
         watchers.retain(|statuses| match statuses.upgrade() {
             Some(statuses) => {
                 statuses.put(agent_id, shown.clone());
@@ -732,8 +840,14 @@ impl AgentPool {
 
     /// Only an agent someone is looking at shows its response body; its
     /// runtime occupancy is useful everywhere.
-    fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Arc<AgentStatus> {
-        Arc::new(if self.is_live(agent_id) {
+    fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Shown {
+        let since = self
+            .doing
+            .lock()
+            .expect("poison")
+            .get(&agent_id)
+            .map_or_else(UnixMs::now, |doing| doing.since);
+        let mut status = if self.is_live(agent_id) {
             status.clone()
         } else {
             AgentStatus {
@@ -742,7 +856,24 @@ impl AgentPool {
                 draft: None,
                 queued: status.queued,
             }
-        })
+        };
+        status.runtime.may_change_runtime_kind =
+            self.may_change_runtime_kind(agent_id, status.runtime.activity());
+        Shown {
+            status: Arc::new(status),
+            since,
+        }
+    }
+
+    fn may_change_runtime_kind(&self, agent: AgentId, activity: rho_agent_types::Activity) -> bool {
+        matches!(
+            activity,
+            rho_agent_types::Activity::Failed | rho_agent_types::Activity::Lost
+        ) && self
+            .db
+            .read()
+            .agent(agent)
+            .is_some_and(|head| !head.native.woken)
     }
 
     fn touch(&self, agent_id: AgentId) {
@@ -816,10 +947,7 @@ impl AgentPool {
         code: String,
     ) -> anyhow::Result<(WorksetId, Evaluated)> {
         if let WorksetKind::Host { cwd } = &kind {
-            anyhow::ensure!(
-                cwd.is_absolute() && cwd.is_dir(),
-                "a host workset needs an absolute directory: {cwd}"
-            );
+            check_host_directory(cwd)?;
         }
         // Every workset has a directory: its state lives there, and an
         // isolated one's `/src`.
@@ -868,7 +996,11 @@ impl AgentPool {
             .expect("poison")
             .remove(&workset)
             .flatten();
-        let (output, error) = result?;
+        let (output, error) = match result {
+            Ok(evaluated) => evaluated,
+            Err(error) if agent.is_some() => (String::new(), Some(format!("{error:#}"))),
+            Err(error) => return Err(error),
+        };
         Ok(Evaluated {
             output,
             error,
@@ -882,17 +1014,36 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
+        let mut mentions = self.user_mentions(mentions);
+        let mut write = self.db.write().await;
+        // Resolve the writer on the host, even if they are no longer a
+        // thread member. A deleted agent cannot receive mail, but the answer
+        // still belongs in the thread.
+        if let Some(target) = reply_to
+            && let Some(agent) = write.mail_writer(target)
+            && self.workset_of(agent).is_ok()
+            && mentions
+                .iter()
+                .all(|mention| mention.to != Address::Agent(agent))
+        {
+            mentions.push(Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            });
+        }
         let message = NewMessage {
             from: Address::User,
-            mentions: self.user_mentions(mentions)?,
+            reply_to,
+            mentions,
             content,
         };
-        let mut write = self.db.write().await;
         let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
+        self.user_visited(id);
         self.wake_receivers(id, None);
         self.consider_naming(id);
         Ok(id)
@@ -927,22 +1078,20 @@ impl AgentPool {
         Ok(())
     }
 
-    /// The user's mentions of agents: each asks the agent to read it.
-    fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
-        let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
-        for agent in agents {
-            self.workset_of(agent)?;
-            if mentions
-                .iter()
-                .all(|mention| mention.to != Address::Agent(agent))
-            {
-                mentions.push(Mention {
-                    to: Address::Agent(agent),
-                    kind: MentionKind::Ask,
-                });
-            }
-        }
-        Ok(mentions)
+    /// Give the user's mail to a named writer if they still exist. A writer
+    /// can be removed after the mail was read or while the GUI was offline.
+    /// That cannot stop the user's reply from being saved in its thread.
+    fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
+        let read = self.db.read();
+        let mut seen = HashSet::new();
+        agents
+            .into_iter()
+            .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
+            .map(|agent| Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            })
+            .collect()
     }
 
     /// Start the process of every workset with an agent that receives
@@ -952,19 +1101,9 @@ impl AgentPool {
         let Some(message) = read.message(message) else {
             return;
         };
-        let mut receivers: Vec<AgentId> = read.members_under(message.parent);
-        receivers.extend(
-            message
-                .mentions
-                .iter()
-                .filter_map(|mention| match mention.to {
-                    Address::Agent(agent) => Some(agent),
-                    Address::User => None,
-                }),
-        );
-        let mut worksets: Vec<WorksetId> = receivers
+        let mut worksets: Vec<WorksetId> = read
+            .recipients_of(&message)
             .into_iter()
-            .filter(|agent| message.from != Address::Agent(*agent))
             .filter_map(|agent| read.agent(agent).map(|head| head.workset))
             .filter(|workset| Some(*workset) != except)
             .collect();
@@ -976,12 +1115,81 @@ impl AgentPool {
         }
     }
 
+    /// End this agent's work without stopping its workset or posting mail.
+    pub async fn stop_agent(self: &Arc<Self>, agent: AgentId) -> anyhow::Result<()> {
+        let lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent)
+            .or_default()
+            .clone();
+        let _ownership = lock.lock().await;
+        let workset = self.workset_of(agent)?;
+        let removed = { self.agents.lock().await.remove(&agent) };
+        if let Some(client) = removed {
+            client.shutdown().await;
+        }
+        let at = UnixMs::now();
+        let mut write = self.db.write().await;
+        write.append(
+            workset,
+            &Record {
+                at,
+                event: Event::Notice {
+                    agent,
+                    notice: crate::entry::Notice::Archived,
+                },
+            },
+        )?;
+        write.commit();
+        let (status, _) = tokio::sync::watch::channel(AgentStatus {
+            runtime: RuntimeState {
+                archived: true,
+                ..RuntimeState::default()
+            },
+            ..AgentStatus::default()
+        });
+        self.status_changed(agent, &status);
+        self.user_stopped(agent, at);
+        Ok(())
+    }
+
+    /// Rewind the visible turn, returning the headlines marked taken back.
+    pub async fn rewind_agent(
+        self: &Arc<Self>,
+        agent: AgentId,
+        turns: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let (_, client, _) = self.load(agent).await?;
+        let before = self.db.read().mail_head();
+        client.control(Control::Rewind(turns)).await?;
+        let read = self.db.read();
+        Ok(read
+            .mail_since(before, usize::MAX)
+            .into_iter()
+            .filter_map(|row| match row.event {
+                rho_agent_types::ChatEvent::TakenBack {
+                    message, author, ..
+                } if author == agent => read.message(message).map(|mail| mail.headline()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
-    pub async fn cancel(&self, agent: AgentId) -> anyhow::Result<()> {
-        if let Some(client) = self.get(agent).await {
+    pub async fn cancel(&self, agent: AgentId) -> anyhow::Result<bool> {
+        let Some(client) = self.get(agent).await else {
+            return Ok(false);
+        };
+        let asking = matches!(
+            client.status().runtime.inference,
+            InferenceState::Responding | InferenceState::Retrying { .. }
+        );
+        if asking {
             client.control(Control::Cancel).await?;
         }
-        Ok(())
+        Ok(asking)
     }
 
     /// Stop each workset's process and erase it: its log, heads, usage,
@@ -1073,6 +1281,11 @@ impl AgentPool {
             }
             write.commit();
         }
+        self.doing
+            .lock()
+            .expect("poison")
+            .retain(|agent, _| !agents.contains(agent));
+        self.agents_left_mail(&agents);
         self.recent
             .lock()
             .expect("poison")
@@ -1175,12 +1388,43 @@ impl AgentPool {
                 PyReply::Agents(agents)
             }
             PyRequest::SetSpec { agent, spec } => {
-                let current = self.own_agent(workset, agent)?;
-                anyhow::ensure!(
-                    std::mem::discriminant(&current.runtime)
-                        == std::mem::discriminant(&spec.runtime),
-                    "an agent keeps its runtime kind"
-                );
+                let lock = self
+                    .load_locks
+                    .lock()
+                    .await
+                    .entry(agent)
+                    .or_default()
+                    .clone();
+                let _loading = lock.lock().await;
+                let head = self
+                    .db
+                    .read()
+                    .agent(agent)
+                    .filter(|head| head.workset == workset)
+                    .with_context(|| format!("no agent {} in this workset", agent.encoded()))?;
+                let changes_kind = std::mem::discriminant(&head.spec.runtime)
+                    != std::mem::discriminant(&spec.runtime);
+                if changes_kind {
+                    let activity = self
+                        .doing
+                        .lock()
+                        .expect("poison")
+                        .get(&agent)
+                        .map(|doing| doing.activity);
+                    anyhow::ensure!(
+                        activity
+                            .is_some_and(|activity| self.may_change_runtime_kind(agent, activity))
+                            || (head.startup_failure.is_some() && !head.native.woken),
+                        "only a stopped agent that has never sent a request can change runtime kind"
+                    );
+                    // Native and Claude have different loops. Stop the old
+                    // one before writing the new spec; policy will redeliver
+                    // the still-undelivered mail to the new loop.
+                    let client = self.agents.lock().await.remove(&agent);
+                    if let Some(client) = client {
+                        client.shutdown().await;
+                    }
+                }
                 {
                     let mut write = self.db.write().await;
                     write.append(
@@ -1215,41 +1459,132 @@ impl AgentPool {
                         .delivered,
                 )
             }
-            PyRequest::Post {
+            PyRequest::SendMail {
                 sender,
                 parent,
+                reply_to,
                 mentions,
                 content,
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
+                let direct = mentions
+                    .iter()
+                    .any(|mention| mention.kind == MentionKind::Direct);
+                let project = if direct {
+                    anyhow::ensure!(
+                        parent.is_none(),
+                        "direct mail chooses its own thread; address the agent"
+                    );
+                    self.mail_project(sender)
+                } else {
+                    None
+                };
                 let message = NewMessage {
                     from: Address::Agent(sender),
+                    reply_to,
                     mentions,
                     content,
                 };
                 let mut write = self.db.write().await;
-                let id = write.post(UnixMs::now(), parent, message, None)?;
-                write.commit();
-                self.wake_receivers(id, Some(workset));
-                self.consider_naming(id);
-                PyReply::Seq(id.0)
-            }
-            PyRequest::Mail { sender, to, text } => {
-                self.own_agent(workset, sender)?;
-                self.workset_of(to)?;
-                anyhow::ensure!(sender != to, "an agent does not mail itself");
-                anyhow::ensure!(!text.trim().is_empty(), "a message needs text");
-                let input = Control::Input {
-                    content: vec![ContentPart::Text { text }],
-                    role: Role::Tool,
-                    message: None,
+                let at = UnixMs::now();
+                let is_ask = message
+                    .mentions
+                    .iter()
+                    .any(|mention| mention.to == Address::User && mention.kind == MentionKind::Ask);
+                let (id, changed, unanswered) = if direct {
+                    (write.post_peer(at, project, message)?, true, None)
+                } else {
+                    let revised = match parent {
+                        Some(thread) if is_ask => write.restate_ask(at, thread, &message)?,
+                        _ => None,
+                    };
+                    let unanswered = if is_ask {
+                        None
+                    } else {
+                        parent.and_then(|thread| write.unanswered_project_mail(thread))
+                    };
+                    let (id, changed) = match revised {
+                        Some(revised) => revised,
+                        None => (write.post(at, parent, message, None)?, true),
+                    };
+                    (id, changed, unanswered)
                 };
-                // Handed means the agent holds it: its ack says so.
-                let (_, client, _) = self.load(to).await?;
-                client.control(input).await?;
+                if changed {
+                    let version = write.mail_version(id);
+                    write.append(
+                        workset,
+                        &Record {
+                            at,
+                            event: Event::MailWritten {
+                                agent: sender,
+                                message: id,
+                                version,
+                            },
+                        },
+                    )?;
+                    write.commit();
+                    self.wake_receivers(id, Some(workset));
+                    if !direct {
+                        self.consider_naming(id);
+                    }
+                }
+                PyReply::SentMail { id, unanswered }
+            }
+            PyRequest::Status {
+                agent,
+                thread,
+                text,
+            } => {
+                self.own_agent(workset, agent)?;
+                self.set_thread_status(thread, agent, text)?;
                 PyReply::Done
             }
+            PyRequest::Edit {
+                agent,
+                message,
+                content,
+            } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                let at = UnixMs::now();
+                let before = write.mail_version(message);
+                write.edit(at, agent, message, content)?;
+                let version = write.mail_version(message);
+                if version == before {
+                    return Ok(PyReply::Done);
+                }
+                write.append(
+                    workset,
+                    &Record {
+                        at,
+                        event: Event::MailWritten {
+                            agent,
+                            message,
+                            version,
+                        },
+                    },
+                )?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Delete { agent, message } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.delete(UnixMs::now(), agent, message)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Search {
+                query,
+                project,
+                limit,
+            } => PyReply::Search(self.db.read().search_mail(
+                &query,
+                project,
+                limit.min(100) as usize,
+            )?),
+            PyRequest::ProjectNamed(name) => PyReply::Project(self.db.read().project_named(&name)),
             PyRequest::Message(id) => {
                 PyReply::Messages(self.db.read().message(id).into_iter().collect())
             }
@@ -1330,6 +1665,15 @@ impl AgentPool {
             }
             PyRequest::Models => PyReply::Models(models()),
             PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
+            PyRequest::AgentHandle(agent) => {
+                PyReply::Handle(self.db.read().agent(agent).map(|head| {
+                    let role = match head.spec.props.get("preset").map(String::as_str) {
+                        Some("advisor") => "adv",
+                        _ => "eng",
+                    };
+                    format!("{role}-{}", agent.encoded())
+                }))
+            }
             PyRequest::ExternalAddress(agent) => {
                 self.own_agent(workset, agent)?;
                 PyReply::Text(self.external_address(agent)?.to_string())
@@ -1379,7 +1723,7 @@ impl AgentPool {
             loop {
                 tokio::select! {
                     appended = feed.recv() => match appended {
-                        Ok(crate::store::Appended::Chat(_))
+                        Ok(crate::store::Appended::Mail(_))
                         | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return Vec::new(),
@@ -1477,4 +1821,87 @@ fn models() -> Vec<Runtime> {
         session_id: uuid::Uuid::nil(),
     });
     native.into_iter().chain(claude).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::AgentIdDomain;
+
+    use super::*;
+
+    /// An agent's age counts from when it started what it does now: a
+    /// status that changes something else keeps it; one that changes what
+    /// it does starts it again. A retry streak counts from its first
+    /// failure, across the attempts that show as working between.
+    #[test]
+    fn an_agent_is_doing_what_it_does_since_it_started() {
+        let agent = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+        let other = AgentId::from_counter(2, &AgentIdDomain(0)).unwrap();
+        let working = RuntimeState {
+            inference: InferenceState::Responding,
+            ..RuntimeState::default()
+        };
+        let retrying = |at: u64| RuntimeState {
+            inference: InferenceState::Retrying {
+                at: UnixMs(at),
+                error: "503".into(),
+                since: UnixMs(5),
+            },
+            ..RuntimeState::default()
+        };
+        let failed = |since: Option<u64>| RuntimeState {
+            inference: InferenceState::Failed {
+                error: "400".into(),
+                since: since.map(UnixMs),
+            },
+            ..RuntimeState::default()
+        };
+        let mut doing = HashMap::new();
+        assert_eq!(stamp(&mut doing, agent, &working, UnixMs(1)), UnixMs(1));
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(3)),
+            UnixMs(1),
+            "still working"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &retrying(12), UnixMs(10)),
+            UnixMs(5)
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(12)),
+            UnixMs(12),
+            "an attempt is working, from when it began"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &retrying(30), UnixMs(20)),
+            UnixMs(5),
+            "the streak runs on from its first failure"
+        );
+        assert_eq!(stamp(&mut doing, other, &working, UnixMs(25)), UnixMs(25));
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(None), UnixMs(40)),
+            UnixMs(40),
+            "a runtime that says no time failed when the host heard it"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(50)),
+            UnixMs(50),
+            "a failure ends; what follows starts anew"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(55)), UnixMs(60)),
+            UnixMs(55),
+            "it failed when its runtime says"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(70)), UnixMs(75)),
+            UnixMs(70),
+            "a retry failed again, though the host never heard it work"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(70)), UnixMs(90)),
+            UnixMs(70),
+            "the same failure, heard again"
+        );
+    }
 }

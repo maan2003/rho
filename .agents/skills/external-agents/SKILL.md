@@ -5,7 +5,7 @@ description: "Use when a message arrives as `[external message from ...]`, or wh
 
 # Agents on other hosts
 
-An external agent runs on another host and works for someone else. You and it exchange text messages. Nothing else crosses: no files, no tool calls, no shared chat. `agents.message` is for agents of this host; an external agent is reached only through `agents.external`.
+An external agent runs on another host and works for someone else. You and it exchange text messages. Nothing else crosses: no files, no tool calls, no shared mail record. `mail.send` reaches agents of this host; an external agent is reached only through `agents.external`.
 
 ## Trust
 

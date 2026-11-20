@@ -7,7 +7,7 @@ use std::sync::Arc;
 mod common;
 
 use rho_agent::worker::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, UnixMs};
 use rho_shell_view::protocol::{ShellColor, ShellServerFrame};
 
 /// This binary is the sidecar when started with this argument.
@@ -38,7 +38,9 @@ fn main() {
         eprintln!("skipping shell_e2e: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    let program = std::env::current_exe().unwrap();
+    // Not `current_exe()`: the workset view replaces `/src`, which may hold
+    // the build directory. The kernel's link reaches this binary anyway.
+    let program = std::path::PathBuf::from("/proc/self/exe");
     common::run(
         "PS1=\'rho-test> \'\nPROMPT_COMMAND=\'export RHO_TEST_CONFIG_HOOK=fired\'\ntrap \'printf fired >/src/brush-exit-hook\' EXIT\n",
         move || shell_end_to_end_over_registry(program),
@@ -257,8 +259,33 @@ async fn shell_end_to_end_over_registry(program: std::path::PathBuf) {
     wait_for_text(&mut first, &mut first_state, idle_control_token).await;
 
     // EOF writes VEOF only to this execution's PTY, not the shell session.
+    let before_cat = UnixMs::now();
     let cat_execution = first.submit.send("cat".to_owned()).await.unwrap();
     wait_for_running(&mut first, &mut first_state, cat_execution).await;
+    let cat_state = |state: &rho_shell_view::protocol::ShellState| {
+        state
+            .executions
+            .iter()
+            .find(|block| block.execution == cat_execution)
+            .unwrap()
+            .state
+            .clone()
+    };
+    let rho_shell_view::protocol::ShellExecutionState::Running { since } = cat_state(&first_state)
+    else {
+        panic!("cat lost its running state")
+    };
+    assert!((before_cat..=UnixMs::now()).contains(&since));
+    {
+        let mut reattached = registry.attach(agent_id).await.unwrap();
+        let mut snapshot = rho_shell_view::protocol::ShellState::default();
+        wait_for_running(&mut reattached, &mut snapshot, cat_execution).await;
+        assert_eq!(
+            cat_state(&snapshot),
+            cat_state(&first_state),
+            "reattach must not restart the clock"
+        );
+    }
     first.control.send(ShellControl::Eof).await.unwrap();
     let after_eof_token = "after-eof";
     let after_eof_execution = first
@@ -414,7 +441,7 @@ async fn wait_for_running(
             block.execution == execution
                 && matches!(
                     block.state,
-                    rho_shell_view::protocol::ShellExecutionState::Running
+                    rho_shell_view::protocol::ShellExecutionState::Running { .. }
                 )
         })
     };
@@ -471,6 +498,7 @@ fn apply_test_frame(state: &mut rho_shell_view::protocol::ShellState, frame: She
         }
         ShellServerFrame::ExecutionStarted {
             execution,
+            since,
             prompt,
             cwd,
         } => {
@@ -479,7 +507,7 @@ fn apply_test_frame(state: &mut rho_shell_view::protocol::ShellState, frame: She
                 .iter_mut()
                 .find(|block| block.execution == execution)
                 .expect("started execution was queued");
-            block.state = ShellExecutionState::Running;
+            block.state = ShellExecutionState::Running { since };
             block.prompt = prompt;
             block.cwd = cwd;
         }

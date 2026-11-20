@@ -563,6 +563,8 @@ pub enum SizingBehavior {
     /// scroll margin as requested by user settings.
     #[default]
     Default,
+    /// A full editor with one page of overscroll, even if the document fits.
+    FullOverscrollMargin,
     /// The editor will layout itself using `size_full`, but will not have any
     /// vertical overscroll.
     ExcludeOverscrollMargin,
@@ -10997,6 +10999,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         match event {
+            multi_buffer::Event::EditBlockedByReadOnly => {
+                cx.emit(EditorEvent::EditBlockedByReadOnly);
+            }
             multi_buffer::Event::Edited {
                 edited_buffer,
                 source,
@@ -13848,6 +13853,8 @@ pub enum EditorEvent {
         selections_by_buffer: HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,
         split: bool,
     },
+    /// An attempted edit was rejected because it touched read-only text.
+    EditBlockedByReadOnly,
     /// Emitted when an underlying buffer changes, including edits made through another editor.
     BufferEdited,
     /// Emitted when this editor creates, undoes, or redoes an edit transaction.

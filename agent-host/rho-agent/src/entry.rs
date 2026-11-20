@@ -30,8 +30,6 @@ pub enum Wake {
     Prose,
     /// The host restarted; everything running is gone.
     Restarted,
-    /// The model's history branched; notebook state was not changed.
-    Rewound,
     /// Ask the provider to compact the current context.
     Compaction,
     /// Carry on after a compaction that interrupted owed work.
@@ -46,6 +44,20 @@ pub enum Notice {
     Stopped(String),
     Archived,
     FreshNotebook,
+    /// The user cancelled what was in flight: a request, a retry, or a
+    /// cell.
+    Cancelled,
+    /// The runtime could not launch; mail waits for a change of runtime.
+    StartupFailed(StartupFailure),
+    /// The provider completed a response after a stuck retry streak.
+    Recovered(rho_agent_types::UnixMs),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct StartupFailure {
+    pub error: String,
+    pub since: rho_agent_types::UnixMs,
+    pub runtime: crate::record::Runtime,
 }
 
 /// What one request says, by role.
@@ -175,6 +187,10 @@ pub enum RequestNotice {
     Waiting,
     Checkin,
     NothingNew,
+    ThreadCold {
+        thread: rho_agent_types::MessageId,
+        minutes: u64,
+    },
 }
 
 impl RequestNotice {
@@ -200,6 +216,10 @@ impl RequestNotice {
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
+            Self::ThreadCold { thread, minutes } => return format!(
+                "Thread #{} is cold after {minutes} minutes away. Read it and edit your live mail to stand alone. Start by copying a short part of the user's ask verbatim in backticks, then give enough context to read it on its own. Make new mail stand alone too.",
+                thread.0.0
+            ).into(),
         };
         text.into()
     }

@@ -185,6 +185,7 @@ mod tests {
                 answers: true,
                 compaction: false,
                 timing: None,
+                output: String::new(),
                 at: UnixMs(at),
             },
         )]
@@ -248,6 +249,7 @@ mod tests {
                 answers: true,
                 compaction: false,
                 timing: None,
+                output: String::new(),
                 at: UnixMs(3),
             },
         );

@@ -14,17 +14,16 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, MouseButton, Pixels, Point, TouchEvent,
-    TouchId, TouchPhase, Window, div, ease_out_quint, px,
+    Animation, AnimationExt as _, AnyElement, Context, MouseButton, MouseDownEvent, Pixels, Point,
+    TouchEvent, TouchId, TouchPhase, Window, div, ease_out_quint, px,
 };
 use rho_journal::{PhoneFlickDirection, PhoneVerdict};
 use theme::ActiveTheme as _;
 
 use crate::attention::Verdict;
 use crate::frame::{Frame, snooze_rows};
-use crate::home::HomeTarget;
-use crate::menu::{Pick, Rows};
-use crate::surface::AnySurface;
+use crate::menu::{Pick, Row, Rows};
+use crate::surface::{AnySurface, PhoneSend};
 
 /// The widest window that is laid out as a phone.
 pub(crate) const PHONE_MAX_WIDTH: Pixels = px(600.);
@@ -40,13 +39,13 @@ const HEADER_GUTTER: Pixels = px(28.);
 
 /// How the frame is laid out, from the window's width alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Layout {
+pub enum Layout {
     Desktop,
     Phone,
 }
 
 impl Layout {
-    pub(crate) fn of(viewport_width: Pixels) -> Self {
+    pub fn of(viewport_width: Pixels) -> Self {
         match viewport_width <= PHONE_MAX_WIDTH {
             true => Self::Phone,
             false => Self::Desktop,
@@ -54,26 +53,58 @@ impl Layout {
     }
 }
 
+/// Hit-test a phone editor against its painted layout. Capture this press
+/// before the editor handles selection. The platform synthesizes a mouse
+/// press for a recognized touch tap, not for a pan.
+pub fn phone_editor_tap(
+    editor: &editor::Editor,
+    event: &gpui::MouseDownEvent,
+    window: &Window,
+) -> Option<multi_buffer::Anchor> {
+    if Layout::of(window.viewport_size().width) != Layout::Phone
+        || event.button != MouseButton::Left
+        || event.click_count != 1
+        || event.modifiers.modified()
+    {
+        return None;
+    }
+    editor
+        .buffer_location_for_window_position(event.position, text::Bias::Left)
+        .map(|(anchor, _, _)| anchor)
+}
+
 /// A heading and its state in `width`: the state is what the reader acts
-/// on, so it stays whole and the heading is cut at a word.
+/// on, so it is kept and the heading is cut at a word. A state wider than
+/// the line, one that says why at length, takes the line and is cut at a
+/// word itself.
 pub(crate) fn fit_heading(
     path: &str,
     state: &str,
     width: Pixels,
     measure: impl Fn(&str) -> Pixels,
 ) -> (String, String) {
-    let room = (width - HEADER_GUTTER - measure(state)).max(px(0.));
+    let line = (width - HEADER_GUTTER).max(px(0.));
+    if measure(state) > line {
+        return (String::new(), cut_at_word(state, line, &measure));
+    }
+    let room = (line - measure(state)).max(px(0.));
     if measure(path) <= room {
         return (path.to_owned(), state.to_owned());
     }
+    (cut_at_word(path, room, &measure), state.to_owned())
+}
+
+/// `text` cut at the last word that leaves room for an ellipsis.
+pub(crate) fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
     let ellipsis = "…";
     let mut cut = String::new();
-    for (boundary, character) in path.char_indices() {
+    for (boundary, character) in text.char_indices() {
         if !character.is_whitespace() {
             continue;
         }
-        let prefix = path[..boundary]
-            .trim_end_matches(|character: char| character.is_whitespace() || character == '/');
+        let prefix = text[..boundary].trim_end_matches(|character: char| {
+            character.is_whitespace() || character == '/' || character == '·'
+        });
         let candidate = format!("{prefix}{ellipsis}");
         if measure(&candidate) > room {
             break;
@@ -83,7 +114,7 @@ pub(crate) fn fit_heading(
     if cut.is_empty() && measure(ellipsis) <= room {
         cut.push_str(ellipsis);
     }
-    (cut, state.to_owned())
+    cut
 }
 
 /// How wide `text` is drawn in `style`.
@@ -219,15 +250,13 @@ pub(crate) struct Phone {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Button {
     Back,
-    Home,
+    Desk,
     Menu,
-    /// The row under the cursor on Home, as `enter` opens it.
+    /// Deal the top card.
     Open,
     Done,
-    Mute,
     Snooze,
-    /// The whole verdict menu, as `space` opens it.
-    Verdicts,
+    More,
     Send,
     Cancel,
     Enter,
@@ -237,13 +266,12 @@ impl Button {
     fn id(self) -> &'static str {
         match self {
             Self::Back => "rho-phone-back",
-            Self::Home => "rho-phone-home",
+            Self::Desk => "rho-phone-desk",
             Self::Menu => "rho-phone-menu",
             Self::Open => "rho-phone-open",
             Self::Done => "rho-phone-done",
-            Self::Mute => "rho-phone-mute",
             Self::Snooze => "rho-phone-snooze",
-            Self::Verdicts => "rho-phone-verdicts",
+            Self::More => "rho-phone-verdicts",
             Self::Send => "rho-phone-send",
             Self::Cancel => "rho-phone-cancel",
             Self::Enter => "rho-phone-enter",
@@ -253,13 +281,12 @@ impl Button {
     fn face(self) -> (&'static str, &'static str) {
         match self {
             Self::Back => ("‹", "back"),
-            Self::Home => ("⌂", "home"),
+            Self::Desk => ("⌂", "desk"),
             Self::Menu => ("☰", "menu"),
             Self::Open => ("→", "open"),
             Self::Done => ("✓", "done"),
-            Self::Mute => ("×", "mute"),
             Self::Snooze => ("◷", "snooze"),
-            Self::Verdicts => ("⋯", "more"),
+            Self::More => ("⋯", "more"),
             Self::Send => ("↑", "send"),
             Self::Cancel => ("×", "cancel"),
             Self::Enter => ("↵", "enter"),
@@ -267,61 +294,58 @@ impl Button {
     }
 }
 
+/// Whether this is the card itself or a screen inspecting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCard {
+    Here,
+    Related,
+}
+
 /// What the bar is about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BarState {
     prompting: bool,
-    home: bool,
-    /// The cursor on Home is on a row that opens.
-    row: bool,
-    /// The point is on something a verdict lands on.
-    card: bool,
-    /// The surface in view offers a `send` row.
+    composing_idea: bool,
+    desk: bool,
+    /// A waiting card is open.
+    card: Option<OpenCard>,
+    /// The surface in view has a draft to send.
     send: bool,
 }
 
-/// The bar's buttons, left to right. A prompt takes the bar for its own
-/// answer. On Home, opening and the verdicts are buttons over the row
-/// under the cursor, where a tap only puts the cursor, because dealing from
-/// Home is what the phone is for; elsewhere they are one button for the menu,
-/// and the room goes to sending.
+/// The bar's buttons, left to right.
 fn buttons(state: BarState) -> Vec<Button> {
-    if state.prompting {
-        return vec![Button::Cancel, Button::Enter];
-    }
-    let mut buttons = vec![Button::Back];
-    match state.home {
-        true => {
-            buttons.push(Button::Menu);
-            if state.row {
-                buttons.push(Button::Open);
-            }
-            if state.card {
-                buttons.extend([Button::Done, Button::Mute, Button::Snooze, Button::Verdicts]);
-            }
-        }
-        false => {
-            buttons.extend([Button::Home, Button::Menu]);
-            if state.card {
-                buttons.push(Button::Verdicts);
-            }
-            if state.send {
-                buttons.push(Button::Send);
-            }
+    use Button::*;
+    match state {
+        BarState {
+            prompting: true, ..
+        } => vec![Cancel, Enter],
+        BarState {
+            composing_idea: true,
+            ..
+        } => vec![Cancel, Send],
+        BarState { desk: true, .. } => vec![Menu, Open, More],
+        BarState { card, send, .. } => {
+            let mut buttons = match card {
+                Some(OpenCard::Here) => vec![Back, Menu, Done, Snooze, More],
+                Some(OpenCard::Related) => vec![Back, Done, Snooze, More, Menu],
+                None => vec![Back, Desk, Menu],
+            };
+            buttons.extend(send.then_some(Send));
+            buttons
         }
     }
-    buttons
 }
 
 /// `rows` with each pick also said to the journal as `verdict` by thumb.
 fn journaled(mut rows: Rows, verdict: PhoneVerdict) -> Rows {
     for row in &mut rows.rows {
-        if let Pick::Run(run) = &row.pick {
-            let run = run.clone();
-            row.pick = Pick::Run(Rc::new(move |frame, count, window, cx| {
+        if let Pick::Run { run, .. } = &mut row.pick {
+            let action = run.clone();
+            *run = Rc::new(move |frame, count, window, cx| {
                 record_verdict(verdict);
-                run(frame, count, window, cx);
-            }));
+                action(frame, count, window, cx);
+            });
         }
     }
     rows
@@ -330,9 +354,6 @@ fn journaled(mut rows: Rows, verdict: PhoneVerdict) -> Rows {
 fn record_verdict(verdict: PhoneVerdict) {
     rho_journal::record(rho_journal::Event::PhoneVerdict { verdict });
 }
-
-/// The row a surface offers for sending what is in its composer.
-const SEND_ROW: &str = "send";
 
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
@@ -360,6 +381,7 @@ impl Frame {
     fn phone_touch(&mut self, event: &TouchEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.phase {
             TouchPhase::Started => {
+                self.note_input();
                 self.phone.contacts.insert(event.id);
                 // One finger flicks; a second makes it a pinch, and an
                 // open prompt or menu is what the reader is answering.
@@ -525,35 +547,80 @@ impl Frame {
             .w_full()
             .overflow_hidden()
             .capture_touch(cx.listener(Self::phone_touch))
+            .capture_any_mouse_down(cx.listener(Self::phone_desk_row))
             .child(body)
             .into_any_element()
+    }
+
+    fn phone_desk_row(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left
+            || event.modifiers.modified()
+            || !self.desk_in_view()
+            || self.minibuffer.is_some()
+            || self.menu.is_some()
+            || self.idea_editor().is_some()
+            || self.phone.snap.is_some()
+        {
+            return;
+        }
+        // Claim only an actual desk row. The editor must still see clicks
+        // in its draft and on its address separator.
+        if self
+            .desk
+            .update(cx, |desk, cx| desk.tap(event.position, window, cx))
+        {
+            self.open_row(window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
     }
 
     /// The bar along the bottom edge.
     pub(crate) fn render_phone_bar(
         &mut self,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let surface = self.current_surface().clone();
-        let send = surface
-            .rows(window, cx)
-            .into_iter()
-            .find(|row| row.description == SEND_ROW);
+        let send = surface.phone_send(cx);
+        let prompting = self.minibuffer.is_some();
+        let typing = self.mode(window, cx).contains("insert");
+        let composing_idea = self.idea_editor().is_some() || (typing && self.idea_here(cx));
+        let mut tools = if prompting || composing_idea {
+            Vec::new()
+        } else {
+            surface.phone_tools(typing, cx)
+        };
         let state = BarState {
-            prompting: self.minibuffer.is_some(),
-            home: self.home_in_view(),
-            row: self.home_in_view() && self.home.read(cx).cursor_target(cx) != HomeTarget::None,
-            card: self.card_target(cx).is_some(),
+            prompting,
+            composing_idea,
+            desk: self.desk_in_view(),
+            // Working in a terminal or shell keeps the navigation bar and
+            // its Palette; that still offers the same related verdicts.
+            card: (tools.iter().all(|tool| tool.replaces_desk) && self.phone_card(cx).is_some())
+                .then(|| {
+                    if surface.inspects_card() {
+                        OpenCard::Related
+                    } else {
+                        OpenCard::Here
+                    }
+                }),
             send: send.is_some(),
         };
         let colors = cx.theme().colors();
-        let send = Rc::new(send);
-        let items = buttons(state).into_iter().map(|button| {
-            let (icon, label) = button.face();
-            let send = send.clone();
+        let render_tool = |tool: crate::surface::PhoneTool| {
+            let color = if tool.active {
+                colors.text_accent
+            } else {
+                colors.text_muted
+            };
             div()
-                .id(button.id())
+                .id(tool.label)
                 .cursor_pointer()
                 .h_full()
                 .flex_1()
@@ -562,14 +629,50 @@ impl Frame {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .text_color(colors.text_muted)
-                .child(div().text_size(px(18.)).child(icon))
-                .child(div().text_size(px(11.)).child(label))
+                .text_color(color)
+                .child(div().text_size(px(18.)).child(tool.icon))
+                .child(div().text_size(px(11.)).child(tool.label))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.press(button, send.as_ref().as_ref(), window, cx);
+                    if this.phone.snap.is_none() {
+                        tool.press(window, cx);
+                        cx.notify();
+                    }
                     cx.stop_propagation();
                 }))
-        });
+                .into_any_element()
+        };
+        let mut items = Vec::new();
+        for button in buttons(state) {
+            if button == Button::Desk
+                && let Some(index) = tools.iter().position(|tool| tool.replaces_desk)
+            {
+                items.push(render_tool(tools.remove(index)));
+                continue;
+            }
+            let (icon, label) = button.face();
+            let send = send.clone();
+            items.push(
+                div()
+                    .id(button.id())
+                    .cursor_pointer()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .text_color(colors.text_muted)
+                    .child(div().text_size(px(18.)).child(icon))
+                    .child(div().text_size(px(11.)).child(label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.press(button, send.as_ref(), window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        items.extend(tools.into_iter().map(render_tool));
         div()
             .id("rho-phone-bar")
             .flex_none()
@@ -583,10 +686,19 @@ impl Frame {
             .into_any_element()
     }
 
+    fn phone_card(&self, cx: &gpui::App) -> Option<rho_dealer::Address> {
+        self.card_in_view(cx).filter(|address| {
+            self.hand()
+                .cards
+                .iter()
+                .any(|card| &card.address == address)
+        })
+    }
+
     fn press(
         &mut self,
         button: Button,
-        send: Option<&crate::menu::Row>,
+        send: Option<&PhoneSend>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -594,40 +706,47 @@ impl Frame {
         if self.phone.snap.is_some() {
             return;
         }
-        let target = self.card_target(cx);
+        let target = self.phone_card(cx);
         match button {
             Button::Back => self.back(window, cx),
-            Button::Home => self.toggle_home(window, cx),
+            Button::Desk => self.toggle_desk(window, cx),
             Button::Menu => self.palette(window, cx),
-            Button::Open => self.open_row(window, cx),
+            Button::Open => self.pull_card(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Done);
                     self.verdict(target, Verdict::Done, "done".to_owned(), window, cx);
                 }
             }
-            Button::Mute => {
-                if let Some(target) = &target {
-                    record_verdict(PhoneVerdict::Mute);
-                    self.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx);
-                }
-            }
             // How long is a question, the one the snooze menu asks.
             Button::Snooze => {
                 if let Some(target) = &target {
-                    let rows = journaled(snooze_rows(target), PhoneVerdict::Defer);
+                    let rows = journaled(snooze_rows(target, true), PhoneVerdict::Defer);
                     self.open_menu(rows, window, cx);
                 }
             }
-            Button::Verdicts => self.verdict_menu(window, cx),
+            Button::More if self.desk_in_view() => {
+                let rows = Rows::new("desk")
+                    .row(Row::run("b", "back", |frame, window, cx| {
+                        frame.back(window, cx)
+                    }))
+                    .row(Row::run("i", "write an idea", |frame, window, cx| {
+                        frame.prompt_idea(window, cx)
+                    }))
+                    .row(Row::run("u", "undo", |frame, window, cx| {
+                        frame.undo_verdict(window, cx)
+                    }));
+                self.open_menu(rows, window, cx);
+            }
+            Button::More => self.verdict_menu(window, cx),
+            Button::Send if self.idea_here(cx) => self.send_idea(window, cx),
             Button::Send => {
-                if let Some(crate::menu::Row {
-                    pick: Pick::Run(run),
-                    ..
-                }) = send
-                {
-                    run(self, None, window, cx);
+                if let Some(send) = send {
+                    send(window, cx);
                 }
+            }
+            Button::Cancel if self.idea_here(cx) && self.minibuffer.is_none() => {
+                self.cancel_idea(window, cx)
             }
             Button::Cancel => self.minibuffer_cancel(window, cx),
             Button::Enter => self.minibuffer_confirm(window, cx),
@@ -636,8 +755,8 @@ impl Frame {
     }
 
     /// The open menu as a sheet over the window: the same rows the desk
-    /// draws under the point, each a row a thumb can hit, and a tap off
-    /// the sheet dismisses it.
+    /// draws under the point, each a row a thumb can hit. The scrim and
+    /// bottom edge dismiss it; neither is part of the row hit area.
     pub(crate) fn render_menu_sheet(
         &self,
         text_style: &gpui::TextStyle,
@@ -656,8 +775,10 @@ impl Frame {
                 .text_color(colors.text_muted)
                 .child(label)
         };
+        let dismiss = || cx.listener(|this, _, window, cx| this.close_menu(window, cx));
         let header = div()
             .flex()
+            .flex_none()
             .flex_row()
             .items_center()
             .min_h(TARGET_HEIGHT)
@@ -666,10 +787,8 @@ impl Frame {
             .border_b_1()
             .border_color(colors.border_variant)
             .children((!open.under.is_empty()).then(|| {
-                target("rho-sheet-back", "‹ back").on_click(cx.listener(|this, _, window, cx| {
-                    this.menu_dismiss(window, cx);
-                    cx.stop_propagation();
-                }))
+                target("rho-sheet-back", "‹ back")
+                    .on_click(cx.listener(|this, _, window, cx| this.menu_dismiss(window, cx)))
             }))
             .child(
                 div()
@@ -682,10 +801,7 @@ impl Frame {
             .child(
                 target("rho-sheet-close", "close")
                     .justify_end()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_menu(window, cx);
-                        cx.stop_propagation();
-                    })),
+                    .on_click(dismiss()),
             );
         let rows = open.rows.rows.iter().enumerate().map(|(index, row)| {
             div()
@@ -700,11 +816,11 @@ impl Frame {
                 .gap_3()
                 .border_b_1()
                 .border_color(colors.border_variant)
-                .child(div().flex_1().min_w_0().child(row.description.clone()))
+                .child(div().flex_1().min_w_0().child(row.pick.label().to_owned()))
                 .children(
-                    row.value
-                        .clone()
-                        .map(|value| div().text_color(colors.text_muted).child(value)),
+                    row.pick
+                        .value()
+                        .map(|value| div().text_color(colors.text_muted).child(value.to_owned())),
                 )
                 .children(
                     matches!(row.pick, Pick::Menu(_))
@@ -719,29 +835,57 @@ impl Frame {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.click_menu_row(index, window, cx);
-                    cx.stop_propagation();
                 }))
         });
         let sheet = crate::minibuffer::bottom_strip(text_style, cx)
-            .id("rho-sheet")
+            .occlude()
             .max_h(gpui::relative(0.82))
-            .overflow_y_scroll()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
             .child(header)
-            .children(rows);
+            .child(
+                div()
+                    .id("rho-sheet-rows")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            );
+        let cancel = crate::minibuffer::bottom_strip(text_style, cx)
+            .absolute()
+            .bottom_0()
+            .py_0()
+            .occlude()
+            .child(
+                target("rho-sheet-cancel", "cancel")
+                    .justify_center()
+                    .on_click(dismiss()),
+            );
         Some(
             div()
-                .id("rho-sheet-backdrop")
                 .track_focus(&self.menu_focus)
                 .absolute()
                 .inset_0()
-                .flex()
-                .flex_col()
-                .justify_end()
-                .bg(gpui::black().opacity(0.35))
-                .on_click(cx.listener(|this, _, window, cx| this.close_menu(window, cx)))
-                .child(sheet)
+                // Keep the scrim a sibling, not a click listener on the
+                // sheet's parent. A press outside can't arm a menu row.
+                .child(
+                    div()
+                        .id("rho-sheet-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(gpui::black().opacity(0.35))
+                        .on_click(dismiss()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bottom(TARGET_HEIGHT)
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .child(sheet),
+                )
+                // Cover the work's bar with a dismiss target, not a command row.
+                .child(cancel)
                 .into_any_element(),
         )
     }
@@ -775,6 +919,18 @@ mod tests {
         // Room enough, nothing is cut.
         let (whole, _) = fit_heading("short", state, px(360.), measure);
         assert_eq!(whole, "short");
+    }
+
+    /// A stop that says why can be wider than the phone: it takes the line,
+    /// cut at a word, rather than running under the mode word.
+    #[test]
+    fn a_state_wider_than_the_line_is_cut_and_the_heading_gives_way() {
+        let measure = |text: &str| px(text.chars().count() as f32 * 8.);
+        let state = "failed · now · The model refused the request: the conte…";
+        let (path, kept) = fit_heading("rho-web / FAILME native try", state, px(360.), measure);
+        assert_eq!(path, "");
+        assert_eq!(kept, "failed · now · The model refused the…");
+        assert!(measure(&kept) + HEADER_GUTTER <= px(360.));
     }
 
     fn touch(phase: TouchPhase, y: f32, milliseconds: u64) -> TouchEvent {
@@ -847,38 +1003,40 @@ mod tests {
     #[test]
     fn the_bar_offers_what_the_state_can_take() {
         use Button::*;
-        let home = BarState {
-            home: true,
-            row: true,
-            card: true,
+        let desk = BarState {
+            desk: true,
             ..BarState::default()
         };
-        assert_eq!(
-            buttons(home),
-            [Back, Menu, Open, Done, Mute, Snooze, Verdicts]
-        );
-        // A row may open but take no verdict; a heading takes neither.
+        assert_eq!(buttons(desk), [Menu, Open, More]);
         assert_eq!(
             buttons(BarState {
-                card: false,
-                ..home
+                card: Some(OpenCard::Here),
+                ..desk
             }),
-            [Back, Menu, Open]
+            [Menu, Open, More]
         );
-        assert_eq!(
-            buttons(BarState {
-                row: false,
-                card: false,
-                ..home
-            }),
-            [Back, Menu]
-        );
-        let thread = BarState {
-            card: true,
-            send: true,
+        let card = BarState {
+            card: Some(OpenCard::Here),
             ..BarState::default()
         };
-        assert_eq!(buttons(thread), [Back, Home, Menu, Verdicts, Send]);
+        assert_eq!(buttons(card), [Back, Menu, Done, Snooze, More]);
+        let thread = BarState { send: true, ..card };
+        assert_eq!(buttons(thread), [Back, Menu, Done, Snooze, More, Send]);
+        assert_eq!(
+            buttons(BarState {
+                card: Some(OpenCard::Related),
+                ..BarState::default()
+            }),
+            [Back, Done, Snooze, More, Menu]
+        );
+        assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
+        assert_eq!(
+            buttons(BarState {
+                composing_idea: true,
+                ..thread
+            }),
+            [Cancel, Send]
+        );
         assert_eq!(
             buttons(BarState {
                 prompting: true,

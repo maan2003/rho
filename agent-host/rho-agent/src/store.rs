@@ -1,10 +1,10 @@
 //! The agent store: workset logs, the heads projected from them, and the
-//! chat ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
+//! mail ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
 //!
 //! Each workset has one log, keyed by `(workset, wpos)`, dense from zero and
 //! never rewritten. Agent and workset heads are folded from it in the same
-//! transaction as every append. Chat is one host-wide log ([`chat`]).
-//! Deleting a workset removes its log and heads; chat stays.
+//! transaction as every append. Mail is one host-wide log ([`mail`]).
+//! Deleting a workset removes its log and heads; mail stays.
 
 use redb::TableDefinition;
 use rho_agent_types::{
@@ -13,7 +13,7 @@ use rho_agent_types::{
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
-use crate::entry::{CompactionState, Notice};
+use crate::entry::{CompactionState, Notice, StartupFailure};
 use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, Event, Record};
 
@@ -56,6 +56,8 @@ pub struct AgentHead {
     /// A Claude rewind whose destination is not verified yet.
     pub claude_rewind: Option<ClaudeRewind>,
     pub native: NativeCursor,
+    #[senax(default)]
+    pub startup_failure: Option<StartupFailure>,
 }
 
 /// The native replay position and recovery facts, derived from the agent's
@@ -113,7 +115,18 @@ impl AgentHead {
         self.last = pos;
         self.native.observe(pos, event);
         match event {
-            Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
+            Event::AgentChanged { spec, .. } => {
+                if self.spec.runtime != spec.runtime {
+                    self.startup_failure = None;
+                }
+                self.spec = spec.clone();
+            }
+            Event::Notice {
+                notice: Notice::StartupFailed(failure),
+                ..
+            } if failure.runtime == self.spec.runtime => {
+                self.startup_failure = Some(failure.clone())
+            }
             Event::Request { inputs, .. } => {
                 let newest = inputs.iter().filter_map(|input| input.message).max();
                 if let Some(newest) = newest {
@@ -130,7 +143,7 @@ impl AgentHead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appended {
     Row { workset: WorksetId, pos: Wpos },
-    Chat(ChatSeq),
+    Mail(ChatSeq),
     WorksetDeleted(WorksetId),
 }
 
@@ -325,7 +338,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_LOG);
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
-        self.init_chat_tables();
+        self.init_mail_tables();
         self.init_gccp_tables();
         agent_rows::init(self);
     }
@@ -381,6 +394,7 @@ impl StoreWrite for WriteTxn {
                     last: pos,
                     delivered: ChatSeq::ZERO,
                     claude_rewind: None,
+                    startup_failure: None,
                     native: NativeCursor {
                         from: pos,
                         ..NativeCursor::default()
@@ -403,6 +417,30 @@ impl StoreWrite for WriteTxn {
                         *to > agent_head.created && *to <= agent_head.last,
                         "a rewind stays within the agent's history"
                     );
+                }
+
+                if let Event::Rewound { to, .. } = record.event {
+                    for (old, row) in visible(agent_history_in_write(self, agent, workset))
+                        .into_iter()
+                        .rev()
+                    {
+                        if old < to {
+                            break;
+                        }
+                        if let Event::MailWritten {
+                            message, version, ..
+                        } = row.event
+                        {
+                            self.take_back_mail(record.at, agent, message, version);
+                        }
+                    }
+                }
+                if let Event::Notice {
+                    notice: Notice::Recovered(since),
+                    ..
+                } = record.event
+                {
+                    self.recover_stuck(record.at, agent, since);
                 }
                 agent_head.fold(pos, &record.event);
                 self.open_table(AGENT_HEADS)
@@ -474,6 +512,25 @@ impl StoreWrite for WriteTxn {
     }
 }
 
+fn agent_history_in_write(
+    write: &mut WriteTxn,
+    agent: AgentId,
+    workset: WorksetId,
+) -> Vec<(Wpos, Record<'static>)> {
+    agent_rows::positions_in_write(write, agent)
+        .into_iter()
+        .map(|pos| {
+            let record = write
+                .open_table(WORKSET_LOG)
+                .get((workset.0, pos.0))
+                .expect("an indexed row")
+                .value()
+                .into_owned();
+            (pos, record)
+        })
+        .collect()
+}
+
 /// Fold the native cursor again from the agent's visible rows.
 fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
     let mut head = write
@@ -482,18 +539,7 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         .expect("agent head")
         .value()
         .into_owned();
-    let rows: Vec<(Wpos, Record<'static>)> = agent_rows::positions_in_write(write, agent)
-        .into_iter()
-        .map(|pos| {
-            let record = write
-                .open_table(WORKSET_LOG)
-                .get((head.workset.0, pos.0))
-                .expect("an indexed row")
-                .value()
-                .into_owned();
-            (pos, record)
-        })
-        .collect();
+    let rows = agent_history_in_write(write, agent, head.workset);
     let mut cursor = NativeCursor {
         from: head.created,
         ..NativeCursor::default()
@@ -511,15 +557,16 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
 pub fn role_of(from: Address) -> Role {
     match from {
         Address::User => Role::User,
-        Address::Agent(_) => Role::Tool,
+        Address::Agent(_) | Address::System { .. } | Address::StartFailed => Role::Tool,
     }
 }
 
 pub(crate) mod agent_rows;
-pub mod chat;
 pub mod gccp;
+pub mod mail;
 
-pub use chat::{ChatRead, ChatWrite, NewMessage, ThreadHead};
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
+pub(crate) use mail::migrate_mail;
+pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
 #[cfg(test)]
 mod tests;

@@ -1,80 +1,70 @@
 # deal
 
-The deal hands the user the one thing that wants them most, so they never scan a list for it. The user answers each card with a verdict, and the next one comes.
+The deal hands the user the one thing that wants them most. The usual answer is a reply; when there is nothing to say, the user says done.
 
 ## bet The deal, not an inbox
 instead of: a list of unread things the user scans from top to bottom and marks read.
 serves: Know what wants them, and where they were.
-because: between two places the user has a minute and no memory of what asked; a list makes them choose, a card makes them answer, and the product remembers the rest.
-costs: whatever the user has not answered is behind the top card, and a verdict is a decision they must make.
+because: between two places the user has a minute and no memory of what asked; dealing hands them the next thing to answer, and the product remembers the rest.
+costs: the `desk.Desk` shows only the first cards; the rest are behind them.
+
+## journey Back from an hour elsewhere
+goal: the user clears what wants them and gets back to where they were.
+starts when: the user looks up after an hour in a terminal or a page.
+steps:
+1. the user sees what wants them and how much, `desk.Glance at what moves`
+2. the user clears it, `Clear what waits`
+3. the user goes back to where they were, as they left it, `window.Screen.back`
+done when: nothing waits and the user's place is on screen as they left it.
+day: Know what wants them, and where they were.
 
 ## concept Card
-purpose: hand the user the one thing that wants them most, so they never scan a list.
-principle: an agent's message in a thread asks the user something; the thread becomes a card; the user presses `space` then `n`, and the thread opens; they answer it and say done; the next card opens.
-sees: where it is and its name, such as `rho › claude-tool-prompt-audit`; why it wants the user and since when, such as `asks · 48.4d`, `result · 5.4h ago`, or `unread in @Barbara Liskov · needs reply · 0m`; then the thing itself, open on screen.
+status: new waiting mail after a reply comes before older unanswered mail in that thread. A stop reports a repeated error once with a count.
+purpose: put a mail that wants the user in reach, without making them look through the whole thread.
+principle: a project asks whether a test can use a separate clock; the deal opens the thread on that mail, the user replies, and its card goes away.
+sees: the `mail.Project` address, the `mail.Thread` subject, and why and since when it waits, such as `asks · 2h`, `result · 8m`, or `failed · 1h`; open, the `mail.Mail` that asks.
 has:
-- one `chat.Thread`, when an agent's message mentions the user
-- one `slack.Conversation` or one `slack.Thread`, when Slack would badge it for the user
+- one `mail.Thread`
+- one `mail.Mail` that asks for the user, gives a result, or reports a stop
 does:
-- deal `space` then `n`, or `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; the card in view, if any, goes behind the others for half an hour
-- done `space` then `d`, or `done` on the phone: say the user is through with everything in it so far; the card goes away, and when it was on screen, the next one opens
-- mute `space` then `m`, or `mute` on the phone: say nothing from it should reach the user again; the card goes away, and when it was on screen, the next one opens
+- deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour
+
+The longest-waiting card deals first, with asks and stops before results; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
+
+## concept Verdict
+status: Slack in the browser has no rho verdicts.
+purpose: let the user say once what a card means to them, so rho remembers their answer.
+principle: the user replies if they have words; otherwise they say done. If they change their mind about a verdict, they can take it back.
+sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
+does:
+- reply: send the user's words and settle the card, as in `mail.Answer a mail`
+- done `space` then `d`, or `done` on the phone: the user has nothing more to say; put away the card, and if it was on screen, open the next one
+- mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user again; put the card away, and if it was on screen, open the next one
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
-- undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
+- next `space` then `n`: open the next card; with nothing waiting, open the `desk.Desk` and echo `nothing waits`
+- undo `space` then `u`, or `shift-u` outside a `mail.Draft`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
 
-A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is. A verdict about one message alone is a rare act, by name from the palette.
+What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
-status: a verdict lands on what the cursor is on. On a thread that the deal opened, the cursor starts on the newest message, so the verdict menu and the `window.Status line` name that message rather than the card, until the user moves the cursor to the thread's first line.
+## flow Clear what waits
+runs: 50 a day
+day: Know what wants them, and where they were.
+when: the user has a few minutes and wants to clear what asks for them
+want: open each thing that needs them and either answer it or say what to do with it
+so that: nothing waits on the user without their knowing
+steps:
+1. the user deals the next `Card` (`open` on the phone’s `desk.Desk`)
+2. the user reads the mail where the card opened
+3. the user replies, `mail.Answer a mail`
+   - without a reply, they give `Verdict.done`, `Verdict.snooze` with a time, or `Verdict.mute`; on the phone, `done` takes one tap on the open card and deals the next
+4. the user continues until nothing waits and the `desk.Desk` is on screen
+system: orders cards from project mail; asks, results, and stops wait; snoozed cards can come back.
+user: the reply or verdict, and the time for a snooze.
+cases: a result from days ago that has not been read; a stop reported as mail; a snoozed card returns.
+reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
-What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it. The window has no way to enter the phrase. A device without it keeps its verdicts to itself, and when another device has written verdicts, the echo line says so and names `space s s` as the way to enter the phrase, a key that opens the snooze times instead.
-
-## concept Ask
-purpose: say that an agent needs something from the user before its work can go on.
-principle: an agent posts `which repo should I use?` and mentions the user as an ask; the thread's card reads `asks` and rises the longer it waits.
-sees: the word `asks` and how long it has waited, on the card and on its room.
-
-## concept Result
-purpose: say that what the user asked for is done.
-principle: an agent finishes and mentions the user with its result; the thread's card reads `result · 2h ago`; if the user does not look, it sinks and is gone after about three days.
-sees: the word `result` and how long ago, on the card and on its room.
-
-A mention that is only for the record makes no card; the thread shows as unread on Home instead. A message that mentions nobody makes no card.
-
-## concept Lamp
-purpose: tell the user something important waits, while they are looking at something else.
-principle: the user is reading a long transcript; an ask comes in that matters; a dot lights at the right end of the `window.Status line`; they finish and deal.
-sees: a yellow dot `●` at the right end of the top line.
-
-When a card rises past a higher line, the window also chimes once.
-
-## job Clear what waits
-when: I have a few free minutes
-want: see each thing that asks for me, and answer it
-so that: nothing waits on me without my knowing
-flow:
-1. press `space` then `n`; the top `Card` opens
-2. read it
-3. answer in the thread if it needs words from me
-4. `Card.done`, or `Card.snooze` and a time, or `Card.mute`; the next card opens
-5. repeat from 2 until the deal is empty and `home.Home` is on screen
-system: reads every host's chat and Slack, orders the cards, lets a result fade, lets a card come back when its snooze ends, and opens Home when nothing is left.
-user: the verdict, the time for a snooze, and any words of answer.
-cases: on the phone, where a snooze is one unit at a time; an ask that is weeks old from an agent that still exists; a card I skipped that comes back half an hour later
-
-## rule writing in a thread reads it
-when the user posts a message in a `chat.Thread`, then everything in it so far counts as seen, and its `Card` goes away until something new asks.
+## rule a reply settles the card
+when the user replies to a `mail.Mail` that waits, then its `Card` goes away, and the reply goes to whoever wrote the mail.
 
 ## rule opening is not reading
-when the user opens a `chat.Thread` and leaves it without a verdict or a message of their own, then its `Card` and its unread count stay as they were.
-
-## rule done in rho is read in Slack
-when `Card.done` on a card from Slack, then Slack marks it read through its newest message, so every other Slack app shows it as read too.
-
-## rule mute in rho is mute in Slack
-when `Card.mute` on a card from Slack, then Slack mutes that conversation or stops following that thread, and the user can lift it in any Slack app.
-
-## rule undo takes back the Slack side too
-when `Card.undo` takes back a done or a mute on a card from Slack, then Slack's read mark and mute go back to what they were.
-
-## rule a gone agent asks nothing
-when every agent of a `chat.Thread` is gone, then the thread makes no `Card`, whatever its messages asked.
+when the user opens a `mail.Thread` and leaves it without a `Verdict` or a reply, then its `Card` stays as it was.

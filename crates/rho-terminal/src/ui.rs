@@ -6,18 +6,17 @@
 //! terminal when it opens and drops the attachment when it closes, and the
 //! terminal keeps running on the host.
 
+use editor::{Editor, SelectionEffects};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::Surface;
-use rho_frame::keys::{Close, Home, Palette, VerdictMenu};
+use rho_frame::keys::{Close, Desk, Palette, SearchForward, VerdictMenu};
+use rho_frame::{Mode, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::TerminalInfo;
 use crate::{
-    TerminalModel, TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalScrollBottom,
-    TerminalScrollHalfPageDown, TerminalScrollHalfPageUp, TerminalScrollLineDown,
-    TerminalScrollLineUp, TerminalScrollTop, TerminalView, channel,
+    TerminalModel, TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalView, channel,
 };
 
 /// Which of an agent's terminals to open, given the ones that run: with
@@ -50,6 +49,8 @@ pub struct TerminalSurface {
     terminal: u64,
     state: State,
     focus: FocusHandle,
+    reader: Option<Entity<Editor>>,
+    phone_ctrl: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl TerminalSurface {
@@ -72,7 +73,8 @@ impl TerminalSurface {
                     this.state = match dialed {
                         Ok(channel) => {
                             let model = cx.new(|cx| TerminalModel::new(channel, cx));
-                            let view = cx.new(|cx| TerminalView::new(model.clone(), cx));
+                            let ctrl = this.phone_ctrl.clone();
+                            let view = cx.new(|cx| TerminalView::new(model.clone(), ctrl, cx));
                             cx.observe(&model, |_, _, cx| cx.notify()).detach();
                             // The keyboard was on the placeholder; it
                             // moves to the terminal it stood for.
@@ -93,6 +95,39 @@ impl TerminalSurface {
             terminal,
             state,
             focus: cx.focus_handle(),
+            reader: None,
+            phone_ctrl: Default::default(),
+        }
+    }
+    fn read(&mut self, _: &TerminalNormalMode, window: &mut Window, cx: &mut Context<Self>) {
+        let State::Open(view) = &self.state else {
+            return;
+        };
+        self.phone_ctrl.set(false);
+        let (text, row) = view.read(cx).reading_text(cx);
+        let reader = cx.new(|cx| {
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+            let mut editor = Editor::for_buffer(buffer, None, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
+            editor.set_read_only(true);
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                let point = language::Point::new(row as u32, 0);
+                selections.select_ranges([point..point]);
+            });
+            editor
+        });
+        window.focus(&reader.focus_handle(cx), cx);
+        self.reader = Some(reader);
+        cx.notify();
+    }
+
+    fn type_again(&mut self, _: &TerminalRawMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reader.take().is_some() {
+            if let State::Open(view) = &self.state {
+                view.update(cx, |view, cx| view.show_live(cx));
+            }
+            window.focus(&self.focus_handle(cx), cx);
+            cx.notify();
         }
     }
 }
@@ -108,10 +143,67 @@ impl Surface for TerminalSurface {
         }
         title
     }
+
+    fn phone_tools(&self, _: bool, _cx: &App) -> Vec<rho_frame::PhoneTool> {
+        let State::Open(view) = &self.state else {
+            return Vec::new();
+        };
+        use rho_frame::PhoneTool;
+        if self.reader.is_some() {
+            return vec![
+                PhoneTool::new("⌕", "search", |window, cx| {
+                    window.dispatch_action(Box::new(SearchForward), cx)
+                }),
+                PhoneTool::new("✎", "type", |window, cx| {
+                    window.dispatch_action(Box::new(TerminalRawMode), cx)
+                }),
+            ];
+        }
+        let ctrl = self.phone_ctrl.clone();
+        let mut modifier = PhoneTool::new("^", "ctrl", move |_, _| ctrl.set(!ctrl.get()));
+        modifier.active = self.phone_ctrl.get();
+        let mut tools = vec![modifier];
+        tools.extend(
+            [
+                ("⎋", "esc", "escape"),
+                ("⇥", "tab", "tab"),
+                ("←", "left", "left"),
+                ("↓", "down", "down"),
+                ("↑", "up", "up"),
+                ("→", "right", "right"),
+            ]
+            .map(|(icon, label, key)| {
+                let ctrl = self.phone_ctrl.clone();
+                let view = view.clone();
+                PhoneTool::new(icon, label, move |_, cx| {
+                    view.update(cx, |view, cx| view.phone_key(key, ctrl.replace(false), cx));
+                })
+            }),
+        );
+        tools.push(PhoneTool::new("≡", "read", |window, cx| {
+            window.dispatch_action(Box::new(TerminalNormalMode), cx)
+        }));
+        tools
+    }
+
+    fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
+        self.reader.clone()
+    }
+
+    fn mode(&self, _cx: &App) -> Option<Mode> {
+        match (&self.state, &self.reader) {
+            (State::Open(_), None) => Some(Mode::Insert),
+            (State::Open(_), Some(_)) => None,
+            _ => Some(Mode::Normal),
+        }
+    }
 }
 
 impl Focusable for TerminalSurface {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some(reader) = &self.reader {
+            return reader.focus_handle(cx);
+        }
         match &self.state {
             State::Open(view) => view.focus_handle(cx),
             State::Dialing { .. } | State::Failed(_) => self.focus.clone(),
@@ -123,7 +215,18 @@ impl Render for TerminalSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let note = match &self.state {
-            State::Open(view) => return div().size_full().child(view.clone()),
+            State::Open(view) => {
+                return div()
+                    .size_full()
+                    .key_context("RhoTerminalSurface")
+                    .on_action(cx.listener(Self::read))
+                    .on_action(cx.listener(Self::type_again))
+                    .child(if let Some(reader) = &self.reader {
+                        reader.clone().into_any_element()
+                    } else {
+                        view.clone().into_any_element()
+                    });
+            }
             State::Dialing { .. } => {
                 format!("connecting to term {} of {}…", self.terminal, self.agent)
             }
@@ -147,41 +250,27 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         // Raw mode: every unbound key goes to the pty, so the terminal's
         // own chords are ones shells do not see. `ctrl-\ ctrl-n` is vim's
-        // terminal escape; `ctrl-shift-n` the discoverable one.
+        // terminal escape; `ctrl-shift-n` the discoverable one. The palette
+        // chord, `ctrl-shift-;`, is the frame's own.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-;", Palette, Some("RhoTerminal")),
         KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
         // The frame walks history on ctrl-j and ctrl-k; in a shell they are
         // the shell's.
         KeyBinding::new("ctrl-j", NoAction, Some("RhoTerminal")),
         KeyBinding::new("ctrl-k", NoAction, Some("RhoTerminal")),
-        // Normal mode: the keyboard is rho's again; vim keys browse
-        // scrollback and insert returns to raw.
-        KeyBinding::new("i", TerminalRawMode, Some("RhoTerminalNormal")),
-        KeyBinding::new("a", TerminalRawMode, Some("RhoTerminalNormal")),
-        KeyBinding::new("enter", TerminalRawMode, Some("RhoTerminalNormal")),
-        KeyBinding::new("j", TerminalScrollLineDown, Some("RhoTerminalNormal")),
-        KeyBinding::new("k", TerminalScrollLineUp, Some("RhoTerminalNormal")),
-        KeyBinding::new("down", TerminalScrollLineDown, Some("RhoTerminalNormal")),
-        KeyBinding::new("up", TerminalScrollLineUp, Some("RhoTerminalNormal")),
-        KeyBinding::new(
-            "ctrl-d",
-            TerminalScrollHalfPageDown,
-            Some("RhoTerminalNormal"),
-        ),
-        KeyBinding::new(
-            "ctrl-u",
-            TerminalScrollHalfPageUp,
-            Some("RhoTerminalNormal"),
-        ),
-        KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
-        KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
         KeyBinding::new(":", Palette, Some("RhoTerminalNormal")),
         KeyBinding::new("space", VerdictMenu, Some("RhoTerminalNormal")),
-        KeyBinding::new("tab", Home, Some("RhoTerminalNormal")),
+        KeyBinding::new("tab", Desk, Some("RhoTerminalNormal")),
         KeyBinding::new("q", Close, Some("RhoTerminalNormal")),
     ]);
+    for context in rho_frame::normal_contexts("RhoTerminalSurface", " && vim_operator == none") {
+        cx.bind_keys([
+            KeyBinding::new("i", TerminalRawMode, Some(&context)),
+            KeyBinding::new("a", TerminalRawMode, Some(&context)),
+            KeyBinding::new("enter", NoAction, Some(&context)),
+        ]);
+    }
 }
 
 #[cfg(test)]

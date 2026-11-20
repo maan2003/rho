@@ -1,7 +1,9 @@
 exclude = [".rustfmt.toml"]
 
 [formatting]
-reorder_arrays = true
+# Sorting arrays is safe only where order means nothing: elsewhere
+# (rustflags, command lines) it changes what the array says.
+reorder_arrays = false
 reorder_keys = true
 
 # Cargo.toml: keep the conventional key order inside [package] and
@@ -11,3 +13,8 @@ reorder_keys = true
 formatting.reorder_keys = false
 include = ["**/Cargo.toml"]
 keys = ["bench", "bin", "example", "lib", "package", "test"]
+
+# Cargo.toml arrays (workspace members, features) are sets: sort them.
+[[rule]]
+formatting.reorder_arrays = true
+include = ["**/Cargo.toml"]

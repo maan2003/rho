@@ -41,7 +41,7 @@ class Tools(WorksetCase):
     def test_on_notebook_gives_tools_by_preset_and_enters_the_directory(self):
         ns, cwd = self.notebook(self.root)
         self.assertEqual(cwd, os.path.realpath(self.tmp))
-        self.assertEqual(sorted(ns), ["agents", "chat", "skills"])
+        self.assertEqual(sorted(ns), ["agents", "mail", "skills"])
         self.assertTrue(hasattr(ns["agents"], "spawn_user_owned_engineer"))
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(child)
@@ -49,9 +49,7 @@ class Tools(WorksetCase):
         self.assertTrue(hasattr(ns["agents"], "spawn_new_engineer"))
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(advisor)
-        self.assertEqual(sorted(ns), ["agents", "chat", "skills"])
-        self.assertTrue(hasattr(ns["agents"], "message"))
-        self.assertFalse(hasattr(ns["agents"], "spawn_new_engineer"), "an advisor starts no agents")
+        self.assertEqual(sorted(ns), ["mail", "skills"])
 
     def test_spawn_new_engineer(self):
         ns, _ = self.notebook(self.root)
@@ -62,13 +60,14 @@ class Tools(WorksetCase):
             "runtime": native("terra", "xhigh"),
             "props": {"name": "fix-it", "preset": "child", "parent": self.root, "cwd": work},
         })
-        # The brief goes by mail, outside the chat.
-        self.assertEqual(self.state.mail, [(self.root, child, f"[message from eng-{self.root}]\nFix it.")])
-        self.assertEqual(self.state.messages, [])
-        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as messages from it. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
+        brief = self.state.messages[-1]
+        self.assertEqual((brief["sender"], brief["mentions"], brief["text"]), (self.root, [(child, "direct")], "Fix it."))
+        self.assertEqual(self.state.messages[0]["text"], "Agent mail")
+        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive by mail. It works in {work}. Follow up with mail.send(\'eng-{child}\', text).')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
         # The child holds its brief.
+        wait_for(lambda: any(row[0] == child for row in self.state.inputs), 'the brief arrived')
         self.assertEqual([a for a, *_ in self.state.inputs], [child])
         with self.assertRaisesRegex(ValueError, "absolute"):
             ns["agents"].spawn_new_engineer(task_name="x", prompt="p", workdir="relative")
@@ -105,8 +104,8 @@ class Tools(WorksetCase):
             "runtime": native("sol", "xhigh"),
             "props": {"name": "advisor", "preset": "advisor", "parent": self.root, "cwd": self.tmp},
         })
-        self.assertEqual([to for _, to, _ in self.state.mail], [adv])
-        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive as a message from it.")
+        self.assertEqual(self.state.messages[-1]['mentions'], [(adv, 'direct')])
+        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive by mail.")
 
     def test_spawn_user_owned_engineer(self):
         ns, _ = self.notebook(self.root)
@@ -174,99 +173,143 @@ class Tools(WorksetCase):
             ns["agents"].spawn_new_engineer(task_name="deeper", prompt="p")
         self.assertEqual(len(self.state.agents), before)
 
-    def test_a_post_goes_in_the_thread_it_names_and_reaches_whom_it_mentions(self):
+    def test_addresses_keep_project_mail_user_attention_and_peer_delivery_distinct(self):
         ns, _ = self.notebook(self.root)
+        mailbox = ns["mail"]
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        rho_ = fake_rho.post_user(None, "rho")
-        first = fake_rho.post_user(rho_, "Do it.", [self.root])
-        other = fake_rho.post_user(rho_, "Something else.", [self.root])
-        printed, reply = run(lambda: ns["chat"].post(first, "On it."))
-        self.assertEqual((printed, reply), (f"Posted in #{first}.\n", f"Posted in #{first}."))
-        printed, reply = run(lambda: ns["chat"].post(first, "Done.", mention="user", kind="result"))
-        self.assertEqual((printed, reply), ("", ""))
-        run(lambda: ns["chat"].post(other, "Also done.", mention=["user", f"eng-{child}"], kind="ask"))
-        posted = [(m["parent"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
-        self.assertEqual(posted, [
-            (first, "On it.", []),
-            (first, "Done.", [("user", "result")]),
-            (other, "Also done.", [("user", "ask"), (child, "ask")]),
-        ])
-        # A mention reaches an agent outside the thread; posting joins no one.
-        self.assertEqual([m["_to"] for m in self.state.messages if m["sender"] == self.root], [set(), set(), {child}])
-        self.assertEqual(self.state.members, {})
+        other = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
+        project = fake_rho.post_user(None, "rho")
+        first = fake_rho.post_user(project, "Do it.")
+        fake_rho.join(project, other)
+        fake_rho.join(first, self.root)
 
-    def test_chat_rules(self):
+        printed, note = run(lambda: mailbox.send(f"#{first}", "On it."))
+        self.assertEqual(printed, f"Sent mail #{note}.\n")
+        printed, result = run(lambda: mailbox.send(None, "Done.", reply_to=first, kind="result"))
+        self.assertEqual(self.state.messages[-1]["id"], result)
+        self.assertEqual(self.state.messages[-1]["reply_to"], first)
+        self.assertEqual(self.state.messages[-1]["mentions"], [("user", "result")])
+        self.assertIn(f"(reply to #{first}): Done.", run(lambda: mailbox.read(first))[0])
+
+        _, direct = run(lambda: mailbox.send(f"eng-{child}@local", "Check this."))
+        _, reply = run(lambda: tools.Mail(child).send(None, "Yes.", reply_to=direct))
+        self.assertEqual([(m["parent"], m["mentions"], m["_to"]) for m in self.state.messages[-2:]], [
+            (project, [(child, "direct")], {child}),
+            (direct, [(self.root, "direct")], {self.root}),
+        ])
+        self.assertEqual(fake_rho.message(reply)["reply_to"], direct)
+        _, project_mail = run(lambda: mailbox.send("rho@local", "New work."))
+        self.assertEqual(fake_rho.message(project_mail)["parent"], project)
+        self.assertNotIn("chat", ns)
+        self.assertFalse(hasattr(ns["agents"], "message"))
+
+    def test_a_post_can_be_awaited_for_its_id_without_sending_twice(self):
         ns, _ = self.notebook(self.root)
-        rho_ = fake_rho.post_user(None, "rho")
-        thread = fake_rho.post_user(rho_, "Do it.", [self.root])
-        chat = ns["chat"]
-        with self.assertRaisesRegex(ValueError, "needs kind"):
-            chat.post(thread, "Done.", mention="user")
-        with self.assertRaisesRegex(ValueError, "needs kind"):
-            chat.post(thread, "Done.", mention="user", kind="status")
-        with self.assertRaisesRegex(ValueError, "goes with a mention"):
-            chat.post(thread, "Done.", kind="result")
-        with self.assertRaisesRegex(ValueError, "yourself"):
-            chat.post(thread, "hi", mention=f"eng-{self.root}", kind="fyi")
-        with self.assertRaisesRegex(ValueError, "no thread #99"):
-            chat.post(99, "hi")
-        with self.assertRaisesRegex(ValueError, "needs text"):
-            chat.post(thread, " ")
+        mailbox = ns["mail"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+
+        _, posted = run(lambda: mailbox.send(thread, "Use the mock clock."))
+        self.assertEqual(len(self.state.messages), 3, "posting takes effect before await")
+        expected = self.state.messages[-1]["id"]
+        self.assertEqual(posted, expected)
+        awaited = asyncio.run(_await(posted))
+        self.assertEqual(awaited, expected)
+        self.assertIsInstance(awaited, int)
+        self.assertIsNone(awaited.notice)
+
+        self.state.send_unanswered = expected, self.root
+        printed, result = run(lambda: mailbox.send("user", "Done.", thread=thread, kind="result"))
+        self.assertEqual(asyncio.run(_await(result)), expected + 1)
+        self.assertEqual(
+            result.notice,
+            f"Mail #{expected} has no user reply. If it is still live, use `mail.edit({expected}, ...)` for updates.",
+        )
+        self.assertIn(result.notice, printed)
+        self.assertEqual(asyncio.run(_await(result)).notice, result.notice)
+        self.assertEqual([mail["text"] for mail in self.state.messages[2:]], ["Use the mock clock.", "Done."])
+
+    def test_send_recommends_the_writer_edit_their_own_mail(self):
+        other = add_agent(self.state, native(), preset="engineer", cwd=self.tmp)
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        _, earlier = run(lambda: tools.Mail(other).send(thread, "My first finding."))
+        self.state.send_unanswered = earlier, other
+
+        printed, posted = run(lambda: tools.Mail(self.root).send(thread, "Also this."))
+        self.assertEqual(fake_rho.message(posted)["text"], "Also this.")
+        self.assertIn(f"Mail #{earlier} has no user reply.", printed)
+        self.assertIn("ask its writer to use `mail.edit`", posted.notice)
+
+    def test_other_mail_tools_start_immediately_and_can_be_awaited(self):
+        ns, _ = self.notebook(self.root)
+        mailbox = ns["mail"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        mail = fake_rho.post_user(thread, "Look at the kernel.")
+        _, forked = run(lambda: mailbox.fork(mail, "What about the timer?"))
+        self.assertEqual(self.state.messages[-1]["parent"], mail)
+        self.assertEqual(asyncio.run(_await(forked)), mail)
+        self.assertEqual(len(self.state.messages), 4, "awaiting a fork must not post again")
+
+        for name, method, args, expected in [
+            ("thread_status", mailbox.status, (thread, "Checking the clock"), (self.root, thread, "Checking the clock")),
+            ("edit_message", mailbox.edit, (mail, "A new body"), (self.root, mail, "A new body")),
+            ("delete_message", mailbox.delete, (mail,), (self.root, mail)),
+        ]:
+            with self.subTest(name=name), mock.patch.object(fake_rho, name, create=True, return_value=None) as host:
+                done = method(*args)
+                host.assert_called_once_with(*expected)
+                self.assertIsNone(asyncio.run(_await(done)))
+                host.assert_called_once_with(*expected)
+
+        hits = [{"message": mail, "thread": thread, "project": project, "subject": "Do it.", "excerpt": "kernel"}]
+        with mock.patch.object(fake_rho, "search_mail", create=True, return_value=hits) as search:
+            _, found = run(lambda: mailbox.search("kernel", project=project, limit=2))
+            search.assert_called_once_with("kernel", project, 2)
+            self.assertEqual(found[0]["message"], mail)
+            awaited = asyncio.run(_await(found))
+            self.assertEqual(awaited, hits)
+            self.assertIs(type(awaited), list)
+            search.assert_called_once_with("kernel", project, 2)
+
+    def test_mail_address_validation_and_starting_a_project(self):
+        ns, _ = self.notebook(self.root)
+        mailbox = ns["mail"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        for address, text, opts, error in [
+            ("user", "Done.", {"thread": thread}, "needs kind"),
+            ("user", "Done.", {"kind": "result"}, "needs thread"),
+            (thread, "Done.", {"kind": "result"}, "only mail to the user"),
+            (f"eng-{self.root}", "Hi.", {}, "yourself"),
+            ("#99", "Hi.", {}, "no message 99"),
+            ("#-1", "Hi.", {}, "expected a mail id"),
+            (thread, " ", {}, "needs text"),
+            ("eng-nobody", "Hi.", {}, "no agent nobody"),
+            ("rho@elsewhere", "Hi.", {}, "not this host"),
+            ("missing@local", "Hi.", {}, "no project"),
+        ]:
+            with self.subTest(address=address, error=error), self.assertRaisesRegex(ValueError, error):
+                mailbox.send(address, text, **opts)
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
-        cns, _ = self.notebook(child)
         with self.assertRaisesRegex(ValueError, f"parent agent eng-{self.root}"):
-            cns["chat"].post(thread, "Hi.", mention="user", kind="fyi")
-        self.assertEqual(len(self.state.messages), 2, "nothing refused was posted")
-        # A new subject in a stream that is new: the root is made, the
-        # thread goes under it, and its starter joins it; the mentioned
-        # child does not.
-        printed, started = run(lambda: chat.start("ops", "Look.", mention=f"eng-{child}", kind="ask"))
-        self.assertEqual(printed, f"Started #{started}.\n")
+            tools.Mail(child).send("user", "Hi.", thread=thread, kind="fyi")
+        self.assertEqual(len(self.state.messages), 2, "nothing refused was sent")
+
+        _, started = run(lambda: mailbox.start("ops", "Look."))
         ops = self.state.messages[-2]
         self.assertEqual((ops["parent"], ops["sender"], ops["text"]), (None, self.root, "ops"))
-        self.assertEqual(self.state.messages[-1], {"id": started, "at": 0, "parent": ops["id"], "sender": self.root, "mentions": [(child, "ask")], "text": "Look.", "_to": {child}})
-        # (The user's mention joined the root to `thread` meanwhile.)
-        self.assertEqual(self.state.members, {(thread, self.root): True, (started, self.root): True})
-        # The same stream again is the same root.
-        _, again = run(lambda: chat.start(" ops ", "More."))
-        self.assertEqual(self.state.messages[-1]["parent"], ops["id"])
+        self.assertEqual(fake_rho.thread(started)["agents"], [self.root])
+        _, again = run(lambda: mailbox.start(" ops ", "More."))
         self.assertEqual(fake_rho.thread(again)["path"], [(ops["id"], "ops"), (again, "More.")])
-        # Agents message each other outside the user's chat, by mail, any
-        # agent on the host.
-        printed, _ = run(lambda: ns["agents"].message(agent_id=f"eng-{child}", message="Psst."))
-        self.assertEqual(printed, f"Sent to eng-{child}.\n")
-        run(lambda: cns["agents"].message(agent_id=self.root, message="Yes?"))
-        self.assertEqual(self.state.mail, [
-            (self.root, child, f"[message from eng-{self.root}]\nPsst."),
-            (child, self.root, f"[message from eng-{child}]\nYes?"),
-        ])
-        self.assertEqual([(a, t, r, m) for a, t, r, m in self.state.inputs if m is None], [
-            (child, f"[message from eng-{self.root}]\nPsst.", "tool", None),
-            (self.root, f"[message from eng-{child}]\nYes?", "tool", None),
-        ])
-        with self.assertRaisesRegex(ValueError, "yourself"):
-            ns["agents"].message(agent_id=self.root, message="hi")
-        with self.assertRaisesRegex(ValueError, "no agent nobody on this host"):
-            ns["agents"].message(agent_id="eng-nobody", message="hi")
-        # Any prefix that names one agent of the host will do, in any
-        # workset; one that names several is refused.
         self.state.elsewhere.update({"farther1", "farthest"})
         with self.assertRaisesRegex(ValueError, "names 2 agents"):
-            ns["agents"].message(agent_id="eng-farth", message="Which?")
-        printed, _ = run(lambda: ns["agents"].message(agent_id="eng-farthes", message="From another workset."))
-        self.assertEqual(printed, "Sent to farthest.\n")
-        self.assertEqual(self.state.mail[-1][1], "farthest")
-        self.assertEqual(len(self.state.messages), 5, "mail is not chat")
-
-        self.assertFalse(hasattr(chat, "mail"), "chat is the user's")
-        # Join and read.
-        printed, _ = run(lambda: cns["chat"].join(started))
-        self.assertEqual(printed, f"Joined #{started}.\n")
-        self.assertEqual(fake_rho.thread(started)["agents"], [self.root, child])
-        printed, _ = run(lambda: chat.read(thread))
-        self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{thread} user: Do it.\n")
-        printed, _ = run(lambda: chat.read(rho_))
-        self.assertEqual(printed, f"[#{rho_} rho]\n#{rho_} user: rho\n#{thread} user: Do it.\n")
+            mailbox.send("eng-farth", "Which?")
+        with self.assertRaisesRegex(ValueError, "whose role prefix differs"):
+            mailbox.send("adv-farthes", "Wrong role.")
+        _, direct = run(lambda: mailbox.send("eng-farthes", "From another workset."))
+        self.assertEqual(fake_rho.message(direct)["mentions"], [("farthest", "direct")])
 
     def test_an_agent_on_another_host_is_reached_only_once_its_host_is_approved_and_it_is_accepted(self):
         ns, _ = self.notebook(self.root)
@@ -323,15 +366,15 @@ class Tools(WorksetCase):
         self.assertEqual(run(external.contacts)[0], f"dpc's agent: {theirs}\n")
 
         # Another agent has accepted nothing, and an Advisor talks to no
-        # other host. `agents.message` stays inside this host.
+        # other host. Notebook mail stays inside this host.
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         theirs_too, _ = self.notebook(child)
         self.assertEqual(run(theirs_too["agents"].external.contacts)[0], "You have accepted no address.\n")
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         adv, _ = self.notebook(advisor)
-        self.assertFalse(hasattr(adv["agents"], "external"))
+        self.assertNotIn("agents", adv)
         with self.assertRaises((ValueError, RuntimeError)):
-            ns["agents"].message(agent_id=theirs, message="Hello.")
+            ns["mail"].send(theirs, "Hello.")
         self.assertEqual(len(self.state.sent), 2)
 
         self.state.endpoint = None
@@ -340,23 +383,23 @@ class Tools(WorksetCase):
 
     def test_leave_and_read_by_any_id(self):
         ns, _ = self.notebook(self.root)
-        chat = ns["chat"]
+        mailbox = ns["mail"]
         rho_ = fake_rho.post_user(None, "rho")
         thread = fake_rho.post_user(rho_, "Do it.")
         ids = [fake_rho.post_user(thread, f"m{i}") for i in range(5)]
-        run(lambda: chat.join(thread))
-        printed, _ = run(lambda: chat.leave(thread))
+        run(lambda: mailbox.join(thread))
+        printed, _ = run(lambda: mailbox.leave(thread))
         self.assertEqual(printed, f"Left #{thread}.\n")
         self.assertEqual(fake_rho.thread(thread)["agents"], [])
         # A thread shows its message and the newest under it.
-        printed, _ = run(lambda: chat.read(thread, last=2))
+        printed, _ = run(lambda: mailbox.read(thread, last=2))
         self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{thread} user: Do it.\n#{ids[3]} user: m3\n#{ids[4]} user: m4\n")
         # A message with nothing under it shows the messages around it in
         # its thread, marked.
-        printed, _ = run(lambda: chat.read(ids[2], last=3))
+        printed, _ = run(lambda: mailbox.read(ids[2], last=3))
         self.assertEqual(printed, f"[#{thread} rho › Do it.]\n#{ids[1]} user: m1\n→ #{ids[2]} user: m2\n#{ids[3]} user: m3\n")
         # At the start of a thread the window does not run off its end.
-        printed, _ = run(lambda: chat.read(ids[0], last=3))
+        printed, _ = run(lambda: mailbox.read(ids[0], last=3))
         self.assertEqual(printed.splitlines()[1:], [f"#{thread} user: Do it.", f"→ #{ids[0]} user: m0", f"#{ids[1]} user: m1"])
         # The user moved one away, under another stream's thread, and named
         # the old thread.
@@ -364,52 +407,52 @@ class Tools(WorksetCase):
         aside = fake_rho.post_user(ops, "Aside.")
         fake_rho.reparent("user", ids[4], aside)
         fake_rho.name("user", thread, "Done it")
-        printed, _ = run(lambda: chat.read(ids[4], last=1))
+        printed, _ = run(lambda: mailbox.read(ids[4], last=1))
         self.assertEqual(printed, f"[#{aside} ops › Aside.]\n→ #{ids[4]} user: m4\n")
-        printed, _ = run(lambda: chat.read(thread, last=1))
+        printed, _ = run(lambda: mailbox.read(thread, last=1))
         self.assertEqual(printed, f"[#{thread} rho › Done it]\n#{thread} user: Do it.\n#{ids[3]} user: m3\n")
         with self.assertRaisesRegex(ValueError, "names no message"):
-            chat.read(999)
+            mailbox.read(999)
 
     def test_roots_lists_the_streams(self):
         ns, _ = self.notebook(self.root)
-        chat = ns["chat"]
-        printed, _ = run(lambda: chat.roots())
+        mailbox = ns["mail"]
+        printed, _ = run(lambda: mailbox.roots())
         self.assertEqual(printed, "No threads yet.\n")
         rho_ = fake_rho.post_user(None, "rho")
         ops = fake_rho.post_user(None, "ops")
         fake_rho.name("user", ops, "Operations")
-        printed, _ = run(lambda: chat.roots())
+        printed, _ = run(lambda: mailbox.roots())
         self.assertEqual(printed, f"#{rho_} rho\n#{ops} Operations\n")
 
     def test_an_agent_names_and_moves_only_in_its_threads(self):
         ns, _ = self.notebook(self.root)
-        chat = ns["chat"]
+        mailbox = ns["mail"]
         rho_ = fake_rho.post_user(None, "rho")
         thread = fake_rho.post_user(rho_, "Do it.")
         ids = [fake_rho.post_user(thread, f"m{i}") for i in range(3)]
         ops = fake_rho.post_user(None, "ops")
         with self.assertRaisesRegex(ValueError, "join it first"):
-            chat.name(thread, "Did it")
+            mailbox.name(thread, "Did it")
         with self.assertRaisesRegex(ValueError, "join it first"):
-            chat.move(ids[1], ops)
-        run(lambda: chat.join(thread))
-        printed, _ = run(lambda: chat.name(thread, "Did it"))
+            mailbox.move(ids[1], ops)
+        run(lambda: mailbox.join(thread))
+        printed, _ = run(lambda: mailbox.name(thread, "Did it"))
         self.assertEqual(printed, f"Named #{thread}.\n")
         self.assertEqual(fake_rho.thread(thread)["name"], "Did it")
         # A move takes the message and what hangs under it.
         under = fake_rho.post_user(ids[1], "under m1")
-        printed, _ = run(lambda: chat.move(ids[1], ops))
+        printed, _ = run(lambda: mailbox.move(ids[1], ops))
         self.assertEqual(printed, f"Moved #{ids[1]} to #{ops}.\n")
         self.assertEqual([m["parent"] for m in self.state.messages if m["id"] in ids], [thread, ops, thread])
         self.assertEqual(fake_rho.thread(under)["path"], [(ops, "ops"), (ids[1], "m1"), (under, "under m1")])
         # The agent is not in `ops`, so it moves nothing out of it.
         with self.assertRaisesRegex(ValueError, "join it first"):
-            chat.move(ids[1], thread)
+            mailbox.move(ids[1], thread)
         with self.assertRaisesRegex(ValueError, "no message #999"):
-            chat.move(999, thread)
+            mailbox.move(999, thread)
         with self.assertRaisesRegex(ValueError, "no thread #999"):
-            chat.move(ids[0], 999)
+            mailbox.move(ids[0], 999)
 
     def test_skills_load_keeps_only_skills_that_ask_and_compaction_rereads_them(self):
         ns, _ = self.notebook(self.root)
@@ -453,10 +496,11 @@ class Tools(WorksetCase):
         [child] = [id for id in self.state.agents if id != self.root]
         rho._hook("on_turn_end", child, {"reason": "end_turn", "error": None}, timeout=5)
         rho._hook("on_turn_end", self.root, {"reason": "failed", "error": "boom"}, timeout=5)
-        self.assertEqual(len(self.state.mail), 1)
+        self.assertEqual(self.state.messages[-1]["mentions"], [(child, "direct")])
         rho._hook("on_turn_end", child, {"reason": "failed", "error": "quota"}, timeout=5)
-        self.assertEqual(self.state.mail[1:], [(child, self.root, f"[message from eng-{child}]\nAgent hit an error and stopped: quota")])
-        self.assertEqual(self.state.messages, [])
+        failed = self.state.messages[-1]
+        self.assertEqual((failed["sender"], failed["mentions"], failed["text"]), (child, [(self.root, "direct")], "Agent hit an error and stopped: quota"))
+        self.assertEqual(failed["parent"], self.state.messages[-2]["id"])
 
 
 async def _await(reply):
@@ -481,7 +525,7 @@ class NewAgent(WorksetCase):
         self.assertEqual(self.state.calls, [("clone", ("https://github.com/org/proj.git", cwd, "abc"))])
         self.assertEqual(self.state.agents[id], {
             "runtime": claude(),
-            "props": {"preset": "engineer", "cwd": cwd},
+            "props": {"preset": "engineer", "cwd": cwd, "repo": "https://github.com/org/proj.git"},
         })
         self.assertEqual(self.state.messages, [])
 

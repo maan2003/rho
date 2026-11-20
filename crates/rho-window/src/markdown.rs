@@ -12,8 +12,9 @@ use theme::ActiveTheme as _;
 /// How long a chunk's parse may hold the frame it belongs to.
 const SYNC_PARSE_BUDGET: Duration = Duration::from_millis(1);
 
-/// Longer than any parse a harness composes: the absence of a bound rather
-/// than a wait, so the parse always lands in the frame that made the text.
+/// Longer than any parse a harness or a document composes: the absence of
+/// a bound rather than a wait, so the parse always lands in the frame that
+/// made the text.
 const SYNC_PARSE_UNBOUNDED: Duration = Duration::from_secs(60);
 
 /// Whether the parse of a chunk is bounded by the clock.
@@ -93,6 +94,17 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
     // streamed edit never flashes the markup it is about to conceal.
     buffer.set_sync_parse_timeout(Some(sync_parse_timeout()));
     buffer.set_language_deferred(Some(block.clone()), cx);
+}
+
+/// The same pipeline for a buffer that is a whole document rather than a
+/// chunk, such as a conversation. A document cannot promise a parse that
+/// fits the chunk's budget, and a parse that misses it draws the markup it
+/// conceals until the background parse lands, so a document's parse holds
+/// the frame that made the text however long it takes. An edit reparses
+/// only what it changed, so the frame it holds is the first one.
+pub fn configure_document(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
+    configure_buffer(buffer, cx);
+    buffer.set_sync_parse_timeout(Some(SYNC_PARSE_UNBOUNDED));
 }
 
 fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {

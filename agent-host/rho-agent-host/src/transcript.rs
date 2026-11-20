@@ -8,7 +8,7 @@ use rho_agent::log::AgentUsageBucket;
 use rho_agent::record::{AgentSpec, Event, Record, Runtime};
 use rho_agent_types::{ContentPart, Role};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, RuntimeKind, Usage};
-use rho_agents_client::protocol::worksets::{InputView, LogEvent, SpecView};
+use rho_agents_client::protocol::worksets::{CallView, InputView, LogEvent, SpecView};
 
 /// An agent's spec as a reader needs it.
 pub fn spec_view(spec: &AgentSpec) -> SpecView {
@@ -99,6 +99,12 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             answers: !compose(true, notices, output, inputs).result.is_empty(),
             compaction: *compact,
             timing: timing.clone(),
+            output: content_text(output),
+            at,
+        },
+        Event::CellEnded { agent, end } => LogEvent::CellEnded {
+            agent: *agent,
+            end: end.clone(),
             at,
         },
         Event::Rewound { agent, to } => LogEvent::Rewound {
@@ -126,13 +132,15 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
                 retrying: true,
                 at,
             },
-            Notice::Stopped(error) => LogEvent::Stopped {
+            Notice::StartupFailed(rho_agent::entry::StartupFailure { error, .. })
+            | Notice::Stopped(error) => LogEvent::Stopped {
                 agent: *agent,
                 error: error.clone(),
                 at,
             },
+            Notice::Cancelled => LogEvent::Cancelled { agent: *agent, at },
             // The runtime state says these.
-            Notice::Archived | Notice::FreshNotebook => return None,
+            Notice::Archived | Notice::FreshNotebook | Notice::Recovered(_) => return None,
         },
         Event::Step {
             agent,
@@ -198,7 +206,11 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             agent: *agent,
             calls: results
                 .iter()
-                .map(|result| result.call.as_str().to_owned())
+                .map(|result| CallView {
+                    id: result.call.as_str().to_owned(),
+                    output: result.output.clone(),
+                    failed: result.failed,
+                })
                 .collect(),
             at,
         },
@@ -214,6 +226,16 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             at,
         },
         Event::RewindPending { .. } => return None,
+        Event::MailWritten {
+            agent,
+            message,
+            version,
+        } => LogEvent::MailWritten {
+            agent: *agent,
+            message: *message,
+            version: *version,
+            at,
+        },
     })
 }
 

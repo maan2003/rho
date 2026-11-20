@@ -26,17 +26,21 @@ pub struct Runtime {
 const NATIVE_MODELS: [&str; 4] = ["sol", "terra", "astra", "hydrogen"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
-const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// What the model picker cycles through, first the default. Any other
 /// pair the policy takes can be typed.
+///
+/// The default is the runtime the user picks for agents they start from a
+/// message: `opus-high`, decided once here rather than learned, so a start
+/// that asks nothing still runs where the user would have put it.
 pub const RUNTIMES: [&str; 7] = [
+    "opus-high",
     "sol-medium",
     "sol-high",
     "terra-medium",
     "astra-high",
     "hydrogen-high",
-    "opus-high",
     "fable-high",
 ];
 
@@ -111,6 +115,19 @@ impl Runtime {
             kind,
             model: model.to_owned(),
             effort: effort.to_owned(),
+        })
+    }
+
+    /// All model/effort pairs the host supports, in catalogue order.
+    pub fn choices(kind: RuntimeKind) -> impl Iterator<Item = String> {
+        let (models, efforts) = match kind {
+            RuntimeKind::Rho => (NATIVE_MODELS.as_slice(), NATIVE_EFFORTS.as_slice()),
+            RuntimeKind::Claude => (CLAUDE_MODELS.as_slice(), CLAUDE_EFFORTS.as_slice()),
+        };
+        models.iter().flat_map(move |model| {
+            efforts
+                .iter()
+                .map(move |effort| format!("{model}-{effort}"))
         })
     }
 
@@ -208,10 +225,6 @@ pub fn set_runtime(id: AgentId, runtime: &Runtime) -> String {
 
 /// Branches the agent's history before its `turns`-th last input from the
 /// user.
-pub fn rewind(id: AgentId, turns: u32) -> String {
-    agent(id, &format!("rewind({turns})"))
-}
-
 /// Gives a native agent a fresh prompt cache key.
 pub fn new_cache_key(id: AgentId) -> String {
     agent(id, "new_cache_key()")
@@ -268,16 +281,21 @@ mod tests {
         assert_eq!(
             Runtime::parse("").unwrap(),
             Runtime {
-                kind: RuntimeKind::Rho,
-                model: "sol".into(),
-                effort: "medium".into()
+                kind: RuntimeKind::Claude,
+                model: "opus".into(),
+                effort: "high".into()
             }
         );
         assert_eq!(
             Runtime::parse(" Opus-High ").unwrap().kind,
             RuntimeKind::Claude
         );
-        assert!(Runtime::parse("opus-low").is_err(), "claude takes no low");
+        assert_eq!(
+            Runtime::parse("opus-low").unwrap().kind,
+            RuntimeKind::Claude
+        );
+        assert_eq!(Runtime::parse("fable-max").unwrap().effort, "max");
+        assert!(Runtime::parse("sol-max").is_err(), "max is Claude-only");
         assert_eq!(
             Runtime::parse("haiku-medium").unwrap(),
             Runtime {
@@ -290,6 +308,8 @@ mod tests {
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");
         assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
+        assert_eq!(DEFAULT_RUNTIME, "opus-high");
+        assert_eq!(Runtime::parse("").unwrap().label(), "opus-high");
         assert_eq!(
             Runtime::parse("hydrogen-high").unwrap().kind,
             RuntimeKind::Rho
@@ -308,8 +328,8 @@ mod tests {
     fn a_function_is_a_python_name() {
         assert_eq!(Function::parse(" ").unwrap().as_str(), "new_agent");
         assert_eq!(
-            Function::parse(" fedi.roboman ").unwrap().as_str(),
-            "fedi.roboman"
+            Function::parse(" acme.roboman ").unwrap().as_str(),
+            "acme.roboman"
         );
         assert_eq!(Function::parse("_start2").unwrap().as_str(), "_start2");
         for bad in ["2start", "a..b", "a.", "f()", "a b", "x;import os", "é"] {
@@ -335,10 +355,6 @@ mod tests {
              runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"})\n"
         );
         let id = AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
-        assert_eq!(
-            rewind(id, 2),
-            format!("import rho\nrho.agent(\"{}\").rewind(2)\n", id.encoded())
-        );
         assert!(
             set_runtime(id, &Runtime::parse("sol-low").unwrap())
                 .contains("set_runtime({\"kind\": \"native\", \"model\": \"sol\", \"effort\": \"low\", \"fast\": False})")

@@ -11,7 +11,7 @@ the policy decisions, like elisp: prompts, skills, which agents exist and on
 which model, how messages reach them, and workset setup.
 
 - **Agent host.** Owns worksets (creation, deletion, one process each), the
-  workset logs, the agent directory, the chat log, and everything that must
+  workset logs, the agent directory, the mail log, and everything that must
   stay outside a workset: credentials, inference accounts, the git keeper, and
   the Slack, Notion, Google and GitHub servers. It enforces only what protects the
   host: credentials, accounts, and caps on processes and loaded agents.
@@ -47,10 +47,12 @@ which model, how messages reach them, and workset setup.
 
 Each workset has one append-only log keyed by `(WorksetId, wpos)`, dense from
 zero. A record is its time and one typed event; events about an agent carry
-its `AgentId`. The workset process is the only writer of its log after
-creation. Agent heads and the workset head are projections committed with each
-append. So is an index of each agent's rows, `(AgentId, wpos)`: a workset
-holds many agents, and reading one of them must not cost the others' rows.
+its `AgentId`. The workset process writes its runtime history. The host
+records the exact step that posted or edited agent mail or posted stop mail.
+It appends the message ID in the same transaction; the words stay in the chat
+log. Agent heads and the workset head are projections committed with each
+append. So is an index of each agent's rows, `(AgentId, wpos)`: a workset holds
+many agents, and reading one of them must not cost the others' rows.
 Deleting a workset deletes its log, heads and process; it is the only
 deletion.
 
@@ -75,56 +77,81 @@ worker's memory, and a crash loses them
 ([DECISION-roles](../rho-agent/specs/DECISION-roles.md),
 [DECISION-pull-based-sources](../rho-agent/specs/DECISION-pull-based-sources.md)).
 
-## Chat
+## Mail
 
-Chat is how people and agents talk: one forest of messages per host. Each
-host owns one append-only chat log, dense from 1, of five events: `Posted`
-(with an optional parent), `Reparented`, `Joined`, `Left` and `Named`. A
+Mail is how the user and agents talk: one forest of messages per host. Each
+host owns one append-only mail log, dense from 1, of posts, moves, membership, subject changes, and mail revisions. A
 message is named by the sequence number of the event that posted it, and
 the thread under `#41` is the message `41` with everything below it. A root
 message is what the GUI shows as a channel; a reply to it is what a topic
 was; replies nest without limit. A fresh log is empty, and a channel is a
 root the user posts. The store folds the log into a parent index, a
 children index, the membership and each agent's inbox in the commit of
-every append, so a thread is read as a range. A host's chat is its own: a
+every append, so a thread is read as a range. A host's mail is its own: a
 GUI attached to several hosts shows each host's roots in one list, with the
 host as a tag, and what agents of different hosts say to each other (below)
-is not chat. The log lives on the host because the GUI is often offline and
-chat crosses worksets, and it survives workset deletion.
+uses a different transport. The log lives on the host because the GUI is often offline and
+mail crosses worksets, and it survives workset deletion.
 
-Chat and agents are separate hierarchies. They meet only through
-membership and through mentions. Membership is per thread and covers the
+Mail and agents are separate hierarchies. They meet only through
+membership and through mentions. A user's addressed reply also records
+the exact mail it answers, independently of parentage: its writer receives
+it even if they left the thread, and a move does not undo the answer.
+Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
-leave on a subthread cuts that branch. A message reaches every member of
-the thread it is posted in and every agent it mentions, never its sender;
-who receives it is fixed when it is posted and written to each receiver's
-inbox with it, so a later member reads older messages, not receives them.
-Only Python joins agents to threads (`rho.chat.join`), so the host never
+leave on a subthread cuts that branch. Mail to the user stays readable in
+the thread but does not enter agents' inboxes. Other thread mail reaches
+every member and every agent it mentions, never its sender; the host
+writes the inbox rows with the post, so a later member can read older
+messages but does not receive them.
+Only Python joins agents to threads (`rho.mail.join`), so the host never
 joins anyone on its own: the default delivery (`rho.hooks.deliver`) joins an
 agent to the thread it was started from and to a thread where the user
 mentions it. A policy with other rules replaces the whole delivery, not one
 rule of it.
 
 A move is a parent change (`Reparented`) and the subtree follows; a message
-is read in the thread it is in now, so `#41` always leads to it. `Named` is
-the only thread metadata: without a name the GUI shows the first line of
-the thread's message. The host names a thread under a root once, when its
+is read in the thread it is in now, so `#41` always leads to it. Without a name the GUI shows the first line of the thread's message.
+An edit changes a mail's current body in place; a delete removes its visible
+content but keeps the anchor and descendants. Agents can explicitly edit
+or delete only mail they wrote, and mail with a user reply cannot change.
+Search uses the current bodies
+and subjects, not the original text of edited or deleted mail. The host names a thread under a root once, when its
 second message arrives and nothing has named it, from a model's reading of
 those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
 `result` mention, and the user says so in the ledger, which is theirs
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
+The host derives replies from the original `Posted` events: a move does
+not undo an answer. If the latest project ask is still live, the host
+reuses its mail ID and records a revision only for different content.
+Replies reach the writer of the current words, even across agents. The
+client compares the revision's log position with the user's verdict;
+the host cannot see the verdict.
 
-Agent-to-agent messaging is not chat. `agents.message` is mail: the host
-hands the text to the receiving agent as an input and keeps no log of it;
-the two transcripts are the record. The two agents may be in different
-worksets of the host. An Engineer's child or Advisor is briefed by mail and
-reports by mail.
+A thread's current status is host memory, sent outside the log. A stop
+clears that status only if the stopped agent wrote the current line. The GUI
+reports thread focus without changing its verdict; an open thread or a
+user reply keeps it warm. Once a thread cools, the next model request can
+carry a one-time notice to make live mail stand alone, without initiating a
+request of its own.
+A stop produces durable system mail in the agent's thread, not another
+kind of card. When a start from mail is refused before there is an agent,
+the host writes the stop in the idea's thread instead. Neither is agent input.
+
+Direct mail between two agents on a host uses the same log and inbox.
+The first mail between a pair starts a thread under the writer's project;
+an answer stays in that conversation even if the agents work in different
+projects. Children and Advisors inherit their spawner's project. Only the
+addressed agent gets the mail as tool input, even if others follow the
+project. The user can read the thread but gets no card for it. After an
+incompatible protocol upgrade, a client replays the host's log; unsent
+mail and drafts stay in their existing tables.
 
 An agent talks to an agent on another harness over GCCP
-([docs/gccp.md](../../docs/gccp.md)). That is not chat: nothing of it is in the
-chat log and no client syncs it. An agent's address is the host's iroh endpoint
+([docs/gccp.md](../../docs/gccp.md)). That is separate from local mail: none of it is in the
+mail log and no client syncs it. An agent's address is the host's iroh endpoint
 id and the agent's id; every host listens over iroh, so every host speaks GCCP. Trust
 has two levels. The user approves a harness by its endpoint (`rho iroh approve
 --role gccp`). That approval is kept apart from the clients', and each lets an
@@ -154,10 +181,10 @@ existing message, and Python records that message as the agent's `origin` prop
 follow. The default policy then joins the agent to that message's thread and
 hands it that message first.
 
-Agents post with `rho.chat.post`, always naming the parent. Policy Python
+Agents send with `rho.mail.send`, specifying the recipient. Policy Python
 reads each agent's inbox and hands each message to the agent as an input that
 names it. The delivery position is derived from the `Request` rows that carried
-them, so the chat log keeps no cursors. Slack is not chat: agents reach it through the host's
+them, so the mail log keeps no cursors. Slack is separate from project mail: agents reach it through the host's
 Slack server as Python, and a workset may route its Slack messages to its agents (below).
 
 ## Slack
@@ -196,7 +223,7 @@ own may act on them.
 
 ## GUI sync
 
-The GUI syncs each host's chat log from the newest event it holds and receives the
+The GUI syncs each host's mail log from the newest event it holds and receives the
 directory of worksets and agents as whole entries. It reads the rows of each
 agent it opens, from the newest it holds, through that agent's index; the read
 ends with where the workset's log ends. It then names the worksets it follows,

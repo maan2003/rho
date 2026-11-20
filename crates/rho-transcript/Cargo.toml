@@ -1,7 +1,7 @@
 # A keyed, incremental transcript: items in display order, each owning an
 # anchored range in one buffer. Every operation edits only the range it
 # names, so cursor, scroll and everything outside it survive. No domain
-# types: Slack, agents and later GitHub all drive the same primitive.
+# types: chat and notes drive the same primitive.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"

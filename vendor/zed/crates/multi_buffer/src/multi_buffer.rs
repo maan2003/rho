@@ -130,6 +130,8 @@ pub enum Event {
         buffer_ids: Vec<BufferId>,
     },
     DiffHunksToggled,
+    /// An edit requested a change to a read-only excerpt.
+    EditBlockedByReadOnly,
     Edited {
         edited_buffer: Option<Entity<Buffer>>,
         source: BufferEditSource,
@@ -1647,11 +1649,14 @@ impl MultiBuffer {
                 _ => Default::default(),
             };
 
-            let buffer_edits = MultiBuffer::convert_edits_to_buffer_edits(
+            let (buffer_edits, blocked) = MultiBuffer::convert_edits_to_buffer_edits(
                 edits,
                 this.snapshot.get_mut(),
                 &original_indent_columns,
             );
+            if blocked {
+                cx.emit(Event::EditBlockedByReadOnly);
+            }
 
             let mut buffer_ids = Vec::with_capacity(buffer_edits.len());
             for (buffer_id, mut edits) in buffer_edits {
@@ -1750,8 +1755,24 @@ impl MultiBuffer {
         edits: Vec<(Range<MultiBufferOffset>, Arc<str>)>,
         snapshot: &MultiBufferSnapshot,
         original_indent_columns: &[Option<u32>],
-    ) -> HashMap<BufferId, Vec<BufferEdit>> {
+    ) -> (HashMap<BufferId, Vec<BufferEdit>>, bool) {
         let mut buffer_edits: HashMap<BufferId, Vec<BufferEdit>> = Default::default();
+        let mut blocked = false;
+        let mut assign = |region: &MultiBufferRegion<'_, MultiBufferOffset, BufferOffset>,
+                          edit: BufferEdit| {
+            if !region.is_main_buffer {
+                return;
+            }
+            if region.buffer.capability.editable() {
+                buffer_edits
+                    .entry(region.buffer.remote_id())
+                    .or_default()
+                    .push(edit);
+            } else {
+                blocked |=
+                    !edit.range.is_empty() || (edit.is_insertion && !edit.new_text.is_empty());
+            }
+        };
         let mut cursor = snapshot.cursor::<MultiBufferOffset, BufferOffset>();
         for (ix, (range, new_text)) in edits.into_iter().enumerate() {
             let original_indent_column = original_indent_columns.get(ix).copied().flatten();
@@ -1797,48 +1818,34 @@ impl MultiBuffer {
                 (end_region.buffer_range.start + end_overshoot).min(end_region.buffer_range.end);
 
             if start_region.excerpt == end_region.excerpt {
-                if start_region.buffer.capability == Capability::ReadWrite
-                    && start_region.is_main_buffer
-                {
-                    buffer_edits
-                        .entry(start_region.buffer.remote_id())
-                        .or_default()
-                        .push(BufferEdit {
-                            range: buffer_start..buffer_end,
-                            new_text,
-                            is_insertion: true,
-                            original_indent_column,
-                        });
-                }
+                assign(
+                    &start_region,
+                    BufferEdit {
+                        range: buffer_start..buffer_end,
+                        new_text,
+                        is_insertion: true,
+                        original_indent_column,
+                    },
+                );
             } else {
-                let start_excerpt_range = buffer_start..start_region.buffer_range.end;
-                let end_excerpt_range = end_region.buffer_range.start..buffer_end;
-                if start_region.buffer.capability == Capability::ReadWrite
-                    && start_region.is_main_buffer
-                {
-                    buffer_edits
-                        .entry(start_region.buffer.remote_id())
-                        .or_default()
-                        .push(BufferEdit {
-                            range: start_excerpt_range,
-                            new_text: new_text.clone(),
-                            is_insertion: true,
-                            original_indent_column,
-                        });
-                }
-                if end_region.buffer.capability == Capability::ReadWrite
-                    && end_region.is_main_buffer
-                {
-                    buffer_edits
-                        .entry(end_region.buffer.remote_id())
-                        .or_default()
-                        .push(BufferEdit {
-                            range: end_excerpt_range,
-                            new_text: new_text.clone(),
-                            is_insertion: false,
-                            original_indent_column,
-                        });
-                }
+                assign(
+                    &start_region,
+                    BufferEdit {
+                        range: buffer_start..start_region.buffer_range.end,
+                        new_text: new_text.clone(),
+                        is_insertion: true,
+                        original_indent_column,
+                    },
+                );
+                assign(
+                    end_region,
+                    BufferEdit {
+                        range: end_region.buffer_range.start..buffer_end,
+                        new_text: new_text.clone(),
+                        is_insertion: false,
+                        original_indent_column,
+                    },
+                );
                 let end_region_excerpt = end_region.excerpt.clone();
 
                 cursor.seek(&range.start);
@@ -1847,22 +1854,20 @@ impl MultiBuffer {
                     if region.excerpt == &end_region_excerpt {
                         break;
                     }
-                    if region.buffer.capability == Capability::ReadWrite && region.is_main_buffer {
-                        buffer_edits
-                            .entry(region.buffer.remote_id())
-                            .or_default()
-                            .push(BufferEdit {
-                                range: region.buffer_range.clone(),
-                                new_text: new_text.clone(),
-                                is_insertion: false,
-                                original_indent_column,
-                            });
-                    }
+                    assign(
+                        region,
+                        BufferEdit {
+                            range: region.buffer_range.clone(),
+                            new_text: new_text.clone(),
+                            is_insertion: false,
+                            original_indent_column,
+                        },
+                    );
                     cursor.next_excerpt();
                 }
             }
         }
-        buffer_edits
+        (buffer_edits, blocked)
     }
 
     pub fn autoindent_ranges<I, S>(&mut self, ranges: I, cx: &mut Context<Self>)
@@ -1894,8 +1899,11 @@ impl MultiBuffer {
             edits: Vec<(Range<MultiBufferOffset>, Arc<str>)>,
             cx: &mut Context<MultiBuffer>,
         ) {
-            let buffer_edits =
+            let (buffer_edits, blocked) =
                 MultiBuffer::convert_edits_to_buffer_edits(edits, this.snapshot.get_mut(), &[]);
+            if blocked {
+                cx.emit(Event::EditBlockedByReadOnly);
+            }
 
             let mut buffer_ids = Vec::new();
             for (buffer_id, mut edits) in buffer_edits {

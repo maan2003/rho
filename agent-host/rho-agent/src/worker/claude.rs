@@ -20,7 +20,7 @@ use rho_claude::{
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::entry::{Notice, RequestNotice, Wake, compose, output_content};
+use crate::entry::{Notice, RequestNotice, StartupFailure, Wake, compose, output_content};
 use crate::inference::Inference;
 use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, Event, Record, Runtime};
@@ -164,6 +164,13 @@ struct Launch {
     effort: Effort,
 }
 
+fn startup_failed_state(failure: &StartupFailure) -> InferenceState {
+    InferenceState::Failed {
+        error: failure.error.clone(),
+        since: Some(failure.since),
+    }
+}
+
 pub(crate) struct ClaudeLoop {
     /// The Claude configuration this agent runs against, handed down from
     /// the agent host rather than resolved here.
@@ -187,6 +194,9 @@ pub(crate) struct ClaudeLoop {
     /// What the running process was spawned with, so a switch of account,
     /// model or effort is noticed at the next send.
     launched: Option<Launch>,
+    /// The CLI said this turn that its account cannot reach the model; the
+    /// turn's failure then says what to do about it on the host.
+    authentication_failed: bool,
     /// The notebook, once the first spawn has built it. Outlives the
     /// process: cells keep running across a respawn.
     python: Option<python_host::PythonHost>,
@@ -269,6 +279,7 @@ fn claude_runtime(
         checkin_at: python.and_then(python_host::PythonHost::checkin_at),
         archived,
         stale: false,
+        may_change_runtime_kind: false,
     }
 }
 
@@ -392,7 +403,7 @@ impl ClaudeLoop {
                 };
             (session_id, start_mode, false)
         };
-        let archived = host.head().await?.native.archived;
+        let archived = head.native.archived;
         let status = Arc::new(RwLock::new(AgentStatus::default()));
         let (control, control_rx) = mpsc::unbounded_channel();
         let (outbox, outbound) = Outbox::new();
@@ -412,6 +423,7 @@ impl ClaudeLoop {
             claude_settings_path: None,
             claude_plugin_dir: None,
             launched: None,
+            authentication_failed: false,
             python: None,
             outbox,
             outbound,
@@ -429,7 +441,10 @@ impl ClaudeLoop {
             cancelling: false,
             pending_rewind,
             execution_generation: 0,
-            inference_state: InferenceState::Idle,
+            inference_state: head
+                .startup_failure
+                .as_ref()
+                .map_or(InferenceState::Idle, startup_failed_state),
             status: Arc::clone(&status),
             control_rx,
             head,
@@ -464,7 +479,7 @@ impl ClaudeLoop {
                         biased;
                         changed = self.head_updates.changed() => {
                             changed.context("agent host head connection closed")?;
-                            self.head_changed();
+                            self.head_changed().await?;
                             continue;
                         }
                         control = control_rx.recv() => ClaudeLoopEvent::Control(control),
@@ -553,7 +568,7 @@ impl ClaudeLoop {
                     Some(outbound) = self.outbound.recv() => { self.outbound(outbound).await?; None },
                     changed = self.head_updates.changed() => {
                         changed.context("agent host head connection closed")?;
-                        self.head_changed();
+                        self.head_changed().await?;
                         continue;
                     }
                 };
@@ -576,7 +591,15 @@ impl ClaudeLoop {
             let settled = (initial_runtime.is_working() && !current.is_working())
                 || (self.execution_generation != initial_execution_generation
                     && !current.is_working());
-            if settled && let InferenceState::Failed { error } = &current.inference {
+            // A failure the loop was not working towards, such as Claude
+            // Code not starting, is a stop all the same: the transcript says
+            // why. Each failure has its own time, so one already told is not
+            // told again.
+            let failed_anew = current.inference != initial_runtime.inference;
+            if self.head.startup_failure.is_none()
+                && (settled || failed_anew)
+                && let InferenceState::Failed { error, .. } = &current.inference
+            {
                 self.notice(Notice::Stopped(error.clone())).await?;
             }
             if settled && std::mem::take(&mut self.ended) {
@@ -588,13 +611,29 @@ impl ClaudeLoop {
         }
     }
 
-    /// The host told a new head: a new spec reaches the next launch.
-    fn head_changed(&mut self) {
+    /// A changed runtime releases its launch failure and any waiting mail.
+    async fn head_changed(&mut self) -> anyhow::Result<()> {
         let head = self.head_updates.borrow_and_update().clone();
-        if let Some(head) = head {
-            self.head = head;
+        if let Some(mut head) = head {
+            // This running loop may have logged its own failure after the
+            // incoming snapshot was taken. Unrelated spec changes don't clear
+            // it.
+            let blocked = self.head.startup_failure.take();
+            if self.head.spec.runtime == head.spec.runtime {
+                head.startup_failure = blocked;
+                self.head = head;
+            } else {
+                self.head = head;
+                if blocked.is_some() {
+                    self.set_kind(InferenceState::Idle);
+                    if !self.waiting.is_empty() {
+                        self.request(Vec::new()).await?;
+                    }
+                }
+            }
             self.published();
         }
+        Ok(())
     }
 
     async fn handle_control(&mut self, control: ClaudeControl) -> anyhow::Result<()> {
@@ -629,6 +668,10 @@ impl ClaudeLoop {
                     // The person's input ends a wait it answers.
                     self.awaiting = false;
                 }
+                if self.head.startup_failure.is_some() {
+                    self.waiting.quiet();
+                    return Ok(());
+                }
                 if role != Role::System
                     && let Some(python) = &mut self.python
                 {
@@ -648,11 +691,18 @@ impl ClaudeLoop {
                 }
             }
             ClaudeControl::Cancel => {
+                if self.head.startup_failure.is_some() {
+                    return Ok(());
+                }
                 let kind = self.inference_state.clone();
                 let busy = matches!(kind, InferenceState::Responding);
                 self.compact_wanted = false;
                 self.give_back_following().await?;
                 self.cancelling = busy;
+                let cell_ran = self
+                    .python
+                    .as_ref()
+                    .is_some_and(|host| host.running_tasks() > 0);
                 self.cancel_python().await?;
                 self.waiting.quiet();
                 if busy && self.process.is_some() {
@@ -676,6 +726,9 @@ impl ClaudeLoop {
                 self.stream_items.clear();
                 self.response_id = None;
                 self.set_kind(InferenceState::Idle);
+                if busy || cell_ran {
+                    self.notice(Notice::Cancelled).await?;
+                }
                 self.recover_pending_rewind().await?;
             }
             ClaudeControl::Rewind { turns, reply } => {
@@ -719,12 +772,15 @@ impl ClaudeLoop {
     /// so Claude Code never holds text it could fold into a turn. The row goes
     /// in once the transport has all of it.
     async fn request(&mut self, mut notices: Vec<RequestNotice>) -> anyhow::Result<()> {
+        if self.head.startup_failure.is_some() {
+            return Ok(());
+        }
         // Claude Code went on past the answer, so the text goes with this one.
         self.give_back_following().await?;
         let mut steps = Steps::new();
         if !self.call_open() {
             if let Err(error) = self.ensure_process().await {
-                return self.fail(error).await;
+                return self.fail_to_start(error).await;
             }
             steps.mark("process");
         }
@@ -736,6 +792,13 @@ impl ClaudeLoop {
         let taken = self.waiting.take(open);
         if !open && self.waiting.holds_tool() {
             notices.push(RequestNotice::Waiting);
+        }
+        if let Some(notice) = self
+            .host
+            .cold_notice(taken.inputs.iter().filter_map(|input| input.message).max())
+            .await?
+        {
+            notices.push(notice);
         }
         let composed = compose(open, &notices, &taken.output, &taken.inputs);
         let user = composed.user.concat();
@@ -759,7 +822,7 @@ impl ClaudeLoop {
             return Ok(());
         }
         let host = self.python.as_mut().expect("a call is open");
-        let failed = host.latest_failed();
+        let failed = host.latest_end().is_some_and(|end| end.failed);
         let pending = host.take_pending().expect("a call is open");
         let items = composed.result.iter().map(mcp_item).collect();
         let ends_turn = turn.is_some() || ends_turn_for_compact;
@@ -849,8 +912,11 @@ impl ClaudeLoop {
     /// Sends what waits for a turn to end, one turn at a time.
     async fn next_turn(&mut self) -> anyhow::Result<()> {
         if std::mem::take(&mut self.compact_wanted) {
+            if self.head.startup_failure.is_some() {
+                return Ok(());
+            }
             if let Err(error) = self.ensure_process().await {
-                return self.fail(error).await;
+                return self.fail_to_start(error).await;
             }
             let compact = vec![ContentPart::Text {
                 text: "/compact".into(),
@@ -1153,7 +1219,8 @@ impl ClaudeLoop {
             ":rewind is only available while idle or errored; use :cancel first"
         );
         let rows = self.host.history().await?;
-        let (to, sent) = rewind_point(&rows, turns).context("nothing to rewind")?;
+        let (to, sent) =
+            rewind_point(&rows, turns).context("no recorded model turn can be rewound")?;
         let root = self.root.clone();
         let (source_session_id, messages) = if self.pending_rewind {
             match self.start_mode {
@@ -1485,6 +1552,7 @@ impl ClaudeLoop {
                 if message.parent_tool_use_id.is_some() {
                     return Ok(());
                 }
+                self.authentication_failed |= message.authentication_failed();
                 match reply_row(
                     &message,
                     usage_model(self.running_model()),
@@ -1520,6 +1588,7 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
+                let authentication_failed = std::mem::take(&mut self.authentication_failed);
                 if let Some(host) = &mut self.python {
                     host.turn_ended(
                         rho_agent_types::UnixMs::now(),
@@ -1546,6 +1615,13 @@ impl ClaudeLoop {
                     self.stream_items.clear();
                     self.response_id = None;
                     self.set_kind(InferenceState::Idle);
+                } else if message.is_error && authentication_failed {
+                    let account = match &self.launched {
+                        Some(launched) => launched.account.clone(),
+                        None => self.host.claude_account().await?,
+                    };
+                    self.fail(anyhow::anyhow!("{}", not_logged_in(&account)))
+                        .await?;
                 } else if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.failure_message()))
                         .await?;
@@ -1702,6 +1778,18 @@ impl ClaudeLoop {
     /// and acts on the answer. A working model with no call open hears it at
     /// its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
+        if let Some(end) = self
+            .python
+            .as_mut()
+            .and_then(python_host::PythonHost::take_end)
+        {
+            self.host
+                .append(Event::CellEnded {
+                    agent: self.agent_id,
+                    end,
+                })
+                .await?;
+        }
         // A model waiting in its call would never get to the command.
         if self.compact_wanted && self.waiting_in_call() {
             return self.request(vec![RequestNotice::NothingNew]).await;
@@ -1949,6 +2037,32 @@ impl ClaudeLoop {
         self.set_kind(InferenceState::Responding);
     }
 
+    async fn fail_to_start(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        if error.is::<StoreError>() {
+            return Err(error);
+        }
+        let failure = StartupFailure {
+            error: format!("{error:#}"),
+            since: UnixMs::now(),
+            runtime: self.head.spec.runtime.clone(),
+        };
+        self.notice(Notice::StartupFailed(failure.clone())).await?;
+        if let Err(error) = self.close_process().await {
+            if error.is::<StoreError>() {
+                return Err(error);
+            }
+            eprintln!("rho-agent: closing a partially started Claude process: {error:#}");
+        }
+        self.waiting.quiet();
+        self.compact_wanted = false;
+        self.ended = false;
+        self.turn_ended(TurnEnd::Failed, Some(failure.error.clone()));
+        let state = startup_failed_state(&failure);
+        self.head.startup_failure = Some(failure);
+        self.set_kind(state);
+        Ok(())
+    }
+
     async fn fail(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
         if error.is::<StoreError>() {
             return Err(error);
@@ -1980,6 +2094,7 @@ impl ClaudeLoop {
         self.stream_items.clear();
         self.set_kind(InferenceState::Failed {
             error: error.to_string(),
+            since: Some(UnixMs::now()),
         });
         Ok(())
     }
@@ -2115,25 +2230,24 @@ enum ClaudeLoopEvent {
 }
 
 /// Where a rewind of `turns` goes: the position of the `turns`-th last
-/// request that carried a person's input (the first one, when there are
-/// fewer), and the session lines handed over from there on, oldest first.
-/// `None` with no person's input to go back to.
+/// request handed over as a new Claude turn. A request that only answers
+/// a pending call has no session line and cannot start another turn.
 fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uuid>)> {
-    let people: Vec<usize> = rows
+    let handed_off: Vec<_> = rows
         .iter()
-        .enumerate()
-        .filter(|(_, (_, record))| record.event.carries_a_person())
-        .map(|(index, _)| index)
-        .collect();
-    let index = *people.get(people.len().saturating_sub(turns as usize))?;
-    let sent = rows[index..]
-        .iter()
-        .filter_map(|(_, record)| match &record.event {
-            Event::Request { turn, .. } => *turn,
+        .filter_map(|(pos, record)| match &record.event {
+            Event::Request {
+                turn: Some(turn), ..
+            } => Some((*pos, *turn)),
             _ => None,
         })
         .collect();
-    Some((rows[index].0, sent))
+    let index = handed_off.len().saturating_sub(turns as usize);
+    let (pos, _) = *handed_off.get(index)?;
+    Some((
+        pos,
+        handed_off[index..].iter().map(|(_, turn)| *turn).collect(),
+    ))
 }
 
 /// Where a session forked to forget the user message `uuid` and all after
@@ -2187,6 +2301,16 @@ async fn finish_rewind(
     head.spec = spec;
     head.claude_rewind = None;
     Ok(())
+}
+
+/// What a turn that failed for want of a login says, in the host's words:
+/// which account it is and what to run on the host about it.
+fn not_logged_in(account: &str) -> String {
+    format!(
+        "Claude account {account} is not logged in; on the host, run \
+         `rho claude-account login {account}`, or `rho claude-account use <account>` \
+         for one that is"
+    )
 }
 
 fn usage_model(model: Model) -> crate::log::AgentUsageModel {
@@ -2388,12 +2512,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             agent.status().runtime.inference,
-            InferenceState::Failed {
-                error: explanation.to_owned(),
-            }
-        );
+            InferenceState::Failed { error, since: Some(_) } if error == explanation
+        ));
         assert!(
             host.history()
                 .await
@@ -2406,8 +2528,117 @@ mod tests {
         );
     }
 
+    /// A turn the CLI ends because its account holds no login fails with
+    /// what to do on the host, not with the CLI's own `/login`, which is a
+    /// command of a session the user never sees.
+    #[tokio::test]
+    async fn a_missing_login_fails_with_the_command_to_run_on_the_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let agent_id = agent(1);
+        let workset = WorksetId([1; 6]);
+        let mut write = db.write().await;
+        write.init_store_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent: agent_id,
+                        spec: AgentSpec {
+                            runtime: Runtime::Claude {
+                                model: Model::Opus,
+                                effort: Effort::High,
+                                session_id: Uuid::new_v4(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        write.commit();
+        crate::testing::python(agent_id, &db);
+        let host = crate::testing::services_pair(db.clone(), agent_id, std::sync::Weak::new());
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            rho_claude::accounts::ClaudePaths::at(root.join("claude")),
+            Arc::new(Permissions::Bypass),
+            root,
+        )
+        .await
+        .unwrap();
+        runtime.launched = Some(Launch {
+            account: "work".to_owned(),
+            model: Model::Opus,
+            effort: Effort::High,
+        });
+        // What Claude Code 2.1 writes with an empty account directory.
+        let said = "Not logged in · Please run /login";
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Assistant(
+                serde_json::from_value(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "e0be9f8f-c1ab-49fa-a8f1-2b3400ade663",
+                        "model": "<synthetic>",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": said}],
+                    },
+                    "parent_tool_use_id": null,
+                    "session_id": Uuid::new_v4(),
+                    "uuid": Uuid::new_v4(),
+                    "error": "authentication_failed",
+                    "is_api_error_message": true,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": said,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let InferenceState::Failed { error, .. } = agent.status().runtime.inference else {
+            panic!("the agent failed");
+        };
+        assert_eq!(
+            error,
+            "Claude account work is not logged in; on the host, run \
+             `rho claude-account login work`, or `rho claude-account use <account>` for one that is"
+        );
+        // A later failure for another reason says its own words.
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": "Overloaded",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            agent.status().runtime.inference,
+            InferenceState::Failed { error, since: Some(_) } if error == "Overloaded"
+        ));
+    }
+
     #[test]
-    fn a_rewind_counts_only_peoples_inputs_and_lists_the_turns_from_there() {
+    fn a_rewind_follows_session_handoffs_not_the_input_role() {
         let a = agent(1);
         let (first, message, second, third) = (
             Uuid::new_v4(),
@@ -2426,14 +2657,14 @@ mod tests {
         assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), vec![second, third])));
         assert_eq!(
             rewind_point(&rows, 3),
-            Some((Wpos(1), vec![first, message, second, third]))
+            Some((Wpos(3), vec![message, second, third]))
         );
         assert_eq!(
             rewind_point(&rows, 9),
-            rewind_point(&rows, 3),
+            Some((Wpos(1), vec![first, message, second, third])),
             "more turns than there are go back to the first"
         );
-        assert_eq!(rewind_point(&rows[1..3], 1), None);
+        assert_eq!(rewind_point(&rows[2..3], 1), None);
     }
 
     #[test]

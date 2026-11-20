@@ -19,7 +19,9 @@ mod tests;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, ContentPart, MessageId, Role, UnixMs, Wpos};
+use anyhow::Context as _;
+use rho_agent_types::transcript::ExecId;
+use rho_agent_types::{AgentId, CellEnd, ContentPart, MessageId, Role, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -42,7 +44,8 @@ use crate::{AgentStatus, InferenceState, RuntimeState, StreamingResponse};
 
 /// Retries are volatile: restarting never resumes work without fresh input.
 struct Backoff {
-    since: tokio::time::Instant,
+    /// When the streak's first failure came.
+    since: UnixMs,
     previous: u64,
     delay: u64,
     at: UnixMs,
@@ -53,15 +56,15 @@ impl Backoff {
     const WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
 
     fn failed(previous: Option<Self>, error: String) -> Self {
-        let (since, previous, delay) =
-            previous.map_or((tokio::time::Instant::now(), 0, 1), |last| {
-                (
-                    last.since,
-                    last.delay,
-                    (last.previous + last.delay).min(30 * 60),
-                )
-            });
-        let remaining = Self::WINDOW.saturating_sub(since.elapsed());
+        let (since, previous, delay) = previous.map_or((UnixMs::now(), 0, 1), |last| {
+            (
+                last.since,
+                last.delay,
+                (last.previous + last.delay).min(30 * 60),
+            )
+        });
+        let elapsed = Duration::from_millis(UnixMs::now().saturating_duration_since(since));
+        let remaining = Self::WINDOW.saturating_sub(elapsed);
         Self {
             since,
             previous,
@@ -69,6 +72,10 @@ impl Backoff {
             at: UnixMs::now() + Duration::from_secs(delay).min(remaining),
             error,
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(UnixMs::now().saturating_duration_since(self.since))
     }
 }
 /// Responses Lite's automatic provider-compaction threshold for the GPT-6
@@ -211,6 +218,8 @@ struct Latest {
     cell: CellHandle,
     call: Call,
     published: bool,
+    /// Whether the transcript has been told how the cell ended.
+    end_told: bool,
 }
 
 /// The call of the step in progress, as its code arrives.
@@ -225,8 +234,8 @@ enum Stopped {
     /// Three steps in a row without a call, or a cancel: only the human
     /// wakes it.
     Quiet,
-    /// Model requests kept failing: the human or a retry wakes it.
-    Failed(Arc<str>),
+    /// Model requests kept failing, at `at`: the human or a retry wakes it.
+    Failed { error: Arc<str>, at: UnixMs },
 }
 
 /// Owned request boundary. Concurrent controls update the live context, never
@@ -423,7 +432,7 @@ impl Agent {
             // before deciding whether its completion warrants a wake.
             self.drain_outbox().await?;
             if let Some(backoff) = &self.backoff
-                && backoff.since.elapsed() >= Backoff::WINDOW
+                && backoff.elapsed() >= Backoff::WINDOW
             {
                 self.fail(format!(
                     "Provider retry window exhausted: {}",
@@ -431,14 +440,8 @@ impl Agent {
                 ))
                 .await?;
             }
-            let decision = if let Some(backoff) = &self.backoff {
-                if backoff.at <= UnixMs::now() {
-                    Decision::Now(Wake::Prose)
-                } else {
-                    Decision::Later(Some(backoff.at))
-                }
-            } else {
-                wake::decide(&self.facts(), UnixMs::now())
+            let Some(decision) = self.wake_decision(UnixMs::now()) else {
+                continue; // Drain a newer notebook signal before acting.
             };
             let recheck = match decision {
                 Decision::Now(why) => {
@@ -470,6 +473,22 @@ impl Agent {
                 () = sleep => {}
             }
         }
+    }
+
+    fn wake_decision(&self, now: UnixMs) -> Option<Decision> {
+        let decision = if let Some(backoff) = &self.backoff {
+            if backoff.at <= now {
+                Decision::Now(Wake::Prose)
+            } else {
+                Decision::Later(Some(backoff.at))
+            }
+        } else {
+            wake::decide(&self.facts(), now)
+        };
+        // A notebook can enqueue end_turn() after the initial drain but
+        // before we read that the cell returned (or shortened its check-in).
+        // Do not wake on those facts before applying the earlier signal.
+        self.outbox.is_empty().then_some(decision)
     }
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
@@ -590,7 +609,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Branch history before the `turns`-th last input from the user. What
+    /// Branch history before the `turns`-th last turn started by mail. A
+    /// model request with no preceding mail can be the first turn. What
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`); the notebook, its globals and
     /// anything it did are not rewound.
@@ -603,13 +623,7 @@ impl Agent {
         self.drain_outbox().await?;
         self.flush().await?;
         let rows = self.host.history().await?;
-        let people = rows
-            .iter()
-            .filter(|(_, record)| record.event.carries_a_person())
-            .map(|(pos, _)| *pos)
-            .collect::<Vec<_>>();
-        anyhow::ensure!(!people.is_empty(), "nothing to rewind");
-        let to = people[people.len().saturating_sub(turns as usize)];
+        let to = rewind_point(&rows, turns).context("the agent has not made a model request")?;
         self.host
             .append(Event::Rewound {
                 agent: self.agent_id,
@@ -625,9 +639,11 @@ impl Agent {
         self.cell = None;
         self.progress.told_returned = false;
         self.interrupted = false;
-        self.awaiting = false;
+        // The turn is taken back, and none starts in its place: the agent
+        // waits for the user, who is told so at the next request.
+        self.awaiting = true;
         self.progress.prose = 0;
-        self.stopped = None;
+        self.stopped = Some(Stopped::Quiet);
         self.restarted = false;
         self.rewound = true;
         self.compaction = cursor.compaction;
@@ -769,7 +785,6 @@ impl Agent {
             human: self.waiting.oldest(Role::User),
             agent: self.waiting.oldest(Role::Tool),
             prose: self.progress.prose > 0 || self.retry,
-            rewound: self.rewound,
             compaction: self.compaction.pending,
             compaction_reply: self.compaction.reply,
             archived: self.archived,
@@ -848,8 +863,10 @@ impl Agent {
         if self.restarted {
             notices.push(RequestNotice::Restarted);
         }
+        if std::mem::take(&mut self.rewound) {
+            notices.push(RequestNotice::Rewound);
+        }
         match why {
-            Wake::Rewound => notices.push(RequestNotice::Rewound),
             Wake::Prose if self.progress.prose > 0 => {
                 notices.push(RequestNotice::PreviousResponseHadNoExec)
             }
@@ -913,6 +930,15 @@ impl Agent {
             })
             .await?;
         }
+        self.tell_cell_end().await?;
+        if !quiet
+            && let Some(notice) = self
+                .host
+                .cold_notice(taken.inputs.iter().filter_map(|input| input.message).max())
+                .await?
+        {
+            notices.push(notice);
+        }
         self.log(Event::Request {
             agent: self.agent_id,
             output: taken.output,
@@ -925,7 +951,6 @@ impl Agent {
         .await?;
         if !quiet {
             self.restarted = false;
-            self.rewound = false;
             self.progress.ended = false;
         }
         if let Some(notebook) = &self.notebook {
@@ -946,7 +971,6 @@ impl Agent {
     }
 
     async fn respond(&mut self, mut turn: PreparedTurn) -> anyhow::Result<()> {
-        let previous_backoff = self.backoff.take();
         self.responding = true;
         self.response_id = uuid::Uuid::new_v4().to_string();
         self.writing = None;
@@ -1016,7 +1040,12 @@ impl Agent {
                                 return Ok(());
                             }
                             Some(control) => self.control(control).await?,
-                            None => return Ok(()),
+                            // The last handle went away. The outer loop must
+                            // not immediately retry this abandoned exchange.
+                            None => {
+                                self.backoff = None;
+                                return Ok(());
+                            }
                         },
                         Some(outbound) = self.outbox.recv() => {
                             self.outbound(outbound).await?;
@@ -1030,16 +1059,25 @@ impl Agent {
                 self.publish_stream(streaming.as_ref(), stream_needs_runtime);
             }
             match result {
-                Ok(step) => Ok((step, streaming)),
+                Ok(step) => {
+                    if let Some(backoff) = self.backoff.take()
+                        && backoff.elapsed() >= rho_agent_types::STUCK_AFTER
+                    {
+                        self.publish().await?;
+                        self.notice(Notice::Recovered(backoff.since)).await?;
+                    }
+                    Ok((step, streaming))
+                }
                 Err(error) => {
                     let retryable = crate::inference::is_retryable(&error);
                     let error = format!("{error:#}");
-                    self.notice(Notice::Error(error.clone())).await?;
                     // Code that already ran cannot be taken back: it stands
                     // as the step, and the model hears it was cut off.
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
                         && let Some(ran) = latest.cell.interrupt()
                     {
+                        self.backoff = None;
+                        self.notice(Notice::Error(error.clone())).await?;
                         Err((
                             streaming.carry,
                             streaming.code[..ran.min(streaming.code.len())].to_owned(),
@@ -1050,8 +1088,11 @@ impl Agent {
                         if self.archived {
                             return self.revive_if_written().await;
                         }
+                        // Only a failure the agent retries says so; one it
+                        // stops on is said once, as its stop.
                         if retryable {
-                            self.backoff = Some(Backoff::failed(previous_backoff, error));
+                            self.notice(Notice::Error(error.clone())).await?;
+                            self.backoff = Some(Backoff::failed(self.backoff.take(), error));
                             return Ok(());
                         }
                         return self.fail(error).await;
@@ -1116,6 +1157,7 @@ impl Agent {
                     cell,
                     call,
                     published: false,
+                    end_told: false,
                 });
                 self.progress.told_returned = false;
             }
@@ -1150,13 +1192,22 @@ impl Agent {
     /// Model requests kept failing: stop until someone writes or retries.
     async fn fail(&mut self, error: String) -> anyhow::Result<()> {
         self.backoff = None;
-        self.stopped = Some(Stopped::Failed(Arc::from(error.as_str())));
+        self.stopped = Some(Stopped::Failed {
+            error: Arc::from(error.as_str()),
+            at: UnixMs::now(),
+        });
         self.flush().await?;
         self.turn_ended(TurnEnd::Failed, Some(error));
         Ok(())
     }
 
     async fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
+        let in_flight = self.responding
+            || self.backoff.is_some()
+            || self
+                .cell
+                .as_ref()
+                .is_some_and(|latest| latest.cell.facts().finished.is_none());
         self.backoff = None;
         if let Some(notebook) = &self.notebook {
             notebook.cancel();
@@ -1178,6 +1229,9 @@ impl Agent {
             })
             .await?;
         }
+        if in_flight {
+            self.notice(Notice::Cancelled).await?;
+        }
         Ok(())
     }
 
@@ -1195,6 +1249,7 @@ impl Agent {
                 cell: notebook.stream(),
                 call: carry.with_code(String::new()),
                 published: false,
+                end_told: false,
             });
             self.progress.told_returned = false;
             *streaming = Some(Streaming {
@@ -1265,12 +1320,14 @@ impl Agent {
             InferenceState::Retrying {
                 at: backoff.at,
                 error: backoff.error.clone(),
+                since: backoff.since,
             }
         } else if self.responding {
             InferenceState::Responding
-        } else if let Some(Stopped::Failed(error)) = &self.stopped {
+        } else if let Some(Stopped::Failed { error, at }) = &self.stopped {
             InferenceState::Failed {
                 error: error.to_string(),
+                since: Some(*at),
             }
         } else {
             InferenceState::Idle
@@ -1298,6 +1355,7 @@ impl Agent {
                 },
                 archived: self.archived,
                 stale: false,
+                may_change_runtime_kind: false,
             },
             response: self.response(),
             draft: self.draft(),
@@ -1308,11 +1366,12 @@ impl Agent {
     /// Durable history is committed before replacing the live response.
     /// Current occupancy is published directly, never appended to history.
     async fn publish(&mut self) -> anyhow::Result<()> {
+        self.tell_cell_end().await?;
         self.flush().await?;
         let status = self.status();
         let working = status.runtime.is_working();
         if working != self.working {
-            if !working && let Some(Stopped::Failed(error)) = &self.stopped {
+            if !working && let Some(Stopped::Failed { error, .. }) = &self.stopped {
                 let notice = Notice::Stopped(error.to_string());
                 self.notice(notice).await?;
             }
@@ -1323,6 +1382,54 @@ impl Agent {
         self.host.published();
         Ok(())
     }
+}
+
+impl Agent {
+    /// Tells the transcript how the latest cell ended, once it has: the turn
+    /// may end with it, so no request need follow to say so.
+    async fn tell_cell_end(&mut self) -> anyhow::Result<()> {
+        let Some(latest) = self.cell.as_mut().filter(|latest| !latest.end_told) else {
+            return Ok(());
+        };
+        let Some(end) = latest.cell.facts().finished else {
+            return Ok(());
+        };
+        latest.end_told = true;
+        let Ok(call) = ExecId::try_from(latest.call.display_id()) else {
+            return Ok(());
+        };
+        self.log(Event::CellEnded {
+            agent: self.agent_id,
+            end: CellEnd {
+                call,
+                at: end.at,
+                failed: end.failed,
+            },
+        })
+        .await
+    }
+}
+
+/// A turn starts with the first request, new inputs, or a scheduled check-in.
+/// Requests sent to finish an open call are not separate turns.
+fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<Wpos> {
+    let mut boundaries = Vec::new();
+    for (pos, row) in rows {
+        if let Event::Request {
+            inputs, notices, ..
+        } = &row.event
+        {
+            if boundaries.is_empty()
+                || !inputs.is_empty()
+                || notices.contains(&RequestNotice::Checkin)
+            {
+                boundaries.push(*pos);
+            }
+        }
+    }
+    boundaries
+        .get(boundaries.len().saturating_sub(turns as usize))
+        .copied()
 }
 
 /// The inference session for a spec's model and profile, and the name its

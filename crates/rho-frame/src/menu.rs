@@ -20,20 +20,62 @@ pub type Run = Rc<dyn Fn(&mut Frame, Option<u32>, &mut Window, &mut Context<Fram
 #[derive(Clone)]
 pub enum Pick {
     /// Runs and closes the menu.
-    Run(Run),
+    Run { label: String, run: Run },
     /// Runs and leaves the menu open: a toggle, or a value the next key
     /// reads. The row shows the value.
-    Infix(Run),
+    Infix {
+        label: String,
+        value: String,
+        run: Run,
+    },
     /// Opens these rows over this menu.
     Menu(Rows),
+}
+
+impl Pick {
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Run { label, .. } | Self::Infix { label, .. } => label,
+            Self::Menu(rows) => &rows.title,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<&str> {
+        match self {
+            Self::Infix { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Whose command a row is, for the palette's order: the screen's and the
+/// thing's under the cursor come before the window's own, which every
+/// screen has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scope {
+    /// For the screen in view, or for what the cursor is on.
+    #[default]
+    Here,
+    /// The window's own: the same on every screen.
+    Window,
 }
 
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
-    pub description: String,
-    pub value: Option<String>,
+    /// Other words the palette finds the row by.
+    pub also: Vec<String>,
     pub pick: Pick,
+    pub scope: Scope,
+    pub(crate) shortcut: Option<Shortcut>,
+}
+
+#[derive(Clone)]
+pub(crate) enum Shortcut {
+    /// A binding to resolve in the screen's actual key context.
+    Action(Rc<dyn gpui::Action>),
+    /// A sequence beginning with a resolved binding into a real menu.
+    Menu(String),
 }
 
 impl Row {
@@ -44,10 +86,26 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
-            pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            also: Vec::new(),
+            pick: Pick::Run {
+                label: description.into(),
+                run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
+            },
+            scope: Scope::Here,
+            shortcut: None,
         }
+    }
+
+    /// The row is one of the window's own commands, on every screen: the
+    /// palette lists it after the screen's.
+    pub fn window_wide(mut self) -> Self {
+        self.scope = Scope::Window;
+        self
+    }
+
+    pub fn bound_to(mut self, action: impl gpui::Action) -> Self {
+        self.shortcut = Some(Shortcut::Action(Rc::new(action)));
+        self
     }
 
     /// A row that reads the count typed before it: `45 m`.
@@ -58,9 +116,13 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
-            pick: Pick::Run(Rc::new(run)),
+            also: Vec::new(),
+            pick: Pick::Run {
+                label: description.into(),
+                run: Rc::new(run),
+            },
+            scope: Scope::Here,
+            shortcut: None,
         }
     }
 
@@ -72,18 +134,31 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: Some(value.into()),
-            pick: Pick::Infix(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            also: Vec::new(),
+            pick: Pick::Infix {
+                label: description.into(),
+                value: value.into(),
+                run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
+            },
+            scope: Scope::Here,
+            shortcut: None,
         }
     }
 
-    pub fn menu(key: impl Into<String>, description: impl Into<String>, rows: Rows) -> Self {
+    /// The row is found in the palette by `word` too, as a user who does
+    /// not know its name would ask for it: `rename` for `name this thread`.
+    pub fn also(mut self, word: impl Into<String>) -> Self {
+        self.also.push(word.into());
+        self
+    }
+
+    pub fn menu(key: impl Into<String>, rows: Rows) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
+            also: Vec::new(),
             pick: Pick::Menu(rows),
+            scope: Scope::Here,
+            shortcut: None,
         }
     }
 }
@@ -118,8 +193,8 @@ impl Rows {
             tracing::warn!(
                 menu = %self.title,
                 key = %row.key,
-                kept = %taken.description,
-                dropped = %row.description,
+                kept = %taken.pick.label(),
+                dropped = %row.pick.label(),
                 "two rows on one key"
             );
             return;
@@ -149,14 +224,10 @@ impl Rows {
             transient = transient.counted();
         }
         for (index, row) in self.rows.iter().enumerate() {
-            transient = match (&row.pick, &row.value) {
-                (Pick::Infix(_), value) => transient.infix(
-                    row.key.clone(),
-                    row.description.clone(),
-                    value.clone().unwrap_or_default(),
-                    index,
-                ),
-                _ => transient.item(row.key.clone(), row.description.clone(), index),
+            let label = row.pick.label().to_owned();
+            transient = match row.pick.value() {
+                Some(value) => transient.infix(row.key.clone(), label, value.to_owned(), index),
+                None => transient.item(row.key.clone(), label, index),
             };
         }
         transient

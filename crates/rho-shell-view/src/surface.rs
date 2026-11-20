@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::time::Duration;
 
 use editor::scroll::AutoscrollStrategy;
 use editor::{
@@ -10,6 +11,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use rho_agent_types::UnixMs;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use theme::ActiveTheme as _;
@@ -29,7 +31,11 @@ gpui::actions!(
         ShellEof,
         ShellPagerMore,
         ShellPagerAll,
-        ShellPagerQuit
+        ShellPagerQuit,
+        ShellPrevious,
+        ShellNext,
+        ShellRecall,
+        ShellWrite
     ]
 );
 
@@ -52,9 +58,10 @@ pub struct ShellModel {
     exited: bool,
     disconnected: bool,
     submitting: bool,
-    host_prompt: String,
+    running_tick: Option<gpui::Task<()>>,
     display_prompt: String,
     shell_state: crate::protocol::ShellState,
+    recalled: Option<(u64, String)>,
     _read_task: gpui::Task<()>,
 }
 
@@ -126,8 +133,9 @@ impl ShellModel {
             exited: false,
             disconnected: false,
             submitting: false,
-            host_prompt: "> ".to_owned(),
+            running_tick: None,
             display_prompt: "> ".to_owned(),
+            recalled: None,
             shell_state: crate::protocol::ShellState::default(),
             _read_task: read_task,
         }
@@ -200,6 +208,7 @@ impl ShellModel {
         }) {
             Ok(()) => {
                 self.submitting = true;
+                self.recalled = None;
                 self.input_buffer.update(cx, |buffer, cx| {
                     let len = buffer.len();
                     buffer.edit([(0..len, "")], None, cx);
@@ -211,8 +220,7 @@ impl ShellModel {
                         model.submitting = false;
                         if accepted {
                             if !model.exited && !model.disconnected {
-                                let prompt = model.host_prompt.clone();
-                                model.set_prompt(&prompt, cx);
+                                model.refresh_input_prompt(cx);
                             }
                         } else {
                             model.input_buffer.update(cx, |buffer, cx| {
@@ -238,6 +246,111 @@ impl ShellModel {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
         }
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn is_draft(&self, anchor: multi_buffer::Anchor, cx: &gpui::App) -> bool {
+        matches!(anchor, multi_buffer::Anchor::Max)
+            || anchor.buffer_id() == Some(self.input_buffer.read(cx).remote_id())
+    }
+
+    #[cfg(feature = "ui")]
+    fn replace_input(&self, text: &str, cx: &mut Context<Self>) {
+        self.input_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), text)], None, cx);
+        });
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn go_to_input(
+        &self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.input_end)
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn recall_step(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if self.exited || self.disconnected || self.submitting {
+            return;
+        }
+        let old = self.recalled.as_ref().map(|(id, _)| *id);
+        let executions =
+            visible_executions(&self.shell_state).filter(|execution| !execution.command.is_empty());
+        let target = if previous {
+            executions
+                .rev()
+                .find(|execution| old.is_none_or(|id| execution.execution < id))
+        } else {
+            let Some(old) = old else {
+                return;
+            };
+            executions
+                .into_iter()
+                .find(|execution| execution.execution > old)
+        };
+        if let Some(target) = target {
+            let command = target.command.clone();
+            let id = target.execution;
+            let draft = self
+                .recalled
+                .take()
+                .map(|(_, draft)| draft)
+                .unwrap_or_else(|| self.input_text(cx));
+            self.recalled = Some((id, draft));
+            self.replace_input(&command, cx);
+        } else if !previous && let Some((_, draft)) = self.recalled.take() {
+            self.replace_input(&draft, cx);
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    pub(crate) fn recall_at_cursor(
+        &mut self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.exited || self.disconnected || self.submitting {
+            return false;
+        }
+        use text::ToOffset as _;
+        let head = editor.read(cx).selections.newest_anchor().head();
+        let transcript = self.transcript_buffer.read(cx);
+        let offset = if matches!(head, multi_buffer::Anchor::Min) {
+            0
+        } else if head.buffer_id() == Some(transcript.remote_id()) {
+            head.text_anchor_in(&transcript.snapshot())
+                .to_offset(transcript)
+        } else {
+            return false;
+        };
+        let Some(execution) = command_at_offset(&self.shell_state, offset) else {
+            return false;
+        };
+        let command = execution.command.clone();
+        let id = execution.execution;
+        let draft = self
+            .recalled
+            .take()
+            .map(|(_, draft)| draft)
+            .unwrap_or_else(|| self.input_text(cx));
+        self.recalled = Some((id, draft));
+        self.replace_input(&command, cx);
+        true
     }
 
     pub fn interrupt(&mut self) {
@@ -278,12 +391,7 @@ impl ShellModel {
                     self.mark_disconnected(cx);
                     return;
                 }
-                self.host_prompt.clone_from(&state.prompt);
                 self.shell_state = state;
-                if !self.submitting {
-                    let prompt = self.host_prompt.clone();
-                    self.set_prompt(&prompt, cx);
-                }
             }
             ShellServerFrame::ExecutionQueued { execution } => {
                 if !output_styles_valid(&execution.styles, &execution.output, 0) {
@@ -294,6 +402,7 @@ impl ShellModel {
             }
             ShellServerFrame::ExecutionStarted {
                 execution,
+                since,
                 prompt,
                 cwd,
             } => {
@@ -303,7 +412,7 @@ impl ShellModel {
                     .iter_mut()
                     .find(|block| block.execution == execution)
                 {
-                    block.state = crate::protocol::ShellExecutionState::Running;
+                    block.state = crate::protocol::ShellExecutionState::Running { since };
                     block.prompt = prompt;
                     block.cwd = cwd;
                 }
@@ -433,13 +542,8 @@ impl ShellModel {
                 }
             }
             ShellServerFrame::Prompt { prompt, cwd } => {
-                self.shell_state.prompt.clone_from(&prompt);
+                self.shell_state.prompt = prompt;
                 self.shell_state.cwd = cwd;
-                self.host_prompt = prompt;
-                if !self.submitting {
-                    let prompt = self.host_prompt.clone();
-                    self.set_prompt(&prompt, cx);
-                }
             }
             ShellServerFrame::Exited { status } => {
                 self.exited = true;
@@ -455,7 +559,55 @@ impl ShellModel {
             }
         }
         self.render_transcript(cx);
+        self.refresh_input_prompt(cx);
+        if self.running_since().is_some() {
+            self.running_tick.get_or_insert_with(|| {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        if this
+                            .update(cx, |this, cx| this.refresh_input_prompt(cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                })
+            });
+        } else {
+            self.running_tick = None;
+        }
         cx.notify();
+    }
+
+    pub(crate) fn running_since(&self) -> Option<UnixMs> {
+        if self.exited || self.disconnected {
+            return None;
+        }
+        self.shell_state
+            .executions
+            .iter()
+            .rev()
+            .find_map(|execution| match execution.state {
+                crate::protocol::ShellExecutionState::Running { since } => Some(since),
+                _ => None,
+            })
+    }
+
+    fn refresh_input_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.submitting || self.exited || self.disconnected {
+            return;
+        }
+        let prompt = self.running_since().map_or_else(
+            || self.shell_state.prompt.clone(),
+            |since| {
+                format!(
+                    "running · {}s ",
+                    UnixMs::now().saturating_duration_since(since) / 1000
+                )
+            },
+        );
+        self.set_prompt(&prompt, cx);
     }
 
     fn render_transcript(&mut self, cx: &mut Context<Self>) {
@@ -468,13 +620,7 @@ impl ShellModel {
             0,
             &self.shell_state.terminal_output,
         );
-        for execution in &self.shell_state.executions {
-            if matches!(
-                execution.state,
-                crate::protocol::ShellExecutionState::Queued
-            ) {
-                continue;
-            }
+        for execution in visible_executions(&self.shell_state) {
             let prompt_start = transcript.len();
             transcript.push_str(&execution.prompt);
             styles.push((StyleClass::ShellPrompt, prompt_start..transcript.len()));
@@ -567,6 +713,7 @@ impl ShellModel {
             return;
         }
         self.disconnected = true;
+        self.running_tick = None;
         self.submit = None;
         self.control = None;
         self.set_prompt("[shell disconnected] ", cx);
@@ -576,6 +723,9 @@ impl ShellModel {
     }
 
     fn set_prompt(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        if self.display_prompt == prompt {
+            return;
+        }
         self.display_prompt.clear();
         self.display_prompt.push_str(prompt);
         self.refresh_prompt(cx);
@@ -847,6 +997,36 @@ fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle
     }
 }
 
+/// A queued command has no row yet and cannot be selected or recalled.
+fn visible_executions(
+    shell: &crate::protocol::ShellState,
+) -> impl DoubleEndedIterator<Item = &crate::protocol::ShellExecution> {
+    shell.executions.iter().filter(|execution| {
+        !matches!(
+            execution.state,
+            crate::protocol::ShellExecutionState::Queued
+        )
+    })
+}
+
+#[cfg(feature = "ui")]
+fn command_at_offset(
+    shell: &crate::protocol::ShellState,
+    offset: usize,
+) -> Option<&crate::protocol::ShellExecution> {
+    let mut start = shell.terminal_output.len();
+    for execution in visible_executions(shell) {
+        let end = start + execution.prompt.len() + execution.command.len();
+        if !execution.command.is_empty() && (start..=end).contains(&offset) {
+            return Some(execution);
+        }
+        // A command always ends in a newline; its output need not. The
+        // last bytes of output can share a row with a later command.
+        start = end + 1 + execution.output.len();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +1036,47 @@ mod tests {
             foreground: Some(ShellColor::Indexed(index)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recall_targets_command_not_output_even_on_the_same_row() {
+        use crate::protocol::{ShellExecution, ShellExecutionState, ShellState};
+        let execution = |execution, command: &str, output: &str, state| ShellExecution {
+            execution,
+            command: command.to_owned(),
+            prompt: "> ".into(),
+            cwd: "/src".into(),
+            output: output.to_owned(),
+            styles: Vec::new(),
+            state,
+        };
+        let shell = ShellState {
+            terminal_output: "λ\n".into(),
+            executions: [
+                execution(
+                    4,
+                    "show",
+                    "done",
+                    ShellExecutionState::Finished { status: 0 },
+                ),
+                execution(7, "queued", "", ShellExecutionState::Queued),
+                execution(
+                    12,
+                    "again",
+                    "",
+                    ShellExecutionState::Running { since: UnixMs(78) },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // The projection is `λ\n> show\ndone> again\n`.
+        for offset in [0, 10, 13] {
+            assert!(command_at_offset(&shell, offset).is_none());
+        }
+        assert_eq!(command_at_offset(&shell, 5).unwrap().execution, 4);
+        assert_eq!(command_at_offset(&shell, 14).unwrap().execution, 12);
     }
 
     #[test]

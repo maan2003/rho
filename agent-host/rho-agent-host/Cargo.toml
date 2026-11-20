@@ -10,75 +10,79 @@ version.workspace = true
 # unprefixed_malloc routes CPython and other C allocations through jemalloc
 # too; glibc keeps freed memory in per-thread arenas instead of returning it.
 # Profiling samples allocations from the start, so SIGUSR1 can dump the heap.
-tikv-jemallocator = { version = "0.7", features = [
-  "profiling",
-  "unprefixed_malloc_on_supported_platforms",
-] }
-tikv-jemalloc-ctl = "0.7"
-rho-rtc.workspace = true
-rho-desktop-client.workspace = true
-rho-agent-hosts.workspace = true
-rho-desktop-proto = { workspace = true, features = ["local"] }
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
-clock.workspace = true
 camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ciborium.workspace = true
 clap.workspace = true
+clock.workspace = true
 dirs.workspace = true
 futures.workspace = true
+google-server.workspace = true
 iroh.workspace = true
 json-stream.workspace = true
 libc.workspace = true
+notion-server.workspace = true
 octo-server.workspace = true
 prefix-id.workspace = true
+redb.workspace = true
+reqwest.workspace = true
 rho-agent.workspace = true
+rho-agent-hosts.workspace = true
+rho-agent-types.workspace = true
+rho-agents-client.workspace = true
+rho-mail.workspace = true
 rho-claude.workspace = true
 rho-claude-usage.workspace = true
-rho-agent-types.workspace = true
-slack-server.workspace = true
-google-server.workspace = true
-notion-server.workspace = true
-rho-agents-client.workspace = true
-rho-chat.workspace = true
 rho-db.workspace = true
-rho-ledger-server.workspace = true
-rho-inference.workspace = true
+rho-desktop-client.workspace = true
+rho-desktop-proto = { workspace = true, features = ["local"] }
+rho-fs-view.workspace = true
 rho-image.workspace = true
-rho-openai-realtime.workspace = true
+rho-inference.workspace = true
 rho-iroh-auth.workspace = true
+rho-ledger-server.workspace = true
+rho-openai-realtime.workspace = true
 rho-profiling.workspace = true
 rho-rpc = { workspace = true, features = ["server"] }
-rho-visualizations.workspace = true
-rho-fs-view.workspace = true
+rho-rtc.workspace = true
 rho-shell-view.workspace = true
 rho-terminal.workspace = true
+rho-visualizations.workspace = true
 rustix = { version = "1", features = ["process"] }
 rustix-openpty.workspace = true
+senax-encoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
-redb.workspace = true
+slack-server.workspace = true
 tempfile.workspace = true
-senax-encoder.workspace = true
+tikv-jemalloc-ctl = "0.7"
+tikv-jemallocator = { version = "0.7", features = [
+  "profiling",
+  "unprefixed_malloc_on_supported_platforms",
+] }
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = [
-  "env-filter",
-  "fmt",
-] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-moq-net.workspace = true
-rho-rpc = { workspace = true, features = ["server", "native-client"] }
-rho-fake-model.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+jiff.workspace = true
+moq-net.workspace = true
+rho-mail = { workspace = true, features = ["client"] }
+rho-dealer.workspace = true
+rho-fake-model.workspace = true
+rho-rpc = { workspace = true, features = ["native-client", "server"] }
 rho-shell.workspace = true
 senax-encoder.workspace = true
+
+[[test]]
+name = "mail"
+harness = false
 
 [[test]]
 name = "terminal_stream"
@@ -93,9 +97,9 @@ name = "wayland_stream"
 harness = false
 
 [dependencies.rho-desktop-media]
-workspace = true
 features = ["iroh"]
+workspace = true
 
 [dev-dependencies.rho-desktop-media]
-workspace = true
 features = ["decoder"]
+workspace = true

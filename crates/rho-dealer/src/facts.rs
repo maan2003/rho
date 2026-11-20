@@ -104,8 +104,7 @@ pub enum Fact {
         node: Address,
         seen: Seen,
     },
-    /// Nothing from the node reaches the user, until unmuted. For every
-    /// node but a Slack one, which Slack mutes itself.
+    /// Nothing from the node reaches the user, until unmuted.
     Mute {
         node: Address,
     },
@@ -171,9 +170,11 @@ pub enum Fact {
         label: uuid::Uuid,
         host: Option<String>,
     },
-    /// Marked read this far. Older builds wrote it and none writes it
-    /// now: done is how the user says they read a topic. It still counts
-    /// as seen, and takes nothing back. Later still than `Host`.
+    /// Seen this far, taking nothing back. Older builds wrote it for
+    /// "marked read"; done is how the user says they read a topic now.
+    /// Steering an agent writes it: the user has seen the stop the agent
+    /// is in, and what else waits in its thread still waits. Later still
+    /// than `Host`.
     Read {
         node: Address,
         seen: Seen,
@@ -226,13 +227,15 @@ pub enum Seen {
     /// before topics replaced them. Only the migration to topics reads
     /// it; it stays so `main`'s entries still decode.
     Agent(u64),
-    /// A Slack unit, through this message.
-    Slack(String),
     /// A note: there is nothing more to see.
     Whole,
-    /// A chat topic, through this message. Last: entries decode by variant
-    /// order.
+    /// A mail thread, through this position in its host's log.
     Topic(u64),
+    /// A chat thread, through this message, and through every stop its
+    /// agents were in that began by `stopped`, in unix milliseconds on
+    /// the host's clock: a stop is no message, so the instant its host
+    /// gave it is where it stands.
+    Thread { message: u64, stopped: u64 },
 }
 
 /// A snooze in force or past: when it was said and when it ends.
@@ -282,25 +285,26 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// The newest message of a topic the user had seen when done with it:
+    /// The newest mail version the user had seen when done with the thread:
     /// where its unread starts, and what its card has handled.
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
-                Seen::Topic(id) => Some(*id),
+                Seen::Topic(id) | Seen::Thread { message: id, .. } => Some(*id),
                 _ => None,
             })
             .max()
     }
 
-    /// The newest Slack message the user had seen when done with a unit.
-    pub fn seen_slack(self) -> Option<&'a str> {
+    /// When the newest stop of a thread's agents the user had seen began:
+    /// a stop that began later is news.
+    pub fn seen_stopped(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
-                Seen::Slack(ts) => Some(ts.as_str()),
+                Seen::Thread { stopped, .. } => Some(*stopped),
                 _ => None,
             })
-            .max_by(|a, b| slack_ts_order(a, b))
+            .max()
     }
 
     pub fn muted(self) -> bool {
@@ -352,19 +356,6 @@ impl<'a> Facts<'a> {
             .filter(|entry| matches!(entry.fact, Fact::Snooze { .. }))
             .count()
     }
-}
-
-/// Slack timestamps in time order: seconds, then the sequence after the
-/// dot.
-pub fn slack_ts_order(a: &str, b: &str) -> Ordering {
-    let parts = |ts: &str| {
-        let (seconds, sequence) = ts.split_once('.').unwrap_or((ts, "0"));
-        (
-            seconds.parse::<u64>().unwrap_or(0),
-            sequence.parse::<u64>().unwrap_or(0),
-        )
-    };
-    parts(a).cmp(&parts(b))
 }
 
 #[cfg(test)]
@@ -507,17 +498,5 @@ mod tests {
         assert_eq!(facts.seen_topic(), Some(7));
         assert_eq!(facts.snooze().map(|snooze| snooze.set), Some(at(1)));
         assert!(facts.deadline().is_some());
-    }
-
-    #[test]
-    fn slack_messages_order_by_time_not_by_text() {
-        assert_eq!(
-            slack_ts_order("1800000100.000010", "1800000100.000009"),
-            Ordering::Greater
-        );
-        assert_eq!(
-            slack_ts_order("999999999.000000", "1800000000.000000"),
-            Ordering::Less
-        );
     }
 }

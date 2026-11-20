@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alacritty_terminal::vte::{self, Params, Perform};
 use anyhow::Context as _;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, UnixMs};
 use rho_shell::kernel::{
     self, MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
     Request, Response,
@@ -424,13 +424,15 @@ impl State {
         else {
             return;
         };
-        block.state = view::ShellExecutionState::Running;
+        let since = UnixMs::now();
+        block.state = view::ShellExecutionState::Running { since };
         let prompt = self.shell.prompt.clone();
         let cwd = self.shell.cwd.clone();
         block.prompt.clone_from(&prompt);
         block.cwd.clone_from(&cwd);
         self.send_state_frame(ShellServerFrame::ExecutionStarted {
             execution,
+            since,
             prompt,
             cwd,
         });

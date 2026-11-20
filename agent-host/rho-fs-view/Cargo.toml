@@ -14,9 +14,9 @@ dirs.workspace = true
 libc.workspace = true
 rho-agent-types.workspace = true
 rho-git.workspace = true
-tokio.workspace = true
 senax-encoder.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

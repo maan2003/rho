@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
-use editor::Editor;
 use editor::display_map::CustomBlockId;
+use editor::{Editor, HighlightKey};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Pixels, Window, div};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Pixels, Window, div};
+use language::Point;
+use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
-use rho_frame::{Row, Surface};
+use rho_frame::Surface;
 use theme::ActiveTheme as _;
 
 use super::paint::{self, Summary};
@@ -32,6 +34,14 @@ pub struct UsageSurface {
     block: Option<CustomBlockId>,
 }
 
+/// Between two legend entries: wide enough that `opus $1.20   gpt $0.40`
+/// reads as two entries rather than four words.
+const LEGEND_GAP: &str = "   ";
+
+/// The legend's colours: one highlight per entry, at keys no other surface
+/// uses.
+const LEGEND_KEY_BASE: usize = usize::MAX / 6;
+
 impl UsageSurface {
     pub fn new(
         system: Entity<AgentsSystem>,
@@ -50,11 +60,17 @@ impl UsageSurface {
             editor.set_read_only(true);
             editor
         });
-        cx.subscribe(&system, |this, _, moved: &UsageMoved, cx| {
-            if moved.concerns(this.chart) {
-                this.rebuild(cx);
-            }
-        })
+        cx.subscribe(
+            &system,
+            |this, system, moved: &UsageMoved, cx| match moved {
+                UsageMoved::Connected => {
+                    let chart = this.chart;
+                    system.update(cx, |system, cx| system.ask(chart, cx));
+                }
+                moved if moved.concerns(this.chart) => this.rebuild(cx),
+                _ => {}
+            },
+        )
         .detach();
         Self {
             system,
@@ -68,32 +84,48 @@ impl UsageSurface {
     }
 
     /// What the system holds for this chart, reduced to the picture's
-    /// width; `None` until a host has answered.
-    fn summary(&self, system: &AgentsSystem) -> Option<Summary> {
+    /// width, or the words that stand in the picture's place when there is
+    /// nothing to draw.
+    fn summary(&self, system: &AgentsSystem) -> Result<Summary, String> {
         let now = now_ms();
         let days = self.chart.days.count();
         let columns = self.columns;
+        let waiting = || match system.attached_hosts() {
+            0 => "no agent host is attached".to_owned(),
+            _ => "waiting for the agent hosts' answer".to_owned(),
+        };
         match self.chart.chart {
             Chart::RateLimit => {
-                let (series, active) = system.quota_history()?;
-                Some(Summary::Quota(usage::quota_summary(
+                let (series, active) = system.quota_history().ok_or_else(waiting)?;
+                // An empty grid cannot tell an account at its limit from no
+                // account at all; the words can.
+                if series.iter().all(|series| series.points.is_empty()) {
+                    return Err(match system.hosts_without_accounts() {
+                        Some(hosts) => format!("no accounts on {}", hosts.join(" or ")),
+                        None => "no usage yet".to_owned(),
+                    });
+                }
+                Ok(Summary::Quota(usage::quota_summary(
                     &series, &active, days, now, columns,
                 )))
             }
-            Chart::ModelCost => Some(Summary::Cost(usage::cost_summary(
-                &system.usage().spend(self.chart)?,
+            Chart::ModelCost => Ok(Summary::Cost(usage::cost_summary(
+                &system.usage().spend(self.chart).ok_or_else(waiting)?,
                 days,
                 now,
                 columns,
             ))),
-            Chart::UsageShare => Some(Summary::Share(usage::share_summary(
-                &system.usage().spend(self.chart)?,
+            Chart::UsageShare => Ok(Summary::Share(usage::share_summary(
+                &system.usage().spend(self.chart).ok_or_else(waiting)?,
                 days,
                 now,
                 columns,
             ))),
-            Chart::AgentCost => Some(Summary::AgentCost(usage::agent_cost_summary(
-                &system.usage().agent_cost(self.chart.days)?,
+            Chart::AgentCost => Ok(Summary::AgentCost(usage::agent_cost_summary(
+                &system
+                    .usage()
+                    .agent_cost(self.chart.days)
+                    .ok_or_else(waiting)?,
                 days,
                 now,
                 columns,
@@ -105,46 +137,83 @@ impl UsageSurface {
     /// the totals live in, and put the block back. Once per arrival and
     /// once per resize; never per frame.
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let system = self.system.read(cx);
-        let summary = self.summary(system).map(Arc::new);
-        let waiting = match system.attached_hosts() {
-            0 => "no agent host is attached",
-            _ => "waiting for the agent hosts' answer",
-        };
-        self.write_header(summary.as_deref(), waiting, cx);
-        self.reinsert_block(summary, cx);
+        let summary = self.summary(self.system.read(cx)).map(Arc::new);
+        self.write_header(summary.as_deref().map_err(String::as_str), cx);
+        self.reinsert_block(summary.ok(), cx);
         cx.notify();
     }
 
-    /// The buffer's text: what the chart is, and the totals that are words
-    /// rather than picture.
-    fn write_header(&mut self, summary: Option<&Summary>, waiting: &str, cx: &mut Context<Self>) {
-        let mut text = format!(
-            "{} · last {} days\n",
+    /// The buffer's text: what the chart is, the totals, and what each
+    /// colour stands for — everything that is words rather than picture.
+    /// The point goes to the legend, the first line that says something
+    /// about the picture under it, or to the words standing in for one.
+    fn write_header(&mut self, summary: Result<&Summary, &str>, cx: &mut Context<Self>) {
+        let mut lines = vec![format!(
+            "{} · last {} days",
             self.chart.chart.title(),
             self.chart.days.count()
-        );
+        )];
         match summary {
-            Some(Summary::Cost(cost)) => text.push_str(&format!(
-                "${:.2} estimated API cost · {} requests{}\n",
+            Ok(Summary::Cost(cost)) => lines.push(format!(
+                "${:.2} estimated API cost · {} requests{}",
                 cost.total,
                 cost.requests,
                 paint::backfill_note(cost.approximate)
             )),
-            Some(Summary::Share(share)) => text.push_str(&format!(
-                "colors = share · height = smoothed weighted usage (p95-scaled) · {} requests{}\n",
+            Ok(Summary::Share(share)) => lines.push(format!(
+                "colors = share · height = smoothed weighted usage (p95-scaled) · {} requests{}",
                 share.requests,
                 paint::backfill_note(share.approximate)
             )),
-            Some(Summary::Quota(_) | Summary::AgentCost(_)) => {}
-            None => {
-                text.push_str(waiting);
-                text.push('\n');
+            Ok(Summary::Quota(_) | Summary::AgentCost(_)) => {}
+            Err(words) => lines.push(words.to_owned()),
+        }
+        let mut text = lines.join("\n");
+        let legend = summary.map_or(&[][..], Summary::legend);
+        let mut entries = Vec::new();
+        if !legend.is_empty() {
+            text.push('\n');
+        }
+        for (index, entry) in legend.iter().enumerate() {
+            if index > 0 {
+                text.push_str(LEGEND_GAP);
             }
+            entries.push((entry.color, text.len()..text.len() + entry.label.len()));
+            text.push_str(&entry.label);
         }
         self.buffer.update(cx, |buffer, cx| {
             let old = buffer.len();
             buffer.edit([(0..old, text.as_str())], None, cx);
+        });
+        let home = Point::new(text.matches('\n').count() as u32, 0);
+        self.editor.update(cx, |editor, cx| {
+            // Every highlight in this editor is a legend entry's.
+            editor.clear_highlights_with(
+                &mut |key| {
+                    matches!(key, HighlightKey::SyntaxTreeView(key) if *key >= LEGEND_KEY_BASE)
+                },
+                cx,
+            );
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            for (index, (color, range)) in entries.into_iter().enumerate() {
+                let range = snapshot.anchor_after(MultiBufferOffset(range.start))
+                    ..snapshot.anchor_before(MultiBufferOffset(range.end));
+                let style = HighlightStyle {
+                    color: Some(paint::color_of(color, cx)),
+                    ..HighlightStyle::default()
+                };
+                editor.highlight_text(
+                    HighlightKey::SyntaxTreeView(LEGEND_KEY_BASE + index),
+                    vec![range],
+                    style,
+                    cx,
+                );
+            }
+            let display = editor.display_snapshot(cx);
+            editor.selections.change_with(&display, |selections| {
+                selections.select_ranges([home..home]);
+            });
+            cx.notify();
         });
     }
 
@@ -177,34 +246,6 @@ impl Surface for UsageSurface {
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
         Some(self.editor.clone())
-    }
-
-    /// The other pictures over the same window, and this picture over the
-    /// other one. Model cost is `k` here rather than the usage menu's `c`,
-    /// which the chat system's rows give to a new channel.
-    fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
-        let here = self.chart;
-        let open = |key: &'static str, chart| super::open_row(self.system.clone(), key, chart);
-        let mut rows: Vec<Row> = Chart::ALL
-            .into_iter()
-            .filter(|chart| *chart != here.chart)
-            .map(|chart| {
-                let key = match chart {
-                    Chart::RateLimit => "r",
-                    Chart::ModelCost => "k",
-                    Chart::UsageShare => "s",
-                    Chart::AgentCost => "a",
-                };
-                let to = UsageChart { chart, ..here };
-                open(key, to)
-            })
-            .collect();
-        let other = UsageChart {
-            days: here.days.other(),
-            ..here
-        };
-        rows.push(open("d", other));
-        rows
     }
 }
 

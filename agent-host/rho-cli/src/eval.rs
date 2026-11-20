@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent::entry::{compose, plain_text};
 use rho_agent::record::Event;
-use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
+use rho_agent::store::{Appended, MailRead as _, StoreRead as _};
 use rho_agent_types::{Address, AgentId, ContentPart, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::snippets;
 use rho_fs_view::{UserEnvironment, Worksets};
@@ -280,6 +280,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     pool.post_user(
         client_id,
         None,
+        None,
         vec![id],
         vec![ContentPart::Text { text: prompt }],
     )
@@ -336,7 +337,9 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                         let responding = runtime.inference == rho_agent::InferenceState::Responding;
                         let stopped = !runtime.is_working() && runtime.checkin_at.is_none();
                         let ended = runtime.awaiting_human && runtime.running_tasks == 0;
-                        if let rho_agent::InferenceState::Failed { error } = runtime.inference {
+                        if let rho_agent::InferenceState::Failed { error, .. }
+                        | rho_agent::InferenceState::Lost { error, .. } = runtime.inference
+                        {
                             finished = Some(Err(error));
                         } else if working && runtime.archived {
                             finished = Some(Ok(()));
@@ -490,7 +493,7 @@ impl Watch<'_> {
                     _ => Ok(None),
                 }
             }
-            Appended::Chat(seq) => {
+            Appended::Mail(seq) => {
                 let Some(message) = self.db.read().message(rho_agent_types::MessageId(seq)) else {
                     return Ok(None);
                 };

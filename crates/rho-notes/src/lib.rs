@@ -8,21 +8,28 @@
 //! typed and not yet written. The machine never writes a note's text:
 //! every revision this crate says is a buffer's text as the user left it.
 //!
+//! Notes live apart from the work: no note is a room on Home or a place
+//! in `find`. Their one door is the command `notes`, which opens
+//! [`NotesView`], every note by its first line, the last written first.
+//!
 //! Addresses are `note:<id>`
-//! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)). A deadline on
+//! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)), and the list
+//! of them is `notes:all`. A deadline on
 //! a note is the dealer's to rank, like on anything else; a bare reminder
 //! is a note with a deadline. This system only opens the card.
 
+pub(crate) mod list;
 mod view;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Subscription, Task, Window};
+pub use list::NotesView;
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, RoomRow, Row, System};
+use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, Row, System};
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -30,6 +37,14 @@ const SAVE_AFTER: Duration = Duration::from_millis(700);
 
 /// What a note without a first line is called.
 const UNTITLED: &str = "untitled note";
+
+/// The kind of the one list of every note.
+const NOTES: &str = "notes";
+
+/// The list of every note.
+fn notes_address() -> Address {
+    Address::new(NOTES, "all")
+}
 
 /// A note, by the id it was minted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,12 +70,17 @@ fn text_of(marks: &Marks, note: NoteId) -> String {
     marks.get(&note.address()).body.clone().unwrap_or_default()
 }
 
-/// What a note is called: its first line.
-fn note_title(marks: &Marks, note: &Address) -> String {
-    match marks.get(note).title() {
-        "" => UNTITLED.to_owned(),
-        title => title.to_owned(),
+/// What a note with `text` is called: its first line, or [`UNTITLED`].
+fn title_of(text: &str) -> String {
+    match text.lines().next().map(str::trim) {
+        None | Some("") => UNTITLED.to_owned(),
+        Some(title) => title.to_owned(),
     }
+}
+
+/// What a note is called, as written: its first line.
+fn note_title(marks: &Marks, note: &Address) -> String {
+    title_of(marks.get(note).body.as_deref().unwrap_or_default())
 }
 
 /// The note's new revision, when the text the user left in its buffer
@@ -87,31 +107,54 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
-/// The private rooms: every note that is about nothing, the one last
-/// written first.
-fn private_rooms(marks: &Marks) -> Vec<RoomRow> {
-    marks
-        .private_roots()
+/// A note as `notes` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Listed {
+    note: Address,
+    title: String,
+    /// For a private reply: where it shows, by the name of the thread
+    /// that shows the message it is under, when that can be named.
+    reply: Option<Option<String>>,
+}
+
+/// Every note, about something or about nothing, by its first line: the
+/// one last written first. `place` names where a reply about an address
+/// shows.
+fn listed(marks: &Marks, place: impl Fn(&Address) -> Option<String>) -> Vec<Listed> {
+    let mut notes: Vec<_> = marks.notes().collect();
+    notes.sort_by_key(|(address, held)| {
+        (
+            std::cmp::Reverse(held.written_ms.or(held.created_ms)),
+            *address,
+        )
+    });
+    notes
         .into_iter()
-        .map(|(address, held)| RoomRow {
-            address: address.clone(),
-            name: note_title(marks, address),
-            tag: "private".to_owned(),
-            waiting: String::new(),
-            at: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
+        .map(|(address, held)| Listed {
+            note: address.clone(),
+            title: note_title(marks, address),
+            reply: held.about.as_ref().map(&place),
         })
         .collect()
 }
 
-/// Every note, for `find`.
-fn found(marks: &Marks) -> Vec<Found> {
+/// Every note as the palette lists it, by the first line `title` reads:
+/// a private reply as one, a note about nothing as a note, each as new as
+/// its last revision.
+fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
     marks
         .notes()
-        .map(|(address, held)| Found {
-            address: address.clone(),
-            title: note_title(marks, address),
-            description: "note".to_owned(),
-            recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
+        .filter_map(|(address, held)| {
+            Some(Found {
+                address: address.clone(),
+                title: title(NoteId::from_address(address)?),
+                description: match held.about {
+                    Some(_) => "private reply".to_owned(),
+                    None => "note".to_owned(),
+                },
+                thread: None,
+                recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
+            })
         })
         .collect()
 }
@@ -147,6 +190,7 @@ impl NoteSystem {
             }
             std::future::ready(())
         });
+        list::bind_keys(cx);
         Self {
             frame,
             pending: HashMap::new(),
@@ -169,10 +213,10 @@ impl NoteSystem {
         self.pending.insert(note, Pending { text, _save: save });
     }
 
-    /// Writes what was typed into `note`. It leaves the pending set only
-    /// as it is written, so a surface never takes another device's text
-    /// over it in between.
-    fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
+    /// Writes what was typed into `note`, if anything. It leaves the pending
+    /// set only as it is written, so a surface never takes another device's
+    /// text over it in between.
+    pub(crate) fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
         let this = cx.entity();
         self.frame.with(cx, move |frame, _, cx| {
             let Some(pending) = this.update(cx, |this, _| this.pending.remove(&note)) else {
@@ -191,8 +235,7 @@ fn write(frame: &mut Frame, note: NoteId, text: String, cx: &mut Context<Frame>)
 }
 
 /// `reply privately`: a new note about what the point is on, which the
-/// thread shows under it as the user's own line. On a note it is a note
-/// under that note.
+/// thread shows under it as the user's own line.
 fn reply_privately(
     subject: &Address,
     frame: &mut Frame,
@@ -203,16 +246,15 @@ fn reply_privately(
     frame.open(note.address(), window, cx);
 }
 
-/// A new note about `about`, or about nothing: a private room. It has no
-/// text, and is nothing in the ledger until it is about something or
-/// typed into.
+/// A new note about `about`, or about nothing. It has no text, and is
+/// nothing in the ledger until it is about something or typed into.
 fn new_note(frame: &mut Frame, about: Option<&Address>, cx: &mut Context<Frame>) -> NoteId {
     let note = NoteId(uuid::Uuid::new_v4());
     frame.write_marks(new_note_marks(note, about), cx);
     note
 }
 
-/// `new note`: a private room of its own, opened to type into.
+/// `new note`: a note about nothing, opened to type into.
 fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
     let note = new_note(frame, None, cx);
     frame.open(note.address(), window, cx);
@@ -220,7 +262,7 @@ fn make_note(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
 
 impl System for NoteSystem {
     fn kinds(&self) -> &'static [&'static str] {
-        &[Address::NOTE]
+        &[Address::NOTE, NOTES]
     }
 
     fn open(
@@ -229,42 +271,64 @@ impl System for NoteSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
-        let note = NoteId::from_address(address)?;
         let system = cx.entity();
         let frame = self.frame.clone();
+        if *address == notes_address() {
+            let view = cx.new(|cx| NotesView::new(system, frame, window, cx));
+            return Some(AnySurface::new(view));
+        }
+        let note = NoteId::from_address(address)?;
         let view = cx.new(|cx| NoteView::new(system, frame, note, window, cx));
         Some(AnySurface::new(view))
     }
 
     fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        if let Some(subject) = point.subject.clone() {
-            rows.push(Row::run(
-                "n",
-                "reply privately",
-                move |frame, window, cx| reply_privately(&subject, frame, window, cx),
-            ));
+        if point.surface.kind() == rho_mail::ThreadId::KIND
+            && let Some(subject) = point
+                .subject
+                .clone()
+                .filter(|at| at.kind() == rho_mail::ThreadId::KIND)
+        {
+            rows.push(Row::run("", "reply privately", move |frame, window, cx| {
+                reply_privately(&subject, frame, window, cx);
+            }));
         }
         rows.push(Row::run("w", "new note", make_note));
+        // The one door to the notes, on every screen: one of the window's
+        // own commands.
+        rows.push(
+            Row::run("shift-w", "notes", |frame, window, cx| {
+                frame.open(notes_address(), window, cx)
+            })
+            .window_wide(),
+        );
         rows
     }
 
-    /// Only asked for a note whose first line is empty: the frame names
-    /// notes from the marks.
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
-        NoteId::from_address(address).map(|_| (UNTITLED.to_owned(), String::new()))
+    /// A note is called by its first line: the one being typed while the
+    /// user types, else the one written.
+    fn name(&self, address: &Address, marks: &Marks, _cx: &App) -> Option<(String, String)> {
+        let note = NoteId::from_address(address)?;
+        let title = match self.pending.get(&note) {
+            Some(pending) => title_of(&pending.text),
+            None => note_title(marks, address),
+        };
+        Some((title, String::new()))
     }
 
+    /// Every note, by its first line as the user is typing it, for the
+    /// palette.
     fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
-        found(marks)
-    }
-
-    fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
-        private_rooms(marks)
+        found(marks, |note| match self.pending.get(&note) {
+            Some(pending) => title_of(&pending.text),
+            None => note_title(marks, &note.address()),
+        })
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
-        // A note surface reads its text from the marks.
+        // A note surface reads its text from the marks, and the list its
+        // notes.
         cx.notify();
     }
 }

@@ -368,7 +368,7 @@ class OctoGhApiTest(unittest.IsolatedAsyncioTestCase):
                             "https://github.com/user-attachments/files/1/a.txt?token=1",
                             "https://github.com/user-attachments/files/1/a.txt#x",
                             "https://github.com/user-attachments/other/1/a.txt",
-                            "https://github.com/fedibtc/fedi/files/1/a.txt",
+                            "https://github.com/octocat/hello-world/files/1/a.txt",
                             "/user-attachments/files/1/a.txt",
                         ):
                             with self.subTest(url=url), self.assertRaises(ValueError):

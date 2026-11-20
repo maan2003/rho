@@ -36,7 +36,7 @@ impl Said {
             Address::Agent(from) if from == agent => {
                 Some(Self::Agent(content_text(&message.content)))
             }
-            Address::Agent(_) => None,
+            Address::Agent(_) | Address::System { .. } | Address::StartFailed => None,
         }
     }
 }
@@ -233,11 +233,13 @@ mod tests {
             id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
             parent: Some(MessageId(ChatSeq(2))),
+            reply_to: None,
             from,
             mentions,
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
+            revision: rho_agent_types::Revision::Original,
         }
     }
 

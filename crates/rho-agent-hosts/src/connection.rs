@@ -287,7 +287,8 @@ async fn supervise(
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
-    let mut reconnecting = false;
+    // Since when the host has been away, while it is.
+    let mut dropped: Option<tokio::time::Instant> = None;
     loop {
         if closing() {
             break;
@@ -300,7 +301,7 @@ async fn supervise(
         }
         if connected {
             delay = INITIAL_RECONNECT_DELAY;
-            reconnecting = false;
+            dropped = None;
         }
         // Enrollment already reported its code and waited for approval.
         // Keep that reason visible and do not add reconnect backoff.
@@ -308,19 +309,30 @@ async fn supervise(
             .as_ref()
             .is_err_and(|error| error.is::<EnrollmentPending>())
         {
-            reconnecting = false;
+            dropped = None;
             delay = INITIAL_RECONNECT_DELAY;
             continue;
         }
-        let reason = result
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_else(|| "agent host connection closed".to_owned());
-        if (!reconnecting
+        // The user hears what happened in their words; how the transport
+        // failed is the log's.
+        let detail = match &result {
+            Err(error) => format!("{error:#}"),
+            Ok(()) => "the connection closed".to_owned(),
+        };
+        tracing::warn!(host = %target.describe(), %detail, "agent host connection ended");
+        let reason = match connected {
+            true => "connection lost",
+            false => "cannot reach the host",
+        };
+        let first = dropped.is_none();
+        let since = *dropped.get_or_insert_with(tokio::time::Instant::now);
+        if (first
             && events
-                .unbounded_send(ConnEvent::Disconnected(reason))
+                .unbounded_send(ConnEvent::Disconnected(reason.to_owned()))
                 .is_err())
-            || events.unbounded_send(ConnEvent::Recovering(delay)).is_err()
+            || events
+                .unbounded_send(ConnEvent::Recovering(since.elapsed()))
+                .is_err()
         {
             break;
         }
@@ -336,7 +348,6 @@ async fn supervise(
             _ = closed => break,
         }
         delay = next_reconnect_delay(delay);
-        reconnecting = true;
     }
 }
 

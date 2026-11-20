@@ -5,13 +5,36 @@
 //! model applies these as bounded buffer edits. Keeping this layer pure makes
 //! block rendering testable as plain string assertions.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, ChatSeq, MessageId};
 use rho_agents_client::protocol::transcript::ArgumentsFormat;
-use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
+use rho_agents_client::state::{FailureKind, UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
+
+/// A caption crosses from the agent directory or the mail log into the
+/// transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Label {
+    Agent(AgentId),
+    Write(MessageId, Option<ChatSeq>),
+    Delivery(MessageId),
+}
+
+impl Label {
+    pub(crate) fn for_block(block: &UiBlock) -> Option<Self> {
+        match block {
+            UiBlock::MessageDraft { from, .. } => Some(Self::Agent(*from)),
+            UiBlock::MailWritten { message, version } => Some(Self::Write(*message, *version)),
+            UiBlock::Delivered { message, .. } => Some(Self::Delivery(*message)),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) type Labels = HashMap<Label, String>;
 
 /// The one projection of an agent's blocks: everything it read and did,
 /// in order. Hidden blocks keep their indices so detail requests, lazy
@@ -20,10 +43,10 @@ pub(crate) fn render(
     block: &UiBlock,
     previous: Option<BlockKind>,
     now_ms: u64,
-    label: &impl Fn(AgentId) -> String,
+    label: &impl Fn(Label) -> String,
 ) -> RenderedBlock {
     if block_visible(block) {
-        render_block_with_agent_labels(block, previous, now_ms, label)
+        render_labelled(block, previous, now_ms, label)
     } else {
         invisible(block_kind(block))
     }
@@ -115,7 +138,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. }
         | UiBlock::MessageDraft { .. }
         | UiBlock::Tool(_)
-        | UiBlock::Notice { .. } => BlockKind::Response { working: true },
+        | UiBlock::MailWritten { .. }
+        | UiBlock::Notice { .. }
+        | UiBlock::Failure { .. }
+        | UiBlock::Responded => BlockKind::Response { working: true },
         UiBlock::Status { .. } => BlockKind::QueuedUser,
     }
 }
@@ -127,12 +153,12 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
 /// [`RenderedBlock::visible`] is the same question asked of the spans.
 pub fn block_visible(block: &UiBlock) -> bool {
     match block {
-        UiBlock::Reasoning { .. } => false,
-        UiBlock::Tool(_) => true,
+        UiBlock::Reasoning { .. } | UiBlock::Responded => false,
+        UiBlock::Tool(_) | UiBlock::MailWritten { .. } | UiBlock::Failure { .. } => true,
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageDraft { text, .. }
-        | UiBlock::Notice { text }
+        | UiBlock::Notice { text, .. }
         | UiBlock::Status { text }
         | UiBlock::Delivered { text, .. } => !text.is_empty(),
     }
@@ -230,11 +256,11 @@ fn parse_visualization_attributes(body: &str) -> Option<(String, u32)> {
         .then(|| (id.to_ascii_lowercase(), rows))
 }
 
-pub fn render_block_with_agent_labels(
+fn render_labelled(
     block: &UiBlock,
     prev: Option<BlockKind>,
     now_ms: u64,
-    agent_label: &impl Fn(AgentId) -> String,
+    label: &impl Fn(Label) -> String,
 ) -> RenderedBlock {
     let kind = block_kind(block);
     let mut spans = Vec::new();
@@ -256,13 +282,20 @@ pub fn render_block_with_agent_labels(
         }
         // A chat message handed to the agent reads as the user's words do:
         // it is what the model was given, shown as it was typed.
-        UiBlock::Delivered { text, .. } => {
+        UiBlock::Delivered { message, text } => {
             if text.is_empty() {
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            gutter_span = Some(spans.len());
-            spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+            let (fallback, body) = delivered_mail(text);
+            let header = label(Label::Delivery(*message));
+            if let Some((who, when)) = header.rsplit_once(" · ") {
+                spans.push(Span::new(who, StyleClass::MailSpeaker));
+                spans.push(Span::new(format!(" · {when}\n"), StyleClass::Time));
+            } else if let Some(who) = fallback {
+                spans.push(Span::new(format!("{who}\n"), StyleClass::MailSpeaker));
+            }
+            spans.push(Span::new(format!("{body}\n\n"), StyleClass::Default));
         }
         UiBlock::AssistantMessage { text, .. } => {
             if text.is_empty() {
@@ -318,7 +351,7 @@ pub fn render_block_with_agent_labels(
             }
             spans.extend(separator(prev, kind));
             spans.push(Span::new(
-                format!("{} · writing…\n", agent_label(*from)),
+                format!("{} · writing…\n", label(Label::Agent(*from))),
                 StyleClass::AgentLabel,
             ));
             markdown = true;
@@ -334,16 +367,61 @@ pub fn render_block_with_agent_labels(
             // grammar over it, so it keeps a plain buffer of its own.
             inlay = push_tool_spans(&mut spans, tool, now_ms);
         }
-        UiBlock::Notice { text } => {
+        UiBlock::Responded => return invisible(kind),
+        UiBlock::Notice { text, times } => {
             if text.is_empty() {
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            let mut text = text.clone();
-            if !text.ends_with('\n') {
-                text.push('\n');
+            let mut text = text.trim_end_matches('\n').to_owned();
+            if *times > 1 {
+                text.push_str(&format!(" ×{times}"));
             }
+            text.push('\n');
             spans.push(Span::new(text, StyleClass::SystemInfo));
+        }
+        UiBlock::Failure {
+            kind: failure,
+            text,
+            times,
+            since,
+            ..
+        } => {
+            spans.extend(separator(prev, kind));
+            let cluster = if *times == 1 {
+                String::new()
+            } else {
+                format!(" ×{times}")
+            };
+            let clock = rho_frame::thread::when(since.0 as i64);
+            let summary = match failure {
+                FailureKind::Retrying { runtime } => {
+                    let model = runtime.as_ref().map_or_else(
+                        || "its model".to_owned(),
+                        |label| format!("its model {label}"),
+                    );
+                    let problem =
+                        if text.contains("connecting to ") || text.contains("Connection refused") {
+                            format!("can't reach {model}")
+                        } else {
+                            format!("{model} did not answer")
+                        };
+                    format!("{problem} · retrying{cluster} · since {clock}")
+                }
+                FailureKind::Stopped => {
+                    format!("failed: {}{cluster} · since {clock}", preview(text))
+                }
+            };
+            spans.push(Span::new(format!("{summary}\n"), StyleClass::StatusError));
+        }
+        UiBlock::MailWritten { message, version } => {
+            let words = label(Label::Write(*message, *version));
+            let line = if words.is_empty() {
+                "wrote mail"
+            } else {
+                &words
+            };
+            spans.push(Span::new(format!("{line}\n"), StyleClass::SystemInfo));
         }
         UiBlock::Status { text } => {
             if text.is_empty() {
@@ -363,6 +441,43 @@ pub fn render_block_with_agent_labels(
         visualizations,
         table_padding: Vec::new(),
     }
+}
+
+/// Strip the model's envelope, not mail text. The visible header comes
+/// from the same mail owner as the thread. The fallbacks cover old copies
+/// without a corresponding mail record.
+fn delivered_mail(text: &str) -> (Option<&str>, &str) {
+    fn numbered(header: &str) -> bool {
+        header
+            .strip_prefix("[#")
+            .and_then(|head| head.strip_suffix(']'))
+            .and_then(|head| head.split_once(' '))
+            .is_some_and(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    }
+    let Some((head, body)) = text.split_once('\n') else {
+        return (None, text);
+    };
+    if let Some((where_, sender)) = head.split_once(" Mail from ")
+        && numbered(where_)
+        && let Some(sender) = sender.strip_suffix(':')
+    {
+        return (
+            Some(if sender == "the user" { "you" } else { sender }),
+            body,
+        );
+    }
+    if let Some(sender) = head
+        .strip_prefix("[message from ")
+        .and_then(|head| head.strip_suffix(']'))
+        && let Some((body, where_)) = body.rsplit_once("\n\n")
+        && let Some((where_, id)) = where_.split_once(" · mail #")
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && numbered(where_)
+    {
+        return (Some(sender), body);
+    }
+    (None, text)
 }
 
 fn spans_len(spans: &[Span]) -> usize {
@@ -499,9 +614,10 @@ fn next_tab_stop(column: usize) -> usize {
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<InlaySpec> {
-    let (label, class) = tool_label(&tool.name, &tool.arguments, tool.format);
+    let (source, class) = tool_label(&tool.name, &tool.arguments, tool.format);
+    let label = tool_heading(tool, &source);
     spans.push(Span::new(label, class));
-    spans.push(Span::new(" ", StyleClass::ToolDetail));
+    spans.push(Span::new(" · ", StyleClass::ToolDetail));
     let status = tool_status_label(tool.status);
     spans.push(Span::new(status, tool_status_class(tool.status)));
 
@@ -521,12 +637,8 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
         for (label, start, end) in phases {
             let Some(start) = start else { continue };
             if let Some(end) = end {
-                let millis = end.0.saturating_sub(start.0);
-                let value = if millis < 1000 {
-                    format!("{millis}ms")
-                } else {
-                    format_tool_duration(Duration::from_millis(millis))
-                };
+                let value =
+                    format_tool_duration(Duration::from_millis(end.0.saturating_sub(start.0)));
                 spans.push(Span::new(format!(" {label} {value}"), StyleClass::Time));
             } else if timing.handed_off_at.is_none() && tool.status == UiToolStatus::Running {
                 spans.push(Span::new(format!(" {label}"), StyleClass::Time));
@@ -560,7 +672,286 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     if !spans.last().is_some_and(|span| span.text.ends_with('\n')) {
         spans.push(Span::new("\n", StyleClass::Default));
     }
+    if let Some(detail) = tool_detail(tool, &source) {
+        spans.push(Span::new(detail, StyleClass::Default));
+        spans.push(Span::new("\n", StyleClass::Default));
+    }
     timer
+}
+
+fn mail_preview(source: &str) -> Option<String> {
+    // This is a preview of a literal, not an interpretation of Python.
+    // Do not speculate about dynamic recipients or bodies.
+    let args = source.trim_start().strip_prefix("mail.send(")?.trim_start();
+    let body = args
+        .strip_prefix("\"user\"")
+        .or_else(|| args.strip_prefix("'user'"))?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start();
+    literal_argument(body)
+}
+
+fn literal_argument(body: &str) -> Option<String> {
+    let quote = body.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let end = body[1..]
+        .char_indices()
+        .scan(false, |escape, (at, c)| {
+            let terminator = !*escape && c == quote;
+            *escape = !*escape && c == '\\';
+            Some(terminator.then_some(at + 2))
+        })
+        .flatten()
+        .next()?;
+    if !body[end..].trim_start().starts_with([',', ')']) {
+        return None;
+    }
+    let literal = &body[..end];
+    if quote == '"' {
+        serde_json::from_str::<String>(literal).ok()
+    } else {
+        Some(
+            literal[1..literal.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\n", "\n"),
+        )
+    }
+}
+
+fn python_shell_command(source: &str) -> Option<String> {
+    let source = source.trim_start();
+    let args = source
+        .strip_prefix("await command(")
+        .or_else(|| source.strip_prefix("command("))?;
+    literal_argument(args.trim_start())
+}
+
+fn status_preview(source: &str) -> Option<String> {
+    let args = source.trim_start().strip_prefix("mail.status(")?;
+    let (thread, text) = args.split_once(',')?;
+    // If it is an expression rather than a bare id, the first comma may
+    // belong to that expression. Use the general caption in that case.
+    if !thread
+        .trim()
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b"#_'\"".contains(&c))
+    {
+        return None;
+    }
+    literal_argument(text.trim_start())
+}
+
+// When the recipient, status or body is computed, the transcript can
+// still say which mail action ran without exposing its machine arguments.
+fn mail_operation(source: &str) -> Option<&'static str> {
+    let source = source.trim_start();
+    [
+        ("mail.status(", "set thread status"),
+        ("mail.send(", "send mail"),
+        ("mail.edit(", "edit mail"),
+        ("mail.delete(", "delete mail"),
+        ("mail.read(", "read mail"),
+        ("mail.roots(", "list projects"),
+        ("mail.search(", "search mail"),
+        ("mail.fork(", "start a tangent"),
+        ("mail.start(", "start a thread"),
+        ("mail.join(", "follow a thread"),
+        ("mail.leave(", "leave a thread"),
+        ("mail.name(", "name a thread"),
+        ("mail.move(", "move mail"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, words)| source.starts_with(prefix).then_some(words))
+}
+
+fn tool_heading(tool: &UiTool, source: &str) -> String {
+    let native = matches!(tool.name.as_str(), "exec" | "mcp__py__exec");
+    if native && let Some(mail) = mail_preview(source) {
+        let verb = match tool.status {
+            UiToolStatus::Error | UiToolStatus::Cancelled => Some("tried to write to you"),
+            UiToolStatus::Running => Some("writing to you"),
+            _ => None, // Only the mail log says what was actually written.
+        };
+        if let Some(verb) = verb {
+            return format!("{verb}: {}", preview(&mail));
+        }
+    }
+    if native && let Some(status) = status_preview(source) {
+        return if status.is_empty() {
+            "cleared the status".to_owned()
+        } else {
+            format!("set status \"{}\"", preview(&status))
+        };
+    }
+    if native && let Some(action) = mail_operation(source) {
+        return action.to_owned();
+    }
+    if native && let Some(shell) = python_shell_command(source) {
+        return format!("$ {}", preview(&shell));
+    }
+    if native && source.trim() == "end_turn()" {
+        return "ended the turn".into();
+    }
+    if native {
+        return format!("ran code: {}", preview(source));
+    }
+    preview(source)
+}
+
+pub(crate) fn preview(text: &str) -> String {
+    let mut lines = text.trim().lines();
+    let line = lines.next().unwrap_or_default();
+    let mut result = line.chars().take(100).collect::<String>();
+    if result.len() < line.len() || lines.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+fn tool_detail(tool: &UiTool, source: &str) -> Option<String> {
+    let mut detail = Vec::new();
+    if matches!(tool.name.as_str(), "exec" | "mcp__py__exec")
+        && let Some(mail) = mail_preview(source)
+        && preview(&mail) != mail
+    {
+        detail.push(mail);
+    } else if let Some(shell) = python_shell_command(source) {
+        if preview(&shell) != shell {
+            detail.push(shell);
+        }
+    } else if (source.contains('\n') || source.chars().count() > 100)
+        && mail_preview(source).is_none()
+        && mail_operation(source).is_none()
+    {
+        detail.push(source.to_owned());
+    }
+    if let Some(output) = tool.output.as_deref().or(tool.error.as_deref()) {
+        let output = output.trim_end();
+        detail.push(if mail_operation(source).is_some() {
+            output
+                .lines()
+                .map(|line| mail_output_line(source, line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            output.to_owned()
+        });
+    } else if tool.status == UiToolStatus::Error {
+        detail.push("the host recorded no output".into());
+    }
+    (!detail.is_empty()).then(|| {
+        detail
+            .join("\n")
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn unnumber(text: &str) -> Option<&str> {
+    let (key, text) = text.strip_prefix('#')?.split_once(' ')?;
+    number(key).then_some(text)
+}
+
+/// A few mail tools print a listing by putting numbers in front of each
+/// result. Keep the subject, writer, and excerpt instead of that notation.
+fn mail_output_line(source: &str, line: &str) -> String {
+    let source = source.trim_start();
+    if source.starts_with("mail.search(")
+        && let Some((subject, result)) =
+            unnumber(line).and_then(|line| line.split_once(" · mail #"))
+        && let Some((id, excerpt)) = result.split_once(" · ")
+        && number(id)
+    {
+        return format!("{subject} · {excerpt}");
+    }
+    if source.starts_with("mail.roots(") {
+        return unnumber(line).unwrap_or(line).to_owned();
+    }
+    if source.starts_with("mail.read(") {
+        if let Some(subject) = line
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(unnumber)
+        {
+            return subject.to_owned();
+        }
+        let line_without_arrow = line.strip_prefix("→ ").unwrap_or(line);
+        if let Some((writer, body)) =
+            unnumber(line_without_arrow).and_then(|line| line.split_once(": "))
+        {
+            let writer = match writer.rsplit_once(" (reply to #") {
+                Some((writer, tail)) if tail.strip_suffix(')').is_some_and(number) => writer,
+                _ => writer,
+            };
+            let label = writer.strip_suffix(" (edited)").unwrap_or(writer);
+            if label == "user"
+                || label == "system"
+                || label.starts_with("eng-")
+                || label.starts_with("adv-")
+            {
+                let writer = writer.replacen("user", "you", usize::from(label == "user"));
+                let marker = if line_without_arrow == line {
+                    ""
+                } else {
+                    "→ "
+                };
+                return format!("{marker}{writer}: {body}");
+            }
+        }
+    }
+    mail_receipt(line).to_owned()
+}
+
+// These fixed receipts are useful to the model with their machine ids,
+// but in the transcript the writing step already points to the actual mail.
+fn mail_receipt(line: &str) -> &str {
+    for (prefix, words) in [
+        ("Sent mail #", "Sent mail."),
+        ("Started #", "Started the thread."),
+        ("Joined #", "Followed the thread."),
+        ("Left #", "Left the thread."),
+        ("Named #", "Named the thread."),
+    ] {
+        if let Some(number) = line
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('.'))
+            && self::number(number)
+        {
+            return words;
+        }
+    }
+    if let Some((message, thread)) = line
+        .strip_prefix("Moved #")
+        .and_then(|rest| rest.strip_suffix('.'))
+        .and_then(|rest| rest.split_once(" to #"))
+        && number(message)
+        && number(thread)
+    {
+        return "Moved the mail.";
+    }
+    if let Some((number, advice)) = line
+        .strip_prefix("Mail #")
+        .and_then(|rest| rest.split_once(" has no user reply. If it is still live, "))
+        && self::number(number)
+    {
+        if advice == "ask its writer to use `mail.edit` for updates." {
+            return "Earlier mail is unanswered. If it is still live, ask its writer to update it.";
+        }
+        if advice
+            .strip_prefix("use `mail.edit(")
+            .and_then(|rest| rest.strip_suffix(", ...)` for updates."))
+            == Some(number)
+        {
+            return "Earlier mail is unanswered. If it is still live, update it instead.";
+        }
+    }
+    line
 }
 
 fn tool_status_label(status: UiToolStatus) -> &'static str {
@@ -585,19 +976,27 @@ fn tool_status_class(status: UiToolStatus) -> StyleClass {
     }
 }
 
+/// How long a call ran, or has run while it still runs: a running one
+/// counts only once it reaches a second, a finished one says even a moment.
 pub fn tool_duration_at(tool: &UiTool, now_ms: u64) -> Option<Duration> {
     let started_at = tool.started_at?.0;
-    let finished_at = tool
-        .finished_at
-        .map(|finished_at| finished_at.0)
-        .or_else(|| (tool.status == UiToolStatus::Running).then_some(now_ms))?;
-    let duration = Duration::from_millis(finished_at.saturating_sub(started_at));
-    (Duration::from_secs(1) <= duration).then_some(duration)
+    match tool.finished_at {
+        Some(finished_at) => Some(Duration::from_millis(
+            finished_at.0.saturating_sub(started_at),
+        )),
+        None => {
+            let duration = Duration::from_millis(now_ms.saturating_sub(started_at));
+            (tool.status == UiToolStatus::Running && Duration::from_secs(1) <= duration)
+                .then_some(duration)
+        }
+    }
 }
 
 pub fn format_tool_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    if seconds < 60 {
+    if seconds == 0 {
+        format!("{}ms", duration.as_millis())
+    } else if seconds < 60 {
         format!("{seconds}s")
     } else {
         format!("{}m{}s", seconds / 60, seconds % 60)
@@ -938,17 +1337,24 @@ mod tests {
     }
 
     #[test]
-    fn a_host_draft_and_its_source_both_show() {
+    fn a_host_draft_and_its_step_both_show_in_user_words() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
-        exec.arguments = "chat.post(2, 'Hello')".into();
+        exec.arguments = "mail.send('user', 'Hello', thread=2, kind='fyi')".into();
         let source = UiBlock::Tool(exec);
         let writer = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let draft = UiBlock::MessageDraft {
             from: writer,
             text: "Hello".into(),
         };
-        let label = |agent: AgentId| if agent == writer { "Ann" } else { "Bob" }.to_owned();
+        let label = |name: Label| {
+            if name == Label::Agent(writer) {
+                "Ann"
+            } else {
+                "Bob"
+            }
+            .to_owned()
+        };
         assert!(block_visible(&source));
         assert!(block_visible(&draft));
         let drafted = render(&draft, None, 0, &label);
@@ -957,8 +1363,189 @@ mod tests {
         assert_eq!(drafted.spans[0].class, StyleClass::AgentLabel);
         assert_eq!(drafted.spans[1].class, StyleClass::Default);
         let sourced = render(&source, None, 0, &label);
-        assert!(text_of(&sourced.spans).contains("chat.post(2, 'Hello')"));
-        assert!(!text_of(&sourced.spans).contains("writing"));
+        assert_eq!(text_of(&sourced.spans), "writing to you: Hello · …\n");
+    }
+
+    #[test]
+    fn delivered_mail_uses_a_message_header_and_keeps_the_users_words() {
+        let message = MessageId(rho_agent_types::ChatSeq(31));
+        let block = UiBlock::Delivered {
+            message,
+            text:
+                "[#219 tide › Check the delayed timer] Mail from the user:\nSearch #31 in my tests."
+                    .into(),
+        };
+        let shown = render(&block, None, 0, &|label| {
+            assert_eq!(label, Label::Delivery(message));
+            "you · 12:22".into()
+        });
+        assert_eq!(
+            text_of(&shown.spans),
+            "you · 12:22\nSearch #31 in my tests.\n\n"
+        );
+        assert_eq!(shown.spans[0].class, StyleClass::MailSpeaker);
+        assert_eq!(shown.spans[1].class, StyleClass::Time);
+        assert_eq!(shown.spans[2].class, StyleClass::Default);
+        assert_eq!(
+            delivered_mail(
+                "[message from eng-source]\nTiming note\n\n[#31 tide › Slow clock] · mail #46"
+            ),
+            (Some("eng-source"), "Timing note")
+        );
+        assert_eq!(
+            delivered_mail("[#12] is my code's literal\nkeep it"),
+            (None, "[#12] is my code's literal\nkeep it")
+        );
+    }
+
+    #[test]
+    fn a_write_keeps_its_point_but_displays_words_not_its_key() {
+        let id = MessageId(rho_agent_types::ChatSeq(97));
+        let version = Some(ChatSeq(213));
+        let block = UiBlock::MailWritten {
+            message: id,
+            version,
+        };
+        let render_words = |label| match label {
+            Label::Write(id_, version_) if (id_, version_) == (id, version) => {
+                "wrote to you: Run the slower clock test.".into()
+            }
+            _ => panic!("the writing point has a different identity"),
+        };
+        assert_eq!(
+            text_of(&render(&block, None, 0, &render_words).spans),
+            "wrote to you: Run the slower clock test.\n"
+        );
+        assert_eq!(
+            text_of(&render(&block, None, 0, &|_| String::new()).spans),
+            "wrote mail\n"
+        );
+    }
+
+    #[test]
+    fn a_status_step_describes_the_action_without_printing_machine_arguments() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.name = "exec".into();
+        exec.format = ArgumentsFormat::Text;
+        exec.arguments = "mail.status(273, 'Waiting for clarification')\nend_turn()".into();
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &exec, 300);
+        assert_eq!(
+            text_of(&spans),
+            "set status \"Waiting for clarification\" · ok\n"
+        );
+
+        exec.arguments = "mail.status(pick_thread(a, b), pending_status)\nend_turn()".into();
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &exec, 300);
+        assert_eq!(text_of(&spans), "set thread status · ok\n");
+    }
+
+    #[test]
+    fn mail_receipts_leave_out_machine_keys_and_keep_other_output() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.name = "exec".into();
+        exec.format = ArgumentsFormat::Text;
+        exec.arguments = "mail.status(273, 'waiting')\nmail.send('user', reply)".into();
+        exec.output = Some(concat!(
+            "Sent mail #897.\n",
+            "Mail #273 has no user reply. If it is still live, use `mail.edit(273, ...)` for updates.\n",
+            "Check #273 in my tests."
+        ).into());
+        let source = exec.arguments.as_str();
+        assert_eq!(
+            tool_detail(&exec, source).as_deref(),
+            Some(concat!(
+                "  Sent mail.\n",
+                "  Earlier mail is unanswered. If it is still live, update it instead.\n",
+                "  Check #273 in my tests."
+            ))
+        );
+        assert_eq!(
+            mail_receipt(
+                "Mail #16 has no user reply. If it is still live, ask its writer to use `mail.edit` for updates."
+            ),
+            "Earlier mail is unanswered. If it is still live, ask its writer to update it."
+        );
+        assert_eq!(mail_receipt("Moved #976 to #2."), "Moved the mail.");
+        assert_eq!(mail_receipt("Sent mail #unknown."), "Sent mail #unknown.");
+    }
+
+    #[test]
+    fn structured_mail_search_keeps_subjects_and_excerpts_not_tool_keys() {
+        assert_eq!(
+            mail_output_line(
+                "mail.search('race')",
+                "#14 Race on clock · mail #77 · Check #31 in the fixture"
+            ),
+            "Race on clock · Check #31 in the fixture"
+        );
+        assert_eq!(
+            mail_output_line(
+                "mail.read(14)",
+                "→ #77 user (reply to #97): Keep #31 in the test"
+            ),
+            "→ you: Keep #31 in the test"
+        );
+        assert_eq!(
+            mail_output_line("mail.read(14)", "#31 in the human continuation"),
+            "#31 in the human continuation"
+        );
+    }
+
+    #[test]
+    fn retry_noise_uses_the_runtime_and_the_start_of_the_streak() {
+        use rho_agent_types::UnixMs;
+        let time = chrono::Local::now().timestamp_millis() as u64;
+        let retry = UiBlock::Failure {
+            kind: FailureKind::Retrying {
+                runtime: Some("sol-low".into()),
+            },
+            text:
+                "connecting to the Responses endpoint: IO error: Connection refused (os error 111)"
+                    .into(),
+            times: 12,
+            since: UnixMs(time - 300_000),
+            at: UnixMs(time),
+        };
+        let original_clock = rho_frame::thread::when((time - 300_000) as i64);
+        let shown = render(&retry, None, time, &|_| String::new());
+        assert_eq!(
+            text_of(&shown.spans),
+            format!("can't reach its model sol-low · retrying ×12 · since {original_clock}\n"),
+        );
+        assert_eq!(shown.spans[0].class, StyleClass::StatusError);
+    }
+
+    #[test]
+    fn a_literal_notebook_shell_command_reads_as_a_shell_prompt() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.name = "exec".into();
+        exec.format = ArgumentsFormat::Text;
+        exec.arguments = r#"await command("printf '%s' \"the clock\"")"#.into();
+        exec.output = Some("the clock".into());
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &exec, 3_500);
+        assert_eq!(
+            text_of(&spans),
+            "$ printf '%s' \"the clock\" · ok\n  the clock\n"
+        );
+        assert_eq!(
+            python_shell_command("await command('test ' + filename)"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_command_keeps_its_output_with_its_heading() {
+        let mut failed = tool(UiToolStatus::Error);
+        failed.output = Some("500 samples\nFAIL: clock jumped backward\n".to_owned());
+        let mut spans = Vec::new();
+        push_tool_spans(&mut spans, &failed, 7_000);
+        assert_eq!(
+            text_of(&spans),
+            "$ echo ok · error\n  500 samples\n  FAIL: clock jumped backward\n"
+        );
     }
 
     #[test]
@@ -967,7 +1554,7 @@ mod tests {
         reported.started_at = Some(UnixMs(1_000));
         let mut spans = Vec::new();
         assert_eq!(push_tool_spans(&mut spans, &reported, 10_000), None);
-        assert_eq!(text_of(&spans), "$ echo ok reported\n");
+        assert_eq!(text_of(&spans), "$ echo ok · reported\n");
     }
 
     #[test]
@@ -978,11 +1565,11 @@ mod tests {
         let mut spans = Vec::new();
         let timer = push_tool_spans(&mut spans, &finished, 10_000);
         assert_eq!(timer, None);
-        assert_eq!(text_of(&spans), "$ echo ok ok 2s\n");
+        assert_eq!(text_of(&spans), "$ echo ok · ok 2s\n");
     }
 
     #[test]
-    fn tool_duration_suppresses_subsecond_values() {
+    fn a_running_tool_counts_from_a_second_and_a_finished_one_says_a_moment() {
         let mut running = tool(UiToolStatus::Running);
         running.started_at = Some(UnixMs(1_000));
         assert_eq!(tool_duration_at(&running, 1_999), None);
@@ -991,10 +1578,15 @@ mod tests {
             Some(Duration::from_secs(1))
         );
 
-        let mut finished = tool(UiToolStatus::Success);
+        let mut finished = tool(UiToolStatus::Error);
         finished.started_at = Some(UnixMs(1_000));
-        finished.finished_at = Some(UnixMs(1_999));
-        assert_eq!(tool_duration_at(&finished, 10_000), None);
+        finished.finished_at = Some(UnixMs(1_240));
+        let mut spans = Vec::new();
+        assert_eq!(push_tool_spans(&mut spans, &finished, 10_000), None);
+        assert_eq!(
+            text_of(&spans),
+            "$ echo ok · error 240ms\n  the host recorded no output\n"
+        );
     }
 
     #[test]
@@ -1005,7 +1597,7 @@ mod tests {
         let timer = push_tool_spans(&mut spans, &running, 3_500);
         let timer = timer.expect("running tool with start time should have a timer");
         assert_eq!(spans[timer.span_index].text, "");
-        assert_eq!(text_of(&spans), "$ echo ok …\n");
+        assert_eq!(text_of(&spans), "$ echo ok · …\n");
     }
 
     #[test]
@@ -1057,9 +1649,11 @@ mod tests {
             UiBlock::Tool(tool(UiToolStatus::Running)),
             UiBlock::Notice {
                 text: "notice".to_owned(),
+                times: 1,
             },
             UiBlock::Notice {
                 text: String::new(),
+                times: 1,
             },
             UiBlock::Delivered {
                 message: rho_agent_types::MessageId(rho_agent_types::ChatSeq(1)),
@@ -1071,7 +1665,7 @@ mod tests {
             },
         ];
         for block in blocks {
-            let rendered = render_block_with_agent_labels(&block, None, 0, &|_| "a".to_owned());
+            let rendered = render_labelled(&block, None, 0, &|_| "a".to_owned());
             assert_eq!(
                 block_visible(&block),
                 rendered.visible(),
@@ -1079,6 +1673,18 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_notice_said_again_reads_once_with_its_count() {
+        let notice = |times| UiBlock::Notice {
+            text: "The server is overloaded".to_owned(),
+            times,
+        };
+        let text =
+            |block: &UiBlock| text_of(&render_labelled(block, None, 0, &|_| "a".to_owned()).spans);
+        assert_eq!(text(&notice(1)), "The server is overloaded\n");
+        assert_eq!(text(&notice(3)), "The server is overloaded ×3\n");
+    }
+
     #[test]
     fn exec_timing_names_provider_phases_not_python_duration() {
         let mut exec = tool(UiToolStatus::Success);

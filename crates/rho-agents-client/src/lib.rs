@@ -5,7 +5,7 @@
 //! every step of that: the host frames that carry it, the fold on its own
 //! thread ([`model`]) and the disk copy ([`cache`]). What crosses out is
 //! agents as they now stand; nothing above needs to know there is a fold
-//! underneath. Chat is not here: it is `rho-chat`'s, and a transcript names
+//! underneath. Mail is not here: it is `rho-mail`'s, and a transcript names
 //! the messages it was handed by id. Nothing here draws: the screens are
 //! `rho-agents-view`'s.
 //!
@@ -50,7 +50,7 @@ pub use find::AgentHit;
 #[cfg(feature = "client")]
 pub use fold::{AgentIdentity, MirroredAgent, TranscriptFold, transcript};
 #[cfg(feature = "client")]
-pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};
+pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap, Heard};
 #[cfg(feature = "client")]
 pub use rho_agent_hosts::HostId;
 

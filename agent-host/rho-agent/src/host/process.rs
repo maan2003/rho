@@ -360,12 +360,16 @@ impl Process {
         // gets the process before init.py ended well.
         let failure = match tokio::time::timeout(INIT_TIMEOUT, init).await {
             Ok(Ok(None)) => return Ok(process),
-            Ok(Ok(Some(error))) => format!("init.py failed:\n{error}"),
-            Ok(Err(_)) => "the workset process ended before init.py did".to_owned(),
-            Err(_) => format!("init.py did not end within {}s", INIT_TIMEOUT.as_secs()),
+            Ok(Ok(Some(error))) => format!("the host's init.py failed:\n{error}"),
+            Ok(Err(_)) => "the workset's process ended while it started".to_owned(),
+            Err(_) => format!(
+                "the host's init.py did not end within {}s",
+                INIT_TIMEOUT.as_secs()
+            ),
         };
         process.shutdown().await;
-        anyhow::bail!("{failure}; no agent of the workset starts")
+        // Said to whoever asked for an agent, after `agent did not start:`.
+        anyhow::bail!("{failure}")
     }
 
     /// Takes over a workset process from the agent host this one re-executed.
@@ -684,9 +688,12 @@ impl Process {
     }
 }
 
-/// The worker this agent host starts: the one beside its own executable, as
-/// installed, or else the one on `PATH`.
+/// The worker this agent host starts: the one `RHO_AGENT_WORKER` names, else
+/// the one beside its own executable, as installed, or else the one on `PATH`.
 fn worker_program() -> std::io::Result<std::path::PathBuf> {
+    if let Some(program) = std::env::var_os("RHO_AGENT_WORKER") {
+        return Ok(program.into());
+    }
     let sibling = std::env::current_exe()?.with_file_name("rho-agent-worker");
     Ok(if sibling.is_file() {
         sibling

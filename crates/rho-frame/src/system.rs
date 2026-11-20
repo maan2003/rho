@@ -2,9 +2,9 @@
 //!
 //! A system owns a few kinds of address and everything about them: the
 //! surfaces that open them, the rows a menu offers over them, what of
-//! them wants the user, the rooms Home lists, what `find` finds, and the
-//! streams it keeps to each host. The frame holds systems as a list and asks
-//! each in turn; a system never names another.
+//! them wants the user, the status changes the desk lists, what `find` finds,
+//! and the streams it keeps to each host. The frame holds systems as a list and
+//! asks each in turn; a system never names another.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -17,42 +17,32 @@ use rho_agent_types::EndpointId;
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
+use url::Url;
 
-use crate::attention::Verdict;
+use crate::desk::MovingThread;
 use crate::frame::Point;
+use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
-/// One room: a root the user can read, as the system that holds it lists
-/// it on Home. Home orders the rooms by attention: a room with a card in
-/// the hand goes by that card, the rest by what waits in them and when
-/// they last moved.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoomRow {
-    pub address: Address,
-    pub name: String,
-    /// Where it is: a host's name, a Slack workspace, `private`.
-    pub tag: String,
-    /// What waits in it, in the system's words (`3 unread · 2h`); empty
-    /// when nothing does.
-    pub waiting: String,
-    /// When it last moved, in unix milliseconds; zero when nothing says.
-    pub at: u64,
-}
-
-/// Something `find` can open.
+/// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub address: Address,
     pub title: String,
     pub description: String,
-    /// When it last moved, for ordering; zero when nothing says.
+    /// A thread and its current status (if any), shown before its project
+    /// address.
+    pub thread: Option<FoundThread>,
+    /// When it last moved, for ordering unvisited places; zero when nothing
+    /// says.
     pub recency: u64,
 }
 
-/// What takes back the side of a verdict a system did outside the ledger:
-/// Slack's own cursor moved back, a unit unmuted there.
-pub type Reversal = Box<dyn FnOnce(&mut App)>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundThread {
+    pub status: Option<String>,
+}
 
 pub trait System: Sized + 'static {
     /// The address kinds this system opens.
@@ -66,6 +56,10 @@ pub trait System: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface>;
+
+    /// The foreground surface, independent of where an overlay takes keys.
+    /// `None` means that the window is inactive.
+    fn active_surface(&mut self, _address: Option<&Address>, _cx: &mut Context<Self>) {}
 
     /// The streams this system keeps to a host, opened on every connect.
     /// `name` is what the user calls the host, `endpoint` its identity as
@@ -99,9 +93,22 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    /// Opens a web link the user chose in a message, when this system is
+    /// the one that shows the web; `false` leaves it to the next.
+    fn open_link(&mut self, _url: &Url, _cx: &mut Context<Self>) -> bool {
+        false
+    }
+
     /// What an address of this system is called and where it is, for a
-    /// card no claim named.
-    fn name(&self, _address: &Address, _cx: &App) -> Option<(String, String)> {
+    /// card no claim named. `marks` are the frame's, which a system cannot
+    /// read for itself while the frame draws.
+    fn name(&self, _address: &Address, _marks: &Marks, _cx: &App) -> Option<(String, String)> {
+        None
+    }
+
+    /// The screen that shows `address` as one of its lines, when the
+    /// system has one: a message, the thread it is read in.
+    fn shown_in(&self, _address: &Address, _cx: &App) -> Option<Address> {
         None
     }
 
@@ -111,15 +118,38 @@ pub trait System: Sized + 'static {
         Seen::Whole
     }
 
-    /// The rooms this system has, given what the user has said about its
-    /// things: every root they can read.
-    fn rooms(&self, _marks: &Marks, _cx: &App) -> Vec<RoomRow> {
+    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
         Vec::new()
     }
 
-    /// Everything the system has that `find` lists by title, given what
-    /// the user has said about its things; notes live in the marks
-    /// alone. Asked with the frame busy, so the marks are handed in.
+    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
+        Vec::new()
+    }
+
+    fn idea_project(&self, _address: &Address, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn idea_project_hosts(&self, _cx: &App) -> Vec<(EndpointId, String)> {
+        Vec::new()
+    }
+
+    fn create_idea_project(
+        &mut self,
+        _project: NewIdeaProject,
+        _created: ProjectCreated,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
+
+    /// Every place of the system's that the palette lists by title. The
+    /// frame joins them with the current hand and visit history.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         Vec::new()
     }
@@ -128,29 +158,12 @@ pub trait System: Sized + 'static {
     /// from another. Asked with the frame busy: a system reads the marks
     /// afterwards, through [`crate::FrameLink::read`].
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, _cx: &mut Context<Self>) {}
-
-    /// Whether this system holds a mute of the address itself, where the
-    /// user can lift it too: the ledger then only settles it, so a mute
-    /// lifted there is lifted here.
-    fn mutes_itself(&self, _address: &Address) -> bool {
-        false
-    }
-
-    /// The user said this about one of the system's addresses; what the
-    /// system does about it outside the ledger, and how to take that back.
-    fn said(
-        &mut self,
-        _address: &Address,
-        _verdict: &Verdict,
-        _cx: &mut Context<Self>,
-    ) -> Option<Reversal> {
-        None
-    }
 }
 
 trait SystemHandle {
     fn kinds(&self, cx: &App) -> &'static [&'static str];
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface>;
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App);
     fn streams(
         &self,
         host: HostId,
@@ -168,13 +181,25 @@ trait SystemHandle {
         trace: Option<&mut Trace>,
         cx: &App,
     ) -> Vec<Claim>;
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)>;
+    fn open_link(&self, url: &Url, cx: &mut App) -> bool;
+    fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
+    fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
-    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread>;
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject>;
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject>;
+
+    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)>;
+    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App);
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App);
+
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
-    fn mutes_itself(&self, address: &Address, cx: &App) -> bool;
-    fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal>;
 }
 
 impl<S: System> SystemHandle for Entity<S> {
@@ -184,6 +209,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.update(cx, |system, cx| system.open(address, window, cx))
+    }
+
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.update(cx, |system, cx| system.active_surface(address, cx));
     }
 
     fn streams(
@@ -217,16 +246,50 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).claims(marks, now, trace, cx)
     }
 
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
-        self.read(cx).name(address, cx)
+    fn open_link(&self, url: &Url, cx: &mut App) -> bool {
+        self.update(cx, |system, cx| system.open_link(url, cx))
+    }
+
+    fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
+        self.read(cx).name(address, marks, cx)
+    }
+
+    fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
+        self.read(cx).shown_in(address, cx)
     }
 
     fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.read(cx).seen(address, cx)
     }
 
-    fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
-        self.read(cx).rooms(marks, cx)
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.read(cx).moving_threads(cx)
+    }
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.read(cx).idea_projects(cx)
+    }
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).idea_project(address, cx)
+    }
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).last_idea_project(cx)
+    }
+
+    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
+        self.read(cx).idea_project_hosts(cx)
+    }
+
+    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App) {
+        self.update(cx, |system, cx| {
+            system.create_idea_project(project, created, cx)
+        })
+    }
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.update(cx, |system, cx| system.send_idea(mail, cx))
     }
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -235,14 +298,6 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.update(cx, |system, cx| system.marks_moved(touched, cx))
-    }
-
-    fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
-        self.read(cx).mutes_itself(address)
-    }
-
-    fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
-        self.update(cx, |system, cx| system.said(address, verdict, cx))
     }
 }
 
@@ -261,6 +316,10 @@ impl AnySystem {
 
     pub fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.0.open(address, window, cx)
+    }
+
+    pub(crate) fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.0.active_surface(address, cx);
     }
 
     pub fn streams(
@@ -292,16 +351,53 @@ impl AnySystem {
         self.0.claims(marks, now, trace, cx)
     }
 
-    pub fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
-        self.0.name(address, cx)
+    pub fn open_link(&self, url: &Url, cx: &mut App) -> bool {
+        self.0.open_link(url, cx)
+    }
+
+    pub fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
+        self.0.name(address, marks, cx)
+    }
+
+    pub fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
+        self.0.shown_in(address, cx)
     }
 
     pub fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.0.seen(address, cx)
     }
 
-    pub fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
-        self.0.rooms(marks, cx)
+    pub(crate) fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.0.moving_threads(cx)
+    }
+
+    pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.0.idea_projects(cx)
+    }
+
+    pub(crate) fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.0.idea_project(address, cx)
+    }
+
+    pub(crate) fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.0.last_idea_project(cx)
+    }
+
+    pub(crate) fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
+        self.0.idea_project_hosts(cx)
+    }
+
+    pub(crate) fn create_idea_project(
+        &self,
+        project: NewIdeaProject,
+        created: ProjectCreated,
+        cx: &mut App,
+    ) {
+        self.0.create_idea_project(project, created, cx)
+    }
+
+    pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.0.send_idea(mail, cx)
     }
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -310,13 +406,5 @@ impl AnySystem {
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
         self.0.marks_moved(touched, cx)
-    }
-
-    pub fn mutes_itself(&self, address: &Address, cx: &App) -> bool {
-        self.0.mutes_itself(address, cx)
-    }
-
-    pub fn said(&self, address: &Address, verdict: &Verdict, cx: &mut App) -> Option<Reversal> {
-        self.0.said(address, verdict, cx)
     }
 }

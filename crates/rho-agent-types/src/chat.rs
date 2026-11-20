@@ -16,7 +16,7 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::{AgentId, ContentPart, UnixMs};
+use crate::{AgentId, ContentPart, Stop, UnixMs};
 
 /// A position in a host's chat log: dense from one, never reused. Zero is
 /// "before any event".
@@ -47,6 +47,14 @@ pub struct MessageId(pub ChatSeq);
 pub enum Address {
     User,
     Agent(AgentId),
+    /// The host's bot. The stop identity survives even if its agent is deleted.
+    System {
+        agent: AgentId,
+        stop: Stop,
+        since: UnixMs,
+    },
+    /// A start declined before there was an agent to own the stop.
+    StartFailed,
 }
 
 /// What a mention asks of the one it names. A mention of the user is how
@@ -59,6 +67,8 @@ pub enum MentionKind {
     Result,
     /// Worth reading, not now.
     Fyi,
+    /// Mail to a particular agent, without delivery to thread members.
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -70,12 +80,15 @@ pub struct Mention {
 /// One change to a host's chat.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ChatEvent {
-    /// A message under `parent`, or a root. Its content never changes.
+    /// A message under `parent`, or a root.
     /// Every member of the thread it is posted in, or of a thread above,
     /// receives it, and so does each agent it mentions, never its sender.
     /// Neither posting nor a mention makes anyone a member.
     Posted {
         parent: Option<MessageId>,
+        /// The specific mail the user answered; independent of where the answer
+        /// is posted.
+        reply_to: Option<MessageId>,
         from: Address,
         mentions: Vec<Mention>,
         content: Vec<ContentPart>,
@@ -89,13 +102,74 @@ pub enum ChatEvent {
     },
     /// An agent becomes a member of a thread: it receives every later
     /// message in it and in the threads below it, until it leaves one.
-    Joined { thread: MessageId, agent: AgentId },
+    Joined {
+        thread: MessageId,
+        agent: AgentId,
+    },
     /// An agent stops being a member of a thread and of the threads below
     /// it: it receives only the messages that mention it from here on.
-    Left { thread: MessageId, agent: AgentId },
+    Left {
+        thread: MessageId,
+        agent: AgentId,
+    },
     /// A thread's name. Empty takes a name back: the thread is then shown by
     /// the first line of its message.
-    Named { thread: MessageId, name: String },
+    Named {
+        thread: MessageId,
+        name: String,
+    },
+    Edited {
+        message: MessageId,
+        content: Vec<ContentPart>,
+    },
+    Deleted {
+        message: MessageId,
+    },
+    /// The project replaces the live mail without making a new mail.
+    /// Replies to it go to the writer of these words.
+    Revised {
+        message: MessageId,
+        author: AgentId,
+        content: Vec<ContentPart>,
+    },
+    /// The turn that wrote this version was rewound. Keep its words readable.
+    TakenBack {
+        message: MessageId,
+        version: ChatSeq,
+        author: AgentId,
+    },
+    /// A system stop no longer needs an answer because work resumed.
+    Recovered {
+        message: MessageId,
+        content: Vec<ContentPart>,
+    },
+}
+
+/// The current status of a thread, separate from its durable mail.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ThreadStatus {
+    pub thread: MessageId,
+    pub at: UnixMs,
+    pub state: StatusText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum StatusText {
+    Written(String),
+    Working,
+    Stuck,
+    StoppedByYou,
+}
+
+impl StatusText {
+    pub fn words(&self) -> &str {
+        match self {
+            Self::Written(text) => text,
+            Self::Working => "working",
+            Self::Stuck => "stuck · can't reach its model",
+            Self::StoppedByYou => "stopped by you",
+        }
+    }
 }
 
 /// One entry of a host's chat log.
@@ -114,9 +188,26 @@ pub struct Message {
     /// Its parent now: a later `Reparented` moved it from where it was
     /// posted.
     pub parent: Option<MessageId>,
+    pub reply_to: Option<MessageId>,
     pub from: Address,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
+    pub revision: Revision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Revision {
+    Original,
+    Edited {
+        seq: ChatSeq,
+        at: UnixMs,
+    },
+    /// Retains the anchor for replies and old references, but no visible mail.
+    Deleted,
+    TakenBack {
+        seq: ChatSeq,
+        at: UnixMs,
+    },
 }
 
 impl Message {
@@ -125,6 +216,7 @@ impl Message {
     pub fn from_record(record: &ChatRecord) -> Option<Self> {
         let ChatEvent::Posted {
             parent,
+            reply_to,
             from,
             mentions,
             content,
@@ -136,10 +228,57 @@ impl Message {
             id: MessageId(record.seq),
             at: record.at,
             parent: *parent,
+            reply_to: *reply_to,
             from: *from,
             mentions: mentions.clone(),
             content: content.clone(),
+            revision: Revision::Original,
         })
+    }
+
+    pub fn apply_revision(&mut self, record: &ChatRecord) {
+        let (content, writer, seq, at) = match &record.event {
+            // Old edits changed the words on screen but were never part of
+            // the verdict cursor. Do not reopen historical mail on upgrade.
+            ChatEvent::Edited { message, content } if *message == self.id => {
+                (content, None, self.id.0, self.at)
+            }
+            ChatEvent::Revised {
+                message,
+                author,
+                content,
+            } if *message == self.id => (content, Some(*author), record.seq, record.at),
+            ChatEvent::TakenBack { message, .. } if *message == self.id => {
+                self.mentions.clear();
+                let (seq, at) = self.version();
+                self.revision = Revision::TakenBack { seq, at };
+                return;
+            }
+            ChatEvent::Recovered { message, content } if *message == self.id => {
+                self.mentions.clear();
+                (content, None, record.seq, record.at)
+            }
+            ChatEvent::Deleted { message } if *message == self.id => {
+                self.content.clear();
+                self.mentions.clear();
+                self.revision = Revision::Deleted;
+                return;
+            }
+            _ => return,
+        };
+        self.content.clone_from(content);
+        if let Some(writer) = writer {
+            self.from = Address::Agent(writer);
+        }
+        self.revision = Revision::Edited { seq, at };
+    }
+
+    /// The position and time of the words now shown, not of the mail's anchor.
+    pub fn version(&self) -> (ChatSeq, UnixMs) {
+        match self.revision {
+            Revision::Edited { seq, at } | Revision::TakenBack { seq, at } => (seq, at),
+            _ => (self.id.0, self.at),
+        }
     }
 
     pub fn mentions(&self, address: Address) -> Option<MentionKind> {
@@ -189,12 +328,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_post_written_before_reply_addresses_still_decodes() {
+        #[derive(Encode)]
+        enum OldChatEvent {
+            Posted {
+                parent: Option<MessageId>,
+                from: Address,
+                mentions: Vec<Mention>,
+                content: Vec<ContentPart>,
+            },
+        }
+        let parent = Some(MessageId(ChatSeq(3)));
+        let content = vec![ContentPart::Text {
+            text: "still here".into(),
+        }];
+        let bytes = senax_encoder::encode(&OldChatEvent::Posted {
+            parent,
+            from: Address::User,
+            mentions: Vec::new(),
+            content: content.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            senax_encoder::decode::<ChatEvent>(&mut bytes.as_ref()).unwrap(),
+            ChatEvent::Posted {
+                parent,
+                reply_to: None,
+                from: Address::User,
+                mentions: Vec::new(),
+                content
+            }
+        );
+    }
+
+    #[test]
     fn a_message_is_shown_by_its_first_line() {
         let record = ChatRecord {
             seq: ChatSeq(3),
             at: UnixMs(1),
             event: ChatEvent::Posted {
                 parent: Some(MessageId(ChatSeq(1))),
+                reply_to: None,
                 from: Address::User,
                 mentions: Vec::new(),
                 content: vec![

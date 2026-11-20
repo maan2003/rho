@@ -204,7 +204,7 @@ async fn stream_cut_before_python_admission_allows_retry() {
     assert!(retry.iter().any(|event| {
         event["item"]["input"]
             .as_str()
-            .is_some_and(|code| code.contains("chat.post("))
+            .is_some_and(|code| code.contains("mail.send("))
     }));
     server.shutdown().await.unwrap();
 }
@@ -279,7 +279,7 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
     let events = openai_events(
         &client,
         &clarifying,
-        json!({"model":"gpt-test","tools":[{"type":"custom","name":"exec"}]}),
+        json!({"model":"gpt-test","tools":[{"type":"custom","name":"exec"}],"input":[{"role":"user","content":"[#57 tide@lab] Fix flaky tests"}]}),
     )
     .await;
     let code = events
@@ -291,9 +291,11 @@ async fn forty_calls_compaction_and_clarifying_scenarios_are_protocol_items() {
         .unwrap()["item"]["input"]
         .as_str()
         .unwrap();
-    assert!(code.contains("chat.post("));
+    assert!(code.contains("mail.send("));
     assert!(code.contains("end_turn()"));
     assert!(code.contains("clarify"));
+    assert!(code.contains(r#"thread=57, kind="ask""#));
+    assert!(code.contains(r#"mail.status(57, "Waiting for clarification")"#));
     clarifying.shutdown().await.unwrap();
 }
 
@@ -386,7 +388,8 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
                 "{code}"
             );
         } else {
-            assert!(code.contains("chat.post("));
+            assert!(code.contains("mail.send("));
+            assert!(code.contains(r#"kind="result""#));
             assert!(code.contains("end_turn()"));
         }
     }
@@ -447,8 +450,8 @@ fn request_timing_counts_overlap_once_and_closes_cancelled_requests() {
 #[test]
 fn the_topic_is_that_of_the_newest_message() {
     let request: OpenAiRequest = serde_json::from_value(json!({"input":[
-        {"role":"user","content":[{"type":"input_text","text":"[#3 rho › first] Message from the user:\nhi"}]},
-        {"role":"user","content":[{"type":"input_text","text":"[#12 rho › second] Message from the user:\nmore [# not a topic"}]},
+        {"role":"user","content":[{"type":"input_text","text":"[#3 rho › first] Mail from the user:\nhi"}]},
+        {"role":"user","content":[{"type":"input_text","text":"[#12 rho › second] Mail from the user:\nmore [# not a topic"}]},
     ]}))
     .unwrap();
     assert_eq!(newest_topic(&request), Some(12));

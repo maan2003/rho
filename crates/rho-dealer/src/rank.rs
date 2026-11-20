@@ -10,6 +10,7 @@
 //! the dealer itself must meet are in `cases.md`, and each has a test
 //! under its name.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use jiff::{Timestamp, Zoned};
@@ -19,6 +20,26 @@ use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
 use crate::facts::Snooze;
 use crate::marks::Marks;
 
+/// What is waiting, independent of the words in which it appears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardKind {
+    Ask,
+    Stop(&'static str),
+    Result,
+    Other,
+}
+
+impl CardKind {
+    fn words(self) -> String {
+        match self {
+            Self::Ask => "asks · {age}".to_owned(),
+            Self::Stop(word) => format!("{word} · {{age}}"),
+            Self::Result => "result · {age}".to_owned(),
+            Self::Other => String::new(), // Deadlines supply their own words.
+        }
+    }
+}
+
 /// One thing a source says wants the user.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Claim {
@@ -27,9 +48,7 @@ pub struct Claim {
     pub title: String,
     pub context: String,
     pub curve: Curve,
-    /// The words beside the age, `asks · {age}`; `{age}` is filled in
-    /// when the hand is read.
-    pub reason: String,
+    pub kind: CardKind,
     /// Where the source stands: a skip holds on to it, and the source
     /// moving past it voids the skip.
     pub cursor: String,
@@ -38,31 +57,22 @@ pub struct Claim {
     /// A reply this soon after the user's own words comes through a
     /// snooze said before them (Z4).
     pub breaks_snooze_set_by: Option<Timestamp>,
-    /// When the other side wrote: a snooze that slept through some of it
-    /// brings the card back a little higher (Z5).
-    pub others: Vec<Timestamp>,
     /// An address a snooze on which holds this one too: the room a thread
-    /// is in (S7).
+    /// is in.
     pub under: Option<Address>,
 }
 
 impl Claim {
-    pub fn new(
-        address: Address,
-        curve: Curve,
-        reason: impl Into<String>,
-        cursor: impl Into<String>,
-    ) -> Self {
+    pub fn new(address: Address, curve: Curve, kind: CardKind, cursor: impl Into<String>) -> Self {
         Self {
             address,
             title: String::new(),
             context: String::new(),
             curve,
-            reason: reason.into(),
+            kind,
             cursor: cursor.into(),
             bonus: 0.0,
             breaks_snooze_set_by: None,
-            others: Vec::new(),
             under: None,
         }
     }
@@ -75,6 +85,7 @@ pub struct Card {
     pub title: String,
     pub context: String,
     pub label: String,
+    pub kind: CardKind,
     pub priority: f64,
     /// Where the source stood: a skip holds on to it, and the source
     /// moving past it voids the skip.
@@ -82,9 +93,6 @@ pub struct Card {
     /// Passed over this sitting: behind every card that was not, until its
     /// source moves or the skip runs out.
     pub skipped: bool,
-    /// The room the card is in, when its claim said one: what a list of
-    /// rooms orders by.
-    pub room: Option<Address>,
 }
 
 impl Card {
@@ -100,7 +108,7 @@ impl Card {
     }
 }
 
-/// Every card above the floor, pressing hardest first, and when the hand
+/// Every card above the floor, in deal order, and when the hand
 /// next changes with nobody touching anything.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hand {
@@ -204,11 +212,10 @@ impl Skips {
 /// One reason an address wants the user, as weighed.
 struct Part {
     curve: Curve,
-    reason: String,
+    kind: CardKind,
     cursor: String,
     bonus: f64,
     breaks_snooze_set_by: Option<Timestamp>,
-    others: Vec<Timestamp>,
     /// From a source, which a snooze's end moves; the user's own dates
     /// stand where they were said.
     from_source: bool,
@@ -218,11 +225,10 @@ impl Part {
     fn claimed(claim: &Claim) -> Self {
         Self {
             curve: claim.curve,
-            reason: claim.reason.clone(),
+            kind: claim.kind,
             cursor: claim.cursor.clone(),
             bonus: claim.bonus,
             breaks_snooze_set_by: claim.breaks_snooze_set_by,
-            others: claim.others.clone(),
             from_source: true,
         }
     }
@@ -230,11 +236,10 @@ impl Part {
     fn dated(curve: Curve, cursor: String) -> Self {
         Self {
             curve,
-            reason: String::new(),
+            kind: CardKind::Other,
             cursor,
             bonus: 0.0,
             breaks_snooze_set_by: None,
-            others: Vec::new(),
             from_source: false,
         }
     }
@@ -250,6 +255,28 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned) -> Hand {
 pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, mut trace: Trace) -> (Hand, Trace) {
     let hand = rank_into(sources, now, Some(&mut trace));
     (hand, trace)
+}
+
+/// Waiting mail is a queue, not a competition between pressure scores.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DealOrder {
+    Overdue,
+    Prompt(Timestamp),
+    Result(Timestamp),
+    Other,
+}
+
+impl Part {
+    fn deal_order(&self, now: Timestamp) -> DealOrder {
+        match (self.curve, self.kind) {
+            (Curve::Deadline { by, .. }, _) if by < now => DealOrder::Overdue,
+            (Curve::Waiting { since, .. }, CardKind::Ask | CardKind::Stop(_)) => {
+                DealOrder::Prompt(since)
+            }
+            (Curve::Waiting { since, .. }, CardKind::Result) => DealOrder::Result(since),
+            _ => DealOrder::Other,
+        }
+    }
 }
 
 fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) -> Hand {
@@ -302,14 +329,13 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 .iter()
                 .map(|part| {
                     format!(
-                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} others {} breaks_snooze_set_by {:?}",
-                        part.reason,
+                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} breaks_snooze_set_by {:?}",
+                        part.kind,
                         part.curve,
                         part.curve.priority(at),
                         part.bonus,
                         part.cursor,
                         part.from_source,
-                        part.others.len(),
                         part.breaks_snooze_set_by,
                     )
                 })
@@ -350,27 +376,18 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 continue;
             }
         }
-        // Z2 and Z5: an address back from a snooze counts from the
-        // snooze's end, a little higher for every message it slept through.
+        // Z2: an address back from a snooze counts from the snooze's end.
         if let Some(snooze) = snoozes
             .iter()
             .filter(|snooze| snooze.until <= at)
             .max_by_key(|snooze| snooze.until)
         {
-            let set = snooze.set.timestamp();
             for part in address_parts.iter_mut().filter(|part| part.from_source) {
                 match &mut part.curve {
                     Curve::Waiting { since, .. } | Curve::Fading { since, .. }
                         if *since < snooze.until =>
                     {
                         *since = snooze.until;
-                        let slept = part
-                            .others
-                            .iter()
-                            .filter(|wrote| set < **wrote && **wrote <= snooze.until)
-                            .count();
-                        part.bonus += (curve::SNOOZED_MESSAGE_BUMP * slept as f64)
-                            .min(curve::SNOOZED_MESSAGE_BUMP_CAP);
                     }
                     _ => {}
                 }
@@ -415,19 +432,22 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         if let Some((_, gone)) = skip {
             steps.push(gone);
         }
+        // Its words say how long it has waited: they move on by themselves.
+        steps.push(part.curve.label_changes(at));
         let (title, context) = named
             .remove(&address)
             .unwrap_or_else(|| name(sources, &address));
         cards.push((
             skip.map(|(skipped, _)| skipped),
+            part.deal_order(at),
             Card {
                 title,
                 context,
-                label: part.curve.label(&part.reason, at),
+                label: part.curve.label(&part.kind.words(), at),
+                kind: part.kind,
                 priority,
                 cursor: part.cursor.clone(),
                 skipped: skip.is_some(),
-                room: under.get(&address).cloned(),
                 address,
             },
         ));
@@ -437,21 +457,24 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
     // between the same two cards. Skipped cards go behind the rest, the
     // longest-skipped first, so every card is dealt once before any comes
     // round again.
-    cards.sort_by(
-        |(a_skipped, a), (b_skipped, b)| match (a_skipped, b_skipped) {
+    cards.sort_by(|(a_skipped, a_order, a), (b_skipped, b_order, b)| {
+        match (a_skipped, b_skipped) {
             (Some(a_skipped), Some(b_skipped)) => a_skipped
                 .cmp(b_skipped)
                 .then_with(|| a.address.cmp(&b.address)),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => b
-                .priority
-                .total_cmp(&a.priority)
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => a_order
+                .cmp(b_order)
+                .then_with(|| match a_order {
+                    DealOrder::Overdue | DealOrder::Other => b.priority.total_cmp(&a.priority),
+                    _ => Ordering::Equal,
+                })
                 .then_with(|| a.address.cmp(&b.address)),
-        },
-    );
+        }
+    });
     Hand {
-        cards: cards.into_iter().map(|(_, card)| card).collect(),
+        cards: cards.into_iter().map(|(_, _, card)| card).collect(),
         next_change: steps.into_iter().filter(|step| *step > at).min(),
     }
 }

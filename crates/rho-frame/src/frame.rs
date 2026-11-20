@@ -9,40 +9,47 @@ use editor::Editor;
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window, div, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Pixels, Subscription, Task, Window,
+    div, px,
 };
+use jiff::Timestamp;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostEvent, HostSpec};
-use rho_dealer::Address;
-use rho_ledger::stream::LedgerEvent;
+use rho_dealer::{Address, Card};
+use rho_ledger::Pairing;
 use rho_window::history::History;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
-use crate::home::{HomeTarget, HomeView};
-use crate::menu::{OpenMenu, Pick, Row, Rows};
+use crate::desk::{DeskTarget, DeskView};
+use crate::idea::IdeaBox;
+use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
-    CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
+    Answer, CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler,
     bottom_strip,
 };
 use crate::phone::{Layout, Phone};
-use crate::surface::{AnySurface, Subject};
+use crate::search::Search;
+use crate::surface::{AnySurface, Mode, Subject, Surface as _};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
-use crate::{keys, palette};
+use crate::{keys, palette, place};
 
-/// The kind of the frame's own surface: Home.
+/// The kind of the frame's own surface: Desk.
 pub const FRAME_KIND: &str = "frame";
+pub(crate) const FRAME_PADDING: Pixels = px(2.);
 
-/// Where the reader is: the surface in view, and what the point in it is
+/// Where the reader is: the surface in view, what the point in it is
 /// on, which is the surface's own address when it is a page about one
-/// thing and a row's when it lists things.
+/// thing and a row's when it lists things, and the card that holds it,
+/// which a verdict is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Point {
     pub surface: Address,
     pub subject: Option<Address>,
+    pub card: Option<Address>,
 }
 
 /// How long an echo stays on the line.
@@ -54,11 +61,13 @@ pub struct Frame {
     pub(crate) systems: Vec<AnySystem>,
     pub(crate) attention: Attention,
     /// The surfaces the reader has been on, by address. The newest entry
-    /// is where down deals; Home is the oldest and never closes.
+    /// is where down deals; Desk is the oldest and never closes.
     history: History<Address, ()>,
     surfaces: HashMap<Address, AnySurface>,
-    pub(crate) home: Entity<HomeView>,
+    pub(crate) desk: Entity<DeskView>,
+    pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
+    last_palette_query: Option<String>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
@@ -69,12 +78,28 @@ pub struct Frame {
     mode_indicator: Entity<vim::ModeIndicator>,
     pub(crate) signals: Signals,
     pub(crate) chime: Rc<dyn Fn()>,
-    /// What `find:` listed last, so the chosen title opens its address.
-    found: Vec<Found>,
+    /// The last `/` or `?`, which `n` and `N` repeat in any surface.
+    pub(crate) search: Option<Search>,
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
+    /// Writes down where the user is after each move, for the next start.
+    pub(crate) place: place::Writer,
+    last_input: Option<Timestamp>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
+}
+
+// The palette and the verdict menu answer the same card with the same words.
+fn verdict_rows(target: Address) -> [Row; 2] {
+    let done = target.clone();
+    [
+        Row::run("d", "done", move |frame, window, cx| {
+            frame.verdict(&done, Verdict::Done, "done".to_owned(), window, cx);
+        }),
+        Row::run("m", "mute", move |frame, window, cx| {
+            frame.verdict(&target, Verdict::Mute, "mute".to_owned(), window, cx);
+        }),
+    ]
 }
 
 impl Frame {
@@ -91,34 +116,63 @@ impl Frame {
         keys::bind(cx);
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
-        let home = cx.new(|cx| HomeView::new(window, cx));
+        let idea = IdeaBox::new(cx, &db);
+        let desk = cx.new(|cx| DeskView::new(idea.text.clone(), window, cx));
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor
         });
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
-        let home_address = Self::home_address();
+        let desk_editor = desk.read(cx).editor(cx).expect("Desk is an editor");
+        let desk_selection = cx.subscribe(&desk_editor, |frame, _, event, cx| {
+            if frame.desk_in_view() {
+                if matches!(event, editor::EditorEvent::SelectionsChanged { .. }) {
+                    cx.notify();
+                }
+            }
+        });
+        let desk_address = Self::desk_address();
         let mut surfaces = HashMap::new();
-        surfaces.insert(home_address.clone(), AnySurface::new(home.clone()));
+        surfaces.insert(desk_address.clone(), AnySurface::new(desk.clone()));
         // A menu owns its keys before gpui resolves bindings: vim binds `g`
         // as a prefix, and an ordinary key handler would not see a menu's
         // one-stroke `g` until another key arrived.
-        let menu_keys = cx.listener(|this, event: &gpui::KeystrokeEvent, window, cx| {
+        let window_id = window.window_handle().window_id();
+        let menu_keys = cx.listener(move |this, event: &gpui::KeystrokeEvent, window, cx| {
+            if window.window_handle().window_id() != window_id {
+                return;
+            }
+            this.note_input();
             if this.menu.is_some() && this.menu_focus.is_focused(window) {
                 this.menu_keystroke(&event.keystroke, window, cx);
             }
         });
         let menu_keys = cx.intercept_keystrokes(menu_keys);
+        let saved_place = place::Saved::load(&db);
+        let last_input = place::last_input(&db);
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active()
+                && !this.desk_in_view()
+                && place::is_cold(this.last_input, Timestamp::now())
+            {
+                // Opening the desk reports the active surface itself.
+                this.open_desk(window, cx);
+            } else {
+                this.report_active_surface(window, cx);
+            }
+        });
         let mut frame = Self {
-            db,
+            db: db.clone(),
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
-            history: History::new(home_address, ()),
+            history: History::new(desk_address, ()),
             surfaces,
-            home,
+            desk,
+            idea,
             minibuffer: None,
+            last_palette_query: None,
             menu: None,
             menu_focus: cx.focus_handle(),
             overlay_return: None,
@@ -127,21 +181,23 @@ impl Frame {
             mode_indicator,
             signals: Signals::default(),
             chime,
-            found: Vec::new(),
+            search: None,
             phone: Phone::default(),
-            _subscriptions: vec![menu_keys],
+            place: place::Writer::spawn(db.clone()),
+            last_input,
+            _subscriptions: vec![menu_keys, activation, desk_selection],
             _tasks: Vec::new(),
         };
-        let ledger = cx.spawn(async move |this, cx| {
+        let ledger = cx.spawn_in(window, async move |this, cx| {
             let mut events = ledger_events;
             while let Some(event) = events.next().await {
                 let mut batch = vec![event];
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
-                let updated = this.update(cx, |this, cx| {
+                let updated = this.update_in(cx, |this, window, cx| {
                     for event in batch {
-                        this.ledger_event(event, cx);
+                        this.ledger_event(event, window, cx);
                     }
                 });
                 if updated.is_err() {
@@ -167,21 +223,99 @@ impl Frame {
         for spec in hosts {
             frame.attach_host(spec, cx);
         }
+        if let Some(saved) = saved_place {
+            frame.return_to(saved, window, cx);
+            // In particular a warm restart after a cold one must restore
+            // the desk, not the screen now behind it.
+            frame.moved();
+        }
         frame.systems_changed(cx);
         frame.focus_surface(window, cx);
         frame
     }
 
-    pub fn home_address() -> Address {
-        Address::new(FRAME_KIND, "home")
+    /// Opens the window where the user was when it last ran on this
+    /// device, with the way back and forward as it was. The screens behind
+    /// and ahead are made when the user reaches them; the one they were on
+    /// is made now, and when it no longer opens the window opens on Desk.
+    fn return_to(&mut self, saved: place::Saved, window: &mut Window, cx: &mut Context<Self>) {
+        self.history = place::return_history(
+            &saved,
+            &Self::desk_address(),
+            self.last_input,
+            Timestamp::now(),
+        );
+        let address = self.current_address().clone();
+        if self.surfaces.contains_key(&address) {
+            return;
+        }
+        match self.make_surface(&address, window, cx) {
+            Some(surface) => {
+                self.surfaces.insert(address, surface);
+            }
+            None => {
+                self.history.forget(&address);
+                self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
+                self.history.show(Self::desk_address(), ());
+            }
+        }
     }
 
-    fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
-        let (touched, said) = self.attention.ledger_event(event);
-        for line in said {
-            self.echo(&line, StyleClass::SystemInfo, cx);
+    /// The surface for `address`, from the system that owns its kind.
+    fn make_surface(
+        &self,
+        address: &Address,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnySurface> {
+        self.systems
+            .clone()
+            .into_iter()
+            .find(|system| system.opens(address, cx))
+            .and_then(|system| system.open(address, window, cx))
+    }
+
+    /// Makes the screen the cursor came to, when the history holds it by
+    /// address alone, as one it was given back at start does. One that no
+    /// longer opens leaves the history and the walk goes on the way it
+    /// went, or the other way from the end; Desk always opens.
+    fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let address = self.current_address().clone();
+            if self.surfaces.contains_key(&address) {
+                return;
+            }
+            if let Some(surface) = self.make_surface(&address, window, cx) {
+                self.surfaces.insert(address, surface);
+                return;
+            }
+            self.history.forget(&address);
+            let stepped = match forward {
+                true => self.history.forward().is_some() || self.history.back().is_some(),
+                false => self.history.back().is_some() || self.history.forward().is_some(),
+            };
+            if !stepped {
+                self.history.show(Self::desk_address(), ());
+            }
         }
-        self.marks_moved(touched, cx);
+    }
+
+    /// Writes down where the user is now, for the next start.
+    fn moved(&self) {
+        self.place
+            .write(place::Write::Place(place::Saved::of(&self.history)));
+    }
+
+    /// A key or deliberate pointer/touch input is activity by the user;
+    /// focuses and host/network activity are not.
+    pub(crate) fn note_input(&mut self) {
+        let at = Timestamp::now();
+        self.last_input = Some(at);
+        self.place.write(place::Write::Input(at));
+    }
+
+    pub fn desk_address() -> Address {
+        Address::new(FRAME_KIND, "desk")
     }
 
     // ---- surfaces ----
@@ -207,22 +341,30 @@ impl Frame {
     /// Where the reader is.
     pub fn point(&self, cx: &App) -> Point {
         let surface = self.current_address().clone();
-        let subject = match self.current_surface().subject(cx) {
+        let resolve = |subject: Subject| match subject {
             Subject::Own if surface.kind() == FRAME_KIND => None,
             Subject::Own => Some(surface.clone()),
             Subject::Address(address) => Some(address),
             Subject::None => None,
         };
-        Point { surface, subject }
+        let current = self.current_surface();
+        let subject = resolve(current.subject(cx));
+        let card = resolve(current.card(cx));
+        Point {
+            surface,
+            subject,
+            card,
+        }
     }
 
-    /// The card a verdict lands on: what the point is on.
+    /// The card a verdict lands on: the one that holds what the point is
+    /// on.
     pub fn card_target(&self, cx: &App) -> Option<Address> {
-        self.point(cx).subject
+        self.point(cx).card
     }
 
-    /// The card the surface in view stands for, which is nothing on Home:
-    /// Home is a list, so a pull from it opens the top card rather than
+    /// The card the surface in view stands for, which is nothing on Desk:
+    /// Desk is a list, so a pull from it opens the top card rather than
     /// passing over the row.
     pub fn card_in_view(&self, cx: &App) -> Option<Address> {
         match self.current_address().kind() == FRAME_KIND {
@@ -231,31 +373,25 @@ impl Frame {
         }
     }
 
-    pub fn home_in_view(&self) -> bool {
-        *self.current_address() == Self::home_address()
+    pub fn desk_in_view(&self) -> bool {
+        *self.current_address() == Self::desk_address()
     }
 
     /// Opens `address`: the system that owns its kind makes the surface,
     /// or the one already made is shown again.
     pub fn open(&mut self, address: Address, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_with(address, rho_journal::SurfaceShowMethod::Open, window, cx);
+        self.open_with(address, None, window, cx);
     }
 
     pub(crate) fn open_with(
         &mut self,
         address: Address,
-        method: rho_journal::SurfaceShowMethod,
+        card: Option<&Card>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.surfaces.contains_key(&address) {
-            let opened = self
-                .systems
-                .clone()
-                .into_iter()
-                .find(|system| system.opens(&address, cx))
-                .and_then(|system| system.open(&address, window, cx));
-            let Some(surface) = opened else {
+            let Some(surface) = self.make_surface(&address, window, cx) else {
                 self.echo(
                     &format!("nothing opens {address}"),
                     StyleClass::SystemInfo,
@@ -265,22 +401,51 @@ impl Frame {
             };
             self.surfaces.insert(address.clone(), surface);
         }
+        let surface = self.surfaces[&address].clone();
+        if let Some(card) = card {
+            surface.show_card(card, window, cx);
+        } else {
+            surface.opened(window, cx);
+        }
         rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: journal_surface(&address),
-            method,
+            method: if card.is_some() {
+                rho_journal::SurfaceShowMethod::Deal
+            } else {
+                rho_journal::SurfaceShowMethod::Open
+            },
         });
+        // Desk opens on its first waiting or moving row;
+        // only the way back returns to it as it was left.
+        if address == Self::desk_address() {
+            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
+        }
         self.history.show(address, ());
+        self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
         cx.notify();
     }
 
-    pub fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open(Self::home_address(), window, cx);
+    /// Opens a web link the user chose: the system that shows the web
+    /// takes it.
+    pub fn open_link(&mut self, url: url::Url, cx: &mut Context<Self>) {
+        let taken = self
+            .systems
+            .clone()
+            .into_iter()
+            .any(|system| system.open_link(&url, cx));
+        if !taken {
+            self.echo(&format!("nothing opens {url}"), StyleClass::SystemInfo, cx);
+        }
+    }
+
+    pub fn open_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(Self::desk_address(), window, cx);
     }
 
     /// Closes `address`: its surface goes, and no walk reaches it again.
-    /// Home only steps out of view.
+    /// Desk only steps out of view.
     pub fn close(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_address() == address;
         if address.kind() != FRAME_KIND {
@@ -293,17 +458,33 @@ impl Frame {
         }
         if current {
             if self.history.back().is_none() && self.history.forward().is_none() {
-                self.history.show(Self::home_address(), ());
+                self.history.show(Self::desk_address(), ());
             }
             // A forgotten entry under the cursor is left on the first step
             // either way; a frame surface closes by stepping off it.
             if address.kind() == FRAME_KIND && self.current_address() == address {
-                self.history.show(Self::home_address(), ());
+                self.history.show(Self::desk_address(), ());
             }
+            self.settle(false, window, cx);
             self.close_overlays(window, cx);
             self.focus_surface(window, cx);
         }
+        self.moved();
         cx.notify();
+    }
+
+    /// Closes every open surface whose address `which` picks: what a
+    /// detached host leaves behind.
+    pub fn close_all(
+        &mut self,
+        which: impl Fn(&Address) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked: Vec<Address> = self.surfaces.keys().filter(|a| which(a)).cloned().collect();
+        for address in picked {
+            self.close(&address, window, cx);
+        }
     }
 
     pub fn close_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -316,6 +497,8 @@ impl Frame {
             self.echo("at the oldest", StyleClass::SystemInfo, cx);
             return;
         }
+        self.settle(false, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Back,
             position: self.history.behind(),
@@ -333,6 +516,8 @@ impl Frame {
             self.pull_card(window, cx);
             return;
         }
+        self.settle(true, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Forward,
             position: self.history.behind(),
@@ -346,6 +531,15 @@ impl Frame {
     fn focus_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.current_surface().focus_handle(cx);
         window.focus(&handle, cx);
+        self.report_active_surface(window, cx);
+        self.systems_changed(cx);
+    }
+
+    fn report_active_surface(&self, window: &Window, cx: &mut Context<Self>) {
+        let active = window.is_window_active().then(|| self.current_address());
+        for system in &self.systems {
+            system.active_surface(active, cx);
+        }
     }
 
     /// The surface for `address` while it is open, for a system that wants
@@ -392,6 +586,7 @@ impl Frame {
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
+        self.close_idea_overlay(window, cx);
         self.overlay_return = None;
     }
 
@@ -496,7 +691,7 @@ impl Frame {
             return;
         };
         rho_journal::record(rho_journal::Event::MenuRan {
-            action: format!("{} › {}", open.rows.title, row.description),
+            action: format!("{} › {}", open.rows.title, row.pick.label()),
             count,
         });
         match row.pick {
@@ -507,14 +702,14 @@ impl Frame {
                 open.carried_count = count;
                 cx.notify();
             }
-            Pick::Run(run) => {
+            Pick::Run { run, .. } => {
                 if closes {
                     self.close_menu(window, cx);
                 }
                 run(self, count, window, cx);
                 cx.notify();
             }
-            Pick::Infix(run) => {
+            Pick::Infix { run, .. } => {
                 run(self, count, window, cx);
                 cx.notify();
             }
@@ -536,73 +731,167 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// `:`: every command by name, found by a fuzzy query, with the keys
-    /// that reach it through the menus as a hint. A command that is a
-    /// menu opens it as a transient.
+    /// The Palette joins the catalogue to the actual dealt cards and the
+    /// places this window has visited. It does not infer a card from mail.
     pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entries = Rc::new(palette::flatten(&self.commands(window, cx)));
-        let complete = {
-            let entries = entries.clone();
-            Rc::new(move |_: &Frame, input: &str, _: &App| {
-                let mut found: Vec<(u32, usize)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| {
-                        palette::score(input, &entry.label).map(|score| (score, index))
-                    })
-                    .collect();
-                found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-                found
-                    .into_iter()
-                    .map(|(_, index)| Candidate {
-                        value: entries[index].label.clone(),
-                        description: entries[index].keys.clone(),
-                    })
-                    .collect()
-            })
-        };
-        let submit = Rc::new(
-            move |frame: &mut Frame,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Frame>| {
-                let Some(entry) = entries.iter().find(|entry| entry.label == input.trim()) else {
-                    frame.echo(&format!("no command {input:?}"), StyleClass::SystemInfo, cx);
-                    return;
-                };
-                match &entry.pick {
-                    Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
-                    Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
-                }
-            },
-        );
-        self.open_prompt("command:", complete, submit, window, cx);
-        // A command's name is words (`new note`, `hosts › attach`), so the
-        // candidate replaces the whole input, not the last word.
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
+        let rows = self.commands(window, cx);
+        let desk_address = Self::desk_address();
+        let desk_key = self.screen_binding(&keys::Desk, window, cx);
+        let commands = palette::commands(&rows, |action| self.screen_binding(action, window, cx));
+        let mut found = Vec::new();
+        for system in &self.systems {
+            found.extend(system.find(&self.attention.marks, cx));
         }
+
+        let mut known: std::collections::HashSet<_> =
+            found.iter().map(|place| place.address.clone()).collect();
+        let recent = self.history.recent();
+        let visits: HashMap<_, _> = recent
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(rank, key)| (key, rank))
+            .collect();
+        for address in recent {
+            if !known.insert(address.clone()) {
+                continue;
+            }
+            if let Some((title, description)) = self
+                .surfaces
+                .get(address)
+                .map(|surface| (surface.title(cx), String::new()))
+                .or_else(|| self.name_of(address, cx))
+            {
+                found.push(Found {
+                    address: address.clone(),
+                    title,
+                    description,
+                    thread: None,
+                    recency: 0,
+                });
+            }
+        }
+
+        for card in &self.hand().cards {
+            if known.insert(card.address.clone()) {
+                found.push(Found {
+                    address: card.address.clone(),
+                    title: card.title.clone(),
+                    description: card.context.clone(),
+                    thread: None,
+                    recency: 0,
+                });
+            }
+        }
+        let cards: HashMap<_, _> = self
+            .hand()
+            .cards
+            .iter()
+            .enumerate()
+            .map(|(rank, card)| (&card.address, (rank, card)))
+            .collect();
+        // Preserve the deal's own order among waiting places on blank input.
+        found.sort_by_key(|place| {
+            cards
+                .get(&place.address)
+                .map_or(usize::MAX, |(rank, _)| *rank)
+        });
+        let places = found
+            .into_iter()
+            .map(|found| palette::Place {
+                visit: visits.get(&found.address).copied(),
+                current: self.current_address() == &found.address,
+                shortcut: if found.address == desk_address {
+                    desk_key.clone()
+                } else {
+                    None
+                },
+                card: cards.get(&found.address).map(|(_, card)| (*card).clone()),
+                found,
+            })
+            .collect();
+        self.open_minibuffer(
+            ":",
+            Answer::palette(palette::Listing::new(commands, places)),
+            None,
+            window,
+            cx,
+        );
     }
 
-    /// The frame's rows, the surface's, and every system's for what is in
-    /// view: what the palette lists.
-    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Rows {
+    fn screen_binding(
+        &self,
+        action: &dyn gpui::Action,
+        window: &Window,
+        cx: &App,
+    ) -> Option<String> {
+        let focus = window.focused(cx)?;
+        window
+            .bindings_for_action_in(action, &focus)
+            .last()
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(|key| key.unparse())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+    }
+
+    /// The frame's rows, the surface's, and each system's for the point.
+    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("h", "home", |frame, window, cx| {
-            frame.open_home(window, cx)
-        }));
-        rows.push(Row::run("f", "find", |frame, window, cx| {
-            frame.find(window, cx)
-        }));
-        rows.push(Row::run("u", "undo", |frame, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
-        rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
-        rows.extend(self.current_surface().clone().rows(window, cx));
+        let mut undo = Row::run("", "undo", |frame, window, cx| {
+            frame.undo_verdict(window, cx);
+        })
+        .window_wide();
+        undo.shortcut = self
+            .current_surface()
+            .undo_verdict_action(cx)
+            .map(|action| Shortcut::Action(Rc::from(action)));
+        let mut rows = vec![
+            Row::run("", "write an idea", |frame, window, cx| {
+                frame.prompt_idea(window, cx)
+            })
+            .bound_to(keys::PromptIdea)
+            .window_wide(),
+            undo,
+            Row::menu("", self.hosts_menu()).window_wide(),
+        ];
+        let phrase = match self.attention.secret() {
+            Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
+                frame.show_secret(secret, "your secret phrase · enter:", window, cx)
+            }),
+            None => Row::run("", "pair this device", |frame, window, cx| {
+                frame.prompt_pair(String::new(), None, window, cx)
+            }),
+        };
+        rows.push(phrase.window_wide());
+        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
+        let surface = self.current_surface().clone();
+        rows.extend(surface.rows(window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
+        }
+        if !self.desk_in_view() {
+            let opener = self.screen_binding(&keys::VerdictMenu, window, cx);
+            rows.extend(
+                self.verdict_rows(Layout::of(window.viewport_size().width), cx)
+                    .rows
+                    .into_iter()
+                    .filter_map(|mut row| {
+                        // The window-wide undo is the same verdict and has its
+                        // own key.
+                        if row.key == "u" {
+                            return None;
+                        }
+                        row.shortcut = opener
+                            .as_ref()
+                            .map(|key| Shortcut::Menu(format!("{key} {}", row.key)));
+                        Some(row)
+                    }),
+            );
         }
         rows
     }
@@ -611,7 +900,8 @@ impl Frame {
         let mut rows = Rows::new("hosts");
         rows.push(Row::run("a", "attach", |frame, window, cx| {
             frame.open_prompt(
-                "attach host (name=local[:dir] or name=iroh:...):",
+                "attach host · name=local (this machine), name=iroh:<id>@<ssh host> (ssh), \
+                 or name=iroh:<id> (security key):",
                 Rc::new(|_, _, _| Vec::new()),
                 Rc::new(
                     |frame, input, _, cx| match HostSpec::parse(input.trim(), "rho") {
@@ -634,17 +924,25 @@ impl Frame {
                     frame
                         .hosts
                         .iter()
-                        .filter(|host| host.name.contains(needle))
+                        .filter(|host| host.name.contains(needle.trim()))
                         .map(|host| Candidate {
                             value: host.name.clone(),
-                            description: format!("{:?}", host.status),
+                            description: host.status.label(),
                         })
                         .collect()
                 }),
                 Rc::new(|frame, input, _, cx| {
-                    match frame.hosts.by_name(input.trim()).map(|host| host.id) {
-                        Some(host) => frame.detach_host(host, cx),
-                        None => frame.echo("detach: no such host", StyleClass::SystemInfo, cx),
+                    let name = input.trim();
+                    match frame.hosts.by_name(name).map(|host| host.id) {
+                        Some(host) => {
+                            frame.detach_host(host, cx);
+                            frame.echo(&format!("detached: {name}"), StyleClass::SystemInfo, cx);
+                        }
+                        None => frame.echo(
+                            &format!("detach: no host called {name}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
                     }
                 }),
                 window,
@@ -655,13 +953,13 @@ impl Frame {
             let id = host.id;
             rows.push(Row::run(
                 (index + 1).to_string(),
-                format!("{} · {}", host.name, status_words(&host.status)),
+                format!("{} · {}", host.name, host.status.label()),
                 move |frame, _, cx| {
                     let label = frame.hosts.host_label(id);
                     let status = frame
                         .hosts
                         .get(id)
-                        .map(|host| status_words(&host.status))
+                        .map(|host| host.status.label())
                         .unwrap_or_default();
                     frame.echo(&format!("{label}: {status}"), StyleClass::SystemInfo, cx);
                 },
@@ -670,106 +968,61 @@ impl Frame {
         rows
     }
 
-    /// `space`: the verdicts, over whatever card is in view. With no card
-    /// it goes Home, and from Home it is the way back.
+    /// The verdicts over the card under the cursor.
     pub(crate) fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(window, cx);
-            self.toggle_home(window, cx);
+            self.toggle_desk(window, cx);
             return;
         }
-        let Some(target) = self.card_target(cx) else {
-            self.toggle_home(window, cx);
+        let inspecting = self.current_surface().inspects_card();
+        let target = self.card_target(cx);
+        if inspecting
+            && !target
+                .as_ref()
+                .is_some_and(|target| self.hand().cards.iter().any(|card| &card.address == target))
+        {
+            self.echo("nothing waits here", StyleClass::SystemInfo, cx);
             return;
-        };
-        let card = self.card_for(&target, cx);
-        let mut rows = Rows::new(card.heading()).counted();
-        let on = |run: fn(&mut Frame, &Address, Option<u32>, &mut Window, &mut Context<Frame>)| {
-            let target = target.clone();
-            move |frame: &mut Frame,
-                  count: Option<u32>,
-                  window: &mut Window,
-                  cx: &mut Context<Frame>| { run(frame, &target, count, window, cx) }
-        };
-        rows.push(Row::counted(
-            "d",
-            "done",
-            on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Done, "done".to_owned(), window, cx)
-            }),
-        ));
-        rows.push(Row::counted(
-            "m",
-            "mute",
-            on(|frame, target, _, window, cx| {
-                frame.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx)
-            }),
-        ));
-        rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
-        rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
-            frame.pull_card(window, cx)
-        }));
-        self.open_menu(rows, window, cx);
-    }
-
-    pub(crate) fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.home_in_view() {
-            true => self.back(window, cx),
-            false => self.open_home(window, cx),
         }
-    }
-
-    /// `find:` everything every system has, by title.
-    pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut found = Vec::new();
-        for system in &self.systems {
-            found.extend(system.find(&self.attention.marks, cx));
-        }
-        found.sort_by_key(|found| std::cmp::Reverse(found.recency));
-        self.found = found;
-        self.open_prompt(
-            "find:",
-            Rc::new(|frame: &Frame, input: &str, _: &App| {
-                let needle = input.trim().to_lowercase();
-                frame
-                    .found
-                    .iter()
-                    .filter(|found| {
-                        found.title.to_lowercase().contains(&needle)
-                            || found.description.to_lowercase().contains(&needle)
-                    })
-                    .take(40)
-                    .map(|found| Candidate {
-                        value: found.title.clone(),
-                        description: found.description.clone(),
-                    })
-                    .collect()
-            }),
-            Rc::new(|frame, input, window, cx| {
-                let input = input.trim();
-                let address = frame
-                    .found
-                    .iter()
-                    .find(|found| found.title == input)
-                    .map(|found| found.address.clone())
-                    .or_else(|| Address::parse(input));
-                match address {
-                    Some(address) => frame.open(address, window, cx),
-                    None => frame.echo(
-                        &format!("find: nothing called {input}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }),
+        self.open_menu(
+            self.verdict_rows(Layout::of(window.viewport_size().width), cx),
             window,
             cx,
         );
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
+    }
+
+    fn verdict_rows(&self, layout: Layout, cx: &App) -> Rows {
+        let inspecting = self.current_surface().inspects_card();
+        let Some(target) = self.card_target(cx).filter(|target| {
+            !inspecting || self.hand().cards.iter().any(|card| &card.address == target)
+        }) else {
+            // With no card here there is nothing to judge, but the deal
+            // still goes on: `n` is how the user asks what waits.
+            let mut rows = Rows::new("no card here").counted();
+            push_deal_rows(&mut rows);
+            return rows;
+        };
+        let card = self.card_for(&target, cx);
+        let mut rows = Rows::new(if inspecting {
+            card.title.clone()
+        } else {
+            card.heading()
+        })
+        .counted();
+        rows.extend(verdict_rows(target.clone()));
+        rows.push(Row::menu(
+            "s",
+            snooze_rows(&target, layout == Layout::Phone),
+        ));
+        push_deal_rows(&mut rows);
+        rows
+    }
+
+    pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.desk_in_view() {
+            true => self.back(window, cx),
+            false => self.open_desk(window, cx),
         }
     }
 
@@ -793,21 +1046,19 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_prompt_watching(prompt, complete, None, on_submit, on_cancel, window, cx);
+        self.open_minibuffer(
+            prompt,
+            Answer::text(complete, on_submit),
+            on_cancel,
+            window,
+            cx,
+        );
     }
 
-    /// A prompt that narrows what is behind it as the reader types:
-    /// `on_change` hears every edit.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
-    )]
-    pub fn open_prompt_watching(
+    fn open_minibuffer(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
-        complete: CandidateSource,
-        on_change: Option<ChangeHandler>,
-        on_submit: SubmitHandler,
+        answer: Answer,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -821,16 +1072,7 @@ impl Frame {
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer = Minibuffer::open(
-            prompt,
-            &text_style,
-            complete,
-            on_change,
-            on_submit,
-            on_cancel,
-            window,
-            cx,
-        );
+        let mut minibuffer = Minibuffer::open(prompt, &text_style, answer, on_cancel, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         // The strip is single-occupancy; a stale message after the prompt
@@ -846,28 +1088,34 @@ impl Frame {
         self.minibuffer.as_mut()
     }
 
-    pub(crate) fn refresh_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
         minibuffer.refresh(self, cx);
-        let on_change = minibuffer.on_change();
-        let input = minibuffer.input(cx);
         self.minibuffer = Some(minibuffer);
-        if let Some(on_change) = on_change {
-            on_change(self, &input, window, cx);
-        }
         cx.notify();
     }
 
     pub(crate) fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut minibuffer) = self.minibuffer.take() else {
+        let Some(minibuffer) = self.minibuffer.as_ref() else {
             return;
         };
+        if !minibuffer.has_answer() {
+            return;
+        }
+        if let Some(reason) = minibuffer.rejection(cx) {
+            self.echo(reason, StyleClass::SystemInfo, cx);
+            return;
+        }
+        let minibuffer = self.minibuffer.take().expect("the prompt is open");
+        let is_palette = minibuffer.is_palette();
         let prompt = minibuffer.prompt().to_owned();
-        minibuffer.accept_selected(window, cx);
         let secret = minibuffer.is_secret();
-        let (input, on_submit) = minibuffer.into_submission(cx);
+        let (input, submission) = minibuffer.into_submission(cx);
+        if is_palette && !input.trim().is_empty() {
+            self.last_palette_query = Some(input.clone());
+        }
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
             input: match secret {
@@ -876,7 +1124,7 @@ impl Frame {
             },
         });
         self.give_keyboard_back(window, cx);
-        on_submit(self, input, window, cx);
+        submission(self, window, cx);
         cx.notify();
     }
 
@@ -884,6 +1132,12 @@ impl Frame {
         let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
+        if minibuffer.is_palette() {
+            let input = minibuffer.input(cx);
+            if !input.trim().is_empty() {
+                self.last_palette_query = Some(input);
+            }
+        }
         rho_journal::record(rho_journal::Event::MinibufferCancelled {
             prompt: minibuffer.prompt().to_owned(),
             input: match minibuffer.is_secret() {
@@ -906,6 +1160,20 @@ impl Frame {
         }
     }
 
+    fn minibuffer_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.minibuffer.as_mut() else {
+            return;
+        };
+        if prompt.is_palette() {
+            if let Some(query) = self.last_palette_query.clone() {
+                prompt.set_input(query, window, cx);
+            }
+        } else {
+            prompt.select_by_delta(-1);
+        }
+        cx.notify();
+    }
+
     fn minibuffer_complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = &mut self.minibuffer {
             minibuffer.complete_selected(window, cx);
@@ -913,11 +1181,30 @@ impl Frame {
         }
     }
 
-    /// Enter on Home: the row under the cursor.
+    fn minibuffer_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.clear_input(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Enter on Desk: the row under the cursor.
     pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.home.read(cx).cursor_target(cx) {
-            HomeTarget::Address(address) => self.open(address, window, cx),
-            HomeTarget::None => {}
+        match self.desk.read(cx).cursor_target(cx) {
+            Some(DeskTarget::Card(address)) => {
+                if let Some(card) = self
+                    .hand()
+                    .cards
+                    .iter()
+                    .find(|card| card.address == address)
+                    .cloned()
+                {
+                    self.journal_deal(Some(&address), cx);
+                    self.open_card(card, window, cx);
+                }
+            }
+            Some(DeskTarget::Thread(address)) => self.open(address, window, cx),
+            None => {}
         }
     }
 
@@ -932,24 +1219,56 @@ impl Frame {
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        let mode = self
-            .mode_indicator
-            .read(cx)
-            .plain_mode(cx)
-            .unwrap_or_else(|| "normal".to_owned());
+        let mode = self.mode(window, cx);
         let mode_color = match mode.contains("insert") {
             true => status.warning,
             false => colors.terminal_ansi_bright_cyan,
         };
         let mode = mode_word(&mode);
-        let lamp = self.signals.lamp_on.then_some("●");
+        // Signal evaluation is deferred. Desk must not paint the lamp
+        // from the previous screen while that update is still pending.
+        let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
         let unwell = self.unwell_hosts();
+        let surface = self.current_surface();
+        let phone_titles = match layout {
+            Layout::Phone => Some(surface.phone_titles(cx)),
+            Layout::Desktop => None,
+        };
+        let surface_status = surface.status(cx).unwrap_or_default();
+        let measured = crate::phone::measure(text_style, window);
+        // The pairing hint is secondary to a surface that has already
+        // shed everything but the name of the work and its condition.
+        let show_phone_notice = phone_titles.as_ref().is_none_or(|titles| {
+            titles.len() < 2
+                || titles.last().is_none_or(|title| {
+                    let reserve = lamp
+                        .into_iter()
+                        .chain(unwell.as_deref())
+                        .chain(["unpaired", mode.as_str()])
+                        .map(|words| measured(words) + px(12.))
+                        .fold(px(0.), |sum, width| sum + width);
+                    crate::phone::fit_heading(
+                        title,
+                        &surface_status,
+                        window.viewport_size().width - reserve,
+                        &measured,
+                    )
+                    .0 == *title
+                })
+        });
+        let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
+            .then_some(match layout {
+                Layout::Desktop => Some("verdicts stay on this device until it is paired"),
+                Layout::Phone => show_phone_notice.then_some("unpaired"),
+            })
+            .flatten();
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.
         let right_words = lamp
             .into_iter()
             .chain(unwell.as_deref())
+            .chain(unpaired)
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
         let fit = |path: &str, state: &str| match layout {
@@ -970,15 +1289,21 @@ impl Frame {
         };
         // An echo is the answer to the key just pressed, so it takes the
         // line while it lasts. Otherwise the line is about what is in view:
-        // a card says which card and why; anything else says its name.
-        let left: AnyElement = match (&self.echo, self.card_in_view(cx)) {
+        // a surface that is a card says which card and why; anything else,
+        // a list or results included, says its own name, whatever card
+        // the row under the point belongs to.
+        let own_card = self
+            .card_in_view(cx)
+            .filter(|address| address == self.current_address());
+        let left: AnyElement = match (&self.echo, own_card) {
             (Some(echo), _) => div()
                 .text_color(status.info)
-                .child(echo.text().to_owned())
+                .child(fit("", echo.text()).1)
                 .into_any_element(),
             (None, Some(address)) => {
                 let card = self.card_for(&address, cx);
-                let (heading, label) = fit(&card.heading(), &card.label);
+                let heading = surface.heading(cx).unwrap_or_else(|| card.heading());
+                let (heading, label) = fit(&heading, &card.label);
                 div()
                     .flex()
                     .flex_row()
@@ -987,18 +1312,47 @@ impl Frame {
                     .child(div().text_color(status.warning).child(label))
                     .into_any_element()
             }
-            (None, None) => div()
-                .child(fit(&self.current_surface().title(cx), "").0)
-                .into_any_element(),
+            (None, None) => {
+                let (title, status) = if let Some(titles) = phone_titles {
+                    titles
+                        .iter()
+                        .map(|title| (title, fit(title, &surface_status)))
+                        .find_map(|(title, (fitted, status))| {
+                            (fitted == *title).then_some((fitted, status))
+                        })
+                        .unwrap_or_else(|| {
+                            fit(titles.last().map_or("", String::as_str), &surface_status)
+                        })
+                } else {
+                    fit(&surface.title(cx), &surface_status)
+                };
+                div()
+                    .flex()
+                    .gap_3()
+                    .min_w_0()
+                    .child(div().truncate().child(title))
+                    .children((!status.is_empty()).then(|| div().flex_none().child(status)))
+                    .into_any_element()
+            }
         };
+        // A host that is away outranks the notice, which is cut first when
+        // the line is short.
         let right = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .items_center()
             .gap_3()
-            .children(lamp.map(|lamp| div().text_color(status.warning).child(lamp)))
-            .children(unwell.map(|text| div().text_color(status.error).child(text)))
-            .child(div().text_color(mode_color).child(mode));
+            .children(lamp.map(|lamp| div().flex_none().text_color(status.warning).child(lamp)))
+            .children(unwell.map(|text| div().flex_none().text_color(status.error).child(text)))
+            .children(unpaired.map(|text| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .child(text)
+            }))
+            .child(div().flex_none().text_color(mode_color).child(mode));
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -1030,6 +1384,43 @@ impl Frame {
             .into_any_element()
     }
 
+    /// The mode the keys are in. The minibuffer and global idea strip
+    /// always type; the mode indicator follows the active surface editor.
+    pub(crate) fn mode(&self, window: &Window, cx: &App) -> String {
+        let idea = self.idea_editor();
+        if idea
+            .as_ref()
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+        {
+            return "insert".to_owned();
+        }
+        // A surface with a mode of its own says it while it has the keys;
+        // a menu or a prompt over it is the editor's to say.
+        if self.menu.is_none() && self.minibuffer.is_none() {
+            match self.current_surface().mode(cx) {
+                Some(Mode::Normal) => return "normal".to_owned(),
+                Some(Mode::Insert) => return "insert".to_owned(),
+                None => {}
+            }
+        }
+        let typing = self
+            .minibuffer
+            .as_ref()
+            .map(|minibuffer| minibuffer.editor().clone())
+            .into_iter()
+            .chain(self.current_surface().editor(cx))
+            .any(|editor| {
+                editor.focus_handle(cx).is_focused(window) && !editor.read(cx).use_modal_editing()
+            });
+        if typing {
+            return "insert".to_owned();
+        }
+        self.mode_indicator
+            .read(cx)
+            .plain_mode(cx)
+            .unwrap_or_else(|| "normal".to_owned())
+    }
+
     fn unwell_hosts(&self) -> Option<String> {
         let (name, status) = self.hosts.worst_status()?;
         let unwell = self
@@ -1043,43 +1434,47 @@ impl Frame {
                 self.hosts.len()
             ));
         }
-        let subject = match self.hosts.len() > 1 {
-            true => format!("{name} "),
-            false => String::new(),
-        };
+        // Named even when it is the only host: `reconnecting` alone does
+        // not say what is away.
         match status {
             HostStatus::Online => None,
-            status => Some(format!("{subject}{}", status_words(&status))),
+            status => Some(format!("{name} · {}", status.label())),
         }
     }
 }
 
+/// The verdict menu's rows that need no card: take back the last verdict,
+/// and deal the next card.
+fn push_deal_rows(rows: &mut Rows) {
+    rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
+        frame.undo_verdict(window, cx)
+    }));
+    rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
+        frame.pull_card(window, cx)
+    }));
+}
+
 /// How long `target` sleeps: a unit, and the count typed before it.
-pub(crate) fn snooze_rows(target: &Address) -> Rows {
-    let mut snooze = Rows::new("snooze for").counted();
-    for (key, description, unit) in [
-        ("m", "minutes", SnoozeUnit::Minutes),
-        ("h", "hours", SnoozeUnit::Hours),
-        ("d", "days", SnoozeUnit::Days),
-        ("w", "weeks", SnoozeUnit::Weeks),
+pub(crate) fn snooze_rows(target: &Address, phone: bool) -> Rows {
+    let mut snooze = Rows::new("snooze").counted();
+    for (key, singular, plural, unit) in [
+        ("m", "minute", "minutes", SnoozeUnit::Minutes),
+        ("h", "hour", "hours", SnoozeUnit::Hours),
+        ("d", "day", "days", SnoozeUnit::Days),
+        ("w", "week", "weeks", SnoozeUnit::Weeks),
     ] {
         let target = target.clone();
         snooze.push(Row::counted(
             key,
-            description,
+            if phone {
+                format!("snooze for 1 {singular}")
+            } else {
+                plural.to_owned()
+            },
             move |frame, count, window, cx| frame.snooze(&target, unit, count, window, cx),
         ));
     }
     snooze
-}
-
-fn status_words(status: &HostStatus) -> String {
-    match status {
-        HostStatus::Connecting => "connecting".to_owned(),
-        HostStatus::Online => "online".to_owned(),
-        HostStatus::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
-        HostStatus::Disconnected(reason) => format!("disconnected · {reason}"),
-    }
 }
 
 /// The status line's mode word: three letters, the way helix does it, so
@@ -1125,20 +1520,27 @@ impl Focusable for Frame {
 
 impl Render for Frame {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = self.active_editor(cx);
+        let editor = self.idea_editor().unwrap_or_else(|| self.active_editor(cx));
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
         let layout = Layout::of(window.viewport_size().width);
+        if self.desk_in_view() {
+            self.sync_desk_idea(layout, cx);
+        }
+        let inset = FRAME_PADDING;
         let frame = div()
             .id("rho-frame")
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .p(px(2.))
+            .p(inset)
             .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .key_context(crate::KEY_CONTEXT)
+            .capture_any_mouse_down(
+                cx.listener(|this, _: &gpui::MouseDownEvent, _, _| this.note_input()),
+            )
             .on_action(cx.listener(|this, _: &keys::Back, window, cx| this.back(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::Forward, window, cx| this.forward_or_deal(window, cx)),
@@ -1151,14 +1553,47 @@ impl Render for Frame {
                 this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
+                if this.desk_in_view() {
+                    this.pull_card(window, cx);
+                } else {
+                    this.verdict_menu(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keys::Desk, window, cx| this.toggle_desk(window, cx)))
             .on_action(
-                cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
-                    this.verdict_menu(window, cx)
+                cx.listener(|this, _: &keys::PromptIdea, window, cx| this.prompt_idea(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &keys::SendIdea, window, cx| this.send_idea(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &keys::CancelIdea, window, cx| this.cancel_idea(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &keys::RedoIdeaOrUndoVerdict, window, cx| {
+                    if this.desk.read(cx).on_draft(cx) {
+                        this.active_editor(cx).update(cx, |editor, cx| {
+                            editor.redo(&editor::actions::Redo, window, cx);
+                        });
+                    } else {
+                        this.undo_verdict(window, cx);
+                    }
                 }),
             )
-            .on_action(cx.listener(|this, _: &keys::Home, window, cx| this.toggle_home(window, cx)))
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
-            .on_action(cx.listener(|this, _: &keys::FindAddress, window, cx| this.find(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
+                this.search(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchBackward, window, cx| {
+                this.search(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchNext, window, cx| {
+                this.search_again(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &keys::SearchPrevious, window, cx| {
+                this.search_again(true, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &keys::UndoVerdict, window, cx| {
                     this.undo_verdict(window, cx)
@@ -1178,28 +1613,48 @@ impl Render for Frame {
             .on_action(cx.listener(|this, _: &keys::MinibufferPrevious, _, cx| {
                 this.minibuffer_select(-1, cx)
             }))
+            .on_action(cx.listener(|this, _: &keys::MinibufferUp, window, cx| {
+                this.minibuffer_up(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
+                    if let Some(prompt) = &mut this.minibuffer {
+                        prompt.delete_word(window, cx);
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &keys::MinibufferComplete, window, cx| {
                     this.minibuffer_complete(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
+                this.minibuffer_clear(window, cx);
+            }))
             .child(self.render_status_line(&text_style, layout, window, cx));
+        let minibuffer = self.minibuffer.as_ref().map(|minibuffer| {
+            minibuffer.render(
+                &text_style,
+                layout,
+                window.viewport_size().width - inset * 2.,
+                window,
+                cx,
+            )
+        });
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
             let bar = self.render_phone_bar(window, cx);
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
                 .child(body)
-                .children(
-                    self.minibuffer
-                        .as_ref()
-                        .map(|minibuffer| minibuffer.render(&text_style, cx)),
-                )
+                .children(self.render_idea(&text_style, layout, cx))
+                .children(minibuffer)
                 .child(bar)
                 .children(sheet);
         }
         frame
             .child(div().flex_1().min_h_0().w_full().child(surface.view()))
+            .children(self.render_idea(&text_style, layout, cx))
             // The menu, pinned to the bottom edge and drawn over the buffer
             // rather than in it: nothing reflows, and the point stays where
             // the reader left it.
@@ -1226,10 +1681,6 @@ impl Render for Frame {
                         )),
                     )
             }))
-            .children(
-                self.minibuffer
-                    .as_ref()
-                    .map(|minibuffer| minibuffer.render(&text_style, cx)),
-            )
+            .children(minibuffer)
     }
 }

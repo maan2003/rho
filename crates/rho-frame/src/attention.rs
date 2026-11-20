@@ -3,21 +3,23 @@
 //! What the user says lives in the ledger, which syncs it sealed between
 //! their devices through the hosts: facts, every one kept, a note's text
 //! among them. The dealer reads them with what every system claims
-//! into the hand Home shows and a pull deals from. A verdict is a fact the
-//! user said; a system may do something of its own about it too (Slack
-//! moves its cursor), and hands back how to undo that.
+//! into the hand the desk shows and a pull deals from. A verdict is a fact the
+//! user said, and undo retracts the fact.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedReceiver;
+use gpui::{Context, Window};
 use rho_dealer::facts::{Device, Entry, EntryId, Fact, Seen};
 use rho_dealer::{Address, Marks, Skips, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
-use rho_ledger::{Channel, Item, Ledger, Secret};
+use rho_ledger::{Channel, Item, Ledger, Pairing, Secret};
+use rho_window::style::StyleClass;
 
 use crate::frame::Frame;
-use crate::system::Reversal;
+use crate::minibuffer::{Candidate, token_start};
 
 /// Something the user says: a fact, or a note's new text or state.
 #[derive(Clone, Debug)]
@@ -68,20 +70,12 @@ impl Verdict {
     }
 }
 
-/// What `shift-u` takes back: what a verdict said, and what it did
-/// outside the ledger.
+/// What `shift-u` takes back.
 pub struct Undo {
-    /// Which verdict this is, in the order they were taken.
-    pub sequence: u64,
     pub verb: String,
-    /// What takes back what it said.
     pub takeback: Vec<Takeback>,
-    /// The address the verdict was on, dealt again by the undo, and what
-    /// the journal called the verdict. `None` for a batch with no card of
-    /// its own.
-    pub card: Option<(Address, rho_journal::DealerVerdict)>,
-    /// What the systems did about it, undone in order.
-    pub reversals: Vec<Reversal>,
+    pub address: Address,
+    pub verdict: rho_journal::DealerVerdict,
 }
 
 pub struct Attention {
@@ -91,7 +85,6 @@ pub struct Attention {
     pub marks: Marks,
     pub skips: Skips,
     undo: Vec<Undo>,
-    next_undo: u64,
 }
 
 impl Attention {
@@ -108,18 +101,13 @@ impl Attention {
             marks,
             skips: Skips::default(),
             undo: Vec::new(),
-            next_undo: 0,
         };
         (attention, events)
     }
 
-    /// Keeps a verdict for `shift-u`, numbered after every one before it.
-    pub fn push_undo(&mut self, mut undo: Undo) -> u64 {
-        undo.sequence = self.next_undo;
-        self.next_undo += 1;
-        let sequence = undo.sequence;
+    /// Keeps a verdict for `shift-u`.
+    pub fn push_undo(&mut self, undo: Undo) {
         self.undo.push(undo);
-        sequence
     }
 
     pub fn pop_undo(&mut self) -> Option<Undo> {
@@ -135,8 +123,18 @@ impl Attention {
         &self.streams
     }
 
+    pub fn pairing(&self) -> Pairing {
+        self.streams.ledger().pairing()
+    }
+
     pub fn secret(&self) -> Option<Secret> {
         self.streams.ledger().secret()
+    }
+
+    /// Takes the phrase the user typed, and everything the other devices
+    /// wrote that it opens.
+    pub fn pair(&self, secret: Secret) -> anyhow::Result<()> {
+        futures::executor::block_on(self.streams.set_secret(secret))
     }
 
     /// Says `writes` on this device, and returns what takes each back and
@@ -213,13 +211,10 @@ impl Attention {
                     )
                 )],
             ),
-            LedgerEvent::NeedsKey => (
-                BTreeSet::new(),
-                vec![
-                    "ledger: other devices have written marks; `space s s` enters the secret phrase they share"
-                        .to_owned(),
-                ],
-            ),
+            // The status line says it for as long as it lasts.
+            LedgerEvent::NeedsKey => (BTreeSet::new(), Vec::new()),
+            // The frame shows it, once.
+            LedgerEvent::SecretMade(_) => (BTreeSet::new(), Vec::new()),
         }
     }
 
@@ -242,6 +237,108 @@ impl Frame {
     /// the user typed.
     pub fn marks(&self) -> &Marks {
         &self.attention.marks
+    }
+
+    pub(crate) fn ledger_event(
+        &mut self,
+        event: LedgerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let LedgerEvent::SecretMade(secret) = &event {
+            self.show_secret(
+                *secret,
+                "write down your secret phrase · it pairs your other devices · enter:",
+                window,
+                cx,
+            );
+        }
+        let (touched, said) = self.attention.ledger_event(event);
+        for line in said {
+            self.echo(&line, StyleClass::SystemInfo, cx);
+        }
+        self.marks_moved(touched, cx);
+        // Whether this device is paired shows on the status line.
+        cx.notify();
+    }
+
+    /// The phrase on the prompt line, for the user to write down: when the
+    /// first device makes it, and by name (`show my secret phrase`) on a
+    /// device that holds it. Enter or escape puts it away. The phrase is a
+    /// row under the question rather than the question itself, since the
+    /// journal keeps every question asked.
+    pub(crate) fn show_secret(
+        &mut self,
+        secret: Secret,
+        question: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let phrase = Candidate {
+            value: secret.to_words(),
+            description: "your secret phrase".to_owned(),
+        };
+        self.open_prompt(
+            question,
+            Rc::new(move |_, _, _| vec![phrase.clone()]),
+            Rc::new(|_, _, _, _| {}),
+            window,
+            cx,
+        );
+        if let Some(minibuffer) = self.minibuffer_mut() {
+            minibuffer.set_secret();
+        }
+    }
+
+    /// `pair this device`: asks for the phrase another device made, word
+    /// by word with completion. A phrase that is wrong asks again with
+    /// what was typed, and says what is wrong with it.
+    pub(crate) fn prompt_pair(
+        &mut self,
+        typed: String,
+        problem: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = match problem {
+            Some(problem) => format!("secret phrase ({problem}):"),
+            None => "secret phrase:".to_owned(),
+        };
+        self.open_prompt(
+            prompt,
+            Rc::new(|_, input, _| {
+                let word = &input[token_start(input)..];
+                if word.is_empty() {
+                    return Vec::new();
+                }
+                Secret::words_starting(&word.to_lowercase())
+                    .map(|word| Candidate {
+                        value: word.to_owned(),
+                        description: String::new(),
+                    })
+                    .collect()
+            }),
+            Rc::new(|frame, input, window, cx| {
+                let paired = Secret::from_words(&input)
+                    .and_then(|secret| frame.attention.pair(secret).map_err(|e| e.to_string()));
+                match paired {
+                    Ok(()) => frame.echo(
+                        "paired: this device holds what your other devices said and wrote",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                    Err(problem) => frame.prompt_pair(input, Some(problem), window, cx),
+                }
+                cx.notify();
+            }),
+            window,
+            cx,
+        );
+        if let Some(minibuffer) = self.minibuffer_mut() {
+            minibuffer.set_secret();
+            minibuffer.complete_last_word();
+            minibuffer.set_input(typed, window, cx);
+        }
     }
 }
 
