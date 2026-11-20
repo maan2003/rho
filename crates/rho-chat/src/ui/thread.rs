@@ -814,6 +814,10 @@ fn thread_rows(
 }
 
 impl ThreadView {
+    fn on_draft(&self, cx: &App) -> bool {
+        self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row
+    }
+
     fn has_draft(&self, cx: &App) -> bool {
         !self.draft.read(cx).text().trim().is_empty()
     }
@@ -966,7 +970,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
+        if self.on_draft(cx) {
             window.dispatch_action(Box::new(editor::actions::Redo), cx);
         } else {
             window.dispatch_action(Box::new(rho_frame::keys::UndoVerdict), cx);
@@ -1216,7 +1220,7 @@ impl Surface for ThreadView {
     /// A mail under the point anchors a tangent; the draft belongs to the
     /// whole thread rather than to any particular row.
     fn subject(&self, cx: &App) -> Subject {
-        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
+        if self.on_draft(cx) {
             return Subject::Own;
         }
         line_subject(
@@ -1234,6 +1238,10 @@ impl Surface for ThreadView {
             return Subject::Own;
         }
         self.subject(cx)
+    }
+
+    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn gpui::Action>> {
+        (!self.on_draft(cx)).then(|| Box::new(RedoDraftOrUndoVerdict) as Box<dyn gpui::Action>)
     }
 
     fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {

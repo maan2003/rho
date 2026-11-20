@@ -840,17 +840,21 @@ impl Frame {
     /// The frame's rows, the surface's, and each system's for the point.
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
+        let mut undo = Row::run("", "undo", |frame, window, cx| {
+            frame.undo_verdict(window, cx);
+        })
+        .window_wide();
+        undo.shortcut = self
+            .current_surface()
+            .undo_verdict_action(cx)
+            .map(|action| Shortcut::Action(Rc::from(action)));
         let mut rows = vec![
             Row::run("", "write an idea", |frame, window, cx| {
                 frame.prompt_idea(window, cx)
             })
             .bound_to(keys::PromptIdea)
             .window_wide(),
-            Row::run("", "undo", |frame, window, cx| {
-                frame.undo_verdict(window, cx)
-            })
-            .bound_to(keys::UndoVerdict)
-            .window_wide(),
+            undo,
             Row::menu("", "hosts", self.hosts_menu()).window_wide(),
         ];
         // Elsewhere the desk is already a recent place (with this key).
