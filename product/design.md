@@ -44,7 +44,6 @@ The built window puts the work in one editor. The top line tells the user where 
 - echo life · `4 s` · long enough to see the result of the last action before the heading returns.
 - age beat · `1 min` · refresh elapsed ages on the thread and its list without a ticking clock on every row.
 - card age step · nearest minute under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
-- result stays current · `3 days` · the built deal lowers an informational result until it goes away.
 - while needed · event-bound, no fixed duration · the signal or open choice stays while it is true or still takes the next action.
 - cut · immediate, no transition · hand the keys or the line to the newly active thing.
 - thumb settle · `180 ms` · finish the phone page move or return it to where it was.
@@ -210,10 +209,6 @@ lasts: `while needed`; at a higher crossing the chime sounds once, not on each r
 ## motion The ages catch up
 means: relative ages change in place as the work waits, without moving the user's point.
 lasts: `age beat` on thread summaries; `card age step` for the deal's words.
-
-## motion A result sinks
-means: in the built deal, an informational result loses urgency and finally leaves the hand; the row is ordered again, not faded with an animation.
-lasts: `result stays current`.
 
 ## motion A question or menu takes the keys
 means: the bottom strip or sheet is present while it can take a choice; a laptop menu covers the work instead of reflowing it.
