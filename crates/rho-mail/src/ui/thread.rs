@@ -1289,15 +1289,12 @@ impl Surface for ThreadView {
     }
 
     fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {
+        if !self.has_draft(cx) {
+            return None;
+        }
         let this = cx.entity();
         Some(Rc::new(move |window, cx| {
-            this.update(cx, |view, cx| {
-                if !view.has_draft(cx) {
-                    view.focus_draft(None, window, cx);
-                } else {
-                    view.send_only(&SendOnly, window, cx);
-                }
-            });
+            this.update(cx, |view, cx| view.send_only(&SendOnly, window, cx));
         }))
     }
 

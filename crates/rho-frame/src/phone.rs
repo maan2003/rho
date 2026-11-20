@@ -294,6 +294,13 @@ impl Button {
     }
 }
 
+/// Whether this is the card itself or a screen inspecting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCard {
+    Here,
+    Related,
+}
+
 /// What the bar is about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BarState {
@@ -301,8 +308,8 @@ struct BarState {
     composing_idea: bool,
     desk: bool,
     /// A waiting card is open.
-    card: bool,
-    /// The surface in view offers a `send` row.
+    card: Option<OpenCard>,
+    /// The surface in view has a draft to send.
     send: bool,
 }
 
@@ -318,15 +325,12 @@ fn buttons(state: BarState) -> Vec<Button> {
             ..
         } => vec![Cancel, Send],
         BarState { desk: true, .. } => vec![Menu, Open, More],
-        BarState {
-            card: true, send, ..
-        } => {
-            let mut buttons = vec![Back, Done, Snooze, More];
-            buttons.extend(send.then_some(Send));
-            buttons
-        }
-        BarState { send, .. } => {
-            let mut buttons = vec![Back, Desk, Menu];
+        BarState { card, send, .. } => {
+            let mut buttons = match card {
+                Some(OpenCard::Here) => vec![Back, Menu, Done, Snooze, More],
+                Some(OpenCard::Related) => vec![Back, Done, Snooze, More, Menu],
+                None => vec![Back, Desk, Menu],
+            };
             buttons.extend(send.then_some(Send));
             buttons
         }
@@ -597,7 +601,13 @@ impl Frame {
             desk: self.desk_in_view(),
             // Working in a terminal or shell keeps the navigation bar and
             // its Palette; that still offers the same related verdicts.
-            card: tools.is_empty() && self.phone_card(cx).is_some(),
+            card: (tools.is_empty() && self.phone_card(cx).is_some()).then(|| {
+                if surface.inspects_card() {
+                    OpenCard::Related
+                } else {
+                    OpenCard::Here
+                }
+            }),
             send: send.is_some(),
         };
         let colors = cx.theme().colors();
@@ -733,8 +743,8 @@ impl Frame {
     }
 
     /// The open menu as a sheet over the window: the same rows the desk
-    /// draws under the point, each a row a thumb can hit, and a tap off
-    /// the sheet dismisses it.
+    /// draws under the point, each a row a thumb can hit. The scrim and
+    /// bottom edge dismiss it; neither is part of the row hit area.
     pub(crate) fn render_menu_sheet(
         &self,
         text_style: &gpui::TextStyle,
@@ -753,8 +763,10 @@ impl Frame {
                 .text_color(colors.text_muted)
                 .child(label)
         };
+        let dismiss = || cx.listener(|this, _, window, cx| this.close_menu(window, cx));
         let header = div()
             .flex()
+            .flex_none()
             .flex_row()
             .items_center()
             .min_h(TARGET_HEIGHT)
@@ -763,10 +775,8 @@ impl Frame {
             .border_b_1()
             .border_color(colors.border_variant)
             .children((!open.under.is_empty()).then(|| {
-                target("rho-sheet-back", "‹ back").on_click(cx.listener(|this, _, window, cx| {
-                    this.menu_dismiss(window, cx);
-                    cx.stop_propagation();
-                }))
+                target("rho-sheet-back", "‹ back")
+                    .on_click(cx.listener(|this, _, window, cx| this.menu_dismiss(window, cx)))
             }))
             .child(
                 div()
@@ -779,10 +789,7 @@ impl Frame {
             .child(
                 target("rho-sheet-close", "close")
                     .justify_end()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_menu(window, cx);
-                        cx.stop_propagation();
-                    })),
+                    .on_click(dismiss()),
             );
         let rows = open.rows.rows.iter().enumerate().map(|(index, row)| {
             div()
@@ -816,29 +823,57 @@ impl Frame {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.click_menu_row(index, window, cx);
-                    cx.stop_propagation();
                 }))
         });
         let sheet = crate::minibuffer::bottom_strip(text_style, cx)
-            .id("rho-sheet")
+            .occlude()
             .max_h(gpui::relative(0.82))
-            .overflow_y_scroll()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(|_, _, cx| cx.stop_propagation())
             .child(header)
-            .children(rows);
+            .child(
+                div()
+                    .id("rho-sheet-rows")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            );
+        let cancel = crate::minibuffer::bottom_strip(text_style, cx)
+            .absolute()
+            .bottom_0()
+            .py_0()
+            .occlude()
+            .child(
+                target("rho-sheet-cancel", "cancel")
+                    .justify_center()
+                    .on_click(dismiss()),
+            );
         Some(
             div()
-                .id("rho-sheet-backdrop")
                 .track_focus(&self.menu_focus)
                 .absolute()
                 .inset_0()
-                .flex()
-                .flex_col()
-                .justify_end()
-                .bg(gpui::black().opacity(0.35))
-                .on_click(cx.listener(|this, _, window, cx| this.close_menu(window, cx)))
-                .child(sheet)
+                // Keep the scrim a sibling, not a click listener on the
+                // sheet's parent. A press outside can't arm a menu row.
+                .child(
+                    div()
+                        .id("rho-sheet-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(gpui::black().opacity(0.35))
+                        .on_click(dismiss()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bottom(TARGET_HEIGHT)
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .child(sheet),
+                )
+                // Cover the work's bar with a dismiss target, not a command row.
+                .child(cancel)
                 .into_any_element(),
         )
     }
@@ -961,13 +996,27 @@ mod tests {
             ..BarState::default()
         };
         assert_eq!(buttons(desk), [Menu, Open, More]);
-        assert_eq!(buttons(BarState { card: true, ..desk }), [Menu, Open, More]);
-        let thread = BarState {
-            card: true,
-            send: true,
+        assert_eq!(
+            buttons(BarState {
+                card: Some(OpenCard::Here),
+                ..desk
+            }),
+            [Menu, Open, More]
+        );
+        let card = BarState {
+            card: Some(OpenCard::Here),
             ..BarState::default()
         };
-        assert_eq!(buttons(thread), [Back, Done, Snooze, More, Send]);
+        assert_eq!(buttons(card), [Back, Menu, Done, Snooze, More]);
+        let thread = BarState { send: true, ..card };
+        assert_eq!(buttons(thread), [Back, Menu, Done, Snooze, More, Send]);
+        assert_eq!(
+            buttons(BarState {
+                card: Some(OpenCard::Related),
+                ..BarState::default()
+            }),
+            [Back, Done, Snooze, More, Menu]
+        );
         assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
         assert_eq!(
             buttons(BarState {

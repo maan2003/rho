@@ -119,7 +119,7 @@ purpose: offer a few keyed choices without taking the user away from the thing t
 looks: on a laptop an `emphasis` title and compact `menu column` grid sit in the `command strip` over the bottom of the work; `marked` keys lead each column. Available values in parentheses use `choice value`. On a phone `thumb target` rows start with their action, end with the key in `keys in motion`, and have `behind the sheet` over the work.
 states:
 - closed: the work fills its space, and no menu is visible.
-- open: title, actions, keys, and any values; on the phone the sheet has `close` at the top.
+- open: title, actions, keys, and any values; on the phone the sheet has `close` at the top and a full-width `cancel` at the bottom edge.
 - sub-menu: it takes the same place; the phone sheet adds `‹ back`.
 - empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
 used on: `window.Screen` wherever `window.Menu` opens, including verdicts in `mail.Thread` and `agents.Agent`. Desk does not offer verdicts.
@@ -141,11 +141,12 @@ purpose: give the thumb the actions that the current place can use.
 looks: one `thumb target` band with a `seam` above and equally wide buttons; each `thumb icon` sits over its `thumb label`, both in `quiet`.
 states:
 - desk: menu, open, and more; open deals the top card and a tap on a row opens that row.
-- card open: back, done, snooze, and more; send is added where there is a draft. Verdicts land on the card, including from the agent transcript that belongs to it.
+- card open: back, menu, done, snooze, and more; send appears only when there is a draft.
+- agent transcript for an open card: back, done, snooze, more, and menu. Verdicts land on the card.
 - reading elsewhere: back, desk, and menu; send is added where there is a draft.
 - writing an idea: cancel and send.
 - prompt: only cancel and enter.
-- menu sheet: the sheet takes taps in front of the work and bar.
+- menu sheet: the sheet takes taps in front of the work, and its cancel target covers the bar.
 used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `mail.Thread`, `agents.Agent`, and `window.Palette`.
 form: [Desk](design/phone-desk.png), [card with send](design/phone-card.png), [transcript without send](design/phone-agent.png), and [palette](design/phone-prompt.png).
 

@@ -53,7 +53,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 | Render | Capture |
 | --- | --- |
 | [Project with wrapped unread row](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. This is the existing project list, not the agreed Desk narrowed to a project. |
-| [Verdict sheet over the card](phone-menu.png) | From the project, `form_way phone input 'key:tab' 'wait:550'`; tap Desk's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 545 1640; sleep .55; form_shot phone menu`. |
+| [Verdict sheet over the card](phone-menu.png) | From the project, `form_way phone input 'key:tab' 'wait:550'`; tap Desk's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55; form_shot phone menu`. |
 | [Blank palette over the card](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:550' 'text::' 'wait:600'; form_shot phone prompt`. |
 
 For the card without the `unpaired` notice, reuse the laptop identity:
@@ -66,14 +66,14 @@ form_way phone tree
 form_way phone input 'key:tab' 'wait:600'
 form_way phone click 390 1640
 sleep .7
-form_shot phone card
+form_shot phone card-empty
 # The second mail header is the project's ask. Tap it to inspect the writing step.
 form_way phone click 165 203
 sleep .75
 form_shot phone agent
 ```
 
-This makes the [phone card](phone-card.png) and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action.
+This makes the phone card and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action. To capture a [card with `send`](phone-card.png), return to the card, tap the draft separator, and type a reply without sending it before taking the screenshot.
 
 ## Desk on laptop and phone: waiting and moving together
 
