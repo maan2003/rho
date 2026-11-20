@@ -3,8 +3,8 @@
 `end_turn` and `archive`.
 
 A tool runs on the notebook thread of the agent that calls it. What it
-reports, it prints, so the model sees it with its cell, and returns as an
-awaitable string, so the model may `await` it or not.
+reports, it prints, so the model sees it with its cell. A host call runs
+immediately and may also be awaited for its result.
 """
 
 import asyncio
@@ -28,6 +28,27 @@ class Reply(str):
     def __await__(self):
         return str(self)
         yield
+
+
+class _MessageId(int):
+    def __await__(self):
+        return int(self)
+        yield
+
+
+class _MailHits(list):
+    def __await__(self):
+        return list(self)
+        yield
+
+
+class _Done:
+    def __await__(self):
+        return None
+        yield
+
+
+_DONE = _Done()
 
 
 def report(text: str) -> Reply:
@@ -123,19 +144,22 @@ class Chat:
         message = rho_chat.post(self._agent, int(thread), text, mentions)
         if all(address != rho_chat.USER for address, _ in mentions):
             print(f"Posted #{message} in #{int(thread)}.")
-        return message
+        return _MessageId(message)
 
     def status(self, thread, text):
         """Replace the thread's one-line status; pass "" to clear it."""
         _host(_rho.thread_status, self._agent, int(thread), str(text))
+        return _DONE
 
     def edit(self, message, text):
         """Replace the body of your mail #message; an answered ask is fixed."""
         _host(_rho.edit_message, self._agent, int(message), _text(text))
+        return _DONE
 
     def delete(self, message):
         """Remove your mail #message; an answered ask is fixed."""
         _host(_rho.delete_message, self._agent, int(message))
+        return _DONE
 
     def search(self, query, *, project=None, limit=20):
         """Find mail by words in subjects and bodies, newest first. Set
@@ -146,7 +170,7 @@ class Chat:
             print(f"#{hit['thread']} {_label_text(hit['subject'])} · mail #{hit['message']} · {hit['excerpt']}")
         if not results:
             print("No mail found.")
-        return results
+        return _MailHits(results)
 
     def fork(self, message, text, *, mention=None, kind=None):
         """Start a tangent under mail #message, then follow it; returns
@@ -154,7 +178,7 @@ class Chat:
         thread = int(message)
         self.post(thread, text, mention=mention, kind=kind)
         rho_chat.join(thread, self._agent)
-        return thread
+        return _MessageId(thread)
 
     def start(self, stream, text, *, mention=None, kind=None):
         """Start a thread for a new subject in `stream`, a root of the chat
