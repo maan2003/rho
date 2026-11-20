@@ -197,7 +197,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - Address kinds: `thread:<endpoint>/<id>`, `agent:<id>` with its
   terminals, shell and desktops as parts under it (`agent:<id>/term/<n>`,
   `agent:<id>/shell`, `agent:<id>/desktop/<name>`), `note:<uuid>`,
-  `slack:<ws>/...`, `usage:<chart>/<days>`. The forms that no one crate owns are Linked Specs
+  `slack:<ws>/...`, `usage:<chart>/<days>`, `page:<uuid>`. The forms that no one crate owns are Linked Specs
   beside their crates.
 - iroh is the one transport. A host always binds its endpoint; a peer on
   the same machine reaches it over the IPC transport
@@ -250,7 +250,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   (`rho-claude-usage`) and its quota observations, which the removal
   had left in the database: wire epoch 52. `rho claude-account usage`
   prints the same per-account windows for a timer, with the five-hour
-  session window when the account's screen shows one. The page system stays
-  gone, and so do the browser crates (`rho-browser`,
-  `rho-browser-wayland`, the extension); `a79f5090` is the last commit
-  that has them, for when the browser comes back under chat.
+  session window when the account's screen shows one. The page system and
+  the browser crates (`rho-browser`, `rho-browser-wayland`, the
+  extension) came back on 2026-11-19, revived from `a79f5090`, for
+  `browser.Page`: a link in a message opens as a page through the
+  frame's `open_link`, so chat and Slack never name the browser.

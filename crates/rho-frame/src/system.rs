@@ -17,6 +17,7 @@ use rho_agent_types::EndpointId;
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
+use url::Url;
 
 use crate::attention::Verdict;
 use crate::frame::Point;
@@ -112,6 +113,12 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    /// Opens a web link the user chose in a message, when this system is
+    /// the one that shows the web; `false` leaves it to the next.
+    fn open_link(&mut self, _url: &Url, _cx: &mut Context<Self>) -> bool {
+        false
+    }
+
     /// What an address of this system is called and where it is, for a
     /// card no claim named.
     fn name(&self, _address: &Address, _cx: &App) -> Option<(String, String)> {
@@ -182,6 +189,7 @@ trait SystemHandle {
         trace: Option<&mut Trace>,
         cx: &App,
     ) -> Vec<Claim>;
+    fn open_link(&self, url: &Url, cx: &mut App) -> bool;
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
     fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
@@ -229,6 +237,10 @@ impl<S: System> SystemHandle for Entity<S> {
         cx: &App,
     ) -> Vec<Claim> {
         self.read(cx).claims(marks, now, trace, cx)
+    }
+
+    fn open_link(&self, url: &Url, cx: &mut App) -> bool {
+        self.update(cx, |system, cx| system.open_link(url, cx))
     }
 
     fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
@@ -304,6 +316,10 @@ impl AnySystem {
         cx: &App,
     ) -> Vec<Claim> {
         self.0.claims(marks, now, trace, cx)
+    }
+
+    pub fn open_link(&self, url: &Url, cx: &mut App) -> bool {
+        self.0.open_link(url, cx)
     }
 
     pub fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {

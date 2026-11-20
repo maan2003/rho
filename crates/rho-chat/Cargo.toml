@@ -35,6 +35,7 @@ ui = [
   "dep:rho-transcript",
   "dep:rho-window",
   "dep:theme",
+  "dep:url",
 ]
 
 [dependencies]
@@ -61,6 +62,7 @@ multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true 
 rho-frame = { workspace = true, optional = true }
 rho-transcript = { workspace = true, optional = true }
 rho-window = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 
 [dev-dependencies]

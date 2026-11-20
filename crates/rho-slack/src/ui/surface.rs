@@ -222,6 +222,18 @@ impl SlackSurface {
         }
     }
 
+    /// A web link in a message opens as a page in the window.
+    fn open_link(&self, link: &str, cx: &mut App) {
+        match url::Url::parse(link) {
+            Ok(url) => self.frame.open_link(url, cx),
+            Err(error) => self.frame.echo(
+                format!("slack: {link} is no link: {error}"),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
+    }
+
     fn open_file(&self, file: &FileSummary, cx: &mut App) {
         self.session
             .update(cx, |session, cx| session.open_file(file, cx));
@@ -263,7 +275,7 @@ impl SlackSurface {
                 if let Some(interaction) = view.update(cx, |view, cx| view.cursor_interaction(cx)) {
                     let action = &interaction.action;
                     match (action.element_type.as_str(), action.payload["url"].as_str()) {
-                        ("button", Some(url)) => cx.open_url(url),
+                        ("button", Some(url)) => self.open_link(url, cx),
                         ("button", None) if action.confirmation.is_none() => {
                             view.update(cx, |view, cx| view.run_interaction(interaction, None, cx))
                         }
@@ -284,7 +296,7 @@ impl SlackSurface {
                     let archive = archive_target(self.session.read(cx).model(), &link);
                     match archive {
                         Some(target) => self.open_target(target, window, cx),
-                        None => cx.open_url(&link),
+                        None => self.open_link(&link, cx),
                     }
                     return;
                 }

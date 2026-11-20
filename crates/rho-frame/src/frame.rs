@@ -277,6 +277,19 @@ impl Frame {
         cx.notify();
     }
 
+    /// Opens a web link the user chose: the system that shows the web
+    /// takes it.
+    pub fn open_link(&mut self, url: url::Url, cx: &mut Context<Self>) {
+        let taken = self
+            .systems
+            .clone()
+            .into_iter()
+            .any(|system| system.open_link(&url, cx));
+        if !taken {
+            self.echo(&format!("nothing opens {url}"), StyleClass::SystemInfo, cx);
+        }
+    }
+
     pub fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open(Self::home_address(), window, cx);
     }
