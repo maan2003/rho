@@ -38,7 +38,9 @@ fn main() {
         eprintln!("skipping shell_e2e: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    let program = std::env::current_exe().unwrap();
+    // Not `current_exe()`: the workset view replaces `/src`, which may hold
+    // the build directory. The kernel's link reaches this binary anyway.
+    let program = std::path::PathBuf::from("/proc/self/exe");
     common::run(
         "PS1=\'rho-test> \'\nPROMPT_COMMAND=\'export RHO_TEST_CONFIG_HOOK=fired\'\ntrap \'printf fired >/src/brush-exit-hook\' EXIT\n",
         move || shell_end_to_end_over_registry(program),

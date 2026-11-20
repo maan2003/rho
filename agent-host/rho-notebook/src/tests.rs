@@ -18,6 +18,21 @@ async fn notebook() -> (Notebook, Arc<Notify>) {
     )
 }
 
+/// A notebook whose ended commands count against `ended_logs`, not the
+/// process's.
+async fn notebook_sharing(
+    ended_logs: &'static crate::source::EndedLogs,
+) -> (Notebook, Arc<Notify>) {
+    let shell = ShellTools::in_directory("/tmp".into(), PathOverrides::default());
+    let wake = Arc::new(Notify::new());
+    (
+        Notebook::sharing(ended_logs, shell, Vec::new(), Arc::clone(&wake), None)
+            .await
+            .unwrap(),
+        wake,
+    )
+}
+
 async fn until(wake: &Notify, mut done: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while !done() {
@@ -223,15 +238,12 @@ async fn a_background_task_outlives_its_return() {
         "{text}"
     );
     finished(&wake, &cell).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(
-        notebook
-            .report()
-            .unwrap()
-            .render()
-            .text
-            .contains("Output:\nlate")
-    );
+    until(&wake, || {
+        (notebook.facts().iter()).any(|f| f.kind == crate::Kind::Task && f.finished.is_some())
+    })
+    .await;
+    let text = notebook.report().unwrap().render().text;
+    assert!(text.contains("Output:\nlate"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -340,8 +352,14 @@ async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
 #[tokio::test(flavor = "multi_thread")]
 async fn notebook_retention_discards_oldest_command_log() {
     let (notebook, wake) = notebook().await;
-    let cell =
-        notebook.run("jobs = [command('head -c 4194304 /dev/zero') for _ in range(14)]".into());
+    // The oldest has ended before the others fill the notebook's 50 MB: the
+    // command still writing is never the one dropped, so an oldest that
+    // starts late would keep its log.
+    let cell = notebook.run(
+        "oldest = command('head -c 4194304 /dev/zero')\nawait oldest\n\
+         jobs = [command('head -c 4194304 /dev/zero') for _ in range(13)]"
+            .into(),
+    );
     finished(&wake, &cell).await;
     let oldest = notebook
         .facts()
@@ -356,22 +374,12 @@ async fn notebook_retention_discards_oldest_command_log() {
     assert!(text.contains("retained output is gone"), "{text}");
 }
 
-fn open_output_files() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-        .filter(|target| target.to_string_lossy().contains("notebook-output"))
-        .count()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_process_keeps_logs_of_its_newest_ended_commands_across_notebooks() {
-    // Nextest runs each test in its own process, so the cap and the
-    // descriptor count are this test's alone.
-    crate::source::keep_ended_logs(2);
-    let (a, a_wake) = notebook().await;
-    let (b, b_wake) = notebook().await;
-    let before = open_output_files();
+    // A scope of its own: other tests' notebooks share the process's.
+    let ended_logs = Box::leak(Box::new(crate::source::EndedLogs::keeping(2)));
+    let (a, a_wake) = notebook_sharing(ended_logs).await;
+    let (b, b_wake) = notebook_sharing(ended_logs).await;
     // End order a1, a2, fast, slow, a3: in b, the command started first ends
     // last.
     for (notebook, wake, code) in [
@@ -390,7 +398,7 @@ async fn the_process_keeps_logs_of_its_newest_ended_commands_across_notebooks() 
         let cell = notebook.run(code.into());
         finished(wake, &cell).await;
     }
-    assert_eq!(open_output_files() - before, 2);
+    assert_eq!(a.open_logs() + b.open_logs(), 2);
     let _ = (a.report(), b.report());
     for (notebook, wake, job, gone) in [
         (&a, &a_wake, "a2", true),
