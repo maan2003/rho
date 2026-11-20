@@ -286,45 +286,25 @@ impl DeskView {
             DeskKey::WaitHeader,
             format!("{} wait", self.rows.wait_count),
         )];
-        let subject_width = self
-            .rows
-            .waiting
-            .iter()
-            .chain(&self.rows.moving)
-            .map(|row| row.subject.chars().count())
-            .max()
-            .unwrap_or(0)
-            .min(40)
-            .min(self.width / 3);
-        let project_width = self
-            .rows
-            .waiting
-            .iter()
-            .chain(&self.rows.moving)
-            .map(|row| row.project.chars().count())
-            .max()
-            .unwrap_or(0)
-            .min(self.width / 3);
-        let words_width = self.width.saturating_sub(subject_width + project_width + 4);
+        let field_width = |field: fn(&DeskRow) -> &str| {
+            self.rows
+                .waiting
+                .iter()
+                .chain(&self.rows.moving)
+                .map(|row| first_line(field(row)).chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let subject_width = field_width(|row| &row.subject).min(40);
+        let project_width = field_width(|row| &row.project).min(30);
+        let words_width = field_width(|row| &row.words).min(42);
+        let compact = subject_width + project_width + words_width + 4 > self.width;
         let row_item = |row: &DeskRow| {
-            let class = if matches!(row.target, DeskTarget::Card(_)) {
-                DeskClass::Label
+            if compact {
+                row.compact(self.width, project_width)
             } else {
-                DeskClass::Muted
-            };
-            let cells = [
-                (
-                    cut(&row.subject, subject_width),
-                    DeskClass::Title,
-                    subject_width,
-                ),
-                (cut(&row.words, words_width), class, words_width),
-                (cut(&row.project, project_width), DeskClass::Muted, 0),
-            ];
-            let (text, styles) = columns(&cells);
-            Item::new(row.key.clone(), text)
-                .with_styles(styles)
-                .with_lines(vec![row.target.clone()])
+                row.wide(subject_width, words_width, project_width)
+            }
         };
         items.extend(self.rows.waiting.iter().map(row_item));
         if !self.rows.moving.is_empty() {
@@ -371,14 +351,90 @@ impl Focusable for DeskView {
     }
 }
 
+impl DeskRow {
+    fn words_class(&self) -> DeskClass {
+        match self.target {
+            DeskTarget::Card(_) => DeskClass::Label,
+            DeskTarget::Thread(_) => DeskClass::Muted,
+        }
+    }
+
+    fn wide(
+        &self,
+        subject_width: usize,
+        words_width: usize,
+        project_width: usize,
+    ) -> Item<DeskKey, DeskClass, DeskTarget> {
+        let (text, styles) = columns(&[
+            (
+                cut(&self.subject, subject_width),
+                DeskClass::Title,
+                subject_width,
+            ),
+            (
+                cut_words(&self.words, words_width),
+                self.words_class(),
+                words_width,
+            ),
+            (cut(&self.project, project_width), DeskClass::Muted, 0),
+        ]);
+        Item::new(self.key.clone(), text)
+            .with_styles(styles)
+            .with_lines(vec![self.target.clone()])
+    }
+
+    fn compact(&self, width: usize, project_width: usize) -> Item<DeskKey, DeskClass, DeskTarget> {
+        // A narrow row is two lines, with the address by the subject and
+        // the card words or status below. Either line opens the same thing.
+        let project_width = project_width.min(width / 2);
+        let subject_width = width.saturating_sub(project_width + 2);
+        let (mut text, mut styles) = columns(&[
+            (
+                cut(&self.subject, subject_width),
+                DeskClass::Title,
+                subject_width,
+            ),
+            (cut(&self.project, project_width), DeskClass::Muted, 0),
+        ]);
+        text.push_str("\\n  ");
+        let start = text.len();
+        text.push_str(&cut_words(&self.words, width.saturating_sub(2)));
+        styles.push((self.words_class(), start..text.len()));
+        Item::new(self.key.clone(), text)
+            .with_styles(styles)
+            .with_lines(vec![self.target.clone(), self.target.clone()])
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
+}
+
+fn cut_words(text: &str, width: usize) -> String {
+    // Keep the age of long statuses legible even at the narrowest width.
+    let text = first_line(text);
+    if text.chars().count() > width
+        && let Some((words, age)) = text.rsplit_once(" · ")
+        && let Some(remaining) = width.checked_sub(age.chars().count() + 3)
+        && remaining > 0
+    {
+        format!("{} · {age}", cut(words, remaining))
+    } else {
+        cut(text, width)
+    }
+}
+
 fn cut(text: &str, width: usize) -> String {
-    let text = text.lines().next().unwrap_or_default();
+    let text = first_line(text);
     if text.chars().count() <= width {
         text.to_owned()
     } else if width == 0 {
         String::new()
     } else {
-        text.chars().take(width - 1).collect::<String>() + "…"
+        format!(
+            "{}…",
+            text.chars().take(width - 1).collect::<String>().trim_end()
+        )
     }
 }
 
@@ -486,6 +542,24 @@ mod tests {
         );
         assert_eq!(rows.waiting[1].project, "shoal@lab");
         assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(94)));
+    }
+
+    #[test]
+    fn a_narrow_row_keeps_the_project_and_status_age_and_opens_from_either_line() {
+        let thread = address(7);
+        let row = DeskRow {
+            key: DeskKey::Moving(thread.clone()),
+            subject: "Clock correction edge cases".into(),
+            words: "Replaying the slower timezone tests · 16m".into(),
+            project: "tide@lab".into(),
+            target: DeskTarget::Thread(thread),
+        };
+        let item = row.compact(30, 8);
+        assert_eq!(
+            item.text,
+            "Clock correction ed…  tide@lab\\n  Replaying the slowe… · 16m\\n"
+        );
+        assert_eq!(item.lines, [row.target.clone(), row.target]);
     }
 
     #[test]
