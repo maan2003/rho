@@ -297,10 +297,7 @@ mod tests {
                 &left,
                 "warm restart keeps the current screen"
             );
-            assert_eq!(
-                history.keys_forward().collect::<Vec<_>>(),
-                [&later]
-            );
+            assert_eq!(history.keys_forward().collect::<Vec<_>>(), [&later]);
             assert_eq!(
                 history.keys_back().cloned().collect::<Vec<_>>(),
                 [old.clone(), desk.clone()]
