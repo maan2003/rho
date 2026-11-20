@@ -14,6 +14,18 @@ serves: Keep the work moving.
 because: the user does not edit code by hand and must still know whether a result is right; the transcript shows every step, and the terminal, shell, and desktop let the user stand beside the agent.
 costs: a transcript is long, and the user reads it to find what went wrong.
 
+## journey An agent in trouble gets back on track
+goal: the user gets the agent back to work so its result comes.
+starts when: an agent stops or goes quiet.
+steps:
+1. the user learns of it without looking for it, `deal.Clear what waits`
+2. the user sees why in one glance, `Look into what an agent did`
+3. the user steers it, `Steer an agent`
+   - or the user tells it what to do in its thread, `chat.Answer an agent`
+4. the user gets the result after the agent carries on, `deal.Clear what waits`
+done when: the user sees the agent's result.
+day: Keep the work moving.
+
 ## concept Agent
 purpose: do a piece of the user's work on a host, in a thread the user can read and answer.
 principle: the user starts an agent from the message `fix the flaky test`; the agent joins that thread, reads the message first, works in its workset, and posts there; when it asks, the thread becomes a card.
@@ -40,7 +52,7 @@ The agent's screen is its transcript: everything it did, so the user can check i
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
-principle: an agent starts on `opus-high`, the default; the user wants a cheaper one for a small job, so they choose `set runtime…` and give it `sol-medium`.
+principle: an agent starts on `opus-high`, the default; the user wants a cheaper one for a small piece of work, so they choose `set runtime…` and give it `sol-medium`.
 sees: a name such as `sol-medium`, `opus-high`, or `fable-high`.
 
 ## concept Terminal
@@ -92,75 +104,79 @@ A desktop is also a place in `window.Palette`, as the agent's name and `desktop`
 shows: `Agent`, its transcript
 starts: `Look into what an agent did`, `Steer an agent`, `Work beside an agent`
 
-## job Start an agent from a message
+## flow Start an agent from a message
 day: Turn ideas into work.
-when: I have an idea, or a message in a thread is work I want an agent to do
+when: the user has an idea, or a message in a thread is work they want an agent to do
 want: have an agent at work on it, in the right place, with nothing asked that the product can know
 so that: the agent reads that message first and works in that thread
-flow:
-1. in a `chat.Channel`, press `i` and write the idea; the box reads `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`
-2. `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
-   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; answer `repository (url or host path):` or `directory on the host:` when asked; the next ideas in that channel ask nothing
+steps:
+1. in a `chat.Channel`, the user presses `i` and writes the idea; the box reads `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`
+2. the user presses `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
+   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; the user answers `repository (url or host path):` or `directory on the host:` when asked; the next ideas in that channel ask nothing
    - `ctrl-shift-enter` only sends, for a message that is not work
-3. for a message already in a thread, put the cursor on it, open the palette and choose `start agent, choosing where and runtime…`; it asks where and `runtime (opus-high):`, as does `send and start agent, choosing where and runtime…` for the box
+3. for a message already in a thread, the user puts the cursor on it, opens the palette and chooses `start agent, choosing where and runtime…`; it asks where and `runtime (opus-high):`, as does `send and start agent, choosing where and runtime…` for the box
 system: puts the agent where the channel's newest agent works, in that agent's workset, a copy of the repository of its own that others can join; runs it on the default runtime, `opus-high`, written in the product; sends the message first when it is still in the box, and starts the agent once the host has it.
 user: the words; where the agent works, once per channel; the runtime only by the rare path or `Agent.set runtime` afterwards.
 cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea
+reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
-## job Look into what an agent did
+## flow Look into what an agent did
 day: Keep the work moving.
 when: an agent says it is done, or has been quiet too long
 want: see what it actually did
-so that: I can trust its result or see where it is stuck
-flow:
-1. in its thread, put the cursor on the `with` line and press `enter`; the agent's screen, `Agent`, opens at its newest step
-2. read up through what it ran and what came back
-3. `window.Screen.back` to the thread
+so that: the user can trust its result or see where it is stuck
+steps:
+1. in the agent's thread, the user puts the cursor on the `with` line and presses `enter`; the agent's screen, `Agent`, opens at its newest step
+2. the user reads up through what the agent ran and what came back
+3. the user goes back to the thread with `window.Screen.back`
 system: shows what the agent is doing now in the top line.
 user: the judgement.
 cases: the agent is `retrying` after errors from its model
+reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
-## job Steer an agent
+## flow Steer an agent
 day: Keep the work moving.
 when: an agent is stuck, going the wrong way, or on the wrong model
 want: change its course without starting over
 so that: its work goes on from a good point
-flow:
-1. open its screen, `Agent`
-2. open the palette and choose `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`
-3. go to its thread and tell it what to do instead
+steps:
+1. the user opens the agent's screen, `Agent`
+2. the user opens the palette and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`
+3. the user goes to the agent's thread and tells it what to do instead
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
+reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
-## job Work beside an agent
+## flow Work beside an agent
 day: Reach anything.
-when: I want to check or fix something in an agent's workset with my own hands
+when: the user wants to check or fix something in an agent's workset with their own hands
 want: open its terminal, its shell, or its desktop
-so that: I see what it sees and can act there
-flow:
-1. open the agent's screen, `Agent`
-2. open the palette and choose `terminal`, `new terminal`, `shell`, or `desktop…`
-3. work there; to leave a terminal, press `ctrl-shift-n`, then `q` or `tab`; to leave a desktop, press `ctrl-shift-;` and choose `home`
+so that: the user sees what the agent sees and can act there
+steps:
+1. the user opens the agent's screen, `Agent`
+2. the user opens the palette and chooses `terminal`, `new terminal`, `shell`, or `desktop…`
+3. the user works there; to leave a terminal, they press `ctrl-shift-n`, then `q` or `tab`; to leave a desktop, they press `ctrl-shift-;` and choose `home`
 system: starts a terminal or the shell when none runs, and keeps it running after the user leaves.
 user: what to type.
-cases: the agent's host is a host on this machine, where its desktop does not open; the host drops while I type in the shell
+cases: the agent's host is a host on this machine, where its desktop does not open; the host drops while the user types in the shell
+reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule an agent starts in its message's thread
 when an `Agent` starts from a `chat.Message`, then it joins that message's `chat.Thread` and reads the message before anything else.
 
-## job Approve a push or a fetch
+## flow Approve a push or a fetch
 day: Keep the work moving.
-when: an agent pushes a branch to, or fetches from, a repository that needs my ssh login
+when: an agent pushes a branch to, or fetches from, a repository that needs the user's ssh login
 want: see exactly where it goes and what it pushes, and say yes or no
-so that: no agent uses my login without my word, and the agent does not wait long
-flow:
+so that: no agent uses the user's login without their word, and the agent does not wait long
+steps:
 1. a prompt opens by itself, over whatever is on screen; it reads the agent's name, `git asks`, what git asks, such as `Push via SSH to ssh://…: branch fix-flaky-test Approve? [shift-Y/N]`, and `allow? (y/n):`
-2. type `y` and press `enter` to allow
+2. the user types `y` and presses `enter` to allow
    - anything else, or `escape`, says no
    - after a minute with no answer, the push or fetch fails, and the echo line says that the approval timed out
 system: uses the ssh login of the device the window runs on, so the host never holds it; asks about one push or fetch at a time; names each branch and tag a push would change.
 user: the yes or the no.
-cases: two agents push at once, where the second question waits for the first; a push to a repository I do not recognise
+cases: two agents push at once, where the second question waits for the first; a push to a repository the user does not recognise
 
 ## rule a push waits for the user
 when an `Agent` pushes to or fetches from a repository through the user's ssh login, then the window asks the user first, and without a `y` the push or fetch does not happen.

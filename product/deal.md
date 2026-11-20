@@ -8,6 +8,16 @@ serves: Know what wants them, and where they were.
 because: between two places the user has a minute and no memory of what asked; a list makes them choose, a card makes them answer, and the product remembers the rest.
 costs: whatever the user has not answered is behind the top card, and a verdict is a decision they must make.
 
+## journey Back from an hour elsewhere
+goal: the user clears what wants them and gets back to where they were.
+starts when: the user looks up after an hour in a terminal or a page.
+steps:
+1. the user sees what wants them and how much, `home.Glance at what waits`
+2. the user clears it, `Clear what waits`
+3. the user goes back to where they were, as they left it, `window.Screen.back`
+done when: nothing waits and the user's place is on screen as they left it.
+day: Know what wants them, and where they were.
+
 ## concept Card
 purpose: hand the user the one thing that wants them most, so they never scan a list.
 principle: an agent's message in a thread asks the user something; the thread becomes a card; the user presses `space` then `n`, and the thread opens; they answer it and say done; the next card opens.
@@ -40,20 +50,21 @@ A verdict is about the card: the thread or conversation it stands for, and every
 
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
-## job Clear what waits
+## flow Clear what waits
 day: Know what wants them, and where they were.
-when: I have a few free minutes
-want: see each thing that asks for me, and answer it
-so that: nothing waits on me without my knowing
-flow:
-1. press `space` then `n`; the top `Card` opens
-2. read it
-3. answer in the thread if it needs words from me
-4. `Verdict.done`, or `Verdict.snooze` and a time, or `Verdict.mute`; the next card opens
-5. repeat from 2 until the deal is empty and `home.Home` is on screen
+when: the user has a few free minutes
+want: see each thing that asks for the user, and answer it
+so that: nothing waits on the user without their knowing
+steps:
+1. the user presses `space` then `n`; the top `Card` opens
+2. the user reads it
+3. the user answers in the thread if it needs words from them
+4. the user gives `Verdict.done`, or `Verdict.snooze` and a time, or `Verdict.mute`; the next card opens
+5. the user repeats from 2 until the deal is empty and `home.Home` is on screen
 system: reads every host's chat and Slack, orders the cards, lets a result fade, lets a card come back when its snooze ends, and opens Home when nothing is left.
 user: the verdict, the time for a snooze, and any words of answer.
-cases: on the phone, where a snooze is one unit at a time; an ask that is weeks old from an agent that still exists; a card I skipped that comes back half an hour later
+cases: on the phone, where a snooze is one unit at a time; an ask that is weeks old from an agent that still exists; a card the user skipped that comes back half an hour later
+reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule writing in a thread reads it
 when the user posts a message in a `chat.Thread`, then everything in it so far counts as seen, and its `Card` goes away until something new asks.

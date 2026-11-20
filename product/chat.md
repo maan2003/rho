@@ -14,6 +14,21 @@ serves: Know what wants them, and where they were.
 because: agents write far more than the user can read; a mention that is an ask or a result is the agent's one way to say "you, now", and a stop it did not choose says the same without words.
 costs: a card for a failure the user may not care about, which `deal.Verdict.mute` puts away.
 
+## journey An idea becomes a merged result
+goal: the user turns an idea into merged work.
+starts when: the user has an idea.
+steps:
+1. the user writes it where the project lives, `Start a thread`
+2. the user sees an agent start on it, `agents.Start an agent from a message`
+3. the user sees the agent's ask, `deal.Clear what waits`
+4. the user answers in its thread, `Answer an agent`
+5. the user gets the result when the agent finishes and says so, `deal.Clear what waits`
+6. the user looks into what it did, `agents.Look into what an agent did`
+7. the user sees its proof (no flow serves this step yet)
+8. the user says done, `deal.Clear what waits`
+done when: the work is merged and nothing waits.
+day: Turn ideas into work.
+
 ## concept Channel
 purpose: keep the threads of one subject or one project together, so the user reads them in one place.
 principle: the user makes a channel `fedi`; every thread about that project starts in it; on Home, `fedi` is one row that says what waits in it.
@@ -91,33 +106,35 @@ starts: `Answer an agent`, `slack.Answer Slack`, `agents.Start an agent from a m
 
 When a Slack conversation opens while it asks for the user, the cursor lands on the oldest message from someone else that the user has not dealt with.
 
-## job Answer an agent
+## flow Answer an agent
 day: Keep the work moving.
-when: an agent asked me something, or told me it is done
+when: an agent asked the user something, or told them it is done
 want: read what it said and reply in its thread
-so that: its work goes on, or I know it is finished
-flow:
+so that: the agent's work goes on, or the user knows it is finished
+steps:
 1. the thread is on screen, from the deal or from Home
-2. read the newest messages; open a reply's thread with `enter` when the answer is under it
-3. press `i` and write the answer
-4. `Thread.send`; the message shows `you · sending…`, then the time
-5. `deal.Verdict.done` if nothing more is needed, or `deal.Card.deal` for the next card
-system: names the thread, folds the replies under each message, keeps the `Draft` if I leave before sending, and counts my message as having read the thread.
+2. the user reads the newest messages; they open a reply's thread with `enter` when the answer is under it
+3. the user presses `i` and writes the answer
+4. the user sends with `Thread.send`; the message shows `you · sending…`, then the time
+5. the user says done with `deal.Verdict.done` if nothing more is needed, or deals the next card with `deal.Card.deal`
+system: names the thread, folds the replies under each message, keeps the `Draft` if the user leaves before sending, and counts their message as having read the thread.
 user: the words of the answer.
-cases: the host is away while I write; the agent that asked is gone
+cases: the host is away while the user writes; the agent that asked is gone
+reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
-## job Start a thread
+## flow Start a thread
 day: Turn ideas into work.
-when: I have a new piece of work or a question
+when: the user has a new piece of work or a question
 want: write it once in the right channel and have it become a thread
 so that: an agent can start from it and the conversation stays in one place
-flow:
-1. open the `Channel`
-2. press `i` and write the message
-3. `ctrl-enter`; the message is a new thread in the channel, and an agent starts on it, as in `agents.Start an agent from a message`; `ctrl-shift-enter` makes the thread and starts nobody
+steps:
+1. the user opens the `Channel`
+2. the user presses `i` and writes the message
+3. the user presses `ctrl-enter`; the message is a new thread in the channel, and an agent starts on it, as in `agents.Start an agent from a message`; `ctrl-shift-enter` makes the thread and starts nobody
 system: names the thread after the second message.
 user: the channel and the words.
-cases: a question for myself, no agent: `ctrl-shift-enter`
+cases: a question the user writes for themselves, no agent: `ctrl-shift-enter`
+reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## rule a channel is a room
 when a host's `Channel` is one the user made or has written in, or holds a `deal.Card` or an unread mention of the user, then it is a `home.Room` on Home, tagged with the host's name; a channel the user never wrote in that asks nothing is not.

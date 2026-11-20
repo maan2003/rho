@@ -32,31 +32,33 @@ starts: `Write something down`
 shows: `Note`
 starts: `Write something down`
 
-## job Write something down
+## flow Write something down
 day: Keep their own memory.
-when: something comes to mind that I must not forget
+when: something comes to mind that the user must not forget
 want: write it down at once, without choosing where it goes
-so that: I find it again later, in `Notes`
-flow:
-1. open the palette and choose `new note`; an empty note is on screen
-2. press `i` and type; the first line is its title
-3. leave with `escape` and `tab`; the note is at the top of `Notes`
+so that: the user finds it again later, in `Notes`
+steps:
+1. the user opens the palette and chooses `new note`; an empty note is on screen
+2. the user presses `i` and types; the first line is its title
+3. the user leaves with `escape` and `tab`; the note is at the top of `Notes`
 system: keeps the text without a save step, and lists the note in `Notes` by when it was last written.
 user: every word of it.
 cases: the same note open on the laptop and the phone at once, where the newest text wins and text being typed is not replaced
+reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
-## job Reply privately
+## flow Reply privately
 day: Keep their own memory.
-when: a message in a thread needs a remark that is for me only
+when: a message in a thread needs a remark that is for the user only
 want: write it beside the message
-so that: I see it the next time I read the thread, and no agent does
-flow:
-1. put the cursor on the message
-2. open the palette and choose `reply privately`; a new note opens
-3. type the remark
-4. `window.Screen.back`; the remark shows under the message
+so that: the user sees it the next time they read the thread, and no agent does
+steps:
+1. the user puts the cursor on the message
+2. the user opens the palette and chooses `reply privately`; a new note opens
+3. the user types the remark
+4. the user goes back with `window.Screen.back`; the remark shows under the message
 system: keeps the remark with the message on every device.
 user: the remark.
+reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a note about nothing stays off Home
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is never a `home.Room`.
