@@ -120,8 +120,15 @@ pub trait System: Sized + 'static {
     }
 
     /// What an address of this system is called and where it is, for a
-    /// card no claim named.
-    fn name(&self, _address: &Address, _cx: &App) -> Option<(String, String)> {
+    /// card no claim named. `marks` are the frame's, which a system cannot
+    /// read for itself while the frame draws.
+    fn name(&self, _address: &Address, _marks: &Marks, _cx: &App) -> Option<(String, String)> {
+        None
+    }
+
+    /// The screen that shows `address` as one of its lines, when the
+    /// system has one: a message, the thread it is read in.
+    fn shown_in(&self, _address: &Address, _cx: &App) -> Option<Address> {
         None
     }
 
@@ -190,7 +197,8 @@ trait SystemHandle {
         cx: &App,
     ) -> Vec<Claim>;
     fn open_link(&self, url: &Url, cx: &mut App) -> bool;
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)>;
+    fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
+    fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
     fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
@@ -243,8 +251,12 @@ impl<S: System> SystemHandle for Entity<S> {
         self.update(cx, |system, cx| system.open_link(url, cx))
     }
 
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
-        self.read(cx).name(address, cx)
+    fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
+        self.read(cx).name(address, marks, cx)
+    }
+
+    fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
+        self.read(cx).shown_in(address, cx)
     }
 
     fn seen(&self, address: &Address, cx: &App) -> Seen {
@@ -322,8 +334,12 @@ impl AnySystem {
         self.0.open_link(url, cx)
     }
 
-    pub fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
-        self.0.name(address, cx)
+    pub fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
+        self.0.name(address, marks, cx)
+    }
+
+    pub fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
+        self.0.shown_in(address, cx)
     }
 
     pub fn seen(&self, address: &Address, cx: &App) -> Seen {

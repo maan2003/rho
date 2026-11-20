@@ -48,7 +48,7 @@ pub use menu::{Row, Rows};
 pub use minibuffer::{CancelHandler, Candidate, CandidateSource, ChangeHandler, SubmitHandler};
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
-pub use surface::{AnySurface, Subject, Surface};
+pub use surface::{AnySurface, Mode, Subject, Surface};
 pub use system::{AnySystem, Found, Reversal, RoomRow, Standing, System};
 
 /// The key context every surface is drawn in. A system binds its keys

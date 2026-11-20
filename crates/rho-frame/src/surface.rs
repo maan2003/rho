@@ -20,6 +20,16 @@ pub enum Subject {
     None,
 }
 
+/// Where the keys go on a surface that keeps a mode of its own rather
+/// than being a buffer: what the status line's mode word says for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The keys move through the screen.
+    Normal,
+    /// The keys are typed into the screen.
+    Insert,
+}
+
 /// A view the frame can show. Its address is the frame's to know; the
 /// surface says what it is called, what it is a buffer of, and what the
 /// point is on.
@@ -34,6 +44,12 @@ pub trait Surface: Render + Focusable + Sized + 'static {
 
     fn subject(&self, _cx: &App) -> Subject {
         Subject::Own
+    }
+
+    /// The mode the surface is in, for a surface that keeps its own;
+    /// `None` leaves the mode word to the editor that has the keys.
+    fn mode(&self, _cx: &App) -> Option<Mode> {
+        None
     }
 
     /// The card a verdict pressed over the surface is about: what holds
@@ -56,6 +72,7 @@ trait SurfaceHandle {
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subject(&self, cx: &App) -> Subject;
+    fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
 }
@@ -83,6 +100,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn subject(&self, cx: &App) -> Subject {
         self.read(cx).subject(cx)
+    }
+
+    fn mode(&self, cx: &App) -> Option<Mode> {
+        self.read(cx).mode(cx)
     }
 
     fn card(&self, cx: &App) -> Subject {
@@ -125,6 +146,10 @@ impl AnySurface {
 
     pub fn subject(&self, cx: &App) -> Subject {
         self.0.subject(cx)
+    }
+
+    pub fn mode(&self, cx: &App) -> Option<Mode> {
+        self.0.mode(cx)
     }
 
     pub fn card(&self, cx: &App) -> Subject {

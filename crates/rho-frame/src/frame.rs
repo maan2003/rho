@@ -28,7 +28,7 @@ use crate::minibuffer::{
     bottom_strip,
 };
 use crate::phone::{Layout, Phone};
-use crate::surface::{AnySurface, Subject};
+use crate::surface::{AnySurface, Mode, Subject};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
 use crate::{keys, palette};
@@ -959,11 +959,21 @@ impl Frame {
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        let mode = self
-            .mode_indicator
-            .read(cx)
-            .plain_mode(cx)
-            .unwrap_or_else(|| "normal".to_owned());
+        // A surface with a mode of its own says it while it has the keys;
+        // a menu or a prompt over it is the editor's to say.
+        let own_mode = match self.menu.is_none() && self.minibuffer.is_none() {
+            true => self.current_surface().mode(cx),
+            false => None,
+        };
+        let mode = match own_mode {
+            Some(Mode::Normal) => "normal".to_owned(),
+            Some(Mode::Insert) => "insert".to_owned(),
+            None => self
+                .mode_indicator
+                .read(cx)
+                .plain_mode(cx)
+                .unwrap_or_else(|| "normal".to_owned()),
+        };
         let mode_color = match mode.contains("insert") {
             true => status.warning,
             false => colors.terminal_ansi_bright_cyan,

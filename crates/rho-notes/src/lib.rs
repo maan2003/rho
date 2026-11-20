@@ -18,7 +18,7 @@
 //! a note is the dealer's to rank, like on anything else; a bare reminder
 //! is a note with a deadline. This system only opens the card.
 
-mod list;
+pub(crate) mod list;
 mod view;
 
 use std::collections::{BTreeSet, HashMap};
@@ -30,6 +30,7 @@ use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{AnySurface, Frame, FrameLink, Point, Row, System};
+use rho_window::style::StyleClass;
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -37,6 +38,10 @@ const SAVE_AFTER: Duration = Duration::from_millis(700);
 
 /// What a note without a first line is called.
 const UNTITLED: &str = "untitled note";
+
+/// What `reply privately` says with the point on nothing a reply could
+/// be under.
+const NOT_ON_A_MESSAGE: &str = "reply privately: put the cursor on a message";
 
 /// The kind of the one list of every note.
 const NOTES: &str = "notes";
@@ -70,12 +75,17 @@ fn text_of(marks: &Marks, note: NoteId) -> String {
     marks.get(&note.address()).body.clone().unwrap_or_default()
 }
 
-/// What a note is called: its first line.
-fn note_title(marks: &Marks, note: &Address) -> String {
-    match marks.get(note).title() {
-        "" => UNTITLED.to_owned(),
-        title => title.to_owned(),
+/// What a note with `text` is called: its first line, or [`UNTITLED`].
+fn title_of(text: &str) -> String {
+    match text.lines().next().map(str::trim) {
+        None | Some("") => UNTITLED.to_owned(),
+        Some(title) => title.to_owned(),
     }
+}
+
+/// What a note is called, as written: its first line.
+fn note_title(marks: &Marks, note: &Address) -> String {
+    title_of(marks.get(note).body.as_deref().unwrap_or_default())
 }
 
 /// The note's new revision, when the text the user left in its buffer
@@ -102,9 +112,20 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
+/// A note as `notes` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Listed {
+    note: Address,
+    title: String,
+    /// For a private reply: where it shows, by the name of the thread
+    /// that shows the message it is under, when that can be named.
+    reply: Option<Option<String>>,
+}
+
 /// Every note, about something or about nothing, by its first line: the
-/// one last written first.
-fn listed(marks: &Marks) -> Vec<(Address, String)> {
+/// one last written first. `place` names where a reply about an address
+/// shows.
+fn listed(marks: &Marks, place: impl Fn(&Address) -> Option<String>) -> Vec<Listed> {
     let mut notes: Vec<_> = marks.notes().collect();
     notes.sort_by_key(|(address, held)| {
         (
@@ -114,7 +135,11 @@ fn listed(marks: &Marks) -> Vec<(Address, String)> {
     });
     notes
         .into_iter()
-        .map(|(address, _)| (address.clone(), note_title(marks, address)))
+        .map(|(address, held)| Listed {
+            note: address.clone(),
+            title: note_title(marks, address),
+            reply: held.about.as_ref().map(&place),
+        })
         .collect()
 }
 
@@ -172,10 +197,10 @@ impl NoteSystem {
         self.pending.insert(note, Pending { text, _save: save });
     }
 
-    /// Writes what was typed into `note`. It leaves the pending set only
-    /// as it is written, so a surface never takes another device's text
-    /// over it in between.
-    fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
+    /// Writes what was typed into `note`, if anything. It leaves the pending
+    /// set only as it is written, so a surface never takes another device's
+    /// text over it in between.
+    pub(crate) fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
         let this = cx.entity();
         self.frame.with(cx, move |frame, _, cx| {
             let Some(pending) = this.update(cx, |this, _| this.pending.remove(&note)) else {
@@ -242,15 +267,20 @@ impl System for NoteSystem {
         Some(AnySurface::new(view))
     }
 
+    /// `reply privately` is listed everywhere, so it is found by name;
+    /// with the point on nothing a reply could be under, it says so rather
+    /// than make a note about nothing.
     fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        if let Some(subject) = point.subject.clone() {
-            rows.push(Row::run(
-                "n",
-                "reply privately",
-                move |frame, window, cx| reply_privately(&subject, frame, window, cx),
-            ));
-        }
+        let subject = point.subject.clone();
+        rows.push(Row::run(
+            "n",
+            "reply privately",
+            move |frame, window, cx| match &subject {
+                Some(subject) => reply_privately(subject, frame, window, cx),
+                None => frame.echo(NOT_ON_A_MESSAGE, StyleClass::SystemInfo, cx),
+            },
+        ));
         rows.push(Row::run("w", "new note", make_note));
         rows.push(Row::run("shift-w", "notes", |frame, window, cx| {
             frame.open(notes_address(), window, cx)
@@ -258,10 +288,15 @@ impl System for NoteSystem {
         rows
     }
 
-    /// Only asked for a note whose first line is empty: the frame names
-    /// notes from the marks.
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
-        NoteId::from_address(address).map(|_| (UNTITLED.to_owned(), String::new()))
+    /// A note is called by its first line: the one being typed while the
+    /// user types, else the one written.
+    fn name(&self, address: &Address, marks: &Marks, _cx: &App) -> Option<(String, String)> {
+        let note = NoteId::from_address(address)?;
+        let title = match self.pending.get(&note) {
+            Some(pending) => title_of(&pending.text),
+            None => note_title(marks, address),
+        };
+        Some((title, String::new()))
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {

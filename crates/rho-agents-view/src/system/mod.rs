@@ -949,7 +949,12 @@ impl System for AgentsSystem {
         rows
     }
 
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_frame::Marks,
+        _cx: &App,
+    ) -> Option<(String, String)> {
         if let Some(chart) = UsageChart::from_address(address) {
             return Some((chart.title(), "usage".to_owned()));
         }

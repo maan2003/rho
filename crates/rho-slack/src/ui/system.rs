@@ -417,7 +417,12 @@ impl System for SlackSystem {
         cards::claims(session.model(), session.mirror(), marks, now, trace)
     }
 
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_dealer::Marks,
+        cx: &App,
+    ) -> Option<(String, String)> {
         let (session, unit) = self.unit_of(address, cx)?;
         let session = session.read(cx);
         Some(cards::name(session.model(), session.mirror(), &unit))

@@ -134,6 +134,15 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     .await?;
     wait_for_line(&mut stream, "e2e-done").await?;
 
+    // The terminal starts where the agent works, in its clone, not at the
+    // root of its workset.
+    write_frame(
+        &mut stream,
+        &TermClientFrame::Input(b"echo \"cwd=\"\"$PWD:end\"\r".to_vec()),
+    )
+    .await?;
+    wait_for_line(&mut stream, "cwd=/src/repo:end").await?;
+
     // The listing sees the running terminal.
     let list = rho_rpc::protocol::client::call(
         &paths,

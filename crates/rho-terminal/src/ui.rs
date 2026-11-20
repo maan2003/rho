@@ -9,8 +9,8 @@
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::Surface;
 use rho_frame::keys::{Close, Home, Palette, VerdictMenu};
+use rho_frame::{Mode, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::TerminalInfo;
@@ -107,6 +107,15 @@ impl Surface for TerminalSurface {
             }
         }
         title
+    }
+
+    /// Typing while the terminal has the keys, reading once
+    /// `ctrl-shift-n` took them back; a terminal not yet open only reads.
+    fn mode(&self, cx: &App) -> Option<Mode> {
+        Some(match &self.state {
+            State::Open(view) if view.read(cx).is_raw() => Mode::Insert,
+            State::Open(_) | State::Dialing { .. } | State::Failed(_) => Mode::Normal,
+        })
     }
 }
 

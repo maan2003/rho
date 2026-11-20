@@ -84,7 +84,7 @@ impl AgentIdentity {
             WorksetKind::Isolated => camino::Utf8Path::new("/src"),
             WorksetKind::Host { cwd } => cwd.as_path(),
         };
-        let cwd = self.prop(props::CWD).map_or(start, camino::Utf8Path::new);
+        let cwd = rho_agent_types::agent_cwd(&self.entry.spec.props).unwrap_or(start);
         Place {
             cwd: cwd.to_owned(),
             workset: match self.kind {

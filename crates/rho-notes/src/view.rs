@@ -75,12 +75,19 @@ impl NoteView {
             editor.set_placeholder_text("a note · its first line is its title", window, cx);
             editor
         });
+        // Leaving the note writes what was typed at once, so the screen
+        // the user goes back to already shows it.
+        let typed_in = editor.focus_handle(cx);
         let subscriptions = vec![
             cx.observe(&system, |this, _, cx| this.refresh(cx)),
             cx.subscribe(&body, |this, _, event: &BufferEvent, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.edited(cx);
                 }
+            }),
+            cx.on_blur(&typed_in, window, |this, _, cx| {
+                let note = this.note;
+                this.system.update(cx, |system, cx| system.save(note, cx));
             }),
         ];
         // Not `defer_in`: that runs inside the window's update, where the
@@ -133,10 +140,7 @@ impl NoteView {
             return;
         }
         self.synced = Some(text.clone());
-        self.title = match text.lines().next().map(str::trim) {
-            None | Some("") => crate::UNTITLED.to_owned(),
-            Some(title) => title.to_owned(),
-        };
+        self.title = crate::title_of(&text);
         let note = self.note;
         self.system
             .update(cx, |system, cx| system.edited(note, text, cx));
