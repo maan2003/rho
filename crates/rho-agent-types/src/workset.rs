@@ -65,6 +65,9 @@ pub mod props {
     /// The directory the agent works in, as it sees it: where its
     /// notebook starts, and where a terminal or shell beside it starts.
     pub const CWD: &str = "cwd";
+    /// The repository the agent's directory was cloned from, as the user
+    /// named it: a URL or a path on the host.
+    pub const REPO: &str = "repo";
 }
 
 /// Where an agent works, as its props say: the `cwd` prop, when set. An

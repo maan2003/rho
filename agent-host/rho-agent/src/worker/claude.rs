@@ -187,6 +187,9 @@ pub(crate) struct ClaudeLoop {
     /// What the running process was spawned with, so a switch of account,
     /// model or effort is noticed at the next send.
     launched: Option<Launch>,
+    /// The CLI said this turn that its account cannot reach the model; the
+    /// turn's failure then says what to do about it on the host.
+    authentication_failed: bool,
     /// The notebook, once the first spawn has built it. Outlives the
     /// process: cells keep running across a respawn.
     python: Option<python_host::PythonHost>,
@@ -412,6 +415,7 @@ impl ClaudeLoop {
             claude_settings_path: None,
             claude_plugin_dir: None,
             launched: None,
+            authentication_failed: false,
             python: None,
             outbox,
             outbound,
@@ -1485,6 +1489,7 @@ impl ClaudeLoop {
                 if message.parent_tool_use_id.is_some() {
                     return Ok(());
                 }
+                self.authentication_failed |= message.authentication_failed();
                 match reply_row(
                     &message,
                     usage_model(self.running_model()),
@@ -1520,6 +1525,7 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
+                let authentication_failed = std::mem::take(&mut self.authentication_failed);
                 if let Some(host) = &mut self.python {
                     host.turn_ended(
                         rho_agent_types::UnixMs::now(),
@@ -1546,6 +1552,13 @@ impl ClaudeLoop {
                     self.stream_items.clear();
                     self.response_id = None;
                     self.set_kind(InferenceState::Idle);
+                } else if message.is_error && authentication_failed {
+                    let account = match &self.launched {
+                        Some(launched) => launched.account.clone(),
+                        None => self.host.claude_account().await?,
+                    };
+                    self.fail(anyhow::anyhow!("{}", not_logged_in(&account)))
+                        .await?;
                 } else if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.failure_message()))
                         .await?;
@@ -2189,6 +2202,16 @@ async fn finish_rewind(
     Ok(())
 }
 
+/// What a turn that failed for want of a login says, in the host's words:
+/// which account it is and what to run on the host about it.
+fn not_logged_in(account: &str) -> String {
+    format!(
+        "Claude account {account} is not logged in; on the host, run \
+         `rho claude-account login {account}`, or `rho claude-account use <account>` \
+         for one that is"
+    )
+}
+
 fn usage_model(model: Model) -> crate::log::AgentUsageModel {
     match model {
         Model::Opus => crate::log::AgentUsageModel::OPUS,
@@ -2403,6 +2426,117 @@ mod tests {
                     record.event,
                     Event::Failed { error, .. } if error == explanation
                 ))
+        );
+    }
+
+    /// A turn the CLI ends because its account holds no login fails with
+    /// what to do on the host, not with the CLI's own `/login`, which is a
+    /// command of a session the user never sees.
+    #[tokio::test]
+    async fn a_missing_login_fails_with_the_command_to_run_on_the_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let agent_id = agent(1);
+        let workset = WorksetId([1; 6]);
+        let mut write = db.write().await;
+        write.init_store_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent: agent_id,
+                        spec: AgentSpec {
+                            runtime: Runtime::Claude {
+                                model: Model::Opus,
+                                effort: Effort::High,
+                                session_id: Uuid::new_v4(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        write.commit();
+        crate::testing::python(agent_id, &db);
+        let host = crate::testing::services_pair(db.clone(), agent_id, std::sync::Weak::new());
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            rho_claude::accounts::ClaudePaths::at(root.join("claude")),
+            Arc::new(Permissions::Bypass),
+            root,
+        )
+        .await
+        .unwrap();
+        runtime.launched = Some(Launch {
+            account: "work".to_owned(),
+            model: Model::Opus,
+            effort: Effort::High,
+        });
+        // What Claude Code 2.1 writes with an empty account directory.
+        let said = "Not logged in · Please run /login";
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Assistant(
+                serde_json::from_value(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "e0be9f8f-c1ab-49fa-a8f1-2b3400ade663",
+                        "model": "<synthetic>",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": said}],
+                    },
+                    "parent_tool_use_id": null,
+                    "session_id": Uuid::new_v4(),
+                    "uuid": Uuid::new_v4(),
+                    "error": "authentication_failed",
+                    "is_api_error_message": true,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": said,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let InferenceState::Failed { error } = agent.status().runtime.inference else {
+            panic!("the agent failed");
+        };
+        assert_eq!(
+            error,
+            "Claude account work is not logged in; on the host, run \
+             `rho claude-account login work`, or `rho claude-account use <account>` for one that is"
+        );
+        // A later failure for another reason says its own words.
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": "Overloaded",
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.status().runtime.inference,
+            InferenceState::Failed {
+                error: "Overloaded".to_owned()
+            }
         );
     }
 

@@ -16,7 +16,6 @@ use camino::Utf8PathBuf;
 use futures::FutureExt as _;
 use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
-use rho_agent_types::MessageId;
 use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, channel_start};
 use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
 use rho_chat::ThreadId;
@@ -76,6 +75,9 @@ pub(crate) fn idea(system: &mut AgentsSystem, thread: ThreadId, cx: &mut Context
             chat.message(message).is_some() && chat.root_of(message) == channel
         })
     });
+    // Before the channel has an agent, which is also after its first start
+    // failed, the answer the user gave is where.
+    let start = start.or_else(|| system.places.get(thread.host, thread.message));
     match start {
         Some(start) => {
             let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
@@ -121,6 +123,12 @@ pub(crate) fn rows(
         Runtimes::Ask => "start agent",
         Runtimes::Default => "where this channel's agents work",
     });
+    let host = read.host_of(thread.host);
+    let known = host
+        .map(|host| known_places(read, host))
+        .unwrap_or_default();
+    let repositories = Rc::new(known.repositories);
+    let directories = Rc::new(known.directories);
     let on_repo = system.clone();
     rows.push(Row::run(
         "n",
@@ -129,7 +137,7 @@ pub(crate) fn rows(
             let system = on_repo.clone();
             frame.open_prompt(
                 "repository (url or host path):",
-                Rc::new(|_, _, _| Vec::new()),
+                completions(repositories.clone()),
                 Rc::new(move |frame, input, window, cx| {
                     let repo = input.trim();
                     if repo.is_empty() {
@@ -164,7 +172,7 @@ pub(crate) fn rows(
             let system = here.clone();
             frame.open_prompt(
                 "directory on the host:",
-                Rc::new(|_, _, _| Vec::new()),
+                completions(directories.clone()),
                 Rc::new(move |frame, input, window, cx| {
                     let cwd = input.trim();
                     if cwd.is_empty() {
@@ -193,7 +201,7 @@ pub(crate) fn rows(
     // Beside an agent of the thread, in its workset: the ones already
     // reading it first, then the rest of the host's.
     let registry = read.registry();
-    let Some(host) = read.host_of(thread.host) else {
+    let Some(host) = host else {
         return rows;
     };
     let members = read
@@ -245,6 +253,69 @@ pub(crate) fn rows(
     rows
 }
 
+/// What the host already knows of where agents work, newest first, each
+/// once with what it is: the repositories its worksets were made on, and
+/// the directories on it its agents work in as they are.
+#[derive(Default)]
+struct KnownPlaces {
+    /// Repositories, then host directories: either answers
+    /// `repository (url or host path):`.
+    repositories: Vec<Candidate>,
+    directories: Vec<Candidate>,
+}
+
+fn known_places(read: &AgentsSystem, host: HostId) -> KnownPlaces {
+    let registry = read.registry();
+    let mut agents: Vec<_> = registry
+        .host_agents(host)
+        .into_iter()
+        .filter_map(|agent| registry.agent_identity(agent))
+        .collect();
+    agents.sort_by_key(|agent| std::cmp::Reverse(agent.entry.created_at));
+    let mut known = KnownPlaces::default();
+    let add = |into: &mut Vec<Candidate>, value: &str, description: &str| {
+        if !into.iter().any(|known| known.value == value) {
+            into.push(Candidate {
+                value: value.to_owned(),
+                description: description.to_owned(),
+            });
+        }
+    };
+    for agent in &agents {
+        if let Some(repo) = agent.repository() {
+            add(&mut known.repositories, repo, "repository");
+        }
+    }
+    for agent in &agents {
+        let place = agent.place();
+        if place.workset.is_none() {
+            add(
+                &mut known.repositories,
+                place.cwd.as_str(),
+                "directory on the host",
+            );
+            add(
+                &mut known.directories,
+                place.cwd.as_str(),
+                "directory on the host",
+            );
+        }
+    }
+    known
+}
+
+/// A prompt's answers: the known ones that hold what is typed.
+fn completions(known: Rc<Vec<Candidate>>) -> rho_frame::CandidateSource {
+    Rc::new(move |_, needle, _| {
+        let needle = needle.trim();
+        known
+            .iter()
+            .filter(|candidate| candidate.value.contains(needle))
+            .cloned()
+            .collect()
+    })
+}
+
 /// Where is answered: ask the runtime, or start on the default.
 #[allow(clippy::too_many_arguments)]
 fn then(
@@ -260,6 +331,11 @@ fn then(
     match runtimes {
         Runtimes::Ask => prompt_runtime(system, thread, origin, start, frame, window, cx),
         Runtimes::Default => {
+            // The channel's question, answered: kept, so the next idea asks
+            // nothing even if this start fails.
+            system.update(cx, |system, _| {
+                system.places.remember(thread.host, thread.message, &start)
+            });
             let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
             begin(system, thread, origin, start, runtime, cx);
         }
@@ -326,7 +402,7 @@ fn begin(
             runtime,
         };
         match origin {
-            Origin::Message => create(system, plan, thread.message, cx),
+            Origin::Message => create(system, plan, thread, cx),
             Origin::Draft => send_and_start(system, thread, plan, cx),
         }
     });
@@ -360,9 +436,10 @@ fn send_and_start(
 pub(crate) fn create(
     system: &mut AgentsSystem,
     plan: Plan,
-    origin: MessageId,
+    thread: ThreadId,
     cx: &mut Context<AgentsSystem>,
 ) {
+    let origin = thread.message;
     let Some(agents) = system.agents_on(plan.host) else {
         system
             .frame
@@ -384,7 +461,7 @@ pub(crate) fn create(
         Creation::Eval(eval) => agents.call(eval).boxed_local(),
     };
     let frame = system.frame.clone();
-    cx.spawn(async move |_, cx| {
+    cx.spawn(async move |this, cx| {
         let reply = reply.await.and_then(|result| {
             if let Some(error) = result.error {
                 anyhow::bail!("{error}");
@@ -394,16 +471,29 @@ pub(crate) fn create(
                 .ok_or_else(|| anyhow::anyhow!("the creation code made no agent"))
         });
         cx.update(|cx| match reply {
-            Ok(agent) => frame.echo(
-                format!("agent {} started · {on}", agent.encoded()),
-                StyleClass::SystemInfo,
-                cx,
-            ),
-            Err(error) => frame.echo(
-                format!("start agent: {error:#}"),
-                StyleClass::SystemImportant,
-                cx,
-            ),
+            Ok(agent) => {
+                frame.echo(
+                    format!("agent {} started · {on}", agent.encoded()),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                // Its first turn may still fail, such as for want of a
+                // login on the host; the echo line says so when it does.
+                let _ = this.update(cx, |system, cx| system.watch_first_turn(agent, cx));
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                frame.echo(
+                    format!("agent did not start: {reason}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+                let _ = this.update(cx, |system, cx| {
+                    system
+                        .chat
+                        .update(cx, |chat, cx| chat.note_failed_start(thread, reason, cx))
+                });
+            }
         });
     })
     .detach();

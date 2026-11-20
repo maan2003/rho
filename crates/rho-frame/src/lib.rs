@@ -35,6 +35,7 @@ pub mod menu;
 pub mod minibuffer;
 mod palette;
 mod phone;
+mod place;
 mod search;
 pub mod surface;
 pub mod system;

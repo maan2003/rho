@@ -153,6 +153,15 @@ enum Focused {
     Composer,
 }
 
+/// A thread the user just started in a channel, which the cursor follows
+/// until it stands in the list: by the id this client gave the message
+/// while it is on its way, then by its own once the host logged it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Follow {
+    Sending(u64),
+    Logged(MessageId),
+}
+
 pub struct ThreadView {
     system: Entity<ChatSystem>,
     thread: ThreadId,
@@ -160,6 +169,7 @@ pub struct ThreadView {
     log: Entity<Editor>,
     composer: Entity<Editor>,
     focused: Focused,
+    follow: Option<Follow>,
     _subscriptions: Vec<Subscription>,
     /// Reads the thread again each minute while agents are in it: the
     /// `with` line says for how long each has been doing what it does.
@@ -232,6 +242,19 @@ impl ThreadView {
         });
         let subscriptions = vec![
             cx.observe(&entity, |this, _, cx| this.refresh(cx)),
+            cx.subscribe(&entity, |this, _, event: &Event, cx| {
+                if let Event::Delivered {
+                    endpoint,
+                    client_id,
+                    message,
+                } = event
+                    && *endpoint == this.thread.host
+                    && this.follow == Some(Follow::Sending(*client_id))
+                {
+                    this.follow = Some(Follow::Logged(*message));
+                    this.refresh(cx);
+                }
+            }),
             cx.subscribe(&composer, |this, composer, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::BufferEdited) {
                     let text = composer.read(cx).text(cx);
@@ -249,6 +272,7 @@ impl ThreadView {
             log,
             composer,
             focused: Focused::Log,
+            follow: None,
             _subscriptions: subscriptions,
             _ages: cx.spawn(async move |this, cx| {
                 loop {
@@ -309,6 +333,11 @@ impl ThreadView {
         if at_end && !list {
             self.cursor_to_end(cx);
         }
+        if let Some(Follow::Logged(message)) = self.follow
+            && self.cursor_to_thread(message, cx)
+        {
+            self.follow = None;
+        }
         // A draft the system sent on the user's behalf (`send and start`)
         // leaves the composer: its words are in the thread now.
         let draft_gone = self
@@ -364,6 +393,26 @@ impl ThreadView {
             .into_iter()
             .find(|link| link.start <= column && column < link.end)
             .and_then(|link| url::Url::parse(&line[link]).ok())
+    }
+
+    /// Puts the cursor on `message`'s line in a root's list; `false` while
+    /// the list does not hold it yet.
+    fn cursor_to_thread(&mut self, message: MessageId, cx: &mut Context<Self>) -> bool {
+        let rows = self.transcript.buffer().read(cx).max_point().row;
+        let Some(row) = (0..=rows)
+            .find(|row| self.transcript.line_meta(*row, cx) == Some(&Meta::Message(message)))
+        else {
+            return false;
+        };
+        self.log.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.change_with(&snapshot, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+            });
+            editor.request_autoscroll(Autoscroll::fit(), cx);
+            cx.notify();
+        });
+        true
     }
 
     /// The first thread of a root's list, if it has one.
@@ -449,6 +498,15 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     }
     if !head.members.is_empty() {
         items.push(with_line(system, host, &head.members, cx));
+    } else if let Some(reason) = system.failed_start(thread) {
+        // An idea whose agent did not start is not work in progress: it
+        // says so, and why, where the agents would be.
+        let reason = reason.lines().next().unwrap_or_default();
+        items.push(line(
+            Key::Participants,
+            &format!("no agent · did not start: {reason}"),
+            Class::Stopped,
+        ));
     }
     // A root's list starts at its first thread: nothing stands above it
     // to keep a gap from.
@@ -527,6 +585,9 @@ fn with_line(
             .map_or_else(|| agent.encoded(), |participant| participant.label.clone());
         text.push_str(&label);
         styles.push((Class::Participants, start..text.len()));
+        let stopped_because = participant
+            .as_ref()
+            .and_then(|participant| participant.stopped_because.clone());
         if let Some(doing) = participant.and_then(|participant| participant.doing) {
             text.push_str(" · ");
             let state = text.len();
@@ -535,7 +596,18 @@ fn with_line(
                 doing.activity.word(),
                 ago(doing.since.0, now)
             ));
-            let class = match doing.stop(now_ms) {
+            let stop = doing.stop(now_ms);
+            // A failure says why in the host's words, so the user knows what
+            // to do without opening the transcript. One line: the first.
+            if stop.is_some()
+                && let Some(reason) = stopped_because
+                    .as_deref()
+                    .and_then(|reason| reason.lines().next())
+            {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            let class = match stop {
                 Some(_) => Class::Stopped,
                 None => Class::Participants,
             };
@@ -700,6 +772,25 @@ fn thread_rows(
                 names.push(format!("+{}", agents.len() - 2));
             }
             waiting.push((names.join(", "), Class::Participants));
+            // A thread whose agents have all stopped is not work going on:
+            // say the stop, as the thread's `with` line does.
+            let now_ms = rho_agent_types::UnixMs(now.as_millisecond().max(0) as u64);
+            let stops: Vec<_> = agents
+                .iter()
+                .map(|agent| {
+                    system
+                        .participant(host, *agent, cx)
+                        .and_then(|participant| participant.doing)
+                        .and_then(|doing| doing.stop(now_ms))
+                })
+                .collect();
+            if let Some(Some(stop)) = stops.first()
+                && stops.iter().all(Option::is_some)
+            {
+                waiting.push((stop.word().to_owned(), Class::Stopped));
+            }
+        } else if system.failed_start(thread).is_some() {
+            waiting.push(("did not start".to_owned(), Class::Stopped));
         }
         waiting.push((ago(at.0, now), Class::Time));
         for (index, (word, class)) in waiting.into_iter().enumerate() {
@@ -762,14 +853,22 @@ impl ThreadView {
             return;
         }
         let thread = self.thread;
-        self.system.update(cx, |system, cx| {
-            system.post(thread.host, Some(thread.message), text, Vec::new(), cx);
+        let client_id = self.system.update(cx, |system, cx| {
+            let client_id = system.post(thread.host, Some(thread.message), text, Vec::new(), cx);
             system.set_draft(thread.host, Some(thread.message), String::new());
+            client_id
         });
         self.composer
             .update(cx, |composer, cx| composer.clear(window, cx));
         self.refresh(cx);
         self.cursor_to_end(cx);
+        // In a channel the message is a new thread: the cursor goes to it in
+        // the list, on its way and then where the list puts it, so `enter`
+        // opens it.
+        if is_root(self.system.read(cx), thread) {
+            self.follow = Some(Follow::Sending(client_id));
+            self.focus_log(&FocusLog, window, cx);
+        }
     }
 
     fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {

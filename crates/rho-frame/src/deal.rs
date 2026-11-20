@@ -21,6 +21,9 @@ use crate::frame::Frame;
 use crate::home::room_lines;
 use crate::when::{SnoozeUnit, snooze_target};
 
+/// What the echo line says when a pull finds nothing to deal.
+const NOTHING_WAITS: &str = "nothing waits";
+
 /// The lamp and the chime, as last evaluated.
 #[derive(Default)]
 pub(crate) struct Signals {
@@ -260,12 +263,22 @@ impl Frame {
             occurred_at: Timestamp::now().to_string(),
             skip_until: None,
         });
-        self.echo(&format!("{verb}: {called}"), StyleClass::SystemInfo, cx);
-        if self.card_in_view(cx).as_ref() == Some(address) {
-            self.close_current(window, cx);
-            self.pull_card(window, cx);
-        } else {
+        let said = format!("{verb}: {called}");
+        if self.card_in_view(cx).as_ref() != Some(address) {
+            self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
+            return;
+        }
+        self.close_current(window, cx);
+        // The verdict and what comes of it, on one line: the last card put
+        // away says the deal is empty too.
+        match self.deal_next(window, cx) {
+            true => self.echo(&said, StyleClass::SystemInfo, cx),
+            false => self.echo(
+                &format!("{said} · {NOTHING_WAITS}"),
+                StyleClass::SystemInfo,
+                cx,
+            ),
         }
     }
 
@@ -303,7 +316,16 @@ impl Frame {
     /// One pull: rank everything, pass over the card in view, and open
     /// the most important of the rest. Nothing is retained, so two pulls
     /// in a row see the same world and the skip is what moves them on.
+    /// With nothing to deal, Home opens and the echo line says so.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.deal_next(window, cx) {
+            self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
+        }
+    }
+
+    /// The pull itself: whether a card opened. Empty lands on Home, since
+    /// there is nothing to deal and the glance is the answer.
+    fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let now = Timestamp::now();
         let in_view = self.card_in_view(cx);
         // Reading a card and pulling again is what a skip is: the card is
@@ -331,13 +353,12 @@ impl Frame {
         // has passed since the last change.
         self.signals.hand = self.rank(cx);
         let Some(card) = self.hand().top(in_view.as_ref()).cloned() else {
-            // Empty lands on Home: there is nothing to deal, so the glance
-            // is the answer.
             self.open_home(window, cx);
-            return;
+            return false;
         };
         self.journal_deal(Some(&card.address), cx);
         self.open_card(card, window, cx);
+        true
     }
 
     fn open_card(&mut self, card: Card, window: &mut Window, cx: &mut Context<Self>) {

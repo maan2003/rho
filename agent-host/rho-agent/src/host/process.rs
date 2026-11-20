@@ -360,12 +360,16 @@ impl Process {
         // gets the process before init.py ended well.
         let failure = match tokio::time::timeout(INIT_TIMEOUT, init).await {
             Ok(Ok(None)) => return Ok(process),
-            Ok(Ok(Some(error))) => format!("init.py failed:\n{error}"),
-            Ok(Err(_)) => "the workset process ended before init.py did".to_owned(),
-            Err(_) => format!("init.py did not end within {}s", INIT_TIMEOUT.as_secs()),
+            Ok(Ok(Some(error))) => format!("the host's init.py failed:\n{error}"),
+            Ok(Err(_)) => "the workset's process ended while it started".to_owned(),
+            Err(_) => format!(
+                "the host's init.py did not end within {}s",
+                INIT_TIMEOUT.as_secs()
+            ),
         };
         process.shutdown().await;
-        anyhow::bail!("{failure}; no agent of the workset starts")
+        // Said to whoever asked for an agent, after `agent did not start:`.
+        anyhow::bail!("{failure}")
     }
 
     /// Takes over a workset process from the agent host this one re-executed.

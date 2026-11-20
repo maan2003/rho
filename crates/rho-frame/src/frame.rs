@@ -32,7 +32,7 @@ use crate::search::Search;
 use crate::surface::{AnySurface, Mode, Subject};
 use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
-use crate::{keys, palette};
+use crate::{keys, palette, place};
 
 /// The kind of the frame's own surface: Home.
 pub const FRAME_KIND: &str = "frame";
@@ -78,6 +78,8 @@ pub struct Frame {
     pub(crate) search: Option<Search>,
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
+    /// Writes down where the user is after each move, for the next start.
+    place: place::Writer,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -115,8 +117,9 @@ impl Frame {
             }
         });
         let menu_keys = cx.intercept_keystrokes(menu_keys);
+        let saved_place = place::Saved::load(&db);
         let mut frame = Self {
-            db,
+            db: db.clone(),
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
@@ -135,6 +138,7 @@ impl Frame {
             found: Vec::new(),
             search: None,
             phone: Phone::default(),
+            place: place::Writer::spawn(db.clone()),
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
         };
@@ -173,9 +177,78 @@ impl Frame {
         for spec in hosts {
             frame.attach_host(spec, cx);
         }
+        if let Some(saved) = saved_place {
+            frame.return_to(saved, window, cx);
+        }
         frame.systems_changed(cx);
         frame.focus_surface(window, cx);
         frame
+    }
+
+    /// Opens the window where the user was when it last ran on this
+    /// device, with the way back and forward as it was. The screens behind
+    /// and ahead are made when the user reaches them; the one they were on
+    /// is made now, and when it no longer opens the window opens on Home.
+    fn return_to(&mut self, saved: place::Saved, window: &mut Window, cx: &mut Context<Self>) {
+        self.history = saved.history(&Self::home_address());
+        let address = self.current_address().clone();
+        if self.surfaces.contains_key(&address) {
+            return;
+        }
+        match self.make_surface(&address, window, cx) {
+            Some(surface) => {
+                self.surfaces.insert(address, surface);
+            }
+            None => {
+                self.history.forget(&address);
+                self.home.update(cx, |home, cx| home.focus_first_row(cx));
+                self.history.show(Self::home_address(), ());
+            }
+        }
+    }
+
+    /// The surface for `address`, from the system that owns its kind.
+    fn make_surface(
+        &self,
+        address: &Address,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnySurface> {
+        self.systems
+            .clone()
+            .into_iter()
+            .find(|system| system.opens(address, cx))
+            .and_then(|system| system.open(address, window, cx))
+    }
+
+    /// Makes the screen the cursor came to, when the history holds it by
+    /// address alone, as one it was given back at start does. One that no
+    /// longer opens leaves the history and the walk goes on the way it
+    /// went, or the other way from the end; Home always opens.
+    fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let address = self.current_address().clone();
+            if self.surfaces.contains_key(&address) {
+                return;
+            }
+            if let Some(surface) = self.make_surface(&address, window, cx) {
+                self.surfaces.insert(address, surface);
+                return;
+            }
+            self.history.forget(&address);
+            let stepped = match forward {
+                true => self.history.forward().is_some() || self.history.back().is_some(),
+                false => self.history.back().is_some() || self.history.forward().is_some(),
+            };
+            if !stepped {
+                self.history.show(Self::home_address(), ());
+            }
+        }
+    }
+
+    /// Writes down where the user is now, for the next start.
+    fn moved(&self) {
+        self.place.write(place::Saved::of(&self.history));
     }
 
     pub fn home_address() -> Address {
@@ -255,13 +328,7 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         if !self.surfaces.contains_key(&address) {
-            let opened = self
-                .systems
-                .clone()
-                .into_iter()
-                .find(|system| system.opens(&address, cx))
-                .and_then(|system| system.open(&address, window, cx));
-            let Some(surface) = opened else {
+            let Some(surface) = self.make_surface(&address, window, cx) else {
                 self.echo(
                     &format!("nothing opens {address}"),
                     StyleClass::SystemInfo,
@@ -275,7 +342,13 @@ impl Frame {
             surface: journal_surface(&address),
             method,
         });
+        // Home opens on its top room, the one that wants the user most;
+        // only the way back returns to it as it was left.
+        if address == Self::home_address() {
+            self.home.update(cx, |home, cx| home.focus_first_row(cx));
+        }
         self.history.show(address, ());
+        self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
         cx.notify();
@@ -319,9 +392,11 @@ impl Frame {
             if address.kind() == FRAME_KIND && self.current_address() == address {
                 self.history.show(Self::home_address(), ());
             }
+            self.settle(false, window, cx);
             self.close_overlays(window, cx);
             self.focus_surface(window, cx);
         }
+        self.moved();
         cx.notify();
     }
 
@@ -349,6 +424,8 @@ impl Frame {
             self.echo("at the oldest", StyleClass::SystemInfo, cx);
             return;
         }
+        self.settle(false, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Back,
             position: self.history.behind(),
@@ -366,6 +443,8 @@ impl Frame {
             self.pull_card(window, cx);
             return;
         }
+        self.settle(true, window, cx);
+        self.moved();
         rho_journal::record(rho_journal::Event::HistoryStepped {
             direction: rho_journal::HistoryDirection::Forward,
             position: self.history.behind(),
@@ -577,17 +656,9 @@ impl Frame {
         let complete = {
             let entries = entries.clone();
             Rc::new(move |_: &Frame, input: &str, _: &App| {
-                let mut found: Vec<(u32, usize)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| {
-                        palette::score(input, &entry.label).map(|score| (score, index))
-                    })
-                    .collect();
-                found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-                found
+                palette::rank(&entries, input)
                     .into_iter()
-                    .map(|(_, index)| Candidate {
+                    .map(|index| Candidate {
                         value: entries[index].label.clone(),
                         description: entries[index].keys.clone(),
                     })
@@ -623,27 +694,26 @@ impl Frame {
     /// one.
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
+        // The window's own rows: the palette lists them after the screen's.
         let mut rows = vec![
-            Row::run("", "home", |frame, window, cx| frame.open_home(window, cx)),
-            Row::run("", "find", |frame, window, cx| frame.find(window, cx)),
+            Row::run("", "home", |frame, window, cx| frame.open_home(window, cx)).window_wide(),
+            Row::run("", "find", |frame, window, cx| frame.find(window, cx)).window_wide(),
             Row::run("", "undo", |frame, window, cx| {
                 frame.undo_verdict(window, cx)
-            }),
-            Row::menu("", "hosts", self.hosts_menu()),
+            })
+            .window_wide(),
+            Row::menu("", "hosts", self.hosts_menu()).window_wide(),
         ];
-        match self.attention.secret() {
-            Some(secret) => rows.push(Row::run(
-                "",
-                "show my secret phrase",
-                move |frame, window, cx| {
-                    frame.show_secret(secret, "your secret phrase · enter:", window, cx)
-                },
-            )),
-            None => rows.push(Row::run("", "pair this device", |frame, window, cx| {
+        let phrase = match self.attention.secret() {
+            Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
+                frame.show_secret(secret, "your secret phrase · enter:", window, cx)
+            }),
+            None => Row::run("", "pair this device", |frame, window, cx| {
                 frame.prompt_pair(String::new(), None, window, cx)
-            })),
-        }
-        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()));
+            }),
+        };
+        rows.push(phrase.window_wide());
+        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
         rows.extend(self.current_surface().clone().rows(window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
@@ -736,7 +806,11 @@ impl Frame {
             return;
         }
         let Some(target) = self.card_target(cx) else {
-            self.toggle_home(window, cx);
+            // With no card here there is nothing to judge, but the deal
+            // still goes on: `n` is how the user asks what waits.
+            let mut rows = Rows::new("no card here").counted();
+            push_deal_rows(&mut rows);
+            self.open_menu(rows, window, cx);
             return;
         };
         let card = self.card_for(&target, cx);
@@ -763,12 +837,7 @@ impl Frame {
             }),
         ));
         rows.push(Row::menu("s", "snooze", snooze_rows(&target)));
-        rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
-            frame.pull_card(window, cx)
-        }));
+        push_deal_rows(&mut rows);
         self.open_menu(rows, window, cx);
     }
 
@@ -1139,6 +1208,17 @@ impl Frame {
             status => Some(format!("{name} · {}", status.label())),
         }
     }
+}
+
+/// The verdict menu's rows that need no card: take back the last verdict,
+/// and deal the next card.
+fn push_deal_rows(rows: &mut Rows) {
+    rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
+        frame.undo_verdict(window, cx)
+    }));
+    rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
+        frame.pull_card(window, cx)
+    }));
 }
 
 /// How long `target` sleeps: a unit, and the count typed before it.

@@ -15,6 +15,7 @@
 //! hosts it reaches and keeps their answers, and a chart observes it.
 
 mod address;
+mod places;
 mod start;
 mod surface;
 
@@ -78,6 +79,13 @@ pub struct AgentsSystem {
     /// Agents asked for with the user's message, by the id the chat gave
     /// the message: started once the host has logged it.
     starting: HashMap<(EndpointId, u64), start::Plan>,
+    /// Where each channel's agents work, as the user answered it, until an
+    /// agent of the channel says so itself.
+    places: places::ChannelPlaces,
+    /// Agents this window started whose first turn has not ended, and
+    /// whether it got to work: a failure before then is the start failing,
+    /// and the echo line says so.
+    first_turns: HashMap<AgentId, bool>,
     timer: Option<Task<()>>,
     /// When each retrying agent turns stuck, which no host frame says, and
     /// the wake that ranks the deal again at the first of them.
@@ -88,7 +96,12 @@ pub struct AgentsSystem {
 }
 
 impl AgentsSystem {
-    pub fn new(chat: Entity<ChatSystem>, frame: FrameLink, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db: rho_db::RhoDb,
+        chat: Entity<ChatSystem>,
+        frame: FrameLink,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (client, changes) = AgentsClient::spawn();
         let pump = cx.spawn(async move |this, cx| {
             let mut changes = changes;
@@ -152,6 +165,8 @@ impl AgentsSystem {
             chat,
             frame,
             starting: HashMap::new(),
+            places: places::ChannelPlaces::open(db),
+            first_turns: HashMap::new(),
             timer: None,
             stuck: HashMap::new(),
             stuck_wake: None,
@@ -170,17 +185,21 @@ impl AgentsSystem {
     /// of what they do.
     pub fn participant(&self, endpoint: EndpointId, agent: AgentId) -> Option<Participant> {
         match self.host_of(endpoint) {
-            Some(_) => self.registry.mirrored(agent).map(|_| Participant {
-                label: self.registry.agent_display_label(agent),
-                doing: self
-                    .registry
-                    .agent_facts(agent)
-                    .runtime
-                    .map(|heard| heard.doing()),
+            Some(_) => self.registry.mirrored(agent).map(|_| {
+                let heard = self.registry.agent_facts(agent).runtime;
+                Participant {
+                    label: self.registry.agent_display_label(agent),
+                    doing: heard.as_ref().map(|heard| heard.doing()),
+                    stopped_because: heard
+                        .as_ref()
+                        .and_then(|heard| heard.stopped_because())
+                        .map(str::to_owned),
+                }
             }),
             None => Some(Participant {
                 label: agent.encoded(),
                 doing: None,
+                stopped_because: None,
             }),
         }
     }
@@ -254,6 +273,7 @@ impl AgentsSystem {
                 }
                 if self.registry.set_runtime(agent_id, Heard { state, since }) {
                     self.watch_stuck(agent_id, cx);
+                    self.first_turn_moved(agent_id, cx);
                     self.changed(cx);
                 }
             }
@@ -547,6 +567,43 @@ impl AgentsSystem {
         .detach();
     }
 
+    /// Watches the first turn of an agent this window just started: the
+    /// start is not done until the agent got to work.
+    pub(crate) fn watch_first_turn(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        self.first_turns.insert(agent, false);
+        self.first_turn_moved(agent, cx);
+    }
+
+    fn first_turn_moved(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        use rho_agent_types::Activity;
+        let Some(worked) = self.first_turns.get_mut(&agent) else {
+            return;
+        };
+        let Some(heard) = self.registry.agent_facts(agent).runtime else {
+            return;
+        };
+        match heard.doing().activity {
+            Activity::Failed | Activity::Lost => {
+                self.first_turns.remove(&agent);
+                let reason = heard.stopped_because().unwrap_or("its host gave no reason");
+                self.frame.echo(
+                    format!("agent did not start: {reason}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+            }
+            Activity::Working | Activity::Retrying => *worked = true,
+            Activity::Waiting | Activity::Archived => {
+                self.first_turns.remove(&agent);
+            }
+            Activity::Idle => {
+                if *worked {
+                    self.first_turns.remove(&agent);
+                }
+            }
+        }
+    }
+
     /// The host logged a message the user sent to start an agent with.
     fn delivered(
         &mut self,
@@ -556,7 +613,15 @@ impl AgentsSystem {
         cx: &mut Context<Self>,
     ) {
         if let Some(plan) = self.starting.remove(&(endpoint, client_id)) {
-            start::create(self, plan, message, cx);
+            start::create(
+                self,
+                plan,
+                ThreadId {
+                    host: endpoint,
+                    message,
+                },
+                cx,
+            );
         }
     }
 
@@ -911,7 +976,10 @@ impl System for AgentsSystem {
         if let Some(here) = AgentAddress::from_address(&point.surface) {
             return self.agent_rows(here, cx);
         }
-        let mut rows = vec![Row::menu("shift-u", "usage…", usage::menu(this.clone()))];
+        // Usage is offered on every screen, so it is the window's, as
+        // `home` and `quit` are, and comes after the screen's own commands.
+        let mut rows =
+            vec![Row::menu("shift-u", "usage…", usage::menu(this.clone())).window_wide()];
         // On an agent in a thread's `with` line: the agent is steered from
         // there as from its transcript.
         if let Some(AgentAddress {

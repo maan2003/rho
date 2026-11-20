@@ -5,7 +5,9 @@
 //! a key. A row keeps the key it has in the menus as a hint beside its
 //! name, so the palette teaches the keys it replaces.
 
-use crate::menu::{Pick, Row, Rows};
+use std::cmp::Reverse;
+
+use crate::menu::{Pick, Row, Rows, Scope};
 
 /// One command in the palette.
 pub(crate) struct Entry {
@@ -17,6 +19,8 @@ pub(crate) struct Entry {
     /// which no menu holds.
     pub keys: String,
     pub pick: Pick,
+    /// Whose it is: a row under a menu is its top row's.
+    pub scope: Scope,
 }
 
 /// Every row of `top` and of the menus under them, each menu as an entry
@@ -29,9 +33,10 @@ pub(crate) fn flatten(top: &[Row]) -> Vec<Entry> {
             label: row.description.clone(),
             keys: String::new(),
             pick: row.pick.clone(),
+            scope: row.scope,
         });
         if let Pick::Menu(rows) = &row.pick {
-            walk(rows, &row.description, "", &mut entries);
+            walk(rows, &row.description, "", row.scope, &mut entries);
         }
     }
     let mut seen: Vec<String> = Vec::new();
@@ -47,7 +52,7 @@ pub(crate) fn flatten(top: &[Row]) -> Vec<Entry> {
     entries
 }
 
-fn walk(rows: &Rows, label_above: &str, keys_above: &str, into: &mut Vec<Entry>) {
+fn walk(rows: &Rows, label_above: &str, keys_above: &str, scope: Scope, into: &mut Vec<Entry>) {
     for row in &rows.rows {
         let label = format!("{label_above} › {}", row.description);
         let keys = match keys_above.is_empty() {
@@ -58,11 +63,31 @@ fn walk(rows: &Rows, label_above: &str, keys_above: &str, into: &mut Vec<Entry>)
             label: label.clone(),
             keys: keys.clone(),
             pick: row.pick.clone(),
+            scope,
         });
         if let Pick::Menu(rows) = &row.pick {
-            walk(rows, &label, &keys, into);
+            walk(rows, &label, &keys, scope, into);
         }
     }
+}
+
+/// The entries that answer `query`, best first, by index. With nothing
+/// typed, the screen's commands and the thing's under the cursor come
+/// first in the order they were offered, and the window's own after them
+/// (`window.Palette`). With a query, the best match comes first, and a tie
+/// goes the same way.
+pub(crate) fn rank(entries: &[Entry], query: &str) -> Vec<usize> {
+    let typed = !query.trim().is_empty();
+    let mut found: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let score = score(query, &entry.label)?;
+            Some((Reverse(typed.then_some(score)), entry.scope, index))
+        })
+        .collect();
+    found.sort_unstable();
+    found.into_iter().map(|(.., index)| index).collect()
 }
 
 /// How well `label` answers `query`: `None` when some letter of the query
@@ -126,6 +151,43 @@ mod tests {
                 ("home (2)", ""),
             ]
         );
+    }
+
+    #[test]
+    fn the_screens_commands_come_before_the_windows() {
+        let mut hosts = Rows::new("hosts");
+        hosts.push(Row::run("a", "attach", |_, _, _| {}));
+        let top = vec![
+            Row::run("", "home", |_, _, _| {}).window_wide(),
+            Row::menu("", "hosts", hosts).window_wide(),
+            Row::run("", "quit", |_, _, _| {}).window_wide(),
+            Row::run("x", "shell", |_, _, _| {}),
+            Row::run("t", "terminal", |_, _, _| {}),
+            Row::run("shift-w", "notes", |_, _, _| {}).window_wide(),
+            Row::run("c", "cancel the request", |_, _, _| {}),
+        ];
+        let entries = flatten(&top);
+        let listed = |query: &str| -> Vec<&str> {
+            rank(&entries, query)
+                .into_iter()
+                .map(|index| entries[index].label.as_str())
+                .collect()
+        };
+        assert_eq!(
+            listed(""),
+            [
+                "shell",
+                "terminal",
+                "cancel the request",
+                "home",
+                "hosts",
+                "hosts › attach",
+                "quit",
+                "notes",
+            ]
+        );
+        assert_eq!(listed("ho")[0], "home");
+        assert_eq!(listed("te"), ["terminal", "cancel the request", "notes"]);
     }
 
     #[test]
