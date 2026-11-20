@@ -150,7 +150,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   phone has today, on every screen; panes may split where the editor
   allows. Home is the deal plus sections: unread threads, then the
   channels (rho roots across hosts and the Slack channels followed, one
-  list with a tag). The find minibuffer reaches anything by address.
+  list with a tag). The palette reaches every place by name, and by
+  address when one is typed.
 - A thread surface: breadcrumb up, messages with subthreads folded under
   their anchors, participants, composer at the bottom. `start agent`
   from any message, `send and start` from the composer.
@@ -218,7 +219,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - Keys: `space` is the verdict transient over the card in view, and
   again it is Home; `tab` is Home; `:` is the palette, every row of the
   frame, the surface and the systems by name, fuzzy, with the keys it has
-  in the menus as a hint. Transients stay only where the list is the
+  in the menus as a hint, and every place the systems `find`;
+  `ctrl-shift-f` opens it with the places first. Transients stay only where the list is the
   information: the verdicts, the snooze times, and where an agent starts.
 - Starting an agent goes through the agents system's rows on a thread
   surface, from the palette: `start agent here` from the message under

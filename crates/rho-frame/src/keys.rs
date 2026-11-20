@@ -17,7 +17,7 @@ actions!(
         Close,
         /// Closes the surface in view and deals the next card.
         CloseAndDeal,
-        /// `:`: every command by name.
+        /// `:`: the palette, the commands that fit this screen first.
         Palette,
         /// `space`: the verdicts over the card in view; `space` again is
         /// Home.
@@ -25,7 +25,8 @@ actions!(
         /// `tab`: Home, and from Home the way back.
         Home,
         OpenRow,
-        FindAddress,
+        /// `ctrl-shift-f`: the palette, the places first.
+        Find,
         UndoVerdict,
         MinibufferConfirm,
         MinibufferCancel,
@@ -56,7 +57,7 @@ pub fn bind(cx: &mut App) {
             KeyBinding::new("ctrl-shift-backspace", Close, Some(context)),
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
-            KeyBinding::new("ctrl-shift-f", FindAddress, Some(context)),
+            KeyBinding::new("ctrl-shift-f", Find, Some(context)),
         ]);
     }
     for context in normal_contexts("RhoFrame", " && !showing_completions") {

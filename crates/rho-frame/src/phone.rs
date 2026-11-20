@@ -617,7 +617,7 @@ impl Frame {
         match button {
             Button::Back => self.back(window, cx),
             Button::Home => self.toggle_home(window, cx),
-            Button::Menu => self.palette(window, cx),
+            Button::Menu => self.palette(crate::palette::First::Commands, window, cx),
             Button::Open if self.home_in_view() => self.open_row(window, cx),
             Button::Open => run_row(self, OPEN_ROW, window, cx),
             Button::Done => {

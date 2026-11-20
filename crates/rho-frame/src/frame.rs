@@ -1,5 +1,6 @@
 //! The frame entity: the window's root view.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,12 +25,12 @@ use crate::deal::Signals;
 use crate::home::{HomeTarget, HomeView};
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
-    CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
-    bottom_strip,
+    Answer, CancelHandler, Candidate, CandidateSource, ChangeHandler, ChooseHandler, Chosen, Echo,
+    Minibuffer, SubmitHandler, bottom_strip,
 };
 use crate::phone::{Layout, Phone};
 use crate::surface::{AnySurface, Subject};
-use crate::system::{AnySystem, Found};
+use crate::system::AnySystem;
 use crate::when::SnoozeUnit;
 use crate::{keys, palette};
 
@@ -71,8 +72,6 @@ pub struct Frame {
     mode_indicator: Entity<vim::ModeIndicator>,
     pub(crate) signals: Signals,
     pub(crate) chime: Rc<dyn Fn()>,
-    /// What `find:` listed last, so the chosen title opens its address.
-    found: Vec<Found>,
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
     _subscriptions: Vec<Subscription>,
@@ -129,7 +128,6 @@ impl Frame {
             mode_indicator,
             signals: Signals::default(),
             chime,
-            found: Vec::new(),
             phone: Phone::default(),
             _subscriptions: vec![menu_keys],
             _tasks: Vec::new(),
@@ -551,52 +549,77 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// `:`: every command by name, found by a fuzzy query, with the keys
-    /// that reach it through the menus as a hint. A command that is a
-    /// menu opens it as a transient.
-    pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entries = Rc::new(palette::flatten(&self.commands(window, cx)));
+    /// The palette: every place and every command by name, found by a
+    /// fuzzy query, with the place's where or the command's menu keys
+    /// beside it. `first` says which half leads until the query tells
+    /// them apart. A command that is a menu opens it as a transient.
+    pub(crate) fn palette(
+        &mut self,
+        first: palette::First,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let commands = palette::flatten(&self.commands(window, cx));
+        let mut places = Vec::new();
+        for system in &self.systems {
+            places.extend(system.find(&self.attention.marks, cx));
+        }
+        let listing = Rc::new(palette::Listing::new(commands, places, first));
+        // What the rows on screen are, so the row chosen is a choice and
+        // not words two rows may share.
+        let shown: Rc<RefCell<Vec<usize>>> = Rc::default();
         let complete = {
-            let entries = entries.clone();
+            let listing = listing.clone();
+            let shown = shown.clone();
             Rc::new(move |_: &Frame, input: &str, _: &App| {
-                let mut found: Vec<(u32, usize)> = entries
+                let ranked = listing.rank(input.trim());
+                let candidates = ranked
                     .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| {
-                        palette::score(input, &entry.label).map(|score| (score, index))
+                    .map(|index| {
+                        let choice = &listing.choices[*index];
+                        Candidate {
+                            value: choice.name().to_owned(),
+                            description: choice.beside().to_owned(),
+                        }
                     })
                     .collect();
-                found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-                found
-                    .into_iter()
-                    .map(|(_, index)| Candidate {
-                        value: entries[index].label.clone(),
-                        description: entries[index].keys.clone(),
-                    })
-                    .collect()
+                *shown.borrow_mut() = ranked;
+                candidates
             })
         };
-        let submit = Rc::new(
+        let choose = Rc::new(
             move |frame: &mut Frame,
-                  input: String,
+                  chosen: Chosen,
                   window: &mut Window,
                   cx: &mut Context<Frame>| {
-                let Some(entry) = entries.iter().find(|entry| entry.label == input.trim()) else {
-                    frame.echo(&format!("no command {input:?}"), StyleClass::SystemInfo, cx);
-                    return;
+                let row = match chosen {
+                    Chosen::Row(row) => shown.borrow().get(row).copied(),
+                    Chosen::Typed(input) => {
+                        // A name that fits nothing may still be an address.
+                        match Address::parse(input.trim()) {
+                            Some(address) => frame.open(address, window, cx),
+                            None => frame.echo(
+                                &format!("no command {input:?}"),
+                                StyleClass::SystemInfo,
+                                cx,
+                            ),
+                        }
+                        return;
+                    }
                 };
-                match &entry.pick {
-                    Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
-                    Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
+                match row.map(|row| &listing.choices[row]) {
+                    Some(palette::Choice::Place(found)) => {
+                        frame.open(found.address.clone(), window, cx)
+                    }
+                    Some(palette::Choice::Command(entry)) => match &entry.pick {
+                        Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
+                        Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
+                    },
+                    None => {}
                 }
             },
         );
-        self.open_prompt("command:", complete, submit, window, cx);
-        // A command's name is words (`new note`, `hosts › attach`), so the
-        // candidate replaces the whole input, not the last word.
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
-        }
+        self.open_chooser(":", complete, choose, window, cx);
     }
 
     /// The frame's rows, the surface's, and every system's for what is in
@@ -606,9 +629,6 @@ impl Frame {
         let mut rows = Rows::new("rho");
         rows.push(Row::run("h", "home", |frame, window, cx| {
             frame.open_home(window, cx)
-        }));
-        rows.push(Row::run("f", "find", |frame, window, cx| {
-            frame.find(window, cx)
         }));
         rows.push(Row::run("u", "undo", |frame, window, cx| {
             frame.undo_verdict(window, cx)
@@ -749,57 +769,6 @@ impl Frame {
         }
     }
 
-    /// `find:` everything every system has, by title.
-    pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut found = Vec::new();
-        for system in &self.systems {
-            found.extend(system.find(&self.attention.marks, cx));
-        }
-        found.sort_by_key(|found| std::cmp::Reverse(found.recency));
-        self.found = found;
-        self.open_prompt(
-            "find:",
-            Rc::new(|frame: &Frame, input: &str, _: &App| {
-                let needle = input.trim().to_lowercase();
-                frame
-                    .found
-                    .iter()
-                    .filter(|found| {
-                        found.title.to_lowercase().contains(&needle)
-                            || found.description.to_lowercase().contains(&needle)
-                    })
-                    .take(40)
-                    .map(|found| Candidate {
-                        value: found.title.clone(),
-                        description: found.description.clone(),
-                    })
-                    .collect()
-            }),
-            Rc::new(|frame, input, window, cx| {
-                let input = input.trim();
-                let address = frame
-                    .found
-                    .iter()
-                    .find(|found| found.title == input)
-                    .map(|found| found.address.clone())
-                    .or_else(|| Address::parse(input));
-                match address {
-                    Some(address) => frame.open(address, window, cx),
-                    None => frame.echo(
-                        &format!("find: nothing called {input}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }),
-            window,
-            cx,
-        );
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
-        }
-    }
-
     pub fn open_prompt(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
@@ -839,6 +808,38 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let answer = Answer::Text(on_submit);
+        self.open_minibuffer(prompt, complete, on_change, answer, on_cancel, window, cx);
+    }
+
+    /// A prompt whose rows are its answers: enter hands `on_choose` the
+    /// highlighted row, so rows of the same words stay apart.
+    pub(crate) fn open_chooser(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: CandidateSource,
+        on_choose: ChooseHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = Answer::Row(on_choose);
+        self.open_minibuffer(prompt, complete, None, answer, None, window, cx);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
+    )]
+    fn open_minibuffer(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: CandidateSource,
+        on_change: Option<ChangeHandler>,
+        answer: Answer,
+        on_cancel: Option<CancelHandler>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = prompt.into();
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
@@ -853,7 +854,7 @@ impl Frame {
             &text_style,
             complete,
             on_change,
-            on_submit,
+            answer,
             on_cancel,
             window,
             cx,
@@ -894,7 +895,7 @@ impl Frame {
         let prompt = minibuffer.prompt().to_owned();
         minibuffer.accept_selected(window, cx);
         let secret = minibuffer.is_secret();
-        let (input, on_submit) = minibuffer.into_submission(cx);
+        let (input, submission) = minibuffer.into_submission(cx);
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
             input: match secret {
@@ -903,7 +904,7 @@ impl Frame {
             },
         });
         self.give_keyboard_back(window, cx);
-        on_submit(self, input, window, cx);
+        submission(self, window, cx);
         cx.notify();
     }
 
@@ -1181,7 +1182,9 @@ impl Render for Frame {
                 this.close_current(window, cx);
                 this.pull_card(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| {
+                this.palette(palette::First::Commands, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
                     this.verdict_menu(window, cx)
@@ -1189,7 +1192,9 @@ impl Render for Frame {
             )
             .on_action(cx.listener(|this, _: &keys::Home, window, cx| this.toggle_home(window, cx)))
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
-            .on_action(cx.listener(|this, _: &keys::FindAddress, window, cx| this.find(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::Find, window, cx| {
+                this.palette(palette::First::Places, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &keys::UndoVerdict, window, cx| {
                     this.undo_verdict(window, cx)

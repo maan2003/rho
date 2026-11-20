@@ -129,6 +129,31 @@ pub type CandidateSource = Rc<dyn Fn(&Frame, &str, &App) -> Vec<Candidate>>;
 /// Receives the typed input (tab-completions applied) after the
 /// minibuffer has closed.
 pub type SubmitHandler = Rc<dyn Fn(&mut Frame, String, &mut Window, &mut Context<Frame>)>;
+/// Receives what the reader chose in a prompt whose rows are its answers,
+/// after the minibuffer has closed.
+pub type ChooseHandler = Rc<dyn Fn(&mut Frame, Chosen, &mut Window, &mut Context<Frame>)>;
+
+/// What enter chose in a prompt whose rows are its answers: a row, which
+/// two rows of the same words cannot confuse, or, when no row fits, the
+/// words typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// The index of the highlighted row in what the candidate source
+    /// returned last.
+    Row(usize),
+    Typed(String),
+}
+
+/// What a prompt does with enter.
+pub(crate) enum Answer {
+    /// Hands over the line, a highlighted row's words put into it.
+    Text(SubmitHandler),
+    /// Hands over the highlighted row.
+    Row(ChooseHandler),
+}
+
+/// A closed prompt's answer, run once focus is back where it was.
+pub(crate) type Submission = Box<dyn FnOnce(&mut Frame, &mut Window, &mut Context<Frame>)>;
 /// Runs when Escape dismisses a prompt that owns external state.
 pub type CancelHandler = Rc<dyn Fn(&mut Frame, &mut Window, &mut Context<Frame>)>;
 /// Receives the input as it now stands, after each edit, while the
@@ -147,7 +172,7 @@ pub struct Minibuffer {
     editor: Entity<Editor>,
     complete: CandidateSource,
     on_change: Option<ChangeHandler>,
-    on_submit: SubmitHandler,
+    answer: Answer,
     on_cancel: Option<CancelHandler>,
     candidates: Vec<Candidate>,
     selected: usize,
@@ -182,12 +207,12 @@ impl Minibuffer {
         clippy::too_many_arguments,
         reason = "editor primitives pass their callbacks and GPUI window/context explicitly"
     )]
-    pub fn open(
+    pub(crate) fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
         complete: CandidateSource,
         on_change: Option<ChangeHandler>,
-        on_submit: SubmitHandler,
+        answer: Answer,
         on_cancel: Option<CancelHandler>,
         window: &mut Window,
         cx: &mut Context<Frame>,
@@ -218,12 +243,12 @@ impl Minibuffer {
             editor,
             complete,
             on_change,
-            on_submit,
+            complete_whole_input: matches!(answer, Answer::Row(_)),
+            answer,
             on_cancel,
             candidates: Vec::new(),
             selected: 0,
             selection_moved: false,
-            complete_whole_input: false,
             completed_selection: None,
             secret: false,
             _edits: edits,
@@ -299,7 +324,7 @@ impl Minibuffer {
     /// style: it replaces the last token before submission whenever the
     /// user has typed something or explicitly moved the selection. A bare
     /// enter on an untouched minibuffer still submits the empty input,
-    /// except where the input is one candidate whole (`find:`, a chooser):
+    /// except where the input is one candidate whole (the palette, a chooser):
     /// there the highlighted row is the answer.
     pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
         if self.accepts_selected(cx) {
@@ -349,11 +374,24 @@ impl Minibuffer {
         Some((candidate, occurrence))
     }
 
-    /// Consumes the minibuffer into its input and handler; the caller
-    /// invokes the handler after restoring focus.
-    pub fn into_submission(self, cx: &App) -> (String, SubmitHandler) {
+    /// Consumes the minibuffer into its input and its answer; the caller
+    /// runs the answer after restoring focus.
+    pub(crate) fn into_submission(self, cx: &App) -> (String, Submission) {
         let input = self.input(cx);
-        (input, self.on_submit)
+        let chosen = match self.accepts_selected(cx) && self.selected < self.candidates.len() {
+            true => Chosen::Row(self.selected),
+            false => Chosen::Typed(input.clone()),
+        };
+        let submission: Submission = match self.answer {
+            Answer::Text(on_submit) => {
+                let input = input.clone();
+                Box::new(move |frame, window, cx| on_submit(frame, input, window, cx))
+            }
+            Answer::Row(on_choose) => {
+                Box::new(move |frame, window, cx| on_choose(frame, chosen, window, cx))
+            }
+        };
+        (input, submission)
     }
 
     pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Frame>) -> AnyElement {
