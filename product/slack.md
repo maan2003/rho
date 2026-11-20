@@ -29,7 +29,7 @@ does:
 - receive: take mentions in channels the bot is in, direct messages to the bot, and messages in threads the bot is in; the user's own direct messages do not reach it
 - post: send the user's reply into Slack as `rho`
 - answer on its own: answer using only what rho itself knows
-- show chatter: show the latest chatter from starred channels as the project's `mail.Status`, not as waiting mail
+- show chatter: show the latest chatter from starred channels as the project's latest words, a mail that does not ping, not as waiting mail
 
 The rest is Slack in a `browser.Page` under the user's own account. The user can return to it with a `browser.Bookmark`.
 
