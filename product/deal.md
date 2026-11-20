@@ -44,7 +44,7 @@ does:
 - done `space` then `d`, or `done` on the phone: say the user is through with everything in the card so far; the card goes away, and when it was on screen, the next one opens
 - mute `space` then `m`, or `mute` on the phone: say nothing from it should reach the user again; the card goes away, and when it was on screen, the next one opens
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
-- undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
+- undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the echo line reads `undid done: debug`; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
 
 A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is in it, on the `with` line or in the box too. On a channel's list, a thread's row is that thread's card. A verdict about one message alone is a rare act, by name from the palette: `done with this message` and `mute this message`, offered only when the line under the cursor is a message that is not itself the card; the card stays.
 

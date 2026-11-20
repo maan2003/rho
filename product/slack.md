@@ -80,7 +80,7 @@ so that: only what is recent asks for the user
 steps:
 1. the user chooses `mark read before…` in the `slack` menu
 2. the user answers `mark read before (7d):` with an age such as `6h`, or a date such as `2026-08-15`; the answer shows how many conversations and threads it covers
-3. the user presses `enter`; everything up to that time counts as done, in Slack too; one `shift-u` takes it all back
+3. the user presses `enter`; everything up to that time counts as done, in Slack too, except what is muted; the echo line reads `marked read before 2026-11-21: 4 conversations · 0 threads`; one `shift-u` takes it all back
 system: counts what the answer covers before the user commits, and leaves whatever came after the time as it was.
 user: the time.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
