@@ -42,14 +42,10 @@ gpui::actions!(
         /// Opens what the cursor is on: a conversation, a thread, a hit, a
         /// file, a link, an app's button.
         OpenRow,
-        /// The next conversation with something unread.
-        NextUnread,
         /// Asks Slack for messages.
         FindMessage,
         /// Asks Slack for files.
         FindFile,
-        /// A direct message to people.
-        NewMessage,
         /// The search page before this one.
         PreviousPage,
         /// The search page after this one.
@@ -313,10 +309,7 @@ impl SlackSystem {
         vec![
             with("n", "new message…", prompt_people),
             with("shift-n", "next unread", |session, frame, window, cx| {
-                let here = match SlackAddress::from_address(frame.current_address()) {
-                    Some(SlackAddress::Unit(_, unit)) => Some(unit.channel),
-                    _ => None,
-                };
+                let here = channel_here(frame);
                 next_unread(&session, here.as_ref(), frame, window, cx)
             }),
             with("c", "browse channels…", |session, frame, _, cx| {
@@ -328,10 +321,12 @@ impl SlackSystem {
                 session.update(cx, |session, cx| session.browse_channels(cx));
             }),
             with("s", "search messages…", |session, frame, window, cx| {
-                prompt_find(session, None, SearchKind::Messages, frame, window, cx)
+                let scope = search_scope_here(&session, frame, cx);
+                prompt_find(session, scope, SearchKind::Messages, frame, window, cx)
             }),
             with("f", "search files…", |session, frame, window, cx| {
-                prompt_find(session, None, SearchKind::Files, frame, window, cx)
+                let scope = search_scope_here(&session, frame, cx);
+                prompt_find(session, scope, SearchKind::Files, frame, window, cx)
             }),
             with("d", "drafts…", prompt_drafts),
             with("m", "mark read before…", prompt_mark_read_before),
@@ -733,7 +728,7 @@ impl SlackSystem {
     }
 }
 
-/// `ctrl-n`: a direct message to one to eight people, opened by Slack and
+/// `new message…`: a direct message to one to eight people, opened by Slack and
 /// then answered with [`SessionEvent::OpenConversation`].
 pub(super) fn prompt_people(
     session: Entity<Session>,
@@ -1172,7 +1167,27 @@ fn mark_read_before(
     );
 }
 
-/// `shift-n`: the next conversation with something unread.
+/// The conversation the frame is showing, if it shows one.
+fn channel_here(frame: &Frame) -> Option<ChannelId> {
+    match SlackAddress::from_address(frame.current_address()) {
+        Some(SlackAddress::Unit(_, unit)) => Some(unit.channel),
+        _ => None,
+    }
+}
+
+/// A search started inside a conversation asks Slack about that
+/// conversation only.
+fn search_scope_here(
+    session: &Entity<Session>,
+    frame: &Frame,
+    cx: &App,
+) -> Option<(String, String)> {
+    let channel = channel_here(frame)?;
+    let model = session.read(cx).model();
+    Some((model.search_scope(&channel)?, model.label(&channel)))
+}
+
+/// The next conversation with something unread.
 pub(super) fn next_unread(
     session: &Entity<Session>,
     here: Option<&ChannelId>,
@@ -1209,30 +1224,17 @@ pub(super) fn subject_of(model: &Model, source: Option<Source>) -> Subject {
 
 fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
-    let mut bindings = Vec::new();
-    // Deal mode is not here, so these need no `!VimDeal`: a key means one
-    // thing per context.
-    // The thread's own keys are the frame's (`rho_frame::thread`). A Slack
-    // message's own actions are in the `slack` menu, not on letters, so
-    // every vim motion means what it means in any thread.
-    for context in rho_frame::normal_contexts("RhoSlackConversation", "") {
-        bindings.extend([
-            KeyBinding::new("shift-s", FindMessage, Some(&context)),
-            KeyBinding::new("ctrl-shift-s", FindFile, Some(&context)),
-            KeyBinding::new("ctrl-n", NewMessage, Some(&context)),
-            // `shift-n` and not `n`: `n` is the search the reader just ran.
-            KeyBinding::new("shift-n", NextUnread, Some(&context)),
-        ]);
-    }
+    // A conversation binds no letters of its own: its thread keys are the
+    // frame's (`rho_frame::thread`) and everything Slack does is in the
+    // `slack` menu, so every vim motion means what it means in any thread.
     let results = "RhoSlackResults > Editor";
-    bindings.extend([
+    cx.bind_keys([
         KeyBinding::new("enter", OpenRow, Some(results)),
         KeyBinding::new("[", PreviousPage, Some(results)),
         KeyBinding::new("]", NextPage, Some(results)),
         KeyBinding::new("shift-s", FindMessage, Some(results)),
         KeyBinding::new("ctrl-shift-s", FindFile, Some(results)),
     ]);
-    cx.bind_keys(bindings);
 }
 
 #[cfg(test)]

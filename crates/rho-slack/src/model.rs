@@ -279,12 +279,12 @@ pub struct ConversationRow {
     /// and no number to put on it.
     pub unread_count: u32,
     /// Muted in Slack, from any client. These sit at the bottom of the list
-    /// and never pull the reader with `shift-n`.
+    /// and never pull the reader with `next unread`.
     pub muted: bool,
     pub latest: Option<Ts>,
 }
 
-/// What the next-unread key found.
+/// What `next unread` found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NextUnread {
     /// Open this one.
@@ -1205,9 +1205,9 @@ impl Model {
             .map_or(NextUnread::Nothing, |row| NextUnread::Go(row.id.clone()))
     }
 
-    /// Whether a conversation is somewhere the next-unread key will take
-    /// the reader: unread or holding a mention, and not muted. Muted is
-    /// the reader saying "not this one", which the key obeys.
+    /// Whether a conversation is somewhere `next unread` will take the
+    /// reader: unread or holding a mention, and not muted. Muted is the
+    /// reader saying "not this one", which it obeys.
     fn unread(row: &&ConversationRow) -> bool {
         !row.muted && (row.unread || row.mention_count > 0)
     }
@@ -3253,7 +3253,7 @@ mod tests {
         assert_eq!(model.conversation_rows()[0].id, ChannelId("C1".into()));
 
         // Muted in another client: it keeps its count, loses its place, and
-        // stops being somewhere `shift-n` will take the reader.
+        // stops being somewhere `next unread` will take the reader.
         model.set_muted([ChannelId("C1".into())]);
         let rows = model.conversation_rows();
         assert_eq!(
