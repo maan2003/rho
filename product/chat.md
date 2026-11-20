@@ -31,7 +31,7 @@ day: Turn ideas into work.
 
 ## concept Channel
 purpose: keep the threads of one subject or one project together, so the user reads them in one place.
-principle: the user makes a channel `fedi`; every thread about that project starts in it; on Home, `fedi` is one row that says what waits in it.
+principle: the user makes a channel `tide`; every thread about that project starts in it; on Home, `tide` is one row that says what waits in it.
 sees: its name and its host; open, the list of its threads, one line each.
 has:
 - many `Thread`
@@ -107,7 +107,7 @@ shows:
 - the `with` line: each `agents.Agent` in the thread, what it is doing and for how long, such as `working 12m` or `failed 1h`
 - the first `Message`, the brief every agent started from
 - under a `Message` with replies, `↳ 2 replies · name · time`
-- the line of threads above this one, such as `fedi`, when there is one
+- the line of threads above this one, such as `tide`, when there is one
 - the box to write in, holding the `Draft`, `message · ctrl-enter sends` while empty
 - the `window.Status line`: the thread's name, with its host before it when more than one is attached, and the card's words such as `asks · 2h` when the thread is one
 - a `notes.Private reply` under the message it answers, marked `🔒 you`
@@ -127,8 +127,8 @@ keys:
 starts: `Answer an agent`, `slack.Answer Slack`, `agents.Start an agent from a message`, `notes.Reply privately`
 mock:
 ```
-fedi › flaky test                                       asks · 2h             NOR
-fedi
+tide › flaky test                                       asks · 2h             NOR
+tide
 you · 09:12
 hey, fix the flaky test in sync_tests.rs, it fails one run in five
 with eng-q9tz · working 12m, eng-kjhi · failed 1h

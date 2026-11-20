@@ -314,8 +314,8 @@ mod tests {
     fn a_function_is_a_python_name() {
         assert_eq!(Function::parse(" ").unwrap().as_str(), "new_agent");
         assert_eq!(
-            Function::parse(" fedi.roboman ").unwrap().as_str(),
-            "fedi.roboman"
+            Function::parse(" acme.roboman ").unwrap().as_str(),
+            "acme.roboman"
         );
         assert_eq!(Function::parse("_start2").unwrap().as_str(), "_start2");
         for bad in ["2start", "a..b", "a.", "f()", "a b", "x;import os", "é"] {

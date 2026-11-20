@@ -223,10 +223,7 @@ mod git_tests {
     #[test]
     fn validates_allowlisted_repository_shapes() {
         assert!(valid_ssh_repository("github.com", "acme/project"));
-        assert!(valid_ssh_repository(
-            "github.com",
-            "fedibtc/decentralized-federations"
-        ));
+        assert!(valid_ssh_repository("github.com", "octocat/hello-world"));
         assert!(valid_ssh_repository("github.com", "acme/project_name"));
         assert!(valid_ssh_repository("github.com", "acme/.github"));
         assert!(valid_ssh_repository("git.sr.ht", "~alice/project"));

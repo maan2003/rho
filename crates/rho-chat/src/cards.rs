@@ -1147,7 +1147,7 @@ mod tests {
         };
         let worked = |w: &World, root| worked_in(&w.chat, EndpointId([0; 32]), root, &w.marks);
 
-        let made = w.post(None, Party::User, Vec::new(), "fedi");
+        let made = w.post(None, Party::User, Vec::new(), "tide");
         assert!(worked(&w, made), "the user made it");
 
         let deploy = w.post(None, deployer, Vec::new(), "deploy 41");

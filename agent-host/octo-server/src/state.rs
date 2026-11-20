@@ -76,10 +76,10 @@ mod tests {
 
         assert_eq!(
             state
-                .github_git_url("fedimint", "fedimint", "info/refs")
+                .github_git_url("octocat", "hello-world", "info/refs")
                 .unwrap()
                 .as_str(),
-            "https://github.com/fedimint/fedimint.git/info/refs"
+            "https://github.com/octocat/hello-world.git/info/refs"
         );
     }
     #[test]
