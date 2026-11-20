@@ -14,9 +14,13 @@ chrono = { version = "0.4", default-features = false, features = [
   "std",
 ] }
 collections = { path = "../../vendor/zed/crates/collections" }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = [
+  "native",
+] }
 futures.workspace = true
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "wayland",
+] }
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
@@ -31,8 +35,8 @@ rho-shell-view = { workspace = true, features = ["ui"] }
 rho-terminal = { workspace = true, features = ["ui"] }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
-settings = { path = "../../vendor/zed/crates/settings" }
 serde_json.workspace = true
+settings = { path = "../../vendor/zed/crates/settings" }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }

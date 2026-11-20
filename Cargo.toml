@@ -9,11 +9,10 @@ exclude = [
   "vendor/zed",
 ]
 members = [
-  "agent-host/octo-cli",
-  "agent-host/octo-server",
-  "agent-host/slack-server",
   "agent-host/google-server",
   "agent-host/notion-server",
+  "agent-host/octo-cli",
+  "agent-host/octo-server",
   "agent-host/rho-agent",
   "agent-host/rho-agent-host",
   "agent-host/rho-ci",
@@ -37,6 +36,7 @@ members = [
   "agent-host/rho-visualizations",
   "agent-host/rho-watch",
   "agent-host/rho-web-search",
+  "agent-host/slack-server",
   "crates/json-stream",
   "crates/octo-types",
   "crates/prefix-id",
@@ -103,6 +103,7 @@ dirs = { version = "7", default-features = false }
 fnv = "1"
 futures = "0.3"
 futures-util = "0.3"
+google-server = { path = "agent-host/google-server" }
 iroh = { version = "1.3.0", default-features = false }
 iroh-ipc-transport = { path = "vendor/iroh-ipc-transport" }
 jiff = "0.2"
@@ -113,13 +114,11 @@ moq-net = { path = "vendor/moq/rs/moq-net" }
 moq-tokio = { path = "vendor/moq/rs/moq-tokio", default-features = false }
 noq-proto = { version = "=1.3.0", default-features = false }
 notify = "9.0.0-rc.4"
-octo-server = { path = "agent-host/octo-server" }
-slack-server = { path = "agent-host/slack-server" }
-google-server = { path = "agent-host/google-server" }
 notion-server = { path = "agent-host/notion-server" }
+octo-server = { path = "agent-host/octo-server" }
 octo-types = { path = "crates/octo-types" }
-prefix-id = { path = "crates/prefix-id", default-features = false }
 percent-encoding = "2"
+prefix-id = { path = "crates/prefix-id", default-features = false }
 pyo3 = "0.29"
 pythonize = "0.29"
 rand = "0.10"
@@ -138,10 +137,10 @@ rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-agent-hosts = { path = "crates/rho-agent-hosts" }
 rho-agent-types = { path = "crates/rho-agent-types" }
 rho-agents-client = { path = "crates/rho-agents-client" }
-rho-chat = { path = "crates/rho-chat" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }
+rho-chat = { path = "crates/rho-chat" }
 rho-claude = { path = "agent-host/rho-claude" }
 rho-claude-usage = { path = "agent-host/rho-claude-usage" }
 rho-context-config = { path = "agent-host/rho-context-config" }
@@ -162,9 +161,9 @@ rho-inference = { path = "agent-host/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-ledger = { path = "crates/rho-ledger" }
-rho-notes = { path = "crates/rho-notes" }
 rho-ledger-server = { path = "agent-host/rho-ledger-server" }
 rho-notebook = { path = "agent-host/rho-notebook" }
+rho-notes = { path = "crates/rho-notes" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
@@ -190,6 +189,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.11"
+slack-server = { path = "agent-host/slack-server" }
 tempfile = { version = "3", default-features = false }
 text = { path = "vendor/zed/crates/text" }
 tokio = { version = "1", features = [

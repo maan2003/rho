@@ -23,10 +23,7 @@ client = [
 ]
 
 # The terminals as the frame shows them: the surface and its keys.
-ui = [
-  "client",
-  "dep:rho-frame",
-]
+ui = ["client", "dep:rho-frame"]
 
 [dependencies]
 bytes.workspace = true
@@ -35,7 +32,9 @@ senax-encoder.workspace = true
 
 anyhow = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "wayland",
+], optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-frame = { workspace = true, optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }

@@ -24,10 +24,9 @@ use rho_frame::{
     AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Subject, Surface,
 };
 use rho_window::style::StyleClass;
-
-use self::pages::{GRACE, Pages};
 use url::Url;
 
+use self::pages::{GRACE, Pages};
 use crate::{
     Browser, PageId, PageMetadata, PageMetadataChanged, PageModel, PageView, live_page_name,
     live_pages,
@@ -150,7 +149,12 @@ impl PageSystem {
 
     /// `page:` asks for a page: one the browser has open, by its title,
     /// most recent first, or a new one at what is typed.
-    fn ask_page(this: Entity<Self>, frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) {
+    fn ask_page(
+        this: Entity<Self>,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
         frame.open_prompt(
             "page:",
             Rc::new(|_, input, _| {
@@ -194,7 +198,6 @@ impl PageSystem {
             minibuffer.set_complete_whole_input();
         }
     }
-
 }
 
 /// What a page is called: its title while the browser has it, or its
@@ -355,7 +358,11 @@ mod tests {
             typed_url("http://127.0.0.1:8765/").unwrap().as_str(),
             "http://127.0.0.1:8765/"
         );
-        for other in ["ftp://example.com/", "file:///etc/passwd", "chrome://settings"] {
+        for other in [
+            "ftp://example.com/",
+            "file:///etc/passwd",
+            "chrome://settings",
+        ] {
             assert!(typed_url(other).is_err(), "{other}");
         }
         // No `://`, so it reads as a host with a port-like tail, which is

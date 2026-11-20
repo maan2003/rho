@@ -9,9 +9,9 @@ rust-version = "1.91"
 [dependencies]
 anyhow.workspace = true
 iroh.workspace = true
+rand.workspace = true
 redb = { workspace = true }
 redb-derive = { workspace = true }
-rand.workspace = true
 rho-agent-types.workspace = true
 rho-db = { workspace = true }
 sha2.workspace = true

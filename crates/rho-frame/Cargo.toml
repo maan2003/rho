@@ -12,10 +12,15 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 collections = { path = "../../vendor/zed/crates/collections" }
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = [
+  "native",
+] }
 futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "wayland",
+] }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 jiff.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
@@ -28,14 +33,15 @@ rho-journal.workspace = true
 rho-ledger = { workspace = true, features = ["client"] }
 rho-transcript.workspace = true
 rho-window.workspace = true
-text = { path = "../../vendor/zed/crates/text" }
+senax-encoder.workspace = true
 settings = { path = "../../vendor/zed/crates/settings" }
+text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 tokio = { workspace = true, features = ["rt"] }
-bytes.workspace = true
-senax-encoder.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
+vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = [
+  "zed-workspace",
+] }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }

@@ -19,31 +19,35 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-base64.workspace = true
 assets = { path = "../../vendor/zed/crates/assets" }
+base64.workspace = true
 clap = { workspace = true }
 dirs = { workspace = true }
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = [
+  "native",
+] }
 futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "wayland",
+] }
 gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-features = false, features = [
   "font-kit",
   "wayland",
 ] }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
+rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view.workspace = true
-rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-browser = { workspace = true, features = ["ui"] }
 rho-chat = { workspace = true, features = ["ui"] }
-rho-slack = { workspace = true, features = ["ui"] }
 rho-db = { workspace = true }
 rho-frame = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
 rho-notes = { workspace = true }
 rho-profiling = { workspace = true }
+rho-slack = { workspace = true, features = ["ui"] }
 rho-window.workspace = true
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "3ee9745862279ce1d18db593155016e7ce024aeb", default-features = false, features = [
   "playback",
@@ -63,11 +67,10 @@ theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 tokio = { workspace = true, features = ["rt", "signal"] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = [
-  "env-filter",
-  "fmt",
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = [
+  "zed-workspace",
 ] }
-vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 zbus.workspace = true
 
@@ -80,4 +83,6 @@ tikv-jemallocator = { version = "0.7", features = [
 ] }
 
 [dev-dependencies]
-gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu", features = ["test-support"] }
+gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu", features = [
+  "test-support",
+] }

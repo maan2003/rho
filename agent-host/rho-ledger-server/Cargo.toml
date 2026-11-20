@@ -13,11 +13,17 @@ redb.workspace = true
 rho-db.workspace = true
 rho-ledger = { workspace = true, features = ["store"] }
 rho-rpc.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
 futures.workspace = true
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-ledger = { workspace = true, features = ["client"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "rt",
+  "sync",
+  "time",
+] }

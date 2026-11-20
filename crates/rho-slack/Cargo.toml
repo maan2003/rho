@@ -17,22 +17,22 @@ default = ["ui"]
 ui = [
   "dep:bytes",
   "dep:chrono",
-  "dep:jiff",
-  "dep:rho-dealer",
-  "dep:rho-frame",
-  "dep:rho-journal",
-  "dep:rho-window",
-  "dep:redb",
-  "dep:rho-transcript",
-  "dep:rho-db",
-  "dep:senax-encoder",
   "dep:editor",
   "dep:gpui",
   "dep:gpui_tokio",
   "dep:image",
+  "dep:jiff",
   "dep:language",
   "dep:multi_buffer",
   "dep:project",
+  "dep:redb",
+  "dep:rho-db",
+  "dep:rho-dealer",
+  "dep:rho-frame",
+  "dep:rho-journal",
+  "dep:rho-transcript",
+  "dep:rho-window",
+  "dep:senax-encoder",
   "dep:text",
   "dep:theme",
   "dep:ui",
@@ -72,19 +72,25 @@ url.workspace = true
 
 bytes = { workspace = true, optional = true }
 jiff = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+rho-db = { workspace = true, optional = true }
 rho-dealer = { workspace = true, optional = true }
 rho-frame = { workspace = true, optional = true }
 rho-journal = { workspace = true, optional = true }
-rho-window = { workspace = true, optional = true }
-redb = { workspace = true, optional = true }
-rho-db = { workspace = true, optional = true }
 rho-transcript = { workspace = true, optional = true }
+rho-window = { workspace = true, optional = true }
 senax-encoder = { workspace = true, optional = true }
 
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, optional = true }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio", optional = true }
-image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp", "bmp"], optional = true }
+image = { version = "0.25", default-features = false, features = [
+  "bmp",
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+], optional = true }
 language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 project = { path = "../../vendor/zed/crates/project", default-features = false, optional = true }
