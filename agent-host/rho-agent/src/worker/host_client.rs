@@ -308,6 +308,24 @@ impl HostClient {
             _ => Err(StoreError(anyhow::anyhow!("unexpected head reply"))),
         }
     }
+    pub(crate) async fn cold_notice(
+        &self,
+        incoming: Option<rho_agent_types::MessageId>,
+    ) -> Result<Option<crate::entry::RequestNotice>, StoreError> {
+        match self
+            .request(Request::ColdNotice { incoming })
+            .await
+            .map_err(StoreError)?
+        {
+            Reply::ColdNotice(value) => {
+                Ok(value.map(
+                    |(thread, minutes)| crate::entry::RequestNotice::ThreadCold { thread, minutes },
+                ))
+            }
+            _ => Err(StoreError(anyhow::anyhow!("unexpected cold-notice reply"))),
+        }
+    }
+
     /// Every visible row of the agent.
     pub(crate) async fn history(&self) -> Result<Vec<(Wpos, Record<'static>)>, StoreError> {
         match self.request(Request::History).await.map_err(StoreError)? {

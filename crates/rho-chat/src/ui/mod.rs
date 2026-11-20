@@ -18,7 +18,9 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{Address as Party, AgentId, ContentPart, Doing, EndpointId, MessageId};
+use rho_agent_types::{
+    Address as Party, AgentId, ContentPart, Doing, EndpointId, MessageId, ThreadStatus,
+};
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
@@ -62,6 +64,7 @@ struct Slot {
     name: String,
     link: Link,
     endpoint: Option<EndpointId>,
+    view: tokio::sync::watch::Sender<Option<MessageId>>,
 }
 
 /// An agent of a thread as the agents system tells the chat: what to
@@ -86,6 +89,7 @@ pub struct ChatSystem {
     chats: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
+    view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     /// Threads whose agent did not start from this window, and why, in the
     /// host's words, while this window runs.
@@ -132,6 +136,7 @@ impl ChatSystem {
                 .map(|(seed, parent, text)| ((seed, parent), text))
                 .collect(),
             cache,
+            view: None,
             failed_starts: HashMap::new(),
             hosts: HashMap::new(),
             chats,
@@ -148,10 +153,7 @@ impl ChatSystem {
         }
     }
 
-    /// Tells the chat which agents still exist, what to call them, and
-    /// what they are doing: a thread whose agents are all gone raises no
-    /// card, one whose agent stopped unbidden raises one, and a thread's
-    /// participants read by label and state.
+    /// Tells chat which agents still exist and how their transcripts are named.
     pub fn set_participants(&mut self, participants: Participants) {
         self.participants = participants;
     }
@@ -173,40 +175,51 @@ impl ChatSystem {
             .map(|participant| participant.label)
     }
 
-    /// The user steered an agent that is doing `doing`: the stop it is
-    /// in, if any, is seen, and its thread's card for it goes. What else
-    /// waits in the thread still waits. The agents system tells what the
-    /// agent does, as it is the one steering.
-    pub fn steered(&self, endpoint: EndpointId, agent: AgentId, doing: Doing, cx: &mut App) {
-        let now = rho_agent_types::UnixMs::now();
-        if doing.stop(now).is_none() {
-            return;
+    /// Reports which mail thread is open in the focused place, if any.
+    /// A focus change to a non-mail screen sends `None`; neither opens
+    /// nor closes change a verdict or read mark.
+    pub fn set_view(&mut self, thread: Option<ThreadId>) {
+        self.view = thread;
+        for slot in self.hosts.values() {
+            Self::sync_view(slot, thread);
         }
-        let Some(thread) = self
-            .chats
-            .get(&endpoint)
-            .and_then(|chat| chat.agent_thread(agent))
-        else {
-            return;
-        };
-        let node = ThreadId {
-            host: endpoint,
-            message: thread,
-        }
-        .address();
-        self.frame.with(cx, move |frame, _, cx| {
-            let message = frame.marks().get(&node).facts().seen_topic().unwrap_or(0);
-            let seen = Seen::Thread {
-                message,
-                stopped: doing.since.0,
-            };
-            frame.write_marks(
-                vec![rho_frame::attention::Write::Fact(
-                    rho_dealer::facts::Fact::Read { node, seen },
-                )],
-                cx,
-            );
+    }
+
+    fn sync_view(slot: &Slot, view: Option<ThreadId>) {
+        let next = view
+            .filter(|view| Some(view.host) == slot.endpoint)
+            .map(|view| view.message);
+        slot.view.send_if_modified(|current| {
+            let changed = *current != next;
+            *current = next;
+            changed
         });
+    }
+
+    pub fn status(&self, thread: ThreadId) -> Option<&ThreadStatus> {
+        self.chat(thread.host)?.status(thread.message)
+    }
+
+    pub fn project_address(&self, channel: ThreadId) -> Option<String> {
+        self.chat(channel.host)?
+            .project(channel.message)
+            .map(|project| project.address(&self.host_name(channel.host)))
+    }
+
+    /// Resolves a project address against aliases this device owns and the
+    /// channels the host has sent us.
+    pub fn project_named(&self, address: &str) -> Option<ThreadId> {
+        let (project, host_alias) = address.rsplit_once('@')?;
+        let endpoint = self
+            .hosts
+            .values()
+            .find(|slot| slot.name == host_alias)?
+            .endpoint?;
+        let message = self.chat(endpoint)?.root_named(project)?;
+        Some(ThreadId {
+            host: endpoint,
+            message,
+        })
     }
 
     pub fn chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
@@ -272,6 +285,7 @@ impl ChatSystem {
             } => {
                 if let Some(slot) = self.hosts.get_mut(&host) {
                     slot.endpoint = Some(endpoint);
+                    Self::sync_view(slot, self.view);
                 }
                 if fresh {
                     self.cache.reset(endpoint);
@@ -295,7 +309,23 @@ impl ChatSystem {
                 self.cache.write_records(endpoint, records);
                 self.changed(endpoint, cx);
             }
-            ChatEvent::Closed { .. } => {}
+            ChatEvent::Statuses { host, statuses } => {
+                if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
+                    self.chats
+                        .entry(endpoint)
+                        .or_default()
+                        .set_statuses(statuses);
+                    self.changed(endpoint, cx);
+                }
+            }
+            ChatEvent::Closed { host } => {
+                if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint)
+                    && let Some(chat) = self.chats.get_mut(&endpoint)
+                {
+                    chat.set_statuses(Vec::new());
+                    self.changed(endpoint, cx);
+                }
+            }
         }
     }
 
@@ -467,21 +497,15 @@ impl ChatSystem {
     fn with_host<R>(
         &self,
         endpoint: EndpointId,
-        cx: &App,
+        _cx: &App,
         read: impl FnOnce(&cards::Host<'_>) -> R,
     ) -> Option<R> {
         let chat = self.chats.get(&endpoint)?;
         let name = self.host_name(endpoint);
-        let alive = |agent: AgentId| self.participant(endpoint, agent, cx).is_some();
-        let doing = |agent: AgentId| self.participant(endpoint, agent, cx)?.doing;
-        let reason = |agent: AgentId| self.participant(endpoint, agent, cx)?.stopped_because;
         let host = cards::Host {
             endpoint,
             chat,
             name: self.many_hosts().then_some(name.as_str()),
-            alive: &alive,
-            doing: &doing,
-            reason: &reason,
         };
         Some(read(&host))
     }
@@ -538,18 +562,20 @@ impl System for ChatSystem {
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
-        self.hosts.insert(
-            host,
-            Slot {
-                name: name.to_owned(),
-                link: link.clone(),
-                endpoint,
-            },
-        );
+        let (view, incoming_view) = tokio::sync::watch::channel(None);
+        let slot = Slot {
+            name: name.to_owned(),
+            link: link.clone(),
+            endpoint,
+            view,
+        };
+        Self::sync_view(&slot, self.view);
+        self.hosts.insert(host, slot);
         vec![Arc::new(ChatStream::new(
             host,
             self.cursors.clone(),
             self.events.clone(),
+            incoming_view,
         ))]
     }
 
@@ -762,30 +788,10 @@ impl System for ChatSystem {
 
     /// Through its newest message, and through the stops its agents are
     /// in when any is: a done on a stop's card sees the stop.
-    fn seen(&self, address: &Address, cx: &App) -> Seen {
-        let Some(thread) = self.thread_of(address) else {
-            return Seen::Whole;
-        };
-        let Some((newest, _)) = self
-            .chats
-            .get(&thread.host)
-            .and_then(|chat| chat.newest_in(thread.message))
-        else {
-            return Seen::Whole;
-        };
-        let stopped = self
-            .with_host(thread.host, cx, |host| {
-                cards::stops(host, Timestamp::now()).remove(&thread.message)
-            })
-            .flatten()
-            .and_then(|stops| stops.iter().map(|stop| stop.since.0).max());
-        match stopped {
-            Some(stopped) => Seen::Thread {
-                message: newest.0.0,
-                stopped,
-            },
-            None => Seen::Topic(newest.0.0),
-        }
+    fn seen(&self, address: &Address, _cx: &App) -> Seen {
+        self.thread_of(address)
+            .and_then(|thread| self.chats.get(&thread.host)?.newest_in(thread.message))
+            .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
     }
 
     /// Every root on every host, with how many of its threads hold

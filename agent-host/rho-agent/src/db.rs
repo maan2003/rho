@@ -51,13 +51,14 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "e41b7c2a";
+const CURRENT_AGENT_DB_FORMAT: &str = "a8f02c31";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
 /// each from a savepoint `rho debug rollback` can put it back to. Oldest
-/// first. Empty: nothing has moved since `e41b7c2a`.
-const MIGRATIONS: &[Migration] = &[];
+/// first. Existing records retain their layout; older hosts cannot read the
+/// new event variants, so gate downgrade at the format stamp.
+const MIGRATIONS: &[Migration] = &[("e41b7c2a", CURRENT_AGENT_DB_FORMAT, |_| {})];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]

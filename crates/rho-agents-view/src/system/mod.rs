@@ -29,7 +29,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{AgentId, EndpointId, MessageId, UnixMs};
+use rho_agent_types::{AgentId, EndpointId, MessageId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
@@ -87,10 +87,6 @@ pub struct AgentsSystem {
     /// and the echo line says so.
     first_turns: HashMap<AgentId, bool>,
     timer: Option<Task<()>>,
-    /// When each retrying agent turns stuck, which no host frame says, and
-    /// the wake that ranks the deal again at the first of them.
-    stuck: HashMap<AgentId, UnixMs>,
-    stuck_wake: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -168,8 +164,6 @@ impl AgentsSystem {
             places: places::ChannelPlaces::open(db),
             first_turns: HashMap::new(),
             timer: None,
-            stuck: HashMap::new(),
-            stuck_wake: None,
             _tasks: vec![pump, desktops_pump],
             _subscriptions: vec![delivered],
         }
@@ -272,7 +266,6 @@ impl AgentsSystem {
                     self.land(agent_id, TranscriptFrame::Runtime(state.clone()), cx);
                 }
                 if self.registry.set_runtime(agent_id, Heard { state, since }) {
-                    self.watch_stuck(agent_id, cx);
                     self.first_turn_moved(agent_id, cx);
                     self.changed(cx);
                 }
@@ -480,61 +473,6 @@ impl AgentsSystem {
                 }
             }
             let _ = this.update(cx, |this, _| this.timer = None);
-        }));
-    }
-
-    /// The user steered `agent`: the chat counts the stop it is in as
-    /// seen.
-    pub(crate) fn steered(&self, agent: AgentId, cx: &mut Context<Self>) {
-        let (Some(endpoint), Some(heard)) = (
-            self.registry
-                .host_of_agent(agent)
-                .and_then(|host| self.registry.host_endpoint(host)),
-            self.registry.agent_facts(agent).runtime,
-        ) else {
-            return;
-        };
-        let doing = heard.doing();
-        self.chat
-            .update(cx, |chat, cx| chat.steered(endpoint, agent, doing, cx));
-    }
-
-    /// Keeps when `agent` turns stuck, if it is retrying and not stuck
-    /// yet, and wakes at the first such moment to rank the deal again:
-    /// nothing from the host marks it.
-    fn watch_stuck(&mut self, agent: AgentId, cx: &mut Context<Self>) {
-        let now = UnixMs::now();
-        let stuck_at = self
-            .registry
-            .agent_facts(agent)
-            .runtime
-            .and_then(|heard| heard.doing().stuck_at())
-            .filter(|at| *at > now);
-        match stuck_at {
-            Some(at) => self.stuck.insert(agent, at),
-            None => self.stuck.remove(&agent),
-        };
-        self.stuck.retain(|_, at| *at > now);
-        let Some(first) = self.stuck.values().min().copied() else {
-            self.stuck_wake = None;
-            return;
-        };
-        let wait = std::time::Duration::from_millis(first.saturating_duration_since(now));
-        self.stuck_wake = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(wait).await;
-            let _ = this.update(cx, |this, cx| {
-                let now = UnixMs::now();
-                let turned: Vec<AgentId> = this
-                    .stuck
-                    .iter()
-                    .filter(|(_, at)| **at <= now)
-                    .map(|(agent, _)| *agent)
-                    .collect();
-                for agent in turned {
-                    this.watch_stuck(agent, cx);
-                }
-                this.changed(cx);
-            });
         }));
     }
 

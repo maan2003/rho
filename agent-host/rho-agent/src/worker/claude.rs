@@ -755,6 +755,13 @@ impl ClaudeLoop {
         if !open && self.waiting.holds_tool() {
             notices.push(RequestNotice::Waiting);
         }
+        if let Some(notice) = self
+            .host
+            .cold_notice(taken.inputs.iter().filter_map(|input| input.message).max())
+            .await?
+        {
+            notices.push(notice);
+        }
         let composed = compose(open, &notices, &taken.output, &taken.inputs);
         let user = composed.user.concat();
         // Rho names the line of the text, and a rewind forks there.
