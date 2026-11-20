@@ -336,7 +336,9 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                         let responding = runtime.inference == rho_agent::InferenceState::Responding;
                         let stopped = !runtime.is_working() && runtime.checkin_at.is_none();
                         let ended = runtime.awaiting_human && runtime.running_tasks == 0;
-                        if let rho_agent::InferenceState::Failed { error } = runtime.inference {
+                        if let rho_agent::InferenceState::Failed { error }
+                        | rho_agent::InferenceState::Lost { error } = runtime.inference
+                        {
                             finished = Some(Err(error));
                         } else if working && runtime.archived {
                             finished = Some(Ok(()));

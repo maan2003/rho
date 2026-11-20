@@ -6,7 +6,7 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
 use rho_agent_types::AgentId;
-use rho_agents_client::protocol::transcript::{InferenceState, RuntimeState};
+use rho_agents_client::protocol::transcript::RuntimeState;
 use rho_agents_client::protocol::worksets::Cancel;
 use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
 use rho_chat::ThreadId;
@@ -48,6 +48,7 @@ impl AgentSurface {
             .registry()
             .agent_facts(self.agent)
             .runtime
+            .map(|heard| heard.state)
     }
 
     /// The line over the transcript: who, where, and what it is doing.
@@ -62,21 +63,9 @@ impl AgentSurface {
             words.push(directory.to_string());
         }
         if let Some(state) = self.runtime(cx) {
-            words.push(status_word(&state).to_owned());
+            words.push(state.activity().word().to_owned());
         }
         words.join(" · ")
-    }
-}
-
-/// What an agent's runtime is doing, in a word.
-pub(crate) fn status_word(state: &RuntimeState) -> &'static str {
-    match &state.inference {
-        InferenceState::Failed { .. } => "failed",
-        InferenceState::Retrying { .. } => "retrying",
-        _ if state.awaiting_human => "waiting",
-        _ if state.is_working() => "working",
-        _ if state.archived => "archived",
-        _ => "idle",
     }
 }
 
@@ -98,95 +87,7 @@ impl Surface for AgentSurface {
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let agent = self.agent;
-        let system = self.system.clone();
-        let eval = |description: &'static str,
-                    key: &'static str,
-                    code: Rc<dyn Fn(Option<u32>) -> String>| {
-            let system = system.clone();
-            Row::counted(key, description, move |_, count, _, cx| {
-                let code = code(count);
-                system.update(cx, |system, cx| system.eval(agent, code, cx));
-            })
-        };
-        let mut rows = vec![
-            eval(
-                "rewind turns",
-                "r",
-                Rc::new(move |count| snippets::rewind(agent, count.unwrap_or(1))),
-            ),
-            eval(
-                "compact context",
-                "c",
-                Rc::new(move |_| snippets::compact(agent)),
-            ),
-            eval(
-                "new cache key",
-                "k",
-                Rc::new(move |_| snippets::new_cache_key(agent)),
-            ),
-        ];
-        let current = self
-            .system
-            .read(cx)
-            .registry()
-            .agent_spec(agent)
-            .map(|spec| format!("{}-{}", spec.model, spec.effort))
-            .unwrap_or_default();
-        let runtime_system = system.clone();
-        rows.push(Row::run(
-            "shift-r",
-            "set runtime…",
-            move |frame, window, cx| {
-                let system = runtime_system.clone();
-                frame.open_prompt(
-                    format!("runtime ({current}):"),
-                    Rc::new(|_, needle, _| {
-                        RUNTIMES
-                            .iter()
-                            .filter(|runtime| runtime.contains(needle))
-                            .map(|runtime| Candidate {
-                                value: (*runtime).to_owned(),
-                                description: "runtime".to_owned(),
-                            })
-                            .collect()
-                    }),
-                    Rc::new(move |frame, input, _, cx| match Runtime::parse(&input) {
-                        Ok(runtime) => system.update(cx, |system, cx| {
-                            system.eval(agent, snippets::set_runtime(agent, &runtime), cx)
-                        }),
-                        Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
-                    }),
-                    window,
-                    cx,
-                );
-            },
-        ));
-        let cancel_system = system.clone();
-        rows.push(Row::run(
-            "shift-c",
-            "cancel the request",
-            move |frame, _, cx| {
-                let system = cancel_system.read(cx);
-                let Some(agents) = system.agents_for(agent) else {
-                    frame.echo(
-                        "the agent's host is not attached",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                let reply = agents.call(Cancel { agent });
-                let link = system.frame.clone();
-                cx.spawn(async move |_, cx| {
-                    if let Err(error) = reply.await {
-                        cx.update(|cx| {
-                            link.echo(format!("{error:#}"), StyleClass::SystemImportant, cx)
-                        });
-                    }
-                })
-                .detach();
-            },
-        ));
+        let mut rows = steer_rows(self.system.clone(), agent);
         let origin = {
             let system = self.system.read(cx);
             let registry = system.registry();
@@ -212,6 +113,106 @@ impl Surface for AgentSurface {
         }
         rows
     }
+}
+
+/// The rows that steer an agent, from its transcript or from a thread's
+/// `with` line. Each carries the change to the agent's host, and says the
+/// user has seen the stop the agent is in.
+pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Row> {
+    let eval =
+        |description: &'static str, key: &'static str, code: Rc<dyn Fn(Option<u32>) -> String>| {
+            let system = system.clone();
+            Row::counted(key, description, move |_, count, _, cx| {
+                let code = code(count);
+                system.update(cx, |system, cx| {
+                    system.eval(agent, code, cx);
+                    system.steered(agent, cx);
+                });
+            })
+        };
+    let mut rows = vec![
+        eval(
+            "rewind turns",
+            "r",
+            Rc::new(move |count| snippets::rewind(agent, count.unwrap_or(1))),
+        ),
+        eval(
+            "compact context",
+            "c",
+            Rc::new(move |_| snippets::compact(agent)),
+        ),
+        eval(
+            "new cache key",
+            "k",
+            Rc::new(move |_| snippets::new_cache_key(agent)),
+        ),
+    ];
+    // Read when chosen, not here: the palette asks for rows while this
+    // system is updating.
+    let runtime_system = system.clone();
+    rows.push(Row::run(
+        "shift-r",
+        "set runtime…",
+        move |frame, window, cx| {
+            let system = runtime_system.clone();
+            let current = system
+                .read(cx)
+                .registry()
+                .agent_spec(agent)
+                .map(|spec| format!("{}-{}", spec.model, spec.effort))
+                .unwrap_or_default();
+            frame.open_prompt(
+                format!("runtime ({current}):"),
+                Rc::new(|_, needle, _| {
+                    RUNTIMES
+                        .iter()
+                        .filter(|runtime| runtime.contains(needle))
+                        .map(|runtime| Candidate {
+                            value: (*runtime).to_owned(),
+                            description: "runtime".to_owned(),
+                        })
+                        .collect()
+                }),
+                Rc::new(move |frame, input, _, cx| match Runtime::parse(&input) {
+                    Ok(runtime) => system.update(cx, |system, cx| {
+                        system.eval(agent, snippets::set_runtime(agent, &runtime), cx);
+                        system.steered(agent, cx);
+                    }),
+                    Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
+                }),
+                window,
+                cx,
+            );
+        },
+    ));
+    let cancel_system = system.clone();
+    rows.push(Row::run(
+        "shift-c",
+        "cancel the request",
+        move |frame, _, cx| {
+            let system = cancel_system.read(cx);
+            let Some(agents) = system.agents_for(agent) else {
+                frame.echo(
+                    "the agent's host is not attached",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            };
+            let reply = agents.call(Cancel { agent });
+            let link = system.frame.clone();
+            cx.spawn(async move |_, cx| {
+                if let Err(error) = reply.await {
+                    cx.update(|cx| {
+                        link.echo(format!("{error:#}"), StyleClass::SystemImportant, cx)
+                    });
+                }
+            })
+            .detach();
+            cancel_system.update(cx, |system, cx| system.steered(agent, cx));
+        },
+    ));
+    rows
 }
 
 impl Focusable for AgentSurface {

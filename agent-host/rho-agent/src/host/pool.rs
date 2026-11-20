@@ -24,7 +24,6 @@ use rho_fs_view::{Layout, WorksetId, Worksets};
 use tokio::sync::Mutex;
 
 use super::AgentClient;
-use crate::AgentStatus;
 use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
 use crate::ipc::protocol::Control;
@@ -34,6 +33,7 @@ use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
     ChatRead as _, ChatWrite as _, GccpWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
 };
+use crate::{AgentStatus, InferenceState, RuntimeState};
 
 /// How many agents stay loaded. Past this the least recently used one
 /// that is settled and nobody is looking at is dropped; its log is the
@@ -81,6 +81,9 @@ pub struct AgentPool {
     live: std::sync::Mutex<HashSet<AgentId>>,
     /// Every GUI connection's statuses still to send.
     statuses: std::sync::Mutex<Vec<std::sync::Weak<Statuses>>>,
+    /// What each agent is doing as its status last said, and since when:
+    /// the one clock every device reads an agent's age by.
+    doing: std::sync::Mutex<HashMap<AgentId, rho_agent_types::Doing>>,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -100,13 +103,21 @@ pub struct AgentPool {
 /// per agent and never falls behind.
 #[derive(Default)]
 pub struct Statuses {
-    unsent: std::sync::Mutex<HashMap<AgentId, Arc<AgentStatus>>>,
+    unsent: std::sync::Mutex<HashMap<AgentId, Shown>>,
     changed: tokio::sync::Notify,
+}
+
+/// A loaded agent's status as a connection is told it, and since when the
+/// agent has been doing what the status says.
+#[derive(Clone, Debug)]
+pub struct Shown {
+    pub status: Arc<AgentStatus>,
+    pub since: UnixMs,
 }
 
 impl Statuses {
     /// Every status not yet taken.
-    pub fn take(&self) -> HashMap<AgentId, Arc<AgentStatus>> {
+    pub fn take(&self) -> HashMap<AgentId, Shown> {
         std::mem::take(&mut *self.unsent.lock().expect("poison"))
     }
 
@@ -115,9 +126,35 @@ impl Statuses {
         self.changed.notified().await;
     }
 
-    fn put(&self, agent_id: AgentId, status: Arc<AgentStatus>) {
-        self.unsent.lock().expect("poison").insert(agent_id, status);
+    fn put(&self, agent_id: AgentId, shown: Shown) {
+        self.unsent.lock().expect("poison").insert(agent_id, shown);
         self.changed.notify_one();
+    }
+}
+
+/// When the agent started what `runtime` says it does: `now`, unless its
+/// last status said it was doing it already. A retry streak keeps the
+/// start its runtime gives: its attempts show as working in between.
+fn stamp(
+    doing: &mut HashMap<AgentId, rho_agent_types::Doing>,
+    agent_id: AgentId,
+    runtime: &RuntimeState,
+    now: UnixMs,
+) -> UnixMs {
+    let activity = runtime.activity();
+    let held = doing.entry(agent_id).or_insert(rho_agent_types::Doing {
+        activity,
+        since: now,
+    });
+    if held.activity != activity {
+        *held = rho_agent_types::Doing {
+            activity,
+            since: now,
+        };
+    }
+    match runtime.inference {
+        InferenceState::Retrying { since, .. } => since,
+        _ => held.since,
     }
 }
 
@@ -160,6 +197,7 @@ impl AgentPool {
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
             statuses: std::sync::Mutex::new(Vec::new()),
+            doing: std::sync::Mutex::new(HashMap::new()),
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             first_agent: std::sync::Mutex::default(),
@@ -731,9 +769,11 @@ impl AgentPool {
     }
 
     /// Only an agent someone is looking at shows its response body; its
-    /// runtime occupancy is useful everywhere.
-    fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Arc<AgentStatus> {
-        Arc::new(if self.is_live(agent_id) {
+    /// runtime occupancy is useful everywhere. What it is doing is stamped
+    /// with when it started, here, where every status passes.
+    fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Shown {
+        let since = self.since(agent_id, &status.runtime);
+        let status = Arc::new(if self.is_live(agent_id) {
             status.clone()
         } else {
             AgentStatus {
@@ -742,7 +782,13 @@ impl AgentPool {
                 draft: None,
                 queued: status.queued,
             }
-        })
+        });
+        Shown { status, since }
+    }
+
+    fn since(&self, agent_id: AgentId, runtime: &RuntimeState) -> UnixMs {
+        let mut doing = self.doing.lock().expect("poison");
+        stamp(&mut doing, agent_id, runtime, UnixMs::now())
     }
 
     fn touch(&self, agent_id: AgentId) {
@@ -1477,4 +1523,67 @@ fn models() -> Vec<Runtime> {
         session_id: uuid::Uuid::nil(),
     });
     native.into_iter().chain(claude).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::AgentIdDomain;
+
+    use super::*;
+
+    /// An agent's age counts from when it started what it does now: a
+    /// status that changes something else keeps it; one that changes what
+    /// it does starts it again. A retry streak counts from its first
+    /// failure, across the attempts that show as working between.
+    #[test]
+    fn an_agent_is_doing_what_it_does_since_it_started() {
+        let agent = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+        let other = AgentId::from_counter(2, &AgentIdDomain(0)).unwrap();
+        let working = RuntimeState {
+            inference: InferenceState::Responding,
+            ..RuntimeState::default()
+        };
+        let retrying = |at: u64| RuntimeState {
+            inference: InferenceState::Retrying {
+                at: UnixMs(at),
+                error: "503".into(),
+                since: UnixMs(5),
+            },
+            ..RuntimeState::default()
+        };
+        let failed = RuntimeState {
+            inference: InferenceState::Failed {
+                error: "400".into(),
+            },
+            ..RuntimeState::default()
+        };
+        let mut doing = HashMap::new();
+        assert_eq!(stamp(&mut doing, agent, &working, UnixMs(1)), UnixMs(1));
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(3)),
+            UnixMs(1),
+            "still working"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &retrying(12), UnixMs(10)),
+            UnixMs(5)
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(12)),
+            UnixMs(12),
+            "an attempt is working, from when it began"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &retrying(30), UnixMs(20)),
+            UnixMs(5),
+            "the streak runs on from its first failure"
+        );
+        assert_eq!(stamp(&mut doing, other, &working, UnixMs(25)), UnixMs(25));
+        assert_eq!(stamp(&mut doing, agent, &failed, UnixMs(40)), UnixMs(40));
+        assert_eq!(
+            stamp(&mut doing, agent, &working, UnixMs(50)),
+            UnixMs(50),
+            "a failure ends; what follows starts anew"
+        );
+    }
 }

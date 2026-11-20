@@ -50,7 +50,7 @@ pub use find::AgentHit;
 #[cfg(feature = "client")]
 pub use fold::{AgentIdentity, MirroredAgent, TranscriptFold, transcript};
 #[cfg(feature = "client")]
-pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};
+pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap, Heard};
 #[cfg(feature = "client")]
 pub use rho_agent_hosts::HostId;
 

@@ -79,6 +79,21 @@ impl RuntimeState {
             InferenceState::Responding | InferenceState::Retrying { .. }
         ) || (!self.archived && self.running_tasks > 0)
     }
+
+    /// What it is doing, in the word every screen says: the host stamps
+    /// when it started on this, and a client says it.
+    pub fn activity(&self) -> rho_agent_types::Activity {
+        use rho_agent_types::Activity;
+        match &self.inference {
+            InferenceState::Lost { .. } => Activity::Lost,
+            InferenceState::Failed { .. } => Activity::Failed,
+            InferenceState::Retrying { .. } => Activity::Retrying,
+            _ if self.awaiting_human => Activity::Waiting,
+            _ if self.is_working() => Activity::Working,
+            _ if self.archived => Activity::Archived,
+            _ => Activity::Idle,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -89,8 +104,16 @@ pub enum InferenceState {
     Retrying {
         at: UnixMs,
         error: String,
+        /// When the first of these failures came: the runtime keeps one
+        /// streak across its attempts, which its status shows as working.
+        since: UnixMs,
     },
     Failed {
+        error: String,
+    },
+    /// The process the agent ran in ended without a word: its host lost
+    /// it. Only the host says this, never the runtime itself.
+    Lost {
         error: String,
     },
 }

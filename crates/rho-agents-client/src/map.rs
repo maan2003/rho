@@ -81,7 +81,24 @@ pub struct AgentFiling {
 pub struct AgentFacts {
     /// What its host last said it is doing, `None` while it has said
     /// nothing.
-    pub runtime: Option<crate::protocol::transcript::RuntimeState>,
+    pub runtime: Option<Heard>,
+}
+
+/// What an agent's host last said it is doing, and since when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heard {
+    pub state: crate::protocol::transcript::RuntimeState,
+    /// When it started doing it, on the host's clock.
+    pub since: rho_agent_types::UnixMs,
+}
+
+impl Heard {
+    pub fn doing(&self) -> rho_agent_types::Doing {
+        rho_agent_types::Doing {
+            activity: self.state.activity(),
+            since: self.since,
+        }
+    }
 }
 
 type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;
@@ -97,7 +114,7 @@ type OrderKey = i64;
 pub struct AgentMap {
     agents: BTreeMap<AgentId, AgentLife>,
     /// Ephemeral snapshots, never part of the mirror or persisted filing.
-    runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
+    runtime: BTreeMap<AgentId, Heard>,
     /// The mirror: what every agent is.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: muted agents, and what the user
@@ -626,12 +643,8 @@ impl AgentMap {
             entry.insert(AgentLife::Known);
         }
     }
-    pub fn set_runtime(
-        &mut self,
-        agent_id: AgentId,
-        state: crate::protocol::transcript::RuntimeState,
-    ) -> bool {
-        self.runtime.insert(agent_id, state.clone()).as_ref() != Some(&state)
+    pub fn set_runtime(&mut self, agent_id: AgentId, heard: Heard) -> bool {
+        self.runtime.insert(agent_id, heard.clone()).as_ref() != Some(&heard)
     }
 
     pub fn clear_host_runtime(&mut self, host: HostId) {
@@ -758,16 +771,19 @@ mod tests {
         assert!(map.agent_facts(agent(1)).runtime.is_none());
         map.set_runtime(
             agent(1),
-            RuntimeState {
-                running_tasks: 2,
-                ..Default::default()
+            Heard {
+                state: RuntimeState {
+                    running_tasks: 2,
+                    ..Default::default()
+                },
+                since: rho_agent_types::UnixMs(7),
             },
         );
         assert_eq!(
             map.agent_facts(agent(1))
                 .runtime
-                .map(|runtime| runtime.running_tasks),
-            Some(2)
+                .map(|heard| (heard.state.running_tasks, heard.since)),
+            Some((2, rho_agent_types::UnixMs(7)))
         );
         map.clear_host_runtime(host);
         assert!(map.agent_facts(agent(1)).runtime.is_none());

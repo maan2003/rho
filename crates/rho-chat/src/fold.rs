@@ -54,6 +54,9 @@ pub struct HostChat {
     names: HashMap<MessageId, String>,
     /// What each agent last said about each thread: joined or left.
     members: BTreeMap<(MessageId, AgentId), bool>,
+    /// The first thread each agent joined: its thread, the one it started
+    /// from, where a stop it did not choose draws the user.
+    first_joined: BTreeMap<AgentId, MessageId>,
 }
 
 impl HostChat {
@@ -95,6 +98,7 @@ impl HostChat {
             }
             ChatEvent::Joined { thread, agent } => {
                 self.members.insert((*thread, *agent), true);
+                self.first_joined.entry(*agent).or_insert(*thread);
                 Told::Thread(*thread)
             }
             ChatEvent::Left { thread, agent } => {
@@ -248,6 +252,22 @@ impl HostChat {
             .into_iter()
             .filter_map(|(agent, joined)| joined.then_some(agent))
             .collect()
+    }
+
+    /// Every agent that joined a thread, with the first it joined: its
+    /// own thread.
+    pub fn agent_threads(&self) -> impl Iterator<Item = (AgentId, MessageId)> + '_ {
+        self.first_joined
+            .iter()
+            .map(|(agent, thread)| (*agent, *thread))
+    }
+
+    /// The thread an agent is the agent of: the card of the first thread
+    /// it joined.
+    pub fn agent_thread(&self, agent: AgentId) -> Option<MessageId> {
+        self.first_joined
+            .get(&agent)
+            .map(|joined| self.thread_of(*joined))
     }
 
     /// The newest message in a thread or under it, the thread's own

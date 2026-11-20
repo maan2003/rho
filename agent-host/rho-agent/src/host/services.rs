@@ -63,11 +63,11 @@ impl Services {
     }
 
     /// The worker went away without saying why: the agent's row says it
-    /// stopped, and its status that it failed.
+    /// stopped, and its status that its host lost it.
     pub(crate) async fn worker_failed(&self, error: String) {
         let status = crate::AgentStatus {
             runtime: crate::RuntimeState {
-                inference: crate::InferenceState::Failed {
+                inference: crate::InferenceState::Lost {
                     error: error.clone(),
                 },
                 ..Default::default()

@@ -688,12 +688,12 @@ async fn backoff_caps_delay_and_expires_at_eight_hours() {
         retry = Backoff::failed(Some(retry), "again".into());
     }
     assert_eq!(retry.delay, 1800);
-    retry.since = tokio::time::Instant::now() - Backoff::WINDOW;
+    retry.since = UnixMs(UnixMs::now().0 - Backoff::WINDOW.as_millis() as u64);
     let before = UnixMs::now();
     let retry = Backoff::failed(Some(retry), "again".into());
     assert!(retry.at <= UnixMs::now());
     assert!(retry.at >= before);
-    assert!(retry.since.elapsed() >= Backoff::WINDOW);
+    assert!(retry.elapsed() >= Backoff::WINDOW);
 }
 
 #[tokio::test]
@@ -767,7 +767,7 @@ async fn exhausted_retry_window_stops_without_another_request() {
     let (handle, mut agent) = harness.load().await;
     agent.script(script.clone());
     let mut retry = Backoff::failed(None, "outage".into());
-    retry.since = tokio::time::Instant::now() - Backoff::WINDOW;
+    retry.since = UnixMs(UnixMs::now().0 - Backoff::WINDOW.as_millis() as u64);
     agent.backoff = Some(retry);
     let task = tokio::spawn(async move {
         agent.run().await.unwrap();
