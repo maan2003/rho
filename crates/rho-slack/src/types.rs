@@ -45,6 +45,19 @@ impl Ts {
         &self.0
     }
 
+    /// Slack's read mark on a conversation or thread nothing of which has
+    /// been read: what Slack reports for one, and what marks all of it
+    /// unread again.
+    pub fn never_read() -> Self {
+        Self("0000000000.000000".to_owned())
+    }
+
+    /// A cutoff in epoch seconds, in Slack's words, so it orders against
+    /// the messages it is compared with.
+    pub fn at_epoch_seconds(seconds: f64) -> Self {
+        Self(format!("{seconds:.6}"))
+    }
+
     /// Seconds since the epoch, for ordering and for the clock time shown
     /// next to a message. A malformed timestamp sorts oldest rather than
     /// panicking: a thread that renders slightly out of order beats a client

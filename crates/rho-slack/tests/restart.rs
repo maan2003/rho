@@ -130,11 +130,9 @@ async fn a_restart_deals_what_slack_still_has_unread(cx: &mut TestAppContext) {
         "the first run deals both: {dealt:?}"
     );
 
-    // Done, then undo, on each: Slack is told both times.
-    for unit in [&random, &group] {
-        let newest = first.read_with(cx, |session, _| {
-            session.model().unit(unit).unwrap().newest.0.clone()
-        });
+    // Done, then undo, on each: Slack is told both times, and done reads
+    // each through its newest message, the chatter after the ping included.
+    for (unit, newest) in [(&random, ts(now - 3600)), (&group, ts(group_ask))] {
         let said = first
             .update(cx, |session, cx| say(session, unit, &Verdict::Done, cx))
             .expect("done says something in Slack");

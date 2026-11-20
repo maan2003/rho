@@ -576,9 +576,8 @@ pub enum Event {
         by: IgnoredBy,
     },
     /// The old backlog marked read in one go: the cutoff the user gave and
-    /// how much it touched. The verdicts it wrote are undone as a batch,
-    /// which is what `SlackMarkReadBeforeUndone` records; the marking
-    /// itself is Slack's state and is not reversed.
+    /// how much it touched. One undo takes all of it back, in Slack too,
+    /// which is what `SlackMarkReadBeforeUndone` records.
     SlackMarkedReadBefore {
         cutoff: String,
         conversations: usize,

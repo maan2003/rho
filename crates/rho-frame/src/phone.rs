@@ -629,7 +629,7 @@ impl Frame {
             Button::Mute => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Mute);
-                    self.verdict(target, Verdict::Mute, "muted".to_owned(), window, cx);
+                    self.verdict(target, Verdict::Mute, "mute".to_owned(), window, cx);
                 }
             }
             // How long is a question, the one the snooze menu asks.

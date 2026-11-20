@@ -168,6 +168,20 @@ impl Frame {
         }
     }
 
+    /// What the echo line calls a card: a note by its first line, anything
+    /// else by the name its system gives it -- a Slack conversation by the
+    /// conversation, not by its newest words -- and by the card's title
+    /// when its system names nothing.
+    fn called(&self, address: &Address, cx: &gpui::App) -> String {
+        match self.attention.marks.get(address).title() {
+            "" => self
+                .name_of(address, cx)
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| self.card_for(address, cx).title),
+            title => title.to_owned(),
+        }
+    }
+
     /// How far the user has seen `address`: everything its system has.
     fn seen(&self, address: &Address, cx: &gpui::App) -> Seen {
         self.systems
@@ -208,7 +222,7 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         tracing::debug!(address = %address, ?verdict, "verdict");
-        let card = self.card_for(address, cx);
+        let called = self.called(address, cx);
         let seen = self.seen(address, cx);
         // A mute the system holds itself is only settled here: lifted
         // there, it is lifted.
@@ -246,11 +260,7 @@ impl Frame {
             occurred_at: Timestamp::now().to_string(),
             skip_until: None,
         });
-        self.echo(
-            &format!("{verb}: {}", card.title),
-            StyleClass::SystemInfo,
-            cx,
-        );
+        self.echo(&format!("{verb}: {called}"), StyleClass::SystemInfo, cx);
         if self.card_in_view(cx).as_ref() == Some(address) {
             self.close_current(window, cx);
             self.pull_card(window, cx);
@@ -276,13 +286,13 @@ impl Frame {
             return;
         };
         self.attention.skips.clear(&address);
-        let card = self.card_for(&address, cx);
+        let called = self.called(&address, cx);
         rho_journal::record(rho_journal::Event::VerdictUndone {
             card: journal_card(&address),
             verdict,
         });
         self.echo(
-            &format!("undid {}: {}", undo.verb, card.title),
+            &format!("undid {}: {called}", undo.verb),
             StyleClass::SystemInfo,
             cx,
         );

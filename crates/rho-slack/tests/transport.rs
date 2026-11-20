@@ -868,7 +868,7 @@ async fn marking_the_backlog_touches_only_what_is_older_than_the_cutoff() {
         );
     }
 
-    let plan = model.mark_plan(500.0);
+    let plan = model.mark_plan(500.0, |_, _| None);
     assert_eq!(
         plan.conversations,
         vec![(ChannelId("C1".into()), Ts("100.0".into()))],
