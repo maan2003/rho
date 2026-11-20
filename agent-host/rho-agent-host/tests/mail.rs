@@ -188,7 +188,9 @@ from rho.tools import Mail
 mail = Mail("{}")
 mail.status({}, "Waiting for the capacity report")
 note = await mail.send({}, "Use polling for this check.")
-assert type(note) is int
+assert isinstance(note, int)
+assert "Mail #{prior} has no user reply" in note.notice, note.notice
+assert "mail.edit({prior}, ...)" in note.notice, note.notice
 mail.edit(note, "Use sockets for this check.")
 hits = await mail.search("sockets", project={})
 assert [row["message"] for row in hits] == [note]
@@ -200,7 +202,8 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                 thread.0.0,
                 thread.0.0,
                 project.0.0,
-                project.0.0
+                project.0.0,
+                prior = origin_result.seq.0,
             ),
         },
     )

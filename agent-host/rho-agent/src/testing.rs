@@ -190,7 +190,10 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         match write.post(rho_agent_types::UnixMs::now(), parent, message, None) {
                             Ok(id) => {
                                 write.commit();
-                                PyReply::Seq(id.0)
+                                PyReply::SentMail {
+                                    id,
+                                    unanswered: None,
+                                }
                             }
                             Err(error) => PyReply::Error(format!("{error:#}")),
                         }

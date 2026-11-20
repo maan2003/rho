@@ -17,6 +17,8 @@ class State:
         self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
         self.messages = []  # MessageRecord, in order, with `_to`: who receives it
+        self.send_unanswered = None  # host-supplied prior mail and author in a send receipt
+        self.send_unanswered = None  # host-supplied prior mail and author in a send receipt
         self.members = {}  # (thread, agent) -> joined (True) or left
         self.names = {}  # thread -> name
         self.inputs = []  # (agent, text, role, message)
@@ -182,9 +184,10 @@ def _post(sender, parent, text, mentions, reply_to=None):
     members = [] if any(kind == "direct" for _, kind in mentions) else _members_under(parent)
     to = [agent for agent in members + [address for address, _ in mentions] if agent not in ("user", sender)]
     id = _event()
-    STATE.messages.append({"id": id, "at": 0, "parent": parent, "sender": sender, "mentions": list(mentions), "text": text, "_to": set(to)})
-    if reply_to is not None:
-        STATE.messages[-1]["reply_to"] = reply_to
+    STATE.messages.append({
+        "id": id, "at": 0, "parent": parent, "sender": sender, "mentions": list(mentions),
+        "text": text, "reply_to": reply_to, "_to": set(to),
+    })
     return id
 
 
@@ -203,10 +206,9 @@ def send_mail(sender, parent, text, *, to=None, kind=None, reply_to=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        if to is None:
-            return _post(sender, parent, text, [], reply_to)
-        if to == "user":
-            return _post(sender, parent, text, [(to, kind)], reply_to)
+        if to in (None, "user"):
+            mentions = [] if to is None else [(to, kind)]
+            return _post(sender, parent, text, mentions, reply_to), STATE.send_unanswered
         if to not in STATE.agents and to not in STATE.elsewhere:
             raise ValueError("agent was deleted or does not exist")
         if sender == to:
@@ -243,7 +245,7 @@ def send_mail(sender, parent, text, *, to=None, kind=None, reply_to=None):
         id = _post(sender, thread or project, text, [(to, "direct")], reply_to)
         if thread is None:
             STATE.names[id] = " ↔ ".join(sorted(pair))
-        return id
+        return id, None
 
 
 def agent_handle(agent):

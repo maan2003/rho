@@ -489,7 +489,9 @@ pub trait MailWrite {
         project: Option<MessageId>,
         message: NewMessage,
     ) -> anyhow::Result<MessageId>;
-    /// Change an agent's own posted mail, except an answered ask.
+    /// The latest project mail in this thread, if it has no user reply.
+    fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)>;
+    /// Change an agent's own posted mail, except mail the user answered.
     fn edit(
         &mut self,
         at: UnixMs,
@@ -654,9 +656,43 @@ fn unscoped_peer_project(
     )
 }
 
+fn has_user_reply(write: &mut WriteTxn, id: MessageId) -> bool {
+    // A reply still answers the same mail if either one moves. Older
+    // clients could reply by posting directly under the mail.
+    write
+        .open_table(MAIL_LOG)
+        .range(id.0.0 + 1..)
+        .any(|(_, row)| {
+            matches!(
+                row.value().into_owned().event,
+                ChatEvent::Posted { from: Address::User, parent, reply_to, .. }
+                    if reply_to.or(parent) == Some(id)
+            )
+        })
+}
+
+fn is_deleted(write: &mut WriteTxn, id: MessageId) -> bool {
+    let revision = write
+        .open_table(REVISIONS)
+        .get(id.0.0)
+        .map(|seq| seq.value());
+    revision.is_some_and(|seq| {
+        matches!(
+            write
+                .open_table(MAIL_LOG)
+                .get(seq)
+                .expect("a revision is a mail event")
+                .value()
+                .into_owned()
+                .event,
+            ChatEvent::Deleted { .. }
+        )
+    })
+}
+
 fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow::Result<()> {
-    let log = write.open_table(MAIL_LOG);
-    let original = log
+    let original = write
+        .open_table(MAIL_LOG)
         .get(id.0.0)
         .and_then(|record| Message::from_record(&record.value().into_owned()))
         .ok_or_else(|| anyhow::anyhow!("no message #{}", id.0.0))?;
@@ -664,43 +700,12 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         original.from == Address::Agent(agent),
         "you can only change your own mail"
     );
-    drop(log);
-    let revision = write
-        .open_table(REVISIONS)
-        .get(id.0.0)
-        .map(|seq| seq.value());
-    let log = write.open_table(MAIL_LOG);
+    anyhow::ensure!(!is_deleted(write, id), "mail #{} was deleted", id.0.0);
     anyhow::ensure!(
-        !revision.is_some_and(|seq| matches!(
-            log.get(seq)
-                .expect("a revision is a mail event")
-                .value()
-                .into_owned()
-                .event,
-            ChatEvent::Deleted { .. }
-        )),
-        "mail #{} was deleted",
+        !has_user_reply(write, id),
+        "you cannot change mail #{}: the user already answered it",
         id.0.0
     );
-    if original.mentions(Address::User) == Some(MentionKind::Ask) {
-        // An explicit answer doesn't depend on either mail's current
-        // parent. Older clients could also reply directly under a mail.
-        for (_, row) in log.range(id.0.0 + 1..) {
-            if let ChatEvent::Posted {
-                from: Address::User,
-                parent,
-                reply_to,
-                ..
-            } = row.value().into_owned().event
-                && reply_to.or(parent) == Some(id)
-            {
-                anyhow::bail!(
-                    "you cannot change ask #{}: the user already answered it",
-                    id.0.0
-                );
-            }
-        }
-    }
     Ok(())
 }
 
@@ -810,6 +815,39 @@ impl MailWrite for WriteTxn {
             )?;
         }
         Ok(id)
+    }
+
+    fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)> {
+        if !is_message(self, thread) {
+            return None; // post reports an unknown parent
+        }
+        // A root holds work threads, not a single conversation.
+        let parent = parent_now(self, thread)?;
+        let mut candidates: Vec<_> = self
+            .open_table(CHILDREN)
+            .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
+            .rev()
+            .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
+            .collect();
+        // The anchor is the first mail of a branch under a project root.
+        // A deeper branch's anchor is mail in its enclosing conversation.
+        if parent_now(self, parent).is_none() {
+            candidates.insert(candidates.partition_point(|id| *id > thread), thread);
+        }
+        let latest = candidates.into_iter().find_map(|id| {
+            let row = self.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
+            let ChatEvent::Posted {
+                from: Address::Agent(author),
+                mentions,
+                ..
+            } = row.event
+            else {
+                return None;
+            };
+            (!mentions.iter().any(|m| m.kind == MentionKind::Direct) && !is_deleted(self, id))
+                .then_some((id, author))
+        })?;
+        (!has_user_reply(self, latest.0)).then_some(latest)
     }
 
     fn edit(

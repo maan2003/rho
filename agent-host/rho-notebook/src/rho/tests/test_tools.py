@@ -189,6 +189,7 @@ class Tools(WorksetCase):
         self.assertEqual(self.state.messages[-1]["id"], result)
         self.assertEqual(self.state.messages[-1]["reply_to"], first)
         self.assertEqual(self.state.messages[-1]["mentions"], [("user", "result")])
+        self.assertIn(f"(reply to #{first}): Done.", run(lambda: mailbox.read(first))[0])
 
         _, direct = run(lambda: mailbox.send(f"eng-{child}@local", "Check this."))
         _, reply = run(lambda: tools.Mail(child).send(None, "Yes.", reply_to=direct))
@@ -214,13 +215,31 @@ class Tools(WorksetCase):
         self.assertEqual(posted, expected)
         awaited = asyncio.run(_await(posted))
         self.assertEqual(awaited, expected)
-        self.assertIs(type(awaited), int)
+        self.assertIsInstance(awaited, int)
+        self.assertIsNone(awaited.notice)
 
-        async def reply():
-            return await mailbox.send("user", "Done.", thread=thread, kind="result")
-
-        self.assertEqual(asyncio.run(reply()), expected + 1)
+        self.state.send_unanswered = expected, self.root
+        printed, result = run(lambda: mailbox.send("user", "Done.", thread=thread, kind="result"))
+        self.assertEqual(asyncio.run(_await(result)), expected + 1)
+        self.assertEqual(
+            result.notice,
+            f"Mail #{expected} has no user reply. If it is still live, use `mail.edit({expected}, ...)` for updates.",
+        )
+        self.assertIn(result.notice, printed)
+        self.assertEqual(asyncio.run(_await(result)).notice, result.notice)
         self.assertEqual([mail["text"] for mail in self.state.messages[2:]], ["Use the mock clock.", "Done."])
+
+    def test_send_recommends_the_writer_edit_their_own_mail(self):
+        other = add_agent(self.state, native(), preset="engineer", cwd=self.tmp)
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        _, earlier = run(lambda: tools.Mail(other).send(thread, "My first finding."))
+        self.state.send_unanswered = earlier, other
+
+        printed, posted = run(lambda: tools.Mail(self.root).send(thread, "Also this."))
+        self.assertEqual(fake_rho.message(posted)["text"], "Also this.")
+        self.assertIn(f"Mail #{earlier} has no user reply.", printed)
+        self.assertIn("ask its writer to use `mail.edit`", posted.notice)
 
     def test_other_mail_tools_start_immediately_and_can_be_awaited(self):
         ns, _ = self.notebook(self.root)

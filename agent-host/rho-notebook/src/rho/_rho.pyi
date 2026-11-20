@@ -151,8 +151,9 @@ def send_mail(
     to: str | None = None,
     kind: MentionKind | None = None,
     reply_to: int | None = None,
-) -> int:
-    """Send durable mail as `sender`. With an agent in `to`, the host
+) -> tuple[int, tuple[int, str] | None]:
+    """Return the new id and, if unanswered, the preceding project's mail id and writer.
+    Send durable mail as `sender`. With an agent in `to`, the host
     chooses the conversation. Only mail to "user" takes a kind and must
     pass the STE check."""
 def agent_handle(agent: str) -> str | None: ...

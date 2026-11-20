@@ -849,7 +849,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         .post(
             at,
             Some(note),
-            said(Address::User, "Context to retain"),
+            said(Address::Agent(b), "Context to retain"),
             None,
         )
         .unwrap();
@@ -875,6 +875,129 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     assert_eq!(removed.revision, Revision::Deleted);
     assert!(removed.text().is_empty());
     assert_eq!(read.message(reply).unwrap().parent, Some(note));
+}
+
+#[tokio::test]
+async fn last_project_mail_waits_for_a_user_reply_not_a_new_post() {
+    let (_dir, db) = db().await;
+    let mut write = db.write().await;
+    let (a, b) = (agent(1), agent(2));
+    let at = UnixMs(20);
+    let root = write
+        .post(at, None, said(Address::User, "Atlas"), None)
+        .unwrap();
+    let thread = write
+        .post(
+            at,
+            Some(root),
+            said(Address::Agent(a), "Release checks"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(write.unanswered_project_mail(root), None);
+    assert_eq!(write.unanswered_project_mail(thread), Some((thread, a)));
+
+    let result = write
+        .post(
+            at,
+            Some(thread),
+            NewMessage {
+                mentions: vec![Mention {
+                    to: Address::User,
+                    kind: MentionKind::Result,
+                }],
+                ..said(Address::Agent(b), "Gateway passed")
+            },
+            None,
+        )
+        .unwrap();
+    let unrelated = write
+        .post(
+            at,
+            Some(thread),
+            said(Address::User, "Separate question"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(write.unanswered_project_mail(unrelated), None);
+    assert_eq!(
+        write.unanswered_project_mail(result),
+        None,
+        "a tangent's anchor belongs to the main thread"
+    );
+
+    let coworker = write
+        .post(
+            at,
+            Some(thread),
+            NewMessage {
+                reply_to: Some(result),
+                ..said(Address::Agent(a), "The queue is clear")
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(write.unanswered_project_mail(thread), Some((coworker, a)));
+    write.delete(at, a, coworker).unwrap();
+    assert_eq!(write.unanswered_project_mail(thread), Some((result, b)));
+
+    let answer = write
+        .post(
+            at,
+            Some(thread),
+            NewMessage {
+                reply_to: Some(result),
+                ..said(Address::User, "Thanks")
+            },
+            None,
+        )
+        .unwrap();
+    write.reparent(at, answer, Some(unrelated)).unwrap();
+    assert_eq!(
+        write.unanswered_project_mail(thread),
+        None,
+        "do not fall back to the older unacknowledged anchor"
+    );
+    assert!(
+        write
+            .edit(
+                at,
+                b,
+                result,
+                said(Address::Agent(b), "Actually failed").content
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("already answered")
+    );
+    assert!(
+        write
+            .delete(at, b, result)
+            .unwrap_err()
+            .to_string()
+            .contains("already answered")
+    );
+
+    let followup = write
+        .post(at, Some(thread), said(Address::Agent(b), "All done"), None)
+        .unwrap();
+    assert_eq!(write.unanswered_project_mail(thread), Some((followup, b)));
+    let legacy = write
+        .post(at, Some(followup), said(Address::User, "That's all"), None)
+        .unwrap();
+    write.reparent(at, legacy, Some(unrelated)).unwrap();
+    assert_eq!(
+        write.unanswered_project_mail(thread),
+        None,
+        "a legacy answer survives moves too"
+    );
+    assert!(
+        write
+            .delete(at, b, followup)
+            .unwrap_err()
+            .to_string()
+            .contains("already answered")
+    );
 }
 
 #[tokio::test]

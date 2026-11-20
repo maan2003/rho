@@ -33,7 +33,29 @@ def _local_address(sender, to):
     return to
 
 
-def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> int:
+class SentMail(int):
+    """The new mail's id, with any follow-up suggestion in `notice`."""
+
+    def __new__(cls, id: int, notice: str | None = None):
+        self = super().__new__(cls, id)
+        self.notice = notice
+        return self
+
+    def __await__(self):
+        return self
+        yield
+
+
+def _send(sender, parent, text, **kwargs) -> SentMail:
+    id, unanswered = _rho.send_mail(sender, parent, text, **kwargs)
+    if unanswered is None:
+        return SentMail(id)
+    prior, author = unanswered
+    edit = f"use `mail.edit({prior}, ...)`" if author == sender else "ask its writer to use `mail.edit`"
+    return SentMail(id, f"Mail #{prior} has no user reply. If it is still live, {edit} for updates.")
+
+
+def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> SentMail:
     """Send to a local project, #thread, agent handle, or `user`.
     `reply_to=#id` identifies the exact mail answered. To address its
     writer use `to=None`. Mail to `user` needs kind and a thread or reply.
@@ -75,7 +97,7 @@ def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> int:
             if reply is None:
                 raise ValueError("mail to the user needs thread or reply_to")
             thread = thread_of(reply)
-        return _rho.send_mail(sender, ident(thread), text, to=USER, kind=kind, reply_to=reply_to)
+        return _send(sender, ident(thread), text, to=USER, kind=kind, reply_to=reply_to)
 
     if thread is not None or kind is not None:
         raise ValueError("only mail to the user takes thread or kind")
@@ -83,7 +105,7 @@ def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> int:
         target = agents.resolve(to)
         if sender == target:
             raise ValueError("cannot mail yourself")
-        return _rho.send_mail(sender, None, text, to=target, reply_to=reply_to)
+        return _send(sender, None, text, to=target, reply_to=reply_to)
     if isinstance(to, int) or isinstance(to, str) and to.startswith("#"):
         parent = ident(to)
     elif isinstance(to, str):
@@ -92,11 +114,11 @@ def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> int:
             raise ValueError(f"no project {to!r} on this host")
     else:
         raise ValueError(f"unknown mail address {to!r}")
-    return _rho.send_mail(sender, parent, text, reply_to=reply_to)
+    return _send(sender, parent, text, reply_to=reply_to)
 
 
 def make_project(sender: str, name: str) -> int:
-    return _rho.send_mail(sender, None, name)
+    return _rho.send_mail(sender, None, name)[0]
 
 
 def join(thread: int, agent: str) -> None:
