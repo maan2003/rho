@@ -20,6 +20,12 @@ the same host handlers and worker clients through an in-process Unix socket
 pair, not an alternate local backend. These are module boundaries within one
 crate, not separate build targets.
 
+Host re-exec preserves a workset and its running jobs only when the successor
+adopts its channels. The inherited channels belong to the successor, not its
+startup helpers. Loss of the host connection ends the worker and its child
+processes after a short cleanup grace, including jobs in separate sessions.
+The successor also ends rejected workers that cannot clean up themselves.
+
 The append-only workset log
 ([ARCH-agent-host](../../specs/ARCH-agent-host.md)) owns the recoverable
 conversation prefix. The

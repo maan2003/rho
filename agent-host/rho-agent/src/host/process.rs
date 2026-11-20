@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -48,6 +49,19 @@ pub struct Handed {
     /// Frames for the worker not yet written, first to write.
     pub(crate) unwritten: Vec<transport::Packet>,
     pub(crate) unwritten_requests: Vec<transport::Packet>,
+}
+
+impl Handed {
+    /// Keep inherited channels in the successor, not in its startup helpers.
+    pub fn protect_channels(&self) -> std::io::Result<()> {
+        for fd in [self.fd, self.requests_fd] {
+            // fcntl validates the raw fd without taking ownership.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A handoff step, taken by the router between frames.
@@ -390,13 +404,19 @@ impl Process {
                 std::os::unix::net::UnixStream::from_raw_fd(handed.requests_fd),
             )
         };
-        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
-        rustix::io::fcntl_setfd(&requests, rustix::io::FdFlags::CLOEXEC)?;
         let worker = Worker::open(handed.pid)?;
         if handed.version != protocol::VERSION {
-            // Closing the connections ends it; it is still ours to reap.
+            // Older workers may wait for tasks that can no longer reach a
+            // host. Pin their descendants before EOF can reparent any of them.
+            let mut descendants = crate::process_tree::Descendants::default();
+            worker.scan_descendants(&mut descendants, false);
+            // Shutdown the connection itself: old hosts may have let another
+            // process inherit a copy of either fd during an earlier re-exec.
+            for channel in [&socket, &requests] {
+                let _ = channel.shutdown(std::net::Shutdown::Both);
+            }
             drop((socket, requests));
-            tokio::spawn(async move { worker.wait().await });
+            tokio::spawn(worker.reap_refused(descendants));
             anyhow::bail!(
                 "worker speaks protocol {}, not {}",
                 handed.version,
@@ -743,6 +763,33 @@ impl Worker {
                 Ok(None) => ready.clear_ready(),
             }
         }
+    }
+
+    fn scan_descendants(&self, tree: &mut crate::process_tree::Descendants, freeze: bool) {
+        use std::os::fd::AsFd as _;
+
+        let pid = rustix::process::Pid::from_raw(self.pid as i32).expect("opened worker pid");
+        tree.scan(pid, self.pidfd.get_ref().as_fd(), freeze);
+    }
+
+    async fn reap_refused(self, mut descendants: crate::process_tree::Descendants) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        if tokio::time::timeout_at(deadline, self.wait()).await.is_ok() {
+            while descendants.is_running() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !descendants.is_running() {
+                return;
+            }
+        }
+        // Stop producers first, then rescan for children born during the
+        // grace or while the stop signals were being delivered.
+        self.scan_descendants(&mut descendants, true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.scan_descendants(&mut descendants, true);
+        descendants.kill();
+        self.kill();
+        self.wait().await;
     }
 
     fn kill(&self) {

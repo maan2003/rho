@@ -1,5 +1,6 @@
 //! Worker-owned runtimes and their local control dispatch. No database or pool.
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::net::UnixStream;
@@ -396,15 +397,31 @@ pub(crate) async fn run(
                 .await;
         });
     };
+    // The mount view is not a PID namespace, and terminal/Claude/shell
+    // children may be in separate sessions. Become their reaper before
+    // normal cancellation starts making their parents exit.
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+        .context("become workset child reaper")?;
     policy.disconnect();
     agents.lock().expect("poison").clear();
     execution.clients.lock().expect("poison").clear();
-    while tasks.join_next().await.is_some() {}
-    tokio::join!(execution.terminals.shutdown(), execution.shells.shutdown());
     sender.close();
     requests.close();
     writer.abort();
     requests_writer.abort();
+    // Closing an individual agent port still waits for its Stopped reply
+    // above. Here the host connection is gone, so let cooperative cleanup
+    // run briefly, but never wait for hung policy or a provider.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        tokio::join!(
+            drain,
+            execution.terminals.shutdown(),
+            execution.shells.shutdown()
+        );
+    })
+    .await;
+    tasks.abort_all();
     result
 }
 
