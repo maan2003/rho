@@ -396,7 +396,7 @@ impl DeskRow {
             ),
             (cut(&self.project, project_width), DeskClass::Muted, 0),
         ]);
-        text.push_str("\\n  ");
+        text.push_str("\n  ");
         let start = text.len();
         text.push_str(&cut_words(&self.words, width.saturating_sub(2)));
         styles.push((self.words_class(), start..text.len()));
@@ -557,7 +557,7 @@ mod tests {
         let item = row.compact(30, 8);
         assert_eq!(
             item.text,
-            "Clock correction ed…  tide@lab\\n  Replaying the slowe… · 16m\\n"
+            "Clock correction ed…  tide@lab\n  Replaying the slower… · 16m\n"
         );
         assert_eq!(item.lines, [row.target.clone(), row.target]);
     }
