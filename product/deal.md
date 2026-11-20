@@ -31,6 +31,9 @@ does:
 
 The longest-waiting card deals first, with asks and stops before results; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 
+## rule a result already gone before results waited stays gone
+Until 2026-11-20 a result faded and left the deal three days after it was written, with no verdict asked. A result that had already left by then counts as read, so the rule change does not bring months of old results back as cards. Asks and stops never faded, so they stay as they were.
+
 ## concept Verdict
 status: Slack in the browser has no rho verdicts.
 purpose: let the user say once what a card means to them, so rho remembers their answer.

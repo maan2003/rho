@@ -53,6 +53,19 @@ fn unix(ms: u64) -> Timestamp {
     Timestamp::from_millisecond(ms as i64).expect("a message's time")
 }
 
+/// When results stopped fading: the first release that keeps a result
+/// waiting until the user deals it, 2026-11-20T14:39Z. Before it, a result
+/// faded and was gone three days after it was written, with no verdict
+/// asked. A result already gone then was read as far as the user knew, and
+/// the rule change does not bring it back as a card.
+const RESULTS_WAIT_SINCE: u64 = 1795185540000;
+const RESULT_GONE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+
+fn faded_before_results_waited(mail: &Message) -> bool {
+    mail.mentions(Party::User) == Some(MentionKind::Result)
+        && mail.at.0.saturating_add(RESULT_GONE_MS) <= RESULTS_WAIT_SINCE
+}
+
 /// Every thread on the host that wants the user, as a claim each.
 pub fn claims(
     host: &Host<'_>,
@@ -103,6 +116,7 @@ pub fn claims(
             .into_iter()
             .filter(|message| {
                 !answered.contains(&message.id)
+                    && !faded_before_results_waited(message)
                     && seen.is_none_or(|seen| message.version().0 > seen)
             })
             .collect::<Vec<_>>();
@@ -268,7 +282,7 @@ mod tests {
             agents: HashMap::new(),
             marks: Marks::default(),
             skips: Skips::default(),
-            now: "2026-08-23T09:00:00Z"
+            now: "2026-11-23T09:00:00Z"
                 .parse::<Timestamp>()
                 .unwrap()
                 .to_zoned(jiff::tz::TimeZone::UTC),
@@ -602,6 +616,31 @@ mod tests {
         assert_eq!(attention_mail(&card.cursor), Some(result));
         w.writes_to(a);
         assert_eq!(w.hand(), "rho@lab › b · asks · 6.0d");
+    }
+
+    /// Before results waited, a result faded and was gone in three days.
+    /// One already gone at the change stays gone; an ask from then still
+    /// waits, and a result still fading then waits from now on.
+    #[test]
+    fn a2b_a_result_gone_before_results_waited_makes_no_card() {
+        let mut w = world();
+        w.now = "2026-11-10T09:00:00Z"
+            .parse::<Timestamp>()
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let gone = w.agent("gone");
+        w.finishes(gone);
+        let asked = w.agent("asked");
+        w.asks(asked);
+        w.pass(hours(24 * 8));
+        let fading = w.agent("fading");
+        w.finishes(fading);
+        w.pass(hours(24 * 5));
+        assert!(w.now.timestamp().as_millisecond() as u64 > RESULTS_WAIT_SINCE);
+        let hand = w.hand();
+        assert!(!hand.contains("gone"), "{hand}");
+        assert!(hand.contains("asked · asks"), "{hand}");
+        assert!(hand.contains("fading · result"), "{hand}");
     }
 
     #[test]
