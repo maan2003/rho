@@ -13734,7 +13734,6 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-agents-client",
- "rho-chat",
  "rho-claude",
  "rho-claude-usage",
  "rho-db",
@@ -13748,6 +13747,7 @@ dependencies = [
  "rho-inference",
  "rho-iroh-auth",
  "rho-ledger-server",
+ "rho-mail",
  "rho-openai-realtime",
  "rho-profiling",
  "rho-rpc",
@@ -13852,10 +13852,10 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-agents-client",
- "rho-chat",
  "rho-db",
  "rho-desktop-client",
  "rho-frame",
+ "rho-mail",
  "rho-rpc",
  "rho-shell-view",
  "rho-terminal",
@@ -13911,37 +13911,6 @@ dependencies = [
  "libc",
  "smithay",
  "tracing",
-]
-
-[[package]]
-name = "rho-chat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "editor",
- "futures",
- "gpui",
- "jiff",
- "language",
- "multi_buffer",
- "rand 0.10.3",
- "redb",
- "rho-agent-hosts",
- "rho-agent-types",
- "rho-chat",
- "rho-db",
- "rho-dealer",
- "rho-frame",
- "rho-rpc",
- "rho-transcript",
- "rho-window",
- "senax-encoder",
- "tempfile",
- "theme",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -14009,7 +13978,6 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-agents-client",
- "rho-chat",
  "rho-claude",
  "rho-db",
  "rho-desktop-client",
@@ -14017,6 +13985,7 @@ dependencies = [
  "rho-fs-view",
  "rho-inference",
  "rho-ledger",
+ "rho-mail",
  "rho-rpc",
  "rho-rtc",
  "rho-shell-view",
@@ -14290,11 +14259,11 @@ dependencies = [
  "rho-agents-client",
  "rho-agents-view",
  "rho-browser",
- "rho-chat",
  "rho-db",
  "rho-frame",
  "rho-iroh-auth",
  "rho-journal",
+ "rho-mail",
  "rho-notes",
  "rho-profiling",
  "rho-window",
@@ -14444,6 +14413,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-mail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "editor",
+ "futures",
+ "gpui",
+ "jiff",
+ "language",
+ "multi_buffer",
+ "rand 0.10.3",
+ "redb",
+ "rho-agent-hosts",
+ "rho-agent-types",
+ "rho-db",
+ "rho-dealer",
+ "rho-frame",
+ "rho-mail",
+ "rho-rpc",
+ "rho-transcript",
+ "rho-window",
+ "senax-encoder",
+ "tempfile",
+ "theme",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "rho-notebook"
 version = "0.1.0"
 dependencies = [
@@ -14469,9 +14469,9 @@ dependencies = [
  "jiff",
  "language",
  "multi_buffer",
- "rho-chat",
  "rho-dealer",
  "rho-frame",
+ "rho-mail",
  "rho-transcript",
  "rho-window",
  "theme",

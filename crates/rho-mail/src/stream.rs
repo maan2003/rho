@@ -1,5 +1,5 @@
-//! One host's chat session: the host's log to whoever folds it, and what
-//! the user did in the chat to the host, on call streams of their own.
+//! One host's mail session: the host's log to whoever folds it, and what
+//! the user did in the mail to the host, on call streams of their own.
 //!
 //! The host opens the session on every connection
 //! ([`rho_agent_hosts::HostStream`]); what is said on it and where its
@@ -18,7 +18,7 @@ use crate::protocol::{ClientFrame, Open, ServerFrame};
 
 /// What reaches the fold from one host.
 #[derive(Debug)]
-pub enum ChatEvent {
+pub enum MailEvent {
     /// The session opened: whose log the host carries and how far it
     /// goes. `fresh` says the copy held here was not of this log and was
     /// dropped: the records that follow start from the beginning.
@@ -79,19 +79,19 @@ impl Cursors {
     }
 }
 
-/// One host's chat session, as the host keeps it across reconnects.
-pub struct ChatStream {
+/// One host's mail session, as the host keeps it across reconnects.
+pub struct MailStream {
     host: HostId,
     cursors: Cursors,
-    events: futures_mpsc::UnboundedSender<ChatEvent>,
+    events: futures_mpsc::UnboundedSender<MailEvent>,
     view: tokio::sync::watch::Receiver<Option<MessageId>>,
 }
 
-impl ChatStream {
+impl MailStream {
     pub fn new(
         host: HostId,
         cursors: Cursors,
-        events: futures_mpsc::UnboundedSender<ChatEvent>,
+        events: futures_mpsc::UnboundedSender<MailEvent>,
         view: tokio::sync::watch::Receiver<Option<MessageId>>,
     ) -> Self {
         Self {
@@ -103,9 +103,9 @@ impl ChatStream {
     }
 }
 
-impl HostStream for ChatStream {
+impl HostStream for MailStream {
     fn name(&self) -> &'static str {
-        "chat"
+        "mail"
     }
 
     /// `Hello`, then the log after the cursor and each new record, for as
@@ -125,7 +125,7 @@ impl HostStream for ChatStream {
                     host: endpoint,
                 } = read_frame(&mut socket).await?
                 else {
-                    anyhow::bail!("the chat session did not open with its hello");
+                    anyhow::bail!("the mail session did not open with its hello");
                 };
                 // A copy that stands past the host's head is of some other
                 // log (the host's database was replaced): it starts over.
@@ -136,7 +136,7 @@ impl HostStream for ChatStream {
                     since = ChatSeq::ZERO;
                 }
                 if events
-                    .unbounded_send(ChatEvent::Hello {
+                    .unbounded_send(MailEvent::Hello {
                         host,
                         endpoint,
                         head,
@@ -152,9 +152,9 @@ impl HostStream for ChatStream {
                     loop {
                         let frame = read_frame::<_, ServerFrame>(&mut reader).await?;
                         let event = match frame {
-                            ServerFrame::Chat { records } => ChatEvent::Records { host, records },
+                            ServerFrame::Mail { records } => MailEvent::Records { host, records },
                             ServerFrame::Statuses { statuses } => {
-                                ChatEvent::Statuses { host, statuses }
+                                MailEvent::Statuses { host, statuses }
                             }
                             ServerFrame::Hello { .. } => continue,
                         };
@@ -175,13 +175,13 @@ impl HostStream for ChatStream {
                 tokio::select! { result = receive => result, result = send => result }
             }
             .await;
-            let _ = events.unbounded_send(ChatEvent::Closed { host });
+            let _ = events.unbounded_send(MailEvent::Closed { host });
             result
         })
     }
 }
 
-/// One call to a host's chat, on a stream of its own.
+/// One call to a host's mail, on a stream of its own.
 pub async fn call<C: Call>(dialer: &Dialer, call: C) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
     rho_rpc::protocol::call(&mut stream, call).await

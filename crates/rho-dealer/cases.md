@@ -10,11 +10,11 @@ does not fade. The user answers waiting mail with a reply or verdict.
 
 ## Threads
 
-Agents and the user talk in chat: each host holds a forest of messages,
+Agents and the user talk in mail: each host holds a forest of messages,
 and the thread under a message is every reply below it. A message goes to
 a thread, not to a person, and draws the user only by mentioning them.
-Each thread is a node; an agent is never a card. What the chat claims for
-each of its cases is the chat's own, in `rho-chat/src/cards.rs`, tested
+Each thread is a node; an agent is never a card. What the mail claims for
+each of its cases is the mail's own, in `rho-mail/src/cards.rs`, tested
 there. The rows below are what the dealer makes of a source shaped like
 it, with a stand-in thread that asks and answers.
 
@@ -32,7 +32,7 @@ A card is titled by the thread's subject and the project's address.
 | A8 | Done through a message before the mention | the mention still deals |
 | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
-| A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not chat |
+| A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not mail |
 | A13 | The thread muted | nothing |
 | A14 | A stop mailed by the system bot | one card, as an ask; stays until answered even if the agent moves on |
 

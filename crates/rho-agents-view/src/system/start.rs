@@ -1,14 +1,14 @@
-//! Starting an agent from a message.
+//! Starting an agent from a mail.
 //!
-//! Any message is what an agent starts from: the one under the point, or
-//! the one the composer is about to send. An idea sent in a channel asks
-//! nothing it need not: it works where the channel's agents work, on the
-//! default runtime, and only a channel no agent started from yet asks
+//! An agent can start from any mail: the one under the point, or
+//! the one the composer is about to send. An idea sent in a project asks
+//! nothing it need not: it works where the project's agents work, on the
+//! default runtime, and only a project no agent started from yet asks
 //! where, once. The rare `start agent, choosing where and runtime…` asks both:
 //! where (a new workset on a repository, a directory on the host as it is, or
 //! beside an agent already there) and the runtime. The GUI sends the code,
-//! which names the message as `origin`, so policy joins the agent to its thread
-//! and hands it the message first.
+//! which names the mail as `origin`, so policy joins the agent to its thread
+//! and hands it the mail first.
 
 use std::rc::Rc;
 
@@ -16,16 +16,16 @@ use camino::Utf8PathBuf;
 use futures::FutureExt as _;
 use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
-use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, channel_start};
+use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, project_start};
 use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
-use rho_chat::ThreadId;
-use rho_chat::ui::IdeaSource;
 use rho_frame::{Candidate, Frame, Row, Rows};
+use rho_mail::ThreadId;
+use rho_mail::ui::IdeaSource;
 use rho_window::style::StyleClass;
 
 use super::AgentsSystem;
 
-/// Everything a start needs but the message it starts from.
+/// Everything a start needs but the mail it starts from.
 pub(crate) struct Plan {
     pub host: HostId,
     pub start: Start,
@@ -40,12 +40,12 @@ enum Feedback {
     Sent,
 }
 
-/// Which message the agent starts from.
+/// Which mail the agent starts from.
 #[derive(Clone)]
 pub(crate) enum Origin {
-    /// The thread's message under the point: it exists, so the start goes
+    /// The mail under the point: it exists, so the start goes
     /// out at once.
-    Message,
+    Mail,
     /// The composer's draft: sent first, started once the host logs it.
     Draft(IdeaSource),
 }
@@ -64,14 +64,13 @@ impl Origin {
 pub(crate) enum Runtimes {
     /// `runtime (default):`, for the rare start that asks everything.
     Ask,
-    /// Nothing: the default runtime, for an idea sent in a channel.
+    /// Nothing: the default runtime, for an idea sent in a project.
     Default,
 }
 
-/// An idea sent in the channel `thread`: sent and started where the
-/// channel's agents work, on the default runtime. A channel no agent has
-/// started from asks where, once; the agent it starts is what the channel
-/// remembers.
+/// Send an idea to the project rooted at `thread` and start an agent where
+/// its agents already work, on the default runtime. If none has started yet,
+/// ask where once; the project remembers where that agent works.
 pub(crate) fn idea(
     system: &mut AgentsSystem,
     thread: ThreadId,
@@ -87,18 +86,18 @@ pub(crate) fn idea(
         return;
     };
     let registry = system.registry();
-    let chat = system.chat.read(cx);
-    let start = chat.chat(thread.host).and_then(|chat| {
-        let channel = chat.root_of(thread.message);
+    let mail = system.mail.read(cx);
+    let start = mail.host_mail(thread.host).and_then(|log| {
+        let root = log.root_of(thread.message);
         let agents = registry
             .host_agents(host)
             .into_iter()
             .filter_map(|agent| registry.agent_identity(agent));
-        channel_start(agents, |message| {
-            chat.message(message).is_some() && chat.root_of(message) == channel
+        project_start(agents, |message| {
+            log.message(message).is_some() && log.root_of(message) == root
         })
     });
-    // Before the channel has an agent, which is also after its first start
+    // Before the project has an agent, which is also after its first start
     // failed, the answer the user gave is where.
     let start = start.or_else(|| system.places.get(thread.host, thread.message));
     match start {
@@ -147,7 +146,7 @@ pub(crate) fn rows(
     // agents work from then on.
     let mut rows = Rows::new(match runtimes {
         Runtimes::Ask => match origin {
-            Origin::Message => "start agent",
+            Origin::Mail => "start agent",
             Origin::Draft(_) => "send and start agent",
         },
         Runtimes::Default => "where this project's agents work",
@@ -238,9 +237,9 @@ pub(crate) fn rows(
         return rows;
     };
     let members = read
-        .chat
+        .mail
         .read(cx)
-        .chat(thread.host)
+        .host_mail(thread.host)
         .map(|chat| chat.members_under(Some(thread.message)))
         .unwrap_or_default();
     let mut beside: Vec<_> = members
@@ -444,7 +443,7 @@ fn begin(
             feedback: origin.feedback(),
         };
         match origin {
-            Origin::Message => create(system, plan, thread, cx),
+            Origin::Mail => create(system, plan, thread, cx),
             Origin::Draft(_) => send_and_start(system, thread, &origin, plan, cx),
         }
     });
@@ -459,9 +458,9 @@ fn send_and_start(
     cx: &mut Context<AgentsSystem>,
 ) {
     let endpoint = thread.host;
-    let sent = system.chat.update(cx, |chat, cx| match origin {
-        Origin::Draft(source) => chat.post_idea(thread, source, cx),
-        Origin::Message => unreachable!("the origin already exists"),
+    let sent = system.mail.update(cx, |mail, cx| match origin {
+        Origin::Draft(source) => mail.send_idea(thread, source, cx),
+        Origin::Mail => unreachable!("the origin already exists"),
     });
     match sent {
         Some(client_id) => {
@@ -536,7 +535,7 @@ pub(crate) fn create(
                 );
                 let _ = this.update(cx, |system, cx| {
                     system
-                        .chat
+                        .mail
                         .update(cx, |chat, cx| chat.note_failed_start(thread, reason, cx))
                 });
             }

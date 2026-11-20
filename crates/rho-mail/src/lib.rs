@@ -1,11 +1,11 @@
-//! Chat: a forest of messages per host.
+//! Mail: a forest of messages per host.
 //!
-//! [`protocol`] is what a client and a host say about the chat; the host
-//! uses it alone. With the `client` feature the crate is also the chat as
+//! [`protocol`] is what a client and a host say about the mail; the host
+//! uses it alone. With the `client` feature the crate is also the mail as
 //! a client holds it: each host's log folded into its forest ([`fold`]),
 //! the disk copy a client starts from ([`cache`]), what the user wrote
 //! that no host has taken yet ([`outbox`]), the session that carries a
-//! host's log in ([`stream`]), and what the chat claims of the user's
+//! host's log in ([`stream`]), and what the mail claims of the user's
 //! attention ([`cards`]). Nothing here draws.
 
 pub mod protocol;
@@ -24,7 +24,7 @@ pub mod stream;
 pub mod ui;
 
 #[cfg(feature = "client")]
-pub use fold::{HostChat, Thread, Told};
+pub use fold::{HostMail, Thread, Told};
 
 /// An agent as an address, `agent:<encoded id>`: what a thread's
 /// participants are named by, and what the agents system opens. The id

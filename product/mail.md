@@ -3,7 +3,7 @@
 The user writes a project a mail to put an idea to work. Each piece of work has one thread, with a subject, the mails so far, and one line about what is happening now.
 
 ## bet A mail is the medium
-instead of: separate conversations beside the project, or a channel full of individually named agents.
+instead of: separate conversations beside the project, or a project feed full of individually named agents.
 serves: Keep the work moving.
 because: one thread keeps one piece of work together. Its subject identifies the work, its status tells the user what is happening now, and the project speaks with one voice even when several agents do the work.
 costs: the user opens the transcript to see which agent did what.
@@ -12,7 +12,7 @@ An agent writes to another agent by mail in a thread under the project; the user
 
 ## bet The project asks by mail, even when an agent stops
 status: when an agent cannot launch, its stop mail explains how to get the work going. Further replies are saved without retrying the failed launch.
-instead of: attention coming from a mixture of named agents' chat mentions and notices about their state.
+instead of: attention coming from a mixture of mentions from named agents and notices about their state.
 serves: Know what wants them, and where they were.
 because: the user only needs what asks for them or returns a result, not each agent's progress. A stop is another mail to answer, not another kind of thing to watch.
 costs: a failure can still ask for the user when they have nothing to add.
@@ -34,7 +34,7 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-status: the project's own screen is still the channel's list of threads, with agent names and counts on its rows.
+status: the project's own screen still lists its threads, with agent names and counts on its rows.
 purpose: give each project one address to write to, without asking the user where its agents should work each time.
 principle: the user sends an idea to `tide@lab`; the project starts the work where its agents work and sends its asks and results from that address.
 sees: its name and host as an address, such as `tide@lab`; open, the threads of that project by subject.
@@ -180,7 +180,7 @@ user: the words and, if different from the automatic choice, the project.
 cases: a multiline idea on Desk is edited before sending; an unsent idea is still present on this device after restart; the idea comes while reading a page; the current thread belongs to a different project.
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
-The historical review above was of Start a thread. Start an agent from a message was walked separately:
+The historical review above was of Start a thread. Starting an agent from a mail was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule the last mail stays live

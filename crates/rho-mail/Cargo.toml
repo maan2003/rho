@@ -1,10 +1,10 @@
-# Chat, as the client holds it: the fold of every host's log, the disk copy,
+# Mail, as the client holds it: the fold of every host's log, the disk copy,
 # the outbox and the host session. Without the `client` feature it is the
-# chat protocol alone, for the host.
+# mail protocol alone, for the host.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
-name = "rho-chat"
+name = "rho-mail"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -23,7 +23,7 @@ client = [
   "dep:tracing",
 ]
 
-# The chat as the frame shows it: the system, the thread surface, the
+# The mail as the frame shows it: the system, the thread surface, the
 # claims, Home's rows.
 ui = [
   "client",
@@ -75,5 +75,5 @@ theme = { path = "../../vendor/zed/crates/theme", optional = true }
 url = { workspace = true, optional = true }
 
 [dev-dependencies]
-rho-chat = { path = ".", features = ["client"] }
+rho-mail = { path = ".", features = ["client"] }
 tempfile = { workspace = true }

@@ -37,14 +37,14 @@ use rho_agents_client::quota::Quotas;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, Heard, now_ms};
-use rho_chat::ui::{ChatSystem, Event as ChatEvent, Participant};
-use rho_chat::{AgentRef, ThreadId};
 use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, System,
 };
+use rho_mail::ui::{Event as MailEvent, MailSystem, Participant};
+use rho_mail::{AgentRef, ThreadId};
 use rho_rpc::protocol::Call;
 use rho_shell_view::ui::ShellSurface;
 use rho_terminal::ui::TerminalSurface;
@@ -74,14 +74,14 @@ pub struct AgentsSystem {
     quotas: Quotas,
     /// What the hosts answered for the spend charts.
     usage: Usage,
-    chat: Entity<ChatSystem>,
+    mail: Entity<MailSystem>,
     frame: FrameLink,
     /// Agents asked for with the user's message, by the id the chat gave
     /// the message: started once the host has logged it.
     starting: HashMap<(EndpointId, u64), start::Plan>,
     /// Where each channel's agents work, as the user answered it, until an
     /// agent of the channel says so itself.
-    places: places::ChannelPlaces,
+    places: places::ProjectPlaces,
     /// Agents this window started whose first turn has not ended, and
     /// whether it got to work: a failure before then is the start failing,
     /// and the echo line says so.
@@ -94,7 +94,7 @@ pub struct AgentsSystem {
 impl AgentsSystem {
     pub fn new(
         db: rho_db::RhoDb,
-        chat: Entity<ChatSystem>,
+        mail: Entity<MailSystem>,
         frame: FrameLink,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -132,13 +132,13 @@ impl AgentsSystem {
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
         rho_desktop_client::ui::bind_keys(cx);
-        let delivered = cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
-            ChatEvent::Delivered {
+        let delivered = cx.subscribe(&mail, |this, _, event: &MailEvent, cx| match event {
+            MailEvent::Delivered {
                 endpoint,
                 client_id,
                 message,
             } => this.delivered(*endpoint, *client_id, *message, cx),
-            ChatEvent::Idea {
+            MailEvent::Idea {
                 endpoint,
                 parent,
                 source,
@@ -151,7 +151,7 @@ impl AgentsSystem {
                 source.clone(),
                 cx,
             ),
-            ChatEvent::Inspect { agent, mail } => {
+            MailEvent::Inspect { agent, mail } => {
                 let agent = *agent;
                 let mail = mail.clone();
                 let system = cx.weak_entity();
@@ -178,7 +178,7 @@ impl AgentsSystem {
                     }
                 });
             }
-            ChatEvent::Changed { .. } | ChatEvent::DraftSent(_) => {}
+            MailEvent::Changed { .. } | MailEvent::DraftSent(_) => {}
         });
         Self {
             client,
@@ -191,10 +191,10 @@ impl AgentsSystem {
             sessions: HashMap::new(),
             quotas: Quotas::default(),
             usage: Usage::default(),
-            chat,
+            mail,
             frame,
             starting: HashMap::new(),
-            places: places::ChannelPlaces::open(db),
+            places: places::ProjectPlaces::open(db),
             first_turns: HashMap::new(),
             timer: None,
             _tasks: vec![pump, desktops_pump],
@@ -662,7 +662,7 @@ impl AgentsSystem {
     fn agent_thread(&self, agent: AgentId, cx: &App) -> Option<ThreadId> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;
-        let chat = self.chat.read(cx).chat(host)?;
+        let chat = self.mail.read(cx).host_mail(host)?;
         let message = chat.agent_thread(agent).or_else(|| {
             mirrored
                 .identity
@@ -675,7 +675,7 @@ impl AgentsSystem {
     fn brief(&self, agent: AgentId, cx: &App) -> Option<String> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;
-        let chat = self.chat.read(cx).chat(host)?;
+        let chat = self.mail.read(cx).host_mail(host)?;
         let origin = mirrored.identity.origin()?;
         let brief = chat.message(origin)?.text();
         (!brief.trim().is_empty()).then_some(brief)
@@ -948,7 +948,7 @@ impl AgentsSystem {
     }
 
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
-        let chat = self.chat.read(cx);
+        let chat = self.mail.read(cx);
         point
             .subject
             .as_ref()
@@ -1088,13 +1088,13 @@ impl System for AgentsSystem {
                 self,
                 this.clone(),
                 thread,
-                start::Origin::Message,
+                start::Origin::Mail,
                 start::Runtimes::Ask,
                 cx,
             ),
         ));
         let draft = !self
-            .chat
+            .mail
             .read(cx)
             .draft(thread.host, Some(thread.message))
             .trim()
@@ -1107,7 +1107,7 @@ impl System for AgentsSystem {
                     self,
                     this,
                     thread,
-                    start::Origin::Draft(rho_chat::ui::IdeaSource::ChannelDraft),
+                    start::Origin::Draft(rho_mail::ui::IdeaSource::ProjectDraft),
                     start::Runtimes::Ask,
                     cx,
                 ),

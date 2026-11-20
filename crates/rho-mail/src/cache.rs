@@ -1,5 +1,5 @@
-//! The client's own copy of every host's chat log, so a client comes up
-//! knowing the chat and asks a host only for what came after. Beside it,
+//! The client's own copy of every host's mail log, so a client comes up
+//! knowing the mail and asks a host only for what came after. Beside it,
 //! what the user wrote that no host has taken ([`crate::outbox`]) and what
 //! they are writing in each thread.
 //!
@@ -100,7 +100,7 @@ impl Cache {
         let (sender, receiver) = mpsc::channel();
         let writer_db = db.clone();
         let handle = std::thread::Builder::new()
-            .name("rho-chat-cache".into())
+            .name("rho-mail-cache".into())
             .spawn(move || writer(writer_db, receiver))?;
         Ok(Self {
             db,
@@ -232,7 +232,7 @@ fn parent_of(key: u64) -> Option<MessageId> {
 fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
-        .expect("build chat cache runtime");
+        .expect("build mail cache runtime");
     // Everything queued goes in one transaction: a catch-up arrives as
     // many pages faster than each can commit on its own.
     while let Ok(first) = receiver.recv() {

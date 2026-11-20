@@ -223,21 +223,21 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let chat =
-                    cx.new(|cx| rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), cx));
+                let mail =
+                    cx.new(|cx| rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), cx));
                 let agents = cx.new(|cx| {
-                    rho_agents_view::AgentsSystem::new(db.clone(), chat.clone(), frame.clone(), cx)
+                    rho_agents_view::AgentsSystem::new(db.clone(), mail.clone(), frame.clone(), cx)
                 });
-                // The chat ranks a thread by the agents still in it and by
+                // The mail ranks a thread by the agents still in it and by
                 // the stops they are in, and names them with what they do;
                 // the agents system knows all of it, and a thread on screen
                 // reads again when it moves.
                 let participants = agents.downgrade();
-                chat.update(cx, |chat, cx| {
-                    chat.set_participants(Rc::new(move |endpoint, agent, cx| {
+                mail.update(cx, |mail, cx| {
+                    mail.set_participants(Rc::new(move |endpoint, agent, cx| {
                         participants.upgrade().map_or_else(
                             || {
-                                Some(rho_chat::ui::Participant {
+                                Some(rho_mail::ui::Participant {
                                     label: agent.encoded(),
                                     runtime: None,
                                     created_at: None,
@@ -256,7 +256,7 @@ fn run() -> Result<()> {
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
-                    AnySystem::new(chat),
+                    AnySystem::new(mail),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
                     AnySystem::new(notes),

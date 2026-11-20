@@ -14,7 +14,7 @@ use rho_dealer::curve::{self, Curve};
 use rho_dealer::rank::Trace;
 use rho_dealer::{Addressed, Claim, Marks};
 
-use crate::fold::HostChat;
+use crate::fold::HostMail;
 use crate::{AgentRef, ThreadId};
 
 impl Addressed for ThreadId {
@@ -44,7 +44,7 @@ impl Addressed for AgentRef {
 /// One host's chat as the dealer reads it.
 pub struct Host<'a> {
     pub endpoint: EndpointId,
-    pub chat: &'a HostChat,
+    pub chat: &'a HostMail,
     /// The device's name for the host, used in the project address.
     pub name: &'a str,
 }
@@ -192,7 +192,7 @@ pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
 }
 
 /// Where a thread is: the address of the project above it.
-pub(crate) fn context(chat: &HostChat, thread: MessageId, host_name: &str) -> String {
+pub(crate) fn context(chat: &HostMail, thread: MessageId, host_name: &str) -> String {
     chat.project(chat.root_of(thread)).map_or_else(
         || host_name.to_owned(),
         |project| project.address(host_name),
@@ -229,7 +229,7 @@ mod tests {
 
     /// One host's chat, the user's facts and a clock to move.
     struct World {
-        chat: HostChat,
+        chat: HostMail,
         seq: u64,
         made: u64,
         /// The one agent each thread was started with.
@@ -249,7 +249,7 @@ mod tests {
 
     fn world() -> World {
         World {
-            chat: HostChat::default(),
+            chat: HostMail::default(),
             seq: 0,
             made: 0,
             agents: HashMap::new(),

@@ -5,7 +5,7 @@
 //! that the message is logged. Until then it is posted again whenever the
 //! host comes back: a host logs a `client_id` once, so posting twice is
 //! harmless, and words written while the network was down are not lost.
-//! A host's messages go one at a time, oldest first, so its chat log holds
+//! A host's messages go one at a time, oldest first, so its mail log holds
 //! them in the order they were written.
 
 use std::collections::HashMap;

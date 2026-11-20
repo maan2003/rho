@@ -90,14 +90,14 @@ impl Start {
     }
 }
 
-/// Where the next agent of a channel works, when the channel has said:
+/// Where the next agent of a project works, when the project has said:
 /// beside the newest agent started from one of its messages, in its
-/// workset and directory. A channel is a project, so its agents share a
-/// workset; the first one's start, asked once, is what the channel
+/// workset and directory. A project is a project, so its agents share a
+/// workset; the first one's start, asked once, is what the project
 /// remembers, and a later start elsewhere moves it. `in_channel` says
-/// whether a message is under the channel. `None` for a channel no agent
+/// whether a message is under the project. `None` for a project no agent
 /// has started from yet.
-pub fn channel_start<'a>(
+pub fn project_start<'a>(
     agents: impl IntoIterator<Item = &'a AgentIdentity>,
     in_channel: impl Fn(MessageId) -> bool,
 ) -> Option<Start> {
@@ -553,12 +553,12 @@ mod tests {
         identity
     }
 
-    /// A channel's next agent goes beside the one started from it last,
+    /// A project's next agent goes beside the one started from it last,
     /// whatever order the map lists them in; agents of other channels and
     /// agents started from no message do not count.
     #[test]
     fn a_channel_works_where_its_newest_agent_does() {
-        // Messages 10..20 are under the channel.
+        // Messages 10..20 are under the project.
         let in_channel = |message: MessageId| (10..20).contains(&message.0.0);
         let agents = [
             started_from(1, "aaaaaaaaaaaa", "/src/old", Some(11), 100),
@@ -568,7 +568,7 @@ mod tests {
             started_from(5, "eeeeeeeeeeee", "/src/mid", Some(13), 200),
         ];
         assert_eq!(
-            channel_start(&agents, in_channel),
+            project_start(&agents, in_channel),
             Some(Start::Join {
                 workset: "bbbbbbbbbbbb".parse().unwrap(),
                 cwd: "/src/rho".into(),
@@ -576,13 +576,13 @@ mod tests {
         );
     }
 
-    /// A channel no agent started from has not said where: the start asks.
+    /// A project no agent started from has not said where: the start asks.
     #[test]
     fn a_channel_without_agents_has_not_said() {
         let agents = [
             started_from(1, "aaaaaaaaaaaa", "/src/rho", Some(30), 100),
             started_from(2, "bbbbbbbbbbbb", "/src/rho", None, 200),
         ];
-        assert_eq!(channel_start(&agents, |message| message.0.0 < 20), None);
+        assert_eq!(project_start(&agents, |message| message.0.0 < 20), None);
     }
 }

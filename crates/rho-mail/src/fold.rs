@@ -46,7 +46,7 @@ pub struct Thread {
 
 /// One host's forest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HostChat {
+pub struct HostMail {
     /// The newest record told.
     pub head: ChatSeq,
     messages: BTreeMap<MessageId, Message>,
@@ -61,7 +61,7 @@ pub struct HostChat {
     first_joined: BTreeMap<AgentId, MessageId>,
 }
 
-impl HostChat {
+impl HostMail {
     pub fn tell(&mut self, record: &ChatRecord) -> Told {
         if record.seq <= self.head {
             return Told::Nothing;
@@ -146,13 +146,13 @@ impl HostChat {
     }
 
     /// One root channel by id, with the name used in a project address.
-    pub fn project(&self, channel: MessageId) -> Option<crate::protocol::Project> {
-        if !self.is_project(channel) {
+    pub fn project(&self, root: MessageId) -> Option<crate::protocol::Project> {
+        if !self.is_project(root) {
             return None;
         }
         Some(crate::protocol::Project {
-            channel,
-            name: self.name(channel)?,
+            root,
+            name: self.name(root)?,
         })
     }
 
@@ -400,23 +400,23 @@ mod tests {
     #[test]
     fn the_fold_keeps_the_forest() {
         let (a, b) = (agent(1), agent(2));
-        let mut chat = HostChat::default();
+        let mut mail = HostMail::default();
         assert_eq!(
-            chat.tell(&posted(1, None, Address::User, "rho")),
+            mail.tell(&posted(1, None, Address::User, "rho")),
             Told::Posted {
                 message: id(1),
                 thread: id(1)
             }
         );
         assert_eq!(
-            chat.tell(&posted(2, Some(1), Address::User, "Fix it\nmore")),
+            mail.tell(&posted(2, Some(1), Address::User, "Fix it\nmore")),
             Told::Posted {
                 message: id(2),
                 thread: id(2)
             }
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 3,
                 ChatEvent::Joined {
                     thread: id(2),
@@ -426,21 +426,21 @@ mod tests {
             Told::Thread(id(2))
         );
         assert_eq!(
-            chat.tell(&posted(4, Some(2), Address::Agent(a), "on it")),
+            mail.tell(&posted(4, Some(2), Address::Agent(a), "on it")),
             Told::Posted {
                 message: id(4),
                 thread: id(2)
             }
         );
         assert_eq!(
-            chat.tell(&posted(5, Some(4), Address::User, "deeper")),
+            mail.tell(&posted(5, Some(4), Address::User, "deeper")),
             Told::Posted {
                 message: id(5),
                 thread: id(2)
             }
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 6,
                 ChatEvent::Joined {
                     thread: id(1),
@@ -450,7 +450,7 @@ mod tests {
             Told::Thread(id(1))
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 7,
                 ChatEvent::Left {
                     thread: id(4),
@@ -460,7 +460,7 @@ mod tests {
             Told::Thread(id(4))
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 8,
                 ChatEvent::Named {
                     thread: id(2),
@@ -470,7 +470,7 @@ mod tests {
             Told::Thread(id(2))
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 8,
                 ChatEvent::Named {
                     thread: id(2),
@@ -480,20 +480,20 @@ mod tests {
             Told::Nothing,
             "told once"
         );
-        assert_eq!(chat.head, ChatSeq(8));
+        assert_eq!(mail.head, ChatSeq(8));
 
-        assert_eq!(chat.roots(), [id(1)]);
-        assert_eq!(chat.children(Some(id(2))), [id(4)]);
-        assert_eq!(chat.thread_of(id(1)), id(1));
-        assert_eq!(chat.thread_of(id(2)), id(2));
-        assert_eq!(chat.thread_of(id(4)), id(2));
-        assert_eq!(chat.thread_of(id(5)), id(2));
-        assert_eq!(chat.subthread_of(id(4)), id(2));
-        assert_eq!(chat.subthread_of(id(5)), id(4));
-        assert_eq!(chat.root_of(id(5)), id(1));
-        assert_eq!(chat.name(id(2)).as_deref(), Some("Fixed it"));
-        assert_eq!(chat.name(id(4)).as_deref(), Some("on it"));
-        let thread = chat.thread(id(4)).unwrap();
+        assert_eq!(mail.roots(), [id(1)]);
+        assert_eq!(mail.children(Some(id(2))), [id(4)]);
+        assert_eq!(mail.thread_of(id(1)), id(1));
+        assert_eq!(mail.thread_of(id(2)), id(2));
+        assert_eq!(mail.thread_of(id(4)), id(2));
+        assert_eq!(mail.thread_of(id(5)), id(2));
+        assert_eq!(mail.subthread_of(id(4)), id(2));
+        assert_eq!(mail.subthread_of(id(5)), id(4));
+        assert_eq!(mail.root_of(id(5)), id(1));
+        assert_eq!(mail.name(id(2)).as_deref(), Some("Fixed it"));
+        assert_eq!(mail.name(id(4)).as_deref(), Some("on it"));
+        let thread = mail.thread(id(4)).unwrap();
         assert_eq!(
             thread.path,
             vec![
@@ -503,16 +503,16 @@ mod tests {
             ]
         );
         assert_eq!(thread.members, [a], "b left this branch");
-        assert_eq!(chat.members_under(Some(id(2))), [a, b]);
-        assert_eq!(chat.members_under(Some(id(1))), [b]);
-        assert_eq!(chat.newest_in(id(2)), Some((id(5), UnixMs(5))));
-        assert_eq!(chat.others_in(id(2)), [id(4)]);
-        assert_eq!(chat.root_named(" rho "), Some(id(1)));
-        assert_eq!(chat.root_named("ops"), None);
+        assert_eq!(mail.members_under(Some(id(2))), [a, b]);
+        assert_eq!(mail.members_under(Some(id(1))), [b]);
+        assert_eq!(mail.newest_in(id(2)), Some((id(5), UnixMs(5))));
+        assert_eq!(mail.others_in(id(2)), [id(4)]);
+        assert_eq!(mail.root_named(" rho "), Some(id(1)));
+        assert_eq!(mail.root_named("ops"), None);
 
         // Under itself or its own child: nothing. Elsewhere: the subtree goes.
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 9,
                 ChatEvent::Reparented {
                     message: id(2),
@@ -521,9 +521,9 @@ mod tests {
             )),
             Told::Nothing
         );
-        chat.tell(&posted(10, None, Address::User, "ops"));
+        mail.tell(&posted(10, None, Address::User, "ops"));
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 11,
                 ChatEvent::Reparented {
                     message: id(4),
@@ -536,13 +536,13 @@ mod tests {
                 to: Some(id(10))
             }
         );
-        assert_eq!(chat.children(Some(id(2))), Vec::<MessageId>::new());
-        assert_eq!(chat.children(Some(id(10))), [id(4)]);
-        assert_eq!(chat.root_of(id(5)), id(10));
-        assert_eq!(chat.thread(id(5)).unwrap().path[0], (id(10), "ops".into()));
-        assert_eq!(chat.newest_in(id(2)), Some((id(2), UnixMs(2))));
+        assert_eq!(mail.children(Some(id(2))), Vec::<MessageId>::new());
+        assert_eq!(mail.children(Some(id(10))), [id(4)]);
+        assert_eq!(mail.root_of(id(5)), id(10));
+        assert_eq!(mail.thread(id(5)).unwrap().path[0], (id(10), "ops".into()));
+        assert_eq!(mail.newest_in(id(2)), Some((id(2), UnixMs(2))));
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 12,
                 ChatEvent::Reparented {
                     message: id(4),
@@ -553,7 +553,7 @@ mod tests {
             "where it is"
         );
         assert_eq!(
-            chat.tell(&record(
+            mail.tell(&record(
                 13,
                 ChatEvent::Reparented {
                     message: id(10),

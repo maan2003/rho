@@ -52,7 +52,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 
 | Render | Capture |
 | --- | --- |
-| [Project with wrapped unread row](phone-channel.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone channel`. The first result is the project. This is the existing project list, not the agreed Desk narrowed to a project. |
+| [Project with wrapped unread row](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. This is the existing project list, not the agreed Desk narrowed to a project. |
 | [Verdict sheet over the card](phone-menu.png) | From the project, `form_way phone input 'key:tab' 'wait:550'`; tap Desk's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 545 1640; sleep .55; form_shot phone menu`. |
 | [Blank palette over the card](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:550' 'text::' 'wait:600'; form_shot phone prompt`. |
 

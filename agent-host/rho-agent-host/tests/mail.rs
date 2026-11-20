@@ -12,8 +12,8 @@ use rho_agent_types::{
 use rho_agents_client::protocol::worksets::{
     AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset,
 };
-use rho_chat::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
-use rho_chat::{HostChat, cards};
+use rho_mail::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
+use rho_mail::{HostMail, cards};
 use rho_rpc::protocol::client::{call, connect};
 use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
 
@@ -145,7 +145,7 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         address,
         Some(Project {
             name: "tide".to_owned(),
-            channel: project
+            root: project
         })
     );
 
@@ -229,7 +229,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                     .iter()
                     .any(|s| s.thread == thread && s.text == "Waiting for the capacity report")
             }
-            ServerFrame::Chat { records } => {
+            ServerFrame::Mail { records } => {
                 for row in records {
                     match row.event {
                         ChatEvent::Edited { message, .. } if message == note => edited = true,
@@ -247,7 +247,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     let mut status_cleared = false;
     let stopped = loop {
         match read_frame(&mut stream).await? {
-            ServerFrame::Chat { records } => {
+            ServerFrame::Mail { records } => {
                 stop_mail = stop_mail.or_else(|| {
                     records.into_iter().find(|row| {
                         matches!(
@@ -502,11 +502,11 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
     .agent
     .context("no parent agent")?;
 
-    let mut history = HostChat::default();
+    let mut history = HostMail::default();
     let mut brief = None;
     let mut peer = None;
     let ask = loop {
-        if let ServerFrame::Chat { records } = read_frame(&mut stream).await? {
+        if let ServerFrame::Mail { records } = read_frame(&mut stream).await? {
             let mut ask = None;
             for record in records {
                 history.tell(&record);
@@ -681,7 +681,7 @@ async fn wait_for_mail(
     predicate: impl Fn(&ChatRecord) -> bool,
 ) -> anyhow::Result<ChatRecord> {
     loop {
-        if let ServerFrame::Chat { records } = read_frame(stream).await?
+        if let ServerFrame::Mail { records } = read_frame(stream).await?
             && let Some(found) = records.into_iter().find(&predicate)
         {
             return Ok(found);

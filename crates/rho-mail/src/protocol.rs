@@ -1,4 +1,4 @@
-//! The chat protocol ([`rho_rpc::protocol::Protocol::Chat`]): a host's log
+//! The mail protocol ([`rho_rpc::protocol::Protocol::Mail`]): a host's log
 //! as it grows, and what the user says in it.
 //!
 //! The session ([`Open::Session`]) carries the log from where the client
@@ -19,7 +19,7 @@ pub enum Open {
 }
 
 impl rho_rpc::protocol::ProtocolOpen for Open {
-    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Chat;
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Mail;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -83,11 +83,12 @@ pub struct ResolveProject {
     pub name: String,
 }
 
-/// A project is a channel. An address combines its name with the client's
-/// alias for the host, not the host's machine or endpoint name.
+/// A project's root anchors its threads. Its address combines its name with the
+/// client's alias for the host, not the host's machine or endpoint name.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Project {
-    pub channel: MessageId,
+    #[senax(rename = "channel")]
+    pub root: MessageId,
     pub name: String,
 }
 
@@ -117,9 +118,9 @@ pub enum ServerFrame {
     Hello { head: ChatSeq, host: EndpointId },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
-    Chat { records: Vec<ChatRecord> },
+    Mail { records: Vec<ChatRecord> },
     /// Full replacement snapshot; an omitted thread has no status. This is
-    /// not part of the chat log and carries no cursor.
+    /// not part of the mail log and carries no cursor.
     Statuses { statuses: Vec<ThreadStatus> },
 }
 
@@ -164,14 +165,14 @@ mod tests {
             .into(),
         ));
         round_trips(rho_rpc::protocol::Answer::Done(Some(Project {
-            channel: MessageId(ChatSeq(2)),
+            root: MessageId(ChatSeq(2)),
             name: "tide".into(),
         })));
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
         });
-        round_trips(ServerFrame::Chat {
+        round_trips(ServerFrame::Mail {
             records: vec![
                 ChatRecord {
                     seq: ChatSeq(4),
@@ -197,7 +198,7 @@ mod tests {
                 },
             ],
         });
-        round_trips(ServerFrame::Chat {
+        round_trips(ServerFrame::Mail {
             records: vec![
                 ChatRecord {
                     seq: ChatSeq(8),
