@@ -12298,8 +12298,23 @@ impl Editor {
         if !position_map.text_hitbox.bounds.contains(&position) {
             return None;
         }
-        let display_point = position_map.point_for_position(position).nearest_valid;
+        let point = position_map.point_for_position(position);
         let snapshot = &position_map.snapshot;
+        if point.exact_unclipped.row() > snapshot.max_point().row() {
+            return None;
+        }
+        // Hit testing for pen/touch editing needs the insertion boundary,
+        // not the Normal-mode block cursor's last-character position.
+        let display_point = snapshot.clip_ignoring_line_ends(
+            DisplayPoint::new(
+                point.exact_unclipped.row(),
+                point
+                    .exact_unclipped
+                    .column()
+                    .min(snapshot.line_len(point.exact_unclipped.row())),
+            ),
+            bias,
+        );
         let anchor = snapshot.display_point_to_anchor(display_point, bias);
         let point = display_point.to_point(snapshot);
         let (buffer, offset) = snapshot.buffer_snapshot().point_to_buffer_offset(point)?;

@@ -38,7 +38,7 @@ states:
 - error: not agreed
 - full: waiting rows, moving rows, and the addressed idea tail
 keys:
-- `space`: deal the first card, `Desk.deal`
+- `space`: deal the first card, `Desk.deal`; with no card waiting and a verdict to take back, open `deal.Verdict`
 - `enter`: open the selected row, `Desk.open a row`
 - `j` and `k`: move between waiting, overflow, moving, and draft rows, skipping labels and blank lines; `gg`: first row, or the draft when empty; `G`: draft
 - `i` on any row, `A`, `o`, or tap in the draft: write in place; `esc`: Normal in the same draft; `ctrl-enter` or `send`: send the idea

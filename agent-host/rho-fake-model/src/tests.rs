@@ -25,6 +25,11 @@ async fn openai_websocket_is_deterministic_and_continues_after_tool_result() {
         .unwrap();
     let first = read_turn(&mut socket).await;
     assert!(
+        !first
+            .iter()
+            .any(|event| event["type"] == "codex.rate_limits")
+    );
+    assert!(
         first
             .iter()
             .any(|event| event["type"] == "response.custom_tool_call_input.delta")
@@ -40,6 +45,39 @@ async fn openai_websocket_is_deterministic_and_continues_after_tool_result() {
         Some("response.output_text.delta" | "response.custom_tool_call_input.delta")
     )));
     assert_eq!(server.metrics().completed_turns, 2);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn responses_websocket_can_report_distinct_session_and_weekly_allowances() {
+    let mut config = FakeModelConfig::seeded(7);
+    config.report_allowance = true;
+    let server = FakeModel::start(config).await.unwrap();
+    let url = server.openai_base_url().replace("http://", "ws://") + "/codex/responses";
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"response.create","model":"gpt-test","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let turn = read_turn(&mut socket).await;
+    let event = turn
+        .iter()
+        .find(|event| event["type"] == "codex.rate_limits")
+        .unwrap();
+    let limits = &event["rate_limits"];
+    assert_eq!(limits["primary"]["window_minutes"], 300);
+    assert_eq!(limits["primary"]["used_percent"], 61);
+    assert_eq!(limits["secondary"]["window_minutes"], 10_080);
+    assert_eq!(limits["secondary"]["used_percent"], 34);
+    assert!(
+        limits["secondary"]["reset_at"].as_i64().unwrap()
+            > limits["primary"]["reset_at"].as_i64().unwrap()
+    );
+    assert_eq!(turn.last().unwrap()["type"], "response.completed");
     server.shutdown().await.unwrap();
 }
 

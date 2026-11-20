@@ -128,6 +128,17 @@ enum DebugCommand {
         runtime_dir: Option<PathBuf>,
         text: String,
     },
+    /// Restart the workset process of an agent on a running agent host: the
+    /// process ends and starts again with the host's current policy; the
+    /// workset's agents and their Claude sessions stay.
+    RestartWorkset {
+        /// Full agent id, as in `$RHO_AGENT_ID`.
+        agent: String,
+        /// The agent host's runtime directory; defaults to `$RHO_RUNTIME_DIR`,
+        /// then the user's agent host.
+        #[arg(long = "runtime-dir")]
+        runtime_dir: Option<PathBuf>,
+    },
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
@@ -225,6 +236,18 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("agent id {agent}"))?;
             let thread = start_debug_thread(&host_paths(runtime_dir)?, agent, text).await?;
             println!("thread {}", thread.0.0);
+            Ok(())
+        }
+        DebugCommand::RestartWorkset { agent, runtime_dir } => {
+            let agent = rho_agent_types::parse_full_handle(&agent)
+                .with_context(|| format!("agent id {agent}"))?;
+            rho_rpc::protocol::client::call(
+                &host_paths(runtime_dir)?,
+                rho_agents_client::protocol::worksets::RestartWorkset { agent },
+            )
+            .await
+            .context("ask the running host to restart the workset")?;
+            println!("restarted the workset of {}", agent.encoded());
             Ok(())
         }
     }

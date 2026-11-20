@@ -223,8 +223,22 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let mail =
-                    cx.new(|cx| rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), cx));
+                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
+                let mail = cx.new(|cx| {
+                    rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), notes.clone(), cx)
+                });
+                // The mail owns its words; Notes holds only a weak reader of
+                // it.
+                let mail_for_notes = mail.downgrade();
+                notes.update(cx, |notes, _| {
+                    notes.set_mail_excerpt(Rc::new(move |address, cx| {
+                        let mail = mail_for_notes.upgrade()?;
+                        let mail = mail.read(cx);
+                        let id = mail.thread_of(address)?;
+                        let text = mail.host_mail(id.host)?.message(id.message)?.headline();
+                        (!text.is_empty()).then_some(text)
+                    }));
+                });
                 let agents = cx.new(|cx| {
                     rho_agents_view::AgentsSystem::new(db.clone(), mail.clone(), frame.clone(), cx)
                 });
@@ -253,7 +267,6 @@ fn run() -> Result<()> {
                 let browser = cx.new(|_| {
                     rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
                 });
-                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(mail),

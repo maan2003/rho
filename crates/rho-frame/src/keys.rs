@@ -31,7 +31,7 @@ actions!(
         DeskFirst,
         DeskDraft,
         PromptIdea,
-        RedoIdeaOrUndoVerdict,
+        RedoEdit,
         SendIdea,
         CancelIdea,
         /// `/`: search forward in what is in view.
@@ -42,7 +42,6 @@ actions!(
         SearchNext,
         /// `N`: the last search again, the other way.
         SearchPrevious,
-        UndoVerdict,
         MinibufferConfirm,
         MinibufferCancel,
         MinibufferNext,
@@ -96,13 +95,17 @@ fn end_of_document(cx: &App) -> KeyBinding {
 fn bindings() -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for context in ["RhoFrame", "RhoFrame > Editor"] {
+        // Ordinary navigation chords belong to the site while a page has
+        // focus. The negation checks the whole focus stack, not just the
+        // context at which the binding would otherwise match.
+        let outside_page = format!("({context}) && !RhoBrowser");
         bindings.extend([
-            KeyBinding::new("ctrl-k", Back, Some(context)),
+            KeyBinding::new("ctrl-k", Back, Some(&outside_page)),
+            KeyBinding::new("ctrl-j", Forward, Some(&outside_page)),
+            KeyBinding::new("ctrl-shift-backspace", Close, Some(&outside_page)),
+            KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(&outside_page)),
             KeyBinding::new("f21", Back, Some(context)),
-            KeyBinding::new("ctrl-j", Forward, Some(context)),
             KeyBinding::new("f20", Forward, Some(context)),
-            KeyBinding::new("ctrl-shift-backspace", Close, Some(context)),
-            KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
             KeyBinding::new("ctrl-alt-m", PromptIdea, Some(context)),
             // `ctrl-shift-;`, the palette where `:` would be typed: in a
@@ -112,6 +115,12 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-:", Palette, Some(context)),
         ]);
     }
+    let page = Some("RhoFrame > RhoBrowser");
+    bindings.extend([
+        KeyBinding::new("ctrl-shift-f9", Back, page),
+        KeyBinding::new("ctrl-shift-f10", Forward, page),
+        KeyBinding::new("ctrl-shift-f11", Close, page),
+    ]);
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
         bindings.extend([
             KeyBinding::new(":", Palette, Some(&context)),
@@ -122,7 +131,7 @@ fn bindings() -> Vec<KeyBinding> {
     }
     for context in normal_contexts("RhoFrame", " && vim_operator == none") {
         bindings.extend([
-            KeyBinding::new("shift-u", UndoVerdict, Some(&context)),
+            KeyBinding::new("shift-u", RedoEdit, Some(&context)),
             // vim's search keys reach for a Zed pane's search bar, which no
             // surface has; the frame searches the surface's editor instead.
             KeyBinding::new("/", SearchForward, Some(&context)),
@@ -142,7 +151,6 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("g g", DeskFirst, Some(&context)),
             KeyBinding::new("shift-g", DeskDraft, Some(&context)),
             KeyBinding::new("enter", OpenRow, Some(&context)),
-            KeyBinding::new("shift-u", RedoIdeaOrUndoVerdict, Some(&context)),
         ]);
     }
     for context in normal_contexts("RhoIdeaUnaddressed", " && vim_operator == none") {
@@ -188,7 +196,7 @@ fn bindings() -> Vec<KeyBinding> {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+    use gpui::{Action as _, KeyContext, Keymap, Keystroke, Modifiers};
 
     use super::*;
 
@@ -234,6 +242,30 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
         }
+    }
+
+    #[test]
+    fn a_page_reserves_its_window_chords_and_leaves_site_chords_unbound() {
+        let action_at = |surface, key| {
+            bindings_for(surface, Keystroke::parse(key).unwrap())
+                .first()
+                .map(|binding| binding.action().name())
+        };
+        let page = "RhoBrowser";
+        let editor = "Editor vim_mode=helix_normal";
+        for (legacy, reserved, action) in [
+            ("ctrl-k", "ctrl-shift-f9", Back.name()),
+            ("ctrl-j", "ctrl-shift-f10", Forward.name()),
+            ("ctrl-shift-backspace", "ctrl-shift-f11", Close.name()),
+        ] {
+            assert_eq!(action_at(page, reserved), Some(action));
+            assert_eq!(action_at(page, legacy), None);
+            assert_eq!(action_at(editor, legacy), Some(action));
+            assert_eq!(action_at(editor, reserved), None);
+            assert_eq!(action_at("RhoDesktop", legacy), Some(action));
+        }
+        assert_eq!(action_at(page, "ctrl-shift-j"), None);
+        assert_eq!(action_at(editor, "ctrl-shift-j"), Some(CloseAndDeal.name()));
     }
 
     #[test]

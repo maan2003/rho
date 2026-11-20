@@ -8,7 +8,7 @@ pub const REAL_TOOL_ROUNDS: usize = 100;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use axum::Router;
@@ -150,6 +150,7 @@ pub struct FakeModelConfig {
     pub bind: SocketAddr,
     pub scenario: Scenario,
     pub real_tool_rounds: usize,
+    pub report_allowance: bool,
     pub timing: StreamTiming,
     pub distribution: PersonaDistribution,
 }
@@ -161,6 +162,7 @@ impl FakeModelConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             scenario: Scenario::Baseline,
             real_tool_rounds: REAL_TOOL_ROUNDS,
+            report_allowance: false,
             timing: StreamTiming::default(),
             distribution: PersonaDistribution::default(),
         }
@@ -445,7 +447,22 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
         } else {
             TerminalOutcome::Complete
         };
-        let events = openai_turn(&state, request_number, &envelope.request, terminal);
+        let mut events = openai_turn(&state, request_number, &envelope.request, terminal);
+        if state.config.report_allowance && terminal == TerminalOutcome::Complete {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("wall clock")
+                .as_secs();
+            // Different percentages in the session and week exercise the
+            // distinction between routing headroom and the weekly chart.
+            events.insert(1, json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"window_minutes": 300, "used_percent": 61, "reset_at": now + 3 * 3600},
+                    "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": now + 5 * 86400},
+                },
+            }));
+        }
         for (index, event) in events.into_iter().enumerate() {
             delay(&state.config, index, &event).await;
             let bytes = event.to_string();

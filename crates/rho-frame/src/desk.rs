@@ -713,9 +713,8 @@ impl Surface for DeskView {
         Some(self.editor.clone())
     }
 
-    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn gpui::Action>> {
-        (!self.on_draft(cx))
-            .then(|| Box::new(crate::keys::RedoIdeaOrUndoVerdict) as Box<dyn gpui::Action>)
+    fn edits_at_point(&self, cx: &App) -> bool {
+        self.on_draft(cx)
     }
 
     fn subject(&self, cx: &App) -> Subject {

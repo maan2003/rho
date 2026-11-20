@@ -597,6 +597,14 @@ impl std::fmt::Display for Phases {
 pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let mut phases = Phases::new();
     let handoff = args.handoff.as_deref().map(Handoff::decode).transpose()?;
+    if let Some(handoff) = &handoff {
+        // Startup launches subprocesses before the pool can take over.
+        for worker in &handoff.workers {
+            worker
+                .protect_channels()
+                .context("protect inherited workset channels")?;
+        }
+    }
     let platform_secrets = match handoff.as_ref().and_then(|handoff| handoff.secrets) {
         Some(fd) => PlatformSecrets::handed(fd)?,
         None => PlatformSecrets::from_fd_store(),

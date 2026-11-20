@@ -59,18 +59,23 @@ pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<(
         .map_err(|_| anyhow::anyhow!("workset TLS provider already initialized"))?;
     socket.set_nonblocking(true)?;
     requests.set_nonblocking(true)?;
-    tokio::runtime::Builder::new_multi_thread()
+    let executor = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
-        .build()?
-        .block_on(async {
-            tokio::spawn(crate::heap::dump_on_sigusr1());
-            runtime::run(
-                tokio::net::UnixStream::from_std(socket)?,
-                tokio::net::UnixStream::from_std(requests)?,
-                startup,
-                factory,
-            )
-            .await
-        })
+        .build()?;
+    let result = executor.block_on(async {
+        tokio::spawn(crate::heap::dump_on_sigusr1());
+        runtime::run(
+            tokio::net::UnixStream::from_std(socket)?,
+            tokio::net::UnixStream::from_std(requests)?,
+            startup,
+            factory,
+        )
+        .await
+    });
+    // An abandoned worker must not wait for a blocking executor task. No
+    // one can use it now, and this standalone process exits after cleanup.
+    executor.shutdown_timeout(std::time::Duration::from_millis(100));
+    crate::process_tree::terminate_children();
+    result
 }

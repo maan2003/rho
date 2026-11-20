@@ -162,6 +162,21 @@ states:
 used on: `desk.Desk` and `mail.Thread` when open as a card.
 form: [ask on the phone's top line](design/phone-card.png) and [grouped results on Desk](design/laptop-desk.png).
 
+## part Allowance row
+purpose: say how much an account has left and when it resets without making the user read the picture.
+looks: one line of `editor text` per account above the picture, with `row air` before the share left and a centered dot before the reset time. The row uses its line's color, and `★` marks the GPT account the host is using.
+states:
+- reported: `★ gpt/work  66% left · resets in 5.0d`.
+- no reset time: `gpt/home  18% left · reset time not reported`.
+- reset time passed: `gpt/home  18% left · last report before reset`.
+- no allowance from this account yet: `gpt/home  allowance not reported`.
+used on: `usage.Chart`.
+form:
+```text
+★ gpt/work  66% left · resets in 5.0d
+gpt/home  18% left · resets in 2.1d
+```
+
 ## motion An answer replaces the heading
 means: the last action has an answer; the ordinary name and card words return without the user doing anything.
 lasts: `echo life`; a new answer replaces the old one and a prompt takes it away.

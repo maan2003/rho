@@ -7,9 +7,9 @@
 //! closing it, and closes its tab. The browser stays in this process: no
 //! host knows a page.
 //!
-//! A page takes every key, as a desktop does, so the frame's normal-mode
-//! keys cannot reach the frame from one. Its chords can (`ctrl-k`,
-//! `ctrl-j`, `ctrl-shift-backspace`, and the palette's `ctrl-shift-;`).
+//! The site takes the keys, except for the window's reserved chords.
+//! `Surface::rows` makes the window's navigation discoverable from the
+//! palette, with shortcuts resolved in the page's actual key context.
 
 mod pages;
 
@@ -20,12 +20,13 @@ use std::rc::Rc;
 use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
 use rho_dealer::{Address, Addressed};
 use rho_frame::{
-    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Subject, Surface,
+    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Subject, Surface, keys,
 };
 use rho_window::style::StyleClass;
 use url::Url;
 
 use self::pages::{GRACE, Pages};
+use crate::runtime::{CannotDraw, NoBrowser};
 use crate::{
     Browser, PageId, PageMetadata, PageMetadataChanged, PageModel, PageView, live_page_name,
     live_pages,
@@ -145,12 +146,14 @@ impl PageSystem {
         .detach();
     }
 
-    /// Says why a page does not open, on the echo line: the browser is
-    /// the user's to fix, so the log alone would hide it.
+    /// The echo answers in the user's words; diagnostics go to the log.
     fn cannot_open(&self, error: anyhow::Error, cx: &mut Context<Self>) {
         tracing::error!(error = format!("{error:#}"), "a page does not open");
-        self.frame
-            .echo(format!("page: {error:#}"), StyleClass::SystemImportant, cx);
+        self.frame.echo(
+            page_open_echo(&error).to_owned(),
+            StyleClass::SystemImportant,
+            cx,
+        );
     }
 
     /// `page:` asks for a page: one the browser has open, by its title,
@@ -189,17 +192,23 @@ impl PageSystem {
                     return frame.open(page.address(), window, cx);
                 }
                 match typed_url(input) {
-                    Ok(url) => this.update(cx, |system, cx| system.open_url(&url, cx)),
-                    Err(error) => frame.echo(
-                        &format!("page: {input} is no web address: {error}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
+                    Some(url) => this.update(cx, |system, cx| system.open_url(&url, cx)),
+                    None => frame.echo("not a web address", StyleClass::SystemInfo, cx),
                 }
             }),
             window,
             cx,
         );
+    }
+}
+
+fn page_open_echo(error: &anyhow::Error) -> &'static str {
+    if error.is::<CannotDraw>() {
+        "this display cannot draw a page"
+    } else if error.is::<NoBrowser>() {
+        "page: no browser found"
+    } else {
+        "page did not open"
     }
 }
 
@@ -221,15 +230,12 @@ fn recent_pages() -> Vec<(PageId, PageMetadata)> {
 /// name (`127.0.0.1:8080`, `localhost:3000`, `intranet/wiki`): those are
 /// local servers, which rarely speak TLS, so `http://`. Only the web's own
 /// schemes open.
-fn typed_url(input: &str) -> Result<Url, String> {
+fn typed_url(input: &str) -> Option<Url> {
     if input.contains("://") {
-        let url = Url::parse(input).map_err(|error| error.to_string())?;
-        return match url.scheme() {
-            "http" | "https" => Ok(url),
-            scheme => Err(format!("{scheme} is not http or https")),
-        };
+        let url = Url::parse(input).ok()?;
+        return matches!(url.scheme(), "http" | "https").then_some(url);
     }
-    let mut url = Url::parse(&format!("https://{input}")).map_err(|error| error.to_string())?;
+    let mut url = Url::parse(&format!("https://{input}")).ok()?;
     let local = match url.host() {
         Some(url::Host::Domain(name)) => !name.contains('.'),
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
@@ -239,7 +245,7 @@ fn typed_url(input: &str) -> Result<Url, String> {
     if local {
         url.set_scheme("http").expect("https becomes http");
     }
-    Ok(url)
+    Some(url)
 }
 
 impl rho_frame::System for PageSystem {
@@ -313,11 +319,36 @@ impl Surface for PageView {
     fn subject(&self, _cx: &App) -> Subject {
         Subject::Own
     }
+
+    fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
+        vec![
+            Row::run("", "go back", |frame, window, cx| frame.back(window, cx))
+                .bound_to(keys::Back),
+            Row::run("", "go forward", |frame, window, cx| {
+                frame.forward_or_deal(window, cx)
+            })
+            .bound_to(keys::Forward),
+            Row::run("", "close page", |frame, window, cx| {
+                frame.close_current(window, cx)
+            })
+            .bound_to(keys::Close),
+        ]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_open_echo_does_not_include_diagnostics() {
+        let display = anyhow::anyhow!("failed to bind /run/user/123/rho-chrome-1")
+            .context(CannotDraw)
+            .context("launch browser");
+        assert_eq!(page_open_echo(&display), "this display cannot draw a page");
+        let other = anyhow::anyhow!("extension replied with internal error");
+        assert_eq!(page_open_echo(&other), "page did not open");
+    }
 
     #[test]
     fn a_page_address_is_the_extensions_id_in_one_spelling() {
@@ -366,11 +397,11 @@ mod tests {
             "file:///etc/passwd",
             "chrome://settings",
         ] {
-            assert!(typed_url(other).is_err(), "{other}");
+            assert!(typed_url(other).is_none(), "{other}");
         }
         // No `://`, so it reads as a host with a port-like tail, which is
         // no web address rather than script.
-        assert!(typed_url("javascript:alert(1)").is_err());
+        assert!(typed_url("javascript:alert(1)").is_none());
     }
 
     #[test]
