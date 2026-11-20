@@ -916,7 +916,7 @@ impl System for AgentsSystem {
         }
         rows.push(Row::menu(
             "a",
-            "start agent…",
+            "start agent, choosing where and runtime…",
             start::rows(
                 self,
                 this.clone(),
@@ -935,7 +935,7 @@ impl System for AgentsSystem {
         if draft {
             rows.push(Row::menu(
                 "shift-s",
-                "send and start agent…",
+                "send and start agent, choosing where and runtime…",
                 start::rows(
                     self,
                     this,
