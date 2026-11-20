@@ -726,9 +726,12 @@ impl AgentsSystem {
             return Vec::new();
         }
         let this = cx.entity();
-        let mut rows = vec![Row::run("space", "verdicts", |_, window, cx| {
-            window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
-        })];
+        let mut rows = vec![
+            Row::run("space", "verdicts", |_, window, cx| {
+                window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
+            }),
+            Self::stop_row(this.clone(), agent),
+        ];
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
@@ -947,7 +950,7 @@ impl AgentsSystem {
         }
     }
 
-    pub(crate) fn stop_row(system: Entity<Self>, agent: AgentId) -> rho_frame::Row {
+    fn stop_row(system: Entity<Self>, agent: AgentId) -> rho_frame::Row {
         rho_frame::Row::run("shift-c", "stop agent", move |_, _, cx| {
             system.update(cx, |system, cx| {
                 let Some(agents) = system.agents_for(agent) else {

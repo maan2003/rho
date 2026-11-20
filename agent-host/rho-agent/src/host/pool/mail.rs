@@ -451,10 +451,15 @@ fn with_working(
             .and_modify(|at| *at = (*at).max(since))
             .or_insert(since);
     }
-    for status in &explicit {
-        fallback.remove(&status.thread);
-    }
     let mut statuses = explicit;
+    statuses.retain(|status| {
+        if status.state == StatusText::StoppedByYou {
+            // Another agent can still be working on the same thread.
+            return !fallback.contains_key(&status.thread);
+        }
+        fallback.remove(&status.thread);
+        true
+    });
     statuses.extend(fallback.into_iter().map(|(thread, at)| ThreadStatus {
         thread,
         at,
