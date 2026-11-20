@@ -514,36 +514,35 @@ impl Frame {
         surface: &AnySurface,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let desk_accepts_taps = self.desk_in_view()
-            && self.minibuffer.is_none()
-            && self.menu.is_none()
-            && !self.idea.active();
         let body = div()
             .id("rho-phone-surface")
             .relative()
             .size_full()
-            .child(surface.view())
-            .children(desk_accepts_taps.then(|| {
-                // Keep Desk as one editor for its keys and scroll. The
-                // phone translates a click back through its display map.
-                div()
-                    .id("rho-desk-tap")
-                    .absolute()
-                    .inset_0()
-                    .block_mouse_except_scroll()
-                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
-                        if this.phone.snap.is_none() {
-                            let open = this
-                                .desk
-                                .update(cx, |desk, cx| desk.tap(event.position(), window, cx));
-                            if open {
-                                this.open_row(window, cx);
-                            }
-                            cx.notify();
+            .capture_any_mouse_down(cx.listener(
+                |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if event.button != MouseButton::Left
+                        || event.modifiers.modified()
+                        || !this.desk_in_view()
+                        || this.phone.snap.is_some()
+                        || this.minibuffer.is_some()
+                        || this.menu.is_some()
+                    {
+                        return;
+                    }
+                    let hit = this
+                        .desk
+                        .update(cx, |desk, cx| desk.tap(event.position, window, cx));
+                    if let Some(open) = hit {
+                        if open {
+                            this.open_row(window, cx);
                         }
+                        window.prevent_default();
                         cx.stop_propagation();
-                    }))
-            }));
+                        cx.notify();
+                    }
+                },
+            ))
+            .child(surface.view());
         let body = match self.phone.snap {
             Some(snap) => body
                 .with_animation(
@@ -573,7 +572,7 @@ impl Frame {
         let desk = self.desk_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
-            composing_idea: self.idea.active(),
+            composing_idea: self.idea_here(cx),
             desk,
             row: desk && self.desk.read(cx).cursor_target(cx).is_some(),
             card: self.card_target(cx).is_some(),
@@ -651,13 +650,13 @@ impl Frame {
                 }
             }
             Button::Verdicts => self.verdict_menu(window, cx),
-            Button::Send if self.idea.active() => self.send_idea(window, cx),
+            Button::Send if self.idea_here(cx) => self.send_idea(window, cx),
             Button::Send => {
                 if let Some(send) = send {
                     send(window, cx);
                 }
             }
-            Button::Cancel if self.idea.active() && self.minibuffer.is_none() => {
+            Button::Cancel if self.idea_here(cx) && self.minibuffer.is_none() => {
                 self.cancel_idea(window, cx)
             }
             Button::Cancel => self.minibuffer_cancel(window, cx),

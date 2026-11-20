@@ -17,7 +17,7 @@ day: Know what wants them, and where they were.
 status: on the phone, a tap selects a waiting or moving row; a second tap on it or `open` opens it.
 purpose: show what wants the user, what has moved, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting and a test run under `moving`, and writes a new idea to `tide@lab`.
-sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status` that aren't waiting, newest status change first, then `and N more` for the rest; an idea box addressed to a `mail.Project`, with completion.
+sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status` that aren't waiting, newest status change first, then `and N more` for the rest; the `design.Draft tail`, with project completion.
 does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
@@ -32,16 +32,17 @@ shows:
 - `Desk`: the count of everything that waits
 - `deal.Card`: up to seven waiting rows, in deal order
 - `mail.Thread`: up to ten rows under `moving`, in order of their latest `mail.Status` change; threads with a waiting card are excluded, even when their card isn't shown
-- `mail.Project`: the address on the `Desk` idea box
+- `mail.Project`: the address on the `design.Draft tail`
 states:
-- empty: `0 wait`; no waiting or moving rows; the idea box remains
+- empty: `0 wait`; no waiting or moving rows; the idea tail remains
 - loading: not agreed
 - partial: not agreed
 - error: not agreed
-- full: waiting rows, moving rows, and the addressed idea box
+- full: waiting rows, moving rows, and the addressed idea tail
 keys:
 - `space`: deal the first card, `Desk.deal`
 - `enter`: open the selected row, `Desk.open a row`
+- `G`: go to the idea; `i`, `A`, `o`, or tap: write in place; `esc`: Normal in the same draft; `ctrl-enter` or `send`: send the idea
 - `tab`: `window.Screen`
 - `:`: `window.Palette`
 starts: `Glance at what moves`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
@@ -58,7 +59,8 @@ moving
 Cache eviction tests        running the tests · 3m            tide@lab
 Release notes               checking the links · 18m          shoal@lab
 
-idea to tide@lab · ctrl-enter sends
+── idea to tide@lab · ctrl-enter sends
+Keep the asymmetric clock test in the suite.
 ```
 
 ## flow Glance at what moves

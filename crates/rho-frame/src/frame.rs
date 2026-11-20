@@ -32,7 +32,7 @@ use crate::minibuffer::{
 };
 use crate::phone::{Layout, Phone};
 use crate::search::Search;
-use crate::surface::{AnySurface, Mode, Subject};
+use crate::surface::{AnySurface, Mode, Subject, Surface as _};
 use crate::system::AnySystem;
 use crate::when::SnoozeUnit;
 use crate::{keys, palette, place};
@@ -114,14 +114,22 @@ impl Frame {
         keys::bind(cx);
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
-        let desk = cx.new(|cx| DeskView::new(window, cx));
-        let idea = IdeaBox::new(window, cx, &db);
+        let idea = IdeaBox::new(cx, &db);
+        let desk = cx.new(|cx| DeskView::new(idea.text.clone(), window, cx));
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor
         });
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
+        let desk_editor = desk.read(cx).editor(cx).expect("Desk is an editor");
+        let desk_selection = cx.subscribe(&desk_editor, |frame, _, event, cx| {
+            if frame.desk_in_view()
+                && matches!(event, editor::EditorEvent::SelectionsChanged { .. })
+            {
+                cx.notify();
+            }
+        });
         let desk_address = Self::desk_address();
         let mut surfaces = HashMap::new();
         surfaces.insert(desk_address.clone(), AnySurface::new(desk.clone()));
@@ -174,7 +182,7 @@ impl Frame {
             phone: Phone::default(),
             place: place::Writer::spawn(db.clone()),
             last_input,
-            _subscriptions: vec![menu_keys, activation],
+            _subscriptions: vec![menu_keys, activation, desk_selection],
             _tasks: Vec::new(),
         };
         let ledger = cx.spawn_in(window, async move |this, cx| {
@@ -574,7 +582,7 @@ impl Frame {
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
-        self.cancel_idea(window, cx);
+        self.close_idea_overlay(window, cx);
         self.overlay_return = None;
     }
 
@@ -1229,9 +1237,8 @@ impl Frame {
             .into_any_element()
     }
 
-    /// The mode the keys are in, where they go now. A box to write in, a
-    /// thread's or a prompt's, has no vim of its own and always types; the
-    /// vim the mode indicator follows is the last one that had the keys.
+    /// The mode the keys are in. The minibuffer and global idea strip
+    /// always type; the mode indicator follows the active surface editor.
     fn mode(&self, window: &Window, cx: &App) -> String {
         let idea = self.idea_editor();
         if idea
@@ -1366,6 +1373,9 @@ impl Render for Frame {
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
         let layout = Layout::of(window.viewport_size().width);
+        if self.desk_in_view() {
+            self.sync_desk_idea(layout, cx);
+        }
         let frame = div()
             .id("rho-frame")
             .relative()
@@ -1403,7 +1413,21 @@ impl Render for Frame {
                 cx.listener(|this, _: &keys::PromptIdea, window, cx| this.prompt_idea(window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &keys::EditIdea, window, cx| this.edit_desk_idea(window, cx)),
+                cx.listener(|this, _: &keys::SendIdea, window, cx| this.send_idea(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &keys::CancelIdea, window, cx| this.cancel_idea(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &keys::RedoIdeaOrUndoVerdict, window, cx| {
+                    if this.desk.read(cx).on_draft(cx) {
+                        this.active_editor(cx).update(cx, |editor, cx| {
+                            editor.redo(&editor::actions::Redo, window, cx);
+                        });
+                    } else {
+                        this.undo_verdict(window, cx);
+                    }
+                }),
             )
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
             .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {

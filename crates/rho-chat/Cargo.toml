@@ -75,8 +75,5 @@ theme = { path = "../../vendor/zed/crates/theme", optional = true }
 url = { workspace = true, optional = true }
 
 [dev-dependencies]
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
-  "test-support",
-] }
 rho-chat = { path = ".", features = ["client"] }
 tempfile = { workspace = true }

@@ -152,13 +152,13 @@ when: the user has an idea, wherever they are in the window
 want: send it to the right project without leaving their place
 so that: work starts and the user can carry on where they were
 steps:
-1. the user opens the idea box with the idea key, or uses the box on `desk.Desk`
-2. the user writes the idea
+1. the user writes in the `design.Draft tail` on `desk.Desk`, or opens the idea strip elsewhere with the idea key
+2. on Desk, the user can return to Normal and edit the same text without hiding it
    - if it is for a different project, the user changes the address with project completion
 3. the user sends the mail and stays where they were
 system: picks the thread's project, or the last project the user wrote to; starts the work where that project's agents work.
 user: the words and, if different from the automatic choice, the project.
-cases: the idea comes while reading a page; the current thread belongs to a different project.
+cases: a multiline idea on Desk is edited before sending; an unsent idea is still present on this device after restart; the idea comes while reading a page; the current thread belongs to a different project.
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 The historical review above was of Start a thread. Start an agent from a message was walked separately:

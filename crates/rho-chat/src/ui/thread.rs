@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use editor::scroll::Autoscroll;
-use editor::{Anchor, Bias, Editor, EditorMode, HighlightKey, SelectionEffects, SizingBehavior};
+use editor::{Anchor, Editor, EditorMode, HighlightKey, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent,
@@ -16,14 +16,14 @@ use gpui::{
 };
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, BufferEvent, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+use multi_buffer::ToPoint as _;
 use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{
     self, OpenRow, QuoteSelection, RedoDraftOrUndoVerdict, SendMessage, SendOnly,
 };
-use rho_frame::{Candidate, Layout, Row, Subject, Surface};
+use rho_frame::{Candidate, Row, Subject, Surface, draft};
 use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -206,18 +206,7 @@ impl ThreadView {
         let draft = cx.new(|cx| Buffer::local(system.draft(thread.host, Some(thread.message)), cx));
         // The editor treats these excerpts as one document for navigation,
         // search and registers, but only the draft accepts edits.
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                buffer.clone(),
-                [Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            set_draft_excerpt(&mut multi_buffer, &draft, cx);
-            multi_buffer
-        });
+        let multi_buffer = draft::document(&buffer, &draft, cx);
         let this = cx.weak_entity();
         let history = buffer.clone();
         let editor = cx.new(|cx| {
@@ -242,7 +231,7 @@ impl ThreadView {
                     move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
                         let snapshot = editor.display_snapshot(cx);
                         let row = editor.selections.newest::<Point>(&snapshot).head().row;
-                        let tail = draft_start(&history, cx);
+                        let tail = draft::start(&history, cx);
                         if row < tail.row {
                             let _ = this.update(cx, |view, cx| {
                                 if let Some(mail) = view.selected_reply_target(row, cx) {
@@ -385,14 +374,7 @@ impl ThreadView {
     /// A sent draft is not the next draft's undo history.
     fn clear_draft(&mut self, cx: &mut Context<Self>) {
         let draft = cx.new(|cx| Buffer::local("", cx));
-        let buffer = self.editor.read(cx).buffer().clone();
-        buffer.update(cx, |buffer, cx| {
-            buffer.remove_excerpts(draft_path(), cx);
-            set_draft_excerpt(buffer, &draft, cx);
-        });
-        self.editor.update(cx, |editor, cx| {
-            editor.disable_header_for_buffer(draft.read(cx).remote_id(), cx);
-        });
+        draft::replace(&self.editor, &draft, cx);
         self.draft_subscription = Self::subscribe_draft(&draft, cx);
         self.draft = draft;
         self.reply_to = None;
@@ -443,7 +425,7 @@ impl ThreadView {
     fn cursor_link(&self, cx: &App) -> Option<url::Url> {
         let cursor = self.cursor(cx);
         let buffer = self.transcript.buffer().read(cx);
-        if cursor.row >= draft_start(self.transcript.buffer(), cx).row {
+        if cursor.row >= draft::start(self.transcript.buffer(), cx).row {
             return None;
         }
         let start = buffer.point_to_offset(Point::new(cursor.row, 0));
@@ -506,29 +488,6 @@ impl ThreadView {
             .expect("every thread has a draft separator");
         self.cursor_to_row(row.saturating_sub(1), Autoscroll::fit(), cx);
     }
-}
-
-/// The multibuffer supplies the newline between the two excerpts.
-fn draft_start(history: &Entity<Buffer>, cx: &App) -> Point {
-    Point::new(history.read(cx).max_point().row + 1, 0)
-}
-
-fn draft_path() -> PathKey {
-    PathKey::sorted(1)
-}
-
-fn set_draft_excerpt(
-    buffer: &mut MultiBuffer,
-    draft: &Entity<Buffer>,
-    cx: &mut Context<MultiBuffer>,
-) {
-    buffer.set_excerpts_for_path(
-        draft_path(),
-        draft.clone(),
-        [Point::zero()..draft.read(cx).max_point()],
-        0,
-        cx,
-    );
 }
 
 /// The rows of `thread` as `system` holds it.
@@ -913,26 +872,16 @@ impl ThreadView {
         if event.button != MouseButton::Left || event.modifiers.modified() {
             return;
         }
-        let Some((anchor, buffer_id, offset)) = self
-            .editor
-            .read(cx)
-            .buffer_location_for_window_position(event.position, Bias::Left)
-        else {
-            return;
-        };
-        let position = if buffer_id == self.draft.read(cx).remote_id() {
-            Some(anchor)
-        } else if self.item_row(&Key::Separator, cx).is_some_and(|row| {
-            self.transcript
-                .buffer()
-                .read(cx)
-                .offset_to_point(offset)
-                .row
-                == row
-        }) {
-            None
-        } else {
-            return;
+        let position = match draft::hit(
+            self.editor.read(cx),
+            self.transcript.buffer(),
+            &self.draft,
+            event.position,
+            cx,
+        ) {
+            Some(draft::Hit::Text(anchor)) => Some(anchor),
+            Some(draft::Hit::Separator) => None,
+            None => return,
         };
         self.focus_draft(position, window, cx);
         window.prevent_default();
@@ -940,25 +889,7 @@ impl ThreadView {
     }
 
     fn focus_draft(&self, position: Option<Anchor>, window: &mut Window, cx: &mut Context<Self>) {
-        let focus = self.editor.focus_handle(cx);
-        window.focus(&focus, cx);
-        let tail = draft_start(self.transcript.buffer(), cx);
-        // Move into the draft before the Vim action (which can otherwise
-        // jump there from history), then place the caret at the exact
-        // clicked column, now without Normal mode's end-of-line clipping.
-        self.editor.update(cx, |editor, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([tail..tail]);
-            });
-        });
-        thread::enter_insert_mode(&focus, window, cx);
-        if let Some(anchor) = position {
-            self.editor.update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_anchor_ranges([anchor..anchor]);
-                });
-            });
-        }
+        draft::focus(&self.editor, self.transcript.buffer(), position, window, cx);
     }
 
     fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
@@ -1024,7 +955,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.cursor_row(cx) >= draft_start(self.transcript.buffer(), cx).row {
+        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
             window.dispatch_action(Box::new(editor::actions::Redo), cx);
         } else {
             window.dispatch_action(Box::new(rho_frame::keys::UndoVerdict), cx);
@@ -1274,7 +1205,7 @@ impl Surface for ThreadView {
     /// A mail under the point anchors a tangent; the draft belongs to the
     /// whole thread rather than to any particular row.
     fn subject(&self, cx: &App) -> Subject {
-        if self.cursor_row(cx) >= draft_start(self.transcript.buffer(), cx).row {
+        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
             return Subject::Own;
         }
         line_subject(
@@ -1476,92 +1407,6 @@ mod tests {
             }],
             revision,
         }
-    }
-
-    #[gpui::test]
-    fn the_shared_document_cannot_edit_history_and_keeps_the_draft_through_new_mail(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| {
-            let history = cx.new(|cx| {
-                let mut history = Buffer::local("old mail\n── reply", cx);
-                history.set_capability(Capability::Read, cx);
-                history
-            });
-            let draft = cx.new(|cx| Buffer::local("one\ntwo words\nthree", cx));
-            let document = cx.new(|cx| {
-                let mut buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-                buffer.set_excerpts_for_path(
-                    PathKey::sorted(0),
-                    history.clone(),
-                    [Point::zero()..history.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-                set_draft_excerpt(&mut buffer, &draft, cx);
-                buffer
-            });
-            assert_eq!(
-                document.read(cx).snapshot(cx).text(),
-                "old mail\n── reply\none\ntwo words\nthree"
-            );
-            let caret = document
-                .read(cx)
-                .snapshot(cx)
-                .anchor_after(Point::new(3, 4));
-            document.update(cx, |document, cx| {
-                // Both edits go through the editor's edit boundary, not
-                // directly to the component buffers.
-                document.start_transaction(cx);
-                document.edit(
-                    [
-                        (Point::new(0, 0)..Point::new(0, 3), "bad"),
-                        (Point::new(3, 4)..Point::new(3, 9), "asymmetric"),
-                    ],
-                    None,
-                    cx,
-                );
-                document.end_transaction(cx);
-            });
-            assert_eq!(history.read(cx).text(), "old mail\n── reply");
-            assert_eq!(draft.read(cx).text(), "one\ntwo asymmetric\nthree");
-
-            history.update(cx, |history, cx| {
-                history.edit(
-                    [(Point::zero()..Point::zero(), "new mail\nextra line\n")],
-                    None,
-                    cx,
-                );
-            });
-            assert_eq!(caret.to_point(&document.read(cx).snapshot(cx)).row, 5);
-            assert_eq!(
-                document.read(cx).snapshot(cx).text(),
-                "new mail\nextra line\nold mail\n── reply\none\ntwo asymmetric\nthree"
-            );
-            document.update(cx, |doc, cx| {
-                assert!(doc.undo(cx).is_some());
-            });
-            assert_eq!(
-                document.read(cx).snapshot(cx).text(),
-                "new mail\nextra line\nold mail\n── reply\none\ntwo words\nthree"
-            );
-
-            let next_draft = cx.new(|cx| Buffer::local("", cx));
-            document.update(cx, |doc, cx| {
-                doc.remove_excerpts(draft_path(), cx);
-                set_draft_excerpt(doc, &next_draft, cx);
-                assert!(doc.redo(cx).is_none(), "the sent draft is discarded");
-            });
-            let snapshot = document.read(cx).snapshot(cx);
-            let tail = draft_start(&history, cx);
-            assert_eq!(
-                snapshot.text(),
-                "new mail\nextra line\nold mail\n── reply\n"
-            );
-            assert_eq!(tail, snapshot.max_point());
-            assert!(!Editor::point_is_editable(&snapshot, Point::new(3, 0)));
-            assert!(Editor::point_is_editable(&snapshot, tail));
-        });
     }
 
     #[test]

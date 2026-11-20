@@ -3,7 +3,7 @@
 //!
 //! The mails and draft share one editor under [`SCREEN`].
 
-use gpui::{App, FocusHandle, KeyBinding, Window, actions};
+use gpui::{App, KeyBinding, actions};
 pub use vim::enter_normal_mode;
 
 actions!(
@@ -28,14 +28,6 @@ actions!(
 pub const SCREEN: &str = "RhoThread";
 /// The project list has a second way to send an idea.
 pub const PROJECT_SCREEN: &str = "RhoThread RhoProjectThread";
-/// Starts editing in the thread's already focused editor, as `i` would.
-pub fn enter_insert_mode(focus: &FocusHandle, window: &mut Window, cx: &mut App) {
-    let action = cx
-        .build_action("vim::InsertBefore", None)
-        .expect("vim is initialised before a thread opens");
-    focus.dispatch_action(action.as_ref(), window, cx);
-}
-
 /// A message's time on the user's clock, as every thread says it: the hour
 /// when it is today, the day in front of it when it is not.
 pub fn when(at_ms: i64) -> String {
