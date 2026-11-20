@@ -1,12 +1,12 @@
 //! Which pages are on their way out.
 //!
-//! A page is not the GUI's to keep. The browser owns it, and a page no
-//! surface shows is closed after [`GRACE`], long enough that a tab the
-//! reader stepped away from is still there when they come back, short
-//! enough that a day's browsing does not accumulate. Every tab the browser
-//! has open and no surface shows waits out exactly one grace period:
-//! one the reader closed, one the browser restored from its last session,
-//! one a page opened by itself. Showing a page again takes its timer back.
+//! A page is not the GUI's to keep. The browser owns it. A page the user
+//! closes closes its tab at once, as closing any screen ends it: no back or
+//! forward reaches it again, so a tab kept for one would be a tab nothing
+//! can show. A tab no screen shows, one the browser restored from its last
+//! session or one a page opened by itself, is closed after [`GRACE`], long
+//! enough to be found in `open page…`, short enough that a day's browsing
+//! does not accumulate. Showing such a page takes its timer back.
 //!
 //! The timers are the system's, the one thing that outlives every surface;
 //! this is the bookkeeping that says when one starts and stops, kept
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::PageId;
 
-/// How long a page no surface shows is kept before it is closed.
+/// How long a tab no screen shows is kept before it is closed.
 pub(crate) const GRACE: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct Pages<T> {
@@ -57,10 +57,12 @@ impl<T> Pages<T> {
         self.closing.remove(&page);
     }
 
-    /// The surface showing `page` went. Answers whether a timer starts.
+    /// The surface showing `page` went. Answers whether the browser still
+    /// has its tab, for the caller to close.
     pub fn hide(&mut self, page: PageId) -> bool {
         self.shown.remove(&page);
-        self.live.contains(&page) && !self.closing.contains_key(&page)
+        self.closing.remove(&page);
+        self.live.contains(&page)
     }
 
     /// The browser's tabs are now `live`. A page that is gone takes its
@@ -139,10 +141,20 @@ mod tests {
         assert!(timers(&pages).is_empty());
         // A timer taken back closes nothing if it fires anyway.
         assert!(!pages.fired(tab));
-        // Hidden again, it starts over.
-        assert!(pages.hide(tab));
-        pages.closing(tab, 2);
-        assert!(pages.fired(tab));
+    }
+
+    #[test]
+    fn a_closed_page_closes_its_tab_and_keeps_no_timer() {
+        let (closed, gone) = (page(1), page(2));
+        let mut pages = Pages::<u32>::default();
+        pages.show(closed);
+        pages.show(gone);
+        pages.live(live(&[closed, gone]));
+        assert!(pages.hide(closed), "the tab is still open, so it closes");
+        assert!(timers(&pages).is_empty());
+        // The browser said the tab went first: there is nothing to close.
+        pages.live(live(&[]));
+        assert!(!pages.hide(gone));
     }
 
     #[test]
