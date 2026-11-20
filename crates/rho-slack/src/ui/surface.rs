@@ -12,11 +12,11 @@ use rho_frame::thread::{FocusComposer, FocusLog, SendMessage};
 use rho_frame::{Candidate, Frame, FrameLink, Row, Rows, Subject, Surface};
 use rho_window::style::StyleClass;
 
-use super::conversation::{self, Attaching, EditStart, Submitted};
+use super::conversation::{self, Attaching, Submitted};
 use super::results::{self, Place, Target};
 use super::system::{
-    self, EditMessage, FindFile, FindMessage, MarkUnread, NewMessage, NextPage, NextUnread,
-    OpenRow, PreviousPage, React, SlackSystem,
+    self, FindFile, FindMessage, NewMessage, NextPage, NextUnread, OpenRow, PreviousPage,
+    SlackSystem,
 };
 use super::{ConversationView, ReactionChoices, ResultsView, SearchKind};
 use crate::address::Listing;
@@ -357,47 +357,6 @@ impl SlackSurface {
         .detach();
     }
 
-    fn edit_message(&mut self, _: &EditMessage, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.conversation_view().cloned() else {
-            return cx.propagate();
-        };
-        match view.update(cx, |view, cx| view.start_edit(window, cx)) {
-            EditStart::Started(_) => {}
-            // A key that does nothing quietly reads as broken.
-            EditStart::NotYours => self.frame.echo(
-                "slack: only your own messages can be edited",
-                StyleClass::SystemInfo,
-                cx,
-            ),
-            EditStart::Nothing => cx.propagate(),
-        }
-    }
-
-    fn react(&mut self, _: &React, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.conversation_view().cloned() else {
-            return cx.propagate();
-        };
-        match view.update(cx, |view, cx| view.reaction_choices(cx)) {
-            Some(choices) => self.frame.menu(react_menu(&view, &choices), cx),
-            None => cx.propagate(),
-        }
-    }
-
-    fn mark_unread(&mut self, _: &MarkUnread, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.conversation_view().cloned() else {
-            return cx.propagate();
-        };
-        let Some(message) = view.update(cx, |view, cx| view.cursor_message(cx)) else {
-            return cx.propagate();
-        };
-        let source = view.read(cx).source().clone();
-        self.session.update(cx, |session, cx| {
-            session.mark_unread_from(&source, &message.ts, cx)
-        });
-        self.frame
-            .echo("slack: marked unread", StyleClass::SystemInfo, cx);
-    }
-
     fn next_unread(&mut self, _: &NextUnread, _window: &mut Window, cx: &mut Context<Self>) {
         let here = self
             .conversation_view()
@@ -561,8 +520,8 @@ fn follow_row(session: &Entity<Session>, key: &ThreadKey, cx: &App) -> Row {
     )
 }
 
-/// `r`: the emoji already on the message, then the reader's own, then any
-/// by name.
+/// `react…`: the emoji already on the message, then the reader's own, then
+/// any by name.
 fn react_menu(view: &Entity<ConversationView>, choices: &ReactionChoices) -> Rows {
     let mut menu = Rows::new("react");
     let offered = choices.on_message.iter().chain(&choices.recent);
@@ -746,8 +705,10 @@ fn message_menu(
             );
         }));
     }
-    menu.row(Row::run("u", "mark unread", |_, window, cx| {
-        window.dispatch_action(Box::new(MarkUnread), cx)
+    let (view, link) = (view.clone(), frame.clone());
+    menu.row(Row::run("u", "mark unread", move |_, _, cx| {
+        view.update(cx, |view, cx| view.mark_unread_from(&ts, cx));
+        link.echo("slack: marked unread", StyleClass::SystemInfo, cx);
     }))
 }
 
@@ -928,9 +889,6 @@ impl Render for SlackSurface {
             .on_action(cx.listener(Self::focus_composer))
             .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::send))
-            .on_action(cx.listener(Self::edit_message))
-            .on_action(cx.listener(Self::react))
-            .on_action(cx.listener(Self::mark_unread))
             .on_action(cx.listener(Self::next_unread))
             .on_action(cx.listener(Self::find_message))
             .on_action(cx.listener(Self::find_file))
