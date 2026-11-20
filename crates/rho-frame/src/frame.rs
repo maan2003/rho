@@ -1216,10 +1216,7 @@ impl Frame {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
         let mode = self.mode(window, cx);
-        let mode_color = match mode.contains("insert") {
-            true => status.warning,
-            false => colors.terminal_ansi_bright_cyan,
-        };
+        let mode_color = colors.terminal_ansi_bright_cyan;
         let mode = mode_word(&mode);
         // Signal evaluation is deferred. Desk must not paint the lamp
         // from the previous screen while that update is still pending.

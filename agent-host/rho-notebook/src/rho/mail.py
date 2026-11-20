@@ -6,7 +6,6 @@ import _rho
 from . import agents
 
 USER = "user"
-KINDS = ("ask", "result", "fyi")
 ORIGIN = "origin"
 
 
@@ -55,11 +54,14 @@ def _send(sender, parent, text, **kwargs) -> SentMail:
     return SentMail(id, f"Mail #{prior} has no user reply. If it is still live, {edit} for updates.")
 
 
-def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> SentMail:
+def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail:
     """Send to a local project, #thread, agent handle, or `user`.
     `reply_to=#id` identifies the exact mail answered. To address its
-    writer use `to=None`. Mail to `user` needs kind and a thread or reply.
+    writer use `to=None`. Mail to `user` needs a thread or reply; it pings
+    the user unless `ping=False`, which only mail to the user takes.
     """
+    if type(ping) is not bool:
+        raise ValueError(f"ping is True or False, not {ping!r}")
     text = str(text).strip()
     if not text:
         raise ValueError("mail needs text")
@@ -85,8 +87,6 @@ def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> SentMail
     if isinstance(to, str):
         to = _local_address(sender, to.strip())
     if to == USER:
-        if kind not in KINDS:
-            raise ValueError('mail to the user needs kind: "ask", "result" or "fyi"')
         props = agents.Agent(sender).props
         if props.get("preset") != "engineer":
             if (parent := props.get("parent")) is None:
@@ -97,10 +97,10 @@ def send(sender, to, text, *, thread=None, reply_to=None, kind=None) -> SentMail
             if reply is None:
                 raise ValueError("mail to the user needs thread or reply_to")
             thread = thread_of(reply)
-        return _send(sender, ident(thread), text, to=USER, kind=kind, reply_to=reply_to)
+        return _send(sender, ident(thread), text, to=USER, ping=ping, reply_to=reply_to)
 
-    if thread is not None or kind is not None:
-        raise ValueError("only mail to the user takes thread or kind")
+    if thread is not None or not ping:
+        raise ValueError("only mail to the user takes thread or ping=False")
     if isinstance(to, str) and to.startswith(("eng-", "adv-")):
         target = agents.resolve(to)
         if sender == target:

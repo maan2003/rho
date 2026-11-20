@@ -113,7 +113,7 @@ def on_notebook(agent, ns):
 
     class Human:
         def send(self, text, kind):
-            address = {} if kind == "status" else {"to": "user", "kind": kind}
+            address = {"to": "user", "ping": kind != "status"}
             if thread:
                 _rho.send_mail(agent.id, thread[0], text, **address)
             else:

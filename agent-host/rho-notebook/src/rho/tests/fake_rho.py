@@ -179,7 +179,7 @@ def _post(sender, parent, text, mentions, reply_to=None):
     if not text.strip():
         raise ValueError("a message needs text")
     for address, kind in mentions:
-        assert kind in ("ask", "result", "fyi", "direct"), kind
+        assert (type(kind) is bool if address == "user" else kind in ("ask", "fyi", "direct")), kind
         assert address == "user" or address in STATE.agents or address in STATE.elsewhere, address
     members = [] if any(kind == "direct" for _, kind in mentions) else _members_under(parent)
     to = [agent for agent in members + [address for address, _ in mentions] if agent not in ("user", sender)]
@@ -202,12 +202,12 @@ def post(sender, parent, text, *, mentions=None):
         return _post(sender, parent, text, mentions or [])
 
 
-def send_mail(sender, parent, text, *, to=None, kind=None, reply_to=None):
+def send_mail(sender, parent, text, *, to=None, ping=True, reply_to=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
         if to in (None, "user"):
-            mentions = [] if to is None else [(to, kind)]
+            mentions = [] if to is None else [(to, ping)]
             return _post(sender, parent, text, mentions, reply_to), STATE.send_unanswered
         if to not in STATE.agents and to not in STATE.elsewhere:
             raise ValueError("agent was deleted or does not exist")

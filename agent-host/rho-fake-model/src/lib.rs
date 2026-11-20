@@ -819,7 +819,7 @@ fn mail_chain(request: &OpenAiRequest, topic: u64) -> String {
         if let Some(output) = item.get("output") {
             let output = output.to_string();
             if output.contains("MAIL-RIG-PEER-RESULT") {
-                return "mail.send('user', 'Can I use the test clock?', thread=mail_rig_thread, kind='ask')\nend_turn()".into();
+                return "mail.send('user', 'Can I use the test clock?', thread=mail_rig_thread)\nend_turn()".into();
             }
             if let Some(brief) = output.rsplit_once("· mail #").and_then(|(_, tail)| {
                 let id = tail.split(|c: char| !c.is_ascii_digit()).next()?;
@@ -887,16 +887,7 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let (status, kind) = match state.config.scenario {
-            Scenario::ClarifyingQuestion => (
-                format!("mail.status({topic}, \"Waiting for clarification\")\n"),
-                "ask",
-            ),
-            _ => (String::new(), "result"),
-        };
-        let source = format!(
-            "{status}mail.send(\"user\", {text:?}, thread={topic}, kind={kind:?})\nend_turn()"
-        );
+        let source = format!("mail.send(\"user\", {text:?}, thread={topic})\nend_turn()");
         append_tool_call(
             events,
             state,

@@ -138,15 +138,12 @@ pub(crate) enum PyRequest {
     },
     /// The addresses the agent accepted.
     ExternalContacts(rho_agent_types::AgentId),
-    Status {
-        agent: rho_agent_types::AgentId,
-        thread: rho_agent_types::MessageId,
-        text: String,
-    },
+    /// `ping` turns the ping of mail to the user on or off; `None` keeps it.
     Edit {
         agent: rho_agent_types::AgentId,
         message: rho_agent_types::MessageId,
         content: Vec<rho_agent_types::ContentPart>,
+        ping: Option<bool>,
     },
     Delete {
         agent: rho_agent_types::AgentId,

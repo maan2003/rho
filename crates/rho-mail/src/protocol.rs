@@ -8,7 +8,7 @@
 //! only how it crosses the wire.
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ThreadStatus,
+    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ThreadWork,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -119,14 +119,17 @@ pub enum ServerFrame {
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Mail { records: Vec<ChatRecord> },
-    /// Full replacement snapshot; an omitted thread has no status. This is
-    /// not part of the mail log and carries no cursor.
-    Statuses { statuses: Vec<ThreadStatus> },
+    /// What the agents of each thread do now, as a full replacement; an
+    /// omitted thread has no agent at work. This is not part of the mail
+    /// log and carries no cursor.
+    Work {
+        threads: Vec<(MessageId, ThreadWork)>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind, Stop, UnixMs};
+    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, Stop, UnixMs};
 
     use super::*;
 
@@ -148,15 +151,14 @@ mod tests {
             thread: Some(MessageId(ChatSeq(4))),
         });
         round_trips(ClientFrame::View { thread: None });
-        round_trips(ServerFrame::Statuses {
-            statuses: vec![ThreadStatus {
-                thread: MessageId(ChatSeq(14)),
-                at: UnixMs(28),
-                state: rho_agent_types::StatusText::Written("Waiting for the review".into()),
-            }],
+        round_trips(ServerFrame::Work {
+            threads: vec![
+                (MessageId(ChatSeq(14)), ThreadWork::Working),
+                (MessageId(ChatSeq(15)), ThreadWork::StoppedByYou),
+            ],
         });
-        round_trips(ServerFrame::Statuses {
-            statuses: Vec::new(),
+        round_trips(ServerFrame::Work {
+            threads: Vec::new(),
         });
         round_trips(Open::Request(
             ResolveProject {
@@ -181,10 +183,7 @@ mod tests {
                         parent: Some(MessageId(ChatSeq(2))),
                         reply_to: None,
                         from: Address::Agent(agent),
-                        mentions: vec![Mention {
-                            to: Address::User,
-                            kind: MentionKind::Ask,
-                        }],
+                        mentions: vec![Mention::User { ping: true }],
                         content: vec![ContentPart::Text { text: "hi".into() }],
                     },
                 },
@@ -226,6 +225,7 @@ mod tests {
                         content: vec![ContentPart::Text {
                             text: "Clock B?".into(),
                         }],
+                        ping: Some(true),
                     },
                 },
                 ChatRecord {
@@ -239,10 +239,7 @@ mod tests {
                             stop: Stop::Stuck,
                             since: UnixMs(23),
                         },
-                        mentions: vec![Mention {
-                            to: Address::User,
-                            kind: MentionKind::Ask,
-                        }],
+                        mentions: vec![Mention::User { ping: true }],
                         content: vec![ContentPart::Text {
                             text: "stuck · retries".into(),
                         }],

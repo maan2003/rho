@@ -1,12 +1,12 @@
 //! Mail state that is deliberately not in the chat log.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rho_agent_types::{
-    Activity, Address, AgentId, ContentPart, Doing, Mention, MentionKind, Message, MessageId,
-    StatusText, Stop, ThreadStatus, UnixMs,
+    Activity, Address, AgentId, ContentPart, Doing, Mention, Message, MessageId, Stop,
+    THREAD_COLD_AFTER as COLD_AFTER, ThreadWork, UnixMs,
 };
 use tokio::sync::watch;
 
@@ -15,100 +15,28 @@ use crate::record::{Event, Record};
 use crate::store::{MailRead as _, MailWrite as _, NewMessage, StoreRead as _, StoreWrite as _};
 use crate::{InferenceState, RuntimeState};
 
-const COLD_AFTER: Duration = Duration::from_secs(10 * 60);
-
 #[derive(Default)]
 pub(super) struct Mail {
-    statuses: Mutex<BTreeMap<MessageId, Status>>,
-    status_changed: watch::Sender<()>,
+    /// Threads whose agent the user stopped, by that agent, until an agent
+    /// works there again.
+    stopped: Mutex<BTreeMap<MessageId, AgentId>>,
+    work_changed: watch::Sender<()>,
     presence: Mutex<Presence>,
+    visits: watch::Sender<()>,
     retry_checks: Mutex<HashMap<AgentId, tokio::task::JoinHandle<()>>>,
-}
-
-struct Status {
-    owner: AgentId,
-    at: UnixMs,
-    state: StatusText,
+    /// Pinging mail with no recap that rho has reminded its writer about,
+    /// or will once its thread is cold: once per mail.
+    recap_reminders: Mutex<HashSet<MessageId>>,
 }
 
 impl Mail {
-    fn set_status(
-        &self,
-        thread: MessageId,
-        owner: AgentId,
-        text: String,
-        at: UnixMs,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !text.contains(['\r', '\n', '\u{85}', '\u{2028}', '\u{2029}']),
-            "status is one line"
-        );
-        let text = text.trim().to_owned();
-        anyhow::ensure!(
-            text.chars().count() <= 240,
-            "status can have at most 240 characters"
-        );
-        let mut held = self.statuses.lock().expect("poison");
-        if text.is_empty() {
-            if held.remove(&thread).is_none() {
-                return Ok(());
-            }
-        } else {
-            held.insert(
-                thread,
-                Status {
-                    owner,
-                    at,
-                    state: StatusText::Written(text),
-                },
-            );
+    fn forget_stopped_agent(&self, agent: AgentId) {
+        let mut stopped = self.stopped.lock().expect("poison");
+        let before = stopped.len();
+        stopped.retain(|_, owner| *owner != agent);
+        if stopped.len() != before {
+            self.work_changed.send_replace(());
         }
-        self.status_changed.send_replace(());
-        Ok(())
-    }
-
-    fn clear_stopped_status(&self, agent: AgentId) {
-        let mut held = self.statuses.lock().expect("poison");
-        let before = held.len();
-        held.retain(|_, status| status.owner != agent);
-        if held.len() != before {
-            self.status_changed.send_replace(());
-        }
-    }
-
-    fn user_stopped(&self, thread: MessageId, owner: AgentId, at: UnixMs) {
-        self.statuses.lock().expect("poison").insert(
-            thread,
-            Status {
-                owner,
-                at,
-                state: StatusText::StoppedByYou,
-            },
-        );
-        self.status_changed.send_replace(());
-    }
-
-    fn clear_user_stop(&self, thread: MessageId) {
-        let mut statuses = self.statuses.lock().expect("poison");
-        if statuses
-            .get(&thread)
-            .is_some_and(|status| status.state == StatusText::StoppedByYou)
-        {
-            statuses.remove(&thread);
-        }
-    }
-
-    fn status_snapshot(&self) -> Vec<ThreadStatus> {
-        self.statuses
-            .lock()
-            .expect("poison")
-            .iter()
-            .map(|(&thread, status)| ThreadStatus {
-                thread,
-                at: status.at,
-                state: status.state.clone(),
-            })
-            .collect()
     }
 }
 
@@ -172,6 +100,7 @@ impl MailView {
             presence.warm(new, now).open += 1;
         }
         self.current = thread;
+        self.pool.mail.visits.send_replace(());
     }
 }
 
@@ -206,10 +135,7 @@ impl AgentPool {
             NewMessage {
                 from: Address::StartFailed,
                 reply_to: Some(origin),
-                mentions: vec![Mention {
-                    to: Address::User,
-                    kind: MentionKind::Ask,
-                }],
+                mentions: vec![Mention::User { ping: true }],
                 content: vec![ContentPart::Text { text }],
             },
             None,
@@ -225,85 +151,66 @@ impl AgentPool {
         }
     }
 
-    pub fn watch_thread_statuses(&self) -> watch::Receiver<()> {
-        self.mail.status_changed.subscribe()
+    pub fn watch_thread_work(&self) -> watch::Receiver<()> {
+        self.mail.work_changed.subscribe()
     }
 
-    pub fn thread_statuses(&self) -> Vec<ThreadStatus> {
+    /// What the agents of each thread do now. A stuck agent does not
+    /// work: its stop mail says so.
+    pub fn thread_work(&self) -> Vec<(MessageId, ThreadWork)> {
         let at = UnixMs::now();
         let doing = self.doing.lock().expect("poison").clone();
         let read = self.db.read();
-        let mut working = Vec::new();
-        let mut stuck = BTreeMap::<MessageId, UnixMs>::new();
-        for (agent, doing) in doing {
-            let Some(thread) = thread_for(&read, agent) else {
-                continue;
-            };
-            if is_working(doing, at) {
-                working.push((thread, doing.since));
-            } else if doing.stop(at) == Some(Stop::Stuck) {
-                stuck
-                    .entry(thread)
-                    .and_modify(|since| *since = (*since).min(doing.since))
-                    .or_insert(doing.since);
-            }
-        }
-        let mut statuses = with_working(self.mail.status_snapshot(), working);
-        statuses.retain(|status| !stuck.contains_key(&status.thread));
-        statuses.extend(stuck.into_iter().map(|(thread, at)| ThreadStatus {
-            thread,
-            at,
-            state: StatusText::Stuck,
-        }));
-        statuses
+        let working = doing
+            .into_iter()
+            .filter(|(_, doing)| is_working(*doing, at))
+            .filter_map(|(agent, _)| thread_for(&read, agent))
+            .collect::<HashSet<_>>();
+        let stopped = self.mail.stopped.lock().expect("poison").clone();
+        let mut work = stopped
+            .into_keys()
+            // Another agent can still be working on the same thread.
+            .filter(|thread| !working.contains(thread))
+            .map(|thread| (thread, ThreadWork::StoppedByYou))
+            .chain(
+                working
+                    .iter()
+                    .copied()
+                    .map(|thread| (thread, ThreadWork::Working)),
+            )
+            .collect::<Vec<_>>();
+        work.sort_unstable_by_key(|(thread, _)| *thread);
+        work
     }
 
-    pub(super) fn user_stopped(&self, agent: AgentId, at: UnixMs) {
+    pub(super) fn user_stopped(&self, agent: AgentId) {
         if let Some(thread) = thread_for(&self.db.read(), agent) {
-            self.mail.user_stopped(thread, agent, at);
+            self.mail
+                .stopped
+                .lock()
+                .expect("poison")
+                .insert(thread, agent);
+            self.mail.work_changed.send_replace(());
         }
     }
 
-    pub(super) fn activity_changed(&self, agent: AgentId, before: Option<Doing>, now: Doing) {
-        let at = UnixMs::now();
-        if is_working(now, at)
+    pub(super) fn activity_changed(&self, agent: AgentId, _before: Option<Doing>, now: Doing) {
+        if is_working(now, UnixMs::now())
             && let Some(thread) = thread_for(&self.db.read(), agent)
         {
-            self.mail.clear_user_stop(thread);
-        }
-        if before.is_some_and(|before| is_working(before, at)) && !is_working(now, at) {
-            self.mail.clear_stopped_status(agent);
+            self.mail.stopped.lock().expect("poison").remove(&thread);
         }
         self.thread_work_changed();
     }
 
     pub(super) fn agents_left_mail(&self, agents: &[AgentId]) {
         for &agent in agents {
-            self.mail.clear_stopped_status(agent);
+            self.mail.forget_stopped_agent(agent);
         }
     }
 
     pub(crate) fn thread_work_changed(&self) {
-        self.mail.status_changed.send_replace(());
-    }
-
-    pub(super) fn set_thread_status(
-        &self,
-        thread: MessageId,
-        agent: AgentId,
-        text: String,
-    ) -> anyhow::Result<()> {
-        let head = self
-            .db
-            .read()
-            .thread(thread)
-            .ok_or_else(|| anyhow::anyhow!("no thread #{}", thread.0.0))?;
-        anyhow::ensure!(
-            head.members.contains(&agent),
-            "you are not in thread #{}",
-            thread.0.0
-        );
-        self.mail.set_status(thread, agent, text, UnixMs::now())
+        self.mail.work_changed.send_replace(());
     }
 
     /// Use the project the sender works in; children and advisors inherit
@@ -370,6 +277,88 @@ impl AgentPool {
             .map(|minutes| (thread, minutes))
     }
 
+    /// A ping left cold without its recap gets at most one reminder.
+    pub(super) fn watch_recap(self: &Arc<Self>, id: MessageId) {
+        let needs_recap = |mail: &Message| {
+            mail.pings_user()
+                && matches!(mail.from, Address::Agent(_))
+                && rho_agent_types::recap_section(&mail.text()).is_none()
+        };
+        let read = self.db.read();
+        if !read.message(id).is_some_and(|mail| needs_recap(&mail))
+            || !self.mail.recap_reminders.lock().expect("poison").insert(id)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let mut visits = self.mail.visits.subscribe();
+        tokio::spawn(async move {
+            tokio::time::sleep(COLD_AFTER).await;
+            loop {
+                visits.borrow_and_update();
+                let Some(pool) = weak.upgrade() else { return };
+                let now = UnixMs::now();
+                let (agent, thread, last_user) = {
+                    let read = pool.db.read();
+                    let Some(mail) = read.message(id).filter(|mail| needs_recap(mail)) else {
+                        return;
+                    };
+                    let Address::Agent(agent) = mail.from else {
+                        return;
+                    };
+                    let thread = read.mail_thread(&mail);
+                    let last = read.last_user_mail(thread).unwrap_or(mail.at);
+                    if last > mail.version().1 {
+                        // The user already returned to the conversation to
+                        // write.
+                        return;
+                    }
+                    (agent, thread, last)
+                };
+                let (open, last) = pool
+                    .mail
+                    .presence
+                    .lock()
+                    .expect("poison")
+                    .0
+                    .get(&thread)
+                    .map_or((false, last_user), |visit| {
+                        (visit.open != 0, visit.last.max(last_user))
+                    });
+                if open {
+                    drop(pool);
+                    if visits.changed().await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if let Some(left) = (last + COLD_AFTER).0.checked_sub(now.0)
+                    && left > 0
+                {
+                    drop(pool);
+                    tokio::time::sleep(Duration::from_millis(left)).await;
+                    continue;
+                }
+                // An explicitly stopped or unloaded agent is not restarted
+                // just to rephrase something it already wrote.
+                let client = pool.agents.lock().await.get(&agent).cloned();
+                if let Some(client) = client {
+                    let _ = client.control(crate::ipc::protocol::Control::Input {
+                        role: rho_agent_types::Role::Tool,
+                        message: None,
+                        content: vec![ContentPart::Text {
+                            text: format!(
+                                "Mail #{} still waits without a recap. Edit it to include a ## recap section so the user can answer without reading the thread.",
+                                id.0.0
+                            ),
+                        }],
+                    }).await;
+                }
+                return;
+            }
+        });
+    }
+
     pub(super) fn observe_stop(
         self: &Arc<Self>,
         agent: AgentId,
@@ -391,7 +380,6 @@ impl AgentPool {
         };
         let weak = Arc::downgrade(self);
         if let Some(stop) = doing.stop(now) {
-            self.mail.clear_stopped_status(agent);
             tokio::spawn(send_stop(weak, agent, doing, stop, reason));
         } else if let Some(deadline) = doing.stuck_at() {
             let check = tokio::spawn(async move {
@@ -403,8 +391,7 @@ impl AgentPool {
                     if current.get(&agent) != Some(&doing) {
                         return;
                     }
-                    pool.mail.clear_stopped_status(agent);
-                    pool.mail.status_changed.send_replace(());
+                    pool.thread_work_changed();
                     // Leave the write alone if the next status comes just
                     // after this deadline; never remove a newer timer.
                     checks.remove(&agent);
@@ -437,35 +424,6 @@ fn is_working(doing: Doing, now: UnixMs) -> bool {
         Activity::Retrying => doing.stop(now).is_none(),
         _ => false,
     }
-}
-
-fn with_working(
-    explicit: Vec<ThreadStatus>,
-    working: impl IntoIterator<Item = (MessageId, UnixMs)>,
-) -> Vec<ThreadStatus> {
-    let mut fallback = BTreeMap::<MessageId, UnixMs>::new();
-    for (thread, since) in working {
-        // The newest worker starting work is the last change to this row.
-        fallback
-            .entry(thread)
-            .and_modify(|at| *at = (*at).max(since))
-            .or_insert(since);
-    }
-    let mut statuses = explicit;
-    statuses.retain(|status| {
-        if status.state == StatusText::StoppedByYou {
-            // Another agent can still be working on the same thread.
-            return !fallback.contains_key(&status.thread);
-        }
-        fallback.remove(&status.thread);
-        true
-    });
-    statuses.extend(fallback.into_iter().map(|(thread, at)| ThreadStatus {
-        thread,
-        at,
-        state: StatusText::Working,
-    }));
-    statuses
 }
 
 fn thread_for(read: &rho_db::ReadTxn, agent: AgentId) -> Option<MessageId> {
@@ -710,103 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_status_replaces_only_its_own_thread() {
-        let mail = Mail::default();
-        let mut changed = mail.status_changed.subscribe();
-        let owner = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
-        let a = MessageId(ChatSeq(7));
-        let b = MessageId(ChatSeq(9));
-        mail.set_status(a, owner, "Read the logs".into(), UnixMs(15))
-            .unwrap();
-        mail.set_status(b, owner, "Bisecting".into(), UnixMs(24))
-            .unwrap();
-        mail.set_status(a, owner, "Runs with SSL".into(), UnixMs(31))
-            .unwrap();
-        assert!(changed.has_changed().unwrap());
-        changed.borrow_and_update();
-        assert!(
-            mail.set_status(a, owner, "one\ntwo".into(), UnixMs(33))
-                .is_err()
-        );
-        assert!(!changed.has_changed().unwrap());
-        {
-            let held = mail.statuses.lock().unwrap();
-            assert_eq!(held.len(), 2);
-            assert_eq!(
-                (&held[&a].state, held[&a].at),
-                (&StatusText::Written("Runs with SSL".into()), UnixMs(31))
-            );
-            assert_eq!(
-                (&held[&b].state, held[&b].at),
-                (&StatusText::Written("Bisecting".into()), UnixMs(24))
-            );
-        }
-        mail.set_status(a, owner, String::new(), UnixMs(37))
-            .unwrap();
-        assert!(changed.has_changed().unwrap());
-        let held = mail.statuses.lock().unwrap();
-        assert_eq!(held.keys().copied().collect::<Vec<_>>(), [b]);
-        assert!(Mail::default().statuses.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_stop_clears_only_status_still_owned_by_the_stopped_agent() {
-        let mail = Mail::default();
-        let a = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
-        let b = AgentId::from_counter(2, &AgentIdDomain(0)).unwrap();
-        let thread = MessageId(ChatSeq(7));
-        let mut changed = mail.status_changed.subscribe();
-
-        mail.set_status(thread, a, "Checking the clock".into(), UnixMs(31))
-            .unwrap();
-        changed.borrow_and_update();
-        mail.clear_stopped_status(a);
-        assert!(mail.status_snapshot().is_empty());
-        assert!(changed.has_changed().unwrap());
-
-        mail.set_status(thread, a, "Retrying the check".into(), UnixMs(35))
-            .unwrap();
-        mail.set_status(thread, b, "Verifying the result".into(), UnixMs(40))
-            .unwrap();
-        changed.borrow_and_update();
-        mail.clear_stopped_status(a);
-        assert_eq!(
-            mail.status_snapshot(),
-            [ThreadStatus {
-                thread,
-                at: UnixMs(40),
-                state: StatusText::Written("Verifying the result".into()),
-            }]
-        );
-        assert!(!changed.has_changed().unwrap());
-
-        mail.set_status(thread, b, "Writing the proof".into(), UnixMs(46))
-            .unwrap();
-        assert_eq!(mail.status_snapshot()[0].state.words(), "Writing the proof");
-        assert!(changed.has_changed().unwrap());
-    }
-
-    #[test]
-    fn working_fills_only_missing_statuses_and_uses_the_newest_worker_clock() {
-        let a = MessageId(ChatSeq(7));
-        let b = MessageId(ChatSeq(4));
-        let explicit = ThreadStatus {
-            thread: a,
-            at: UnixMs(31),
-            state: StatusText::Written("Checking the clock".into()),
-        };
-        let working = [(a, UnixMs(42)), (b, UnixMs(73)), (b, UnixMs(55))];
-        assert_eq!(
-            with_working(vec![explicit.clone()], working),
-            [
-                explicit,
-                ThreadStatus {
-                    thread: b,
-                    at: UnixMs(73),
-                    state: StatusText::Working,
-                },
-            ]
-        );
+    fn a_retrying_agent_works_until_it_is_stuck() {
         let retry = Doing {
             activity: Activity::Retrying,
             since: UnixMs(10),

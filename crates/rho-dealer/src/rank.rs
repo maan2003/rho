@@ -23,18 +23,16 @@ use crate::marks::Marks;
 /// What is waiting, independent of the words in which it appears.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardKind {
-    Ask,
+    Waits,
     Stop(&'static str),
-    Result,
     Other,
 }
 
 impl CardKind {
     fn words(self) -> String {
         match self {
-            Self::Ask => "asks · {age}".to_owned(),
+            Self::Waits => "waits · {age}".to_owned(),
             Self::Stop(word) => format!("{word} · {{age}}"),
-            Self::Result => "result · {age}".to_owned(),
             Self::Other => String::new(), // Deadlines supply their own words.
         }
     }
@@ -261,8 +259,7 @@ pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, mut trace: Trace) -> (Han
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum DealOrder {
     Overdue,
-    Prompt(Timestamp),
-    Result(Timestamp),
+    Waiting(Timestamp),
     Other,
 }
 
@@ -270,10 +267,9 @@ impl Part {
     fn deal_order(&self, now: Timestamp) -> DealOrder {
         match (self.curve, self.kind) {
             (Curve::Deadline { by, .. }, _) if by < now => DealOrder::Overdue,
-            (Curve::Waiting { since, .. }, CardKind::Ask | CardKind::Stop(_)) => {
-                DealOrder::Prompt(since)
+            (Curve::Waiting { since, .. }, CardKind::Waits | CardKind::Stop(_)) => {
+                DealOrder::Waiting(since)
             }
-            (Curve::Waiting { since, .. }, CardKind::Result) => DealOrder::Result(since),
             _ => DealOrder::Other,
         }
     }

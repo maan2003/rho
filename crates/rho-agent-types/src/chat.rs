@@ -57,24 +57,30 @@ pub enum Address {
     StartFailed,
 }
 
-/// What a mention asks of the one it names. A mention of the user is how
-/// an agent asks for attention: the dealer ranks on it (`rho-dealer`).
+/// Who a message reaches beyond the members of its thread. A mention of
+/// the user is mail to the user, which never goes to the thread's agents;
+/// whether it pings decides whether it waits for them as a card
+/// (`rho-dealer`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum MentionKind {
-    /// Asks for something the work needs.
-    Ask,
-    /// Delivers what was asked for.
-    Result,
-    /// Worth reading, not now.
-    Fyi,
-    /// Mail to a particular agent, without delivery to thread members.
-    Direct,
+pub enum Mention {
+    /// Mail to the user. A mail that pings is dealt; one that does not is
+    /// how the project says what it is doing, edited in place as it works.
+    User { ping: bool },
+    /// Reaches the agent whether or not it is a member, as well as the
+    /// members.
+    Agent(AgentId),
+    /// Mail to this agent alone, without delivery to thread members.
+    Direct(AgentId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct Mention {
-    pub to: Address,
-    pub kind: MentionKind,
+impl Mention {
+    /// The agent the mention reaches, if it names one.
+    pub fn agent(self) -> Option<AgentId> {
+        match self {
+            Self::Agent(agent) | Self::Direct(agent) => Some(agent),
+            Self::User { .. } => None,
+        }
+    }
 }
 
 /// One change to a host's chat.
@@ -126,11 +132,13 @@ pub enum ChatEvent {
         message: MessageId,
     },
     /// The project replaces the live mail without making a new mail.
-    /// Replies to it go to the writer of these words.
+    /// Replies to it go to the writer of these words. `ping` turns the
+    /// mail's ping to the user on or off; `None` leaves it as it was.
     Revised {
         message: MessageId,
         author: AgentId,
         content: Vec<ContentPart>,
+        ping: Option<bool>,
     },
     /// The turn that wrote this version was rewound. Keep its words readable.
     TakenBack {
@@ -145,31 +153,47 @@ pub enum ChatEvent {
     },
 }
 
-/// The current status of a thread, separate from its durable mail.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct ThreadStatus {
-    pub thread: MessageId,
-    pub at: UnixMs,
-    pub state: StatusText,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum StatusText {
-    Written(String),
+/// What a thread's agents are doing beside its mail, for as long as it is
+/// true. It is never logged: the mail is the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum ThreadWork {
+    /// An agent works in the thread now.
     Working,
-    Stuck,
+    /// The user stopped the thread's agent, and none works in it now.
     StoppedByYou,
 }
 
-impl StatusText {
-    pub fn words(&self) -> &str {
+impl ThreadWork {
+    pub fn words(self) -> &'static str {
         match self {
-            Self::Written(text) => text,
             Self::Working => "working",
-            Self::Stuck => "stuck · can't reach its model",
             Self::StoppedByYou => "stopped by you",
         }
     }
+}
+
+pub const THREAD_COLD_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The `## recap` section of a mail's text, heading included: the words
+/// that let the user answer a cold thread without its history. It runs to
+/// the next heading of the same or a higher level, or to the end.
+pub fn recap_section(text: &str) -> Option<std::ops::Range<usize>> {
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let level = trimmed.chars().take_while(|c| *c == '#').count();
+        let heading = (1..=2).contains(&level) && trimmed[level..].starts_with(' ');
+        match start {
+            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case("recap") => {
+                start = Some(offset);
+            }
+            Some(start) if heading => return Some(start..offset),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    start.map(|start| start..text.len())
 }
 
 /// One entry of a host's chat log.
@@ -192,6 +216,8 @@ pub struct Message {
     pub from: Address,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
+    /// A revision that started the current ping, rather than the original mail.
+    pub ping_started: Option<(ChatSeq, UnixMs)>,
     pub revision: Revision,
 }
 
@@ -232,6 +258,7 @@ impl Message {
             from: *from,
             mentions: mentions.clone(),
             content: content.clone(),
+            ping_started: None,
             revision: Revision::Original,
         })
     }
@@ -247,15 +274,27 @@ impl Message {
                 message,
                 author,
                 content,
-            } if *message == self.id => (content, Some(*author), record.seq, record.at),
+                ping,
+            } if *message == self.id => {
+                if let Some(ping) = *ping {
+                    if ping && !self.pings_user() {
+                        self.ping_started = Some((record.seq, record.at));
+                    }
+                    if !ping {
+                        self.ping_started = None;
+                    }
+                    self.set_ping(ping);
+                }
+                (content, Some(*author), record.seq, record.at)
+            }
             ChatEvent::TakenBack { message, .. } if *message == self.id => {
-                self.mentions.clear();
+                self.set_ping(false);
                 let (seq, at) = self.version();
                 self.revision = Revision::TakenBack { seq, at };
                 return;
             }
             ChatEvent::Recovered { message, content } if *message == self.id => {
-                self.mentions.clear();
+                self.set_ping(false);
                 (content, None, record.seq, record.at)
             }
             ChatEvent::Deleted { message } if *message == self.id => {
@@ -281,11 +320,36 @@ impl Message {
         }
     }
 
-    pub fn mentions(&self, address: Address) -> Option<MentionKind> {
+    /// When the current wait began. An edit before a verdict keeps that
+    /// clock; a version after a verdict can begin another wait.
+    pub fn ping_since(&self, seen: Option<ChatSeq>) -> (ChatSeq, UnixMs) {
+        let began = self.ping_started.unwrap_or((self.id.0, self.at));
+        if seen.is_some_and(|seen| began.0 <= seen) {
+            self.version()
+        } else {
+            began
+        }
+    }
+
+    /// Whether the mail is to the user, pinging or not.
+    pub fn to_user(&self) -> bool {
         self.mentions
             .iter()
-            .find(|mention| mention.to == address)
-            .map(|mention| mention.kind)
+            .any(|mention| matches!(mention, Mention::User { .. }))
+    }
+
+    /// Whether the mail waits for the user as a card.
+    pub fn pings_user(&self) -> bool {
+        self.mentions.contains(&Mention::User { ping: true })
+    }
+
+    /// Mail to the user pings or stops pinging; other mail stays as it is.
+    fn set_ping(&mut self, ping: bool) {
+        for mention in &mut self.mentions {
+            if let Mention::User { ping: was } = mention {
+                *was = ping;
+            }
+        }
     }
 
     /// The message's text, images left out.
@@ -359,6 +423,57 @@ mod tests {
                 content
             }
         );
+    }
+
+    #[test]
+    fn a_recap_runs_from_its_heading_to_the_next_heading_or_the_end() {
+        let text =
+            "Use clock B?\n\n## Recap\nThe clock is shared.\n### detail\nmore\n## next\nafter";
+        let range = recap_section(text).unwrap();
+        assert_eq!(
+            &text[range],
+            "## Recap\nThe clock is shared.\n### detail\nmore\n"
+        );
+        let last = "Ask\n## recap\nAll of it";
+        assert_eq!(&last[recap_section(last).unwrap()], "## recap\nAll of it");
+        assert_eq!(recap_section("## recaps\nno"), None);
+        assert_eq!(recap_section("#recap\nno"), None);
+        assert_eq!(recap_section("##recap\nno"), None);
+        assert_eq!(recap_section("plain words about a recap"), None);
+    }
+
+    #[test]
+    fn an_edit_turns_the_ping_on_or_leaves_it() {
+        let agent = AgentId::from_counter(4, &crate::AgentIdDomain(7)).unwrap();
+        let posted = ChatRecord {
+            seq: ChatSeq(5),
+            at: UnixMs(1),
+            event: ChatEvent::Posted {
+                parent: Some(MessageId(ChatSeq(2))),
+                reply_to: None,
+                from: Address::Agent(agent),
+                mentions: vec![Mention::User { ping: false }],
+                content: Vec::new(),
+            },
+        };
+        let mut mail = Message::from_record(&posted).unwrap();
+        assert!(mail.to_user() && !mail.pings_user());
+        let revised = |seq, ping| ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(seq),
+            event: ChatEvent::Revised {
+                message: MessageId(ChatSeq(5)),
+                author: agent,
+                content: Vec::new(),
+                ping,
+            },
+        };
+        mail.apply_revision(&revised(6, None));
+        assert!(!mail.pings_user());
+        mail.apply_revision(&revised(7, Some(true)));
+        assert!(mail.pings_user());
+        mail.apply_revision(&revised(8, None));
+        assert!(mail.pings_user());
     }
 
     #[test]

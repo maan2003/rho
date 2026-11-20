@@ -29,15 +29,16 @@ def between(text, start, end):
 class Templates(unittest.TestCase):
     def test_engineer_mail_contract(self):
         for text in [gpt("engineer"), claude_t("engineer")]:
-            self.assertIn("In a warm thread, answer directly without recapping.", text)
-            self.assertIn("Before you send or edit user mail, check the thread with `mail.read`.", text)
-            self.assertIn("Your project's last mail stays live until the user replies or deals it.", text)
-            self.assertIn("For the same question, use `mail.edit` for new findings, including the result.", text)
-            self.assertIn("Send new mail only if none is live.", text)
-            self.assertIn("Never edit answered mail.", text)
-            self.assertIn("Put running status in `mail.status`", text)
-            self.assertIn("Follow-ups about the same work stay in the thread.", text)
-            self.assertIn("For a different question, use `mail.fork(id, answer)` with the id of the mail that raised it.", text)
+            for rule in [
+                "In a warm thread, answer directly.",
+                "check the thread with `mail.read`",
+                "send with `ping=False` and edit that mail as the work moves",
+                "`mail.edit(id, text, ping=True)` makes it wait for the user",
+                "do not edit mail the user answered",
+                "a `## recap` section that lets the user answer without reading the history",
+            ]:
+                self.assertIn(rule, text)
+            self.assertNotIn("mail.status", text)
             self.assertIn("link to the PR or save and link the diff", text)
             self.assertIn("paste its last output lines verbatim in a code block, including the final summary", text)
             self.assertIn("include a screenshot if the change is visible", text)
@@ -79,9 +80,8 @@ class Templates(unittest.TestCase):
                        "loads applicable AGENTS.md guidance and the skill catalogue",
                        "Without an explicit request, do NOT consult the Advisor for:"]:
             self.assertIn(needle, collaboration)
-        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, kind=None) → int', text)
-        self.assertIn('mail.status(thread, text)', text)
-        self.assertIn("Put running status in `mail.status`", text)
+        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, ping=True) → int', text)
+        self.assertNotIn('mail.status', text)
         self.assertNotIn("Post passing progress", text)
         self.assertIn("(ASD-STE100). The send refuses a sentence of more than 25 words", text)
         self.assertIn("it reports back to you with mail.send.", text)
@@ -268,7 +268,7 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
-            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, kind=None)", text)
+            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, ping=True)", text)
         note = (f"Engineer eng-{direct.id} started you for the user; ask it with mail.send('eng-{direct.id}', text) if you "
                 "need more context. You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))

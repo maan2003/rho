@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rho_agent_types::{Address, ChatSeq, MentionKind, Message, WorksetId, WorksetKind};
+use rho_agent_types::{Address, ChatSeq, Message, WorksetId, WorksetKind};
 use rho_db::RhoDb;
 
 use super::scripted::Scripted;
@@ -136,7 +136,7 @@ impl Harness {
     }
 
     /// What the model posted, oldest first, with how it mentions the user.
-    fn posted(&self) -> Vec<(String, Option<MentionKind>)> {
+    fn posted(&self) -> Vec<(String, bool)> {
         self.db
             .read()
             .mail_since(ChatSeq::ZERO, usize::MAX)
@@ -146,7 +146,7 @@ impl Harness {
             .map(|message| {
                 (
                     rho_agent_types::transcript::text_content(&message.content),
-                    message.mentions(Address::User),
+                    message.pings_user(),
                 )
             })
             .collect()
@@ -397,8 +397,8 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     assert_eq!(
         harness.posted(),
         [
-            ("hello there".to_owned(), Some(MentionKind::Result)),
-            ("reading".to_owned(), None),
+            ("hello there".to_owned(), true),
+            ("reading".to_owned(), false),
         ]
     );
 }
@@ -875,7 +875,7 @@ async fn a_post_outside_simplified_technical_english_raises_and_is_not_posted() 
     let script = Arc::new(Scripted::new());
     script
         .then(
-            "human.send(\"I'm reading\", kind='status')\nhuman.send(\"It's done.\", kind='result')",
+            "human.send(\"I am reading.\", kind='status')\nhuman.send(\"It's done.\", kind='result')",
         )
         .then("human.send('It is done.', kind='result')\nend_turn()");
     let (handle, _task) = harness.start(&script).await;
@@ -891,8 +891,8 @@ async fn a_post_outside_simplified_technical_english_raises_and_is_not_posted() 
         "{told}"
     );
     harness.until_sent("It is done.").await;
-    // A status is not held to the standard.
-    assert_eq!(harness.sent(), ["I'm reading", "It is done."]);
+    // Progress is user mail too; unlike the invalid words it is kept.
+    assert_eq!(harness.sent(), ["I am reading.", "It is done."]);
     drop(handle);
 }
 

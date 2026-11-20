@@ -101,40 +101,40 @@ async fn follow(
     mut asks: mpsc::UnboundedReceiver<ChatSeq>,
 ) {
     let mut sent: Option<ChatSeq> = None;
-    let mut status_changed = services.pool.watch_thread_statuses();
-    let mut send_statuses = true;
-    let mut last_statuses = None;
+    let mut work_changed = services.pool.watch_thread_work();
+    let mut send_work = true;
+    let mut last_work = None;
     loop {
         if let Some(sent) = sent.as_mut()
             && !send_from(&services.db, &outgoing_tx, sent).await
         {
             return;
         }
-        if sent.is_some() && send_statuses {
-            status_changed.borrow_and_update();
-            let statuses = services.pool.thread_statuses();
-            if last_statuses.as_ref() != Some(&statuses) {
+        if sent.is_some() && send_work {
+            work_changed.borrow_and_update();
+            let threads = services.pool.thread_work();
+            if last_work.as_ref() != Some(&threads) {
                 if outgoing_tx
-                    .send(ServerFrame::Statuses {
-                        statuses: statuses.clone(),
+                    .send(ServerFrame::Work {
+                        threads: threads.clone(),
                     })
                     .is_err()
                 {
                     return;
                 }
-                last_statuses = Some(statuses);
+                last_work = Some(threads);
             }
-            send_statuses = false;
+            send_work = false;
         }
         tokio::select! {
-            changed = status_changed.changed() => {
+            changed = work_changed.changed() => {
                 if changed.is_err() {
                     return;
                 }
-                send_statuses = true;
+                send_work = true;
             }
             appended = feed.recv() => match appended {
-                Ok(Appended::Mail(_) | Appended::WorksetDeleted(_)) | Err(broadcast::error::RecvError::Lagged(_)) => send_statuses = true,
+                Ok(Appended::Mail(_) | Appended::WorksetDeleted(_)) | Err(broadcast::error::RecvError::Lagged(_)) => send_work = true,
                 Ok(Appended::Row { .. }) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },

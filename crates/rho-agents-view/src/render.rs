@@ -1340,7 +1340,7 @@ mod tests {
     fn a_host_draft_and_its_step_both_show_in_user_words() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
-        exec.arguments = "mail.send('user', 'Hello', thread=2, kind='fyi')".into();
+        exec.arguments = "mail.send('user', 'Hello', thread=2, ping=False)".into();
         let source = UiBlock::Tool(exec);
         let writer = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let draft = UiBlock::MessageDraft {

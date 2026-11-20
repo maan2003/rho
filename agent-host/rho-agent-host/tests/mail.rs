@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ContentPart, MentionKind, MessageId, Role, Stop,
-    WorksetKind, Wpos,
+    Address, AgentId, ChatEvent, ChatRecord, ContentPart, MessageId, Role, Stop, WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::worksets::{
     AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
@@ -240,7 +239,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         eval(
             workset,
             format!(
-                "from rho import mail\nprint(int(mail.send({:?}, 'user', {:?}, thread={}, kind='ask')))",
+                "from rho import mail\nprint(int(mail.send({:?}, 'user', {:?}, thread={})))",
                 agent.encoded(),
                 words,
                 thread.0.0
@@ -303,16 +302,17 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         unreachable!()
     };
     assert_eq!(
-        mentions.into_iter().map(|m| m.to).collect::<Vec<_>>(),
-        [Address::Agent(b)]
+        mentions
+            .into_iter()
+            .filter_map(|m| m.agent())
+            .collect::<Vec<_>>(),
+        [b]
     );
     // An explicit stop leaves a status, not another mail.
     call(paths, StopAgent { agent: b }).await?;
     loop {
         match read_frame(&mut stream).await? {
-            ServerFrame::Statuses { statuses } if statuses.iter().any(|status|
-                status.thread == thread && status.state == rho_agent_types::StatusText::StoppedByYou
-            ) => break,
+            ServerFrame::Work { threads } if threads.contains(&(thread, rho_agent_types::ThreadWork::StoppedByYou)) => break,
             ServerFrame::Mail { records } => assert!(!records.into_iter().any(|row| {
                 matches!(row.event, ChatEvent::Posted { from: Address::System { agent, .. }, .. } if agent == b)
             })),
@@ -381,7 +381,7 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
     .await?;
     let origin_result = wait_for_mail(&mut stream, |row| matches!(&row.event,
         ChatEvent::Posted { parent: Some(parent), from: Address::Agent(from), mentions, .. }
-        if *parent == thread && *from == agent && mentions.iter().any(|m| m.to == Address::User && m.kind == MentionKind::Result)
+        if *parent == thread && *from == agent && mentions.iter().any(|m| matches!(m, rho_agent_types::Mention::User { ping: true }))
     )).await?;
     let EvalResult { output, error, .. } = call(
         paths,
@@ -392,12 +392,11 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
 import os
 from rho.tools import Mail
 mail = Mail("{}")
-mail.status({}, "Waiting for the capacity report")
-note = await mail.send({}, "Use polling for this check.")
+note = await mail.send("user", "Use polling for this check.", thread={}, ping=False)
 assert isinstance(note, int)
 assert "Mail #{prior} has no user reply" in note.notice, note.notice
 assert "mail.edit({prior}, ...)" in note.notice, note.notice
-mail.edit(note, "Use sockets for this check.")
+mail.edit(note, "Use sockets for this check.", ping=True)
 hits = await mail.search("sockets", project={})
 assert [row["message"] for row in hits] == [note]
 mail.delete(note)
@@ -405,7 +404,6 @@ assert not mail.search("sockets", project={})
 print(f"worker:{{os.getpid()}} note:{{note}}")
 "#,
                 agent.encoded(),
-                thread.0.0,
                 thread.0.0,
                 project.0.0,
                 project.0.0,
@@ -427,18 +425,17 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     let note = MessageId(rho_agent_types::ChatSeq(note.parse()?));
     let mut edited = false;
     let mut deleted = false;
-    let mut status = false;
-    while !(edited && deleted && status) {
+    while !(edited && deleted) {
         match read_frame(&mut stream).await? {
-            ServerFrame::Statuses { statuses } => {
-                status |= statuses.iter().any(|s| {
-                    s.thread == thread && s.state.words() == "Waiting for the capacity report"
-                })
-            }
+            ServerFrame::Work { .. } => {}
             ServerFrame::Mail { records } => {
                 for row in records {
                     match row.event {
-                        ChatEvent::Revised { message, .. } if message == note => edited = true,
+                        ChatEvent::Revised {
+                            message,
+                            ping: Some(true),
+                            ..
+                        } if message == note => edited = true,
                         ChatEvent::Deleted { message } if message == note => deleted = true,
                         _ => {}
                     }
@@ -450,7 +447,6 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     write_frame(&mut stream, &ClientFrame::View { thread: None }).await?;
     rustix::process::kill_process(worker, rustix::process::Signal::KILL)?;
     let mut stop_mail = None;
-    let mut status_cleared = false;
     let stopped = loop {
         match read_frame(&mut stream).await? {
             ServerFrame::Mail { records } => {
@@ -466,12 +462,10 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                     })
                 });
             }
-            ServerFrame::Statuses { statuses } => {
-                status_cleared = !statuses.iter().any(|status| status.thread == thread);
-            }
+            ServerFrame::Work { .. } => {}
             ServerFrame::Hello { .. } => {}
         }
-        if status_cleared && let Some(mail) = stop_mail.take() {
+        if let Some(mail) = stop_mail.take() {
             break mail;
         }
     };
@@ -484,7 +478,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     assert!(
         mentions
             .iter()
-            .any(|m| m.to == Address::User && m.kind == MentionKind::Ask)
+            .any(|m| matches!(m, rho_agent_types::Mention::User { ping: true }))
     );
     let text = rho_agent_types::content_text(&content);
     assert!(text.starts_with("lost · "), "{text}");
@@ -518,15 +512,9 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
         anyhow::bail!("the answer must be durable project mail")
     };
     assert_eq!((parent, target), (Some(thread), Some(reply_to)));
-    assert_eq!(
-        mentions,
-        [rho_agent_types::Mention {
-            to: Address::Agent(agent),
-            kind: MentionKind::Ask
-        }]
-    );
+    assert_eq!(mentions, [rho_agent_types::Mention::Agent(agent)]);
     Ok(format!(
-        "mail wire: project {}, fake model result #{}, status set/cleared, edit/delete #{}, lost stop #{}, and addressed reply #{}",
+        "mail wire: project {}, fake model result #{}, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
 }
@@ -726,10 +714,9 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                         let [mention] = &mail.mentions[..] else {
                             anyhow::bail!("bad child address")
                         };
-                        let Address::Agent(child) = mention.to else {
+                        let rho_agent_types::Mention::Direct(child) = *mention else {
                             anyhow::bail!("not a child")
                         };
-                        assert_eq!(mention.kind, MentionKind::Direct);
                         brief = Some((mail.id, child));
                     }
                     "MAIL-RIG-PEER-RESULT" => {
@@ -737,13 +724,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                         assert_eq!(mail.parent, Some(brief));
                         assert_eq!(mail.reply_to, Some(brief));
                         assert_eq!(mail.from, Address::Agent(child));
-                        assert_eq!(
-                            mail.mentions,
-                            [rho_agent_types::Mention {
-                                to: Address::Agent(leader),
-                                kind: MentionKind::Direct,
-                            }]
-                        );
+                        assert_eq!(mail.mentions, [rho_agent_types::Mention::Direct(leader)]);
                         let claims = cards::claims(
                             &cards::Host {
                                 endpoint: host,
@@ -760,7 +741,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                     "Can I use the test clock?" => {
                         assert_eq!(mail.parent, Some(work));
                         assert_eq!(mail.from, Address::Agent(leader));
-                        assert_eq!(mail.mentions(Address::User), Some(MentionKind::Ask));
+                        assert!(mail.pings_user());
                         ask = Some(mail.id);
                     }
                     _ => {}

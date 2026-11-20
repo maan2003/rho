@@ -5,9 +5,8 @@ What `rank` must make of a history. Each row is a scenario test in
 for every history are proptests there too. The constants the numbers come
 from are in `src/curve.rs`.
 
-The deal ranks cards above the floor. A result waits like an ask: it
-does not fade. An ask or stop deals before a result; within each of
-those groups the longest-waiting card deals first. A recent reply can
+The deal ranks cards above the floor. Pinging mail and stops wait until
+answered, and the longest-waiting card deals first. A recent reply can
 still raise the lamp or chime pressure without changing this order.
 The user's overdue deadlines and skips keep their turns. The user
 answers waiting mail with a reply or verdict.
@@ -16,7 +15,7 @@ answers waiting mail with a reply or verdict.
 
 Agents and the user talk in mail: each host holds a forest of messages,
 and the thread under a message is every reply below it. A message goes to
-a thread, not to a person, and draws the user only by mentioning them.
+a thread, not to a person, and draws the user only by pinging them.
 Each thread is a node; an agent is never a card. What the mail claims for
 each of its cases is the mail's own, in `rho-mail/src/cards.rs`, tested
 there. The rows below are what the dealer makes of a source shaped like
@@ -26,19 +25,19 @@ A card is titled by the thread's subject and the project's address.
 
 | # | History and facts | Card |
 |---|---|---|
-| A1 | An unseen ask | "asks", rises |
-| A2 | An unseen result | "result", rises like an ask, stays until answered |
-| A3 | An unseen fyi | nothing, and it hides no ask or result; the thread is unread on Home |
+| A1 | Unseen pinging mail | `waits`, rises |
+| A2 | A result that pings | `waits` just like a question, stays until answered |
+| A3 | Unseen non-pinging mail | no card; it does not hide pinging mail |
 | A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
-| A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
-| A6 | Seen | nothing until a newer ask or result |
+| A5 | Several unseen pings | one card, counting from the selected ping |
+| A6 | Seen | nothing until newer pinging mail |
 | A7 | The user wrote in the thread within the hour before the mention | a signal pressure bonus, fading over the hour |
 | A8 | Done through a message before the mention | the mention still deals |
 | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not mail |
 | A13 | The thread muted | nothing |
-| A14 | A stop mailed by the system bot | one card, as an ask; stays until answered even if the agent moves on |
+| A14 | A stop mailed by the system bot | one card, with the stop’s reason; stays until answered or recovered |
 
 ## Snoozes
 

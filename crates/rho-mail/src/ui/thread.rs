@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use editor::scroll::Autoscroll;
 use editor::{
-    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, SelectionEffects, SizingBehavior,
+    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, RowExt as _, SelectionEffects,
+    SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -21,7 +22,7 @@ use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
-    Address as Party, ContentPart, EndpointId, Message, MessageId, Revision, StatusText,
+    Address as Party, ChatSeq, ContentPart, EndpointId, Mention, Message, MessageId, Revision,
 };
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
@@ -89,7 +90,8 @@ enum Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Class {
     Crumb,
-    From,
+    User,
+    Recap,
     Time,
     Fold,
     Pending,
@@ -107,12 +109,13 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
 
     fn slot(self) -> usize {
         match self {
             Self::Crumb => 0,
-            Self::From => 1,
+            Self::User => 1,
+            Self::Recap => 11,
             Self::Time => 2,
             Self::Fold => 3,
             Self::Pending => 4,
@@ -135,7 +138,8 @@ impl rho_transcript::Style for Class {
         let colors = cx.theme().colors();
         let (color, weight) = match self {
             Self::Crumb | Self::Time | Self::Pending => (colors.text_muted, None),
-            Self::From => (colors.text_accent, Some(gpui::FontWeight::BOLD)),
+            Self::User => (gpui::rgb(0xafa851).into(), None),
+            Self::Recap => (gpui::rgb(0x97af9b).into(), None),
             Self::Fold => (cx.theme().status().info, None),
             Self::Quote => (colors.text_muted, None),
             Self::Name => (colors.text, None),
@@ -217,6 +221,10 @@ pub struct ThreadView {
     private_edit: Option<PrivateEdit>,
     draft_subscription: Subscription,
     follow: Option<Follow>,
+    awaiting_ping: Option<ChatSeq>,
+    initial_scroll: Option<MessageId>,
+    hint_anchor: Option<Anchor>,
+    last_point_row: u32,
     /// The mail dealt to this view, also the target when the cursor is
     /// between mails rather than on a different writer's mail.
     dealt_mail: Option<MessageId>,
@@ -306,7 +314,30 @@ impl ThreadView {
                 if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
                     let editor = editor.read(cx);
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
-                    let head = editor.selections.newest_anchor().head();
+                    let selection = editor.selections.newest_anchor();
+                    let head = selection.head();
+                    let row = head.to_point(&snapshot).row;
+                    let previous = std::mem::replace(&mut this.last_point_row, row);
+                    let tail = draft::start(this.transcript.buffer(), cx).row;
+                    if selection.start == selection.end
+                        && row < tail
+                        && matches!(this.transcript.line_meta(row, cx), Some(Meta::None))
+                        && this.transcript.buffer().read(cx).line_len(row) == 0
+                    {
+                        let target = if row < previous {
+                            (0..row)
+                                .rev()
+                                .find(|&row| this.transcript.buffer().read(cx).line_len(row) > 0)
+                                .unwrap_or(tail)
+                        } else {
+                            (row + 1..tail)
+                                .find(|&row| this.transcript.buffer().read(cx).line_len(row) > 0)
+                                .unwrap_or(tail)
+                        };
+                        this.last_point_row = target;
+                        this.cursor_to_row(target, Autoscroll::fit(), cx);
+                        return;
+                    }
                     if snapshot
                         .anchor_to_buffer_anchor(head)
                         .is_some_and(|(_, buffer)| {
@@ -317,7 +348,7 @@ impl ThreadView {
                     }
                 } else if matches!(event, EditorEvent::EditBlockedByReadOnly) {
                     this.system.read(cx).frame.clone().echo(
-                        "mail cannot be edited · write below the line",
+                        "mail cannot be edited · write in the draft",
                         StyleClass::SystemInfo,
                         cx,
                     );
@@ -355,6 +386,10 @@ impl ThreadView {
             private_edit: None,
             draft_subscription,
             follow: None,
+            awaiting_ping: None,
+            initial_scroll: None,
+            hint_anchor: None,
+            last_point_row: 0,
             dealt_mail: None,
             reply_to: None,
             expanded_quotes: HashSet::new(),
@@ -376,7 +411,7 @@ impl ThreadView {
             // The list reads from the top.
             view.cursor_to_first_thread(cx);
         } else {
-            view.cursor_to_latest_mail(cx);
+            view.cursor_to_row(0, Autoscroll::top(), cx);
         }
         // What is unread and the user's private replies come from the
         // ledger, which is the frame's and is leased while it opens this:
@@ -419,6 +454,25 @@ impl ThreadView {
         {
             self.follow = None;
         }
+        if let Some(after) = self.awaiting_ping
+            && !self.has_draft(cx)
+            && draft::on_tail(self.editor.read(cx), self.transcript.buffer(), cx)
+            && let Some(id) = self
+                .system
+                .read(cx)
+                .host_mail(self.thread.host)
+                .and_then(|chat| {
+                    chat.children(Some(self.thread.message))
+                        .iter()
+                        .filter_map(|&id| chat.message(id))
+                        .filter(|mail| mail.pings_user() && mail.version().0 > after)
+                        .min_by_key(|mail| mail.version().0)
+                })
+                .map(|mail| mail.id)
+            && self.cursor_to_item(&Key::Message(id), Autoscroll::fit(), cx)
+        {
+            self.awaiting_ping = None;
+        }
         self.schedule_ages(cx);
         cx.notify();
     }
@@ -430,10 +484,7 @@ impl ThreadView {
             && system
                 .host_mail(self.thread.host)
                 .is_some_and(|chat| !chat.children(Some(self.thread.message)).is_empty());
-        let working = system
-            .status(self.thread)
-            .is_some_and(|status| matches!(status.state, StatusText::Working | StatusText::Stuck));
-        self._ages = (list || working).then(|| {
+        self._ages = list.then(|| {
             let wait = std::time::Duration::try_from(LIST_AGES_EVERY).expect("positive interval");
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
@@ -565,10 +616,7 @@ impl ThreadView {
     }
 
     fn cursor_to_latest_mail(&mut self, cx: &mut Context<Self>) {
-        let row = self
-            .item_row(&Key::Status, cx)
-            .or_else(|| self.item_row(&Key::Separator, cx))
-            .expect("every thread has a draft separator");
+        let row = self.transcript.buffer().read(cx).max_point().row;
         self.cursor_to_row(row.saturating_sub(1), Autoscroll::fit(), cx);
     }
 }
@@ -584,26 +632,15 @@ fn items(
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     let mut items = history_items(system, thread, list, expanded_quotes, private_edit, cx);
-    if !list && let Some(status) = system.status(thread) {
-        let text = status_words(status, Timestamp::now());
-        items.push(line(Key::Status, &text, Class::Crumb));
+    if !list && system.work(thread) == Some(rho_agent_types::ThreadWork::StoppedByYou) {
+        items.push(line(Key::Status, "stopped by you", Class::Crumb));
     }
-    items.push(separator_item(&system.project_of(thread), list, layout));
+    if list {
+        items.push(separator_item(&system.project_of(thread), list, layout));
+    } else {
+        items.push(Item::new(Key::Separator, "").with_lines(vec![Meta::None]));
+    }
     items
-}
-
-fn status_words(status: &rho_agent_types::ThreadStatus, now: Timestamp) -> String {
-    match &status.state {
-        StatusText::Written(_) | StatusText::StoppedByYou => status.state.words().to_owned(),
-        StatusText::Working | StatusText::Stuck => {
-            let since = Timestamp::from_millisecond(status.at.0 as i64).expect("a status time");
-            format!(
-                "{} · {}",
-                status.state.words(),
-                rho_dealer::curve::age(since, now)
-            )
-        }
-    }
 }
 
 fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class, Meta> {
@@ -671,11 +708,27 @@ fn history_items(
             private_items(frame.marks(), chat, host, thread.message, private_edit)
         })
         .unwrap_or_default();
-    let project = system.project_of(thread);
+    let cold = system.thread_is_cold(thread, Timestamp::now());
+    let mail_item = |message: &Message| {
+        let voice = match message.from {
+            Party::Agent(agent)
+                if message
+                    .mentions
+                    .iter()
+                    .any(|m| matches!(m, Mention::Direct(_))) =>
+            {
+                system
+                    .agent_label(host, agent, cx)
+                    .or_else(|| Some(agent.encoded()))
+            }
+            _ => None,
+        };
+        message_item(message, voice.as_deref(), cold, expanded_quotes)
+    };
     if let Some(message) = chat.message(thread.message)
         && !list
     {
-        items.extend(message_item(message, &project, expanded_quotes));
+        items.extend(mail_item(message));
         items.extend(private.remove(&thread.message).unwrap_or_default());
     }
     // A root's list starts at its first thread: nothing stands above it
@@ -700,7 +753,8 @@ fn history_items(
         let Some(message) = chat.message(*id) else {
             continue;
         };
-        items.extend(message_item(message, &project, expanded_quotes));
+        let start = items.len();
+        items.extend(mail_item(message));
         items.extend(private.remove(id).unwrap_or_default());
         let replies = chat.children(Some(*id));
         if !replies.is_empty() {
@@ -718,7 +772,9 @@ fn history_items(
             items
                 .push(line(Key::Fold(*id), &text, Class::Fold).with_lines(vec![Meta::Thread(*id)]));
         }
-        gap_item(&mut items);
+        if items.len() != start {
+            gap_item(&mut items);
+        }
     }
     items.extend(pending_items(system, host, thread.message, &mut gap_item));
     without_trailing_gap(items)
@@ -824,13 +880,19 @@ fn pending_items(
     let mut items = Vec::new();
     for outgoing in system.waiting_under(host, Some(parent)) {
         let id = outgoing.at.0;
-        let mut text = "you · sending…\n".to_owned();
-        text.push_str(&body(&outgoing.content));
-        let header = text.find('\n').unwrap_or(text.len());
+        let mut text = body(&outgoing.content);
+        let first = text.find('\n').unwrap_or(text.len());
+        text.insert_str(first, " · sending…");
+        let tag = first..first + " · sending…".len();
         let lines = text.lines().count().max(1);
+        let len = text.len();
         items.push(
             Item::new(Key::Pending(id), text)
-                .with_styles(vec![(Class::Pending, 0..header)])
+                .with_styles(vec![
+                    (Class::User, 0..tag.start),
+                    (Class::Pending, tag.clone()),
+                    (Class::User, tag.end..len),
+                ])
                 .with_lines(vec![Meta::None; lines]),
         );
         gap_item(&mut items);
@@ -869,7 +931,7 @@ fn thread_rows(
             .iter()
             .filter(|id| {
                 chat.message(**id)
-                    .is_some_and(|message| message.mentions(Party::User).is_some())
+                    .is_some_and(|message| message.pings_user())
             })
             .count();
         let (_, at) = chat.newest_in(*id).unwrap_or_else(|| message.version());
@@ -895,9 +957,7 @@ fn thread_rows(
             };
             waiting.push((format!("{replies} {word}"), Class::Time));
         }
-        if let Some(status) = system.status(thread) {
-            waiting.push((status.state.words().to_owned(), Class::Time));
-        }
+
         waiting.push((ago(at.0, now), Class::Time));
         for (index, (word, class)) in waiting.into_iter().enumerate() {
             text.push_str(match index {
@@ -996,7 +1056,13 @@ impl ThreadView {
         self.clear_draft(cx);
         self.dealt_mail = None;
         self.refresh(cx);
-        self.cursor_to_latest_mail(cx);
+        let tail = draft::start(self.transcript.buffer(), cx);
+        self.cursor_to_row(tail.row, Autoscroll::fit(), cx);
+        self.awaiting_ping = self
+            .system
+            .read(cx)
+            .host_mail(thread.host)
+            .map(|chat| chat.head);
         // In a project the message is a new thread: the cursor goes to it in
         // the list, on its way and then where the list puts it, so `enter`
         // opens it.
@@ -1023,11 +1089,33 @@ impl ThreadView {
         ) {
             Some(draft::Hit::Text(anchor)) => Some(anchor),
             Some(draft::Hit::Separator) => None,
+            None if self.layout == Layout::Phone
+                && self.below_draft(event.position, window, cx) =>
+            {
+                None
+            }
             None => return,
         };
         self.focus_draft(position, window, cx);
         window.prevent_default();
         cx.stop_propagation();
+    }
+
+    fn below_draft(
+        &self,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let snapshot = self
+            .editor
+            .update(cx, |editor, cx| editor.snapshot(window, cx));
+        let last = snapshot.max_point();
+        self.editor.update(cx, |editor, cx| {
+            editor
+                .window_position_for_display_point(last, &snapshot, window, cx)
+                .is_some_and(|point| at.y > point.y)
+        })
     }
 
     fn focus_draft(&self, position: Option<Anchor>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1302,6 +1390,34 @@ impl ThreadView {
             .update(cx, |_, cx| cx.emit(Event::Inspect { mail, agent }));
     }
 
+    fn long_press(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.private_edit.is_some() {
+            return;
+        }
+        let editor = self.editor.read(cx);
+        let Some((anchor, _, _)) =
+            editor.buffer_location_for_window_position(position, editor::Bias::Left)
+        else {
+            return;
+        };
+        let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
+        if self
+            .transcript
+            .line_meta(row, cx)
+            .and_then(Meta::mail)
+            .is_some()
+        {
+            self.quote(row..=row, window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
     fn tap_mail_header(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -1512,7 +1628,8 @@ fn incoming(mail: Option<&Message>) -> bool {
 
 fn message_item(
     message: &Message,
-    project: &str,
+    third_voice: Option<&str>,
+    cold: bool,
     expanded_quotes: &HashSet<QuoteId>,
 ) -> Option<Item<Key, Class, Meta>> {
     let edited = match message.revision {
@@ -1521,24 +1638,41 @@ fn message_item(
         Revision::TakenBack { .. } => " · taken back",
         Revision::Deleted => return None,
     };
-    let from = match message.from {
-        Party::User => "you",
-        Party::Agent(_) | Party::System { .. } | Party::StartFailed => project,
-    };
-    let time = thread::when(message.at.0 as i64);
-    let mut text = format!("{from} · {time}{edited}");
-    let mut styles = vec![
-        (Class::From, 0..from.len()),
-        (Class::Time, from.len()..text.len()),
-    ];
-    let mut lines = vec![Meta::Mail(message.id)];
     let body = body(&message.content);
+    let recap = rho_agent_types::recap_section(&body);
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    let mut lines = Vec::new();
+    if let Some(voice) = third_voice {
+        text.push_str(voice);
+        styles.push((Class::Crumb, 0..text.len()));
+        lines.push(Meta::Mail(message.id));
+    }
+    let voice = if message.from == Party::User {
+        Class::User
+    } else {
+        Class::Name
+    };
+    let mut offset = 0;
     let mut body_lines = body.lines().enumerate().peekable();
+    let mut first_body = true;
     while let Some((first_line, line)) = body_lines.next() {
-        text.push('\n');
+        let in_recap = recap.as_ref().is_some_and(|range| range.contains(&offset));
+        offset += line.len() + 1;
+        if in_recap && !cold {
+            // The preceding separator belongs to the hidden section.
+            if lines.len() > 1 && text.ends_with('\n') {
+                text.pop();
+                lines.pop();
+            }
+            continue;
+        }
+        if !lines.is_empty() {
+            text.push('\n');
+        }
         let start = text.len();
         text.push_str(line);
-        if line.starts_with("> ") {
+        if line.starts_with("> ") && !in_recap {
             let quote = QuoteId {
                 mail: message.id,
                 first_line,
@@ -1550,6 +1684,7 @@ fn message_item(
                 .is_some_and(|(_, line)| line.starts_with("> "))
             {
                 let (_, quoted) = body_lines.next().expect("peeked a quote line");
+                offset += quoted.len() + 1;
                 more = true;
                 if expanded {
                     text.push('\n');
@@ -1563,8 +1698,28 @@ fn message_item(
             styles.push((Class::Quote, start..text.len()));
             lines.push(Meta::Quote(quote));
         } else {
+            styles.push((
+                if in_recap { Class::Recap } else { voice },
+                start..text.len(),
+            ));
             lines.push(Meta::Mail(message.id));
         }
+        if first_body {
+            let first_end = text[start..].find('\n').map_or(text.len(), |n| start + n);
+            text.insert_str(first_end, edited);
+            // An expanded quote is still quiet after its tag.
+            if let Some((_, range)) = styles.last_mut() {
+                if first_end != range.end {
+                    range.end += edited.len();
+                }
+            }
+            styles.push((Class::Crumb, first_end..first_end + edited.len()));
+            first_body = false;
+        }
+    }
+    // A mail containing only a hidden recap has no visible rows.
+    if lines.is_empty() {
+        return None;
     }
     styles.extend(links(&text).into_iter().map(|link| (Class::Link, link)));
     Some(
@@ -1597,7 +1752,8 @@ impl Surface for ThreadView {
         };
         self.dealt_mail = Some(mail);
         thread::enter_normal_mode(&self.editor, window, cx);
-        self.cursor_to_item(&Key::Message(mail), Autoscroll::focused(), cx);
+        self.cursor_to_item(&Key::Message(mail), Autoscroll::fit(), cx);
+        self.initial_scroll = Some(mail);
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -1674,6 +1830,21 @@ impl Surface for ThreadView {
                     })
                     .bound_to(ReplyPrivately),
                 );
+            }
+            if self
+                .selected_reply_target(self.cursor_row(cx), cx)
+                .is_some()
+            {
+                let view = this.clone();
+                rows.push(Row::run("", "quote mail line", move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        let row = view.cursor_row(cx);
+                        let lines = view
+                            .mail_selection(view.selection_range(cx), cx)
+                            .unwrap_or(row..=row);
+                        view.quote(lines, window, cx);
+                    });
+                }));
             }
             if has_draft {
                 rows.push(
@@ -1822,19 +1993,101 @@ impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let system = self.system.read(cx);
         let list = self.is_list(system);
+        if let Some(mail) = self.initial_scroll.take() {
+            let weak = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.editor.update(cx, |editor, cx| {
+                        let display = editor.display_snapshot(cx);
+                        let fits = editor.visible_line_count().is_some_and(|count| {
+                            display.row_y(display.max_point().row().as_f64() + 1.) <= count
+                        });
+                        if fits {
+                            let top = editor
+                                .buffer()
+                                .read(cx)
+                                .snapshot(cx)
+                                .anchor_before(Point::zero());
+                            editor.request_autoscroll(Autoscroll::top().for_anchor(top), cx);
+                        } else if let Some(row) = view.item_row(&Key::Message(mail), cx) {
+                            let from = editor
+                                .buffer()
+                                .read(cx)
+                                .snapshot(cx)
+                                .anchor_after(Point::new(row, 0));
+                            editor.request_autoscroll(Autoscroll::top().for_anchor(from), cx);
+                        }
+                        let _ = window;
+                    });
+                });
+            });
+        }
+        let hint = (!list && self.draft.read(cx).is_empty()).then(|| {
+            self.editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(draft::start(self.transcript.buffer(), cx))
+        });
+        if self.hint_anchor != hint {
+            self.hint_anchor = hint;
+            self.editor.update(cx, |editor, cx| {
+                editor.set_eol_hints(
+                    hint.map(|anchor| {
+                        let render: editor::EolHintRenderer = Arc::new(|_, cx| {
+                            div()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child("reply")
+                                .into_any_element()
+                        });
+                        (anchor, render)
+                    })
+                    .into_iter()
+                    .collect(),
+                    cx,
+                );
+            });
+        }
         let layout = Layout::of(window.viewport_size().width);
         if layout != self.layout {
             self.layout = layout;
-            let label = separator_item(&system.project_of(self.thread), list, layout);
-            self.transcript.replace(&Key::Separator, label, cx);
+            if list {
+                let label =
+                    separator_item(&self.system.read(cx).project_of(self.thread), list, layout);
+                self.transcript.replace(&Key::Separator, label, cx);
+            }
         }
         let context = if list {
             thread::PROJECT_SCREEN
         } else {
             thread::SCREEN
         };
+        let view = cx.weak_entity();
+        let gesture = (layout == Layout::Phone && !list).then(move || {
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    window.on_mouse_event(
+                        move |event: &gpui::LongPressEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture
+                                && event.phase == gpui::TouchPhase::Started
+                                && bounds.contains(&event.start_position)
+                            {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.long_press(event.start_position, window, cx)
+                                });
+                            }
+                        },
+                    );
+                },
+            )
+            .absolute()
+            .size_full()
+        });
         div()
             .id("thread")
+            .relative()
             .key_context(context)
             .size_full()
             .bg(cx.theme().colors().editor_background)
@@ -1850,6 +2103,7 @@ impl Render for ThreadView {
             .capture_any_mouse_down(cx.listener(Self::tap_tail))
             .capture_any_mouse_down(cx.listener(Self::tap_mail_header))
             .child(self.editor.clone())
+            .children(gesture)
     }
 }
 
@@ -1895,24 +2149,6 @@ mod tests {
         assert_eq!(saved.lines[3], Meta::Private { note, mail });
     }
 
-    #[test]
-    fn working_and_stuck_show_their_own_words_and_clock() {
-        let first = 1_000_000;
-        let mut status = rho_agent_types::ThreadStatus {
-            thread: MessageId(ChatSeq(7)),
-            at: UnixMs(first),
-            state: StatusText::Working,
-        };
-        let now = Timestamp::from_millisecond(first as i64 + 5_000).unwrap();
-        assert_eq!(status_words(&status, now), "working · now");
-        status.state = StatusText::Stuck;
-        let now = Timestamp::from_millisecond(first as i64 + 258_000).unwrap();
-        assert_eq!(
-            status_words(&status, now),
-            "stuck · can't reach its model · 4m"
-        );
-    }
-
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
             id: MessageId(rho_agent_types::ChatSeq(13)),
@@ -1925,6 +2161,7 @@ mod tests {
                 text: text.to_owned(),
             }],
             revision,
+            ping_started: None,
         }
     }
 
@@ -1945,21 +2182,21 @@ mod tests {
             "cargo exited 101",
         );
         let user = mail(Party::User, Revision::Original, "Go ahead.");
-        for (mail, from, marker) in [
-            (&original, "tide@lab", false),
-            (&bot, "tide@lab", true),
-            (&user, "you", false),
+        for (mail, first) in [
+            (&original, "Ready?"),
+            (&bot, "cargo exited 101 · edited"),
+            (&user, "Go ahead."),
         ] {
-            let item = message_item(mail, "tide@lab", &HashSet::new()).unwrap();
-            let header = item.text.lines().next().unwrap();
-            assert!(header.starts_with(&format!("{from} · ")), "{header}");
-            assert_eq!(header.ends_with(" · edited"), marker);
+            let item = message_item(mail, None, true, &HashSet::new()).unwrap();
+            assert_eq!(item.text, format!("{first}\n"));
         }
+        let third_voice = message_item(&original, Some("eng-ab12"), true, &HashSet::new()).unwrap();
+        assert_eq!(third_voice.text, "eng-ab12\nReady?\n");
         let deleted = Message {
             revision: Revision::Deleted,
             ..original
         };
-        assert!(message_item(&deleted, "tide@lab", &HashSet::new()).is_none());
+        assert!(message_item(&deleted, None, true, &HashSet::new()).is_none());
     }
 
     #[test]
@@ -2005,10 +2242,9 @@ mod tests {
             mail: message.id,
             first_line: 4,
         };
-        let folded = message_item(&message, "tide@lab", &HashSet::new()).unwrap();
-        let display = |text: &str| text.split_once('\n').unwrap().1.to_owned();
+        let folded = message_item(&message, None, true, &HashSet::new()).unwrap();
         assert_eq!(
-            display(&folded.text),
+            folded.text,
             "preface\n> façade first …\nCan this ship?\n> another quote …\n",
         );
         let quote_text = |item: &Item<Key, Class, Meta>| {
@@ -2022,9 +2258,9 @@ mod tests {
             quote_text(&folded),
             ["> façade first …", "> another quote …"]
         );
-        let expanded = message_item(&message, "tide@lab", &HashSet::from([first])).unwrap();
+        let expanded = message_item(&message, None, true, &HashSet::from([first])).unwrap();
         assert_eq!(
-            display(&expanded.text),
+            expanded.text,
             "preface\n> façade first\n> second\nCan this ship?\n> another quote …\n",
         );
         assert_eq!(
@@ -2032,7 +2268,7 @@ mod tests {
             ["> façade first\n> second", "> another quote …"]
         );
         assert_eq!(
-            &expanded.lines[2..],
+            &expanded.lines[1..],
             &[
                 Meta::Quote(first),
                 Meta::Quote(first),

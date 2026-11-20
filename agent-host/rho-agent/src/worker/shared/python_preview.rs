@@ -518,7 +518,7 @@ mod tests {
                 "mail.send('user', 'old')\nmail.send('user', 'new",
                 Some("new"),
             ),
-            ("mail.send('user', 'done', kind='result')", Some("done")),
+            ("mail.send('user', 'done')", Some("done")),
             (
                 "end_turn()\nfor item in items:\n    print(item)\nmail.send('user', \"After work",
                 Some("After work"),
@@ -542,7 +542,7 @@ mod tests {
         };
         assert_eq!(
             topic(draft(
-                "mail.send('user', 'old', kind='fyi')\nmail.send('user', 'Hello', kind='result', thread='#41')"
+                "mail.send('user', 'old', ping=False)\nmail.send('user', 'Hello', thread='#41')"
             )),
             Some((Some(MessageId(ChatSeq(41))), "Hello".to_owned()))
         );
@@ -563,7 +563,7 @@ mod tests {
             "mail.send('user', value)",
             // Finished posts that do not mention the user.
             "mail.send('#12', 'to the topic')",
-            "mail.send('user', 'old', kind='fyi')\nmail.send('eng-abc', 'to an agent",
+            "mail.send('user', 'old', ping=False)\nmail.send('eng-abc', 'to an agent",
             "mail.send('eng-a', 'to agents')",
             "mail.send(who, 'to someone')",
             "mail.send('user', 'text', value)",
@@ -602,12 +602,9 @@ mod tests {
             ("mail.send('user', 'Hi ' + str(name)", Some("Hi ")),
             ("mail.send('user', name + 'suffix'", None),
             ("mail.send('user', 'Hi ' * 0", None),
+            ("mail.send('user', 'Hi ' + name)", Some("Hi ")),
             (
-                "mail.send('user', 'Hi ' + name, kind='result')",
-                Some("Hi "),
-            ),
-            (
-                "mail.send('user', 'Hi ' + 'there' + name, kind='result')",
+                "mail.send('user', 'Hi ' + 'there' + name)",
                 Some("Hi there"),
             ),
         ] {
@@ -634,10 +631,7 @@ mod tests {
                 "mail.send('user', \"foo\" + \"bar\" \"baz",
                 Some("foobarbaz"),
             ),
-            (
-                "mail.send('user', \"foo\" \"bar\", kind='result')",
-                Some("foobar"),
-            ),
+            ("mail.send('user', \"foo\" \"bar\")", Some("foobar")),
             ("mail.send('user', \"foo\" name", None),
             ("mail.send('user', \"foo\" b\"bar", None),
         ] {
@@ -670,12 +664,9 @@ mod tests {
             ("mail.send('user', f\"Hello {name} later", Some("Hello ")),
             ("mail.send('user', f\"Hello {name} later\"", Some("Hello ")),
             ("print(1)\nmail.send('user', f\"Hello {name", Some("Hello ")),
+            ("mail.send('user', f\"Hello {name} later\")", Some("Hello ")),
             (
-                "mail.send('user', f\"Hello {name} later\", kind='result')",
-                Some("Hello "),
-            ),
-            (
-                "mail.send('user', f\"Hello {name} later\", kind='result')\nx = 2",
+                "mail.send('user', f\"Hello {name} later\")\nx = 2",
                 Some("Hello "),
             ),
         ] {
@@ -690,10 +681,10 @@ mod tests {
     #[test]
     fn all_prefixes_after_visible_text_keep_draft() {
         let cases = [
-            "import asyncio\nawait asyncio.sleep(10)\nmail.send('user', \"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\", kind='result')",
-            "mail.send('user', 'Hello, world!', kind='result')",
-            "mail.send('user', \"One line\\nThe next!\", kind='result')",
-            "mail.send('user', 'first' + ' second' + ' third', kind='result')",
+            "import asyncio\nawait asyncio.sleep(10)\nmail.send('user', \"\"\"The first line.\\nThe second line with a \\\"quote\\\" and α.\"\"\")",
+            "mail.send('user', 'Hello, world!')",
+            "mail.send('user', \"One line\\nThe next!\")",
+            "mail.send('user', 'first' + ' second' + ' third')",
         ];
         let mut parser = Parser::new();
         parser
@@ -720,31 +711,31 @@ mod tests {
     fn multiline_triple_quoted_prefixes_keep_their_known_text() {
         let cases = [
             (
-                "mail.send('user', \"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\", kind='result')",
+                "mail.send('user', \"\"\"First line\n\nSecond line with \"quotes\" and α.\"\"\")",
                 "First line\n\nSecond line with \"quotes\" and α.",
             ),
             (
-                "mail.send('user', \n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n, kind='result')",
+                "mail.send('user', \n    \"\"\"\nFirst line\nSecond line\n\"\"\"\n)",
                 "\nFirst line\nSecond line\n",
             ),
             (
-                "mail.send('user', '''First line\nSecond line with 'quotes'.''', kind='result')",
+                "mail.send('user', '''First line\nSecond line with 'quotes'.''')",
                 "First line\nSecond line with 'quotes'.",
             ),
             (
-                "mail.send('user', f\"\"\"First line\nSecond line {name}!\"\"\", kind='result')",
+                "mail.send('user', f\"\"\"First line\nSecond line {name}!\"\"\")",
                 "First line\nSecond line ",
             ),
             (
-                "mail.send('user', r\"\"\"First line\nSecond line\\n\"\"\", kind='result')",
+                "mail.send('user', r\"\"\"First line\nSecond line\\n\"\"\")",
                 "First line\nSecond line\\n",
             ),
             (
-                "mail.send('user', \"\"\"First line\"\"\" + \"\"\"Second line\"\"\", kind='result')",
+                "mail.send('user', \"\"\"First line\"\"\" + \"\"\"Second line\"\"\")",
                 "First lineSecond line",
             ),
             (
-                "mail.send('user', \"\"\"Before (\"A Python\"). After.\"\"\", kind='result')",
+                "mail.send('user', \"\"\"Before (\"A Python\"). After.\"\"\")",
                 "Before (\"A Python\"). After.",
             ),
         ];
@@ -790,10 +781,10 @@ mod tests {
         for source in [
             "mail.send('user', \"\"\"Hello\"",
             "mail.send('user', \"\"\"Hello\"\"",
-            "mail.send('user', \"\"\"Hello\"\"\", kind='result')",
+            "mail.send('user', \"\"\"Hello\"\"\")",
             "mail.send('user', '''Hello'",
             "mail.send('user', '''Hello''",
-            "mail.send('user', '''Hello''', kind='result')",
+            "mail.send('user', '''Hello''')",
         ] {
             assert_eq!(
                 preview(&mut parser, source).as_deref(),
@@ -805,7 +796,7 @@ mod tests {
 
     #[test]
     fn streamed_claude_json_prefix_does_not_withdraw_visible_draft() {
-        let source = "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\", kind='result')";
+        let source = "mail.send('user', \"\"\"First line (\"A Python\").\nSecond line with \"quotes\".\"\"\")";
         let arguments = serde_json::json!({"source": source}).to_string();
         let mut visible = false;
         for (i, _) in arguments

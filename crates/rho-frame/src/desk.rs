@@ -99,8 +99,8 @@ pub(crate) fn desk_rows(
     project_of: impl Fn(&Address) -> Option<IdeaProject>,
     now: Timestamp,
 ) -> DeskRows {
-    // A project's stops occupy its first stop's place. Every ask and
-    // result remains a row, even when another came from the same project.
+    // A project's stops occupy its first stop's place. Every pinging mail
+    // remains a row, even when another came from the same project.
     let mut waiting: Vec<(DeskRow, CardKind, usize, bool)> = Vec::new();
     let mut stops = HashMap::new();
     for card in &hand.cards {
@@ -139,9 +139,8 @@ pub(crate) fn desk_rows(
         let mut total = 0;
         for (row, kind, count, _) in hidden {
             let nouns = match kind {
-                CardKind::Ask => ("ask", "asks"),
+                CardKind::Waits => ("wait", "wait"),
                 CardKind::Stop(_) => ("stop", "stops"),
-                CardKind::Result => ("result", "results"),
                 CardKind::Other => ("card", "cards"),
             };
             let index = *positions.entry((&row.project, nouns)).or_insert_with(|| {
@@ -1001,8 +1000,8 @@ mod tests {
             address: address(n),
             title: format!("idea {n}"),
             context: "unformatted channel".into(),
-            label: format!("asks · {n}m"),
-            kind: CardKind::Ask,
+            label: format!("waits · {n}m"),
+            kind: CardKind::Waits,
             priority: f64::from(n),
             cursor: format!("{n}/100"),
             skipped: false,
@@ -1051,8 +1050,8 @@ mod tests {
         }
         cards[10].label = "stuck · 1m".into();
         cards[10].kind = CardKind::Stop("stuck");
-        cards[8].label = "result · 6m".into();
-        cards[8].kind = CardKind::Result;
+        cards[8].label = "waits · 6m".into();
+        cards[8].kind = CardKind::Waits;
         let hand = Hand {
             cards: cards.to_vec(),
             next_change: None,
@@ -1079,10 +1078,7 @@ mod tests {
         assert_eq!(rows.waiting[6].words, "3 stops · 7m");
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, DeskTarget::Card(address(12)));
-        assert_eq!(
-            overflow.words,
-            "and 2 more · unformatted channel 1 result · unformatted channel 1 ask"
-        );
+        assert_eq!(overflow.words, "and 2 more · unformatted channel 2 wait");
         let afterwards = Hand {
             cards: hand
                 .cards
@@ -1100,8 +1096,8 @@ mod tests {
     fn two_results_from_one_project_keep_their_subjects_and_name_hidden_cards() {
         let mut cards = [7, 85, 2, 71, 28, 25, 48, 44, 12, 16].map(card);
         for card in &mut cards[8..] {
-            card.kind = CardKind::Result;
-            card.label = "result · now".into();
+            card.kind = CardKind::Waits;
+            card.label = "waits · now".into();
         }
         let hand = Hand {
             cards: cards.into(),
@@ -1118,10 +1114,7 @@ mod tests {
         assert_eq!(rows.waiting[1].subject, "idea 85");
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, DeskTarget::Card(address(44)));
-        assert_eq!(
-            overflow.words,
-            "and 3 more · clock@lab 1 ask · clock@lab 2 results"
-        );
+        assert_eq!(overflow.words, "and 3 more · clock@lab 3 wait");
 
         let hand = Hand {
             cards: hand.cards[8..].into(),

@@ -127,7 +127,7 @@ class Tools(WorksetCase):
             "name": "side", "preset": "engineer", "started_by": self.root, "cwd": self.tmp, "origin": f"chat:{brief['id']}",
         })
         # The user learns of it by a mention that makes no card.
-        self.assertEqual(brief["mentions"], [("user", "fyi")])
+        self.assertEqual(brief["mentions"], [("user", False)])
         self.assertIn("It reports to the user, not to you.", reply)
         # It joins the brief's thread and starts from the brief; the spawner
         # does not join.
@@ -185,10 +185,10 @@ class Tools(WorksetCase):
 
         printed, note = run(lambda: mailbox.send(f"#{first}", "On it."))
         self.assertEqual(printed, f"Sent mail #{note}.\n")
-        printed, result = run(lambda: mailbox.send(None, "Done.", reply_to=first, kind="result"))
+        printed, result = run(lambda: mailbox.send(None, "Done.", reply_to=first))
         self.assertEqual(self.state.messages[-1]["id"], result)
         self.assertEqual(self.state.messages[-1]["reply_to"], first)
-        self.assertEqual(self.state.messages[-1]["mentions"], [("user", "result")])
+        self.assertEqual(self.state.messages[-1]["mentions"], [("user", True)])
         self.assertIn(f"(reply to #{first}): Done.", run(lambda: mailbox.read(first))[0])
 
         _, direct = run(lambda: mailbox.send(f"eng-{child}@local", "Check this."))
@@ -219,7 +219,7 @@ class Tools(WorksetCase):
         self.assertIsNone(awaited.notice)
 
         self.state.send_unanswered = expected, self.root
-        printed, result = run(lambda: mailbox.send("user", "Done.", thread=thread, kind="result"))
+        printed, result = run(lambda: mailbox.send("user", "Done.", thread=thread))
         self.assertEqual(asyncio.run(_await(result)), expected + 1)
         self.assertEqual(
             result.notice,
@@ -253,15 +253,15 @@ class Tools(WorksetCase):
         self.assertEqual(len(self.state.messages), 4, "awaiting a fork must not post again")
 
         for name, method, args, expected in [
-            ("thread_status", mailbox.status, (thread, "Checking the clock"), (self.root, thread, "Checking the clock")),
             ("edit_message", mailbox.edit, (mail, "A new body"), (self.root, mail, "A new body")),
             ("delete_message", mailbox.delete, (mail,), (self.root, mail)),
         ]:
             with self.subTest(name=name), mock.patch.object(fake_rho, name, create=True, return_value=None) as host:
                 done = method(*args)
-                host.assert_called_once_with(*expected)
+                kwargs = {"ping": None} if name == "edit_message" else {}
+                host.assert_called_once_with(*expected, **kwargs)
                 self.assertIsNone(asyncio.run(_await(done)))
-                host.assert_called_once_with(*expected)
+                host.assert_called_once_with(*expected, **kwargs)
 
         hits = [{"message": mail, "thread": thread, "project": project, "subject": "Do it.", "excerpt": "kernel"}]
         with mock.patch.object(fake_rho, "search_mail", create=True, return_value=hits) as search:
@@ -279,9 +279,8 @@ class Tools(WorksetCase):
         project = fake_rho.post_user(None, "rho")
         thread = fake_rho.post_user(project, "Do it.")
         for address, text, opts, error in [
-            ("user", "Done.", {"thread": thread}, "needs kind"),
-            ("user", "Done.", {"kind": "result"}, "needs thread"),
-            (thread, "Done.", {"kind": "result"}, "only mail to the user"),
+            ("user", "Done.", {}, "needs thread"),
+            (thread, "Done.", {"ping": False}, "only mail to the user"),
             (f"eng-{self.root}", "Hi.", {}, "yourself"),
             ("#99", "Hi.", {}, "no message 99"),
             ("#-1", "Hi.", {}, "expected a mail id"),
@@ -294,7 +293,7 @@ class Tools(WorksetCase):
                 mailbox.send(address, text, **opts)
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         with self.assertRaisesRegex(ValueError, f"parent agent eng-{self.root}"):
-            tools.Mail(child).send("user", "Hi.", thread=thread, kind="fyi")
+            tools.Mail(child).send("user", "Hi.", thread=thread, ping=False)
         self.assertEqual(len(self.state.messages), 2, "nothing refused was sent")
 
         _, started = run(lambda: mailbox.start("ops", "Look."))

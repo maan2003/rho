@@ -13,8 +13,8 @@ use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{
-    Address, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, Mention, MentionKind,
-    MessageId, content_text,
+    Address, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, Mention, MessageId,
+    content_text,
 };
 use rho_db::{RhoDb, Sen, SenValue};
 
@@ -25,9 +25,9 @@ use crate::outbox::{Kept, Outgoing};
 type Host = [u8; 32];
 
 /// Every record, by the host and position.
-const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("mail5_log");
+const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("mail6_log");
 /// Where this client stands in each host's log.
-const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("mail5_cursor");
+const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("mail6_cursor");
 /// What the user wrote that no host has taken yet, by host and client id.
 const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new("chat3_outbox");
 /// What the user is writing under each parent and has not sent, by host
@@ -103,11 +103,14 @@ impl WrittenMail {
     ) -> Self {
         let audience = if matches!(from, Address::System { .. } | Address::StartFailed) {
             MailAudience::System
-        } else if mentions.iter().any(|mention| mention.to == Address::User) {
+        } else if mentions
+            .iter()
+            .any(|mention| matches!(mention, Mention::User { .. }))
+        {
             MailAudience::User
         } else if mentions
             .iter()
-            .any(|mention| mention.kind == MentionKind::Direct)
+            .any(|mention| matches!(mention, Mention::Direct(_)))
         {
             MailAudience::Direct
         } else {
@@ -132,7 +135,9 @@ impl Cache {
             // Give the new copy its own tables. Drafts and unsent mail
             // are user state and keep their existing tables.
             write.delete_table("chat3_log");
+            write.delete_table("mail5_log");
             write.delete_table("chat3_cursor");
+            write.delete_table("mail5_cursor");
             open_or_rebuild(&mut write, LOG);
             open_or_rebuild(&mut write, CURSOR);
             write.open_table(OUTBOX);

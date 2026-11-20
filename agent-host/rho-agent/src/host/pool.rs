@@ -18,8 +18,7 @@ pub use gccp::{
 };
 pub use mail::MailView;
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, UnixMs,
-    WorksetKind,
+    Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, UnixMs, WorksetKind,
 };
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
@@ -1028,12 +1027,9 @@ impl AgentPool {
             && self.workset_of(agent).is_ok()
             && mentions
                 .iter()
-                .all(|mention| mention.to != Address::Agent(agent))
+                .all(|mention| mention.agent() != Some(agent))
         {
-            mentions.push(Mention {
-                to: Address::Agent(agent),
-                kind: MentionKind::Ask,
-            });
+            mentions.push(Mention::Agent(agent));
         }
         let message = NewMessage {
             from: Address::User,
@@ -1087,10 +1083,7 @@ impl AgentPool {
         agents
             .into_iter()
             .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
-            .map(|agent| Mention {
-                to: Address::Agent(agent),
-                kind: MentionKind::Ask,
-            })
+            .map(Mention::Agent)
             .collect()
     }
 
@@ -1151,7 +1144,7 @@ impl AgentPool {
             ..AgentStatus::default()
         });
         self.status_changed(agent, &status);
-        self.user_stopped(agent, at);
+        self.user_stopped(agent);
         Ok(())
     }
 
@@ -1470,7 +1463,7 @@ impl AgentPool {
                 self.known_mentions(&mentions)?;
                 let direct = mentions
                     .iter()
-                    .any(|mention| mention.kind == MentionKind::Direct);
+                    .any(|mention| matches!(mention, Mention::Direct(_)));
                 let project = if direct {
                     anyhow::ensure!(
                         parent.is_none(),
@@ -1488,18 +1481,15 @@ impl AgentPool {
                 };
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
-                let is_ask = message
-                    .mentions
-                    .iter()
-                    .any(|mention| mention.to == Address::User && mention.kind == MentionKind::Ask);
+                let pings = message.mentions.contains(&Mention::User { ping: true });
                 let (id, changed, unanswered) = if direct {
                     (write.post_peer(at, project, message)?, true, None)
                 } else {
                     let revised = match parent {
-                        Some(thread) if is_ask => write.restate_ask(at, thread, &message)?,
+                        Some(thread) if pings => write.restate_ping(at, thread, &message)?,
                         _ => None,
                     };
-                    let unanswered = if is_ask {
+                    let unanswered = if pings {
                         None
                     } else {
                         parent.and_then(|thread| write.unanswered_project_mail(thread))
@@ -1525,31 +1515,26 @@ impl AgentPool {
                     )?;
                     write.commit();
                     self.wake_receivers(id, Some(workset));
+                    if pings {
+                        self.watch_recap(id);
+                    }
                     if !direct {
                         self.consider_naming(id);
                     }
                 }
                 PyReply::SentMail { id, unanswered }
             }
-            PyRequest::Status {
-                agent,
-                thread,
-                text,
-            } => {
-                self.own_agent(workset, agent)?;
-                self.set_thread_status(thread, agent, text)?;
-                PyReply::Done
-            }
             PyRequest::Edit {
                 agent,
                 message,
                 content,
+                ping,
             } => {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
                 let before = write.mail_version(message);
-                write.edit(at, agent, message, content)?;
+                write.edit(at, agent, message, content, ping)?;
                 let version = write.mail_version(message);
                 if version == before {
                     return Ok(PyReply::Done);
@@ -1566,6 +1551,7 @@ impl AgentPool {
                     },
                 )?;
                 write.commit();
+                self.watch_recap(message);
                 PyReply::Done
             }
             PyRequest::Delete { agent, message } => {
@@ -1698,10 +1684,8 @@ impl AgentPool {
 
     /// Fails unless every agent `mentions` names is on this host.
     fn known_mentions(&self, mentions: &[rho_agent_types::Mention]) -> anyhow::Result<()> {
-        for mention in mentions {
-            if let Address::Agent(agent) = mention.to {
-                self.workset_of(agent)?;
-            }
+        for agent in mentions.iter().filter_map(|mention| mention.agent()) {
+            self.workset_of(agent)?;
         }
         Ok(())
     }
