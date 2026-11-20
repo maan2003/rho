@@ -18,7 +18,6 @@ No agent sees a note. A note's text passes between the user's devices through th
 While the user types a new note, the top line follows its first line as it is typed. A note is saved the moment the user leaves it.
 
 ## concept Private reply
-status: the private reply goes beside a chat message, not project mail.
 purpose: let the user keep a remark on a `mail.Mail` in its thread, where only they see it.
 principle: a project mails a result the user doubts; they put the cursor on it and run `reply privately`; a note opens; they type their doubt; back in the thread, it shows under the mail, dim, marked `🔒 you`.
 sees: in the thread, under its message: `🔒 you · time` and the text, dim and slanted.

@@ -121,6 +121,7 @@ A separate clock per test should do it.
 ```
 
 ## part Box
+status: the empty thread box says `reply`; the desk's idea box names the chosen project. Laptop hints show the send key; phone hints omit it.
 purpose: give the user somewhere to write without leaving the work they were reading.
 looks: `editor text` below a `seam` with a `reading inset` and `composer breath`; it shares the reading surface and grows to `box size`.
 states:

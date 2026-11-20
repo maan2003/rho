@@ -39,13 +39,13 @@ const HEADER_GUTTER: Pixels = px(28.);
 
 /// How the frame is laid out, from the window's width alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Layout {
+pub enum Layout {
     Desktop,
     Phone,
 }
 
 impl Layout {
-    pub(crate) fn of(viewport_width: Pixels) -> Self {
+    pub fn of(viewport_width: Pixels) -> Self {
         match viewport_width <= PHONE_MAX_WIDTH {
             true => Self::Phone,
             false => Self::Desktop,

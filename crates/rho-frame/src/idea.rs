@@ -129,7 +129,8 @@ impl Frame {
             Some(project) => format!("to ({}):", project.name),
             None => "to:".into(),
         };
-        let complete: CandidateSource = Rc::new(|frame, needle, cx| {
+        let default_name = default.as_ref().map(|project| project.name.clone());
+        let complete: CandidateSource = Rc::new(move |frame, needle, cx| {
             let needle = needle.trim().to_lowercase();
             let mut projects: Vec<_> = frame
                 .systems
@@ -141,7 +142,12 @@ impl Frame {
                     description: "project".into(),
                 })
                 .collect();
-            projects.sort_by(|a, b| a.value.cmp(&b.value));
+            // The default named in the question is the first answer when
+            // it matches, not an invisible alternative to the highlight.
+            projects.sort_by(|a, b| {
+                let by_default = |row: &Candidate| default_name.as_ref() != Some(&row.value);
+                (by_default(a), &a.value).cmp(&(by_default(b), &b.value))
+            });
             projects
         });
         self.open_prompt(
@@ -149,12 +155,10 @@ impl Frame {
             complete,
             Rc::new(move |frame, input, window, cx| {
                 let input = input.trim();
-                let project = if input.is_empty() {
-                    default.as_ref().and_then(|project| {
-                        frame
-                            .project_for(&project.address, cx)
-                            .map(|(_, project)| project)
-                    })
+                let project = if let Some(default) = default.as_ref().filter(|p| p.name == input) {
+                    frame
+                        .project_for(&default.address, cx)
+                        .map(|(_, project)| project)
                 } else {
                     frame
                         .systems
@@ -176,8 +180,7 @@ impl Frame {
             window,
             cx,
         );
-        // Completion replaces the whole address, including project names
-        // with spaces. Enter on untouched input uses the label's default.
+        // Tapping a project chooses it, just like Enter on its row.
         if let Some(prompt) = self.minibuffer_mut() {
             prompt.complete_project_address();
         }
@@ -273,15 +276,19 @@ impl Frame {
     pub(crate) fn render_idea(
         &self,
         text_style: &gpui::TextStyle,
+        layout: crate::Layout,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let active = self.idea.active();
         if !self.desk_in_view() && !active {
             return None;
         }
-        let label = match self.draft_project(cx) {
-            Some(project) => format!("idea to {} · ctrl-enter sends", project.name),
-            None => "idea · choose a project".into(),
+        let label = match (self.draft_project(cx), layout) {
+            (Some(project), crate::Layout::Desktop) => {
+                format!("idea to {} · ctrl-enter sends", project.name)
+            }
+            (Some(project), crate::Layout::Phone) => format!("idea to {}", project.name),
+            (None, _) => "idea · choose a project".into(),
         };
         let colors = cx.theme().colors();
         Some(

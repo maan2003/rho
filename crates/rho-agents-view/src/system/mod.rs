@@ -1011,7 +1011,7 @@ impl System for AgentsSystem {
         })
     }
 
-    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, _hand: &rho_frame::Hand, _cx: &App) -> Vec<Found> {
         let agents = self.registry.known_agents().copied().map(|agent| {
             let (title, host) = self.label(agent);
             let facts = self.registry.agent_facts(agent);

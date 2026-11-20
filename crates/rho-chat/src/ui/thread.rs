@@ -19,7 +19,7 @@ use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage, SendOnly};
-use rho_frame::{Candidate, Row, Subject, Surface};
+use rho_frame::{Candidate, Layout, Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -231,15 +231,9 @@ impl ThreadView {
             editor
         });
         let draft = system.draft(thread.host, Some(thread.message)).to_owned();
-        // In a channel a message is an idea, and an agent starts from it.
-        let placeholder = match is_project(system, thread) {
-            true => thread::CHANNEL_PLACEHOLDER,
-            false => thread::PLACEHOLDER,
-        };
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 10, window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.set_placeholder_text(placeholder, window, cx);
             if !draft.is_empty() {
                 editor.set_text(draft, window, cx);
             }
@@ -494,8 +488,11 @@ fn items(
         gap += 1;
     };
     // Where the thread is: every thread above it, the nearest last.
-    if head.path.len() > 1 {
-        let above = &head.path[..head.path.len() - 1];
+    // The heading already names the project. Keep only real ancestors,
+    // such as the mail a tangent hangs under.
+    let first = usize::from(chat.is_project(head.path[0].0));
+    if head.path.len() > first + 1 {
+        let above = &head.path[first..head.path.len() - 1];
         let text = above
             .iter()
             .map(|(_, name)| name.as_str())
@@ -606,11 +603,14 @@ fn private_items(
                 let time = held.written_ms.map(thread::when).unwrap_or_default();
                 let header = format!("🔒 you · {time}");
                 let body = held.body.as_deref().unwrap_or_default().trim_end();
-                let text = format!("{header}\n{body}");
-                let lines = text.lines().count().max(1);
+                let text = format!("\n{header}\n{body}");
+                let aside = 1..text.len();
+                let lines = std::iter::once(Meta::None)
+                    .chain(text.lines().skip(1).map(|_| Meta::Open(note.clone())))
+                    .collect();
                 Item::new(Key::Private(note.clone()), text)
-                    .with_styles(vec![(Class::Private, 0..header.len())])
-                    .with_lines(vec![Meta::Open(note.clone()); lines])
+                    .with_styles(vec![(Class::Private, aside)])
+                    .with_lines(lines)
             })
             .collect();
         if !replies.is_empty() {
@@ -1216,9 +1216,21 @@ impl Render for ThreadView {
         } else if self.log.focus_handle(cx).is_focused(window) {
             self.focused = Focused::Log;
         }
+        let list = self.is_list(self.system.read(cx));
+        let hint = match (list, Layout::of(window.viewport_size().width)) {
+            (false, Layout::Phone) => "reply",
+            (true, Layout::Phone) => "idea",
+            (false, Layout::Desktop) => thread::PLACEHOLDER,
+            (true, Layout::Desktop) => thread::CHANNEL_PLACEHOLDER,
+        };
+        let text_style = self.composer.update(cx, |composer, cx| {
+            if composer.placeholder_text(cx).as_deref() != Some(hint) {
+                composer.set_placeholder_text(hint, window, cx);
+            }
+            composer.style(cx).text.clone()
+        });
         let colors = cx.theme().colors();
         let system = self.system.read(cx);
-        let list = self.is_list(system);
         let status = (!list)
             .then(|| {
                 system
@@ -1258,6 +1270,10 @@ impl Render for ThreadView {
                     .px_2()
                     .py_1()
                     .truncate()
+                    .font_family(text_style.font_family)
+                    .font_weight(text_style.font_weight)
+                    .text_size(text_style.font_size)
+                    .line_height(text_style.line_height)
                     .text_color(colors.text_muted)
                     .child(status)
             }))

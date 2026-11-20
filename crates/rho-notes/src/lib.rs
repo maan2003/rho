@@ -326,7 +326,7 @@ impl System for NoteSystem {
 
     /// Every note, by its first line as the user is typing it, for the
     /// palette.
-    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, marks: &Marks, _hand: &rho_dealer::rank::Hand, _cx: &App) -> Vec<Found> {
         found(marks, |note| match self.pending.get(&note) {
             Some(pending) => title_of(&pending.text),
             None => note_title(marks, &note.address()),

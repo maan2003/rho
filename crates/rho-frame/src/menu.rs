@@ -43,6 +43,8 @@ pub enum Scope {
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
+    /// A top-level palette hint when this command has a real shortcut.
+    pub(crate) shortcut: Option<String>,
     pub description: String,
     pub value: Option<String>,
     /// Other words the palette finds the row by.
@@ -59,12 +61,19 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
+            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),
             pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
             scope: Scope::Here,
         }
+    }
+
+    /// Show the keys reaching this action from outside the palette.
+    pub(crate) fn with_shortcut(mut self, keys: String) -> Self {
+        self.shortcut = Some(keys);
+        self
     }
 
     /// The row is one of the window's own commands, on every screen: the
@@ -82,6 +91,7 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
+            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),
@@ -98,6 +108,7 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
+            shortcut: None,
             description: description.into(),
             value: Some(value.into()),
             also: Vec::new(),
@@ -116,6 +127,7 @@ impl Row {
     pub fn menu(key: impl Into<String>, description: impl Into<String>, rows: Rows) -> Self {
         Self {
             key: key.into(),
+            shortcut: None,
             description: description.into(),
             value: None,
             also: Vec::new(),

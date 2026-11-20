@@ -23,9 +23,8 @@ pub(crate) struct Entry {
     pub label: String,
     /// Other words it is found by (see [`Row::also`]).
     pub also: Vec<String>,
-    /// The keys that reach it inside the menus above it once the first of
-    /// them is open (`a` in `hosts › attach`); none for the top of the list,
-    /// which no menu holds.
+    /// The row's shortcut, or its keys inside the menus above it once
+    /// the first of them is open (`a` in `hosts › attach`).
     pub keys: String,
     pub pick: Pick,
     /// Whose it is: a row under a menu is its top row's.
@@ -41,7 +40,7 @@ pub(crate) fn flatten(top: &[Row]) -> Vec<Entry> {
         entries.push(Entry {
             label: row.description.clone(),
             also: row.also.clone(),
-            keys: String::new(),
+            keys: row.shortcut.clone().unwrap_or_default(),
             pick: row.pick.clone(),
             scope: row.scope,
         });
@@ -296,7 +295,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_top_shows_no_key_and_a_menu_shows_its_own() {
+    fn the_top_and_nested_rows_show_their_keys() {
         let mut hosts = Rows::new("hosts");
         hosts.push(Row::run("a", "attach", |_, _, _| {}));
         let mut deeper = Rows::new("deeper");
@@ -304,7 +303,7 @@ mod tests {
         hosts.push(Row::menu("d", "deeper", deeper));
         // Two top rows on one key, and one name twice: none is dropped.
         let top = vec![
-            Row::run("h", "home", |_, _, _| {}),
+            Row::run("h", "home", |_, _, _| {}).with_shortcut("space h".to_owned()),
             Row::menu("shift-h", "hosts", hosts),
             Row::run("h", "pair this device", |_, _, _| {}),
             Row::run("", "home", |_, _, _| {}),
@@ -317,7 +316,7 @@ mod tests {
         assert_eq!(
             seen,
             [
-                ("home", ""),
+                ("home", "space h"),
                 ("hosts", ""),
                 ("hosts › attach", "a"),
                 ("hosts › deeper", "d"),

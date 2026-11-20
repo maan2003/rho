@@ -3,9 +3,9 @@
 //!
 //! Generic machinery — a caller opens it with a prompt, a candidate
 //! source, and a submit handler. The input is a single-line editor (no
-//! vim, like emacs); candidates recompute on every edit. Enter submits
-//! the typed input, tab completes the selected candidate into the last
-//! token, ctrl-n/p or arrows move the selection, escape cancels.
+//! vim, like emacs); candidates recompute on every edit. Enter takes the
+//! highlighted answer or the typed input if none fits, tab completes
+//! without submitting, ctrl-n/p or arrows move the selection, escape cancels.
 
 use std::rc::Rc;
 
@@ -168,8 +168,7 @@ pub type CancelHandler = Rc<dyn Fn(&mut Frame, &mut Window, &mut Context<Frame>)
 enum CompletionInput {
     Word,
     Whole,
-    /// The empty field means the explicit default in the question;
-    /// tapping a project is an explicit choice, not the default.
+    /// A whole-input project address, with tappable rows.
     Address,
 }
 
@@ -181,9 +180,6 @@ pub struct Minibuffer {
     on_cancel: Option<CancelHandler>,
     candidates: Vec<Candidate>,
     selected: usize,
-    /// The user moved the selection since the last edit, making the
-    /// highlighted candidate an explicit choice even on empty input.
-    selection_moved: bool,
     completion_input: CompletionInput,
     completed_selection: Option<(Candidate, usize)>,
     /// What is typed here is a credential: the journal keeps none of it.
@@ -240,15 +236,11 @@ impl Minibuffer {
             prompt: prompt.into(),
             editor,
             complete,
-            completion_input: match answer {
-                Answer::Text(_) => CompletionInput::Word,
-                Answer::Row(_) => CompletionInput::Whole,
-            },
+            completion_input: CompletionInput::Whole,
             answer,
             on_cancel,
             candidates: Vec::new(),
             selected: 0,
-            selection_moved: false,
             completed_selection: None,
             secret: false,
             _edits: edits,
@@ -297,82 +289,53 @@ impl Minibuffer {
                 .map(|(index, _)| index)
         {
             self.selected = index;
-            self.selection_moved = true;
         } else {
             self.completed_selection = None;
             self.selected = 0;
-            self.selection_moved = false;
         }
     }
 
-    pub fn select_by_delta(&mut self, delta: isize, cx: &App) {
-        if self.candidates.is_empty() {
-            return;
+    pub fn select_by_delta(&mut self, delta: isize) {
+        if !self.candidates.is_empty() {
+            self.selected = (self.selected as isize + delta)
+                .rem_euclid(self.candidates.len() as isize) as usize;
         }
-        let len = self.candidates.len() as isize;
-        // An untouched address has no highlighted suggestion: the first
-        // move lands on the first or last row, not the second one.
-        let from = if matches!(self.completion_input, CompletionInput::Address)
-            && !self.accepts_selected(cx)
-            && delta > 0
-        {
-            -1
-        } else {
-            self.selected as isize
-        };
-        self.selected = (from + delta).rem_euclid(len) as usize;
-        self.selection_moved = true;
     }
 
     pub fn select(&mut self, index: usize) {
         if index < self.candidates.len() {
             self.selected = index;
-            self.selection_moved = true;
         }
     }
 
-    /// Enter accepts the highlighted candidate, emacs `completing-read`
-    /// style: it replaces the last token before submission whenever the
-    /// user has typed something or explicitly moved the selection. A bare
-    /// enter on an untouched minibuffer still submits the empty input,
-    /// except where the input is one candidate whole (the palette, a chooser):
-    /// there the highlighted row is the answer.
-    pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
-        if self.accepts_selected(cx) {
-            self.complete_selected(window, cx);
-        }
+    fn completed_text(&self, input: &str, candidate: &Candidate) -> String {
+        let start = completion_start(
+            input,
+            !matches!(self.completion_input, CompletionInput::Word),
+        );
+        format!("{}{}", &input[..start], candidate.value)
     }
 
-    pub fn accepts_selected(&self, cx: &App) -> bool {
-        !self.input(cx).trim().is_empty()
-            || self.selection_moved
-            || matches!(self.completion_input, CompletionInput::Whole)
-    }
-
-    /// Tab: replaces the last whitespace-delimited token of the input with
-    /// the selected candidate.
+    /// Tab: completes the highlighted answer into the prompt without
+    /// submitting.
     pub fn complete_selected(&mut self, window: &mut Window, cx: &mut App) {
         let Some((candidate, occurrence)) = self.selected_candidate() else {
             return;
         };
-        self.completed_selection = Some((candidate.clone(), occurrence));
-        self.editor.update(cx, |editor, cx| {
-            let text = editor.text(cx);
-            let start = completion_start(
-                &text,
-                !matches!(self.completion_input, CompletionInput::Word),
-            );
-            let new_text = format!("{}{}", &text[..start], candidate.value);
-            let end = multi_buffer::MultiBufferOffset(new_text.len());
-            editor.set_text(new_text, window, cx);
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([end..end]);
-            });
-        });
+        let text = self.completed_text(&self.input(cx), &candidate);
+        self.completed_selection = Some((candidate, occurrence));
+        self.set_input(text, window, cx);
     }
 
-    pub fn set_complete_whole_input(&mut self) {
-        self.completion_input = CompletionInput::Whole;
+    pub(crate) fn clear_input(&mut self, window: &mut Window, cx: &mut App) {
+        self.completed_selection = None;
+        self.selected = 0;
+        self.editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+    }
+
+    pub(crate) fn complete_last_word(&mut self) {
+        self.completion_input = CompletionInput::Word;
     }
 
     pub(crate) fn complete_project_address(&mut self) {
@@ -397,10 +360,12 @@ impl Minibuffer {
     /// Consumes the minibuffer into its input and handler; the caller
     /// invokes the handler after restoring focus.
     pub(crate) fn into_submission(self, cx: &App) -> (String, Submission) {
-        let input = self.input(cx);
-        let chosen = match self.accepts_selected(cx) && self.selected < self.candidates.len() {
-            true => Chosen::Row(self.selected),
-            false => Chosen::Typed(input.clone()),
+        let typed = self.input(cx);
+        let candidate = self.candidates.get(self.selected);
+        let input = candidate.map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row));
+        let chosen = match candidate {
+            Some(_) => Chosen::Row(self.selected),
+            None => Chosen::Typed(typed),
         };
         let submission: Submission = match self.answer {
             Answer::Text(on_submit) => {
@@ -414,14 +379,18 @@ impl Minibuffer {
         (input, submission)
     }
 
-    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Frame>) -> AnyElement {
+    pub fn render(
+        &self,
+        text_style: &gpui::TextStyle,
+        layout: crate::Layout,
+        cx: &Context<Frame>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         // Keep the selection visible: scroll the window, not the list.
         let window_start = self
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
-        let highlight = !address || self.accepts_selected(cx);
         let rows = self
             .candidates
             .iter()
@@ -429,19 +398,21 @@ impl Minibuffer {
             .skip(window_start)
             .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
-                let selected = highlight && index == self.selected;
+                let selected = index == self.selected;
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
                 let mut row = div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .gap_x_2()
+                    .when(layout == crate::Layout::Phone, |row| row.flex_wrap())
                     .w_full()
                     .px_2()
-                    .child(div().child(candidate.value.clone()));
+                    .child(div().max_w_full().child(candidate.value.clone()));
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
+                            .max_w_full()
                             .text_color(colors.text_muted)
                             .child(candidate.description.clone()),
                     );
