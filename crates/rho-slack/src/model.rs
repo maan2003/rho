@@ -257,10 +257,6 @@ pub struct Suggestion {
 /// The label is in the key because the list is alphabetical between
 /// conversations that are otherwise equal, and the id is last so that two
 /// conversations with the same name still have distinct keys.
-///
-/// Both strings are shared rather than owned. A key is copied every time a
-/// query is answered — once per match — and a name is long enough that
-/// copying it there was most of what narrowing cost.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RowKey {
     muted: bool,
@@ -270,35 +266,6 @@ struct RowKey {
     label: std::sync::Arc<str>,
     id: std::sync::Arc<str>,
 }
-
-/// One thing that happened to the list: a row left the place it was in, a
-/// row arrived at a place, or both, which is a row that moved.
-///
-/// A badge changing without moving the row is `from` and `at` being the
-/// same place, and is one line rewritten. A conversation rho has just heard
-/// of has no `from`; one that has gone has no `at`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RowEdit {
-    pub channel: ChannelId,
-    /// The conversation had a line on screen and that line has to come
-    /// out. A place is not given: a number would cost the distance down
-    /// the list to count, and the drawer already knows which line it put
-    /// this conversation on. While a query stands this is about the
-    /// narrowed list, which is the list the drawer holds.
-    pub was_shown: bool,
-    /// The conversation the row now sits above, or `None` for the end of
-    /// the list. A neighbour rather than a place, for the same reason:
-    /// the next key is one step from this one, whereas how many rows are
-    /// above it is a walk.
-    pub before: Option<ChannelId>,
-    /// The row to draw, so a drawer never has to ask again.
-    pub row: Option<ConversationRow>,
-}
-
-/// How many unread list edits are kept before the log is thrown away and
-/// the next drawer is told to rebuild. Well past a screenful of traffic,
-/// and far below the point where replaying them beats redrawing.
-const ROW_EDIT_CAP: usize = 4_096;
 
 /// One line of the conversation list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,29 +285,12 @@ pub struct ConversationRow {
 }
 
 /// What the next-unread key found.
-///
-/// Three cases and not an Option, because "nothing here" and "nothing
-/// here, and this much waiting outside what you are looking at" are
-/// different things to be told, and the reader is owed the difference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NextUnread {
     /// Open this one.
     Go(ChannelId),
-    /// Nothing unread the narrowing reaches, and this many outside it.
-    /// Never zero, and never raised when no query stands.
-    Outside(usize),
     /// Nothing unread anywhere the key would go.
     Nothing,
-}
-
-/// Why a narrowed list is empty, for the one line that says so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Empty {
-    /// The query has not reached a conversation since it was typed.
-    Never,
-    /// It reached conversations, and they have been renamed, archived or
-    /// left since.
-    Gone,
 }
 
 /// A same-workspace Slack archive link, reduced to its navigation identity.
@@ -397,30 +347,6 @@ pub struct Model {
     /// The cursor moves this run that are not on disk yet. The session
     /// drains it and writes the rows; the model touches no file.
     handled_edits: Vec<(Unit, Option<Ts>)>,
-    /// Every word start in every conversation's name, paired with the
-    /// conversation it belongs to. This is what a reader typing narrows
-    /// against: the set is ordered by the word, so a query is a range scan
-    /// from the query to the first word that does not begin with it, and
-    /// the cost is the depth of the tree plus the matches, never the list.
-    words: BTreeSet<(String, ChannelId)>,
-    /// The words each conversation currently has in that set. Kept because
-    /// a name that changes has to have its old words taken out, and the
-    /// old words cannot be worked backwards from the new name.
-    worded: BTreeMap<ChannelId, Vec<String>>,
-    /// What the reader has typed to narrow the list, already split into
-    /// words. Empty means the whole list is shown.
-    query: Vec<String>,
-    /// The conversations the query matches, in the list's own order. This
-    /// is the list on screen while a query stands. A sorted vector rather
-    /// than a tree: it is rebuilt whole on a keystroke and walked whole to
-    /// draw, and neither wants a tree's per-node cost.
-    narrowed: Vec<(RowKey, ChannelId)>,
-    /// Whether the standing query has ever had a conversation on screen.
-    /// A query that empties because the mirror moved and one that never
-    /// answered are the same empty list, and this is the only thing that
-    /// tells them apart; cleared by the reader typing, and by nothing
-    /// else.
-    reached_once: bool,
     /// The conversation list, in the order it is read, and the key each
     /// conversation currently sits at.
     ///
@@ -430,26 +356,6 @@ pub struct Model {
     /// row back in its place and leaves the rest standing.
     order: BTreeMap<RowKey, ConversationRow>,
     placed: BTreeMap<ChannelId, RowKey>,
-    /// What the list has done since a drawer last asked: one entry per
-    /// reindex, in the order they happened, each saying where a row left
-    /// and where it arrived.
-    ///
-    /// Replaying these against a buffer that held the last list reproduces
-    /// this one exactly, which is what lets a message cost two line edits
-    /// instead of a redraw. They are in order and each position is the
-    /// position *at that moment*, so they must be applied in order and
-    /// none may be skipped.
-    ///
-    /// Taken rather than read, because a drawer that has been told is
-    /// caught up. That makes one drawer the owner of this; there is one
-    /// today, the conversation list. A drawer holding nothing rebuilds in
-    /// full, so the failure of a second one forgetting this is a slow list
-    /// and never a wrong one.
-    edits: Vec<RowEdit>,
-    /// Set when the log was dropped for growing too long — nobody has drawn
-    /// the list in a long time — and the next drawer must rebuild rather
-    /// than replay.
-    resync: bool,
     /// The units asking for the reader right now, and what for.
     ///
     /// Kept rather than worked out, because working it out is a pass over
@@ -537,17 +443,6 @@ fn mpdm_handles(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The words a query asks for, split exactly as a name is split.
-///
-/// The reader types what they see: `#design`, `dev-ops`, a name pasted
-/// from a completion. Splitting the query the same way the index splits
-/// names is what makes those reach — `#design` asks for `design`, and
-/// `dev-ops` asks for `dev` and `ops`, both of which the name answers.
-/// Any other rule would offer a completion that then matches nothing.
-fn typed_words(query: &str) -> Vec<String> {
-    Model::word_starts(query)
-}
-
 impl Model {
     pub fn new(workspace: WorkspaceName) -> Self {
         Self {
@@ -571,15 +466,8 @@ impl Model {
             thread_read: BTreeMap::new(),
             handled: BTreeMap::new(),
             handled_edits: Vec::new(),
-            words: BTreeSet::new(),
-            worded: BTreeMap::new(),
-            query: Vec::new(),
-            narrowed: Vec::new(),
-            reached_once: false,
             order: BTreeMap::new(),
             placed: BTreeMap::new(),
-            edits: Vec::new(),
-            resync: false,
             asking: BTreeMap::new(),
         }
     }
@@ -1021,55 +909,7 @@ impl Model {
     /// by recency, and the muted ones under both. Within a group, the
     /// noisier conversation sorts first.
     pub fn conversation_rows(&self) -> Vec<ConversationRow> {
-        match self.query.is_empty() {
-            true => self.order.values().cloned().collect(),
-            // While a query stands the list is the narrowed one, and it
-            // costs the matches rather than the workspace.
-            false => self
-                .narrowed
-                .iter()
-                .filter_map(|(key, _)| self.order.get(key).cloned())
-                .collect(),
-        }
-    }
-
-    /// A slice of the list, for a drawer that only has a screen to fill.
-    /// The rows come out already in order, so this costs the rows asked
-    /// for and the walk to reach them, and never the workspace.
-    pub fn conversation_window(&self, from: usize, count: usize) -> Vec<ConversationRow> {
-        self.order
-            .values()
-            .skip(from)
-            .take(count)
-            .cloned()
-            .collect()
-    }
-
-    /// How many conversations the workspace holds, whatever a query
-    /// reaches. What the list's narrowing line counts against, so the
-    /// reader can see how much is being kept off the screen.
-    pub fn conversation_count(&self) -> usize {
-        self.order.len()
-    }
-
-    /// What the list has done since this was last asked, in order, and
-    /// forgets it. `None` means the log was dropped and the caller has to
-    /// draw the list again from scratch.
-    pub fn take_row_edits(&mut self) -> Option<Vec<RowEdit>> {
-        match std::mem::take(&mut self.resync) {
-            true => {
-                self.edits = Vec::new();
-                None
-            }
-            false => Some(std::mem::take(&mut self.edits)),
-        }
-    }
-
-    /// Forgets the log without applying it: for a drawer that has just
-    /// built the list in full and is therefore already caught up.
-    pub fn forget_row_edits(&mut self) {
-        self.edits = Vec::new();
-        self.resync = false;
+        self.order.values().cloned().collect()
     }
 
     /// Puts one conversation back in its place in the list, and nothing
@@ -1083,31 +923,10 @@ impl Model {
     /// be worked backwards from the conversation once its counts have
     /// moved.
     pub(crate) fn reindex(&mut self, channel: &ChannelId) {
-        // Shown, not merely listed: while a query stands the list on
-        // screen is the narrowed one, so what a drawer has to be told
-        // about is whether this conversation had a line there.
-        let mut was_shown = false;
         if let Some(held) = self.placed.remove(channel) {
             self.order.remove(&held);
-            was_shown = match self.query.is_empty() {
-                true => true,
-                false => match self.narrowed.binary_search_by(|(key, _)| key.cmp(&held)) {
-                    Ok(at) => {
-                        self.narrowed.remove(at);
-                        true
-                    }
-                    Err(_) => false,
-                },
-            };
         }
         let Some(conversation) = self.conversations.get(channel) else {
-            self.index_words(channel, None);
-            self.note_row_edit(RowEdit {
-                channel: channel.clone(),
-                was_shown,
-                before: None,
-                row: None,
-            });
             return;
         };
         let count = self.counts.get(channel);
@@ -1139,378 +958,8 @@ impl Model {
             muted: self.muted.contains(channel),
             latest: count.and_then(|count| count.latest.clone()),
         };
-        self.index_words(channel, Some(&row.label));
-        // The neighbour, not the place: one step past this key in the
-        // order, which the tree finds in the depth of the tree. Counting
-        // how many rows are above it instead would cost the distance, and
-        // doing that on every message is what the list is here to avoid.
-        // While a query stands the neighbour is read from the narrowed
-        // list, because that is the list the drawer holds.
-        let shown = self.query.is_empty() || self.matches_query(channel);
-        let before = match self.query.is_empty() {
-            true => self
-                .order
-                .range(&key..)
-                .next()
-                .map(|(next, _)| ChannelId(next.id.to_string())),
-            false => {
-                // Where this row goes in the narrowed list, and so which
-                // row it sits above. The key is not in the list yet, so the
-                // search lands on the successor either way.
-                let at = self
-                    .narrowed
-                    .binary_search_by(|(held, _)| held.cmp(&key))
-                    .unwrap_or_else(|at| at);
-                self.narrowed.get(at).map(|(_, next)| next.clone())
-            }
-        };
         self.placed.insert(channel.clone(), key.clone());
-        self.order.insert(key.clone(), row.clone());
-        if shown && !self.query.is_empty() {
-            let at = self
-                .narrowed
-                .binary_search_by(|(held, _)| held.cmp(&key))
-                .unwrap_or_else(|at| at);
-            self.narrowed.insert(at, (key, channel.clone()));
-            self.reached_once = true;
-        }
-        // Traffic in a conversation the query does not reach changes no
-        // line on screen, so there is nothing to tell the drawer and
-        // nothing to grow the log with.
-        if !was_shown && !shown {
-            return;
-        }
-        self.note_row_edit(RowEdit {
-            channel: channel.clone(),
-            was_shown,
-            before: match shown {
-                true => before,
-                false => None,
-            },
-            row: match shown {
-                true => Some(row),
-                false => None,
-            },
-        });
-    }
-
-    /// The word starts in a name, folded to lower case.
-    ///
-    /// A name breaks at a dash, an underscore, a space, a dot and at a
-    /// change from lower case to upper, so `#design-ops`, `@Ada Lovelace`
-    /// and `mpdm-devOps` all offer the words a reader would type at them.
-    /// The whole name is a word too, sigil stripped, so `#design` is
-    /// reached by `design` and by `des`.
-    fn word_starts(label: &str) -> Vec<String> {
-        let mut words = Vec::new();
-        let mut word = String::new();
-        let mut previous_lower = false;
-        for character in label.chars() {
-            let breaks = matches!(
-                character,
-                '-' | '_' | ' ' | '.' | ',' | '/' | '#' | '@' | ':'
-            );
-            let humps = previous_lower && character.is_uppercase();
-            if breaks || humps {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-                if breaks {
-                    previous_lower = false;
-                    continue;
-                }
-            }
-            previous_lower = character.is_lowercase();
-            word.extend(character.to_lowercase());
-        }
-        if !word.is_empty() {
-            words.push(word);
-        }
-        words.sort();
-        words.dedup();
-        words
-    }
-
-    /// Puts one conversation's words in the index, and takes its old ones
-    /// out. The cost is the words of the one name that changed, which is
-    /// why the words it had are remembered rather than searched for.
-    fn index_words(&mut self, channel: &ChannelId, label: Option<&str>) {
-        let fresh = label.map(Self::word_starts).unwrap_or_default();
-        if let Some(stale) = self.worded.get(channel)
-            && stale == &fresh
-        {
-            return;
-        }
-        if let Some(stale) = self.worded.remove(channel) {
-            for word in stale {
-                self.words.remove(&(word, channel.clone()));
-            }
-        }
-        if fresh.is_empty() {
-            return;
-        }
-        for word in &fresh {
-            self.words.insert((word.clone(), channel.clone()));
-        }
-        self.worded.insert(channel.clone(), fresh);
-    }
-
-    /// Whether a conversation's name answers every typed word. Asked of
-    /// the words already indexed for it, so this costs that one name.
-    fn matches_query(&self, channel: &ChannelId) -> bool {
-        let Some(words) = self.worded.get(channel) else {
-            return false;
-        };
-        self.query
-            .iter()
-            .all(|typed| words.iter().any(|word| word.starts_with(typed)))
-    }
-
-    /// What the reader has typed, or the empty string when the list is not
-    /// narrowed.
-    pub fn query(&self) -> String {
-        self.query.join(" ")
-    }
-
-    /// Whether a query stands, which is what tells a drawer the list it is
-    /// looking at is the narrowed one.
-    pub fn is_narrowed(&self) -> bool {
-        !self.query.is_empty()
-    }
-
-    /// The conversations a query reaches, in the list's own order, at most
-    /// `most` of them. For a caller that wants to show the matches without
-    /// narrowing anything: the minibuffer offering names as the reader
-    /// types is the case.
-    ///
-    /// Costs the depth of the tree per typed word plus the conversations
-    /// they reach, and never the list.
-    pub fn reached_by(&self, query: &str, most: usize) -> Vec<ConversationRow> {
-        let typed = typed_words(query);
-        if typed.is_empty() {
-            return self.conversation_window(0, most);
-        }
-        let mut found = self
-            .reached_for(&typed)
-            .into_iter()
-            .filter_map(|channel| self.placed.get(&channel).cloned())
-            .collect::<Vec<_>>();
-        // Only the first `most` are shown, so only they are put in order:
-        // the rest are partitioned away in one pass rather than sorted.
-        // A letter reaching a tenth of a large workspace was paying to
-        // order thousands of names to show sixty-four of them.
-        match found.len() > most {
-            true => {
-                found.select_nth_unstable(most);
-                found.truncate(most);
-                found.sort_unstable();
-            }
-            false => found.sort_unstable(),
-        }
-        found
-            .into_iter()
-            .take(most)
-            .filter_map(|key| self.order.get(&key).cloned())
-            .collect()
-    }
-
-    /// Narrows the list to the conversations the query reaches, and logs
-    /// the difference from the list that was on screen so a drawer edits
-    /// rows out and back in rather than drawing the list again.
-    ///
-    /// Two typed words intersect: `des ops` reaches only the names with a
-    /// word starting `des` and a word starting `ops`. Each word is its own
-    /// range scan and the smallest is walked first, so the cost is the
-    /// depth of the tree per word plus the conversations they reach, never
-    /// the list.
-    pub fn narrow(&mut self, query: &str) {
-        let typed = typed_words(query);
-        if typed == self.query {
-            return;
-        }
-        let was = std::mem::take(&mut self.narrowed);
-        let was_narrowed = !self.query.is_empty();
-        self.query = typed;
-
-        // Drawn in the list's own order, not in the index's: the key a
-        // conversation already sits at is what orders it, and the reader's
-        // list does not reshuffle because they typed. Sorted in one pass
-        // over a flat vector rather than by inserting each match into a
-        // tree, because the key carries a name and comparing names is the
-        // expensive part.
-        let mut now = self
-            .reached()
-            .into_iter()
-            .filter_map(|channel| Some((self.placed.get(&channel)?.clone(), channel)))
-            .collect::<Vec<_>>();
-        now.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-
-        match (was_narrowed, self.query.is_empty()) {
-            // Into or out of a narrowing from the whole list: the two
-            // lists have no common shape to diff, so the drawer is told to
-            // draw once rather than handed n edits.
-            (false, _) | (_, true) => self.resync_rows(),
-            // Narrowing further or widening by a letter: the difference is
-            // what changed, walked over the two ordered sets at once.
-            (true, false) => self.note_narrow_edits(&was, &now),
-        }
-        self.reached_once = !now.is_empty();
-        self.narrowed = now;
-    }
-
-    /// Why the narrowed list has nothing on it, or `None` when it has rows
-    /// or no query stands at all.
-    ///
-    /// The two are not the same fact and must not read the same: a word
-    /// nothing answers is the reader's last keystroke, and a list that
-    /// emptied under them is Slack's doing. Only the second has to name
-    /// the way out, because only in the second did the reader do nothing
-    /// to get there.
-    pub fn empty_narrowing(&self) -> Option<Empty> {
-        if self.query.is_empty() || !self.narrowed.is_empty() {
-            return None;
-        }
-        match self.reached_once {
-            true => Some(Empty::Gone),
-            false => Some(Empty::Never),
-        }
-    }
-
-    /// The conversations the standing query reaches, or none at all when
-    /// nothing is typed.
-    ///
-    /// One typed word is answered straight off the range scan, with no
-    /// set built to throw away. More than one is an intersection, and the
-    /// rarest word is walked first so the work is that word's matches and
-    /// not the commonest word's.
-    fn reached(&self) -> Vec<ChannelId> {
-        self.reached_for(&self.query)
-    }
-
-    /// The conversations a list of typed words reaches.
-    fn reached_for(&self, query: &[String]) -> Vec<ChannelId> {
-        let Some((first, rest)) = query.split_first() else {
-            return Vec::new();
-        };
-        if rest.is_empty() {
-            return self.reaching_iter(first).cloned().collect();
-        }
-        let mut postings = query
-            .iter()
-            .map(|word| (self.reaching_iter(word).count(), word))
-            .collect::<Vec<_>>();
-        postings.sort();
-        let Some(((_, rarest), others)) = postings.split_first() else {
-            return Vec::new();
-        };
-        self.reaching_iter(rarest)
-            .filter(|channel| {
-                let Some(words) = self.worded.get(*channel) else {
-                    return false;
-                };
-                others
-                    .iter()
-                    .all(|(_, typed)| words.iter().any(|word| word.starts_with(typed.as_str())))
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// The conversations one typed word reaches, as a walk rather than a
-    /// set: every name with a word starting with it. A range scan from the
-    /// word to the first word that does not begin with it, so the cost is
-    /// the depth of the tree plus the matches.
-    fn reaching_iter<'a>(&'a self, word: &'a str) -> impl Iterator<Item = &'a ChannelId> + 'a {
-        let start = (word.to_owned(), ChannelId(String::new()));
-        self.words
-            .range(start..)
-            .take_while(move |(indexed, _)| indexed.starts_with(word))
-            .map(|(_, channel)| channel)
-    }
-
-    /// The edits between two narrowings, walked over both in key order so
-    /// the cost is the two match sets and nothing else.
-    ///
-    /// Rows leaving go first, then rows arriving in descending order.
-    /// Descending is what makes a neighbour namable: by the time a row is
-    /// put back, every row below it in the new list is already on screen,
-    /// so its successor there is a line the drawer holds.
-    fn note_narrow_edits(&mut self, was: &[(RowKey, ChannelId)], now: &[(RowKey, ChannelId)]) {
-        // Both lists are in the same order, so the difference is one walk
-        // down the two of them: no key is looked up in a tree and no name
-        // is compared more than once.
-        let (mut here, mut there) = (0, 0);
-        let mut leaving = Vec::new();
-        let mut arriving = Vec::new();
-        while here < was.len() || there < now.len() {
-            match (was.get(here), now.get(there)) {
-                (Some((left, channel)), Some((right, _))) if left < right => {
-                    leaving.push(channel.clone());
-                    here += 1;
-                }
-                (Some((left, _)), Some((right, channel))) if right < left => {
-                    arriving.push((there, channel.clone()));
-                    there += 1;
-                }
-                (Some(_), Some(_)) => {
-                    here += 1;
-                    there += 1;
-                }
-                (Some((_, channel)), None) => {
-                    leaving.push(channel.clone());
-                    here += 1;
-                }
-                (None, Some((_, channel))) => {
-                    arriving.push((there, channel.clone()));
-                    there += 1;
-                }
-                (None, None) => break,
-            }
-        }
-        for channel in leaving {
-            self.note_row_edit(RowEdit {
-                channel,
-                was_shown: true,
-                before: None,
-                row: None,
-            });
-        }
-        // Rows arriving go back in descending order, which is what makes a
-        // neighbour namable: by the time a row is put back, every row
-        // below it in the new list is already on screen, so its successor
-        // there is a line the drawer holds.
-        for (at, channel) in arriving.into_iter().rev() {
-            let row = self.order.get(&now[at].0).cloned();
-            self.note_row_edit(RowEdit {
-                channel,
-                was_shown: false,
-                before: now.get(at + 1).map(|(_, next)| next.clone()),
-                row,
-            });
-        }
-    }
-
-    /// Tells the drawer to draw the list again and drops the log, for the
-    /// changes where no diff against what is on screen exists.
-    fn resync_rows(&mut self) {
-        self.resync = true;
-        self.edits = Vec::new();
-    }
-
-    /// Notes one list edit, or gives up on the log. Giving up is the right
-    /// answer when nobody has drawn the list in a long time: replaying ten
-    /// thousand edits is slower than drawing the list once, and holding
-    /// them costs memory for a screen nobody is looking at.
-    fn note_row_edit(&mut self, edit: RowEdit) {
-        if self.resync {
-            return;
-        }
-        if self.edits.len() >= ROW_EDIT_CAP {
-            self.edits = Vec::new();
-            self.resync = true;
-            return;
-        }
-        self.edits.push(edit);
+        self.order.insert(key, row);
     }
 
     /// Every conversation put back in its place. For the events that move
@@ -1519,12 +968,6 @@ impl Model {
     /// arriving, which re-renders every name that carries one. Those happen
     /// once a session, not on a keypress and not on a frame.
     fn reindex_all(&mut self) {
-        // Every row moved, so there is nothing for a log of moved rows to
-        // say. Telling the drawer to draw the list again is both cheaper
-        // than n edits and what it would decide for itself on reading
-        // them.
-        self.resync = true;
-        self.edits = Vec::new();
         for channel in self.conversations.keys().cloned().collect::<Vec<_>>() {
             self.reindex(&channel);
         }
@@ -1743,57 +1186,23 @@ impl Model {
         }
     }
 
-    /// The next conversation with something unread, in the order the list
-    /// shows them, starting after `from`. Wraps, so reading through the
-    /// unread ones is one key pressed repeatedly; `None` when there is
-    /// nothing left, which is what sends the reader back to the list.
+    /// The next conversation with something unread, in the list's order
+    /// (unread, then the loudest, then the newest), starting after `from`.
+    /// Wraps, so reading through the unread ones is one key pressed
+    /// repeatedly.
     ///
-    /// The list the reader is looking at, which is the narrowed one while a
-    /// query stands. A key that moves them through the list has to move
-    /// them through *this* list: taking them to a conversation the rows
-    /// cannot show, under a banner still describing the rows, is the list
-    /// and the key disagreeing about where the reader is. The narrowing
-    /// lasts as long as they are in it and no longer -- it is a motion, not
-    /// a setting -- so there is no hour-old query left to answer this
-    /// wrongly.
-    ///
-    /// This is why it no longer reads the same set `mark_plan` does. That
-    /// one is a question about the workspace, and stays one; this is a
-    /// question about the list on screen. Two questions, two answers, and
-    /// the difference is deliberate.
+    /// This does not read the set `mark_plan` does: that one is a question
+    /// about the workspace's backlog, this one about where to go next.
     pub fn next_unread(&self, from: Option<&ChannelId>) -> NextUnread {
-        let rows = self.walked();
+        let rows = self.order.values().collect::<Vec<_>>();
         let at = from
             .and_then(|from| rows.iter().position(|row| &row.id == from))
             .map_or(0, |at| at + 1);
-        let found = rows
-            .iter()
+        rows.iter()
             .skip(at)
             .chain(rows.iter().take(at))
             .find(|row| Self::unread(row) && Some(&row.id) != from)
-            .map(|row| row.id.clone());
-        if let Some(channel) = found {
-            return NextUnread::Go(channel);
-        }
-        // Nothing left on screen. Whether that is the end of the unread or
-        // only the end of what the query reaches is the difference between
-        // "you are done" and "you are done in here", and the reader is owed
-        // it: the same walk, once, and only at the edge.
-        match self.query.is_empty() {
-            true => NextUnread::Nothing,
-            false => {
-                let inside = rows.iter().map(|row| &row.id).collect::<BTreeSet<_>>();
-                let outside = self
-                    .order
-                    .values()
-                    .filter(|row| Self::unread(row) && !inside.contains(&row.id))
-                    .count();
-                match outside {
-                    0 => NextUnread::Nothing,
-                    outside => NextUnread::Outside(outside),
-                }
-            }
-        }
+            .map_or(NextUnread::Nothing, |row| NextUnread::Go(row.id.clone()))
     }
 
     /// Whether a conversation is somewhere the next-unread key will take
@@ -1801,20 +1210,6 @@ impl Model {
     /// the reader saying "not this one", which the key obeys.
     fn unread(row: &&ConversationRow) -> bool {
         !row.muted && (row.unread || row.mention_count > 0)
-    }
-
-    /// The rows a key walks: the narrowed ones while a query stands, the
-    /// whole list otherwise. Costs the matches rather than the workspace
-    /// when narrowed, since the narrowed set is already held in list order.
-    fn walked(&self) -> Vec<&ConversationRow> {
-        match self.query.is_empty() {
-            true => self.order.values().collect(),
-            false => self
-                .narrowed
-                .iter()
-                .filter_map(|(key, _)| self.order.get(key))
-                .collect(),
-        }
     }
 
     /// What `mark read before` would touch, as a plan the caller can count
@@ -3113,304 +2508,6 @@ mod tests {
         );
     }
 
-    /// Replaying the log against the list a drawer already had must give
-    /// the list the model holds now. This is the whole contract the
-    /// incremental redraw rests on: if it can drift, the list on screen
-    /// drifts from Slack and nothing ever corrects it.
-    #[test]
-    fn replaying_the_edits_rebuilds_the_list_the_model_holds() {
-        let mut model = model();
-        // The drawer starts caught up, holding the list as it stands.
-        let mut held = model
-            .conversation_rows()
-            .into_iter()
-            .map(|row| row.id)
-            .collect::<Vec<_>>();
-        model.forget_row_edits();
-
-        let replay = |model: &mut Model, held: &mut Vec<ChannelId>, at: &str| {
-            let edits = model.take_row_edits().expect("the log was not dropped");
-            for edit in edits {
-                if edit.was_shown {
-                    let from = held
-                        .iter()
-                        .position(|line| line == &edit.channel)
-                        .unwrap_or_else(|| panic!("{at}: no line to take out"));
-                    held.remove(from);
-                }
-                if edit.row.is_some() {
-                    let to = match &edit.before {
-                        Some(before) => held
-                            .iter()
-                            .position(|line| line == before)
-                            .unwrap_or_else(|| panic!("{at}: no neighbour to sit above")),
-                        None => held.len(),
-                    };
-                    held.insert(to, edit.channel.clone());
-                }
-            }
-            assert_eq!(
-                *held,
-                model
-                    .conversation_rows()
-                    .into_iter()
-                    .map(|row| row.id)
-                    .collect::<Vec<_>>(),
-                "{at}"
-            );
-        };
-
-        model.note_counts(&message("C1", "100", "U1", "morning"));
-        replay(&mut model, &mut held, "a message lands");
-        model.note_counts(&message("D1", "110", "U1", "lunch?"));
-        replay(&mut model, &mut held, "and one in a direct message");
-        // A badge changing without the row moving: the line comes out and
-        // goes back above the same neighbour, which the rope handles as a
-        // rewrite of one line.
-        model.note_counts(&message("D1", "111", "U1", "still lunch?"));
-        replay(&mut model, &mut held, "the same conversation speaks again");
-        model.mark_read(&ChannelId("D1".into()), &Ts("111".into()));
-        replay(&mut model, &mut held, "it is read");
-        model.set_muted([ChannelId("C1".into())]);
-        replay(&mut model, &mut held, "a channel is muted to the bottom");
-        model.set_muted([]);
-        replay(&mut model, &mut held, "and comes back up");
-        model.add_conversations([Conversation {
-            id: ChannelId("C9".into()),
-            kind: ConversationKind::Channel,
-            name: "new".to_owned(),
-            user: None,
-            members: Vec::new(),
-        }]);
-        replay(&mut model, &mut held, "a conversation rho had not heard of");
-        // The roster is the one event that moves every row, and it asks
-        // for the list again rather than handing over an edit per row: n
-        // edits cost more to replay than one draw, and the drawer would
-        // reach that conclusion itself on reading them.
-        model.add_users([User {
-            id: UserId("U1".into()),
-            name: "Zara".to_owned(),
-            handle: "zara".to_owned(),
-        }]);
-        assert!(
-            model.take_row_edits().is_none(),
-            "the roster landing asks for the list again"
-        );
-    }
-
-    /// The promise the reader is given: a word of a name reaches it, and a
-    /// mid-word run does not. `des` reaches `#design`, `ops` reaches both
-    /// `#dev-ops` and `#ops-alerts`, `sign` reaches nothing. This is
-    /// Emacs completion's style for names, and it is the promise that
-    /// makes a query a range scan rather than a walk.
-    #[test]
-    fn a_word_of_a_name_reaches_it_and_a_run_inside_one_does_not() {
-        let mut model = model();
-        model.add_conversations(
-            ["dev-ops", "ops-alerts", "random"]
-                .into_iter()
-                .enumerate()
-                .map(|(at, name)| Conversation {
-                    id: ChannelId(format!("K{at}")),
-                    kind: ConversationKind::Channel,
-                    name: name.to_owned(),
-                    user: None,
-                    members: Vec::new(),
-                }),
-        );
-        let reached = |model: &Model, query: &str| {
-            model
-                .reached_by(query, 50)
-                .into_iter()
-                .map(|row| row.label)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(reached(&model, "des"), vec!["#design".to_owned()]);
-        assert_eq!(
-            reached(&model, "ops"),
-            vec!["#dev-ops".to_owned(), "#ops-alerts".to_owned()],
-            "a word start anywhere in the name, not only the first"
-        );
-        assert!(
-            reached(&model, "sign").is_empty(),
-            "a run inside a word is not a word start, and is not promised"
-        );
-        assert_eq!(
-            reached(&model, "#dev-ops"),
-            vec!["#dev-ops".to_owned()],
-            "a name typed or completed whole reaches itself: the query is              split exactly as a name is, so the sigil and the dash ask for              the words either side of them"
-        );
-        assert_eq!(
-            reached(&model, "ops al"),
-            vec!["#ops-alerts".to_owned()],
-            "a second typed word intersects"
-        );
-    }
-
-    /// A name breaks where a reader would break it: on the punctuation
-    /// Slack's own names are full of, and at a hump in a name that has no
-    /// punctuation at all.
-    #[test]
-    fn a_name_breaks_on_punctuation_and_on_a_hump() {
-        assert_eq!(
-            Model::word_starts("#design-ops"),
-            vec!["design".to_owned(), "ops".to_owned()]
-        );
-        assert_eq!(
-            Model::word_starts("@Ada Lovelace"),
-            vec!["ada".to_owned(), "lovelace".to_owned()]
-        );
-        assert_eq!(
-            Model::word_starts("mpdm-devOps"),
-            vec!["dev".to_owned(), "mpdm".to_owned(), "ops".to_owned()]
-        );
-    }
-
-    /// Narrowing is the list, so a conversation that arrives while a query
-    /// stands is drawn only if it answers the query, and one that stops
-    /// answering it goes. Otherwise a message would put a row on screen
-    /// that the reader has just filtered away.
-    #[test]
-    fn traffic_while_narrowed_only_reaches_the_rows_the_query_holds() {
-        let mut model = model();
-        model.add_conversations([Conversation {
-            id: ChannelId("C9".into()),
-            kind: ConversationKind::Channel,
-            name: "random".to_owned(),
-            user: None,
-            members: Vec::new(),
-        }]);
-        model.narrow("random");
-        model.forget_row_edits();
-        assert_eq!(
-            model
-                .conversation_rows()
-                .into_iter()
-                .map(|row| row.label)
-                .collect::<Vec<_>>(),
-            vec!["#random".to_owned()],
-            "only what the query reaches is the list"
-        );
-
-        // Something lands in a conversation the query does not reach.
-        model.note_counts(&message("C1", "500", "U1", "morning"));
-        let edits = model.take_row_edits().expect("the log stands");
-        assert!(
-            edits.is_empty(),
-            "a row the query does not reach changes no line, so there is \
-             nothing to tell the drawer: {edits:?}"
-        );
-        assert_eq!(
-            model
-                .conversation_rows()
-                .into_iter()
-                .map(|row| row.label)
-                .collect::<Vec<_>>(),
-            vec!["#random".to_owned()],
-            "and the narrowed list is what it was"
-        );
-    }
-
-    /// An empty narrowing has two causes and the list must not read the
-    /// same for both: a word nothing ever answered is the reader's own
-    /// keystroke, and a list that emptied under them afterwards is Slack's
-    /// doing. Only what the model remembers of the query's own history can
-    /// tell them apart, and the reader typing is the only thing that
-    /// forgets it.
-    #[test]
-    fn an_empty_narrowing_says_which_of_the_two_emptied_it() {
-        let mut model = model();
-        assert_eq!(model.empty_narrowing(), None, "no query stands");
-
-        model.narrow("design");
-        assert_eq!(
-            model.empty_narrowing(),
-            None,
-            "a query with rows under it is not empty"
-        );
-
-        // The channel is renamed out from under the query.
-        model.add_conversations([Conversation {
-            id: ChannelId("C1".into()),
-            kind: ConversationKind::Channel,
-            name: "product".to_owned(),
-            user: None,
-            members: Vec::new(),
-        }]);
-        assert!(model.conversation_rows().is_empty(), "nothing left to draw");
-        assert_eq!(
-            model.empty_narrowing(),
-            Some(Empty::Gone),
-            "the reader did nothing to empty this and is owed the way out"
-        );
-
-        // A conversation answering the standing query arrives: the list is
-        // a list again, and the reason it was empty is not raised.
-        model.add_conversations([Conversation {
-            id: ChannelId("C7".into()),
-            kind: ConversationKind::Channel,
-            name: "design-review".to_owned(),
-            user: None,
-            members: Vec::new(),
-        }]);
-        assert_eq!(model.empty_narrowing(), None, "rows again");
-
-        model.narrow("zzz");
-        assert_eq!(
-            model.empty_narrowing(),
-            Some(Empty::Never),
-            "a fresh query that reaches nothing is the reader's own keystroke"
-        );
-
-        model.narrow("");
-        assert_eq!(model.empty_narrowing(), None, "widening ends the question");
-    }
-
-    /// Widening by deleting a letter puts rows back, and the model says
-    /// which ones rather than telling the drawer to start again.
-    #[test]
-    fn deleting_a_letter_puts_the_rows_it_widens_to_back() {
-        let mut model = model();
-        model.add_conversations([Conversation {
-            id: ChannelId("K0".into()),
-            kind: ConversationKind::Channel,
-            name: "desks".to_owned(),
-            user: None,
-            members: Vec::new(),
-        }]);
-        model.narrow("desi");
-        model.forget_row_edits();
-        assert_eq!(model.conversation_rows().len(), 1, "#design alone");
-
-        model.narrow("des");
-        let edits = model
-            .take_row_edits()
-            .expect("widening is a diff, not a redraw");
-        let arriving = edits.iter().filter(|edit| edit.row.is_some()).count();
-        assert_eq!(arriving, 1, "#desks came back and #design did not move");
-        assert_eq!(model.conversation_rows().len(), 2);
-    }
-
-    /// A log nobody drains is dropped rather than grown without bound, and
-    /// the drawer is told to start again instead of being handed a log that
-    /// no longer begins where its list does.
-    #[test]
-    fn a_list_nobody_draws_gives_up_its_log_rather_than_growing() {
-        let mut model = model();
-        model.forget_row_edits();
-        for at in 0..(ROW_EDIT_CAP + 10) {
-            model.note_counts(&message("C1", &format!("{at}"), "U1", "traffic"));
-        }
-        assert!(
-            model.take_row_edits().is_none(),
-            "the drawer is told to rebuild"
-        );
-        assert!(
-            model.take_row_edits().is_some_and(|edits| edits.is_empty()),
-            "and is caught up again once it has"
-        );
-    }
-
     /// The kept order and a sort must say the same thing after anything
     /// that can move a row. The list is the way in to Slack; a row in the
     /// wrong place is a conversation the reader cannot find, and an index
@@ -4140,99 +3237,6 @@ mod tests {
             model.next_unread(Some(&ChannelId("D1".into()))),
             NextUnread::Nothing
         );
-    }
-
-    /// `shift-n` walks the list the reader is looking at, which is the
-    /// narrowed one while a query stands.
-    ///
-    /// This has been decided both ways and the history is worth keeping.
-    /// It first walked the narrowed rows; that was changed because a query
-    /// left standing answered "nothing unread" while a DM outside it
-    /// waited, and the key that exists to find unread messages was the one
-    /// thing that could not see them. What settles it is the rule that a
-    /// narrowing is a motion and not a setting: it lasts while the reader
-    /// is in it and does not survive a restart, so there is no hour-old
-    /// query to be trapped by, and a key that moved them somewhere the
-    /// rows cannot show -- under a banner still describing the rows --
-    /// would leave the list and the key disagreeing about where they are.
-    ///
-    /// What remains true from the other direction is asserted below: the
-    /// backlog is still counted over the whole workspace, so nothing
-    /// waiting is ever hidden from the reader, only from this one key
-    /// while they are narrowed.
-    #[test]
-    fn the_next_unread_key_stays_inside_the_list_the_reader_is_looking_at() {
-        let mut model = model();
-        let count = |channel: &str| ConversationCount {
-            channel: ChannelId(channel.into()),
-            has_unreads: true,
-            mention_count: 0,
-            unread_count: 0,
-            latest: Some(Ts("100".into())),
-            last_read: None,
-        };
-        // Unread in the DM, which is the one the query will not reach, and
-        // in the channel it will.
-        model.set_counts([count("D1"), count("C1")]);
-        model.narrow("design");
-        assert_eq!(
-            model
-                .conversation_rows()
-                .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>(),
-            vec![ChannelId("C1".into())],
-            "the list is narrowed to #design, which is what the reader sees"
-        );
-        assert_eq!(
-            model.next_unread(None),
-            NextUnread::Go(ChannelId("C1".into())),
-            "the key goes to the unread one on screen, not the one off it"
-        );
-
-        // Nothing unread left inside the narrowing: the key stops rather
-        // than jumping to a conversation the rows cannot show.
-        model.set_counts([
-            count("D1"),
-            ConversationCount {
-                has_unreads: false,
-                ..count("C1")
-            },
-        ]);
-        assert_eq!(
-            model.next_unread(None),
-            NextUnread::Outside(1),
-            "at the edge it stops, and says how much waits outside rather \
-             than jumping there or claiming there is nothing"
-        );
-        assert_eq!(
-            model.mark_plan(f64::MAX).conversations.len(),
-            1,
-            "the backlog is still the workspace's, so nothing is hidden \
-             from the reader -- only from this key while they are narrowed"
-        );
-
-        // Out of the narrowing, the key sees the whole list again.
-        model.narrow("");
-        assert_eq!(
-            model.next_unread(None),
-            NextUnread::Go(ChannelId("D1".into()))
-        );
-
-        // Read everything, narrowed: nothing outside either, so the key
-        // says nothing waits rather than counting zero.
-        model.narrow("design");
-        model.set_counts([
-            ConversationCount {
-                has_unreads: false,
-                ..count("D1")
-            },
-            ConversationCount {
-                has_unreads: false,
-                ..count("C1")
-            },
-        ]);
-        assert_eq!(model.next_unread(None), NextUnread::Nothing);
     }
 
     #[test]

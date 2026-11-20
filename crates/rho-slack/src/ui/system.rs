@@ -1194,9 +1194,7 @@ pub(super) fn next_unread(
             window,
             cx,
         ),
-        // Nothing narrows the conversations any more, so nothing waits
-        // outside a narrowing either.
-        model::NextUnread::Outside(_) | model::NextUnread::Nothing => {
+        model::NextUnread::Nothing => {
             frame.echo("slack: nothing unread", StyleClass::SystemInfo, cx)
         }
     }

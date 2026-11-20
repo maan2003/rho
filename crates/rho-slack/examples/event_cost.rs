@@ -1,12 +1,10 @@
 //! What one arriving message costs, part by part, on a mirror the size of a
 //! real workspace's history.
 //!
-//! `list_cost` measures the model alone. This measures the chain the socket
-//! actually runs — the mirror write, then the model update — on a mirror of
-//! a given number of messages, so the parts can be compared with each other
-//! rather than each with zero. The two view-side parts (the rows a drawer
-//! patches, and the frame) need a window and are measured where the window
-//! is.
+//! This measures the chain the socket actually runs — the mirror write, then
+//! the model update — on a mirror of a given number of messages, so the parts
+//! can be compared with each other rather than each with zero. The view-side
+//! part (the frame) needs a window and is measured where the window is.
 //!
 //! ```text
 //! cargo run --release --example event_cost -- 250000
@@ -121,14 +119,12 @@ fn main() -> anyhow::Result<()> {
         model.note_counts(&arriving(step));
     }
     let counts = counts_at.elapsed() / runs;
-    model.forget_row_edits();
 
     let noted_at = Instant::now();
     for step in 0..runs as usize {
         std::hint::black_box(model.note_message(&arriving(step), 1_900_100_000));
     }
     let noted = noted_at.elapsed() / runs;
-    model.forget_row_edits();
 
     println!("one arriving message, top level, into a conversation of {each}");
     println!("  mirror, newest_chunk(1) {looked:?}   (×2: the thread scope and the channel)");

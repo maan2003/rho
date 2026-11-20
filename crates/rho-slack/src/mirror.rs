@@ -63,10 +63,6 @@ const CURSORS: TableDefinition<&str, Sen<StoredCursor>> =
 /// this table is first opened or when a rebuild is asked for; after that
 /// they are written on the event that moves them and read back whole.
 const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_slack_units_v1");
-/// Messages the reader explicitly saved for later in rho. Slack does not
-/// expose its current Later list through a supported API, so this is honest
-/// client-local state in the same durable mirror as the message it names.
-const SAVED: TableDefinition<&str, Sen<StoredSaved>> = TableDefinition::new("rho_slack_saved_v1");
 /// The channels the reader opted into. Its own table rather than a flag in
 /// `CURSORS`, because the question asked of it is "which ones", and that is
 /// a range scan over a workspace rather than a lookup per channel.
@@ -84,18 +80,6 @@ const DRAFT_FILES: TableDefinition<&str, Sen<StoredDraftFiles>> =
     TableDefinition::new("rho_slack_draft_files_v1");
 const PENDING_DRAFTS: TableDefinition<&str, Sen<StoredPendingDraft>> =
     TableDefinition::new("rho_slack_pending_drafts_v1");
-
-/// One locally saved message. Its source is retained so opening a saved
-/// thread reply returns to the thread rather than the channel timeline.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Saved {
-    pub channel: ChannelId,
-    pub thread: Option<Ts>,
-    pub ts: Ts,
-    /// A human-readable snapshot retained if the mirrored message is later
-    /// deleted or its cached run is collected.
-    pub summary: String,
-}
 
 /// One run of history: a conversation, or one thread inside it. A thread is
 /// its own run because Slack pages it separately.
@@ -212,7 +196,6 @@ impl Mirror {
         futures::executor::block_on(async {
             let mut write = db.write().await;
             write.open_table(FAVORITES);
-            write.open_table(SAVED);
             write.open_table(MESSAGES);
             write.open_table(GAPS);
             write.open_table(USERS);
@@ -853,60 +836,6 @@ impl Mirror {
         );
     }
 
-    /// Saves one message idempotently. The key is Slack's message identity,
-    /// so pressing save twice cannot duplicate an inventory row.
-    pub fn save(&self, workspace: &str, saved: &Saved) {
-        let mut txn = self.write();
-        {
-            let mut table = txn.open_table(SAVED);
-            table.insert(
-                saved_key(workspace, saved).as_str(),
-                SenValue::owned(StoredSaved {
-                    channel: saved.channel.0.clone(),
-                    thread: saved.thread.as_ref().map(|ts| ts.0.clone()),
-                    ts: saved.ts.0.clone(),
-                    summary: saved.summary.clone(),
-                }),
-            );
-        }
-        txn.commit();
-    }
-
-    pub fn unsave(&self, workspace: &str, saved: &Saved) {
-        let mut txn = self.write();
-        {
-            let mut table = txn.open_table(SAVED);
-            table.remove(saved_key(workspace, saved).as_str());
-        }
-        txn.commit();
-    }
-
-    /// Newest first, as a Later inventory is read.
-    pub fn saved(&self, workspace: &str) -> Vec<Saved> {
-        let txn = self.db.read();
-        let table = txn.open_table(SAVED);
-        let prefix = format!("{workspace}{SEPARATOR}");
-        let end = format!(
-            "{workspace}{}",
-            char::from_u32(SEPARATOR as u32 + 1).unwrap()
-        );
-        let mut saved = table
-            .range(prefix.as_str()..end.as_str())
-            .map(|(_, value)| {
-                let value = value.value();
-                let value = value.as_ref();
-                Saved {
-                    channel: ChannelId(value.channel.clone()),
-                    thread: value.thread.as_ref().map(|ts| Ts(ts.clone())),
-                    ts: Ts(value.ts.clone()),
-                    summary: value.summary.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        saved.sort_by(|left, right| right.ts.epoch_seconds().total_cmp(&left.ts.epoch_seconds()));
-        saved
-    }
-
     /// Reads the draft for one source.
     pub fn draft(&self, scope: &Scope) -> Option<Draft> {
         self.read_draft(scope, true)
@@ -1353,22 +1282,6 @@ fn unit_key(workspace: &str, unit: &Unit) -> String {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct StoredSaved {
-    channel: String,
-    thread: Option<String>,
-    ts: String,
-    summary: String,
-}
-
-fn saved_key(workspace: &str, saved: &Saved) -> String {
-    format!(
-        "{workspace}{SEPARATOR}{}{SEPARATOR}{}",
-        saved.channel.as_str(),
-        saved.ts.as_str()
-    )
-}
-
 /// The reader's own reaction history: shortcodes without colons, most
 /// recent first, capped where the picker stops showing them.
 
@@ -1756,12 +1669,6 @@ mod compatibility_tests {
             people: Default::default(),
             from_others: Vec::new(),
         };
-        let saved = Saved {
-            channel: ChannelId::from("C1"),
-            thread: None,
-            ts: cached.ts.clone(),
-            summary: "kept summary".into(),
-        };
 
         // This is the pre-generation database: history and its shape facts
         // exist, as do local state and a table owned by the surrounding
@@ -1799,15 +1706,6 @@ mod compatibility_tests {
             write
                 .open_table(FAVORITES)
                 .insert(format!("acme{SEPARATOR}C1").as_str(), true);
-            write.open_table(SAVED).insert(
-                saved_key("acme", &saved).as_str(),
-                SenValue::owned(StoredSaved {
-                    channel: "C1".into(),
-                    thread: None,
-                    ts: cached.ts.0.clone(),
-                    summary: saved.summary.clone(),
-                }),
-            );
             write
                 .open_table(OTHER_CLIENT_STATE)
                 .insert((), "credential sentinel");
@@ -1832,7 +1730,6 @@ mod compatibility_tests {
             })
         );
         assert!(mirror.favorite("acme", &ChannelId::from("C1")));
-        assert_eq!(mirror.saved("acme"), vec![saved]);
         assert_eq!(
             db.read()
                 .open_table(OTHER_CLIENT_STATE)
