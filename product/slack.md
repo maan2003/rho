@@ -9,7 +9,6 @@ because: the user answers Slack all day, and it must come to the same deal as th
 costs: a token and a cookie copied from a browser, and what Slack's apps can do that the window cannot.
 
 ## concept Workspace
-status: the `slack` menu also has `conversations`, a screen listing every conversation, unread first, with `s` to narrow it by name and the muted ones under a rule at the bottom, which shows `connecting to slack…` or `slack unavailable:` at its top; and `activity`, a list of each conversation or thread that asks, with its newest message under it.
 purpose: connect rho to one of the user's Slack workspaces.
 principle: the user runs `register workspace…`, gives the name, the token, and the cookie from their browser; the echo line reads `slack: acme registered`; Slack's asks start to come in as cards.
 sees: its name, as the tag on its rooms on Home; on the echo line, `slack unavailable:` and the reason when Slack refuses it.
