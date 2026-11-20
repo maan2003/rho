@@ -128,6 +128,7 @@ impl AgentHead {
                 self.startup_failure = Some(failure.clone())
             }
             Event::Request { inputs, .. } => {
+                self.startup_failure = None;
                 let newest = inputs.iter().filter_map(|input| input.message).max();
                 if let Some(newest) = newest {
                     self.delivered = self.delivered.max(newest.0);

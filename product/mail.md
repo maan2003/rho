@@ -11,7 +11,6 @@ costs: the user opens the transcript to see which agent did what.
 An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a `deal.Card` from it.
 
 ## bet The project asks by mail, even when an agent stops
-status: when an agent cannot launch, its stop mail explains how to get the work going. Further replies are saved without retrying the failed launch.
 instead of: attention coming from a mixture of mentions from named agents and notices about their state.
 serves: Know what wants them, and where they were.
 because: the user only needs what asks for them or returns a result, not each agent's progress. A stop is another mail to answer, not another kind of thing to watch.
