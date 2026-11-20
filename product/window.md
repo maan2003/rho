@@ -38,7 +38,7 @@ On the phone, a long name is cut at a word so that the card's words stay whole.
 status: one prompt lists commands, places and notes, and a phone tap chooses a row. Full-text search across mail and notes is not built.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
-sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits, then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or its `mail.Status` otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently visited. A command shows the entire key sequence that works from this screen, if it has one.
+sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits, then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or its `mail.Status` otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently visited. The current place ranks last among matching places. Commands follow the last place and appear once each, by command name, not by the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one.
 does:
 - open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a draft the user is typing: open the same prompt; the place under it does not see the keys
 - search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of mail and notes, with optional prefixes to narrow the search
@@ -50,7 +50,7 @@ When nothing matches, the prompt offers no fallback rows. Nothing acts on a row 
 status: full-text search across mail and notes is not built; the matching mail line in the mock does not appear.
 answers: where can the user go, or what can they run, with these words?
 shows:
-- the query in the `Palette` prompt
+- the query in the `Palette` prompt, with the selected position and total at its right end
 - the `Palette` rows in match order, with each command's key and the `mail.Status` or `deal.Card` words where a thread has them
 states:
 - empty: an empty query lists recent places newest first, leaving out the current place, then what waits, then the screen's commands; a query with no match shows `no match`
@@ -95,6 +95,7 @@ does:
 - answer `enter`: take the highlighted answer, or the text typed
 - next and previous `ctrl-n`, `ctrl-p`, or the arrows: move through the answers (the Palette uses `up` to recall the last query)
 - delete word `ctrl-w`: delete the word before the cursor
+- start of line `ctrl-a`: move to the start without changing the text
 - clear `ctrl-u`: clear the line
 - recall `up`: put the last Palette query into the line
 - complete `tab`: put the highlighted answer into the line

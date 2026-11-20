@@ -462,7 +462,9 @@ impl Minibuffer {
                         _ => frame.open(place.found.address.clone(), window, cx),
                     },
                     Choice::Command(entry) => match &entry.pick {
-                        Pick::Run(run) | Pick::Infix(run) => run(frame, None, window, cx),
+                        Pick::Run { run, .. } | Pick::Infix { run, .. } => {
+                            run(frame, None, window, cx)
+                        }
                         Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
                     },
                 })
@@ -487,16 +489,27 @@ impl Minibuffer {
         let address = matches!(self.completion_input, CompletionInput::Address);
         let clickable = address || (layout == crate::Layout::Phone && self.is_palette());
         let measure = measure(text_style, window);
-        let gap = rems(0.5);
-        let gap_px = gap.to_pixels(window.rem_size());
-        let row_width = (width - gap_px * 2.).max(px(0.));
+        let inset = rems(0.5);
+        let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
+        let columns = match &self.answer {
+            Answer::Palette { listing, rows } => Some(PaletteColumns::new(
+                rows.iter().filter_map(|row| {
+                    let choice = &listing.choices[row.index];
+                    matches!(choice, Choice::Place(_)).then(|| choice.fields())
+                }),
+                row_width,
+                layout,
+                &measure,
+            )),
+            Answer::Text { .. } => None,
+        };
         let rows = (window_start..self.answer.len())
             .take(VISIBLE_CANDIDATES)
             .map(|index| {
                 let selected = index == self.selected;
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
-                let mut row = div().flex().flex_row().gap(gap).w_full().px(gap);
+                let mut row = div().flex().flex_row().gap(inset).w_full().px(inset);
                 if let Answer::Palette { listing, rows } = &self.answer {
                     let matched = &rows[index];
                     let choice = &listing.choices[matched.index];
@@ -528,40 +541,52 @@ impl Minibuffer {
                             .text_color(field_colors[field])
                             .child(StyledText::new(value.to_owned()).with_highlights(marks))
                     };
-                    let fields @ [title, detail, beside] = choice.fields();
-                    if layout == crate::Layout::Phone && !detail.is_empty() {
-                        // As on Desk, the subject and address share the first
-                        // line; the card or status words get their own line.
-                        let beside_width = measure(beside).min(row_width * 0.45);
-                        let title_room = if beside.is_empty() {
-                            row_width
-                        } else {
-                            (row_width - beside_width - gap_px).max(px(0.))
-                        };
-                        let (title, retained) = fit_title(title, title_room, &measure);
-                        row = row
-                            .flex_col()
-                            .gap_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .w_full()
-                                    .gap(gap)
-                                    .child(part(0, &title, retained))
-                                    .children((!beside.is_empty()).then(|| {
-                                        part(2, beside, beside.len()).w(beside_width).flex_none()
-                                    })),
-                            )
-                            .child(part(1, detail, detail.len()).pl(gap));
-                    } else {
-                        for (field, value) in fields.into_iter().enumerate() {
-                            if !value.is_empty() {
-                                row = row.child(
-                                    part(field, value, value.len())
-                                        .when(field == 2, |part| part.flex_none()),
+                    let [title, detail, beside] = choice.fields();
+                    let columns = columns.as_ref().expect("palette has columns");
+                    row = row.gap(columns.air);
+                    match (choice, layout) {
+                        (Choice::Place(_), crate::Layout::Phone) => {
+                            let has_beside = !beside.is_empty();
+                            let title_room = if has_beside { columns.title } else { row_width };
+                            let (title, retained) = fit_title(title, title_room, &measure);
+                            // As on Desk, the subject and address share the
+                            // first line; the card
+                            // or status words get their own line.
+                            row = row
+                                .flex_col()
+                                .gap_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(columns.air)
+                                        .child(part(0, &title, retained).w(title_room).flex_none())
+                                        .children(has_beside.then(|| {
+                                            part(2, beside, beside.len())
+                                                .w(columns.beside)
+                                                .flex_none()
+                                        })),
+                                )
+                                .children(
+                                    (!detail.is_empty())
+                                        .then(|| part(1, detail, detail.len()).pl(columns.air)),
                                 );
-                            }
+                        }
+                        (Choice::Place(_), crate::Layout::Desktop) => {
+                            let (title, retained) = fit_title(title, columns.title, &measure);
+                            row = row
+                                .child(part(0, &title, retained).w(columns.title).flex_none())
+                                .children((columns.detail > px(0.)).then(|| {
+                                    part(1, detail, detail.len()).w(columns.detail).flex_none()
+                                }))
+                                .children((!beside.is_empty()).then(|| {
+                                    part(2, beside, beside.len()).w(columns.beside).flex_none()
+                                }));
+                        }
+                        (Choice::Command(_), _) => {
+                            row = row.child(part(0, title, title.len())).children(
+                                (!beside.is_empty())
+                                    .then(|| part(2, beside, beside.len()).flex_none()),
+                            );
                         }
                     }
                 } else if let Answer::Text { rows, .. } = &self.answer {
@@ -603,7 +628,10 @@ impl Minibuffer {
             .collect::<Vec<_>>();
         // A prompt whose rows are its answers says when none answers, so
         // an empty list does not read as one still loading.
-        let no_match = rows.is_empty() && self.is_palette() && !self.input(cx).trim().is_empty();
+        let palette = self.is_palette();
+        let total = self.answer.len();
+        let no_match = total == 0 && palette && !self.input(cx).trim().is_empty();
+        let position = if total == 0 { 0 } else { self.selected + 1 };
         // Input first, candidates beneath it, like emacs completing-read.
         bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")
@@ -613,23 +641,73 @@ impl Minibuffer {
                 div()
                     .flex()
                     .flex_row()
-                    .flex_wrap()
+                    .when(!palette, |line| line.flex_wrap())
                     .items_center()
                     .gap_1()
-                    .px_2()
+                    .px(inset)
                     .child(div().max_w_full().child(self.prompt.clone()))
                     .child(
                         div()
                             .flex_grow(1.0)
-                            .min_w(px(160.))
+                            .min_w(if palette { px(0.) } else { px(160.) })
                             .child(self.editor.clone()),
-                    ),
+                    )
+                    .children(palette.then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(colors.text_muted)
+                            .child(format!("{position}/{total}"))
+                    })),
             )
             .children(rows)
             .children(
                 no_match.then(|| div().px_2().text_color(colors.text_muted).child("no match")),
             )
             .into_any_element()
+    }
+}
+
+/// A single column grid for all matching places, so it stays put when the
+/// visible rows scroll. As on Desk, the narrow grid moves detail down.
+struct PaletteColumns {
+    title: Pixels,
+    detail: Pixels,
+    beside: Pixels,
+    air: Pixels,
+}
+
+impl PaletteColumns {
+    fn new<'a>(
+        places: impl Iterator<Item = [&'a str; 3]>,
+        width: Pixels,
+        layout: crate::Layout,
+        measure: &impl Fn(&str) -> Pixels,
+    ) -> Self {
+        let [title, detail, beside] = places.fold([px(0.); 3], |mut widest, fields| {
+            for (column, text) in fields.into_iter().enumerate() {
+                if !text.is_empty() && (column != 0 || layout == crate::Layout::Desktop) {
+                    widest[column] = widest[column].max(measure(text));
+                }
+            }
+            widest
+        });
+        let air = measure("  ");
+        let (detail, beside) = match layout {
+            crate::Layout::Phone => (px(0.), beside.min(width * 0.45)),
+            crate::Layout::Desktop => (detail.min(width * 0.40), beside.min(width * 0.25)),
+        };
+        let gap_count = u8::from(detail > px(0.)) + u8::from(beside > px(0.));
+        let heading_room = (width - detail - beside - air * f32::from(gap_count)).max(px(0.));
+        let title = match layout {
+            crate::Layout::Phone => heading_room,
+            crate::Layout::Desktop => title.min(heading_room),
+        };
+        Self {
+            title,
+            detail,
+            beside,
+            air,
+        }
     }
 }
 
@@ -651,6 +729,30 @@ fn fit_title<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_words_and_addresses_have_stable_columns_for_asymmetric_titles() {
+        let measure = |text: &str| px(text.chars().count() as f32);
+        let places = [
+            ["A long project subject", "asks · 1h", "tide@lab"],
+            ["Quiet work", "", "long-project@lab"],
+        ];
+        let desktop = PaletteColumns::new(
+            places.into_iter(),
+            px(60.),
+            crate::Layout::Desktop,
+            &measure,
+        );
+        assert_eq!(desktop.title + desktop.air, px(24.));
+        assert_eq!(desktop.title + desktop.air * 2. + desktop.detail, px(35.));
+        let phone =
+            PaletteColumns::new(places.into_iter(), px(20.), crate::Layout::Phone, &measure);
+        assert_eq!(
+            (phone.title, phone.air, phone.beside),
+            (px(9.), px(2.), px(9.))
+        );
+        assert_eq!(phone.detail, px(0.));
+    }
 
     #[test]
     fn fitted_title_cuts_at_a_word_without_highlighting_its_ellipsis() {

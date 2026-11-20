@@ -20,12 +20,32 @@ pub type Run = Rc<dyn Fn(&mut Frame, Option<u32>, &mut Window, &mut Context<Fram
 #[derive(Clone)]
 pub enum Pick {
     /// Runs and closes the menu.
-    Run(Run),
+    Run { label: String, run: Run },
     /// Runs and leaves the menu open: a toggle, or a value the next key
     /// reads. The row shows the value.
-    Infix(Run),
+    Infix {
+        label: String,
+        value: String,
+        run: Run,
+    },
     /// Opens these rows over this menu.
     Menu(Rows),
+}
+
+impl Pick {
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Run { label, .. } | Self::Infix { label, .. } => label,
+            Self::Menu(rows) => &rows.title,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<&str> {
+        match self {
+            Self::Infix { value, .. } => Some(value),
+            _ => None,
+        }
+    }
 }
 
 /// Whose command a row is, for the palette's order: the screen's and the
@@ -43,8 +63,6 @@ pub enum Scope {
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
-    pub description: String,
-    pub value: Option<String>,
     /// Other words the palette finds the row by.
     pub also: Vec<String>,
     pub pick: Pick,
@@ -68,10 +86,11 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
             also: Vec::new(),
-            pick: Pick::Run(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            pick: Pick::Run {
+                label: description.into(),
+                run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
+            },
             scope: Scope::Here,
             shortcut: None,
         }
@@ -97,10 +116,11 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
             also: Vec::new(),
-            pick: Pick::Run(Rc::new(run)),
+            pick: Pick::Run {
+                label: description.into(),
+                run: Rc::new(run),
+            },
             scope: Scope::Here,
             shortcut: None,
         }
@@ -114,10 +134,12 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: Some(value.into()),
             also: Vec::new(),
-            pick: Pick::Infix(Rc::new(move |frame, _, window, cx| run(frame, window, cx))),
+            pick: Pick::Infix {
+                label: description.into(),
+                value: value.into(),
+                run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
+            },
             scope: Scope::Here,
             shortcut: None,
         }
@@ -130,11 +152,9 @@ impl Row {
         self
     }
 
-    pub fn menu(key: impl Into<String>, description: impl Into<String>, rows: Rows) -> Self {
+    pub fn menu(key: impl Into<String>, rows: Rows) -> Self {
         Self {
             key: key.into(),
-            description: description.into(),
-            value: None,
             also: Vec::new(),
             pick: Pick::Menu(rows),
             scope: Scope::Here,
@@ -173,8 +193,8 @@ impl Rows {
             tracing::warn!(
                 menu = %self.title,
                 key = %row.key,
-                kept = %taken.description,
-                dropped = %row.description,
+                kept = %taken.pick.label(),
+                dropped = %row.pick.label(),
                 "two rows on one key"
             );
             return;
@@ -204,14 +224,10 @@ impl Rows {
             transient = transient.counted();
         }
         for (index, row) in self.rows.iter().enumerate() {
-            transient = match (&row.pick, &row.value) {
-                (Pick::Infix(_), value) => transient.infix(
-                    row.key.clone(),
-                    row.description.clone(),
-                    value.clone().unwrap_or_default(),
-                    index,
-                ),
-                _ => transient.item(row.key.clone(), row.description.clone(), index),
+            let label = row.pick.label().to_owned();
+            transient = match row.pick.value() {
+                Some(value) => transient.infix(row.key.clone(), label, value.to_owned(), index),
+                None => transient.item(row.key.clone(), label, index),
             };
         }
         transient

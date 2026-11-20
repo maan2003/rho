@@ -336,12 +336,12 @@ fn buttons(state: BarState) -> Vec<Button> {
 /// `rows` with each pick also said to the journal as `verdict` by thumb.
 fn journaled(mut rows: Rows, verdict: PhoneVerdict) -> Rows {
     for row in &mut rows.rows {
-        if let Pick::Run(run) = &row.pick {
-            let run = run.clone();
-            row.pick = Pick::Run(Rc::new(move |frame, count, window, cx| {
+        if let Pick::Run { run, .. } = &mut row.pick {
+            let action = run.clone();
+            *run = Rc::new(move |frame, count, window, cx| {
                 record_verdict(verdict);
-                run(frame, count, window, cx);
-            }));
+                action(frame, count, window, cx);
+            });
         }
     }
     rows
@@ -697,9 +697,7 @@ impl Frame {
             // How long is a question, the one the snooze menu asks.
             Button::Snooze => {
                 if let Some(target) = &target {
-                    let card = self.card_for(target, cx);
-                    let rows =
-                        journaled(snooze_rows(target, &card.title, true), PhoneVerdict::Defer);
+                    let rows = journaled(snooze_rows(target, true), PhoneVerdict::Defer);
                     self.open_menu(rows, window, cx);
                 }
             }
@@ -797,11 +795,11 @@ impl Frame {
                 .gap_3()
                 .border_b_1()
                 .border_color(colors.border_variant)
-                .child(div().flex_1().min_w_0().child(row.description.clone()))
+                .child(div().flex_1().min_w_0().child(row.pick.label().to_owned()))
                 .children(
-                    row.value
-                        .clone()
-                        .map(|value| div().text_color(colors.text_muted).child(value)),
+                    row.pick
+                        .value()
+                        .map(|value| div().text_color(colors.text_muted).child(value.to_owned())),
                 )
                 .children(
                     matches!(row.pick, Pick::Menu(_))

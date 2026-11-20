@@ -39,7 +39,7 @@ Starting from the waiting clock ask, run the rows in order. `space` deals on Des
 | Render | Capture |
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
-| [Filtered palette over the thread](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:start agent, choosing' 'wait:600'; form_shot laptop prompt` |
+| [Filtered palette over the thread](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:start agent' 'wait:600'; form_shot laptop prompt` |
 | [Verdict menu over the card](laptop-menu.png) | `form_way laptop input 'key:escape' 'wait:600' 'key:space' 'wait:700'; form_shot laptop menu` |
 | [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |

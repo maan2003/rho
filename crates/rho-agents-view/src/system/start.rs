@@ -4,12 +4,13 @@
 //! the one the composer is about to send. An idea sent in a project asks
 //! nothing it need not: it works where the project's agents work, on the
 //! default runtime, and only a project no agent started from yet asks
-//! where, once. The rare `start agent, choosing where and runtime…` asks both:
+//! where, once. The rare `start agent` asks both:
 //! where (a new workset on a repository, a directory on the host as it is, or
 //! beside an agent already there) and the runtime. The GUI sends the code,
 //! which names the mail as `origin`, so policy joins the agent to its thread
 //! and hands it the mail first.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use camino::Utf8PathBuf;
@@ -147,7 +148,7 @@ pub(crate) fn rows(
     let mut rows = Rows::new(match runtimes {
         Runtimes::Ask => match origin {
             Origin::Mail => "start agent",
-            Origin::Draft(_) => "send and start agent",
+            Origin::Draft(_) => "send and start agent with options",
         },
         Runtimes::Default => "where this project's agents work",
     });
@@ -161,7 +162,7 @@ pub(crate) fn rows(
     let repo_origin = origin.clone();
     rows.push(Row::run(
         "n",
-        "new workset on a repository…",
+        "new workset on a repository",
         move |frame, window, cx| {
             let system = on_repo.clone();
             let origin = repo_origin.clone();
@@ -198,7 +199,7 @@ pub(crate) fn rows(
     let here_origin = origin.clone();
     rows.push(Row::run(
         "h",
-        "here, in a directory on the host…",
+        "here, in a directory on the host",
         move |frame, window, cx| {
             let system = here.clone();
             let origin = here_origin.clone();
@@ -230,41 +231,42 @@ pub(crate) fn rows(
             );
         },
     ));
-    // Beside an agent of the thread, in its workset: the ones already
-    // reading it first, then the rest of the host's.
+    // Join a destination of the work under the point, not just any
+    // destination the host happens to know.
     let registry = read.registry();
     let Some(host) = host else {
         return rows;
     };
-    let members = read
-        .mail
-        .read(cx)
-        .host_mail(thread.host)
-        .map(|chat| chat.members_under(Some(thread.message)))
-        .unwrap_or_default();
-    let mut beside: Vec<_> = members
-        .iter()
-        .copied()
-        .filter(|agent| registry.host_of_agent(*agent) == Some(host))
-        .collect();
-    beside.extend(
-        registry
-            .host_agents(host)
-            .into_iter()
-            .filter(|agent| !members.contains(agent)),
-    );
-    for (index, agent) in beside.into_iter().take(9).enumerate() {
-        let (Some(workset), Some(cwd)) = (
-            registry.agent_workset(agent),
-            registry.working_directory(agent),
-        ) else {
-            continue;
-        };
+    let mail = read.mail.read(cx);
+    let Some(log) = mail.host_mail(thread.host) else {
+        return rows;
+    };
+    let members = if log.is_project(thread.message) {
+        log.members_in_project(thread.message).into_iter().collect()
+    } else {
+        log.members_under(Some(thread.message))
+    };
+    let mut seen = BTreeSet::new();
+    let destinations = members
+        .into_iter()
+        .filter(|&agent| registry.host_of_agent(agent) == Some(host))
+        .filter_map(|agent| {
+            let work = ThreadId {
+                host: thread.host,
+                message: log.agent_thread(agent)?,
+            };
+            let (subject, address) = mail.thread_name(work, cx)?;
+            let workset = registry.agent_workset(agent)?;
+            let cwd = registry.working_directory(agent)?;
+            Some((workset, cwd, subject, address))
+        })
+        .filter(|(workset, cwd, _, _)| seen.insert((*workset, cwd.clone())));
+    for (index, (workset, cwd, subject, address)) in destinations.take(9).enumerate() {
         let system = system.clone();
         let origin = origin.clone();
         rows.push(Row::run(
             (index + 1).to_string(),
-            format!("join {}", registry.agent_display_label(agent)),
+            format!("join {subject}  {address}"),
             move |frame, window, cx| {
                 let start = Start::Join {
                     workset,

@@ -163,6 +163,14 @@ fn bindings() -> Vec<KeyBinding> {
         ),
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-u", MinibufferClear, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new(
+            "ctrl-a",
+            editor::actions::MoveToBeginningOfLine {
+                stop_at_soft_wraps: false,
+                stop_at_indent: false,
+            },
+            Some("RhoMinibuffer > Editor"),
+        ),
     ]);
     bindings
 }
@@ -215,6 +223,31 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
         }
+    }
+
+    #[test]
+    fn prompt_ctrl_a_wins_over_the_editors_select_all() {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([KeyBinding::new(
+            "ctrl-a",
+            editor::actions::SelectAll,
+            Some("Editor"),
+        )]);
+        keymap.add_bindings(bindings());
+        let stack = [
+            KeyContext::parse("RhoMinibuffer").unwrap(),
+            KeyContext::parse("Editor").unwrap(),
+        ];
+        let typed = Keystroke::parse("ctrl-a").unwrap();
+        let (matches, _) = keymap.bindings_for_input(&[typed], &stack);
+        let action = matches[0].action().as_any();
+        assert!(
+            action.downcast_ref::<editor::actions::MoveToBeginningOfLine>()
+                == Some(&editor::actions::MoveToBeginningOfLine {
+                    stop_at_soft_wraps: false,
+                    stop_at_indent: false,
+                })
+        );
     }
 
     #[test]
