@@ -49,6 +49,8 @@ pub enum Notice {
     Cancelled,
     /// The runtime could not launch; mail waits for a change of runtime.
     StartupFailed(StartupFailure),
+    /// The provider completed a response after a stuck retry streak.
+    Recovered(rho_agent_types::UnixMs),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

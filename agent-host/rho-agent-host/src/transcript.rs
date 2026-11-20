@@ -140,7 +140,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             },
             Notice::Cancelled => LogEvent::Cancelled { agent: *agent, at },
             // The runtime state says these.
-            Notice::Archived | Notice::FreshNotebook => return None,
+            Notice::Archived | Notice::FreshNotebook | Notice::Recovered(_) => return None,
         },
         Event::Step {
             agent,
@@ -226,7 +226,7 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
             at,
         },
         Event::RewindPending { .. } => return None,
-        Event::MailWritten { agent, message } => LogEvent::MailWritten {
+        Event::MailWritten { agent, message, .. } => LogEvent::MailWritten {
             agent: *agent,
             message: *message,
             at,

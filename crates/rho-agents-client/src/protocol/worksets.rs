@@ -58,6 +58,11 @@ rho_rpc::calls! {
         /// Answered with the accounts as they stand after the switch.
         SetClaudeAccount(super::SetClaudeAccount) -> super::ClaudeAccountList;
         SetAuthAccountEnabled(super::SetAuthAccountEnabled) -> ();
+        /// Start from a posted idea; if refused before an agent exists, the
+        /// host leaves stop mail in the thread before answering with the error.
+        StartFromMail(StartFromMail) -> AgentId;
+        RewindAgent(RewindAgent) -> RewoundAgent;
+        StopAgent(StopAgent) -> ();
     }
 }
 
@@ -71,6 +76,36 @@ pub struct CreateWorkset {
 pub struct Eval {
     pub workset: WorksetId,
     pub code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct StartFromMail {
+    pub origin: MessageId,
+    pub launch: MailLaunch,
+    /// The initiating window's label for the host, only for diagnostic text.
+    pub host_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum MailLaunch {
+    New(CreateWorkset),
+    Existing(Eval),
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RewindAgent {
+    pub agent: AgentId,
+    pub turns: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RewoundAgent {
+    pub taken_back: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct StopAgent {
+    pub agent: AgentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -459,6 +494,17 @@ mod tests {
             CreateWorkset {
                 kind: WorksetKind::Isolated,
                 code: "new_agent()".into(),
+            }
+            .into(),
+        ));
+        round_trips(Open::Request(
+            StartFromMail {
+                origin: MessageId(rho_agent_types::ChatSeq(29)),
+                launch: MailLaunch::Existing(Eval {
+                    workset: WorksetId([3; 6]),
+                    code: "new_agent()".into(),
+                }),
+                host_label: "lab".into(),
             }
             .into(),
         ));

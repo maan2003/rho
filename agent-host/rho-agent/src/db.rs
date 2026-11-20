@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "d8e4c62f";
+const CURRENT_AGENT_DB_FORMAT: &str = "9f7265ce";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
@@ -64,7 +64,10 @@ const MIGRATIONS: &[Migration] = &[
     // the newer reader.
     ("a8f02c31", "b5082aa5", |_| {}),
     // Existing rows decode unchanged. An old host cannot decode MailWritten.
-    ("b5082aa5", CURRENT_AGENT_DB_FORMAT, |_| {}),
+    ("b5082aa5", "d8e4c62f", |_| {}),
+    // Existing mail rows decode unchanged. Older hosts cannot read a new
+    // live revision or a stop with no agent.
+    ("d8e4c62f", CURRENT_AGENT_DB_FORMAT, |_| {}),
 ];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
@@ -645,6 +648,7 @@ mod tests {
             [
                 "a8f02c31->b5082aa5",
                 "b5082aa5->d8e4c62f",
+                "d8e4c62f->9f7265ce",
                 "e41b7c2a->a8f02c31"
             ]
         );

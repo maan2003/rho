@@ -127,9 +127,6 @@ pub struct MailSystem {
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
-    /// Threads whose agent did not start from this window, and why, in the
-    /// host's words, while this window runs.
-    failed_starts: HashMap<ThreadId, String>,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
@@ -175,7 +172,6 @@ impl MailSystem {
                 .collect(),
             cache,
             view: None,
-            failed_starts: HashMap::new(),
             hosts: HashMap::new(),
             logs,
             events,
@@ -474,18 +470,6 @@ impl MailSystem {
         id
     }
 
-    /// The agent asked for in `thread` did not start, for `reason`: the
-    /// thread says so until an agent is in it.
-    pub fn note_failed_start(&mut self, thread: ThreadId, reason: String, cx: &mut Context<Self>) {
-        self.failed_starts.insert(thread, reason);
-        cx.notify();
-    }
-
-    /// Why the agent asked for in `thread` did not start, when it did not.
-    pub fn failed_start(&self, thread: ThreadId) -> Option<&str> {
-        self.failed_starts.get(&thread).map(String::as_str)
-    }
-
     /// Posts the project's draft after the start prompt is confirmed.
     fn send_project_draft(&mut self, project: ThreadId, cx: &mut Context<Self>) -> Option<u64> {
         let parent = Some(project.message);
@@ -655,21 +639,24 @@ impl MailSystem {
         if facts.muted() {
             return Vec::new();
         }
-        let seen = facts
-            .seen_topic()
-            .map(|seen| MessageId(rho_agent_types::ChatSeq(seen)));
+        let seen = facts.seen_topic().map(rho_agent_types::ChatSeq);
         let mut wrote = None;
         for id in chat.children(Some(thread.message)) {
             if let Some(message) = chat.message(*id)
                 && message.from == Party::User
             {
-                wrote = Some(*id);
+                wrote = Some(id.0);
             }
         }
         let seen = seen.max(wrote);
         chat.others_in(thread.message)
             .into_iter()
-            .filter(|id| seen.is_none_or(|seen| *id > seen))
+            .filter(|id| {
+                seen.is_none_or(|seen| {
+                    chat.message(*id)
+                        .is_some_and(|mail| mail.version().0 > seen)
+                })
+            })
             .collect()
     }
 
@@ -965,7 +952,7 @@ impl System for MailSystem {
     fn seen(&self, address: &Address, _cx: &App) -> Seen {
         self.thread_of(address)
             .and_then(|thread| self.logs.get(&thread.host)?.newest_in(thread.message))
-            .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
+            .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0))
     }
 
     fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
@@ -973,6 +960,13 @@ impl System for MailSystem {
             .iter()
             .flat_map(|(&host, chat)| {
                 chat.statuses().filter_map(move |status| {
+                    if matches!(
+                        status.state,
+                        rho_agent_types::StatusText::StoppedByYou
+                            | rho_agent_types::StatusText::Stuck
+                    ) {
+                        return None;
+                    }
                     let thread = ThreadId {
                         host,
                         message: status.thread,
@@ -983,7 +977,7 @@ impl System for MailSystem {
                         thread: thread.address(),
                         subject: chat.name(thread.message)?,
                         project: self.project_address(project)?,
-                        status: status.text.clone(),
+                        status: status.state.words().to_owned(),
                         changed: Timestamp::from_millisecond(status.at.0.try_into().ok()?).ok()?,
                     })
                 })
@@ -1077,7 +1071,9 @@ impl System for MailSystem {
                     title: if is_project { project.clone() } else { subject },
                     description: if is_project { String::new() } else { project },
                     thread: (!is_project).then(|| FoundThread {
-                        status: chat.status(id).map(|status| status.text.clone()),
+                        status: chat
+                            .status(id)
+                            .map(|status| status.state.words().to_owned()),
                     }),
                     recency: chat.newest_in(id).map_or(mail.at.0, |(_, at)| at.0),
                 });

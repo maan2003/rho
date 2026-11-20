@@ -152,7 +152,7 @@ mod tests {
             statuses: vec![ThreadStatus {
                 thread: MessageId(ChatSeq(14)),
                 at: UnixMs(28),
-                text: "Waiting for the review".into(),
+                state: rho_agent_types::StatusText::Written("Waiting for the review".into()),
             }],
         });
         round_trips(ServerFrame::Statuses {
@@ -219,6 +219,17 @@ mod tests {
                 },
                 ChatRecord {
                     seq: ChatSeq(10),
+                    at: UnixMs(28),
+                    event: ChatEvent::Revised {
+                        message: MessageId(ChatSeq(4)),
+                        author: agent,
+                        content: vec![ContentPart::Text {
+                            text: "Clock B?".into(),
+                        }],
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(11),
                     at: UnixMs(29),
                     event: ChatEvent::Posted {
                         parent: Some(MessageId(ChatSeq(7))),

@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rho_agent_types::{
-    Activity, Address, AgentId, Doing, Message, MessageId, Stop, ThreadStatus, UnixMs,
+    Activity, Address, AgentId, ContentPart, Doing, Mention, MentionKind, Message, MessageId,
+    StatusText, Stop, ThreadStatus, UnixMs,
 };
 use tokio::sync::watch;
 
 use super::AgentPool;
 use crate::record::{Event, Record};
-use crate::store::{MailRead as _, MailWrite as _, StoreRead as _, StoreWrite as _};
+use crate::store::{MailRead as _, MailWrite as _, NewMessage, StoreRead as _, StoreWrite as _};
 use crate::{InferenceState, RuntimeState};
 
 const COLD_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -27,7 +28,7 @@ pub(super) struct Mail {
 struct Status {
     owner: AgentId,
     at: UnixMs,
-    text: String,
+    state: StatusText,
 }
 
 impl Mail {
@@ -53,7 +54,14 @@ impl Mail {
                 return Ok(());
             }
         } else {
-            held.insert(thread, Status { owner, at, text });
+            held.insert(
+                thread,
+                Status {
+                    owner,
+                    at,
+                    state: StatusText::Written(text),
+                },
+            );
         }
         self.status_changed.send_replace(());
         Ok(())
@@ -68,6 +76,28 @@ impl Mail {
         }
     }
 
+    fn user_stopped(&self, thread: MessageId, owner: AgentId, at: UnixMs) {
+        self.statuses.lock().expect("poison").insert(
+            thread,
+            Status {
+                owner,
+                at,
+                state: StatusText::StoppedByYou,
+            },
+        );
+        self.status_changed.send_replace(());
+    }
+
+    fn clear_user_stop(&self, thread: MessageId) {
+        let mut statuses = self.statuses.lock().expect("poison");
+        if statuses
+            .get(&thread)
+            .is_some_and(|status| status.state == StatusText::StoppedByYou)
+        {
+            statuses.remove(&thread);
+        }
+    }
+
     fn status_snapshot(&self) -> Vec<ThreadStatus> {
         self.statuses
             .lock()
@@ -76,7 +106,7 @@ impl Mail {
             .map(|(&thread, status)| ThreadStatus {
                 thread,
                 at: status.at,
-                text: status.text.clone(),
+                state: status.state.clone(),
             })
             .collect()
     }
@@ -152,6 +182,42 @@ impl Drop for MailView {
 }
 
 impl AgentPool {
+    /// A start refused before an agent existed. There is no agent or
+    /// transcript to own this stop; the project speaks in its thread.
+    pub async fn post_start_failure(&self, origin: MessageId, reason: &str) -> anyhow::Result<()> {
+        let (thread, project) = {
+            let read = self.db.read();
+            let mail = read
+                .message(origin)
+                .ok_or_else(|| anyhow::anyhow!("no mail #{}", origin.0.0))?;
+            let root = read.root_of(origin).expect("a message has a root");
+            let project = read.thread(root).expect("the root is a thread").name;
+            (read.mail_thread(&mail), project)
+        };
+        let reason = rho_agent_types::one_line(reason);
+        let project = rho_agent_types::one_line(&project);
+        let text = format!(
+            "failed · did not start · {reason}\n\nTo carry on, run start agent here and choose where {project}'s agents work."
+        );
+        let mut write = self.db.write().await;
+        write.post(
+            UnixMs::now(),
+            Some(thread),
+            NewMessage {
+                from: Address::StartFailed,
+                reply_to: Some(origin),
+                mentions: vec![Mention {
+                    to: Address::User,
+                    kind: MentionKind::Ask,
+                }],
+                content: vec![ContentPart::Text { text }],
+            },
+            None,
+        )?;
+        write.commit();
+        Ok(())
+    }
+
     pub fn mail_view(self: &Arc<Self>) -> MailView {
         MailView {
             pool: self.clone(),
@@ -165,29 +231,46 @@ impl AgentPool {
 
     pub fn thread_statuses(&self) -> Vec<ThreadStatus> {
         let at = UnixMs::now();
-        let working: Vec<_> = self
-            .doing
-            .lock()
-            .expect("poison")
-            .iter()
-            .filter(|(_, doing)| is_working(**doing, at))
-            .map(|(&agent, doing)| (agent, doing.since))
-            .collect();
+        let doing = self.doing.lock().expect("poison").clone();
         let read = self.db.read();
-        let working = working.into_iter().filter_map(|(agent, since)| {
-            let head = read.agent(agent)?;
-            let thread = read
-                .message(MessageId(head.delivered))
-                .or_else(|| origin(&read, agent))
-                .map(|mail| read.mail_thread(&mail))
-                .or_else(|| read.first_thread(agent))?;
-            Some((thread, since))
-        });
-        with_working(self.mail.status_snapshot(), working)
+        let mut working = Vec::new();
+        let mut stuck = BTreeMap::<MessageId, UnixMs>::new();
+        for (agent, doing) in doing {
+            let Some(thread) = thread_for(&read, agent) else {
+                continue;
+            };
+            if is_working(doing, at) {
+                working.push((thread, doing.since));
+            } else if doing.stop(at) == Some(Stop::Stuck) {
+                stuck
+                    .entry(thread)
+                    .and_modify(|since| *since = (*since).min(doing.since))
+                    .or_insert(doing.since);
+            }
+        }
+        let mut statuses = with_working(self.mail.status_snapshot(), working);
+        statuses.retain(|status| !stuck.contains_key(&status.thread));
+        statuses.extend(stuck.into_iter().map(|(thread, at)| ThreadStatus {
+            thread,
+            at,
+            state: StatusText::Stuck,
+        }));
+        statuses
+    }
+
+    pub(super) fn user_stopped(&self, agent: AgentId, at: UnixMs) {
+        if let Some(thread) = thread_for(&self.db.read(), agent) {
+            self.mail.user_stopped(thread, agent, at);
+        }
     }
 
     pub(super) fn activity_changed(&self, agent: AgentId, before: Option<Doing>, now: Doing) {
         let at = UnixMs::now();
+        if is_working(now, at)
+            && let Some(thread) = thread_for(&self.db.read(), agent)
+        {
+            self.mail.clear_user_stop(thread);
+        }
         if before.is_some_and(|before| is_working(before, at)) && !is_working(now, at) {
             self.mail.clear_stopped_status(agent);
         }
@@ -368,16 +451,29 @@ fn with_working(
             .and_modify(|at| *at = (*at).max(since))
             .or_insert(since);
     }
-    for status in &explicit {
-        fallback.remove(&status.thread);
-    }
     let mut statuses = explicit;
+    statuses.retain(|status| {
+        if status.state == StatusText::StoppedByYou {
+            // Another agent can still be working on the same thread.
+            return !fallback.contains_key(&status.thread);
+        }
+        fallback.remove(&status.thread);
+        true
+    });
     statuses.extend(fallback.into_iter().map(|(thread, at)| ThreadStatus {
         thread,
         at,
-        text: Activity::Working.word().to_owned(),
+        state: StatusText::Working,
     }));
     statuses
+}
+
+fn thread_for(read: &rho_db::ReadTxn, agent: AgentId) -> Option<MessageId> {
+    let head = read.agent(agent)?;
+    read.message(MessageId(head.delivered))
+        .or_else(|| origin(read, agent))
+        .map(|mail| read.mail_thread(&mail))
+        .or_else(|| read.first_thread(agent))
 }
 
 fn origin(read: &rho_db::ReadTxn, agent: AgentId) -> Option<Message> {
@@ -405,9 +501,12 @@ async fn send_stop(
         let Some(head) = read.agent(agent) else {
             return;
         };
-        let thread = read
-            .first_thread(agent)
-            .or_else(|| origin(&read, agent).map(|mail| read.mail_thread(&mail)));
+        let thread = if stop == Stop::Stuck {
+            thread_for(&read, agent)
+        } else {
+            read.first_thread(agent)
+                .or_else(|| origin(&read, agent).map(|mail| read.mail_thread(&mail)))
+        };
         let Some(thread) = thread else { return };
         let failed_to_start = head
             .startup_failure
@@ -416,6 +515,11 @@ async fn send_stop(
         (head.workset, thread, body)
     };
     let mut write = pool.db.write().await;
+    // Recovery can race the timer. Either the stop commits first and is
+    // edited by recovery, or we already know the streak ended and post none.
+    if stop == Stop::Stuck && pool.doing.lock().expect("poison").get(&agent) != Some(&doing) {
+        return;
+    }
     let sender = Address::System {
         agent,
         stop,
@@ -430,7 +534,11 @@ async fn send_stop(
                     workset,
                     &Record {
                         at,
-                        event: Event::MailWritten { agent, message },
+                        event: Event::MailWritten {
+                            agent,
+                            message,
+                            version: Some(message.0),
+                        },
                     },
                 )?;
             }
@@ -625,10 +733,13 @@ mod tests {
             let held = mail.statuses.lock().unwrap();
             assert_eq!(held.len(), 2);
             assert_eq!(
-                (&*held[&a].text, held[&a].at),
-                ("Runs with SSL", UnixMs(31))
+                (&held[&a].state, held[&a].at),
+                (&StatusText::Written("Runs with SSL".into()), UnixMs(31))
             );
-            assert_eq!((&*held[&b].text, held[&b].at), ("Bisecting", UnixMs(24)));
+            assert_eq!(
+                (&held[&b].state, held[&b].at),
+                (&StatusText::Written("Bisecting".into()), UnixMs(24))
+            );
         }
         mail.set_status(a, owner, String::new(), UnixMs(37))
             .unwrap();
@@ -664,14 +775,14 @@ mod tests {
             [ThreadStatus {
                 thread,
                 at: UnixMs(40),
-                text: "Verifying the result".into(),
+                state: StatusText::Written("Verifying the result".into()),
             }]
         );
         assert!(!changed.has_changed().unwrap());
 
         mail.set_status(thread, b, "Writing the proof".into(), UnixMs(46))
             .unwrap();
-        assert_eq!(mail.status_snapshot()[0].text, "Writing the proof");
+        assert_eq!(mail.status_snapshot()[0].state.words(), "Writing the proof");
         assert!(changed.has_changed().unwrap());
     }
 
@@ -682,7 +793,7 @@ mod tests {
         let explicit = ThreadStatus {
             thread: a,
             at: UnixMs(31),
-            text: "Checking the clock".into(),
+            state: StatusText::Written("Checking the clock".into()),
         };
         let working = [(a, UnixMs(42)), (b, UnixMs(73)), (b, UnixMs(55))];
         assert_eq!(
@@ -692,7 +803,7 @@ mod tests {
                 ThreadStatus {
                     thread: b,
                     at: UnixMs(73),
-                    text: "working".into()
+                    state: StatusText::Working,
                 },
             ]
         );

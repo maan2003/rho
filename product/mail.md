@@ -184,7 +184,7 @@ The historical review above was of Start a thread. Starting an agent from a mail
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule the last mail stays live
-when the project's last `Mail` in a `Thread` has no user reply or verdict, then it stays live; the project edits it as findings change instead of sending updates. Once the user replies, it is frozen. A reply or verdict earns new mail if there is more to say. A different question forks under the mail that raised it.
+when the project's current ask in a `Thread` has no user reply, then an update replaces its words in place, even if another agent writes them. It reads `edited` and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
 why: a thread of ten mails that each supersede the last is a feed; one live mail is a state the user can read in one look.
 
 ## rule a cold mail stands alone

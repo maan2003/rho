@@ -726,9 +726,12 @@ impl AgentsSystem {
             return Vec::new();
         }
         let this = cx.entity();
-        let mut rows = vec![Row::run("space", "verdicts", |_, window, cx| {
-            window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
-        })];
+        let mut rows = vec![
+            Row::run("space", "verdicts", |_, window, cx| {
+                window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
+            }),
+            Self::stop_row(this.clone(), agent),
+        ];
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
@@ -945,6 +948,40 @@ impl AgentsSystem {
             })
             .detach();
         }
+    }
+
+    fn stop_row(system: Entity<Self>, agent: AgentId) -> rho_frame::Row {
+        rho_frame::Row::run("shift-c", "stop agent", move |_, _, cx| {
+            system.update(cx, |system, cx| {
+                let Some(agents) = system.agents_for(agent) else {
+                    system.frame.echo(
+                        "the agent's host is not attached",
+                        StyleClass::SystemImportant,
+                        cx,
+                    );
+                    return;
+                };
+                let reply = agents.call(rho_agents_client::protocol::worksets::StopAgent { agent });
+                let frame = system.frame.clone();
+                let label = system.registry.agent_display_label(agent);
+                cx.spawn(async move |_, cx| {
+                    let reply = reply.await;
+                    cx.update(|cx| match reply {
+                        Ok(()) => frame.echo(
+                            format!("stopped by you: {label}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
+                        Err(error) => frame.echo(
+                            format!("did not stop {label}: {error:#}"),
+                            StyleClass::SystemImportant,
+                            cx,
+                        ),
+                    });
+                })
+                .detach();
+            });
+        })
     }
 
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {

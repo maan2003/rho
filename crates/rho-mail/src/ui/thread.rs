@@ -19,7 +19,9 @@ use gpui::{
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::ToPoint as _;
-use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
+use rho_agent_types::{
+    Address as Party, ContentPart, EndpointId, Message, MessageId, Revision, StatusText,
+};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{
@@ -389,7 +391,10 @@ impl ThreadView {
             && system
                 .host_mail(self.thread.host)
                 .is_some_and(|chat| !chat.children(Some(self.thread.message)).is_empty());
-        self._ages = list.then(|| {
+        let working = system
+            .status(self.thread)
+            .is_some_and(|status| matches!(status.state, StatusText::Working | StatusText::Stuck));
+        self._ages = (list || working).then(|| {
             let wait = std::time::Duration::try_from(LIST_AGES_EVERY).expect("positive interval");
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
@@ -539,21 +544,26 @@ fn items(
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     let mut items = history_items(system, thread, list, expanded_quotes, cx);
-    if !list
-        && let Some(status) = system
-            .status(thread)
-            .map(|status| status.text.clone())
-            .or_else(|| {
-                system
-                    .failed_start(thread)
-                    .and_then(|reason| reason.lines().next())
-                    .map(|reason| format!("did not start: {reason}"))
-            })
-    {
-        items.push(line(Key::Status, &status, Class::Crumb));
+    if !list && let Some(status) = system.status(thread) {
+        let text = status_words(status, Timestamp::now());
+        items.push(line(Key::Status, &text, Class::Crumb));
     }
     items.push(separator_item(&system.project_of(thread), list, layout));
     items
+}
+
+fn status_words(status: &rho_agent_types::ThreadStatus, now: Timestamp) -> String {
+    match &status.state {
+        StatusText::Written(_) | StatusText::StoppedByYou => status.state.words().to_owned(),
+        StatusText::Working | StatusText::Stuck => {
+            let since = Timestamp::from_millisecond(status.at.0 as i64).expect("a status time");
+            format!(
+                "{} · {}",
+                status.state.words(),
+                rho_dealer::curve::age(since, now)
+            )
+        }
+    }
 }
 
 fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class, Meta> {
@@ -653,7 +663,7 @@ fn history_items(
         items.extend(private.remove(id).unwrap_or_default());
         let replies = chat.children(Some(*id));
         if !replies.is_empty() {
-            let (_, at) = chat.newest_in(*id).unwrap_or((*id, message.at));
+            let (_, at) = chat.newest_in(*id).unwrap_or_else(|| message.version());
             let text = format!(
                 "  ↳ {} {} · {} · {}",
                 replies.len(),
@@ -786,7 +796,7 @@ fn thread_rows(
                     .is_some_and(|message| message.mentions(Party::User).is_some())
             })
             .count();
-        let (_, at) = chat.newest_in(*id).unwrap_or((*id, message.at));
+        let (_, at) = chat.newest_in(*id).unwrap_or_else(|| message.version());
         let mut text = chat.name(*id).unwrap_or_default();
         let name_class = match unread.is_empty() {
             true => Class::Name,
@@ -810,7 +820,7 @@ fn thread_rows(
             waiting.push((format!("{replies} {word}"), Class::Time));
         }
         if let Some(status) = system.status(thread) {
-            waiting.push((status.text.clone(), Class::Time));
+            waiting.push((status.state.words().to_owned(), Class::Time));
         }
         waiting.push((ago(at.0, now), Class::Time));
         for (index, (word, class)) in waiting.into_iter().enumerate() {
@@ -1052,7 +1062,7 @@ impl ThreadView {
         let mail = system.host_mail(self.thread.host)?.message(id)?;
         let agent = match mail.from {
             Party::Agent(agent) | Party::System { agent, .. } => agent,
-            Party::User => return None,
+            Party::User | Party::StartFailed => return None,
         };
         Some((agent, mail.clone()))
     }
@@ -1245,7 +1255,13 @@ fn body(content: &[ContentPart]) -> String {
 }
 
 fn incoming(mail: Option<&Message>) -> bool {
-    mail.is_some_and(|mail| mail.from != Party::User && mail.revision != Revision::Deleted)
+    mail.is_some_and(|mail| {
+        mail.from != Party::User
+            && !matches!(
+                mail.revision,
+                Revision::Deleted | Revision::TakenBack { .. }
+            )
+    })
 }
 
 fn message_item(
@@ -1255,12 +1271,13 @@ fn message_item(
 ) -> Option<Item<Key, Class, Meta>> {
     let edited = match message.revision {
         Revision::Original => "",
-        Revision::Edited => " · edited",
+        Revision::Edited { .. } => " · edited",
+        Revision::TakenBack { .. } => " · taken back",
         Revision::Deleted => return None,
     };
     let from = match message.from {
         Party::User => "you",
-        Party::Agent(_) | Party::System { .. } => project,
+        Party::Agent(_) | Party::System { .. } | Party::StartFailed => project,
     };
     let time = thread::when(message.at.0 as i64);
     let mut text = format!("{from} · {time}{edited}");
@@ -1560,9 +1577,27 @@ impl Render for ThreadView {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::AgentId;
+    use rho_agent_types::{AgentId, ChatSeq, UnixMs};
 
     use super::*;
+
+    #[test]
+    fn working_and_stuck_show_their_own_words_and_clock() {
+        let first = 1_000_000;
+        let mut status = rho_agent_types::ThreadStatus {
+            thread: MessageId(ChatSeq(7)),
+            at: UnixMs(first),
+            state: StatusText::Working,
+        };
+        let now = Timestamp::from_millisecond(first as i64 + 5_000).unwrap();
+        assert_eq!(status_words(&status, now), "working · now");
+        status.state = StatusText::Stuck;
+        let now = Timestamp::from_millisecond(first as i64 + 258_000).unwrap();
+        assert_eq!(
+            status_words(&status, now),
+            "stuck · can't reach its model · 4m"
+        );
+    }
 
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
@@ -1589,7 +1624,10 @@ mod tests {
                 stop: rho_agent_types::Stop::Failed,
                 since: original.at,
             },
-            Revision::Edited,
+            Revision::Edited {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+            },
             "cargo exited 101",
         );
         let user = mail(Party::User, Revision::Original, "Go ahead.");
@@ -1615,7 +1653,10 @@ mod tests {
         let agent = AgentId::from_counter(19, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let incoming_mail = mail(
             Party::Agent(agent),
-            Revision::Edited,
+            Revision::Edited {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+            },
             "Use the release branch.",
         );
         let sent = mail(Party::User, Revision::Original, "Not yet.");

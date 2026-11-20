@@ -100,10 +100,11 @@ it even if they left the thread, and a move does not undo the answer.
 Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
-leave on a subthread cuts that branch. A message reaches every member of
-the thread it is posted in and every agent it mentions, never its sender;
-who receives it is fixed when it is posted and written to each receiver's
-inbox with it, so a later member reads older messages, not receives them.
+leave on a subthread cuts that branch. Mail to the user stays readable in
+the thread but does not enter agents' inboxes. Other thread mail reaches
+every member and every agent it mentions, never its sender; the host
+writes the inbox rows with the post, so a later member can read older
+messages but does not receive them.
 Only Python joins agents to threads (`rho.mail.join`), so the host never
 joins anyone on its own: the default delivery (`rho.hooks.deliver`) joins an
 agent to the thread it was started from and to a thread where the user
@@ -113,8 +114,9 @@ rule of it.
 A move is a parent change (`Reparented`) and the subtree follows; a message
 is read in the thread it is in now, so `#41` always leads to it. Without a name the GUI shows the first line of the thread's message.
 An edit changes a mail's current body in place; a delete removes its visible
-content but keeps the anchor and descendants. Only the author can change
-a mail, and mail with a user reply cannot change. Search uses the current bodies
+content but keeps the anchor and descendants. Agents can explicitly edit
+or delete only mail they wrote, and mail with a user reply cannot change.
+Search uses the current bodies
 and subjects, not the original text of edited or deleted mail. The host names a thread under a root once, when its
 second message arrives and nothing has named it, from a model's reading of
 those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
@@ -122,9 +124,11 @@ those two messages; a name anyone gives wins over it, before or after. Nothing r
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
 The host derives replies from the original `Posted` events: a move does
-not undo an answer. When an agent sends into a thread whose latest project
-mail has no user reply, the send still posts and its receipt suggests
-editing the earlier mail if it is still live. It cannot see a ledger verdict.
+not undo an answer. If the latest project ask is still live, the host
+reuses its mail ID and records a revision only for different content.
+Replies reach the writer of the current words, even across agents. The
+client compares the revision's log position with the user's verdict;
+the host cannot see the verdict.
 
 A thread's current status is host memory, sent outside the log. A stop
 clears that status only if the stopped agent wrote the current line. The GUI
@@ -133,15 +137,16 @@ user reply keeps it warm. Once a thread cools, the next model request can
 carry a one-time notice to make live mail stand alone, without initiating a
 request of its own.
 A stop produces durable system mail in the agent's thread, not another
-kind of card, and never feeds back to an agent as fresh input.
+kind of card. When a start from mail is refused before there is an agent,
+the host writes the stop in the idea's thread instead. Neither is agent input.
 
 Direct mail between two agents on a host uses the same log and inbox.
 The first mail between a pair starts a thread under the writer's project;
 an answer stays in that conversation even if the agents work in different
 projects. Children and Advisors inherit their spawner's project. Only the
 addressed agent gets the mail as tool input, even if others follow the
-project. The user can read the thread but gets no card for it. A client
-that upgrades replays the host's log to learn the new mention kind; unsent
+project. The user can read the thread but gets no card for it. After an
+incompatible protocol upgrade, a client replays the host's log; unsent
 mail and drafts stay in their existing tables.
 
 An agent talks to an agent on another harness over GCCP
