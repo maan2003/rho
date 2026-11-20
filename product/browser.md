@@ -83,10 +83,11 @@ Reply…
 ```
 
 ## concept Bookmark
-status: not built; the user's Slack and other pages open in the browser, but there are no page bookmarks in the rho palette.
 purpose: let the user return to a page by name, including a Slack page under their own account.
 principle: the user bookmarks the Slack page they often need and reaches it by name in `window.Palette`.
 sees: a saved page by name in the palette.
 does:
-- bookmark: save a `Page` for another visit
-- open: reach the saved page by name
+- bookmark: choose `bookmark this page…` from an open page, and name the current web address or accept the page’s title
+- open: find the bookmark by name in the palette; closing its tab does not remove it
+
+Bookmarks are kept in this device’s GUI database. [A saved bookmark in the phone palette](design/phone-bookmark.png).

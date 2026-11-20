@@ -395,6 +395,16 @@ impl Frame {
     /// Opens `address`: the system that owns its kind makes the surface,
     /// or the one already made is shown again.
     pub fn open(&mut self, address: Address, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.surfaces.contains_key(&address)
+            && self
+                .systems
+                .iter()
+                .find(|system| system.opens(&address, cx))
+                .cloned()
+                .is_some_and(|system| system.visit(&address, cx))
+        {
+            return;
+        }
         self.open_with(address, None, window, cx);
     }
 

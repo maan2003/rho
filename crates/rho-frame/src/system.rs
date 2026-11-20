@@ -116,6 +116,12 @@ pub trait System: Sized + 'static {
         cx: &mut Context<Self>,
     ) -> Option<AnySurface>;
 
+    /// Take a named jump whose destination resolves asynchronously. The
+    /// window keeps its current surface until the system opens the target.
+    fn visit(&mut self, _address: &Address, _cx: &mut Context<Self>) -> bool {
+        false
+    }
+
     /// The foreground surface, independent of where an overlay takes keys.
     /// `None` means that the window is inactive.
     fn active_surface(&mut self, _address: Option<&Address>, _cx: &mut Context<Self>) {}
@@ -232,6 +238,8 @@ pub trait System: Sized + 'static {
 trait SystemHandle {
     fn kinds(&self, cx: &App) -> &'static [&'static str];
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface>;
+    fn visit(&self, address: &Address, cx: &mut App) -> bool;
+
     fn active_surface(&self, address: Option<&Address>, cx: &mut App);
     fn streams(
         &self,
@@ -285,6 +293,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.update(cx, |system, cx| system.open(address, window, cx))
+    }
+
+    fn visit(&self, address: &Address, cx: &mut App) -> bool {
+        self.update(cx, |system, cx| system.visit(address, cx))
     }
 
     fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
@@ -435,6 +447,10 @@ impl AnySystem {
         cx: &App,
     ) -> Vec<Claim> {
         self.0.claims(marks, now, trace, cx)
+    }
+
+    pub(crate) fn visit(&self, address: &Address, cx: &mut App) -> bool {
+        self.0.visit(address, cx)
     }
 
     pub fn open_link(&self, url: &Url, cx: &mut App) -> bool {

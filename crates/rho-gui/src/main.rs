@@ -254,7 +254,11 @@ fn run() -> Result<()> {
                     cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });
                 let browser = cx.new(|_| {
-                    rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
+                    rho_browser::ui::PageSystem::new(
+                        client_state_dir.clone(),
+                        db.clone(),
+                        frame.clone(),
+                    )
                 });
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
