@@ -13,7 +13,7 @@ use rho_agent_types::{
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
-use crate::entry::{CompactionState, Notice};
+use crate::entry::{CompactionState, Notice, StartupFailure};
 use crate::log::ClaudeRewind;
 use crate::record::{AgentSpec, Event, Record};
 
@@ -56,6 +56,8 @@ pub struct AgentHead {
     /// A Claude rewind whose destination is not verified yet.
     pub claude_rewind: Option<ClaudeRewind>,
     pub native: NativeCursor,
+    #[senax(default)]
+    pub startup_failure: Option<StartupFailure>,
 }
 
 /// The native replay position and recovery facts, derived from the agent's
@@ -113,7 +115,18 @@ impl AgentHead {
         self.last = pos;
         self.native.observe(pos, event);
         match event {
-            Event::AgentChanged { spec, .. } => self.spec = spec.clone(),
+            Event::AgentChanged { spec, .. } => {
+                if self.spec.runtime != spec.runtime {
+                    self.startup_failure = None;
+                }
+                self.spec = spec.clone();
+            }
+            Event::Notice {
+                notice: Notice::StartupFailed(failure),
+                ..
+            } if failure.runtime == self.spec.runtime => {
+                self.startup_failure = Some(failure.clone())
+            }
             Event::Request { inputs, .. } => {
                 let newest = inputs.iter().filter_map(|input| input.message).max();
                 if let Some(newest) = newest {
@@ -381,6 +394,7 @@ impl StoreWrite for WriteTxn {
                     last: pos,
                     delivered: ChatSeq::ZERO,
                     claude_rewind: None,
+                    startup_failure: None,
                     native: NativeCursor {
                         from: pos,
                         ..NativeCursor::default()

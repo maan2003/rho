@@ -26,7 +26,7 @@ from . import agents, default, hooks, workset
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: int | None = None
 #: Agents `hooks.deliver` started for, so each gets it once.
-_announced: set[str] = set()
+_announced: dict[str, asyncio.Task | None] = {}
 #: Where the running `_eval`'s output goes; unset elsewhere.
 _output: contextvars.ContextVar = contextvars.ContextVar("rho_eval_output", default=None)
 _evals = itertools.count(1)
@@ -116,15 +116,25 @@ def _announce(agent_id: str) -> None:
     be retried forever."""
     if agent_id in _announced:
         return
-    _announced.add(agent_id)
+    _announced[agent_id] = None
     if not _rho.runs(agent_id):
         return
     try:
         result = hooks.deliver(agents.Agent(agent_id))
         if inspect.isawaitable(result):
-            spawn(result)
+            _announced[agent_id] = spawn(result)
     except Exception:
         traceback.print_exc()
+
+
+def redeliver_soon(agent_id: str) -> None:
+    """After replacing its loop, reread mail from the durable cursor."""
+    def restart():
+        if (old := _announced.pop(agent_id, None)) is not None:
+            old.cancel()
+        _announce(agent_id)
+
+    _loop.call_soon_threadsafe(restart)
 
 
 _tasks: set[asyncio.Task] = set()

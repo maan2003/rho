@@ -9,7 +9,9 @@ use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ContentPart, MentionKind, MessageId, Role, Stop,
     WorksetKind, Wpos,
 };
-use rho_agents_client::protocol::worksets::{AgentLog, CreateWorkset, Eval, EvalResult, LogEvent};
+use rho_agents_client::protocol::worksets::{
+    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset,
+};
 use rho_chat::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
 use rho_chat::{HostChat, cards};
 use rho_rpc::protocol::client::{call, connect};
@@ -98,7 +100,9 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
         if scenario == rho_fake_model::Scenario::MailChain {
             run_peer_chain(&paths, root).await
         } else {
-            run(&paths, root).await
+            let mail = run(&paths, root).await?;
+            let recovery = run_startup_failure(&paths, root).await?;
+            anyhow::Ok(format!("{mail}\n{recovery}"))
         }
     })
     .await
@@ -315,6 +319,157 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     Ok(format!(
         "mail wire: project {}, fake model result #{}, status set/cleared, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
+    ))
+}
+
+async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    // Break the fixture account after the host has bootstrapped it. This
+    // fails before a provider request regardless of the machine's Claude
+    // executable or namespace support.
+    std::fs::write(
+        root.join("claude-accounts/default/settings.json"),
+        "{broken",
+    )?;
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no mail hello");
+    };
+    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
+    let project = post(paths, 70, None, "clock").await?;
+    let thread = post(paths, 71, Some(project), "Check the failing clock test.").await?;
+    let created = call(
+        paths,
+        CreateWorkset {
+            kind: WorksetKind::Host { cwd: root.to_str().unwrap().into() },
+            code: format!(
+                r#"new_agent(runtime={{"kind": "claude", "model": "opus", "effort": "high"}}, origin="chat:{}")"#,
+                thread.0.0
+            ),
+        },
+    )
+    .await?;
+    let agent = created
+        .result
+        .agent
+        .with_context(|| format!("agent not created: {:?}", created.result.error))?;
+    let stop = wait_for_mail(&mut stream, |row| {
+        matches!(row.event, ChatEvent::Posted {
+            from: Address::System { agent: stopped, stop: Stop::Failed, .. },
+            parent: Some(parent), ..
+        } if parent == thread && stopped == agent)
+    })
+    .await?;
+    let stop = rho_agent_types::Message::from_record(&stop).unwrap();
+    let text = stop.text();
+    assert!(
+        text.contains("parse Claude settings ‹host path›:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Replies are saved. Change its runtime or start another agent."),
+        "{text}"
+    );
+    assert!(!text.contains(root.to_str().unwrap()), "{text}");
+
+    let mut replies = Vec::new();
+    for (client_id, reply_to, text) in [
+        (72, Some(stop.id), "Use a separate clock per test."),
+        (73, None, "Keep the fix small."),
+    ] {
+        let reply = call(
+            paths,
+            Post {
+                client_id,
+                parent: Some(thread),
+                reply_to,
+                mentions: Vec::new(),
+                content: vec![ContentPart::Text { text: text.into() }],
+            },
+        )
+        .await?;
+        replies.push(reply);
+    }
+
+    // The hold is durable, not just a flag on the running worker. A reply
+    // or a host-side restart must not produce another failed attempt.
+    call(paths, RestartWorkset { agent }).await?;
+    let later = post(paths, 74, Some(thread), "Actually check it twice.").await?;
+    replies.push(later);
+    let switched = call(
+        paths,
+        Eval {
+            workset: created.workset,
+            code: format!(
+                r#"rho.agent("{}").set_runtime({{"kind": "native", "model": "sol", "effort": "medium"}})"#,
+                agent.encoded()
+            ),
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        switched.error.is_none(),
+        "switch failed: {:?}",
+        switched.error
+    );
+
+    let wanted = std::iter::once(thread).chain(replies).collect::<Vec<_>>();
+    loop {
+        let log = call(
+            paths,
+            AgentLog {
+                agent,
+                from: Wpos::ZERO,
+            },
+        )
+        .await?;
+        let failed = log
+            .rows
+            .iter()
+            .filter(|(_, row)| matches!(row, LogEvent::Stopped { .. }))
+            .count();
+        assert_eq!(
+            failed, 1,
+            "replies attempted another launch: {:?}",
+            log.rows
+        );
+        let delivered = log
+            .rows
+            .iter()
+            .filter_map(|(_, row)| match row {
+                LogEvent::Request { inputs, .. } => Some(inputs),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|input| input.message)
+            .collect::<Vec<_>>();
+        if wanted.iter().all(|mail| delivered.contains(mail)) {
+            assert_eq!(
+                delivered, wanted,
+                "the new runtime must read each saved mail exactly once in order"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let refused = call(
+        paths,
+        Eval {
+            workset: created.workset,
+            code: format!(
+                r#"rho.agent("{}").set_runtime({{"kind": "claude", "model": "opus", "effort": "high"}})"#,
+                agent.encoded()
+            ),
+        },
+    )
+    .await?;
+    assert!(
+        refused
+            .raised()
+            .is_some_and(|error| error.contains("never sent a request"))
+    );
+    Ok(format!(
+        "one failed launch #{}; three saved replies survived restart and reached native in order; later cross-kind switch refused",
+        stop.id.0.0
     ))
 }
 

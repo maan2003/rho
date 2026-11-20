@@ -799,7 +799,7 @@ impl AgentPool {
             .expect("poison")
             .get(&agent_id)
             .map_or_else(UnixMs::now, |doing| doing.since);
-        let status = Arc::new(if self.is_live(agent_id) {
+        let mut status = if self.is_live(agent_id) {
             status.clone()
         } else {
             AgentStatus {
@@ -808,8 +808,24 @@ impl AgentPool {
                 draft: None,
                 queued: status.queued,
             }
-        });
-        Shown { status, since }
+        };
+        status.runtime.may_change_runtime_kind =
+            self.may_change_runtime_kind(agent_id, status.runtime.activity());
+        Shown {
+            status: Arc::new(status),
+            since,
+        }
+    }
+
+    fn may_change_runtime_kind(&self, agent: AgentId, activity: rho_agent_types::Activity) -> bool {
+        matches!(
+            activity,
+            rho_agent_types::Activity::Failed | rho_agent_types::Activity::Lost
+        ) && self
+            .db
+            .read()
+            .agent(agent)
+            .is_some_and(|head| !head.native.woken)
     }
 
     fn touch(&self, agent_id: AgentId) {
@@ -1250,12 +1266,43 @@ impl AgentPool {
                 PyReply::Agents(agents)
             }
             PyRequest::SetSpec { agent, spec } => {
-                let current = self.own_agent(workset, agent)?;
-                anyhow::ensure!(
-                    std::mem::discriminant(&current.runtime)
-                        == std::mem::discriminant(&spec.runtime),
-                    "an agent keeps its runtime kind"
-                );
+                let lock = self
+                    .load_locks
+                    .lock()
+                    .await
+                    .entry(agent)
+                    .or_default()
+                    .clone();
+                let _loading = lock.lock().await;
+                let head = self
+                    .db
+                    .read()
+                    .agent(agent)
+                    .filter(|head| head.workset == workset)
+                    .with_context(|| format!("no agent {} in this workset", agent.encoded()))?;
+                let changes_kind = std::mem::discriminant(&head.spec.runtime)
+                    != std::mem::discriminant(&spec.runtime);
+                if changes_kind {
+                    let activity = self
+                        .doing
+                        .lock()
+                        .expect("poison")
+                        .get(&agent)
+                        .map(|doing| doing.activity);
+                    anyhow::ensure!(
+                        activity
+                            .is_some_and(|activity| self.may_change_runtime_kind(agent, activity))
+                            || (head.startup_failure.is_some() && !head.native.woken),
+                        "only a stopped agent that has never sent a request can change runtime kind"
+                    );
+                    // Native and Claude have different loops. Stop the old
+                    // one before writing the new spec; policy will redeliver
+                    // the still-undelivered mail to the new loop.
+                    let client = self.agents.lock().await.remove(&agent);
+                    if let Some(client) = client {
+                        client.shutdown().await;
+                    }
+                }
                 {
                     let mut write = self.db.write().await;
                     write.append(

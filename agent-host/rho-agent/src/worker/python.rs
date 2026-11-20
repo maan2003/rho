@@ -636,7 +636,7 @@ fn agents(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 }
 
 #[pyfunction]
-fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()> {
+fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<bool> {
     let agent = agent_id(agent)?;
     let current = all_agents(py)?
         .into_iter()
@@ -644,8 +644,17 @@ fn set_spec(py: Python<'_>, agent: &str, spec: Bound<'_, PyDict>) -> PyResult<()
         .map(|(_, spec)| spec)
         .ok_or_else(|| PyValueError::new_err(format!("no agent {}", agent.encoded())))?;
     let spec = spec_from_py(&spec, Some(&current))?;
+    let changes_kind =
+        std::mem::discriminant(&current.runtime) != std::mem::discriminant(&spec.runtime);
+    if changes_kind {
+        permissions::admits(
+            &PERMISSIONS.fix(),
+            matches!(spec.runtime, Runtime::Native { .. }),
+        )
+        .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+    }
     match PyHost::block(py, PyRequest::SetSpec { agent, spec })? {
-        PyReply::Done => Ok(()),
+        PyReply::Done => Ok(changes_kind),
         _ => Err(unexpected()),
     }
 }

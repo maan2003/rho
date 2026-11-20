@@ -131,7 +131,8 @@ pub fn strip(record: &Record<'_>) -> Option<LogEvent> {
                 retrying: true,
                 at,
             },
-            Notice::Stopped(error) => LogEvent::Stopped {
+            Notice::StartupFailed(rho_agent::entry::StartupFailure { error, .. })
+            | Notice::Stopped(error) => LogEvent::Stopped {
                 agent: *agent,
                 error: error.clone(),
                 at,

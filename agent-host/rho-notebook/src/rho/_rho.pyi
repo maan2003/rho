@@ -22,7 +22,7 @@ class NativeRuntime(TypedDict):
 class ClaudeRuntime(TypedDict):
     kind: Literal["claude"]
     model: Literal["fable", "opus", "sonnet", "haiku"]
-    effort: Literal["medium", "high", "xhigh"]
+    effort: Literal["low", "medium", "high", "xhigh", "max"]
 
 Runtime = NativeRuntime | ClaudeRuntime
 
@@ -100,9 +100,9 @@ def runs(agent: str) -> bool:
     runs no native agent."""
 def agents() -> dict[str, Spec]:
     """Every agent of this workset, by id."""
-def set_spec(agent: str, spec: Spec) -> None:
-    """Log `AgentChanged` with the whole new spec. A model change keeps the
-    cache key and the Claude session."""
+def set_spec(agent: str, spec: Spec) -> bool:
+    """Log `AgentChanged`. A same-kind model change keeps conversation
+    identity. Return true if a stopped agent's runtime loop was replaced."""
 def input(agent: str, text: str, *, role: Role, message: int | None = None) -> None:
     """Give the agent an input: it waits in memory until a request can carry
     it, and that request's row holds it. This returns once the agent has it. A
