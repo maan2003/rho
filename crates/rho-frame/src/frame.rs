@@ -1058,21 +1058,7 @@ impl Frame {
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        // A surface with a mode of its own says it while it has the keys;
-        // a menu or a prompt over it is the editor's to say.
-        let own_mode = match self.menu.is_none() && self.minibuffer.is_none() {
-            true => self.current_surface().mode(cx),
-            false => None,
-        };
-        let mode = match own_mode {
-            Some(Mode::Normal) => "normal".to_owned(),
-            Some(Mode::Insert) => "insert".to_owned(),
-            None => self
-                .mode_indicator
-                .read(cx)
-                .plain_mode(cx)
-                .unwrap_or_else(|| "normal".to_owned()),
-        };
+        let mode = self.mode(window, cx);
         let mode_color = match mode.contains("insert") {
             true => status.warning,
             false => colors.terminal_ansi_bright_cyan,
@@ -1121,7 +1107,7 @@ impl Frame {
         let left: AnyElement = match (&self.echo, own_card) {
             (Some(echo), _) => div()
                 .text_color(status.info)
-                .child(echo.text().to_owned())
+                .child(fit("", echo.text()).1)
                 .into_any_element(),
             (None, Some(address)) => {
                 let card = self.card_for(&address, cx);
@@ -1186,6 +1172,37 @@ impl Frame {
             )
             .child(right)
             .into_any_element()
+    }
+
+    /// The mode the keys are in, where they go now. A box to write in, a
+    /// thread's or a prompt's, has no vim of its own and always types; the
+    /// vim the mode indicator follows is the last one that had the keys.
+    fn mode(&self, window: &Window, cx: &App) -> String {
+        // A surface with a mode of its own says it while it has the keys;
+        // a menu or a prompt over it is the editor's to say.
+        if self.menu.is_none() && self.minibuffer.is_none() {
+            match self.current_surface().mode(cx) {
+                Some(Mode::Normal) => return "normal".to_owned(),
+                Some(Mode::Insert) => return "insert".to_owned(),
+                None => {}
+            }
+        }
+        let typing = self
+            .minibuffer
+            .as_ref()
+            .map(|minibuffer| minibuffer.editor().clone())
+            .into_iter()
+            .chain(self.current_surface().editor(cx))
+            .any(|editor| {
+                editor.focus_handle(cx).is_focused(window) && !editor.read(cx).use_modal_editing()
+            });
+        if typing {
+            return "insert".to_owned();
+        }
+        self.mode_indicator
+            .read(cx)
+            .plain_mode(cx)
+            .unwrap_or_else(|| "normal".to_owned())
     }
 
     fn unwell_hosts(&self) -> Option<String> {

@@ -18,7 +18,6 @@ pub(crate) struct Facts {
     pub checkin: Option<UnixMs>,
     pub response_finished: Option<UnixMs>,
     pub prose: bool,
-    pub rewound: bool,
     pub compaction: bool,
     pub compaction_reply: bool,
     pub archived: bool,
@@ -67,9 +66,6 @@ pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
             after_response(at, Duration::from_secs(15)),
             Wake::AgentMessage,
         ));
-    }
-    if facts.rewound {
-        due.push((now, Wake::Rewound));
     }
     if facts.prose {
         due.push((now, Wake::Prose));

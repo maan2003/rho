@@ -463,8 +463,8 @@ pub(crate) fn create(
     let frame = system.frame.clone();
     cx.spawn(async move |this, cx| {
         let reply = reply.await.and_then(|result| {
-            if let Some(error) = result.error {
-                anyhow::bail!("{error}");
+            if let Some(raised) = result.raised() {
+                anyhow::bail!("{raised}");
             }
             result
                 .agent

@@ -12,7 +12,7 @@ use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Task, Window, div,
 };
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_agent_types::{Address as Party, AgentId, ContentPart, EndpointId, MessageId};
@@ -171,13 +171,14 @@ pub struct ThreadView {
     focused: Focused,
     follow: Option<Follow>,
     _subscriptions: Vec<Subscription>,
-    /// Reads the thread again each minute while agents are in it: the
-    /// `with` line says for how long each has been doing what it does.
-    _ages: Task<()>,
+    /// Reads the thread again when an age on it next moves: the `with`
+    /// line says for how long each agent has been doing what it does, and
+    /// a channel's list how long ago each thread moved.
+    _ages: Option<Task<()>>,
 }
 
-/// How often the ages on the `with` line move: their unit is the minute.
-const AGES_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the ages in a channel's list move: their unit is the minute.
+const LIST_AGES_EVERY: SignedDuration = SignedDuration::from_secs(60);
 
 impl ThreadView {
     /// The view over `thread` on `system`, which is `entity` as the frame
@@ -274,24 +275,7 @@ impl ThreadView {
             focused: Focused::Log,
             follow: None,
             _subscriptions: subscriptions,
-            _ages: cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(AGES_EVERY).await;
-                    let alive = this.update(cx, |view, cx| {
-                        let thread = view.thread;
-                        let with_agents =
-                            view.system.read(cx).chat(thread.host).is_some_and(|chat| {
-                                !chat.members_under(Some(thread.message)).is_empty()
-                            });
-                        if with_agents {
-                            view.refresh(cx);
-                        }
-                    });
-                    if alive.is_err() {
-                        break;
-                    }
-                }
-            }),
+            _ages: None,
         };
         view.transcript.attach(&view.log.clone(), cx);
         let items = items(system, thread, cx);
@@ -301,6 +285,8 @@ impl ThreadView {
             view.cursor_to_first_thread(cx);
         } else {
             view.cursor_to_end(cx);
+            // The system is leased now: its ages are read once it is not.
+            cx.defer_in(window, |this, _, cx| this.schedule_ages(cx));
         }
         // What is unread and the user's private replies come from the
         // ledger, which is the frame's and is leased while it opens this:
@@ -348,7 +334,37 @@ impl ThreadView {
         if draft_gone && !self.composer.read(cx).text(cx).is_empty() {
             self.clear_composer(cx);
         }
+        self.schedule_ages(cx);
         cx.notify();
+    }
+
+    /// Reads the thread again when an age it shows next says another.
+    fn schedule_ages(&mut self, cx: &mut Context<Self>) {
+        let now = Timestamp::now();
+        let system = self.system.read(cx);
+        let thread = self.thread;
+        let Some(chat) = system.chat(thread.host) else {
+            self._ages = None;
+            return;
+        };
+        let list = is_root(system, thread) && !chat.members_under(Some(thread.message)).is_empty();
+        let agents = chat
+            .thread(thread.message)
+            .map(|head| head.members.clone())
+            .unwrap_or_default();
+        let next = agents
+            .iter()
+            .filter_map(|agent| system.participant(thread.host, *agent, cx)?.doing)
+            .map(|doing| rho_dealer::curve::age_changes(unix(doing.since), now))
+            .chain(list.then(|| now + LIST_AGES_EVERY))
+            .min();
+        self._ages = next.map(|at| {
+            let wait = std::time::Duration::try_from(now.duration_until(at)).unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| view.refresh(cx));
+            })
+        });
     }
 
     /// Empties the composer without a window: the edit goes to its buffer.
@@ -560,6 +576,11 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     without_trailing_gap(items)
 }
 
+/// A time on the host's clock, as the dealer reads one.
+fn unix(at: rho_agent_types::UnixMs) -> Timestamp {
+    Timestamp::from_millisecond(at.0 as i64).unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
 /// `with` and each agent of the thread: what to call it, and what it is
 /// doing and for how long, as `eng-q9tz · working 12m`. A gone agent keeps
 /// its place under its id: the thread was its.
@@ -591,10 +612,11 @@ fn with_line(
         if let Some(doing) = participant.and_then(|participant| participant.doing) {
             text.push_str(" · ");
             let state = text.len();
+            // The age a card says of the same agent: one age, one clock.
             text.push_str(&format!(
                 "{} {}",
                 doing.activity.word(),
-                ago(doing.since.0, now)
+                rho_dealer::curve::age(unix(doing.since), now)
             ));
             let stop = doing.stop(now_ms);
             // A failure says why in the host's words, so the user knows what
@@ -838,6 +860,9 @@ impl ThreadView {
         if self.composer.read(cx).text(cx).trim().is_empty() {
             return;
         }
+        // The keys go back to the messages, as `escape` takes them: the
+        // next `i` writes a new message, never into this one.
+        self.focus_log(&FocusLog, window, cx);
         let thread = self.thread;
         self.system.update(cx, |_, cx| {
             cx.emit(Event::Idea {
@@ -860,6 +885,7 @@ impl ThreadView {
         });
         self.composer
             .update(cx, |composer, cx| composer.clear(window, cx));
+        self.focus_log(&FocusLog, window, cx);
         self.refresh(cx);
         self.cursor_to_end(cx);
         // In a channel the message is a new thread: the cursor goes to it in
@@ -867,7 +893,6 @@ impl ThreadView {
         // opens it.
         if is_root(self.system.read(cx), thread) {
             self.follow = Some(Follow::Sending(client_id));
-            self.focus_log(&FocusLog, window, cx);
         }
     }
 

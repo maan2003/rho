@@ -69,6 +69,7 @@ impl Services {
             runtime: crate::RuntimeState {
                 inference: crate::InferenceState::Lost {
                     error: error.clone(),
+                    since: Some(rho_agent_types::UnixMs::now()),
                 },
                 ..Default::default()
             },

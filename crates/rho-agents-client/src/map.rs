@@ -105,7 +105,9 @@ impl Heard {
     pub fn stopped_because(&self) -> Option<&str> {
         use crate::protocol::transcript::InferenceState;
         match &self.state.inference {
-            InferenceState::Failed { error } | InferenceState::Lost { error } => Some(error),
+            InferenceState::Failed { error, .. } | InferenceState::Lost { error, .. } => {
+                Some(error)
+            }
             _ => None,
         }
     }

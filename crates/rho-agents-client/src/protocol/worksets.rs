@@ -83,6 +83,27 @@ pub struct EvalResult {
     pub agent: Option<AgentId>,
 }
 
+impl EvalResult {
+    /// What the code raised, in the exception's own words: the last line of
+    /// its traceback, without the exception's type, such as `an agent keeps
+    /// its runtime kind` of `RuntimeError: an agent keeps its runtime kind`.
+    pub fn raised(&self) -> Option<&str> {
+        let traceback = self.error.as_deref()?;
+        let last = traceback
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or(traceback);
+        let words = last.split_once(": ").filter(|(kind, _)| {
+            !kind.is_empty()
+                && kind
+                    .chars()
+                    .all(|char| char.is_alphanumeric() || char == '_' || char == '.')
+        });
+        Some(words.map_or(last, |(_, words)| words.trim()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct CreatedWorkset {
     pub workset: WorksetId,
@@ -266,6 +287,12 @@ pub enum LogEvent {
         timing: Option<rho_agent_types::CallTiming>,
         at: UnixMs,
     },
+    /// The cell of the agent's call ended, whether or not a request answers it.
+    CellEnded {
+        agent: AgentId,
+        end: rho_agent_types::CellEnd,
+        at: UnixMs,
+    },
     /// Claude Code says these calls came back, with no request to answer them.
     CallsEnded {
         agent: AgentId,
@@ -304,6 +331,11 @@ pub enum LogEvent {
         text: String,
         at: UnixMs,
     },
+    /// The user cancelled what the agent had in flight.
+    Cancelled {
+        agent: AgentId,
+        at: UnixMs,
+    },
 }
 
 impl LogEvent {
@@ -314,12 +346,14 @@ impl LogEvent {
             | Self::AgentCreated { at, .. }
             | Self::AgentChanged { at, .. }
             | Self::Request { at, .. }
+            | Self::CellEnded { at, .. }
             | Self::CompactionRequested { at, .. }
             | Self::CallsEnded { at, .. }
             | Self::Replied { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
             | Self::Stopped { at, .. }
+            | Self::Cancelled { at, .. }
             | Self::ClaudeMessage { at, .. } => *at,
         }
     }
@@ -331,12 +365,14 @@ impl LogEvent {
             Self::AgentCreated { agent, .. }
             | Self::AgentChanged { agent, .. }
             | Self::Request { agent, .. }
+            | Self::CellEnded { agent, .. }
             | Self::CompactionRequested { agent, .. }
             | Self::CallsEnded { agent, .. }
             | Self::Replied { agent, .. }
             | Self::Rewound { agent, .. }
             | Self::Failed { agent, .. }
             | Self::Stopped { agent, .. }
+            | Self::Cancelled { agent, .. }
             | Self::ClaudeMessage { agent, .. } => Some(*agent),
         }
     }
@@ -415,5 +451,33 @@ mod tests {
             error: None,
             agent: Some(agent),
         }));
+    }
+
+    fn raising(error: Option<&str>) -> EvalResult {
+        EvalResult {
+            output: String::new(),
+            error: error.map(str::to_owned),
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn what_code_raised_is_the_exception_in_its_own_words() {
+        let traceback = "Traceback (most recent call last):\n  File \"<eval>\", line 1, in <module>\n  File \"/policy/rho.py\", line 80, in set_runtime\n    raise RuntimeError(\"an agent keeps its runtime kind\")\nRuntimeError: an agent keeps its runtime kind\n";
+        assert_eq!(
+            raising(Some(traceback)).raised(),
+            Some("an agent keeps its runtime kind")
+        );
+        // A message that itself holds `: ` keeps all of it.
+        assert_eq!(
+            raising(Some("rho.errors.Refused: model: unknown, try sol-high")).raised(),
+            Some("model: unknown, try sol-high")
+        );
+        // A message with no exception type is said as it is.
+        assert_eq!(
+            raising(Some("the workset is closed: try later")).raised(),
+            Some("the workset is closed: try later")
+        );
+        assert_eq!(raising(None).raised(), None);
     }
 }

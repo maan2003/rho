@@ -115,12 +115,31 @@ impl Curve {
     pub fn label(&self, reason: &str, now: Timestamp) -> String {
         match *self {
             Self::Waiting { since, .. } | Self::Fading { since, .. } => {
-                reason.replace("{age}", &age_label(days(since, now)))
+                reason.replace("{age}", &age(since, now))
             }
             Self::Deadline { by, .. } => match days(by, now) {
                 late if late > 0.0 => format!("deadline · {}d late", late.floor() as u64),
                 late => format!("deadline · {}d", (-late).ceil() as u64),
             },
+        }
+    }
+
+    /// The first moment after `now` when its words say another age.
+    pub(crate) fn label_changes(&self, now: Timestamp) -> Timestamp {
+        match *self {
+            Self::Waiting { since, .. } | Self::Fading { since, .. } => age_changes(since, now),
+            Self::Deadline { by, .. } => {
+                let day = SignedDuration::from_hours(24);
+                let late = now.duration_since(by);
+                if late >= SignedDuration::ZERO {
+                    let whole = late.as_secs() / day.as_secs();
+                    by + day * (whole as i32 + 1)
+                } else {
+                    let ahead = (-late).as_secs();
+                    let days = (ahead + day.as_secs() - 1) / day.as_secs();
+                    by - day * (days as i32 - 1)
+                }
+            }
         }
     }
 
@@ -149,14 +168,66 @@ pub(crate) fn fading(from: Timestamp, now: Timestamp, window: SignedDuration, si
     size * remaining * remaining
 }
 
-pub fn age_label(days: f64) -> String {
-    if days < 1.0 / 24.0 {
-        format!("{}m", (days * 1_440.0).max(0.0).round() as i64)
-    } else if days < 1.0 {
-        format!("{:.1}h", days * 24.0)
-    } else {
-        format!("{days:.1}d")
+/// How long since `since`, in the words every screen says it in: minutes
+/// under an hour, then tenths of an hour, then tenths of a day, each the
+/// nearest. A card's words and an agent's on its thread both say this.
+pub fn age(since: Timestamp, now: Timestamp) -> String {
+    let (count, unit) = age_step(since, now);
+    match unit {
+        AgeUnit::Minute => format!("{count}m"),
+        AgeUnit::TenthHour => format!("{}.{}h", count / 10, count % 10),
+        AgeUnit::TenthDay => format!("{}.{}d", count / 10, count % 10),
     }
+}
+
+/// The first moment after `now` when `age(since, ·)` says something else:
+/// halfway to its next count, or where it moves to the next unit.
+pub fn age_changes(since: Timestamp, now: Timestamp) -> Timestamp {
+    let (count, unit) = age_step(since, now);
+    let size = unit.millis();
+    let next = ((count + 1) * size - size / 2).min(unit.until());
+    since + SignedDuration::from_millis(next)
+}
+
+#[derive(Clone, Copy)]
+enum AgeUnit {
+    Minute,
+    TenthHour,
+    TenthDay,
+}
+
+impl AgeUnit {
+    fn millis(self) -> i64 {
+        match self {
+            Self::Minute => 60_000,
+            Self::TenthHour => 360_000,
+            Self::TenthDay => 8_640_000,
+        }
+    }
+
+    /// Where the next unit takes over.
+    fn until(self) -> i64 {
+        match self {
+            Self::Minute => 3_600_000,
+            Self::TenthHour => 86_400_000,
+            Self::TenthDay => i64::MAX,
+        }
+    }
+}
+
+/// The nearest count of the unit `now - since` is said in. In whole
+/// milliseconds, so the moment the words change is exact.
+fn age_step(since: Timestamp, now: Timestamp) -> (i64, AgeUnit) {
+    let elapsed = now
+        .duration_since(since)
+        .as_millis()
+        .clamp(0, i128::from(i64::MAX / 2)) as i64;
+    let unit = [AgeUnit::Minute, AgeUnit::TenthHour, AgeUnit::TenthDay]
+        .into_iter()
+        .find(|unit| elapsed < unit.until())
+        .expect("the last unit has no end");
+    let size = unit.millis();
+    ((elapsed + size / 2) / size, unit)
 }
 
 #[cfg(test)]
@@ -222,5 +293,36 @@ mod tests {
         assert_eq!(deadline(-1.0, 4).priority(noon()), 1_000_001.0);
         assert_eq!(deadline(2.0, 4).label("", noon()), "deadline · 2d");
         assert_eq!(deadline(-1.0, 4).label("", noon()), "deadline · 1d late");
+    }
+
+    #[test]
+    fn an_age_says_the_nearest_count_and_knows_when_it_changes() {
+        let since = noon();
+        let at = |millis: i64| since + SignedDuration::from_millis(millis);
+        let minute = 60_000;
+        let hour = 60 * minute;
+        let day = 24 * hour;
+        for (elapsed, words, changes) in [
+            (0, "0m", 30_000),
+            (29_999, "0m", 30_000),
+            (30_000, "1m", 90_000),
+            (59 * minute + 29_999, "59m", 59 * minute + 30_000),
+            (59 * minute + 30_000, "60m", hour),
+            (hour, "1.0h", hour + 3 * minute),
+            (hour + 3 * minute, "1.1h", hour + 9 * minute),
+            (day - 1, "24.0h", day),
+            (day, "1.0d", day + day / 20),
+            (48 * day + 10 * hour, "48.4d", 48 * day + day * 45 / 100),
+        ] {
+            assert_eq!(age(since, at(elapsed)), words, "at {elapsed}ms");
+            let next = age_changes(since, at(elapsed));
+            assert_eq!(next, at(changes), "after {elapsed}ms");
+            assert_ne!(age(since, next), words, "it changes at {next}");
+            let before = next - SignedDuration::from_millis(1);
+            assert_eq!(age(since, before), words, "not before {next}");
+        }
+        // A clock behind the host's says no age yet, and moves on with it.
+        assert_eq!(age(since, at(-5_000)), "0m");
+        assert_eq!(age_changes(since, at(-5_000)), at(30_000));
     }
 }

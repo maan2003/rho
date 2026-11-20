@@ -152,10 +152,17 @@ fn stamp(
             since: now,
         };
     }
-    match runtime.inference {
-        InferenceState::Retrying { since, .. } => since,
-        _ => held.since,
+    // The runtime knows when a streak or a stop began; the host only when
+    // it heard of it, and two stops can reach it as one.
+    let said = match runtime.inference {
+        InferenceState::Retrying { since, .. } => Some(since),
+        InferenceState::Failed { since, .. } | InferenceState::Lost { since, .. } => since,
+        _ => None,
+    };
+    if let Some(since) = said {
+        held.since = since;
     }
+    held.since
 }
 
 /// What code the GUI ran printed, its traceback if it raised, and the
@@ -1551,9 +1558,10 @@ mod tests {
             },
             ..RuntimeState::default()
         };
-        let failed = RuntimeState {
+        let failed = |since: Option<u64>| RuntimeState {
             inference: InferenceState::Failed {
                 error: "400".into(),
+                since: since.map(UnixMs),
             },
             ..RuntimeState::default()
         };
@@ -1579,11 +1587,30 @@ mod tests {
             "the streak runs on from its first failure"
         );
         assert_eq!(stamp(&mut doing, other, &working, UnixMs(25)), UnixMs(25));
-        assert_eq!(stamp(&mut doing, agent, &failed, UnixMs(40)), UnixMs(40));
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(None), UnixMs(40)),
+            UnixMs(40),
+            "a runtime that says no time failed when the host heard it"
+        );
         assert_eq!(
             stamp(&mut doing, agent, &working, UnixMs(50)),
             UnixMs(50),
             "a failure ends; what follows starts anew"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(55)), UnixMs(60)),
+            UnixMs(55),
+            "it failed when its runtime says"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(70)), UnixMs(75)),
+            UnixMs(70),
+            "a retry failed again, though the host never heard it work"
+        );
+        assert_eq!(
+            stamp(&mut doing, agent, &failed(Some(70)), UnixMs(90)),
+            UnixMs(70),
+            "the same failure, heard again"
         );
     }
 }

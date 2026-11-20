@@ -31,7 +31,9 @@ pub(crate) struct Signals {
     chime_above: bool,
     initialized: bool,
     scheduled: bool,
-    pub next_change: Option<Timestamp>,
+    /// Ranks again when the hand next changes with nobody touching
+    /// anything, such as a card's words saying another age.
+    next_change: Option<gpui::Task<()>>,
     /// The ranking as of the last change: what the status line, Home and
     /// a verdict read. Ranking asks every system for its claims and walks
     /// every host's chat, so it happens once per change, never per draw.
@@ -423,7 +425,15 @@ impl Frame {
 
     fn evaluate_signals(&mut self, cx: &mut Context<Self>) {
         let hand = self.rank(cx);
-        self.signals.next_change = hand.next_change;
+        self.signals.next_change = hand.next_change.map(|at| {
+            // Ranked a moment ago, so a change already due is due now.
+            let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
+                .unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |this, cx| this.systems_changed(cx));
+            })
+        });
         self.refresh_home(&hand, cx);
         // What the lamp is about is what is *not* in front of the reader:
         // the card they are already reading is not news.
@@ -471,7 +481,8 @@ impl Frame {
     }
 
     /// Home is a window onto the same ranking, rebuilt wherever the dealer
-    /// is invalidated and never on a timer.
+    /// is invalidated or the hand changes by itself, never on a timer of
+    /// its own.
     fn refresh_home(&mut self, hand: &Hand, cx: &mut Context<Self>) {
         let mut rooms = Vec::new();
         for system in &self.systems {

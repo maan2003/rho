@@ -473,8 +473,9 @@ impl Session {
                     } else {
                         &event["response"]["error"]
                     };
+                    let said = provider_error(error);
                     if is_rate_limit(error) {
-                        return Err(super::RateLimited(format!("provider error: {error}")).into());
+                        return Err(super::RateLimited(said).into());
                     }
                     let retryable = ["code", "type"].iter().any(|key| {
                         matches!(
@@ -494,9 +495,9 @@ impl Session {
                         )
                     });
                     if retryable {
-                        return Err(Retryable(format!("provider error: {error}")).into());
+                        return Err(Retryable(said).into());
                     }
-                    bail!("provider error: {error}");
+                    bail!("{said}");
                 }
                 _ => {}
             }
@@ -666,6 +667,16 @@ fn websocket_status(error: &tokio_tungstenite::tungstenite::Error) -> Option<u16
     }
 }
 
+/// A provider's error in its own words, such as `The server is
+/// overloaded`, which every screen shows; its whole body only when it has no
+/// message.
+fn provider_error(error: &Value) -> String {
+    match error["message"].as_str().map(str::trim) {
+        Some(message) if !message.is_empty() => message.to_owned(),
+        _ => format!("provider error: {error}"),
+    }
+}
+
 fn is_rate_limit(error: &Value) -> bool {
     ["code", "type"]
         .iter()
@@ -682,6 +693,24 @@ mod tests {
     use crate::accounts::SelectedAuth;
     use crate::inference::{Inference, InferenceConfig, PolicyReply, PolicyRequest};
     use crate::responses::{InferenceAuth, RouteSelection};
+
+    #[test]
+    fn a_provider_error_says_its_message_not_its_body() {
+        let refused = json!({
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": "The model refused the request: the context holds an invalid image"
+        });
+        assert_eq!(
+            provider_error(&refused),
+            "The model refused the request: the context holds an invalid image"
+        );
+        let bare = json!({"code": "usage_limit_reached"});
+        assert_eq!(
+            provider_error(&bare),
+            r#"provider error: {"code":"usage_limit_reached"}"#
+        );
+    }
 
     #[derive(Debug)]
     struct Host {

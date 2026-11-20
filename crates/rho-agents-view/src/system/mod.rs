@@ -538,9 +538,17 @@ impl AgentsSystem {
         }));
     }
 
-    /// Runs a snippet in the agent's workset on its host. What the code
-    /// raised is echoed.
-    pub(crate) fn eval(&self, agent: AgentId, code: String, cx: &mut Context<Self>) {
+    /// Runs a snippet in the agent's workset on its host, for the action the
+    /// user chose. What the code raised is echoed in one line after the
+    /// action's name; `done`, if given, is echoed when it raised nothing.
+    pub(crate) fn eval(
+        &self,
+        agent: AgentId,
+        action: &'static str,
+        code: String,
+        done: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(agents), Some(workset)) =
             (self.agents_for(agent), self.registry.agent_workset(agent))
         else {
@@ -556,12 +564,23 @@ impl AgentsSystem {
         cx.spawn(async move |_, cx| {
             let reply = reply.await;
             cx.update(|cx| match reply {
-                Ok(result) => {
-                    if let Some(error) = result.error {
-                        frame.echo(error, StyleClass::SystemImportant, cx);
+                Ok(result) => match result.raised() {
+                    Some(raised) => frame.echo(
+                        format!("{action}: {raised}"),
+                        StyleClass::SystemImportant,
+                        cx,
+                    ),
+                    None => {
+                        if let Some(done) = done {
+                            frame.echo(done, StyleClass::SystemInfo, cx);
+                        }
                     }
-                }
-                Err(error) => frame.echo(format!("{error:#}"), StyleClass::SystemImportant, cx),
+                },
+                Err(error) => frame.echo(
+                    format!("{action}: {error:#}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                ),
             });
         })
         .detach();

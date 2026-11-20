@@ -110,11 +110,17 @@ pub enum InferenceState {
     },
     Failed {
         error: String,
+        /// When it failed. A failure the user retried into another can reach
+        /// the host as one status, so the time is the runtime's to say; none
+        /// from a runtime built before it said one.
+        since: Option<UnixMs>,
     },
     /// The process the agent ran in ended without a word: its host lost
     /// it. Only the host says this, never the runtime itself.
     Lost {
         error: String,
+        /// When its host lost it.
+        since: Option<UnixMs>,
     },
 }
 
