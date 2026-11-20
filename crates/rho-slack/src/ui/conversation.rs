@@ -15,13 +15,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use editor::display_map::{Crease, ToDisplayPoint as _};
-use editor::scroll::{Autoscroll, AutoscrollStrategy};
+use editor::scroll::Autoscroll;
 use editor::{
     CompletionContext, CompletionProvider, Editor, EditorEvent, EditorMode, FoldPlaceholder, Inlay,
     SelectionEffects, SizingBehavior,
 };
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, Image, ImageFormat, Task, Window, div};
+use gpui::{
+    App, Context, Entity, EventEmitter, Focusable as _, Image, ImageFormat, Task, Window, div,
+};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
 use multi_buffer::{Anchor as MultiBufferAnchor, MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
@@ -33,9 +35,6 @@ use crate::session::{Session, Source, Update};
 use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, crosses_day, day_label, lay_out};
 
-/// Custom inlay zero belongs to the composer; edit markers use subsequent ids.
-const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
-const COMPOSE_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 600;
 pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
@@ -65,14 +64,19 @@ enum DecodedEmoji {
 
 pub struct ConversationView {
     session: Entity<Session>,
-    hooks: Hooks,
     source: Source,
     /// The messages on screen, each keyed and each owning its own range: a
     /// new message rewrites one item, not the conversation.
     transcript: Transcript<Row, Class, LineMeta, ChromeGutter>,
+    /// The box's buffer: what the reader is writing.
     input: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
+    /// The messages.
     editor: Entity<Editor>,
+    /// The box to write in, under the messages.
+    composer: Entity<Editor>,
+    /// Which of the two has the keyboard.
+    focused: Focused,
     /// How far the session's messages have been applied here.
     revision: u64,
     /// Whether the surface is writing the transcript. The edits move the
@@ -365,9 +369,15 @@ enum Row {
     /// the conversation.
     Unread,
     Message(Ts),
-    /// The picture waiting to go with the next message, under everything
-    /// and over the composer.
-    Chip,
+    /// In a thread, the conversation it is in: `enter` opens it.
+    Crumb,
+}
+
+/// Which editor of the screen has the keyboard: the messages or the box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focused {
+    Log,
+    Composer,
 }
 
 /// What a line offers the cursor.
@@ -396,6 +406,8 @@ struct LineMeta {
     reply_users: Vec<crate::types::UserId>,
     reaction_chips: Vec<(Range<usize>, String, bool)>,
     replies: bool,
+    /// The line of the conversation a thread is in.
+    crumb: bool,
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
@@ -436,18 +448,11 @@ impl ConversationView {
         });
         let input = cx.new(|cx| Buffer::local(saved.text.clone(), cx));
         let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
+            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
             multi_buffer.set_excerpts_for_path(
                 PathKey::sorted(0),
                 transcript.clone(),
                 [Point::zero()..transcript.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(1),
-                input.clone(),
-                [Point::zero()..input.read(cx).max_point()],
                 0,
                 cx,
             );
@@ -469,13 +474,27 @@ impl ConversationView {
             editor.set_reserve_image_gutter(true, cx);
             editor.set_gutter_highlight_text_inset(Some(0.5), cx);
             editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
-            editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
-            // Completion is the composer's, not the transcript's: the
-            // provider answers for that one buffer and nothing else.
+            editor
+        });
+        // The box is the same as every thread's: an input under the
+        // messages, always in insert, with Slack's completion in it.
+        let composer = cx.new(|cx| {
+            let buffer = cx.new(|cx| MultiBuffer::singleton(input.clone(), cx));
+            let mut editor = Editor::new(
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(10),
+                },
+                buffer,
+                None,
+                window,
+                cx,
+            );
+            (hooks.configure_editor)(&mut editor, window, cx);
+            editor.set_placeholder_text(rho_frame::thread::PLACEHOLDER, window, cx);
             editor.set_completion_provider(Some(Rc::new(ComposeCompletions {
                 session: session.downgrade(),
                 channel: source.channel().clone(),
-                input: input.entity_id(),
             })));
             editor
         });
@@ -492,12 +511,8 @@ impl ConversationView {
                 }
             },
         ));
-        // The placeholder goes on the first keystroke and comes back when the
-        // reader empties the composer again, so the boundary is never a bare
-        // line whatever they do to it.
         subscriptions.push(cx.subscribe(&input, |this, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
-                this.apply_compose_chrome(cx);
                 this.persist_draft_text(cx);
             }
         }));
@@ -548,12 +563,13 @@ impl ConversationView {
 
         let mut view = Self {
             session: session.clone(),
-            hooks,
             source: source.clone(),
             transcript: Transcript::new(transcript),
             input,
             multi_buffer,
             editor,
+            composer,
+            focused: Focused::Log,
             revision: 0,
             editing: false,
             centre_on_the_point: false,
@@ -588,7 +604,7 @@ impl ConversationView {
             avatar_folds: HashMap::new(),
             edited_inlays: HashMap::new(),
             thread_inlays: HashMap::new(),
-            next_custom_inlay: 1,
+            next_custom_inlay: 0,
             text_folds: Vec::new(),
             reaction_folds: Vec::new(),
             preview_folds: Vec::new(),
@@ -601,15 +617,66 @@ impl ConversationView {
         session.update(cx, |session, cx| session.open(&source, cx));
         // Read before the open's own mark can land.
         view.adopt_cursor(cx);
-        view.apply_compose_chrome(cx);
         view.refresh(window, cx);
-        // A conversation with nothing new opens on the composer, which is
-        // what the reader came to do. One with unread messages opens on the
-        // first of them instead; `refresh` has already put the cursor there.
-        if !view.unread_placed {
-            view.select_compose(window, cx);
+        // A conversation with nothing new opens at its newest message, as
+        // every thread does. One with unread messages opens on the first of
+        // them instead; `refresh` has already put the cursor there.
+        if !view.unread_placed && view.dealt.is_none() {
+            view.cursor_to_end(window, cx);
         }
         view
+    }
+
+    /// Which of the messages and the box has the keyboard.
+    pub fn focused(&self) -> Focused {
+        self.focused
+    }
+
+    /// The editor the keyboard is in: the messages or the box.
+    pub fn focused_editor(&self) -> &Entity<Editor> {
+        match self.focused {
+            Focused::Log => &self.editor,
+            Focused::Composer => &self.composer,
+        }
+    }
+
+    /// Puts the keyboard in the box: what `i` asks for.
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = Focused::Composer;
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Puts the keyboard back in the messages, where it was.
+    pub fn focus_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = Focused::Log;
+        window.focus(&self.editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Whether the cursor is on the last line of the messages.
+    fn cursor_at_end(&self, cx: &mut Context<Self>) -> bool {
+        let last = self.transcript.buffer().read(cx).max_point().row as usize;
+        self.cursor_row(cx) >= last
+    }
+
+    /// Puts the cursor on the last line of the messages, in view.
+    fn cursor_to_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(anchor) = self.multi_buffer.read(cx).snapshot(cx).anchor_in_excerpt({
+            let buffer = self.transcript.buffer().read(cx);
+            buffer.anchor_before(buffer.max_point())
+        }) else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::fit()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
     }
 
     /// How many messages have arrived at the end while the reader was
@@ -809,6 +876,15 @@ impl ConversationView {
             .and_then(|meta| meta.link.clone())
     }
 
+    /// Whether the cursor is on the line that says which conversation a
+    /// thread is in.
+    pub fn cursor_on_crumb(&self, cx: &mut Context<Self>) -> bool {
+        let row = self.cursor_row(cx) as u32;
+        self.transcript
+            .line_meta(row, cx)
+            .is_some_and(|meta| meta.crumb)
+    }
+
     /// The thread the cursor is in, for opening a thread from a channel. A
     /// thread surface has none: it is already the thread.
     pub fn cursor_thread(&self, cx: &mut Context<Self>) -> Option<ThreadKey> {
@@ -889,7 +965,6 @@ impl ConversationView {
         }
         self.send_state = SendState::Sending;
         self.set_compose(String::new(), cx);
-        self.refresh_chip(cx);
         cx.notify();
         let sending = self.session.update(cx, |session, cx| {
             session.submit_draft(
@@ -1193,25 +1268,6 @@ impl ConversationView {
         EditStart::Started(message.ts)
     }
 
-    /// `up` in an empty composer: rewrite the last thing the reader said,
-    /// which is the habit Slack teaches. Nothing of theirs on screen, or a
-    /// composer with something in it, and this is not the reader asking.
-    pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) -> EditStart {
-        if !self.input.read(cx).text().trim().is_empty() || self.editing_message.is_some() {
-            return EditStart::Nothing;
-        }
-        let self_id = self.session.read(cx).model().self_id().clone();
-        let Some(message) = self
-            .shown_messages(cx)
-            .into_iter()
-            .rfind(|message| message.user.as_ref() == Some(&self_id))
-        else {
-            return EditStart::Nothing;
-        };
-        self.begin_edit(&message, window, cx);
-        EditStart::Started(message.ts)
-    }
-
     fn begin_edit(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) {
         if self.held_compose.is_none() {
             self.held_compose = Some(self.input.read(cx).text());
@@ -1228,7 +1284,7 @@ impl ConversationView {
             self.retint(&previous, cx);
         }
         self.retint(&message.ts, cx);
-        self.select_compose(window, cx);
+        self.focus_composer(window, cx);
     }
 
     /// `escape` with an edit open: the message stands as it was and the
@@ -1275,7 +1331,6 @@ impl ConversationView {
             bytes: std::sync::Arc::new(bytes),
         });
         self.persist_draft_files(cx);
-        self.refresh_chip(cx);
         cx.notify();
         Attaching::Attached
     }
@@ -1345,7 +1400,6 @@ impl ConversationView {
         }
         self.attached.remove(index);
         self.persist_draft_files(cx);
-        self.refresh_chip(cx);
         cx.notify();
         true
     }
@@ -1356,7 +1410,6 @@ impl ConversationView {
         self.attached.clear();
         if had {
             self.persist_draft_files(cx);
-            self.refresh_chip(cx);
             cx.notify();
         }
         had
@@ -1382,7 +1435,6 @@ impl ConversationView {
 
     pub fn set_also_send_to_channel(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.also_send_to_channel = matches!(self.source, Source::Thread(_)) && enabled;
-        self.refresh_chip(cx);
         cx.notify();
     }
 
@@ -1400,7 +1452,6 @@ impl ConversationView {
         self.attached.clear();
         self.set_compose(String::new(), cx);
         self.persist_draft_files(cx);
-        self.refresh_chip(cx);
         cx.notify();
         let source = self.source.clone();
         let bytes = files.iter().map(|file| file.bytes.len() as u64).sum();
@@ -1435,17 +1486,9 @@ impl ConversationView {
         watch(cx, told)
     }
 
-    /// The chip line, kept last: it belongs between the transcript and the
-    /// composer, and a message arriving appends itself after whatever is
-    /// at the end.
-    fn refresh_chip(&mut self, cx: &mut Context<Self>) {
-        if self.attached.is_empty()
-            && self.send_state == SendState::Ready
-            && !self.also_send_to_channel
-        {
-            self.transcript.remove(&Row::Chip, cx);
-            return;
-        }
+    /// The line under the box: the files going with the next message,
+    /// where a reply goes, and how the last send went.
+    pub fn chip_lines(&self) -> Vec<String> {
         let mut lines = self.attached.iter().map(Attached::line).collect::<Vec<_>>();
         if self.also_send_to_channel {
             lines.push("reply also goes to channel".to_owned());
@@ -1453,16 +1496,9 @@ impl ConversationView {
         match self.send_state {
             SendState::Ready => {}
             SendState::Sending => lines.push("sending…".to_owned()),
-            SendState::Failed => lines.push("send failed · Enter retries".to_owned()),
+            SendState::Failed => lines.push("send failed · ctrl-enter retries".to_owned()),
         }
-        let item = muted_item(Row::Chip, format!("{}\n", lines.join("\n")), Class::Muted);
-        let last = self.transcript.keys().last().cloned();
-        if last.as_ref() == Some(&Row::Chip) {
-            self.transcript.replace(&Row::Chip, item, cx);
-            return;
-        }
-        self.transcript.remove(&Row::Chip, cx);
-        self.transcript.insert_before(None, vec![item], cx);
+        lines
     }
 
     /// Which message an open edit is about, for the host's journal.
@@ -1492,7 +1528,6 @@ impl ConversationView {
                 bytes: std::sync::Arc::new(file.bytes),
             })
             .collect();
-        self.refresh_chip(cx);
         cx.notify();
     }
 
@@ -1628,72 +1663,6 @@ impl ConversationView {
             Some(Want::Newer(after)) => self.load_newer(after, cx),
             None => {}
         }
-    }
-
-    /// The agent prompt's draft style and a display-only destination hint.
-    /// The gutter is reserved for author avatars, not a composer stripe.
-    fn apply_compose_chrome(&self, cx: &mut Context<Self>) {
-        let placeholder = self.compose_placeholder(cx);
-        let (empty, start, end) = {
-            let buffer = self.input.read(cx);
-            (
-                buffer.is_empty(),
-                buffer.anchor_before(0),
-                buffer.anchor_after(buffer.len()),
-            )
-        };
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let (Some(start), Some(end)) = (
-            snapshot.anchor_in_excerpt(start),
-            snapshot.anchor_in_excerpt(end),
-        ) else {
-            return;
-        };
-        let inlays = match empty {
-            true => vec![Inlay::custom(
-                COMPOSE_PLACEHOLDER_INLAY_ID,
-                end,
-                placeholder,
-            )],
-            false => Vec::new(),
-        };
-        let draft_style = (self.hooks.prompt_style)(cx);
-        self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&[InlayId::Custom(COMPOSE_PLACEHOLDER_INLAY_ID)], inlays, cx);
-            editor.highlight_text(
-                editor::HighlightKey::SyntaxTreeView(COMPOSE_DRAFT_HIGHLIGHT_KEY),
-                if empty { Vec::new() } else { vec![start..end] },
-                draft_style,
-                cx,
-            );
-        });
-    }
-
-    fn compose_placeholder(&self, cx: &App) -> String {
-        let label = self.session.read(cx).model().label(self.source.channel());
-        compose_placeholder(&label, matches!(self.source, Source::Thread(_)))
-    }
-
-    /// Puts the cursor in the composer: what `i` asks for.
-    pub fn select_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let end = {
-            let buffer = self.input.read(cx);
-            buffer.anchor_after(buffer.len())
-        };
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(end)
-        else {
-            return;
-        };
-        self.editor.update(cx, |editor, cx| {
-            editor.set_autoscroll_pin(anchor, AutoscrollStrategy::Bottom, cx);
-            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                selections.select_anchor_ranges([anchor..anchor]);
-            });
-        });
     }
 
     /// Shows the message a deal is about: tinted for the life of the
@@ -1881,6 +1850,10 @@ impl ConversationView {
         // message at all. Asked as a key, which is the transcript's own
         // search rather than a pass over what is shown.
         let was_on = self.cursor_message_ts(cx);
+        // A reader at the end stays at the end as messages arrive, as in
+        // every thread.
+        let at_end = self.cursor_at_end(cx);
+        let placed = (self.dealt_placed, self.unread_placed);
         let Some((revision, updates)) = self
             .session
             .read(cx)
@@ -1926,6 +1899,13 @@ impl ConversationView {
         self.refresh_unread(cx);
         self.place_dealt(window, cx);
         self.place_unread(window, cx);
+        if at_end
+            && placed == (self.dealt_placed, self.unread_placed)
+            && (self.dealt.is_none() || self.dealt_placed)
+            && !self.cursor_at_end(cx)
+        {
+            self.cursor_to_end(window, cx);
+        }
         self.settle_images(cx);
         self.refresh_custom_emoji(window, cx);
         let paragraph_spacing = self.refresh_text_layout(window, cx);
@@ -1956,8 +1936,12 @@ impl ConversationView {
                 let start = text::ToOffset::to_offset(&range.start, &buffer);
                 (end > start).then_some(())?;
                 Some(editor::display_map::RowSpacing {
+                    // The last character's start, which is not `end - 1`
+                    // when the item ends in one wider than a byte.
                     range: snapshot.anchor_in_excerpt(range.start)?
-                        ..snapshot.anchor_in_excerpt(buffer.anchor_before(end - 1))?,
+                        ..snapshot.anchor_in_excerpt(
+                            buffer.anchor_before(buffer.clip_offset(end - 1, text::Bias::Left)),
+                        )?,
                     minimum_height: if self.avatar_authors.contains_key(row) {
                         1.25
                     } else {
@@ -1976,8 +1960,6 @@ impl ConversationView {
             spacing.extend(paragraph_spacing);
             editor.set_row_spacing(spacing, cx);
         });
-        self.refresh_chip(cx);
-        self.apply_compose_chrome(cx);
         cx.notify();
         #[cfg(any(test, feature = "fake"))]
         {
@@ -2873,8 +2855,7 @@ impl ConversationView {
     fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
         // Only what lands at the live end counts: a page of history
         // arriving above is not something the reader is missing. Read from
-        // the end, because the newest message is at the end: the chip is
-        // the only row that can sit under it.
+        // the end, because the newest message is at the end.
         let tail = self.transcript.keys().rev().find_map(|key| match key {
             Row::Message(ts) => Some(ts.clone()),
             _ => None,
@@ -3127,7 +3108,7 @@ impl ConversationView {
                 Some(self.item_for(&message, cx))
             }
             Row::Unread => Some(unread_rule()),
-            Row::Notice | Row::Gap | Row::Newer(_) | Row::Chip => None,
+            Row::Notice | Row::Gap | Row::Newer(_) | Row::Crumb => None,
         }
     }
 
@@ -3159,7 +3140,7 @@ impl ConversationView {
         let first = self
             .transcript
             .keys()
-            .find(|key| !matches!(key, Row::Notice | Row::Gap))
+            .find(|key| !matches!(key, Row::Crumb | Row::Notice | Row::Gap))
             .cloned();
         self.put_top(Row::Gap, gap, first.clone(), cx);
         let after_notice = self
@@ -3168,6 +3149,34 @@ impl ConversationView {
             .then_some(Row::Gap)
             .or(first);
         self.put_top(Row::Notice, notice, after_notice, cx);
+        // A thread says where it is above everything, as every thread does.
+        let crumb = match &self.source {
+            Source::Thread(_) => {
+                let label = self.session.read(cx).model().label(self.source.channel());
+                let mut item = muted_item(Row::Crumb, format!("{label}\n\n"), Class::Muted);
+                for line in &mut item.lines {
+                    line.crumb = true;
+                }
+                Some(item)
+            }
+            Source::Conversation(_) => None,
+        };
+        let drawn = self.transcript.range_of(&Row::Crumb).map(|range| {
+            self.transcript
+                .buffer()
+                .read(cx)
+                .text_for_range(range)
+                .collect::<String>()
+        });
+        if drawn == crumb.as_ref().map(|crumb| crumb.text.clone()) {
+            return;
+        }
+        let top = self
+            .transcript
+            .keys()
+            .find(|key| **key != Row::Crumb)
+            .cloned();
+        self.put_top(Row::Crumb, crumb, top, cx);
     }
 
     /// The rows that say history is missing in the middle: one under each
@@ -3409,7 +3418,10 @@ fn reaches_the_top(op: &Op, placed: &impl Placed) -> bool {
     };
     let mut above = placed.above(&before);
     while let Some(key) = above {
-        if !matches!(key, Row::Notice | Row::Gap | Row::Day(_) | Row::Unread) {
+        if !matches!(
+            key,
+            Row::Crumb | Row::Notice | Row::Gap | Row::Day(_) | Row::Unread
+        ) {
             return false;
         }
         above = placed.above(&key);
@@ -4112,16 +4124,6 @@ fn message_item_with_header(
     item(Row::Message(message.ts.clone()), spans, lines)
 }
 
-/// What the empty composer says it is for. A thread's composer says so in
-/// its own words, because a reply landing in the channel instead is the
-/// mistake this line exists to prevent.
-fn compose_placeholder(label: &str, thread: bool) -> String {
-    match thread {
-        false => format!("Message {label}…"),
-        true => format!("Reply in {label}…"),
-    }
-}
-
 /// Waits for the outcome of a write that is already on its way. The write
 /// is detached, so this task holds nothing: dropping it drops the answer and
 /// not the message. A sender that goes away without answering -- the window
@@ -4297,11 +4299,21 @@ fn push_reactions(
     counts
 }
 
-/// The reply count, without per-message or last-reply timestamps.
+/// The replies folded under a message, as every thread folds them: how
+/// many, and when the newest came.
 fn replies_line(message: &Message) -> String {
     let count = message.reply_count;
     let plural = if count == 1 { "reply" } else { "replies" };
-    format!("{count} {plural} →")
+    match &message.latest_reply {
+        Some(latest) => format!(
+            "↳ {count} {plural} · {}",
+            crate::ui::when_label(
+                latest.epoch_seconds() as i64,
+                chrono::Local::now().timestamp()
+            )
+        ),
+        None => format!("↳ {count} {plural}"),
+    }
 }
 
 /// A body, with the workspace's own emoji muted. `:forrest_gump_wave:` is a
@@ -4464,9 +4476,6 @@ fn is_name_char(character: char) -> bool {
 struct ComposeCompletions {
     session: gpui::WeakEntity<Session>,
     channel: crate::types::ChannelId,
-    /// The composer's buffer. The transcript shares this editor and must
-    /// never offer anything: it is not writable.
-    input: gpui::EntityId,
 }
 
 impl CompletionProvider for ComposeCompletions {
@@ -4479,9 +4488,6 @@ impl CompletionProvider for ComposeCompletions {
         cx: &mut Context<Editor>,
     ) -> gpui::Task<anyhow::Result<Vec<project::CompletionResponse>>> {
         let empty = gpui::Task::ready(Ok(Vec::new()));
-        if buffer.entity_id() != self.input {
-            return empty;
-        }
         let Some(session) = self.session.upgrade() else {
             return empty;
         };
@@ -4541,7 +4547,7 @@ impl CompletionProvider for ComposeCompletions {
 }
 
 impl gpui::Render for ConversationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // One page per frame, which is what makes it one page per keypress:
         // a motion raises a scroll event and a selection event, and a
         // conversation opening onto a gap raises neither.
@@ -4559,13 +4565,22 @@ impl gpui::Render for ConversationView {
             self.unseen = 0;
         }
         self.fill(position, screen, cx);
+        // The keyboard moving by mouse or by the frame counts as much as by
+        // key: whichever editor has it is the one the chrome reads.
+        if self.composer.focus_handle(cx).is_focused(window) {
+            self.focused = Focused::Composer;
+        } else if self.editor.focus_handle(cx).is_focused(window) {
+            self.focused = Focused::Log;
+        }
+        let colors = cx.theme().colors();
+        let chip = self.chip_lines();
         div()
             .id("rho-slack-conversation")
-            .key_context("RhoSlackConversation")
+            .key_context(rho_frame::thread::SCREEN)
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().colors().editor_background)
+            .bg(colors.editor_background)
             // A file dropped on the conversation is an attachment for the
             // next message, the same as pasting one.
             .on_drop(
@@ -4591,6 +4606,7 @@ impl gpui::Render for ConversationView {
             )
             .child(
                 div()
+                    .key_context(rho_frame::thread::LOG)
                     .flex_1()
                     .min_h_0()
                     .px(gpui::px(4.))
@@ -4603,6 +4619,23 @@ impl gpui::Render for ConversationView {
                         }),
                     )
                     .child(self.editor.clone()),
+            )
+            .child(
+                div()
+                    .key_context(rho_frame::thread::COMPOSER)
+                    .flex_none()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .px_2()
+                    .py_1()
+                    .child(self.composer.clone())
+                    .children(chip.into_iter().map(|line| {
+                        div()
+                            .text_color(colors.text_muted)
+                            .text_size(gpui::rems(0.8))
+                            .child(line)
+                    })),
             )
     }
 }
@@ -5165,7 +5198,7 @@ mod tests {
             "a broadcast was said to the room: {text}"
         );
         assert!(text.contains("also sent to the channel"), "{text}");
-        assert!(text.contains("3 replies →\n"), "{text}");
+        assert!(text.contains("↳ 3 replies · "), "{text}");
         assert!(!text.contains("in thread"), "the marker is gone: {text}");
         assert_eq!(
             lines.len(),
@@ -5183,7 +5216,7 @@ mod tests {
         let (text, _, _) = render_messages(&messages, &model(), true);
         assert!(text.contains("deal curve is fine"), "{text}");
         assert!(
-            !text.contains("3 replies →"),
+            !text.contains("3 replies"),
             "a thread does not count itself: {text}"
         );
     }
@@ -5225,7 +5258,7 @@ mod tests {
         }));
         let rendered = message_item(&message, &model(), false);
         assert!(
-            rendered.text.ends_with("body\n  👍 3\n  4 replies →\n"),
+            rendered.text.ends_with("body\n  👍 3\n  ↳ 4 replies\n"),
             "{}",
             rendered.text
         );
@@ -5702,14 +5735,6 @@ mod tests {
             !at_tail(10.0, 30.0, 50.0),
             "a reader twenty lines up is missing what arrives"
         );
-    }
-
-    #[test]
-    fn the_empty_composer_says_where_the_message_is_going() {
-        assert_eq!(compose_placeholder("#design", false), "Message #design…");
-        // A thread's composer is the one place the reader can be wrong about
-        // where the words land, so it says the thread out loud.
-        assert_eq!(compose_placeholder("#design", true), "Reply in #design…");
     }
 
     #[test]

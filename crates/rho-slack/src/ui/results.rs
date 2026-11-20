@@ -16,7 +16,7 @@ use text::{Anchor, Bias};
 use theme::ActiveTheme as _;
 
 use crate::api::{FileSearchPage, SearchHit, SearchPage};
-use crate::session::{ActivityEntry, SearchKind, SearchRefused, Session, Source};
+use crate::session::{SearchKind, SearchRefused, Session, Source};
 use crate::types::{FileSummary, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
@@ -54,9 +54,6 @@ pub struct ResultsView {
     pages: u32,
     loading: bool,
     kind: SearchKind,
-    /// Last inventory inputs, so unrelated session notifications cost no
-    /// buffer edit and cannot disturb scroll or selection.
-    inventory_state: Option<(String, Vec<ActivityEntry>, Option<String>)>,
 }
 
 struct DrawnLine {
@@ -116,7 +113,6 @@ impl ResultsView {
             pages: 0,
             loading: false,
             kind: SearchKind::Messages,
-            inventory_state: None,
         }
     }
 
@@ -297,65 +293,6 @@ impl ResultsView {
             SearchKind::Files => session.search_files(&query, page, cx),
         });
         true
-    }
-
-    /// Draws a durable Slack inventory. Unlike search results these rows
-    /// come from the mirror and remain available while Slack is offline.
-    pub fn inventory(
-        &mut self,
-        heading: &str,
-        entries: &[ActivityEntry],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let health = self.session.read(cx).health_reason().map(str::to_owned);
-        let state = (heading.to_owned(), entries.to_vec(), health.clone());
-        if self.inventory_state.as_ref() == Some(&state) {
-            return;
-        }
-        self.inventory_state = Some(state);
-        let selected = match self.cursor_target(cx) {
-            Some(Target::Message(place)) => Some(place),
-            _ => None,
-        };
-        let mut lines = vec![(None, vec![Span::styled(heading.to_owned(), Class::Muted)])];
-        if let Some(reason) = health {
-            lines.push((None, vec![Span::styled(reason, Class::Error)]));
-        }
-        if entries.is_empty() {
-            lines.push((None, vec![Span::styled("nothing here", Class::Muted)]));
-        }
-        for entry in entries {
-            let place = Place {
-                source: entry.source.clone(),
-                ts: entry.ts.clone(),
-            };
-            let mut head = vec![Span::styled(
-                entry.conversation.clone(),
-                Class::Conversation,
-            )];
-            if entry.unread {
-                head.push(Span::plain("  "));
-                head.push(Span::styled("unread", Class::Unread));
-            }
-            lines.push((Some(Target::Message(place.clone())), head));
-            if !entry.summary.is_empty() {
-                lines.push((
-                    Some(Target::Message(place)),
-                    vec![Span::plain(format!(
-                        "  {}",
-                        entry.summary.replace('\n', " ")
-                    ))],
-                ));
-            }
-        }
-        self.draw(lines, window, cx);
-        if let Some(row) = selected
-            .as_ref()
-            .and_then(|selected| row_for_place(&self.drawn, selected))
-        {
-            self.place_cursor(row, window, cx);
-        }
     }
 
     /// What the reader is told when the search did not answer. One line,
@@ -543,12 +480,6 @@ fn append_navigation(lines: &mut Vec<(Option<Target>, Vec<Span>)>, page: u32, pa
     ));
 }
 
-fn row_for_place(lines: &[DrawnLine], selected: &Place) -> Option<usize> {
-    lines
-        .iter()
-        .position(|line| line.target.as_ref() == Some(&Target::Message(selected.clone())))
-}
-
 /// What the surface says it is showing. The count is Slack's, so a page of
 /// forty out of three hundred says so rather than implying that is all there
 /// was.
@@ -645,40 +576,5 @@ mod tests {
             None,
             "pagination is outside the editor hit region and cannot emit Open"
         );
-    }
-}
-
-#[cfg(test)]
-mod inventory_tests {
-    use super::{DrawnLine, Place, Target, row_for_place};
-    use crate::session::Source;
-    use crate::types::{ChannelId, Ts};
-
-    fn place(channel: &str, ts: &str) -> Place {
-        Place {
-            source: Source::Conversation(ChannelId(channel.into())),
-            ts: Ts(ts.into()),
-        }
-    }
-
-    fn line(place: Option<Place>) -> DrawnLine {
-        DrawnLine {
-            target: place.map(Target::Message),
-            text: String::new(),
-            styles: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn unrelated_inventory_arrival_preserves_the_selected_target() {
-        let selected = place("C2", "200.0");
-        let redrawn = vec![
-            line(None),
-            line(Some(place("C3", "300.0"))),
-            line(Some(place("C1", "100.0"))),
-            line(Some(selected.clone())),
-        ];
-
-        assert_eq!(row_for_place(&redrawn, &selected), Some(3));
     }
 }

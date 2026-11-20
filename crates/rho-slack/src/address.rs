@@ -15,8 +15,6 @@ use crate::types::{ChannelId, Ts};
 /// One `slack:` address.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SlackAddress {
-    /// `slack:<workspace>`: every conversation the user is in.
-    Conversations(WorkspaceName),
     /// `slack:<workspace>/<channel>` or `slack:<workspace>/<channel>/<ts>`:
     /// a conversation or a thread in it, the thing the dealer deals.
     Unit(WorkspaceName, Unit),
@@ -24,14 +22,10 @@ pub enum SlackAddress {
     Listing(WorkspaceName, Listing),
 }
 
-/// The listings a workspace has. Each has one surface, and asking again
-/// draws over it.
+/// The listings a workspace has: the last search of each kind. Each has one
+/// surface, and asking again draws over it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Listing {
-    /// Mentions, direct messages and followed threads, read or not.
-    Activity,
-    /// What the user saved for later here.
-    Saved,
     /// The last message search.
     Messages,
     /// The last file search.
@@ -39,17 +33,10 @@ pub enum Listing {
 }
 
 impl Listing {
-    const ALL: [Listing; 4] = [
-        Listing::Activity,
-        Listing::Saved,
-        Listing::Messages,
-        Listing::Files,
-    ];
+    const ALL: [Listing; 2] = [Listing::Messages, Listing::Files];
 
     fn word(self) -> &'static str {
         match self {
-            Self::Activity => "activity",
-            Self::Saved => "saved",
             Self::Messages => "messages",
             Self::Files => "files",
         }
@@ -59,9 +46,7 @@ impl Listing {
 impl SlackAddress {
     pub fn workspace(&self) -> &WorkspaceName {
         match self {
-            Self::Conversations(workspace)
-            | Self::Unit(workspace, _)
-            | Self::Listing(workspace, _) => workspace,
+            Self::Unit(workspace, _) | Self::Listing(workspace, _) => workspace,
         }
     }
 
@@ -101,7 +86,6 @@ impl Addressed for SlackAddress {
 
     fn rest(&self) -> String {
         match self {
-            Self::Conversations(workspace) => workspace.0.clone(),
             Self::Unit(workspace, unit) => match &unit.thread {
                 None => format!("{workspace}/{}", unit.channel.as_str()),
                 Some(ts) => format!("{workspace}/{}/{}", unit.channel.as_str(), ts.as_str()),
@@ -120,7 +104,7 @@ impl Addressed for SlackAddress {
             return None;
         }
         Some(match (second, third) {
-            (None, _) => Self::Conversations(workspace),
+            (None, _) => return None,
             (Some(word), None) if word.starts_with('~') => {
                 let listing = Listing::ALL
                     .into_iter()
@@ -173,11 +157,8 @@ mod tests {
     }
 
     #[test]
-    fn the_listings_and_the_conversations_are_not_units() {
+    fn the_listings_read_back() {
         for address in [
-            SlackAddress::Conversations(acme()),
-            SlackAddress::Listing(acme(), Listing::Activity),
-            SlackAddress::Listing(acme(), Listing::Saved),
             SlackAddress::Listing(acme(), Listing::Messages),
             SlackAddress::Listing(acme(), Listing::Files),
         ] {
@@ -203,6 +184,12 @@ mod tests {
             "acme/C1/not-a-ts",
             "acme/C1/1700000000.1/more",
             "acme/~activity/1700000000.1",
+            // The screens that went: the conversation list, activity and the
+            // list saved on one device. An old history entry naming one reads
+            // as nothing rather than as a screen that is not there.
+            "acme",
+            "acme/~activity",
+            "acme/~saved",
         ] {
             assert_eq!(SlackAddress::from_rest(rest), None, "{rest:?}");
         }
