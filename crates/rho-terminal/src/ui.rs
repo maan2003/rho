@@ -147,9 +147,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         // Raw mode: every unbound key goes to the pty, so the terminal's
         // own chords are ones shells do not see. `ctrl-\ ctrl-n` is vim's
-        // terminal escape; `ctrl-shift-n` the discoverable one.
+        // terminal escape; `ctrl-shift-n` the discoverable one. The palette
+        // chord, `ctrl-shift-;`, is the frame's own.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-;", Palette, Some("RhoTerminal")),
         KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
         // The frame walks history on ctrl-j and ctrl-k; in a shell they are

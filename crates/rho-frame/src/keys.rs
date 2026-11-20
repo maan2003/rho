@@ -17,7 +17,8 @@ actions!(
         Close,
         /// Closes the surface in view and deals the next card.
         CloseAndDeal,
-        /// `:`: every command by name.
+        /// `:`, and `ctrl-shift-;` where `:` would be typed: every command
+        /// by name.
         Palette,
         /// `space`: the verdicts over the card in view; `space` again is
         /// Home.
@@ -46,6 +47,11 @@ pub fn normal_contexts(surface: &str, more: &str) -> [String; 2] {
 /// gpui prefers the deeper match, so a root-level binding would lose
 /// while typing.
 pub fn bind(cx: &mut App) {
+    cx.bind_keys(bindings());
+    crate::thread::bind(cx);
+}
+
+fn bindings() -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for context in ["RhoFrame", "RhoFrame > Editor"] {
         bindings.extend([
@@ -57,6 +63,11 @@ pub fn bind(cx: &mut App) {
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
             KeyBinding::new("ctrl-shift-f", FindAddress, Some(context)),
+            // `ctrl-shift-;`, the palette where `:` would be typed: in a
+            // terminal, on a desktop or a page. Spelled as gpui reads it on
+            // Linux and macOS: shift turns `;` into `:` and is dropped, so
+            // `ctrl-shift-;` would never match.
+            KeyBinding::new("ctrl-:", Palette, Some(context)),
         ]);
     }
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
@@ -83,6 +94,52 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
     ]);
-    cx.bind_keys(bindings);
-    crate::thread::bind(cx);
+    bindings
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+
+    use super::*;
+
+    /// What the window hears when `ctrl-shift-;` is pressed in `surface`.
+    fn chord_in(surface: &str) -> Vec<KeyBinding> {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings());
+        // As gpui on Linux delivers it: shift made `;` into `:`, and is
+        // dropped because `:` is already the shifted key.
+        let typed = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: ":".into(),
+            key_char: Some(":".into()),
+        };
+        let stack = [
+            KeyContext::parse("RhoFrame").unwrap(),
+            KeyContext::parse(surface).unwrap(),
+        ];
+        keymap.bindings_for_input(&[typed], &stack).0.into_vec()
+    }
+
+    #[test]
+    fn ctrl_shift_semicolon_opens_the_palette_from_a_place_that_takes_every_key() {
+        // A raw terminal, a live desktop and a page bind none of it
+        // themselves: the frame's chord reaches through each.
+        for surface in ["RhoTerminal", "RhoDesktop", "RhoBrowser"] {
+            let bindings = chord_in(surface);
+            assert!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.action().as_any().is::<Palette>()),
+                "ctrl-shift-; in {surface} matched {:?}",
+                bindings
+                    .iter()
+                    .map(|b| b.action().name())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
 }
