@@ -246,10 +246,12 @@ impl ChatSystem {
             .unwrap_or_else(|| format!("{endpoint}"))
     }
 
-    /// Whether the window holds more than one host: when it does, a
-    /// thread says which.
-    fn many_hosts(&self) -> bool {
-        self.chats.len() > 1
+    fn project_of(&self, thread: ThreadId) -> String {
+        let host = self.host_name(thread.host);
+        self.chat(thread.host).map_or_else(
+            || host.clone(),
+            |chat| cards::context(chat, thread.message, &host),
+        )
     }
 
     pub fn draft(&self, endpoint: EndpointId, parent: Option<MessageId>) -> &str {
@@ -505,7 +507,7 @@ impl ChatSystem {
         let host = cards::Host {
             endpoint,
             chat,
-            name: self.many_hosts().then_some(name.as_str()),
+            name: &name,
         };
         Some(read(&host))
     }
@@ -552,6 +554,16 @@ impl System for ChatSystem {
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
+    }
+
+    fn active_surface(&mut self, address: Option<&Address>, _cx: &mut Context<Self>) {
+        let thread = address
+            .and_then(|address| self.thread_of(address))
+            .filter(|thread| {
+                self.chat(thread.host)
+                    .is_some_and(|chat| !chat.is_project(thread.message))
+            });
+        self.set_view(thread);
     }
 
     fn streams(
@@ -605,8 +617,7 @@ impl System for ChatSystem {
         let this = cx.entity();
         let mut rows = Vec::new();
         let hosts = self.hosts();
-        // On an agent in a thread's `with` line the palette is the
-        // agent's, whose `c` compacts its context.
+        // The agent's palette uses `c` to compact its context.
         let on_agent = point
             .subject
             .as_ref()
@@ -767,9 +778,7 @@ impl System for ChatSystem {
         let thread = self.thread_of(address)?;
         let chat = self.chats.get(&thread.host)?;
         let parent = chat.message(thread.message)?.parent?;
-        let in_channel = chat
-            .message(parent)
-            .is_some_and(|parent| parent.parent.is_none());
+        let in_channel = chat.is_project(parent);
         let message = if in_channel { thread.message } else { parent };
         Some(
             ThreadId {

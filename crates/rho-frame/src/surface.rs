@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use editor::Editor;
 use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window};
-use rho_dealer::Address;
+use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
 
@@ -67,6 +67,10 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
+    /// Positions the screen on what the card deals, including when the
+    /// frame already holds the screen in history.
+    fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// The surface's own rows for the palette, for what is in view.
     fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         Vec::new()
@@ -83,6 +87,7 @@ trait SurfaceHandle {
     fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
     fn heading(&self, cx: &App) -> Option<String>;
+    fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
 }
 
@@ -121,6 +126,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn heading(&self, cx: &App) -> Option<String> {
         self.read(cx).heading(cx)
+    }
+
+    fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
+        self.update(cx, |surface, cx| surface.show_card(card, window, cx));
     }
 
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
@@ -171,6 +180,10 @@ impl AnySurface {
 
     pub fn heading(&self, cx: &App) -> Option<String> {
         self.0.heading(cx)
+    }
+
+    pub(crate) fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
+        self.0.show_card(card, window, cx);
     }
 
     pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {

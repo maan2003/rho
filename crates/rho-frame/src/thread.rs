@@ -22,7 +22,7 @@ actions!(
         /// Puts the keyboard in the messages.
         FocusLog,
         /// Opens what the cursor is on: a thread under a message, the
-        /// thread above, a participant.
+        /// thread above, a link, or a quote.
         OpenRow,
     ]
 );
@@ -35,7 +35,7 @@ pub const LOG: &str = "RhoThreadLog";
 pub const COMPOSER: &str = "RhoThreadComposer";
 
 /// What the empty box says.
-pub const PLACEHOLDER: &str = "message · ctrl-enter sends";
+pub const PLACEHOLDER: &str = "reply · ctrl-enter sends";
 /// What the empty box of a channel on a host says, where a message is an
 /// idea an agent starts from.
 pub const CHANNEL_PLACEHOLDER: &str =
