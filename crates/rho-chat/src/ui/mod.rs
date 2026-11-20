@@ -532,9 +532,26 @@ impl System for ChatSystem {
         ))]
     }
 
+    /// The host's rooms and their screens go from the window with it. Its
+    /// log is a copy the host still has, so the copy goes too and is read
+    /// again if the host is attached again; what the user wrote and has
+    /// not sent stays for then.
     fn detached(&mut self, host: HostId, cx: &mut Context<Self>) {
-        self.hosts.remove(&host);
-        cx.notify();
+        let Some(endpoint) = self.hosts.remove(&host).and_then(|slot| slot.endpoint) else {
+            cx.notify();
+            return;
+        };
+        self.chats.remove(&endpoint);
+        self.cursors.reset(endpoint);
+        self.cache.reset(endpoint);
+        self.frame.close_all(
+            move |address| {
+                address.kind() == ThreadId::KIND
+                    && ThreadId::parse(address.rest()).is_some_and(|thread| thread.host == endpoint)
+            },
+            cx,
+        );
+        self.changed(endpoint, cx);
     }
 
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {

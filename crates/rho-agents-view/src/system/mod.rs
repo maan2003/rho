@@ -314,10 +314,17 @@ impl AgentsSystem {
         for agent in &agents {
             self.transcripts.forget(*agent);
             self.models.remove(agent);
-            if self.surfaces.remove(agent).is_some() {
-                self.frame.close(AgentRef(*agent).address(), cx);
-            }
+            self.surfaces.remove(agent);
         }
+        // Every screen of theirs: the transcript, terminals, shells, and
+        // desktops.
+        let gone = agents.clone();
+        self.frame.close_all(
+            move |address| {
+                AgentAddress::from_address(address).is_some_and(|at| gone.contains(&at.agent))
+            },
+            cx,
+        );
         self.registry.forget_agents(&agents);
         self.note_open(cx);
         self.changed(cx);
