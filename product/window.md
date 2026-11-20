@@ -19,6 +19,8 @@ does:
 - close and deal `ctrl-shift-j`: close this screen and deal the next card
 - home `tab`: go to `home.Home`; on Home, go back to the screen before
 
+The screens and the one in view come back as they were when the window starts again. A screen that can no longer open is passed over. Home is always at the bottom.
+
 Every screen is text in an editor. The Vim motions, search, and modes work on every screen, so the user moves through a list of rooms the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
 
 ## concept Status line
@@ -38,7 +40,7 @@ purpose: reach every place and every command by its name, so nothing needs a pla
 principle: the user presses `ctrl-shift-f` and types `privacy`; the thread `privacy VM` is in the list, with its channel beside it; enter opens it. Later they press `:` and type `sa`; `start agent here` comes first, and enter runs it.
 sees: one prompt, listing places and commands together, best match first as the user types:
 - places: every channel, thread, agent, agent's desktop, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`
-- commands: `home`, `notes`, `undo`, `hosts`, and `quit` on every screen, mixed with the commands for the screen in view and for the thing under the cursor; with nothing typed, the shorter names come first; each row has the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`
+- commands: `home`, `notes`, `undo`, `hosts`, and `quit` on every screen, after the commands for the screen in view and for the thing under the cursor, which come first; with a query, the best match comes first; a command inside a menu shows its path and key, such as `hosts › attach`
 does:
 - open `:`, or `ctrl-shift-;` from any place, a terminal, a desktop, a page, or a box the user is typing in: open the prompt with the commands listed first; the place under it does not see the keys
 - find `ctrl-shift-f`: open the same prompt with the places listed first

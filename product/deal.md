@@ -38,12 +38,13 @@ The user answers a card with a `Verdict`.
 
 ## concept Verdict
 purpose: let the user say once what a card means to them, so it goes away and rho remembers their answer.
-principle: the user reads a card's thread and has nothing to add; they press `space` then `d`; the echo line reads `done: debug`, and the next card opens; a minute later they change their mind and press `shift-u`, and the card is back as it was.
+principle: the user reads a card's thread and has nothing to add; they press `space` then `d`; the echo line reads `done: debug`, or `done: debug · nothing waits` on the last card, and the next card opens; a minute later they change their mind and press `shift-u`, and the card is back as it was.
 sees: the verdict menu over the card, after `space`; the echo line naming the verdict and the card, such as `done: debug`.
 does:
 - done `space` then `d`, or `done` on the phone: say the user is through with everything in the card so far; the card goes away, and when it was on screen, the next one opens
 - mute `space` then `m`, or `mute` on the phone: say nothing from it should reach the user again; the card goes away, and when it was on screen, the next one opens
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
+- next `space` then `n`: open the next card; with nothing waiting, open Home and echo `nothing waits`; `space` on a screen with no card opens a short menu headed `no card here`, with `u` undo and `n` next
 - undo `shift-u`, or `space` then `u`: take back the last verdict, including what it did in Slack; the echo line reads `undid done: debug`; the card opens again as it was; with nothing to take back, the echo line reads `nothing to undo`
 
 A verdict is about the card: the thread or conversation it stands for, and everything under it so far, wherever the cursor is in it, on the `with` line or in the box too. On a channel's list, a thread's row is that thread's card. A verdict about one message alone is a rare act, by name from the palette: `done with this message` and `mute this message`, offered only when the line under the cursor is a message that is not itself the card; the card stays.

@@ -68,7 +68,7 @@ when: the user sets up a new device, or their first one
 want: have this device hold the user's secret phrase
 so that: the user's verdicts, notes, and drafts are the same here as on their other devices
 steps:
-1. on the first device ever, when the first host answers that it holds nothing, the prompt line reads `write down your secret phrase · enter:` with the twelve words under it; the user writes them down, and `enter` puts them away
+1. on the first device ever, when the first host answers that it holds nothing, the prompt line reads `write down your secret phrase · it pairs your other devices · enter:` with the twelve words under it; the user writes them down, and `enter` puts them away
 2. on any later device, the status line reads `verdicts stay on this device until it is paired`, in muted text, once it has seen that another device wrote
 3. the user opens the palette and chooses `pair this device`; the prompt `secret phrase:` completes each word; a word that is not a phrase word, a wrong count, or a phrase that opens nothing reopens the prompt with the reason and keeps the text
 4. the echo line reads `paired: this device holds what your other devices said and wrote`, and the notice goes

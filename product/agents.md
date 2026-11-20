@@ -113,12 +113,12 @@ so that: the agent reads that message first and works in that thread
 steps:
 1. in a `chat.Channel`, the user presses `i` and writes the idea; the box reads `idea · ctrl-enter starts an agent · ctrl-shift-enter only sends`
 2. the user presses `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
-   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; the user answers `repository (url or host path):` or `directory on the host:` when asked; the next ideas in that channel ask nothing
+   - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; the user answers `repository (url or host path):` or `directory on the host:` when asked, with the host's known repositories and directories offered, newest first; the next ideas in that channel ask nothing, even when that first start failed
    - `ctrl-shift-enter` only sends, for a message that is not work
 3. for a message already in a thread, the user puts the cursor on it, opens the palette and chooses `start agent, choosing where and runtime…`; it asks where and `runtime (opus-high):`, as does `send and start agent, choosing where and runtime…` for the box
 system: puts the agent where the channel's newest agent works, in that agent's workset, a copy of the repository of its own that others can join; runs it on the default runtime, `opus-high`, written in the product; sends the message first when it is still in the box, and starts the agent once the host has it.
 user: the words; where the agent works, once per channel; the runtime only by the rare path or `Agent.set runtime` afterwards.
-cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea
+cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea; a start that fails, where the echo line reads `agent did not start: <why>`, such as the account that is not logged in and what to run on the host, and the thread's `with` line and the channel's row say the same
 reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## flow Look into what an agent did
