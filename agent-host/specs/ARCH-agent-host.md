@@ -185,9 +185,14 @@ from an agent's notebook routes a thread with no route to that agent. Only
 a new route moves a routed thread. The workset also keeps which agent wrote
 each post from a notebook, and a reaction added to or removed from that post
 goes to that agent, with the post's thread. The workspace route's agent also gets the bot's
-joins to channels and the notice that the host lost events. Direct
-messages, edits, other reactions and the bot's own posts are not routed; a
-handler of the policy's own may act on them.
+joins to channels and the notice that the host lost events. An edit of a
+message's text is heard as the message as edited, by whoever hears that
+message under the routes then, and comes with the text before it: people
+often type `@name` as plain text and fix it into a mention seconds later,
+and a changed question matters as much as a new one. An edit that keeps the
+text, such as a link unfurling, is not heard. Direct messages, other
+reactions and the bot's own posts are not routed; a handler of the policy's
+own may act on them.
 
 ## GUI sync
 

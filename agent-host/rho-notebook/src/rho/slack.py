@@ -8,10 +8,12 @@ new messages to agents: a route gives the workspace, a channel or one thread
 to an agent, and the most specific route wins. A thread route hears its
 whole thread; a workspace or channel route hears mentions of the bot and
 what its mode adds. A mention, or a post from an agent's notebook, in a
-thread with no route routes that thread to the agent. A reaction added to
-or removed from a post from an agent's notebook goes to that agent. Direct
-messages, edits, other reactions and the bot's own posts are not routed; a
-handler of its own sees them.
+thread with no route routes that thread to the agent. An edit of a
+message's text is routed as the message as edited, with the message before
+it (`edited`). A reaction added to or removed from a post from an agent's
+notebook goes to that agent. Direct messages, edits that keep the text,
+other reactions and the bot's own posts are not routed; a handler of its own
+sees them.
 """
 
 import asyncio
@@ -130,6 +132,8 @@ def route_messages(hand) -> None:
             to, thread = heard
             if kind != "message":
                 event = {**event, "item": {**event["item"], "thread_ts": thread}}
+            elif event.get("subtype") == "message_changed":
+                event = edited(event)
         elif kind == "rho_truncated" or (kind == "member_joined_channel" and event.get("user") == _bot):
             to = _rho.slack_owner()
         else:
@@ -176,6 +180,12 @@ def routes() -> dict:
     }
 
 
+def edited(event: dict) -> dict:
+    """A `message_changed` event as the message it edits: Slack's message as
+    edited, in the event's channel, with `previous_message` as it was."""
+    return {**event["message"], "channel": event["channel"], "previous_message": event["previous_message"]}
+
+
 def render(event: dict) -> str:
     """An event as an agent reads it: where it is first, so the agent can
     answer there."""
@@ -190,7 +200,12 @@ def render(event: dict) -> str:
         to = "to" if kind == "reaction_added" else "from"
         return f"[Slack {item['channel']} thread {item['thread_ts']}, ts {item['ts']}] <@{event['user']}> {did} :{event['reaction']}: {to} your post."
     thread = event.get("thread_ts") or event["ts"]
-    return f"[Slack {event['channel']} thread {thread}, from <@{event.get('user') or event.get('bot_id')}>]\n{event.get('text', '')}"
+    sender = f"<@{event.get('user') or event.get('bot_id')}>"
+    text = event.get("text", "")
+    if "previous_message" in event:
+        before = event["previous_message"].get("text", "")
+        return f"[Slack {event['channel']} thread {thread}, ts {event['ts']}, edited by {sender}]\n{text}\n[before the edit]\n{before}"
+    return f"[Slack {event['channel']} thread {thread}, from {sender}]\n{text}"
 
 
 def _posted(response: dict) -> None:
