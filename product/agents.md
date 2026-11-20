@@ -40,7 +40,7 @@ The agent's screen is its transcript: everything it did, so the user can check i
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
-principle: the user starts an agent and takes `sol-medium`; it struggles, so they choose `set runtime…` and give it `opus-high`.
+principle: an agent starts on `opus-high`, the default; the user wants a cheaper one for a small job, so they choose `set runtime…` and give it `sol-medium`.
 sees: a name such as `sol-medium`, `opus-high`, or `fable-high`.
 
 ## concept Terminal
@@ -102,7 +102,7 @@ flow:
 2. `ctrl-enter`; the idea is a new thread, and an agent starts on it where the channel's agents work, on the default runtime; the echo line reads `agent … started · opus-high · …`
    - the first idea in a channel whose agents have no place yet opens the menu `where this channel's agents work`: `n` `new workset on a repository…`, `h` `here, in a directory on the host…`, or a number to join the workset of an agent already on the host; answer `repository (url or host path):` or `directory on the host:` when asked; the next ideas in that channel ask nothing
    - `ctrl-shift-enter` only sends, for a message that is not work
-3. for a message already in a thread, put the cursor on it, open the palette and choose `start agent…`; it asks where and `runtime (opus-high):`, as does `send and start agent…` for the box
+3. for a message already in a thread, put the cursor on it, open the palette and choose `start agent, choosing where and runtime…`; it asks where and `runtime (opus-high):`, as does `send and start agent, choosing where and runtime…` for the box
 system: puts the agent where the channel's newest agent works, in that agent's workset, a copy of the repository of its own that others can join; runs it on the default runtime, `opus-high`, written in the product; sends the message first when it is still in the box, and starts the agent once the host has it.
 user: the words; where the agent works, once per channel; the runtime only by the rare path or `Agent.set runtime` afterwards.
 cases: more than nine agents on the host, where only nine can be joined from the menu; the host is away; a reply inside a thread, where `ctrl-enter` only sends, because a reply is not an idea
