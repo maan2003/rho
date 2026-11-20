@@ -587,7 +587,7 @@ impl StopTail {
         let reason = stop_line(&reason, occurrences);
         let mut body = format!("{} · {reason}", stop.word());
         if failed_to_start {
-            body.push_str("\n\nThis agent cannot start. Replies are saved. Change its runtime or start another agent.");
+            body.push_str("\n\nThis agent cannot start. Reply to retry, change its runtime, or start another agent.");
         }
         if !evidence.is_empty() {
             body.push_str("\n\nLast transcript lines:");
@@ -628,7 +628,7 @@ fn stop_line(line: &str, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ChatSeq};
+    use rho_agent_types::ChatSeq;
 
     use super::*;
 
@@ -663,7 +663,7 @@ mod tests {
         tail.push(error);
         assert_eq!(
             tail.body(Stop::Failed, error, true),
-            "failed · capture Claude mount ‹host path›: Operation not permitted\n\nThis agent cannot start. Replies are saved. Change its runtime or start another agent."
+            "failed · capture Claude mount ‹host path›: Operation not permitted\n\nThis agent cannot start. Reply to retry, change its runtime, or start another agent."
         );
     }
 

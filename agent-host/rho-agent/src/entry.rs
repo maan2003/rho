@@ -1,7 +1,7 @@
 //! What a request says and what happens to an agent, in the words both
 //! runtimes share.
 
-use rho_agent_types::{ContentPart, Role};
+use rho_agent_types::{ChatSeq, ContentPart, Role};
 use senax_encoder::{Decode, Encode};
 
 use crate::inference::{Carry, Image, Usage};
@@ -47,7 +47,7 @@ pub enum Notice {
     /// The user cancelled what was in flight: a request, a retry, or a
     /// cell.
     Cancelled,
-    /// The runtime could not launch; mail waits for a change of runtime.
+    /// The runtime could not launch; another reply can retry it.
     StartupFailed(StartupFailure),
     /// The provider completed a response after a stuck retry streak.
     Recovered(rho_agent_types::UnixMs),
@@ -58,6 +58,10 @@ pub struct StartupFailure {
     pub error: String,
     pub since: rho_agent_types::UnixMs,
     pub runtime: crate::record::Runtime,
+    /// User mail included in this launch attempt; replaying it after a
+    /// restart cannot trigger another launch.
+    #[senax(default)]
+    pub tried_through: Option<ChatSeq>,
 }
 
 /// What one request says, by role.
@@ -301,6 +305,39 @@ impl ResponseUsage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_launch_failure_keeps_its_error_without_a_reply_boundary() {
+        #[derive(Debug, Encode, Decode)]
+        struct OldStartupFailure {
+            error: String,
+            since: rho_agent_types::UnixMs,
+            runtime: crate::record::Runtime,
+        }
+        let old = OldStartupFailure {
+            error: "broken settings".into(),
+            since: rho_agent_types::UnixMs(42),
+            runtime: crate::record::Runtime::Claude {
+                model: rho_claude::Model::Opus,
+                effort: rho_claude::Effort::High,
+                session_id: uuid::Uuid::nil(),
+            },
+        };
+        let mut encoded = senax_encoder::encode(&old).unwrap();
+        let read: StartupFailure = senax_encoder::decode(&mut encoded).unwrap();
+        assert_eq!(read.error, old.error);
+        assert_eq!(read.since, old.since);
+        assert_eq!(read.tried_through, None);
+
+        let mut encoded = senax_encoder::encode(&StartupFailure {
+            tried_through: Some(ChatSeq(713)),
+            ..read
+        })
+        .unwrap();
+        let older_reader: OldStartupFailure = senax_encoder::decode(&mut encoded).unwrap();
+        assert_eq!(older_reader.error, old.error);
+        assert_eq!(older_reader.runtime, old.runtime);
+    }
+
     use super::*;
 
     fn text(text: &str) -> Vec<ContentPart> {

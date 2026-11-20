@@ -563,7 +563,7 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
         "{text}"
     );
     assert!(
-        text.contains("Replies are saved. Change its runtime or start another agent."),
+        text.contains("Reply to retry, change its runtime, or start another agent."),
         "{text}"
     );
     assert!(!text.contains(root.to_str().unwrap()), "{text}");
@@ -585,13 +585,44 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
         )
         .await?;
         replies.push(reply);
+        wait_for_mail(&mut stream, |row| {
+            matches!(row.event, ChatEvent::Posted {
+                from: Address::System { agent: stopped, stop: Stop::Failed, .. },
+                parent: Some(parent), ..
+            } if parent == thread && stopped == agent)
+        })
+        .await?;
     }
 
-    // The hold is durable, not just a flag on the running worker. A reply
-    // or a host-side restart must not produce another failed attempt.
+    // Replaying the same saved mail must not retry by itself.
     call(paths, RestartWorkset { agent }).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let log_before_reply = call(
+        paths,
+        AgentLog {
+            agent,
+            from: Wpos::ZERO,
+        },
+    )
+    .await?;
+    assert_eq!(
+        log_before_reply
+            .rows
+            .iter()
+            .filter(|(_, row)| matches!(row, LogEvent::Stopped { .. }))
+            .count(),
+        3
+    );
+
     let later = post(paths, 74, Some(thread), "Actually check it twice.").await?;
     replies.push(later);
+    wait_for_mail(&mut stream, |row| {
+        matches!(row.event, ChatEvent::Posted {
+            from: Address::System { agent: stopped, stop: Stop::Failed, .. },
+            parent: Some(parent), ..
+        } if parent == thread && stopped == agent)
+    })
+    .await?;
     let switched = call(
         paths,
         Eval {
@@ -625,8 +656,8 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
             .filter(|(_, row)| matches!(row, LogEvent::Stopped { .. }))
             .count();
         assert_eq!(
-            failed, 1,
-            "replies attempted another launch: {:?}",
+            failed, 4,
+            "each new reply, but no replay, should attempt another launch: {:?}",
             log.rows
         );
         let delivered = log
@@ -665,7 +696,7 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
             .is_some_and(|error| error.contains("never sent a request"))
     );
     Ok(format!(
-        "one failed launch #{}; three saved replies survived restart and reached native in order; later cross-kind switch refused",
+        "failed launch #{}; three new replies retried, restart alone did not, and all mail reached native in order; later cross-kind switch refused",
         stop.id.0.0
     ))
 }

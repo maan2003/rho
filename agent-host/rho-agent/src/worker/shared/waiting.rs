@@ -63,6 +63,14 @@ impl Waiting {
             .min()
     }
 
+    pub fn newest_user_mail(&self) -> Option<MessageId> {
+        self.held
+            .iter()
+            .filter(|held| held.input.role == Role::User)
+            .filter_map(|held| held.input.message)
+            .max()
+    }
+
     /// Nothing waits, not even what the model was told of.
     pub fn is_empty(&self) -> bool {
         self.output.is_empty() && self.held.is_empty()

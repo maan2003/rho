@@ -21,13 +21,12 @@ steps:
 1. the user opens the project's mail about the stop, `deal.Clear what waits`
 2. the user reads the reason, `mail.Answer a mail`
    - when they need more, the user goes into the transcript, `Look into the work`
-3. the user replies with what the project should do next, `mail.Answer a mail`
+3. the user replies with what the project should do next, `mail.Answer a mail`; a new reply retries an agent that could not launch
 4. the user gets the result after the work carries on, `deal.Clear what waits`
 done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Agent
-status: the thread keeps replies to an agent that cannot launch, but they do not wake it. The user changes its runtime or starts another agent to carry on.
 purpose: do a piece of the user's work on a host, and let the user inspect what was done if needed.
 principle: an agent works from the user's mail about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.

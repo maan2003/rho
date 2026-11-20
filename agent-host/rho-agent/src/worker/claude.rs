@@ -668,9 +668,17 @@ impl ClaudeLoop {
                     // The person's input ends a wait it answers.
                     self.awaiting = false;
                 }
-                if self.head.startup_failure.is_some() {
-                    self.waiting.quiet();
-                    return Ok(());
+                if let Some(failure) = &self.head.startup_failure {
+                    if role != Role::User
+                        || message.is_none_or(|id| {
+                            failure.tried_through.is_some_and(|through| id.0 <= through)
+                        })
+                    {
+                        self.waiting.quiet();
+                        return Ok(());
+                    }
+                    self.head.startup_failure = None;
+                    self.set_kind(InferenceState::Idle);
                 }
                 if role != Role::System
                     && let Some(python) = &mut self.python
@@ -2045,6 +2053,7 @@ impl ClaudeLoop {
             error: format!("{error:#}"),
             since: UnixMs::now(),
             runtime: self.head.spec.runtime.clone(),
+            tried_through: self.waiting.newest_user_mail().map(|id| id.0),
         };
         self.notice(Notice::StartupFailed(failure.clone())).await?;
         if let Err(error) = self.close_process().await {
