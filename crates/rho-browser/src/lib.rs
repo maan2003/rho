@@ -76,7 +76,7 @@ impl Browser {
             self.running = None;
         }
         if self.running.is_none() {
-            let render = render_config()?;
+            let render = render_config();
             let (runtime, session) =
                 BrowserRuntime::launch(&self.state_dir, &self.socket_path, render)?;
             let runtime = Arc::new(runtime);
@@ -112,9 +112,9 @@ impl Browser {
     }
 }
 
-fn render_config() -> Result<BrowserRenderConfig> {
+fn render_config() -> BrowserRenderConfig {
     match gpui::linux_dmabuf_device() {
-        Some(device) => Ok(BrowserRenderConfig::DmaBuf(DmaBufConfig {
+        Some(device) => BrowserRenderConfig::DmaBuf(DmaBufConfig {
             render_node: device.render_node.clone(),
             device_id: device.device_id,
             formats: device
@@ -122,14 +122,13 @@ fn render_config() -> Result<BrowserRenderConfig> {
                 .iter()
                 .map(|format| (format.fourcc, format.modifier))
                 .collect(),
-        })),
-        None if std::env::var("RHO_BROWSER_SOFTWARE_SHM").as_deref() == Ok("1") => {
-            tracing::warn!("using opt-in software SHM browser rendering");
-            Ok(BrowserRenderConfig::SoftwareShmQa)
+        }),
+        None => {
+            tracing::info!(
+                "GPUI's Vulkan device does not support DMA-BUF import; drawing browser pages in software"
+            );
+            BrowserRenderConfig::SoftwareShm
         }
-        None => Err(anyhow::anyhow!(
-            "GPUI's Vulkan device does not support DMA-BUF import"
-        )),
     }
 }
 

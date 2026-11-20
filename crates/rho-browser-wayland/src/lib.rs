@@ -192,8 +192,8 @@ pub struct DmaBufConfig {
 
 pub enum BrowserRenderConfig {
     DmaBuf(DmaBufConfig),
-    /// Bounded owned SHM snapshots for software-only isolated QA sessions.
-    SoftwareShmQa,
+    /// Bounded owned SHM snapshots when the host cannot import DMA-BUF.
+    SoftwareShm,
 }
 
 pub struct DmaBufFrame {
@@ -2469,7 +2469,7 @@ fn run<K: BrowserPageKey>(
                 false,
             )
         }
-        BrowserRenderConfig::SoftwareShmQa => (None, None, Arc::from([]), true),
+        BrowserRenderConfig::SoftwareShm => (None, None, Arc::from([]), true),
     };
     let mut state = State {
         loop_handle,
@@ -3875,7 +3875,7 @@ mod tests {
     }
 
     #[test]
-    fn qa_root_shm_uses_scene_limit_without_expanding_popup_limit() {
+    fn software_root_shm_uses_scene_limit_without_expanding_popup_limit() {
         assert_eq!(
             shm_surface_limit(true, true, 0).unwrap(),
             MAX_SCENE_SHM_BYTES
