@@ -3,7 +3,7 @@
 The deal hands the user the one thing that wants them most. The usual answer is a reply; when there is nothing to say, the user says done.
 
 ## bet The deal, not an inbox
-status: the user deals one card at a time; Home offers a list of rooms, not the first cards in deal order, and results can fade unread.
+status: the user deals one card at a time; Home offers a list of rooms, not the first cards in deal order.
 instead of: a list of unread things the user scans from top to bottom and marks read.
 serves: Know what wants them, and where they were.
 because: between two places the user has a minute and no memory of what asked; dealing hands them the next thing to answer, and the product remembers the rest.
@@ -21,7 +21,7 @@ done when: nothing waits and the user's place is on screen as they left it.
 day: Know what wants them, and where they were.
 
 ## concept Card
-status: asks and results come from mentions, stops from agent state rather than a mail; results fade after about three days, and a host thread opens at its newest message rather than on the ask.
+status: asks and results come from mentions, and a stop arrives as a mail from the host; a host thread opens at its newest message, not the mail that asks.
 purpose: put a mail that wants the user in reach, without making them look through the whole thread.
 principle: a project asks whether a test can use a separate clock; the deal opens the thread on that mail, the user replies, and its card goes away.
 sees: the `mail.Project` address, the `mail.Thread` subject, and why and since when it waits, such as `asks · 2h`, `result · 8m`, or `failed · 1h`; open, the `mail.Mail` that asks.
@@ -49,7 +49,7 @@ does:
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
 ## flow Clear what waits
-status: a host card opens at the newest message, not the mail that asks; a reply clears a host thread, old results fade, and an empty deal opens Home.
+status: a host card opens at the newest message, not the mail that asks; a reply clears a host thread, and an empty deal opens Home.
 runs: 50 a day
 day: Know what wants them, and where they were.
 when: the user has a few minutes and wants to clear what asks for them

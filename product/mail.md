@@ -10,7 +10,6 @@ because: one thread keeps one piece of work together. Its subject identifies the
 costs: the user opens the transcript to see which agent did what.
 
 ## bet The project asks by mail, even when an agent stops
-status: an agent's mention can make an ask or a result card; a stop makes a card from the agent's state, without a message.
 instead of: attention coming from a mixture of named agents' chat mentions and notices about their state.
 serves: Know what wants them, and where they were.
 because: the user only needs what asks for them or returns a result, not each agent's progress. A stop is another mail to answer, not another kind of thing to watch.
@@ -58,7 +57,7 @@ does:
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
-status: a host message shows the agent's own name or the user's label as sender; result messages do not carry designated proof, and there is no project mail edit marker or protection for an answered ask.
+status: a host message shows the agent's own name as sender; agents can edit and delete their own mails and an answered ask is protected, but the window does not yet show `edited` or proof on a result.
 purpose: carry a brief, an ask, or a result in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the user or the project's address as sender, the time, the words, what the mail quotes, `edited` after an edit, and proof on a result.
@@ -70,7 +69,7 @@ does:
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
 
 ## concept Status
-status: each agent's state and age appear on the thread's `with` line; there is no single status for the thread or a list of threads ordered by status change.
+status: the host keeps one status per thread, set by its agents; the window does not show it yet and shows each agent's state and age on the thread's `with` line instead.
 purpose: say in one glance what the work is doing now, without asking the user to read another mail.
 principle: an agent reports `Checking the clock fix`, then another reports `Running the tests`; the user sees only the latter on the thread and on its row when nothing waits.
 sees: one line about what the work is doing now, replaced by the newest line rather than added to the mail history.
@@ -188,5 +187,5 @@ The historical review above was of Start a thread. Start an agent from a message
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a cold mail stands alone
-status: the project is not told when the user last had a thread open; messages do not distinguish warm and cold visits.
+status: the host tells the project when a thread went cold, from what the window reports about the thread in view; the window's report lands with the thread screen.
 when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; cold `Mail` stands alone by quoting rather than repeating, and warm mail is short.
