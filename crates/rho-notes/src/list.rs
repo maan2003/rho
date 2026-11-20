@@ -20,7 +20,8 @@ use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
 use crate::{
-    Listed, NoteId, NoteSystem, NoteViewed, ReplyContext, excerpt, listed, make_note, start_note,
+    Listed, NoteId, NoteSystem, NoteViewed, ReplyContext, excerpt, listed, make_note,
+    notes_address, start_note,
 };
 
 gpui::actions!(
@@ -227,10 +228,11 @@ impl NotesView {
     fn refresh(&mut self, changed_query: bool, cx: &mut Context<Self>) {
         let query = self.query.read(cx).text(cx);
         let filtering = !query.trim().is_empty();
-        let Some((notes, waiting_to_list)) = self.frame.read(cx, |frame, cx| {
+        let Some((notes, active, waiting_to_list)) = self.frame.read(cx, |frame, cx| {
             let system = self.system.read(cx);
+            let active = *frame.current_address() == notes_address();
             let waiting_to_list = self.return_to.is_some_and(|note| {
-                NoteId::from_address(frame.current_address()) == Some(note)
+                !active
                     || system
                         .pending
                         .get(&note)
@@ -246,31 +248,35 @@ impl NotesView {
                     .and_then(|thread| frame.name_of(&thread, cx))
                     .map(|(name, _)| name),
             });
-            (notes, waiting_to_list)
+            (notes, active, waiting_to_list)
         }) else {
             return;
         };
         let selected = self.cursor_note(cx);
         self.transcript
             .reconcile(items(&notes, filtering, self.phone, Timestamp::now()), cx);
-        if changed_query && filtering {
+        // Clearing the field on departure also emits an edit event. It
+        // restores the full list without choosing its first row.
+        let new_filter = changed_query && filtering;
+        if new_filter {
             self.return_to = None;
         }
-        let target = self
-            .return_to
-            .or_else(|| (!changed_query).then_some(selected).flatten());
+        let returning = self.return_to.filter(|_| active);
+        let target = returning.or_else(|| selected.filter(|_| !new_filter));
         if let Some(target) = target
             && let Some(row) = self.item_row(&Key::Note(target), cx)
         {
-            if self.return_to == Some(target) || self.cursor_note(cx) != Some(target) {
+            if returning == Some(target) {
+                self.return_to = None;
+                self.select_row(row, cx);
+            } else if self.cursor_note(cx) != Some(target) {
                 self.select_row(row, cx);
             }
-            self.return_to = None;
         } else {
             if !waiting_to_list {
                 self.return_to = None;
             }
-            if changed_query || self.cursor_note(cx).is_none() {
+            if new_filter || self.cursor_note(cx).is_none() {
                 self.select_row(0, cx);
             }
         }
