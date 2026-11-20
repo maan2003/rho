@@ -29,11 +29,12 @@ def between(text, start, end):
 class Templates(unittest.TestCase):
     def test_engineer_mail_contract(self):
         for text in [gpt("engineer"), claude_t("engineer")]:
-            self.assertIn("A cold mail stands alone; a warm mail is short.", text)
-            self.assertIn("Quote the line you answer instead of repeating the mail.", text)
+            self.assertIn("In a warm thread, answer directly without recapping.", text)
             self.assertIn("Put progress in `mail.status`, never in a mail.", text)
             self.assertIn("Fork tangents under the mail that raised them.", text)
-            self.assertIn("the check you ran and its last lines", text)
+            self.assertIn("link to the PR or save and link the diff", text)
+            self.assertIn("paste its last output lines verbatim in a code block, including the final summary", text)
+            self.assertIn("include a screenshot if the change is visible", text)
             self.assertIn("or an agent such as `eng-q9tz`.", text)
             for obsolete in ["human.", "message_agent", "chat.direct", "Post passing progress"]:
                 self.assertNotIn(obsolete, text)
@@ -76,7 +77,6 @@ class Templates(unittest.TestCase):
         self.assertIn('mail.status(thread, text)', text)
         self.assertIn("Put progress in `mail.status`, never in a mail", text)
         self.assertNotIn("Post passing progress", text)
-        self.assertIn("A cold mail stands alone; a warm mail is short.", text)
         self.assertIn("(ASD-STE100). The send refuses a sentence of more than 25 words", text)
         self.assertIn("it reports back to you with mail.send.", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)

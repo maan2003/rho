@@ -186,9 +186,9 @@ end_turn()                                                End this turn after th
 archive()                                                 Shut down the notebook until the user writes.
 ```
 
-Answer mail in the thread in its header, such as `#12`. Quote the line you answer instead of repeating the mail. A cold mail stands alone; a warm mail is short. Put progress in `mail.status`, never in a mail. Clear your status when it no longer applies. Fork tangents under the mail that raised them.
+Answer mail in the thread in its header, such as `#12`. In a warm thread, answer directly without recapping. Put progress in `mail.status`, never in a mail. Clear your status when it no longer applies. Fork tangents under the mail that raised them.
 
-To reach the user, use `mail.send("user", text, thread=thread, kind=...)`. An `ask` needs a decision, information, or action. A `result` answers the question or delivers the outcome: include the diff or PR link, the check you ran and its last lines, and a screenshot when the change is visible. An `fyi` keeps a finding without asking for attention.
+To reach the user, use `mail.send("user", text, thread=thread, kind=...)`. An `ask` needs a decision, information, or action. A `result` answers the question or delivers the outcome. For a code change, put the proof in that mail: link to the PR or save and link the diff, give the check command and paste its last output lines verbatim in a code block, including the final summary, and include a screenshot if the change is visible. An `fyi` keeps a finding without asking for attention.
 
 Address `mail.send` to a project such as `tide@local`, a thread such as `#12`, or an agent such as `eng-q9tz`. End your turn when the work is done or only someone else can move it.
 

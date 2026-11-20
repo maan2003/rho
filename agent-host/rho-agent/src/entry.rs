@@ -206,7 +206,7 @@ impl RequestNotice {
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
             Self::ThreadCold { thread, minutes } => return format!(
-                "Thread #{} is cold: the user has not had it open for {minutes} minutes. Write its next mail so the reader needs nothing before it.",
+                "Thread #{} is cold: the user has not had it open for {minutes} minutes. Start your next mail to the user with a short exact quote of their ask in backticks. Then answer with enough context to read the mail on its own.",
                 thread.0.0
             ).into(),
         };
