@@ -269,7 +269,11 @@ impl HomeView {
     fn items(&self) -> Vec<Item<HomeKey, HomeClass, HomeTarget>> {
         if self.rooms.is_empty() {
             return vec![
-                line(HomeKey::Empty, "no rooms yet", HomeClass::Muted)
+                line(
+                    HomeKey::Empty,
+                    "no rooms yet · attach a host or register a Slack workspace from the palette (:)",
+                    HomeClass::Muted,
+                )
                     .with_lines(vec![HomeTarget::None]),
             ];
         }

@@ -321,6 +321,20 @@ impl Frame {
         cx.notify();
     }
 
+    /// Closes every open surface whose address `which` picks: what a
+    /// detached host leaves behind.
+    pub fn close_all(
+        &mut self,
+        which: impl Fn(&Address) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked: Vec<Address> = self.surfaces.keys().filter(|a| which(a)).cloned().collect();
+        for address in picked {
+            self.close(&address, window, cx);
+        }
+    }
+
     pub fn close_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let address = self.current_address().clone();
         self.close(&address, window, cx);
@@ -600,20 +614,19 @@ impl Frame {
     }
 
     /// The frame's rows, the surface's, and every system's for what is in
-    /// view: what the palette lists.
-    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Rows {
+    /// view: what the palette lists. It is a list, not a menu: no key
+    /// opens it, so a row here has no key, and two rows never contend for
+    /// one.
+    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let point = self.point(cx);
-        let mut rows = Rows::new("rho");
-        rows.push(Row::run("h", "home", |frame, window, cx| {
-            frame.open_home(window, cx)
-        }));
-        rows.push(Row::run("f", "find", |frame, window, cx| {
-            frame.find(window, cx)
-        }));
-        rows.push(Row::run("u", "undo", |frame, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        rows.push(Row::menu("shift-h", "hosts", self.hosts_menu()));
+        let mut rows = vec![
+            Row::run("", "home", |frame, window, cx| frame.open_home(window, cx)),
+            Row::run("", "find", |frame, window, cx| frame.find(window, cx)),
+            Row::run("", "undo", |frame, window, cx| {
+                frame.undo_verdict(window, cx)
+            }),
+            Row::menu("", "hosts", self.hosts_menu()),
+        ];
         match self.attention.secret() {
             Some(secret) => rows.push(Row::run(
                 "",
@@ -626,7 +639,7 @@ impl Frame {
                 frame.prompt_pair(String::new(), None, window, cx)
             })),
         }
-        rows.push(Row::run("q", "quit", |_, _, cx| cx.quit()));
+        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()));
         rows.extend(self.current_surface().clone().rows(window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
@@ -638,7 +651,8 @@ impl Frame {
         let mut rows = Rows::new("hosts");
         rows.push(Row::run("a", "attach", |frame, window, cx| {
             frame.open_prompt(
-                "attach host (name=local[:dir] or name=iroh:...):",
+                "attach host · name=local (this machine), name=iroh:<id>@<ssh host> (ssh), \
+                 or name=iroh:<id> (security key):",
                 Rc::new(|_, _, _| Vec::new()),
                 Rc::new(
                     |frame, input, _, cx| match HostSpec::parse(input.trim(), "rho") {
@@ -661,34 +675,46 @@ impl Frame {
                     frame
                         .hosts
                         .iter()
-                        .filter(|host| host.name.contains(needle))
+                        .filter(|host| host.name.contains(needle.trim()))
                         .map(|host| Candidate {
                             value: host.name.clone(),
-                            description: format!("{:?}", host.status),
+                            description: host.status.label(),
                         })
                         .collect()
                 }),
                 Rc::new(|frame, input, _, cx| {
-                    match frame.hosts.by_name(input.trim()).map(|host| host.id) {
-                        Some(host) => frame.detach_host(host, cx),
-                        None => frame.echo("detach: no such host", StyleClass::SystemInfo, cx),
+                    let name = input.trim();
+                    match frame.hosts.by_name(name).map(|host| host.id) {
+                        Some(host) => {
+                            frame.detach_host(host, cx);
+                            frame.echo(&format!("detached: {name}"), StyleClass::SystemInfo, cx);
+                        }
+                        None => frame.echo(
+                            &format!("detach: no host called {name}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
                     }
                 }),
                 window,
                 cx,
             );
+            // A chooser: enter takes the highlighted host.
+            if let Some(minibuffer) = frame.minibuffer_mut() {
+                minibuffer.set_complete_whole_input();
+            }
         }));
         for (index, host) in self.hosts.iter().enumerate().take(9) {
             let id = host.id;
             rows.push(Row::run(
                 (index + 1).to_string(),
-                format!("{} · {}", host.name, status_words(&host.status)),
+                format!("{} · {}", host.name, host.status.label()),
                 move |frame, _, cx| {
                     let label = frame.hosts.host_label(id);
                     let status = frame
                         .hosts
                         .get(id)
-                        .map(|host| status_words(&host.status))
+                        .map(|host| host.status.label())
                         .unwrap_or_default();
                     frame.echo(&format!("{label}: {status}"), StyleClass::SystemInfo, cx);
                 },
@@ -971,15 +997,17 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
-        let unpaired = (self.attention.pairing() == Pairing::Unpaired)
+        // The notice gives way to an echo, which answers the key just
+        // pressed; on a phone the two do not fit beside each other.
+        let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
             .then_some("verdicts stay on this device until it is paired");
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.
         let right_words = lamp
             .into_iter()
-            .chain(unpaired)
             .chain(unwell.as_deref())
+            .chain(unpaired)
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
         let fit = |path: &str, state: &str| match layout {
@@ -1021,15 +1049,24 @@ impl Frame {
                 .child(fit(&self.current_surface().title(cx), "").0)
                 .into_any_element(),
         };
+        // A host that is away outranks the notice, which is cut first when
+        // the line is short.
         let right = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .items_center()
             .gap_3()
-            .children(lamp.map(|lamp| div().text_color(status.warning).child(lamp)))
-            .children(unpaired.map(|text| div().text_color(colors.text_muted).child(text)))
-            .children(unwell.map(|text| div().text_color(status.error).child(text)))
-            .child(div().text_color(mode_color).child(mode));
+            .children(lamp.map(|lamp| div().flex_none().text_color(status.warning).child(lamp)))
+            .children(unwell.map(|text| div().flex_none().text_color(status.error).child(text)))
+            .children(unpaired.map(|text| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .child(text)
+            }))
+            .child(div().flex_none().text_color(mode_color).child(mode));
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -1074,13 +1111,11 @@ impl Frame {
                 self.hosts.len()
             ));
         }
-        let subject = match self.hosts.len() > 1 {
-            true => format!("{name} "),
-            false => String::new(),
-        };
+        // Named even when it is the only host: `reconnecting` alone does
+        // not say what is away.
         match status {
             HostStatus::Online => None,
-            status => Some(format!("{subject}{}", status_words(&status))),
+            status => Some(format!("{name} · {}", status.label())),
         }
     }
 }
@@ -1102,15 +1137,6 @@ pub(crate) fn snooze_rows(target: &Address) -> Rows {
         ));
     }
     snooze
-}
-
-fn status_words(status: &HostStatus) -> String {
-    match status {
-        HostStatus::Connecting => "connecting".to_owned(),
-        HostStatus::Online => "online".to_owned(),
-        HostStatus::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
-        HostStatus::Disconnected(reason) => format!("disconnected · {reason}"),
-    }
 }
 
 /// The status line's mode word: three letters, the way helix does it, so

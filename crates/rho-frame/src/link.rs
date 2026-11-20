@@ -77,6 +77,13 @@ impl FrameLink {
         self.with(cx, |frame, _, cx| frame.systems_changed(cx));
     }
 
+    /// Closes every open surface whose address `which` picks.
+    pub fn close_all(&self, which: impl Fn(&Address) -> bool + 'static, cx: &mut App) {
+        self.with(cx, move |frame, window, cx| {
+            frame.close_all(which, window, cx)
+        });
+    }
+
     pub fn close(&self, address: Address, cx: &mut App) {
         self.with(cx, move |frame, window, cx| {
             frame.close(&address, window, cx)

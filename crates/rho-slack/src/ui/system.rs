@@ -649,7 +649,7 @@ fn prompt_register(
 ) {
     let names = this.read(cx).workspaces();
     frame.open_prompt(
-        "slack workspace:",
+        "slack workspace · a short name you choose, such as acme:",
         // Completing over the registered names is what makes this prompt
         // double as "replace a rotated token".
         Rc::new(move |_, needle, _| {

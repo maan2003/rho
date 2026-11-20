@@ -396,13 +396,22 @@ impl Minibuffer {
         bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")
             .child(
+                // A long question wraps, and the answer goes under it
+                // rather than off the edge of a phone.
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
+                    .gap_1()
                     .px_2()
-                    .child(div().child(self.prompt.clone()))
-                    .child(div().flex_grow(1.0).child(self.editor.clone())),
+                    .child(div().max_w_full().child(self.prompt.clone()))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(160.))
+                            .child(self.editor.clone()),
+                    ),
             )
             .children(rows)
             .into_any_element()
