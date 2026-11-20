@@ -22,8 +22,10 @@ does:
 - deal `space`: open the first waiting card
 - open a row `enter`: open the selected card or thread
 - write an idea: address and send a new idea, as `mail.Write an idea`
+- narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
 
 ## screen Desk
+status: narrowing to one project is not built; the old channel screen still exists in its place.
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits

@@ -118,32 +118,6 @@ Running the tests with a separate clock
 reply
 ```
 
-## screen Project
-status: built as a channel with a list of threads and a box that can start an agent; the rows show mentions, unread counts and agent names, not a single status for the work.
-answers: what work is in this project?
-shows:
-- the `Project` address
-- each `Thread` by subject, with its `deal.Card` words or, when nothing waits, its `Status`
-states:
-- empty: the project address and no threads
-- loading: the project's threads are not yet available; wording not agreed
-- partial: the threads that are available; wording not agreed
-- error: the project is unavailable; wording not agreed
-- full: the address and its threads
-keys:
-- `enter`: open the selected `Thread`
-- `:`: `window.Palette`
-- `ctrl-k`, `tab`, `q`: `window.Screen`
-starts: `Write an idea`, `Answer a mail`, `window.Go to something by name`
-mock:
-```text
-tide@lab                                                                    NOR
-
-Flaky clock test                                               asks · 2h
-Cache eviction tests                                           Running the tests
-Release notes                                                  Checking the links
-```
-
 ## flow Answer a mail
 status: a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
 runs: 100 a day

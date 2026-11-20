@@ -10,7 +10,7 @@ costs: what has no place yet is reached through a terminal, the browser, or an a
 
 ## concept Screen
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
-principle: the user opens a `mail.Project`, then one of its threads; `Screen.back` returns to the project exactly as they left it.
+principle: the user opens a `mail.Thread` from the desk; `Screen.back` returns to the desk exactly as they left it, narrowed or not.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
 does:
 - back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
