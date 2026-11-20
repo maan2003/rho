@@ -52,7 +52,7 @@ does:
 - new terminal, from the palette: start another, numbered after the others
 - type: every key goes to the terminal, `ctrl-j` and `ctrl-k` too
 - paste `ctrl-shift-v`: type what is on the clipboard
-- palette `ctrl-shift-;`: open the palette while typing
+- palette `ctrl-shift-;`: open the palette while typing, as from any place; see `window.Palette`
 - read `ctrl-shift-n`, or `ctrl-\` then `ctrl-n`: stop typing, to scroll with `j`, `k`, `ctrl-d`, `ctrl-u`, `g g`, and `shift-g`, and to use `:`, `space`, `tab`, and `q`; `i`, `a`, or `enter` returns to typing
 - scroll with the wheel: move back through old lines, or, when the program in the terminal asks for the wheel, send it the wheel
 
@@ -80,7 +80,7 @@ sees: the app, live, scaled to fit the window; at the top, the agent's name, `de
 does:
 - desktop…, from the palette on any of the agent's screens: open the agent's desktop, or, with more than one, ask `desktop:` and open the one chosen; the row shows only when the agent runs one
 - every key, click, and wheel: goes to the app on the desktop
-- palette `ctrl-shift-;`: open the palette without the app seeing the keys
+- palette `ctrl-shift-;`: open the palette without the app seeing the keys; see `window.Palette`
 - draw on this frame, from the palette: hold the picture still; dragging draws red lines on it
 - undo `u`, while drawing: take back the last line
 - copy `y`, while drawing: put the picture, with its lines, on the clipboard; the bottom line reads `Annotation copied`

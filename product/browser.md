@@ -10,7 +10,7 @@ does:
 - open `enter` on a link in a `chat.Message`, in a room's list of threads, or in a Slack message: open the link as a page; a link that is not a web address echoes that nothing opens it
 - open page…, from the palette: ask `page:`, listing the open pages by title, most recently visited first; a title opens that page, anything else is read as a web address, `https://` assumed
 - every key, click, and wheel: goes to the page
-- palette `ctrl-shift-;`: open the palette without the page seeing the keys
+- palette `ctrl-shift-;`: open the palette without the page seeing the keys; see `window.Palette`
 - back `ctrl-k`, forward `ctrl-j`, close `ctrl-shift-backspace`: as on any `window.Screen`; home is reached through the palette, as from an `agents.Desktop`
 
 A link in a message is drawn underlined, in the accent colour. A closed page's tab lives on for ten minutes, so `ctrl-j` brings it back as it was.
