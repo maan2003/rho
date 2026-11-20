@@ -14,18 +14,18 @@ does:
 
 No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. The window has no way to delete a note.
 
-While the user types a new note, the top line still reads `untitled note`; it shows the first line once the note is opened again.
+While the user types a new note, the top line follows its first line as it is typed. A note is saved the moment the user leaves it.
 
 ## concept Private reply
 purpose: let the user keep a remark on a message in its thread, where only they see it.
 principle: an agent reports a result the user doubts; they put the cursor on it and run `reply privately`; a note opens; they type their doubt; back in the thread, it shows under the message, dim, marked `🔒 you`.
 sees: in the thread, under its message: `🔒 you · time` and the text, dim and slanted.
 does:
-- reply privately, from the palette: start a note about the thing under the cursor and open it; on a note, the new note is about that note
+- reply privately, from the palette: start a note about the message under the cursor and open it; on a note, the new note is about that note; with the cursor on no message, the echo line reads `reply privately: put the cursor on a message`
 - open `enter` on it in the thread: open the note to edit it
 
 ## screen Notes
-shows: `Note`, by its first line, the last written first, private replies too; with none, `no notes yet`
+shows: `Note`, by its first line, the last written first, private replies too; with none, `no notes yet · new note from the palette (:)`; a private reply reads `answered in eng-4og0  ↳ in fix the flaky test`, the message's first words and the thread it is in
 starts: `Write something down`
 
 ## screen Note

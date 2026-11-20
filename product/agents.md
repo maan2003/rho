@@ -58,7 +58,7 @@ sees: a name such as `sol-medium`, `opus-high`, or `fable-high`.
 ## concept Terminal
 purpose: let the user type in a terminal in an agent's workset, the way the agent does.
 principle: the user opens an agent's terminal from the palette; it fills the window; they type commands; `ctrl-shift-n` lets them scroll back with `j` and `k`, and `i` lets them type again.
-sees: the terminal, filling the window; at the top, the agent's name, `term` and its number, and the title the program in it gives, such as `eng-q9tz · term 0 · vim`; `NORMAL` at the top right while the user reads rather than types; `terminal exited (0)` or `terminal disconnected` along the bottom when it ends; `· · · 120 lines lost · · ·` where old lines were too many to keep.
+sees: the terminal, filling the window; at the top, the agent's name, `term` and its number, and the title the program in it gives, such as `eng-q9tz · term 0 · vim`; `NOR` at the top right while the user reads rather than types; `terminal exited (0)` or `terminal disconnected` along the bottom when it ends; `· · · 120 lines lost · · ·` where old lines were too many to keep.
 does:
 - terminal, from the palette on any of the agent's screens: open its first terminal, starting one when none runs
 - new terminal, from the palette: start another, numbered after the others
