@@ -23,7 +23,7 @@ use theme::ActiveTheme as _;
 use crate::attention::Verdict;
 use crate::frame::{Frame, snooze_rows};
 use crate::home::HomeTarget;
-use crate::menu::{Pick, Rows};
+use crate::menu::{Pick, Row, Rows};
 use crate::surface::AnySurface;
 
 /// The widest window that is laid out as a phone.
@@ -221,7 +221,8 @@ enum Button {
     Back,
     Home,
     Menu,
-    /// The row under the cursor on Home, as `enter` opens it.
+    /// The row under the cursor, as `enter` opens it: on Home, or on a
+    /// list that offers `open`.
     Open,
     Done,
     Mute,
@@ -272,7 +273,8 @@ impl Button {
 struct BarState {
     prompting: bool,
     home: bool,
-    /// The cursor on Home is on a row that opens.
+    /// The cursor is on a row that opens: on Home, a room; elsewhere,
+    /// a row the surface offers `open` for.
     row: bool,
     /// The point is on something a verdict lands on.
     card: bool,
@@ -284,7 +286,7 @@ struct BarState {
 /// answer. On Home, opening and the verdicts are buttons over the row
 /// under the cursor, where a tap only puts the cursor, because dealing from
 /// Home is what the phone is for; elsewhere they are one button for the menu,
-/// and the room goes to sending.
+/// and the room goes to opening the row a list offers and to sending.
 fn buttons(state: BarState) -> Vec<Button> {
     if state.prompting {
         return vec![Button::Cancel, Button::Enter];
@@ -302,6 +304,9 @@ fn buttons(state: BarState) -> Vec<Button> {
         }
         false => {
             buttons.extend([Button::Home, Button::Menu]);
+            if state.row {
+                buttons.push(Button::Open);
+            }
             if state.card {
                 buttons.push(Button::Verdicts);
             }
@@ -333,6 +338,9 @@ fn record_verdict(verdict: PhoneVerdict) {
 
 /// The row a surface offers for sending what is in its composer.
 const SEND_ROW: &str = "send";
+/// The row a list surface offers for opening the row under the cursor,
+/// as `enter` does.
+const OPEN_ROW: &str = "open";
 
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
@@ -536,22 +544,29 @@ impl Frame {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let surface = self.current_surface().clone();
-        let send = surface
-            .rows(window, cx)
-            .into_iter()
-            .find(|row| row.description == SEND_ROW);
+        let rows: Rc<Vec<Row>> = Rc::new(
+            surface
+                .rows(window, cx)
+                .into_iter()
+                .filter(|row| [SEND_ROW, OPEN_ROW].contains(&row.description.as_str()))
+                .collect(),
+        );
+        let offers = |name: &str| rows.iter().any(|row| row.description == name);
+        let home = self.home_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
-            home: self.home_in_view(),
-            row: self.home_in_view() && self.home.read(cx).cursor_target(cx) != HomeTarget::None,
+            home,
+            row: match home {
+                true => self.home.read(cx).cursor_target(cx) != HomeTarget::None,
+                false => offers(OPEN_ROW),
+            },
             card: self.card_target(cx).is_some(),
-            send: send.is_some(),
+            send: offers(SEND_ROW),
         };
         let colors = cx.theme().colors();
-        let send = Rc::new(send);
         let items = buttons(state).into_iter().map(|button| {
             let (icon, label) = button.face();
-            let send = send.clone();
+            let rows = rows.clone();
             div()
                 .id(button.id())
                 .cursor_pointer()
@@ -566,7 +581,7 @@ impl Frame {
                 .child(div().text_size(px(18.)).child(icon))
                 .child(div().text_size(px(11.)).child(label))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.press(button, send.as_ref().as_ref(), window, cx);
+                    this.press(button, &rows, window, cx);
                     cx.stop_propagation();
                 }))
         });
@@ -583,23 +598,28 @@ impl Frame {
             .into_any_element()
     }
 
-    fn press(
-        &mut self,
-        button: Button,
-        send: Option<&crate::menu::Row>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn press(&mut self, button: Button, rows: &[Row], window: &mut Window, cx: &mut Context<Self>) {
         // A verdict mid-snap would land on the card sliding off.
         if self.phone.snap.is_some() {
             return;
         }
         let target = self.card_target(cx);
+        let run_row =
+            |frame: &mut Self, name: &str, window: &mut Window, cx: &mut Context<Self>| {
+                if let Some(Row {
+                    pick: Pick::Run(run),
+                    ..
+                }) = rows.iter().find(|row| row.description == name)
+                {
+                    run(frame, None, window, cx);
+                }
+            };
         match button {
             Button::Back => self.back(window, cx),
             Button::Home => self.toggle_home(window, cx),
             Button::Menu => self.palette(window, cx),
-            Button::Open => self.open_row(window, cx),
+            Button::Open if self.home_in_view() => self.open_row(window, cx),
+            Button::Open => run_row(self, OPEN_ROW, window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Done);
@@ -620,15 +640,7 @@ impl Frame {
                 }
             }
             Button::Verdicts => self.verdict_menu(window, cx),
-            Button::Send => {
-                if let Some(crate::menu::Row {
-                    pick: Pick::Run(run),
-                    ..
-                }) = send
-                {
-                    run(self, None, window, cx);
-                }
-            }
+            Button::Send => run_row(self, SEND_ROW, window, cx),
             Button::Cancel => self.minibuffer_cancel(window, cx),
             Button::Enter => self.minibuffer_confirm(window, cx),
         }
@@ -879,6 +891,13 @@ mod tests {
             ..BarState::default()
         };
         assert_eq!(buttons(thread), [Back, Home, Menu, Verdicts, Send]);
+        // A list elsewhere, such as `notes`, opens its row from the bar.
+        let list = BarState {
+            row: true,
+            card: true,
+            ..BarState::default()
+        };
+        assert_eq!(buttons(list), [Back, Home, Menu, Open, Verdicts]);
         assert_eq!(
             buttons(BarState {
                 prompting: true,

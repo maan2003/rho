@@ -1,11 +1,14 @@
 //! Home: the rooms, the one that wants the user most first.
 //!
-//! A room is a root the user can read: a host's channel, a Slack
-//! conversation they follow, a note about nothing. Each system lists its
-//! own ([`System::rooms`](crate::system::System::rooms)); nothing here
-//! scores anything. A room with a card in the dealer's hand goes by that
-//! card, in the hand's order, wearing the card's words; the rest go by
-//! what waits in them, then by when they last moved. The surface is one
+//! A room is a place the user works in: a host's channel they made or
+//! wrote in, a Slack conversation they starred, or one that holds a card
+//! or something for them unread. Each system lists its own
+//! ([`System::rooms`](crate::system::System::rooms)); nothing here
+//! scores anything. A root that is a room only while it holds a card
+//! ([`Standing::WhileCard`]) is left off while the dealer's hand holds
+//! none in it. A room with a card in the hand goes by that card, in the
+//! hand's order, wearing the card's words; the rest go by what waits in
+//! them, then by when they last moved. The surface is one
 //! keyed transcript: a row is an item keyed by its room, so a change
 //! edits that row and leaves the cursor, the scroll, and every other row
 //! alone.
@@ -23,7 +26,7 @@ use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
 use crate::surface::{Subject, Surface};
-use crate::system::RoomRow;
+use crate::system::{RoomRow, Standing};
 
 /// Home's own highlight-key space, clear of the transcript's semantic slots
 /// at zero and Slack's at the top. Buckets grow upwards from here.
@@ -49,19 +52,23 @@ pub struct RoomLine {
 
 /// The rooms in Home's order: a room with a card in `hand` by its first
 /// card, in the hand's order; then the rooms something waits in, newest
-/// first; then the rest, newest first.
+/// first; then the rest, newest first. A root that is a room only while
+/// it holds a card is left off without one.
 pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
     let mut lines: Vec<(Option<usize>, bool, u64, RoomLine)> = rooms
         .into_iter()
-        .map(|room| {
+        .filter_map(|room| {
             let card = hand.cards.iter().enumerate().find(|(_, card)| {
                 card.address == room.address || card.room.as_ref() == Some(&room.address)
             });
+            if card.is_none() && room.standing == Standing::WhileCard {
+                return None;
+            }
             let (label, dealt) = match card {
                 Some((_, card)) => (card.label.clone(), true),
                 None => (room.waiting.clone(), false),
             };
-            (
+            Some((
                 card.map(|(index, _)| index),
                 room.waiting.is_empty(),
                 u64::MAX - room.at,
@@ -72,7 +79,7 @@ pub fn room_lines(rooms: Vec<RoomRow>, hand: &Hand) -> Vec<RoomLine> {
                     label,
                     dealt,
                 },
-            )
+            ))
         })
         .collect();
     lines.sort_by(|a, b| {
@@ -417,6 +424,7 @@ mod tests {
     fn room(name: &str, waiting: &str, at: u64) -> RoomRow {
         RoomRow {
             address: Address::new("thread", name),
+            standing: Standing::Worked,
             name: name.to_owned(),
             tag: "local".to_owned(),
             waiting: waiting.to_owned(),
@@ -474,5 +482,43 @@ mod tests {
                 ("quiet-old", "", false),
             ]
         );
+    }
+
+    /// A root the user never worked in is a room only while the hand
+    /// holds a card in it, whether the card is on the root or on a thread
+    /// inside it; without one it is left off, however new it is.
+    #[test]
+    fn a_root_only_a_card_makes_a_room_needs_one_in_the_hand() {
+        let hand = Hand {
+            cards: vec![card("deploys/3", Some("deploys"), "asks · 1m")],
+            next_change: None,
+        };
+        let only_with_card = |name: &str, at| RoomRow {
+            standing: Standing::WhileCard,
+            ..room(name, "", at)
+        };
+        let rooms = vec![
+            room("worked", "", 10),
+            only_with_card("deploys", 20),
+            only_with_card("deploy 41", 90),
+            RoomRow {
+                standing: Standing::WhileCard,
+                ..room("deploy 42", "1 unread · 1m", 99)
+            },
+        ];
+        let names: Vec<String> = room_lines(rooms.clone(), &hand)
+            .into_iter()
+            .map(|line| line.name)
+            .collect();
+        assert_eq!(names, ["deploys", "worked"]);
+        let empty = Hand {
+            cards: Vec::new(),
+            next_change: None,
+        };
+        let names: Vec<String> = room_lines(rooms, &empty)
+            .into_iter()
+            .map(|line| line.name)
+            .collect();
+        assert_eq!(names, ["worked"]);
     }
 }

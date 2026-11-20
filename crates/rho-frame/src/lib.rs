@@ -49,7 +49,7 @@ pub use minibuffer::{CancelHandler, Candidate, CandidateSource, ChangeHandler, S
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, Subject, Surface};
-pub use system::{AnySystem, Found, Reversal, RoomRow, System};
+pub use system::{AnySystem, Found, Reversal, RoomRow, Standing, System};
 
 /// The key context every surface is drawn in. A system binds its keys
 /// under `RhoFrame` for the frame and under `RhoFrame > Editor` for keys

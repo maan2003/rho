@@ -190,17 +190,6 @@ impl Marks {
         replies.sort_by_key(|(_, marks)| marks.created_ms);
         replies
     }
-
-    /// The user's private rooms: the notes about nothing, newest written
-    /// first.
-    pub fn private_roots(&self) -> Vec<(&Address, &NodeMarks)> {
-        let mut roots: Vec<_> = self
-            .notes()
-            .filter(|(_, marks)| marks.about.is_none())
-            .collect();
-        roots.sort_by_key(|(_, marks)| std::cmp::Reverse(marks.written_ms));
-        roots
-    }
 }
 
 #[cfg(test)]
@@ -441,12 +430,6 @@ mod tests {
             .collect();
         assert_eq!(replies, ["first, edited last", "second"]);
         assert!(marks.replies_to(&Address::note(first)).is_empty());
-        let roots: Vec<&Address> = marks
-            .private_roots()
-            .into_iter()
-            .map(|(node, _)| node)
-            .collect();
-        assert!(roots.is_empty(), "a reply is not a room");
     }
 
     #[test]

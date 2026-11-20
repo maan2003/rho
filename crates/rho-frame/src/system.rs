@@ -23,21 +23,34 @@ use crate::frame::Point;
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
-/// One room: a root the user can read, as the system that holds it lists
+/// One room: a place the user works in, as the system that holds it lists
 /// it on Home. Home orders the rooms by attention: a room with a card in
 /// the hand goes by that card, the rest by what waits in them and when
 /// they last moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomRow {
     pub address: Address,
+    pub standing: Standing,
     pub name: String,
-    /// Where it is: a host's name, a Slack workspace, `private`.
+    /// Where it is: a host's name, a Slack workspace.
     pub tag: String,
     /// What waits in it, in the system's words (`3 unread · 2h`); empty
     /// when nothing does.
     pub waiting: String,
     /// When it last moved, in unix milliseconds; zero when nothing says.
     pub at: u64,
+}
+
+/// Why a root is on Home. Whether the deal holds a card in it is the
+/// hand's to say, which Home reads; the rest is the system's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// The user works in it: they made it or wrote in it, starred it, or
+    /// something in it asks them or mentions them unread.
+    Worked,
+    /// Only a place a card can be in: a room while the hand holds one in
+    /// it, and otherwise reached by name alone.
+    WhileCard,
 }
 
 /// Something `find` can open.
@@ -112,14 +125,15 @@ pub trait System: Sized + 'static {
     }
 
     /// The rooms this system has, given what the user has said about its
-    /// things: every root they can read.
+    /// things: every root they work in, and every root a card could be in
+    /// as [`Standing::WhileCard`].
     fn rooms(&self, _marks: &Marks, _cx: &App) -> Vec<RoomRow> {
         Vec::new()
     }
 
     /// Everything the system has that `find` lists by title, given what
-    /// the user has said about its things; notes live in the marks
-    /// alone. Asked with the frame busy, so the marks are handed in.
+    /// the user has said about its things. Asked with the frame busy, so
+    /// the marks are handed in.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         Vec::new()
     }

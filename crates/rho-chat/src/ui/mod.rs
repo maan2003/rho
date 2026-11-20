@@ -22,7 +22,7 @@ use rho_agent_types::{Address as Party, AgentId, ContentPart, Doing, EndpointId,
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
-use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, RoomRow, Row, System};
+use rho_frame::{AnySurface, Candidate, Found, FrameLink, Point, RoomRow, Row, Standing, System};
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
@@ -687,8 +687,9 @@ impl System for ChatSystem {
         }
     }
 
-    /// Every root on every host, a room each: how many of its threads hold
-    /// something unread, and when it last moved.
+    /// Every root on every host, with how many of its threads hold
+    /// something unread and when it last moved: a room when the user
+    /// works in it, and otherwise only while it holds a card.
     fn rooms(&self, marks: &Marks, _cx: &App) -> Vec<RoomRow> {
         let now = Timestamp::now();
         let mut rows = Vec::new();
@@ -720,6 +721,10 @@ impl System for ChatSystem {
                         message: *root,
                     }
                     .address(),
+                    standing: match cards::worked_in(chat, seed, *root, marks) {
+                        true => Standing::Worked,
+                        false => Standing::WhileCard,
+                    },
                     name: chat.name(*root).unwrap_or_default(),
                     tag: name.clone(),
                     waiting: match unread {
