@@ -103,6 +103,7 @@ async fn follow(
     let mut sent: Option<ChatSeq> = None;
     let mut status_changed = services.pool.watch_thread_statuses();
     let mut send_statuses = true;
+    let mut last_statuses = None;
     loop {
         if let Some(sent) = sent.as_mut()
             && !send_from(&services.db, &outgoing_tx, sent).await
@@ -111,13 +112,17 @@ async fn follow(
         }
         if sent.is_some() && send_statuses {
             status_changed.borrow_and_update();
-            if outgoing_tx
-                .send(ServerFrame::Statuses {
-                    statuses: services.pool.thread_statuses(),
-                })
-                .is_err()
-            {
-                return;
+            let statuses = services.pool.thread_statuses();
+            if last_statuses.as_ref() != Some(&statuses) {
+                if outgoing_tx
+                    .send(ServerFrame::Statuses {
+                        statuses: statuses.clone(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                last_statuses = Some(statuses);
             }
             send_statuses = false;
         }
@@ -129,8 +134,8 @@ async fn follow(
                 send_statuses = true;
             }
             appended = feed.recv() => match appended {
-                Ok(Appended::Mail(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Ok(Appended::Row { .. } | Appended::WorksetDeleted(_)) => {}
+                Ok(Appended::Mail(_) | Appended::WorksetDeleted(_)) | Err(broadcast::error::RecvError::Lagged(_)) => send_statuses = true,
+                Ok(Appended::Row { .. }) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             ask = asks.recv() => match ask {

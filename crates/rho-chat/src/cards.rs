@@ -530,7 +530,7 @@ mod tests {
         w.writes_to(root);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · 0m",
+            "rho@lab › a · asks · now",
             "the reply settles the standalone ask without clearing an unrelated thread"
         );
     }
@@ -562,7 +562,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · now");
         let first = w.priority(a).unwrap();
         assert!(first >= AGENT_BLOCKED_HEAD_START);
         w.pass(hours(1));
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.asks(a);
         w.sends(a, MentionKind::Fyi);
-        assert_eq!(w.hand(), "rho@lab › a · asks · 0m", "an fyi hides no ask");
+        assert_eq!(w.hand(), "rho@lab › a · asks · now", "an fyi hides no ask");
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
         w.works(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · result · 0m",
+            "rho@lab › a · result · now",
             "and it hides nothing"
         );
     }
@@ -650,7 +650,7 @@ mod tests {
         w.finishes(b);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · 50m\nrho@lab › b · result · 0m",
+            "rho@lab › a · asks · 50m\nrho@lab › b · result · now",
             "from the newest result"
         );
     }
@@ -665,11 +665,11 @@ mod tests {
         w.works(a);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · now");
         w.writes_to(a);
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
-        assert_eq!(w.hand(), "rho@lab › a · result · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · result · now");
     }
 
     #[test]
@@ -715,7 +715,7 @@ mod tests {
         w.done_through(a, result);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · asks · 0m",
+            "rho@lab › a · asks · now",
             "the ask came after the done"
         );
         w.done(a);
@@ -760,7 +760,7 @@ mod tests {
         );
         assert_eq!(w.hand(), "");
         w.asks(parent);
-        assert_eq!(w.hand(), "rho@lab › parent · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › parent · asks · now");
     }
 
     #[test]
@@ -773,7 +773,7 @@ mod tests {
         w.asks(child);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(child));
-        assert_eq!(w.hand(), "rho@lab › child · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › child · asks · now");
     }
 
     #[test]
@@ -786,7 +786,7 @@ mod tests {
         w.stop(b, Stop::Lost);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · failed · 2m\nrho@lab › b · lost · 0m"
+            "rho@lab › a · failed · 2m\nrho@lab › b · lost · now"
         );
         let card = &w.deal().cards[0];
         assert_eq!(attention_mail(&card.cursor), Some(first));
@@ -796,7 +796,7 @@ mod tests {
         w.pass(mins(1));
         let second = w.stop(a, Stop::Stuck);
         w.done_through(a, Seen::Topic(first.0.0));
-        assert_eq!(w.hand(), "rho@lab › a · stuck · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · stuck · now");
         assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(second));
     }
 
@@ -843,7 +843,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · asks · 0m");
+        assert_eq!(w.hand(), "rho@lab › a · asks · now");
         // A message right under the root is a thread of its own.
         let root = w.root();
         let from = Party::Agent(w.agents[&a]);

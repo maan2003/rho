@@ -451,7 +451,6 @@ impl Frame {
                 self.systems
                     .iter()
                     .find_map(|system| system.idea_project(address, cx))
-                    .map(|project| project.name)
             },
             Timestamp::now(),
         );

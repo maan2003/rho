@@ -52,7 +52,7 @@ form_gui() {
 form_shot() {
     form_way "$1" screenshot --output "$out/$1-$2.png"
 }
-mkdir -p "$out" "$rig"/{host-state/rho/auth.d,host-config,host-cache,host-data,claude,repo}
+mkdir -p "$out" "$rig"/{host-state/rho/auth.d,host-config/rho,host-cache,host-data,claude,repo}
 GIT_CONFIG_GLOBAL=/dev/null git -C "$rig/repo" init -q -b main
 GIT_CONFIG_GLOBAL=/dev/null git -C "$rig/repo" \
     -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm fixture
@@ -66,12 +66,25 @@ print(json.dumps({
     "client_secret": [0] * 32,
 }))
 PY
-"$bins/rho-fake-model" --scenario clarifying-question --no-faults >"$rig/model.json" 2>"$rig/model.log" &
+# The desk uses the normal default, which needs Claude's mount overlays.
+# Run that same flow on the sandbox-safe native runtime in this fixture only.
+cat >"$rig/host-config/rho/init.py" <<'PY'
+from rho.default import new_agent as default_new_agent
+
+def new_agent(*, runtime, **kwargs):
+    if runtime["kind"] == "claude":
+        runtime = {"kind": "native", "model": "sol", "effort": "medium"}
+    return default_new_agent(runtime=runtime, **kwargs)
+PY
+read -r -a fake_args <<< "${FAKE_ARGS:-}"
+"$bins/rho-fake-model" --scenario "${FAKE_SCENARIO:-clarifying-question}" \
+    --no-faults "${fake_args[@]}" >"$rig/model.json" 2>"$rig/model.log" &
 model_pid=$!
 for _ in {1..100}; do
     [[ -s "$rig/model.json" ]] && break
     sleep .05
 done
+if [[ ! -s "$rig/model.json" ]]; then cat "$rig/model.log" >&2; exit 1; fi
 openai=$(jq -er .openai_base_url "$rig/model.json")
 anthropic=$(jq -er .anthropic_base_url "$rig/model.json")
 env PATH="$bins:$PATH" \

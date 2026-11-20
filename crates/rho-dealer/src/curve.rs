@@ -152,6 +152,7 @@ pub(crate) fn fading(from: Timestamp, now: Timestamp, window: SignedDuration, si
 pub fn age(since: Timestamp, now: Timestamp) -> String {
     let (count, unit) = age_step(since, now);
     match unit {
+        AgeUnit::Minute if count == 0 => "now".to_owned(),
         AgeUnit::Minute => format!("{count}m"),
         AgeUnit::TenthHour => format!("{}.{}h", count / 10, count % 10),
         AgeUnit::TenthDay => format!("{}.{}d", count / 10, count % 10),
@@ -163,7 +164,11 @@ pub fn age(since: Timestamp, now: Timestamp) -> String {
 pub fn age_changes(since: Timestamp, now: Timestamp) -> Timestamp {
     let (count, unit) = age_step(since, now);
     let size = unit.millis();
-    let next = ((count + 1) * size - size / 2).min(unit.until());
+    let next = if count == 0 && matches!(unit, AgeUnit::Minute) {
+        size
+    } else {
+        ((count + 1) * size - size / 2).min(unit.until())
+    };
     since + SignedDuration::from_millis(next)
 }
 
@@ -205,7 +210,12 @@ fn age_step(since: Timestamp, now: Timestamp) -> (i64, AgeUnit) {
         .find(|unit| elapsed < unit.until())
         .expect("the last unit has no end");
     let size = unit.millis();
-    ((elapsed + size / 2) / size, unit)
+    let count = if matches!(unit, AgeUnit::Minute) && elapsed < size {
+        0
+    } else {
+        (elapsed + size / 2) / size
+    };
+    (count, unit)
 }
 
 #[cfg(test)]
@@ -264,9 +274,10 @@ mod tests {
         let hour = 60 * minute;
         let day = 24 * hour;
         for (elapsed, words, changes) in [
-            (0, "0m", 30_000),
-            (29_999, "0m", 30_000),
-            (30_000, "1m", 90_000),
+            (0, "now", minute),
+            (30_000, "now", minute),
+            (59_999, "now", minute),
+            (60_000, "1m", 90_000),
             (59 * minute + 29_999, "59m", 59 * minute + 30_000),
             (59 * minute + 30_000, "60m", hour),
             (hour, "1.0h", hour + 3 * minute),
@@ -283,7 +294,7 @@ mod tests {
             assert_eq!(age(since, before), words, "not before {next}");
         }
         // A clock behind the host's says no age yet, and moves on with it.
-        assert_eq!(age(since, at(-5_000)), "0m");
-        assert_eq!(age_changes(since, at(-5_000)), at(30_000));
+        assert_eq!(age(since, at(-5_000)), "now");
+        assert_eq!(age_changes(since, at(-5_000)), at(minute));
     }
 }

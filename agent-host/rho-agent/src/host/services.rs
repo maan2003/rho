@@ -314,6 +314,11 @@ impl Services {
             }
         }
         write.commit();
+        if records.iter().any(|record| {
+            matches!(&record.event, Event::Request { inputs, .. } if inputs.iter().any(|input| input.message.is_some()))
+        }) && let Some(pool) = self.pool.upgrade() {
+            pool.thread_work_changed();
+        }
         last.context("no rows to append")
     }
 

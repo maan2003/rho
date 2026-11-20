@@ -140,6 +140,7 @@ fn bindings() -> Vec<KeyBinding> {
         }
     }
     bindings.extend([
+        KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
         KeyBinding::new(
             "enter",

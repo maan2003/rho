@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use rho_agent_types::{Address, AgentId, Doing, Message, MessageId, Stop, ThreadStatus, UnixMs};
+use rho_agent_types::{
+    Activity, Address, AgentId, Doing, Message, MessageId, Stop, ThreadStatus, UnixMs,
+};
 use tokio::sync::watch;
 
 use super::AgentPool;
@@ -162,7 +164,44 @@ impl AgentPool {
     }
 
     pub fn thread_statuses(&self) -> Vec<ThreadStatus> {
-        self.mail.status_snapshot()
+        let at = UnixMs::now();
+        let working: Vec<_> = self
+            .doing
+            .lock()
+            .expect("poison")
+            .iter()
+            .filter(|(_, doing)| is_working(**doing, at))
+            .map(|(&agent, doing)| (agent, doing.since))
+            .collect();
+        let read = self.db.read();
+        let working = working.into_iter().filter_map(|(agent, since)| {
+            let head = read.agent(agent)?;
+            let thread = read
+                .message(MessageId(head.delivered))
+                .or_else(|| origin(&read, agent))
+                .map(|mail| read.mail_thread(&mail))
+                .or_else(|| read.first_thread(agent))?;
+            Some((thread, since))
+        });
+        with_working(self.mail.status_snapshot(), working)
+    }
+
+    pub(super) fn activity_changed(&self, agent: AgentId, before: Option<Doing>, now: Doing) {
+        let at = UnixMs::now();
+        if before.is_some_and(|before| is_working(before, at)) && !is_working(now, at) {
+            self.mail.clear_stopped_status(agent);
+        }
+        self.thread_work_changed();
+    }
+
+    pub(super) fn agents_left_mail(&self, agents: &[AgentId]) {
+        for &agent in agents {
+            self.mail.clear_stopped_status(agent);
+        }
+    }
+
+    pub(crate) fn thread_work_changed(&self) {
+        self.mail.status_changed.send_replace(());
     }
 
     pub(super) fn set_thread_status(
@@ -282,6 +321,7 @@ impl AgentPool {
                         return;
                     }
                     pool.mail.clear_stopped_status(agent);
+                    pool.mail.status_changed.send_replace(());
                     // Leave the write alone if the next status comes just
                     // after this deadline; never remove a newer timer.
                     checks.remove(&agent);
@@ -306,6 +346,38 @@ impl AgentPool {
             checks.insert(agent, check);
         }
     }
+}
+
+fn is_working(doing: Doing, now: UnixMs) -> bool {
+    match doing.activity {
+        Activity::Working => true,
+        Activity::Retrying => doing.stop(now).is_none(),
+        _ => false,
+    }
+}
+
+fn with_working(
+    explicit: Vec<ThreadStatus>,
+    working: impl IntoIterator<Item = (MessageId, UnixMs)>,
+) -> Vec<ThreadStatus> {
+    let mut fallback = BTreeMap::<MessageId, UnixMs>::new();
+    for (thread, since) in working {
+        // The newest worker starting work is the last change to this row.
+        fallback
+            .entry(thread)
+            .and_modify(|at| *at = (*at).max(since))
+            .or_insert(since);
+    }
+    for status in &explicit {
+        fallback.remove(&status.thread);
+    }
+    let mut statuses = explicit;
+    statuses.extend(fallback.into_iter().map(|(thread, at)| ThreadStatus {
+        thread,
+        at,
+        text: Activity::Working.word().to_owned(),
+    }));
+    statuses
 }
 
 fn origin(read: &rho_db::ReadTxn, agent: AgentId) -> Option<Message> {
@@ -584,6 +656,43 @@ mod tests {
             .unwrap();
         assert_eq!(mail.status_snapshot()[0].text, "Writing the proof");
         assert!(changed.has_changed().unwrap());
+    }
+
+    #[test]
+    fn working_fills_only_missing_statuses_and_uses_the_newest_worker_clock() {
+        let a = MessageId(ChatSeq(7));
+        let b = MessageId(ChatSeq(4));
+        let explicit = ThreadStatus {
+            thread: a,
+            at: UnixMs(31),
+            text: "Checking the clock".into(),
+        };
+        let working = [(a, UnixMs(42)), (b, UnixMs(73)), (b, UnixMs(55))];
+        assert_eq!(
+            with_working(vec![explicit.clone()], working),
+            [
+                explicit,
+                ThreadStatus {
+                    thread: b,
+                    at: UnixMs(73),
+                    text: "working".into()
+                },
+            ]
+        );
+        let retry = Doing {
+            activity: Activity::Retrying,
+            since: UnixMs(10),
+        };
+        let deadline = retry.stuck_at().unwrap();
+        assert!(is_working(retry, UnixMs(deadline.0 - 1)));
+        assert!(!is_working(retry, deadline));
+        assert!(!is_working(
+            Doing {
+                activity: Activity::Idle,
+                ..retry
+            },
+            UnixMs(15)
+        ));
     }
 
     #[test]

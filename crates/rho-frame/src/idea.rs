@@ -1,6 +1,7 @@
 //! One local idea draft: the tail of Desk's buffer, or a temporary strip
 //! elsewhere. The minibuffer addresses it. The project owns delivery.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use editor::{Editor, EditorMode};
@@ -8,6 +9,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
 use language::{Buffer, BufferEvent, Capability};
 use multi_buffer::MultiBuffer;
+use rho_agent_types::EndpointId;
 use rho_dealer::Address;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -25,6 +27,29 @@ use crate::{Frame, FrameLink};
 pub struct IdeaProject {
     pub address: Address,
     pub name: String,
+}
+
+/// A validated project name on the host that will own it.
+#[derive(Clone)]
+pub struct NewIdeaProject {
+    pub host: EndpointId,
+    name: String,
+}
+
+impl NewIdeaProject {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+pub(crate) const NEW_PROJECT: &str = "new project";
+
+pub type ProjectCreated = Rc<dyn Fn(IdeaProject, &mut App)>;
+
+#[derive(Clone)]
+enum ProjectChoice {
+    Existing(IdeaProject),
+    New(AnySystem, NewIdeaProject),
 }
 
 pub type IdeaSent = Rc<dyn Fn(String, &mut App)>;
@@ -136,7 +161,10 @@ impl Frame {
     fn idea_label(&self, layout: Layout, cx: &App) -> String {
         match (self.draft_project(cx), self.idea.to.address(), layout) {
             (Some(project), _, Layout::Desktop) => {
-                format!("idea to {} · ctrl-enter sends", project.name)
+                format!(
+                    "idea to {} · ctrl-enter sends · ctrl-t project",
+                    project.name
+                )
             }
             (Some(project), _, Layout::Phone) => format!("idea to {}", project.name),
             (None, Some(_), _) => "idea · project unavailable".into(),
@@ -219,52 +247,57 @@ impl Frame {
             Some(project) => format!("to ({}):", project.name),
             None => "to:".into(),
         };
-        let default_name = default.as_ref().map(|project| project.name.clone());
+        let choices = Rc::new(RefCell::new(Vec::new()));
+        let shown = choices.clone();
+        let contextual = default.clone();
         let complete: CandidateSource = Rc::new(move |frame, needle, cx| {
-            let needle = needle.trim().to_lowercase();
-            let mut projects: Vec<_> = frame
-                .systems
-                .iter()
-                .flat_map(|system| system.idea_projects(cx))
-                .filter(|project| project.name.to_lowercase().contains(&needle))
-                .map(|project| Candidate {
-                    value: project.name,
-                    description: "project".into(),
-                })
-                .collect();
-            // The default named in the question is the first answer when
-            // it matches, not an invisible alternative to the highlight.
-            projects.sort_by(|a, b| {
-                let by_default = |row: &Candidate| default_name.as_ref() != Some(&row.value);
-                (by_default(a), &a.value).cmp(&(by_default(b), &b.value))
-            });
-            projects
+            let rows = frame.project_choices(needle, contextual.as_ref(), cx);
+            let candidates = rows.iter().map(|(row, _)| row.clone()).collect();
+            *shown.borrow_mut() = rows;
+            candidates
         });
         self.open_prompt(
             label,
             complete,
             Rc::new(move |frame, input, window, cx| {
-                let input = input.trim();
-                let project = if let Some(default) = default.as_ref().filter(|p| p.name == input) {
-                    frame
-                        .project_for(&default.address, cx)
-                        .map(|(_, project)| project)
-                } else {
-                    frame
-                        .systems
-                        .iter()
-                        .flat_map(|system| system.idea_projects(cx))
-                        .find(|project| project.name == input)
-                };
-                if let Some(project) = project {
-                    frame.edit_idea_to(project, window, cx);
-                } else {
-                    let why = if input.is_empty() {
-                        "no project chosen".into()
-                    } else {
-                        format!("no project named {input}")
-                    };
-                    frame.echo(&why, StyleClass::SystemInfo, cx);
+                let choice = choices
+                    .borrow()
+                    .iter()
+                    .find(|(row, _)| row.value == input)
+                    .map(|(_, choice)| choice.clone());
+
+                match choice {
+                    Some(ProjectChoice::Existing(project)) => {
+                        frame.edit_idea_to(project, window, cx)
+                    }
+                    Some(ProjectChoice::New(system, project)) => {
+                        let link = FrameLink::new(
+                            window
+                                .window_handle()
+                                .downcast::<Frame>()
+                                .expect("the frame owns the window"),
+                        );
+                        let before = frame.idea.to.address().cloned();
+                        let place = frame.current_address().clone();
+                        system.create_idea_project(
+                            project,
+                            Rc::new(move |project, cx| {
+                                let before = before.clone();
+                                let place = place.clone();
+                                link.with(cx, move |frame, window, cx| {
+                                    if frame.idea.to.address() == before.as_ref()
+                                        && frame.current_address() == &place
+                                        && frame.minibuffer.is_none()
+                                        && frame.menu.is_none()
+                                    {
+                                        frame.edit_idea_to(project, window, cx);
+                                    }
+                                });
+                            }),
+                            cx,
+                        );
+                    }
+                    None => frame.echo("no project chosen", StyleClass::SystemInfo, cx),
                 }
             }),
             window,
@@ -274,6 +307,93 @@ impl Frame {
         if let Some(prompt) = self.minibuffer_mut() {
             prompt.complete_project_address();
         }
+    }
+
+    fn project_choices(
+        &self,
+        input: &str,
+        default: Option<&IdeaProject>,
+        cx: &App,
+    ) -> Vec<(Candidate, ProjectChoice)> {
+        let input = rho_agent_types::one_line(input);
+        let needle = input.to_lowercase();
+        let mut rows: Vec<_> = self
+            .systems
+            .iter()
+            .flat_map(|system| system.idea_projects(cx))
+            .filter(|project| {
+                default.is_none_or(|default| !project.name.eq_ignore_ascii_case(&default.name))
+            })
+            .chain(default.cloned())
+            .filter(|project| project.name.to_lowercase().contains(&needle))
+            .map(|project| {
+                (
+                    Candidate {
+                        value: project.name.clone(),
+                        description: "project".into(),
+                    },
+                    ProjectChoice::Existing(project),
+                )
+            })
+            .collect();
+        rows.sort_by(|(a, _), (b, _)| {
+            let key = |row: &Candidate| {
+                (
+                    !row.value.eq_ignore_ascii_case(&input),
+                    default.is_none_or(|project| project.name != row.value),
+                )
+            };
+            (key(a), &a.value).cmp(&(key(b), &b.value))
+        });
+        if input.is_empty() {
+            return rows;
+        }
+        let (name, requested_host) = input
+            .rsplit_once('@')
+            .map_or((input.as_str(), None), |(name, host)| {
+                (name.trim_end(), Some(host))
+            });
+        if name.is_empty() || name.contains('@') || name.contains('|') {
+            return rows;
+        }
+        let host_hint = requested_host.or_else(|| {
+            default.and_then(|project| project.name.rsplit_once('@').map(|(_, host)| host))
+        });
+        let mut new = self
+            .systems
+            .iter()
+            .flat_map(|system| {
+                system
+                    .idea_project_hosts(cx)
+                    .into_iter()
+                    .map(move |host| (system, host))
+            })
+            .filter(|(_, (_, alias))| host_hint.is_none_or(|host| alias.eq_ignore_ascii_case(host)))
+            .filter_map(|(system, (host, alias))| {
+                let value = format!("{name}@{alias}");
+                (!rows
+                    .iter()
+                    .any(|(row, _)| row.value.eq_ignore_ascii_case(&value)))
+                .then(|| {
+                    (
+                        Candidate {
+                            value,
+                            description: NEW_PROJECT.into(),
+                        },
+                        ProjectChoice::New(
+                            system.clone(),
+                            NewIdeaProject {
+                                host,
+                                name: name.to_owned(),
+                            },
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        new.sort_by(|(a, _), (b, _)| a.value.cmp(&b.value));
+        rows.extend(new);
+        rows
     }
 
     fn edit_idea_to(&mut self, project: IdeaProject, window: &mut Window, cx: &mut Context<Self>) {

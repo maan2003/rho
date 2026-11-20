@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::desk::MovingThread;
 use crate::frame::Point;
-use crate::idea::{IdeaMail, IdeaProject};
+use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
@@ -134,6 +134,18 @@ pub trait System: Sized + 'static {
         None
     }
 
+    fn idea_project_hosts(&self, _cx: &App) -> Vec<(EndpointId, String)> {
+        Vec::new()
+    }
+
+    fn create_idea_project(
+        &mut self,
+        _project: NewIdeaProject,
+        _created: ProjectCreated,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
     /// Every place of the system's that the palette lists by title. The
@@ -180,6 +192,9 @@ trait SystemHandle {
     fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject>;
 
     fn last_idea_project(&self, cx: &App) -> Option<IdeaProject>;
+
+    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)>;
+    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App);
 
     fn send_idea(&self, mail: IdeaMail, cx: &mut App);
 
@@ -261,6 +276,16 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
         self.read(cx).last_idea_project(cx)
+    }
+
+    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
+        self.read(cx).idea_project_hosts(cx)
+    }
+
+    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App) {
+        self.update(cx, |system, cx| {
+            system.create_idea_project(project, created, cx)
+        })
     }
 
     fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
@@ -356,6 +381,19 @@ impl AnySystem {
 
     pub(crate) fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
         self.0.last_idea_project(cx)
+    }
+
+    pub(crate) fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
+        self.0.idea_project_hosts(cx)
+    }
+
+    pub(crate) fn create_idea_project(
+        &self,
+        project: NewIdeaProject,
+        created: ProjectCreated,
+        cx: &mut App,
+    ) {
+        self.0.create_idea_project(project, created, cx)
     }
 
     pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
