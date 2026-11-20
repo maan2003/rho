@@ -1030,7 +1030,12 @@ impl Agent {
                                 return Ok(());
                             }
                             Some(control) => self.control(control).await?,
-                            None => return Ok(()),
+                            // The last handle went away. The outer loop must
+                            // not immediately retry this abandoned exchange.
+                            None => {
+                                self.backoff = None;
+                                return Ok(());
+                            }
                         },
                         Some(outbound) = self.outbox.recv() => {
                             self.outbound(outbound).await?;
