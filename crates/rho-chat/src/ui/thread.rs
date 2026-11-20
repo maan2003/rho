@@ -16,9 +16,7 @@ use gpui::{
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
-use rho_agent_types::{
-    Address as Party, AgentId, ContentPart, EndpointId, Message, MessageId, Revision,
-};
+use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage, SendOnly};
 use rho_frame::{Candidate, Row, Subject, Surface};
@@ -176,7 +174,7 @@ pub struct ThreadView {
     /// The mail dealt to this view, also the target when the cursor is
     /// between mails rather than on a different writer's mail.
     dealt_mail: Option<MessageId>,
-    reply_to: Option<AgentId>,
+    reply_to: Option<MessageId>,
     expanded_quotes: HashSet<QuoteId>,
     _subscriptions: Vec<Subscription>,
     /// Reads a project's list again when a thread's age next changes.
@@ -398,14 +396,13 @@ impl ThreadView {
         is_project(system, self.thread)
     }
 
-    fn current_reply_author(&self, cx: &App) -> Option<AgentId> {
+    fn current_reply_target(&self, cx: &App) -> Option<MessageId> {
+        if self.is_list(self.system.read(cx)) {
+            return None;
+        }
         let chat = self.system.read(cx).chat(self.thread.host)?;
         let point = self.transcript.line_meta(self.cursor_row(cx), cx);
-        point
-            .and_then(Meta::mail)
-            .into_iter()
-            .chain(self.dealt_mail)
-            .find_map(|id| reply_author(chat.message(id)?))
+        reply_target(point, self.dealt_mail, |id| chat.message(id))
     }
 
     /// The web link the cursor is on, if it is on one.
@@ -779,20 +776,15 @@ impl ThreadView {
         }
         let thread = self.thread;
         let list = self.is_list(self.system.read(cx));
-        let author = match self.focused {
+        let reply_to = match self.focused {
             Focused::Composer => self.reply_to.take(),
-            Focused::Log => self.current_reply_author(cx),
+            Focused::Log => self.current_reply_target(cx),
         };
         let client_id = self.system.update(cx, |system, cx| {
-            // A reply is still posted in the thread (its members receive
-            // it), but the author also receives it if they are not a member.
-            let client_id = system.post(
-                thread.host,
-                Some(thread.message),
-                text,
-                author.into_iter().collect(),
-                cx,
-            );
+            let client_id = match reply_to {
+                Some(mail) => system.reply(thread, mail, text, cx),
+                None => system.post(thread.host, Some(thread.message), text, Vec::new(), cx),
+            };
             system.set_draft(thread.host, Some(thread.message), String::new());
             client_id
         });
@@ -812,7 +804,7 @@ impl ThreadView {
 
     fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {
         if self.focused != Focused::Composer {
-            self.reply_to = self.current_reply_author(cx);
+            self.reply_to = self.current_reply_target(cx);
         }
         self.focused = Focused::Composer;
         window.focus(&self.composer.focus_handle(cx), cx);
@@ -944,13 +936,21 @@ fn body(content: &[ContentPart]) -> String {
     text.trim_end().to_owned()
 }
 
-/// The bot keeps the stopped agent's identity in the record, just as an
-/// agent's own mail does. Neither identity is its visible sender.
-fn reply_author(message: &Message) -> Option<AgentId> {
-    match message.from {
-        Party::User => None,
-        Party::Agent(agent) | Party::System { agent, .. } => Some(agent),
-    }
+/// An explicitly selected incoming mail overrides the dealt mail. From a
+/// gap (or the user's own text), a reply still answers the dealt mail.
+fn reply_target<'a>(
+    point: Option<&Meta>,
+    dealt: Option<MessageId>,
+    mail: impl Fn(MessageId) -> Option<&'a Message>,
+) -> Option<MessageId> {
+    point
+        .and_then(Meta::mail)
+        .into_iter()
+        .chain(dealt)
+        .find(|id| {
+            mail(*id)
+                .is_some_and(|mail| mail.from != Party::User && mail.revision != Revision::Deleted)
+        })
 }
 
 fn message_item(
@@ -1209,7 +1209,7 @@ impl Render for ThreadView {
         // by key: whichever editor has it is the one the chrome reads.
         if self.composer.focus_handle(cx).is_focused(window) {
             if self.focused != Focused::Composer {
-                self.reply_to = self.current_reply_author(cx);
+                self.reply_to = self.current_reply_target(cx);
             }
             self.focused = Focused::Composer;
         } else if self.log.focus_handle(cx).is_focused(window) {
@@ -1276,12 +1276,15 @@ impl Render for ThreadView {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::AgentId;
+
     use super::*;
 
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
             id: MessageId(rho_agent_types::ChatSeq(13)),
             parent: None,
+            reply_to: None,
             at: rho_agent_types::UnixMs(1_760_000_000_000),
             from,
             mentions: Vec::new(),
@@ -1293,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn project_voice_does_not_erase_the_author_or_invent_an_edit() {
+    fn mail_speaks_for_the_project_and_marks_edits() {
         let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let original = mail(Party::Agent(agent), Revision::Original, "Ready?");
         let bot = mail(
@@ -1306,22 +1309,66 @@ mod tests {
             "cargo exited 101",
         );
         let user = mail(Party::User, Revision::Original, "Go ahead.");
-        for (mail, from, author, marker) in [
-            (&original, "tide@lab", Some(agent), false),
-            (&bot, "tide@lab", Some(agent), true),
-            (&user, "you", None, false),
+        for (mail, from, marker) in [
+            (&original, "tide@lab", false),
+            (&bot, "tide@lab", true),
+            (&user, "you", false),
         ] {
             let item = message_item(mail, "tide@lab", &HashSet::new()).unwrap();
             let header = item.text.lines().next().unwrap();
             assert!(header.starts_with(&format!("{from} · ")), "{header}");
             assert_eq!(header.ends_with(" · edited"), marker);
-            assert_eq!(reply_author(mail), author);
         }
         let deleted = Message {
             revision: Revision::Deleted,
             ..original
         };
         assert!(message_item(&deleted, "tide@lab", &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn replies_target_the_selected_incoming_mail_or_fall_back_to_the_dealt_ask() {
+        let agent = AgentId::from_counter(19, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let ask = mail(Party::Agent(agent), Revision::Original, "Ship it?");
+        let next = Message {
+            id: MessageId(rho_agent_types::ChatSeq(24)),
+            ..mail(
+                Party::Agent(agent),
+                Revision::Edited,
+                "Use the release branch.",
+            )
+        };
+        let user = Message {
+            id: MessageId(rho_agent_types::ChatSeq(25)),
+            ..mail(Party::User, Revision::Original, "Not yet.")
+        };
+        let removed = Message {
+            id: MessageId(rho_agent_types::ChatSeq(26)),
+            ..mail(Party::Agent(agent), Revision::Deleted, "Removed.")
+        };
+        let lookup = |id| {
+            [&ask, &next, &user, &removed]
+                .into_iter()
+                .find(|message| message.id == id)
+        };
+        assert_eq!(reply_target(None, Some(ask.id), lookup), Some(ask.id));
+        assert_eq!(
+            reply_target(Some(&Meta::Mail(user.id)), Some(ask.id), lookup),
+            Some(ask.id)
+        );
+        let quote = Meta::Quote(QuoteId {
+            mail: next.id,
+            first_line: 2,
+        });
+        assert_eq!(
+            reply_target(Some(&quote), Some(ask.id), lookup),
+            Some(next.id)
+        );
+        assert_eq!(
+            reply_target(Some(&Meta::Mail(removed.id)), Some(ask.id), lookup),
+            Some(ask.id)
+        );
+        assert_eq!(reply_target(Some(&Meta::Mail(user.id)), None, lookup), None);
     }
 
     #[test]
