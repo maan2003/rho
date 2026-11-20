@@ -14,10 +14,7 @@ use rho_window::style::StyleClass;
 
 use super::conversation::{self, Attaching, Submitted};
 use super::results::{self, Place, Target};
-use super::system::{
-    self, FindFile, FindMessage, NewMessage, NextPage, NextUnread, OpenRow, PreviousPage,
-    SlackSystem,
-};
+use super::system::{self, FindFile, FindMessage, NextPage, OpenRow, PreviousPage, SlackSystem};
 use super::{ConversationView, ReactionChoices, ResultsView, SearchKind};
 use crate::address::Listing;
 use crate::session::{FoundPage, Session, SessionEvent, Source};
@@ -357,16 +354,6 @@ impl SlackSurface {
         .detach();
     }
 
-    fn next_unread(&mut self, _: &NextUnread, _window: &mut Window, cx: &mut Context<Self>) {
-        let here = self
-            .conversation_view()
-            .map(|view| view.read(cx).source().channel().clone());
-        let session = self.session.clone();
-        self.frame.with(cx, move |frame, window, cx| {
-            system::next_unread(&session, here.as_ref(), frame, window, cx)
-        });
-    }
-
     fn find_message(&mut self, _: &FindMessage, _window: &mut Window, cx: &mut Context<Self>) {
         self.find(SearchKind::Messages, cx)
     }
@@ -375,24 +362,11 @@ impl SlackSurface {
         self.find(SearchKind::Files, cx)
     }
 
-    /// Asks Slack, inside the conversation the reader is in when they are
-    /// in one, and everywhere otherwise.
+    /// Asks Slack from a page of results: a new search, everywhere.
     fn find(&self, kind: SearchKind, cx: &mut App) {
-        let scope = self.conversation_view().and_then(|view| {
-            let channel = view.read(cx).source().channel().clone();
-            let model = self.session.read(cx).model();
-            Some((model.search_scope(&channel)?, model.label(&channel)))
-        });
         let session = self.session.clone();
         self.frame.with(cx, move |frame, window, cx| {
-            system::prompt_find(session, scope, kind, frame, window, cx)
-        });
-    }
-
-    fn new_message(&mut self, _: &NewMessage, _window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.session.clone();
-        self.frame.with(cx, move |frame, window, cx| {
-            system::prompt_people(session, frame, window, cx)
+            system::prompt_find(session, None, kind, frame, window, cx)
         });
     }
 
@@ -889,10 +863,8 @@ impl Render for SlackSurface {
             .on_action(cx.listener(Self::focus_composer))
             .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::send))
-            .on_action(cx.listener(Self::next_unread))
             .on_action(cx.listener(Self::find_message))
             .on_action(cx.listener(Self::find_file))
-            .on_action(cx.listener(Self::new_message))
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::next_page))
             .child(inner)
