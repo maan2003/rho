@@ -40,7 +40,7 @@ sees: one prompt, listing places and commands together, best match first as the 
 - places: every channel, thread, agent, agent's desktop, usage chart, and Slack conversation and Slack thread, by title, newest first, with where each is and, for an agent, what it is doing, such as `rho · waiting`
 - commands: `home`, `notes`, `undo`, `hosts`, and `quit` on every screen, mixed with the commands for the screen in view and for the thing under the cursor; with nothing typed, the shorter names come first; each row has the keys of its menu beside it; a command inside a menu shows its path, such as `hosts › attach`
 does:
-- open `:`: open the prompt with the commands listed first
+- open `:`, or `ctrl-shift-;` from any place, a terminal, a desktop, a page, or a box the user is typing in: open the prompt with the commands listed first; the place under it does not see the keys
 - find `ctrl-shift-f`: open the same prompt with the places listed first
 - run `enter`: open the place chosen, or run the command; a command that is a `Menu` opens that menu; a name that fits nothing echoes `no command …`
 
