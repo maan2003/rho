@@ -1,4 +1,5 @@
-//! The desk shows the dealer's hand, recent status changes, and the idea box.
+//! The desk shows the dealer's hand, recent status changes, and an editable
+//! idea.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -8,12 +9,12 @@ use std::sync::Arc;
 use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, Pixels, TextRun, Window,
-    WindowTextSystem, div, px,
+    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, MouseButton,
+    MouseDownEvent, Pixels, TextRun, Window, WindowTextSystem, div, px,
 };
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+use multi_buffer::ToPoint as _;
 use rho_dealer::Address;
 use rho_dealer::rank::Hand;
 use rho_transcript::{Item, Transcript};
@@ -22,6 +23,7 @@ use theme::ActiveTheme as _;
 
 use crate::phone::Layout;
 use crate::surface::{Subject, Surface};
+use crate::{Frame, FrameLink, draft};
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
@@ -51,6 +53,7 @@ enum DeskKey {
     MovingHeader,
     Moving(Address),
     More,
+    Idea,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -182,6 +185,8 @@ impl rho_transcript::Style for DeskClass {
 pub(crate) struct DeskView {
     transcript: Transcript<DeskKey, DeskClass, DeskTarget>,
     editor: Entity<Editor>,
+    draft: Entity<Buffer>,
+    idea_label: String,
     rows: DeskRows,
     layout: DeskLayout,
     text_system: Arc<WindowTextSystem>,
@@ -225,23 +230,13 @@ impl DeskLayout {
 }
 
 impl DeskView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(draft: Entity<Buffer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
             buffer
         });
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                buffer.clone(),
-                [Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer
-        });
+        let multi_buffer = draft::document(&buffer, &draft, cx);
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -255,13 +250,37 @@ impl DeskView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
+            editor.disable_headers_for_buffers(
+                [buffer.read(cx).remote_id(), draft.read(cx).remote_id()],
+                cx,
+            );
+            let history = buffer.clone();
+            editor.set_prepare_for_insert(
+                Some(
+                    move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
+                        if !draft::on_tail(editor, &history, cx) {
+                            let tail = draft::start(&history, cx);
+                            editor.change_selections(
+                                Default::default(),
+                                window,
+                                cx,
+                                |selections| {
+                                    selections.select_ranges([tail..tail]);
+                                },
+                            );
+                        }
+                    },
+                ),
+                cx,
+            );
             editor
         });
         let layout = DeskLayout::read(&editor, window, cx);
         let mut view = Self {
             transcript: Transcript::new(buffer),
             editor,
+            draft,
+            idea_label: String::new(),
             rows: DeskRows::default(),
             layout,
             text_system: window.text_system().clone(),
@@ -273,6 +292,66 @@ impl DeskView {
         view.transcript.reconcile(items, cx);
         view.focus_first_row(cx);
         view
+    }
+
+    pub(crate) fn set_idea_label(&mut self, label: String, cx: &mut Context<Self>) {
+        if label != self.idea_label {
+            self.idea_label = label;
+            self.transcript.replace(
+                &DeskKey::Idea,
+                line(DeskKey::Idea, self.idea_label.clone()),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_draft(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        draft::replace(&self.editor, &buffer, cx);
+        self.draft = buffer;
+        cx.notify();
+    }
+
+    pub(crate) fn on_draft(&self, cx: &App) -> bool {
+        draft::on_tail(self.editor.read(cx), self.transcript.buffer(), cx)
+    }
+
+    pub(crate) fn focus_draft(&self, window: &mut Window, cx: &mut App) {
+        draft::focus(&self.editor, self.transcript.buffer(), None, window, cx);
+    }
+
+    fn tap_idea(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left || event.modifiers.modified() {
+            return;
+        }
+        let Some(hit) = draft::hit(
+            self.editor.read(cx),
+            self.transcript.buffer(),
+            &self.draft,
+            event.position,
+            cx,
+        ) else {
+            return;
+        };
+        let ask = self.draft.read(cx).capability() == Capability::Read
+            || (matches!(hit, draft::Hit::Separator) && self.on_draft(cx));
+        if ask {
+            let frame = FrameLink::new(
+                window
+                    .window_handle()
+                    .downcast::<Frame>()
+                    .expect("the frame owns the desk"),
+            );
+            frame.with(cx, |frame, window, cx| frame.prompt_idea(window, cx));
+        } else {
+            let position = match hit {
+                draft::Hit::Text(anchor) => Some(anchor),
+                draft::Hit::Separator => None,
+            };
+            draft::focus(&self.editor, self.transcript.buffer(), position, window, cx);
+        }
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     pub(crate) fn cursor_target(&self, cx: &App) -> Option<DeskTarget> {
@@ -298,7 +377,7 @@ impl DeskView {
         position: gpui::Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<bool> {
         let editor = self.editor.read(cx);
         let hit = editor
             .buffer_location_for_window_position(position, Bias::Left)
@@ -314,7 +393,7 @@ impl DeskView {
             });
         let Some((row, target)) = hit else {
             self.reset_tap();
-            return false;
+            return None;
         };
         let open = self.tapped.as_ref() == Some(&target)
             && self.cursor_target(cx).as_ref() == Some(&target);
@@ -328,7 +407,7 @@ impl DeskView {
             });
             window.focus(&self.editor.focus_handle(cx), cx);
         }
-        open
+        Some(open)
     }
 
     pub(crate) fn set_rows(&mut self, rows: DeskRows, cx: &mut Context<Self>) {
@@ -338,7 +417,7 @@ impl DeskView {
         let was_empty = self.rows.waiting.is_empty() && self.rows.moving.is_empty();
         self.rows = rows;
         self.transcript.reconcile(self.items(), cx);
-        if was_empty {
+        if was_empty && !self.on_draft(cx) {
             self.focus_first_row(cx);
         }
         cx.notify();
@@ -396,6 +475,7 @@ impl DeskView {
                 items.push(line(DeskKey::More, format!("and {} more", self.rows.more)));
             }
         }
+        items.push(line(DeskKey::Idea, self.idea_label.clone()));
         items
     }
 }
@@ -631,7 +711,12 @@ impl Render for DeskView {
             self.transcript.reconcile(self.items(), cx);
         }
         div()
-            .key_context("RhoDesk")
+            .key_context(if self.draft.read(cx).capability() == Capability::Read {
+                "RhoDesk RhoIdea RhoIdeaUnaddressed"
+            } else {
+                "RhoDesk RhoIdea"
+            })
+            .capture_any_mouse_down(cx.listener(Self::tap_idea))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())

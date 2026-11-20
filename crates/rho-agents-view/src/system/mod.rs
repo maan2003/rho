@@ -150,7 +150,7 @@ impl AgentsSystem {
                 source.clone(),
                 cx,
             ),
-            ChatEvent::Changed { .. } => {}
+            ChatEvent::Changed { .. } | ChatEvent::DraftSent(_) => {}
         });
         Self {
             client,

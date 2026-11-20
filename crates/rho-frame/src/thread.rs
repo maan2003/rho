@@ -1,45 +1,33 @@
 //! The keys of a thread screen, the same on every thread the window
 //! shows, whether a channel or a thread on a host.
 //!
-//! A thread screen is the messages, an editor drawn under [`LOG`], above a
-//! box to write in, an editor drawn under [`COMPOSER`], both inside
-//! [`SCREEN`]. A system that draws one in these contexts and handles these
-//! actions has the thread's keys, and binds none of its own for them.
+//! The mails and draft share one editor under [`SCREEN`].
 
 use gpui::{App, KeyBinding, actions};
+pub use vim::enter_normal_mode;
 
 actions!(
     rho_thread,
     [
-        /// Posts what is in the box; in a channel on a host, as an idea an
+        /// Posts the draft; in a channel on a host, as an idea an
         /// agent starts from.
         SendMessage,
-        /// Posts what is in the box and starts nothing, in a channel too.
+        /// Posts the draft and starts nothing, in a channel too.
         SendOnly,
-        /// Puts the keyboard in the box.
-        FocusComposer,
-        /// Puts the keyboard in the messages.
-        FocusLog,
         /// Opens what the cursor is on: a thread under a message, the
         /// thread above, a link, or a quote.
         OpenRow,
+        /// Quotes the selected lines of a mail in the draft.
+        QuoteSelection,
+        /// Helix redo in the draft, or undo verdict on the history.
+        RedoDraftOrUndoVerdict,
     ]
 );
 
 /// The key context of the whole screen.
 pub const SCREEN: &str = "RhoThread";
-/// The key context the messages are drawn in.
-pub const LOG: &str = "RhoThreadLog";
-/// The key context the box to write in is drawn in.
-pub const COMPOSER: &str = "RhoThreadComposer";
-
-/// What the empty box says.
-pub const PLACEHOLDER: &str = "reply · ctrl-enter sends";
-/// What the empty box of a channel on a host says, where a message is an
-/// idea an agent starts from.
-pub const CHANNEL_PLACEHOLDER: &str =
-    "idea · ctrl-enter starts an agent · ctrl-shift-enter only sends";
-
+/// The project list has a second way to send an idea.
+pub const PROJECT_SCREEN: &str = "RhoThread RhoProjectThread";
 /// A message's time on the user's clock, as every thread says it: the hour
 /// when it is today, the day in front of it when it is not.
 pub fn when(at_ms: i64) -> String {
@@ -55,25 +43,29 @@ pub fn when(at_ms: i64) -> String {
 
 pub(crate) fn bind(cx: &mut App) {
     let screen = format!("{SCREEN} > Editor");
-    let composer = format!("{COMPOSER} > Editor && !showing_completions");
     let mut bindings = vec![
         KeyBinding::new("ctrl-enter", SendMessage, Some(&screen)),
-        KeyBinding::new("ctrl-shift-enter", SendOnly, Some(&screen)),
-        KeyBinding::new("ctrl-down", FocusComposer, Some(&screen)),
-        KeyBinding::new("ctrl-up", FocusLog, Some(&screen)),
-        // The box is an input, always in insert: escape is the way back to
-        // the messages, where the vim keys are. With a completion menu open
-        // escape and enter are the menu's.
-        KeyBinding::new("escape", FocusLog, Some(&composer)),
-        // Only `ctrl-enter` sends, so `enter` is free to break the line, the
-        // way it does in every other box that takes paragraphs.
-        KeyBinding::new("enter", editor::actions::Newline, Some(&composer)),
+        KeyBinding::new(
+            "ctrl-shift-enter",
+            SendOnly,
+            Some("RhoProjectThread > Editor"),
+        ),
     ];
-    for context in crate::normal_contexts(LOG, "") {
-        bindings.extend([
-            KeyBinding::new("i", FocusComposer, Some(&context)),
-            KeyBinding::new("enter", OpenRow, Some(&context)),
-        ]);
+    for context in
+        crate::normal_contexts(SCREEN, " && vim_operator == none && !showing_completions")
+    {
+        bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
+    }
+    bindings.push(KeyBinding::new(
+        "shift-u",
+        RedoDraftOrUndoVerdict,
+        Some(&format!(
+            "{screen} && vim_mode == helix_normal && vim_operator == none"
+        )),
+    ));
+    for mode in ["visual", "helix_select"] {
+        let context = format!("{screen} && vim_mode == {mode}");
+        bindings.push(KeyBinding::new("enter", QuoteSelection, Some(&context)));
     }
     cx.bind_keys(bindings);
 }

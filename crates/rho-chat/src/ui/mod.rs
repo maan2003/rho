@@ -50,6 +50,8 @@ pub enum Event {
         parent: MessageId,
         source: IdeaSource,
     },
+    /// The user confirmed sending the draft from a project start prompt.
+    DraftSent(ThreadId),
     /// The host logged a message the user wrote, under the id this client
     /// gave it when it was written.
     Delivered {
@@ -430,20 +432,17 @@ impl ChatSystem {
         self.failed_starts.get(&thread).map(String::as_str)
     }
 
-    /// Posts what the user has written under `parent` and clears the
-    /// draft; the composer follows. `None` when nothing is written.
-    pub fn send_draft(
-        &mut self,
-        endpoint: EndpointId,
-        parent: Option<MessageId>,
-        cx: &mut Context<Self>,
-    ) -> Option<u64> {
-        let text = self.draft(endpoint, parent).trim().to_owned();
+    /// Posts the project's draft after the start prompt is confirmed.
+    fn send_project_draft(&mut self, project: ThreadId, cx: &mut Context<Self>) -> Option<u64> {
+        let parent = Some(project.message);
+        let text = self.draft(project.host, parent).trim().to_owned();
         if text.is_empty() {
             return None;
         }
-        self.set_draft(endpoint, parent, String::new());
-        Some(self.post(endpoint, parent, text, Vec::new(), cx))
+        self.set_draft(project.host, parent, String::new());
+        let id = self.post(project.host, parent, text, Vec::new(), cx);
+        cx.emit(Event::DraftSent(project));
+        Some(id)
     }
 
     /// Post the selected idea, independent of the box that owns its
@@ -455,7 +454,7 @@ impl ChatSystem {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         match source {
-            IdeaSource::ChannelDraft => self.send_draft(project.host, Some(project.message), cx),
+            IdeaSource::ChannelDraft => self.send_project_draft(project, cx),
             IdeaSource::Box(idea) => {
                 let name = self.project_address(project)?;
                 let id = self.post(

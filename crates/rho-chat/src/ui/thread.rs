@@ -1,4 +1,4 @@
-//! A thread: the project's mail, its current status, and a reply box.
+//! A thread: read-only mail and an editable draft in one editor.
 //!
 //! A channel is the same surface over a root: its messages are the threads
 //! under it, each with its replies folded under it.
@@ -8,19 +8,22 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use editor::scroll::Autoscroll;
-use editor::{Editor, EditorEvent, EditorMode, HighlightKey, SizingBehavior};
+use editor::{Anchor, Editor, EditorMode, HighlightKey, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Subscription, Task, Window, div,
+    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent,
+    Subscription, Task, Window, div,
 };
 use jiff::{SignedDuration, Timestamp};
-use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+use language::{Buffer, BufferEvent, Capability, Point};
+use multi_buffer::ToPoint as _;
 use rho_agent_types::{Address as Party, ContentPart, EndpointId, Message, MessageId, Revision};
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
-use rho_frame::thread::{self, FocusComposer, FocusLog, OpenRow, SendMessage, SendOnly};
-use rho_frame::{Candidate, Layout, Row, Subject, Surface};
+use rho_frame::thread::{
+    self, OpenRow, QuoteSelection, RedoDraftOrUndoVerdict, SendMessage, SendOnly,
+};
+use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
 use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -35,6 +38,8 @@ const KEY_BASE: usize = usize::MAX / 5;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Crumb,
+    Status,
+    Separator,
     /// The message the thread hangs under, and each under it.
     Message(MessageId),
     /// The replies under a message, folded.
@@ -149,12 +154,6 @@ impl Meta {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Focused {
-    Log,
-    Composer,
-}
-
 /// A thread the user just started in a channel, which the cursor follows
 /// until it stands in the list: by the id this client gave the message
 /// while it is on its way, then by its own once the host logged it.
@@ -168,9 +167,10 @@ pub struct ThreadView {
     system: Entity<ChatSystem>,
     thread: ThreadId,
     transcript: Transcript<Key, Class, Meta>,
-    log: Entity<Editor>,
-    composer: Entity<Editor>,
-    focused: Focused,
+    layout: Layout,
+    editor: Entity<Editor>,
+    draft: Entity<Buffer>,
+    draft_subscription: Subscription,
     follow: Option<Follow>,
     /// The mail dealt to this view, also the target when the cursor is
     /// between mails rather than on a different writer's mail.
@@ -204,18 +204,13 @@ impl ThreadView {
             rho_window::markdown::configure_buffer(&mut buffer, cx);
             buffer
         });
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                buffer.clone(),
-                [Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer
-        });
-        let log = cx.new(|cx| {
+        let draft = cx.new(|cx| Buffer::local(system.draft(thread.host, Some(thread.message)), cx));
+        // The editor treats these excerpts as one document for navigation,
+        // search and registers, but only the draft accepts edits.
+        let multi_buffer = draft::document(&buffer, &draft, cx);
+        let this = cx.weak_entity();
+        let history = buffer.clone();
+        let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
@@ -228,50 +223,67 @@ impl ThreadView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
-            editor
-        });
-        let draft = system.draft(thread.host, Some(thread.message)).to_owned();
-        let composer = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 10, window, cx);
-            rho_window::editor_config::configure(&mut editor, window, cx);
-            if !draft.is_empty() {
-                editor.set_text(draft, window, cx);
-            }
+            editor.disable_headers_for_buffers(
+                [buffer.read(cx).remote_id(), draft.read(cx).remote_id()],
+                cx,
+            );
+            editor.set_prepare_for_insert(
+                Some(
+                    move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
+                        let snapshot = editor.display_snapshot(cx);
+                        let row = editor.selections.newest::<Point>(&snapshot).head().row;
+                        let tail = draft::start(&history, cx);
+                        if row < tail.row {
+                            let _ = this.update(cx, |view, cx| {
+                                if let Some(mail) = view.selected_reply_target(row, cx) {
+                                    view.reply_to = Some(mail);
+                                }
+                            });
+                            editor.change_selections(
+                                Default::default(),
+                                window,
+                                cx,
+                                |selections| {
+                                    selections.select_ranges([tail..tail]);
+                                },
+                            );
+                        }
+                    },
+                ),
+                cx,
+            );
             editor
         });
         let subscriptions = vec![
             cx.observe(&entity, |this, _, cx| this.refresh(cx)),
-            cx.subscribe(&entity, |this, _, event: &Event, cx| {
-                if let Event::Delivered {
+            cx.subscribe(&entity, |this, _, event: &Event, cx| match event {
+                Event::Delivered {
                     endpoint,
                     client_id,
                     message,
-                } = event
-                    && *endpoint == this.thread.host
-                    && this.follow == Some(Follow::Sending(*client_id))
+                } if *endpoint == this.thread.host
+                    && this.follow == Some(Follow::Sending(*client_id)) =>
                 {
                     this.follow = Some(Follow::Logged(*message));
                     this.refresh(cx);
                 }
-            }),
-            cx.subscribe(&composer, |this, composer, event: &EditorEvent, cx| {
-                if matches!(event, EditorEvent::BufferEdited) {
-                    let text = composer.read(cx).text(cx);
-                    let thread = this.thread;
-                    this.system.update(cx, |system, _| {
-                        system.set_draft(thread.host, Some(thread.message), text);
-                    });
+                Event::DraftSent(project) if *project == this.thread => {
+                    this.clear_draft(cx);
+                    this.refresh(cx);
+                    this.cursor_to_latest_mail(cx);
                 }
+                _ => {}
             }),
         ];
+        let draft_subscription = Self::subscribe_draft(&draft, cx);
         let mut view = Self {
             system: entity,
             thread,
             transcript: Transcript::new(buffer),
-            log,
-            composer,
-            focused: Focused::Log,
+            layout: Layout::of(window.viewport_size().width),
+            editor,
+            draft,
+            draft_subscription,
             follow: None,
             dealt_mail: None,
             reply_to: None,
@@ -279,11 +291,12 @@ impl ThreadView {
             _subscriptions: subscriptions,
             _ages: None,
         };
-        view.transcript.attach(&view.log.clone(), cx);
+        view.transcript.attach(&view.editor, cx);
         let items = items(
             system,
             thread,
             view.is_list(system),
+            view.layout,
             &view.expanded_quotes,
             cx,
         );
@@ -292,7 +305,7 @@ impl ThreadView {
             // The list reads from the top.
             view.cursor_to_first_thread(cx);
         } else {
-            view.cursor_to_end(cx);
+            view.cursor_to_latest_mail(cx);
         }
         // What is unread and the user's private replies come from the
         // ledger, which is the frame's and is leased while it opens this:
@@ -312,39 +325,23 @@ impl ThreadView {
         view
     }
 
-    /// The rows as they stand, reconciled into the buffer. A reader at the
-    /// end stays at the end as messages arrive.
+    /// The rows as they stand, reconciled into the read-only excerpt.
+    /// Never reset a point (or a selection) in the draft as mail arrives.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let list = self.is_list(self.system.read(cx));
-        let at_end = {
-            let last = self.transcript.buffer().read(cx).max_point().row;
-            self.cursor_row(cx) >= last
-        };
         let items = items(
             self.system.read(cx),
             self.thread,
             list,
+            self.layout,
             &self.expanded_quotes,
             cx,
         );
         self.transcript.reconcile(items, cx);
-        if at_end && !list {
-            self.cursor_to_end(cx);
-        }
         if let Some(Follow::Logged(message)) = self.follow
             && self.cursor_to_item(&Key::Thread(message), Autoscroll::fit(), cx)
         {
             self.follow = None;
-        }
-        // A draft the system sent on the user's behalf (`send and start`)
-        // leaves the composer: its words are in the thread now.
-        let draft_gone = self
-            .system
-            .read(cx)
-            .draft(self.thread.host, Some(self.thread.message))
-            .is_empty();
-        if draft_gone && !self.composer.read(cx).text(cx).is_empty() {
-            self.clear_composer(cx);
         }
         self.schedule_ages(cx);
         cx.notify();
@@ -366,15 +363,25 @@ impl ThreadView {
         });
     }
 
-    /// Empties the composer without a window: the edit goes to its buffer.
-    fn clear_composer(&self, cx: &mut Context<Self>) {
-        let Some(buffer) = self.composer.read(cx).buffer().read(cx).as_singleton() else {
-            return;
-        };
-        buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, "")], None, cx);
-        });
+    fn subscribe_draft(draft: &Entity<Buffer>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(draft, |view, draft, event: &BufferEvent, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                let text = draft.read(cx).text();
+                let thread = view.thread;
+                view.system.update(cx, |system, _| {
+                    system.set_draft(thread.host, Some(thread.message), text);
+                });
+            }
+        })
+    }
+
+    /// A sent draft is not the next draft's undo history.
+    fn clear_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = cx.new(|cx| Buffer::local("", cx));
+        draft::replace(&self.editor, &draft, cx);
+        self.draft_subscription = Self::subscribe_draft(&draft, cx);
+        self.draft = draft;
+        self.reply_to = None;
     }
 
     fn cursor_row(&self, cx: &App) -> u32 {
@@ -382,7 +389,7 @@ impl ThreadView {
     }
 
     fn cursor(&self, cx: &App) -> Point {
-        let editor = self.log.read(cx);
+        let editor = self.editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         editor.selections.newest_anchor().head().to_point(&snapshot)
     }
@@ -391,19 +398,40 @@ impl ThreadView {
         is_project(system, self.thread)
     }
 
+    fn selected_reply_target(&self, row: u32, cx: &App) -> Option<MessageId> {
+        let chat = self.system.read(cx).chat(self.thread.host)?;
+        let id = self.transcript.line_meta(row, cx)?.mail()?;
+        incoming(chat.message(id)).then_some(id)
+    }
+
     fn current_reply_target(&self, cx: &App) -> Option<MessageId> {
-        if self.is_list(self.system.read(cx)) {
+        let system = self.system.read(cx);
+        if self.is_list(system) {
             return None;
         }
-        let chat = self.system.read(cx).chat(self.thread.host)?;
+        let chat = system.chat(self.thread.host)?;
         let point = self.transcript.line_meta(self.cursor_row(cx), cx);
-        reply_target(point, self.dealt_mail, |id| chat.message(id))
+        self.reply_to
+            .into_iter()
+            .chain(point.and_then(Meta::mail))
+            .chain(self.dealt_mail)
+            .chain(
+                chat.children(Some(self.thread.message))
+                    .iter()
+                    .rev()
+                    .copied(),
+            )
+            .chain([self.thread.message])
+            .find(|id| incoming(chat.message(*id)))
     }
 
     /// The web link the cursor is on, if it is on one.
     fn cursor_link(&self, cx: &App) -> Option<url::Url> {
         let cursor = self.cursor(cx);
         let buffer = self.transcript.buffer().read(cx);
+        if cursor.row >= draft::start(self.transcript.buffer(), cx).row {
+            return None;
+        }
         let start = buffer.point_to_offset(Point::new(cursor.row, 0));
         let end = buffer.point_to_offset(Point::new(cursor.row, buffer.line_len(cursor.row)));
         let line: String = buffer.text_for_range(start..end).collect();
@@ -430,7 +458,7 @@ impl ThreadView {
     }
 
     fn cursor_to_row(&mut self, row: u32, scroll: Autoscroll, cx: &mut Context<Self>) {
-        self.log.update(cx, |editor, cx| {
+        self.editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             editor.selections.change_with(&snapshot, |selections| {
                 selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
@@ -448,7 +476,7 @@ impl ThreadView {
         else {
             return;
         };
-        self.log.update(cx, |editor, cx| {
+        self.editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             editor.selections.change_with(&snapshot, |selections| {
                 selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
@@ -457,14 +485,55 @@ impl ThreadView {
         });
     }
 
-    fn cursor_to_end(&mut self, cx: &mut Context<Self>) {
-        let row = self.transcript.buffer().read(cx).max_point().row;
-        self.cursor_to_row(row, Autoscroll::fit(), cx);
+    fn cursor_to_latest_mail(&mut self, cx: &mut Context<Self>) {
+        let row = self
+            .item_row(&Key::Status, cx)
+            .or_else(|| self.item_row(&Key::Separator, cx))
+            .expect("every thread has a draft separator");
+        self.cursor_to_row(row.saturating_sub(1), Autoscroll::fit(), cx);
     }
 }
 
 /// The rows of `thread` as `system` holds it.
 fn items(
+    system: &ChatSystem,
+    thread: ThreadId,
+    list: bool,
+    layout: Layout,
+    expanded_quotes: &HashSet<QuoteId>,
+    cx: &App,
+) -> Vec<Item<Key, Class, Meta>> {
+    let mut items = history_items(system, thread, list, expanded_quotes, cx);
+    if !list
+        && let Some(status) = system
+            .status(thread)
+            .map(|status| status.text.clone())
+            .or_else(|| {
+                system
+                    .failed_start(thread)
+                    .and_then(|reason| reason.lines().next())
+                    .map(|reason| format!("did not start: {reason}"))
+            })
+    {
+        items.push(line(Key::Status, &status, Class::Crumb));
+    }
+    items.push(separator_item(&system.project_of(thread), list, layout));
+    items
+}
+
+fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class, Meta> {
+    let label = match (layout, list) {
+        (Layout::Phone, false) => format!("── reply to {project}"),
+        (Layout::Phone, true) => format!("── idea to {project}"),
+        (Layout::Desktop, false) => format!("── reply to {project} · ctrl-enter sends"),
+        (Layout::Desktop, true) => format!(
+            "── idea to {project} · ctrl-enter starts an agent · ctrl-shift-enter only sends"
+        ),
+    };
+    line(Key::Separator, &label, Class::Crumb)
+}
+
+fn history_items(
     system: &ChatSystem,
     thread: ThreadId,
     list: bool,
@@ -534,11 +603,7 @@ fn items(
         });
         let rows = rows.unwrap_or_else(|| thread_rows(system, chat, host, thread.message, None));
         if rows.is_empty() {
-            items.push(line(
-                Key::Gap(u32::MAX),
-                "no threads yet · the composer starts one",
-                Class::Crumb,
-            ));
+            items.push(line(Key::Gap(u32::MAX), "no threads yet", Class::Crumb));
         }
         items.extend(rows);
         gap_item(&mut items);
@@ -749,18 +814,29 @@ fn thread_rows(
 }
 
 impl ThreadView {
+    fn has_draft(&self, cx: &App) -> bool {
+        !self.draft.read(cx).text().trim().is_empty()
+    }
+
+    fn echo_empty_draft(&self, cx: &mut App) {
+        self.system.read(cx).frame.clone().echo(
+            "send: nothing written",
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
     /// In a channel, the idea goes to the agents system, which sends it
     /// and starts an agent from it; in a thread, the reply goes out.
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_list(self.system.read(cx)) {
             return self.send_only(&SendOnly, window, cx);
         }
-        if self.composer.read(cx).text(cx).trim().is_empty() {
+        if !self.has_draft(cx) {
+            self.echo_empty_draft(cx);
             return;
         }
-        // The keys go back to the messages, as `escape` takes them: the
-        // next `i` writes a new message, never into this one.
-        self.focus_log(&FocusLog, window, cx);
+        thread::enter_normal_mode(&self.editor, window, cx);
         let thread = self.thread;
         self.system.update(cx, |_, cx| {
             cx.emit(Event::Idea {
@@ -772,16 +848,14 @@ impl ThreadView {
     }
 
     fn send_only(&mut self, _: &SendOnly, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text(cx);
+        let text = self.draft.read(cx).text();
         if text.trim().is_empty() {
+            self.echo_empty_draft(cx);
             return;
         }
         let thread = self.thread;
         let list = self.is_list(self.system.read(cx));
-        let reply_to = match self.focused {
-            Focused::Composer => self.reply_to.take(),
-            Focused::Log => self.current_reply_target(cx),
-        };
+        let reply_to = self.current_reply_target(cx);
         let client_id = self.system.update(cx, |system, cx| {
             let client_id = match reply_to {
                 Some(mail) => system.reply(thread, mail, text, cx),
@@ -790,12 +864,11 @@ impl ThreadView {
             system.set_draft(thread.host, Some(thread.message), String::new());
             client_id
         });
-        self.composer
-            .update(cx, |composer, cx| composer.clear(window, cx));
-        self.focus_log(&FocusLog, window, cx);
+        thread::enter_normal_mode(&self.editor, window, cx);
+        self.clear_draft(cx);
         self.dealt_mail = None;
         self.refresh(cx);
-        self.cursor_to_end(cx);
+        self.cursor_to_latest_mail(cx);
         // In a channel the message is a new thread: the cursor goes to it in
         // the list, on its way and then where the list puts it, so `enter`
         // opens it.
@@ -804,19 +877,100 @@ impl ThreadView {
         }
     }
 
-    fn focus_composer(&mut self, _: &FocusComposer, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focused != Focused::Composer {
-            self.reply_to = self.current_reply_target(cx);
+    /// Place the point at the tapped column, including at the end of a
+    /// line. A tap on the separator starts at the beginning of the draft.
+    fn tap_tail(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left || event.modifiers.modified() {
+            return;
         }
-        self.focused = Focused::Composer;
-        window.focus(&self.composer.focus_handle(cx), cx);
-        cx.notify();
+        let position = match draft::hit(
+            self.editor.read(cx),
+            self.transcript.buffer(),
+            &self.draft,
+            event.position,
+            cx,
+        ) {
+            Some(draft::Hit::Text(anchor)) => Some(anchor),
+            Some(draft::Hit::Separator) => None,
+            None => return,
+        };
+        self.focus_draft(position, window, cx);
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
-    fn focus_log(&mut self, _: &FocusLog, window: &mut Window, cx: &mut Context<Self>) {
-        self.focused = Focused::Log;
-        window.focus(&self.log.focus_handle(cx), cx);
-        cx.notify();
+    fn focus_draft(&self, position: Option<Anchor>, window: &mut Window, cx: &mut Context<Self>) {
+        draft::focus(&self.editor, self.transcript.buffer(), position, window, cx);
+    }
+
+    fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
+        let range = {
+            let editor = self.editor.read(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let selections = editor.selections.disjoint_anchors();
+            let first = selections.first().expect("the editor has a selection");
+            let last = selections.last().expect("the editor has a selection");
+            selected_lines(first.start.to_point(&snapshot)..last.end.to_point(&snapshot))
+        };
+        let mail = self
+            .transcript
+            .line_meta(*range.start(), cx)
+            .and_then(Meta::mail);
+        if self.is_list(self.system.read(cx))
+            || mail.is_none()
+            || !range
+                .clone()
+                .all(|row| self.transcript.line_meta(row, cx).and_then(Meta::mail) == mail)
+        {
+            self.system.read(cx).frame.clone().echo(
+                "select lines in one mail to quote",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+
+        if let Some(mail) = self.selected_reply_target(*range.start(), cx) {
+            self.reply_to = Some(mail);
+        }
+        let history = self.transcript.buffer().read(cx);
+        let start = history.point_to_offset(Point::new(*range.start(), 0));
+        let end = history.point_to_offset(Point::new(*range.end(), history.line_len(*range.end())));
+        let selected = history.text_for_range(start..end).collect::<String>();
+        let draft = self.draft.read(cx);
+        let quote = quote_lines(&selected, draft.len() > 0 && draft.max_point().column > 0);
+
+        thread::enter_normal_mode(&self.editor, window, cx);
+        self.editor.update(cx, |editor, cx| {
+            let end = editor.buffer().read(cx).snapshot(cx).max_point();
+            editor.finalize_last_transaction(cx);
+            editor.transact(window, cx, |editor, window, cx| {
+                editor.edit([(end..end, quote)], cx);
+                let end = editor.buffer().read(cx).snapshot(cx).max_point();
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::fit()),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges([end..end]);
+                    },
+                );
+            });
+            editor.finalize_last_transaction(cx);
+        });
+    }
+
+    fn redo_draft_or_undo_verdict(
+        &mut self,
+        _: &RedoDraftOrUndoVerdict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
+            window.dispatch_action(Box::new(editor::actions::Redo), cx);
+        } else {
+            window.dispatch_action(Box::new(rho_frame::keys::UndoVerdict), cx);
+        }
     }
 
     /// Enter opens the thing under the point: a quote, link, tangent or crumb.
@@ -862,6 +1016,30 @@ impl ThreadView {
             self.cursor_to_row(row, Autoscroll::fit(), cx);
         }
     }
+}
+
+/// Visual line selections end at the start of the next line; that line
+/// isn't selected. A single empty line still counts as one selected line.
+fn selected_lines(range: Range<Point>) -> std::ops::RangeInclusive<u32> {
+    let end = if range.end.column == 0 && range.start.row < range.end.row {
+        range.end.row - 1
+    } else {
+        range.end.row
+    };
+    range.start.row..=end
+}
+
+fn quote_lines(text: &str, separate: bool) -> String {
+    let mut quote = String::new();
+    if separate {
+        quote.push('\n');
+    }
+    for line in text.split('\n') {
+        quote.push_str("> ");
+        quote.push_str(line);
+        quote.push('\n');
+    }
+    quote
 }
 
 /// What a private reply or a tangent lands on.
@@ -938,21 +1116,8 @@ fn body(content: &[ContentPart]) -> String {
     text.trim_end().to_owned()
 }
 
-/// An explicitly selected incoming mail overrides the dealt mail. From a
-/// gap (or the user's own text), a reply still answers the dealt mail.
-fn reply_target<'a>(
-    point: Option<&Meta>,
-    dealt: Option<MessageId>,
-    mail: impl Fn(MessageId) -> Option<&'a Message>,
-) -> Option<MessageId> {
-    point
-        .and_then(Meta::mail)
-        .into_iter()
-        .chain(dealt)
-        .find(|id| {
-            mail(*id)
-                .is_some_and(|mail| mail.from != Party::User && mail.revision != Revision::Deleted)
-        })
+fn incoming(mail: Option<&Message>) -> bool {
+    mail.is_some_and(|mail| mail.from != Party::User && mail.revision != Revision::Deleted)
 }
 
 fn message_item(
@@ -1035,27 +1200,23 @@ impl Surface for ThreadView {
         }
     }
 
-    fn show_card(&mut self, card: &Card, _window: &mut Window, cx: &mut Context<Self>) {
+    fn show_card(&mut self, card: &Card, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mail) = cards::attention_mail(&card.cursor) else {
             return;
         };
         self.dealt_mail = Some(mail);
-        self.focused = Focused::Log;
+        thread::enter_normal_mode(&self.editor, window, cx);
         self.cursor_to_item(&Key::Message(mail), Autoscroll::focused(), cx);
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
-        Some(match self.focused {
-            Focused::Log => self.log.clone(),
-            Focused::Composer => self.composer.clone(),
-        })
+        Some(self.editor.clone())
     }
 
-    /// The message under the point, as the thread it anchors: any message
-    /// is what an agent starts from or a name goes on. The thread itself
-    /// from its head, the composer, or nothing in particular.
+    /// A mail under the point anchors a tangent; the draft belongs to the
+    /// whole thread rather than to any particular row.
     fn subject(&self, cx: &App) -> Subject {
-        if self.focused == Focused::Composer {
+        if self.cursor_row(cx) >= draft::start(self.transcript.buffer(), cx).row {
             return Subject::Own;
         }
         line_subject(
@@ -1079,8 +1240,8 @@ impl Surface for ThreadView {
         let this = cx.entity();
         Some(Rc::new(move |window, cx| {
             this.update(cx, |view, cx| {
-                if view.composer.read(cx).text(cx).trim().is_empty() {
-                    view.focus_composer(&FocusComposer, window, cx);
+                if !view.has_draft(cx) {
+                    view.focus_draft(None, window, cx);
                 } else {
                     view.send_only(&SendOnly, window, cx);
                 }
@@ -1180,12 +1341,10 @@ impl Surface for ThreadView {
                 )),
             }
             // The thumb's Open action mirrors Enter, including on a quote.
-            if self.focused == Focused::Log
-                && matches!(
-                    self.transcript.line_meta(self.cursor_row(cx), cx),
-                    Some(Meta::Quote(_) | Meta::Thread(_) | Meta::Open(_))
-                )
-            {
+            if matches!(
+                self.transcript.line_meta(self.cursor_row(cx), cx),
+                Some(Meta::Quote(_) | Meta::Thread(_) | Meta::Open(_))
+            ) {
                 rows.push(Row::run("enter", "open", move |_, window, cx| {
                     this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
                 }));
@@ -1211,97 +1370,40 @@ impl Surface for ThreadView {
 
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match self.focused {
-            Focused::Log => self.log.focus_handle(cx),
-            Focused::Composer => self.composer.focus_handle(cx),
-        }
+        self.editor.focus_handle(cx)
     }
 }
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The keyboard moving by mouse or by the frame counts as much as
-        // by key: whichever editor has it is the one the chrome reads.
-        if self.composer.focus_handle(cx).is_focused(window) {
-            if self.focused != Focused::Composer {
-                self.reply_to = self.current_reply_target(cx);
-            }
-            self.focused = Focused::Composer;
-        } else if self.log.focus_handle(cx).is_focused(window) {
-            self.focused = Focused::Log;
-        }
-        let list = self.is_list(self.system.read(cx));
-        let hint = match (list, Layout::of(window.viewport_size().width)) {
-            (false, Layout::Phone) => "reply",
-            (true, Layout::Phone) => "idea",
-            (false, Layout::Desktop) => thread::PLACEHOLDER,
-            (true, Layout::Desktop) => thread::CHANNEL_PLACEHOLDER,
-        };
-        let text_style = self.composer.update(cx, |composer, cx| {
-            if composer.placeholder_text(cx).as_deref() != Some(hint) {
-                composer.set_placeholder_text(hint, window, cx);
-            }
-            composer.style(cx).text.clone()
-        });
-        let colors = cx.theme().colors();
         let system = self.system.read(cx);
-        let status = (!list)
-            .then(|| {
-                system
-                    .status(self.thread)
-                    .map(|status| status.text.clone())
-                    .or_else(|| {
-                        system
-                            .failed_start(self.thread)
-                            .and_then(|reason| reason.lines().next())
-                            .map(|reason| format!("did not start: {reason}"))
-                    })
-            })
-            .flatten();
+        let list = self.is_list(system);
+        let layout = Layout::of(window.viewport_size().width);
+        if layout != self.layout {
+            self.layout = layout;
+            let label = separator_item(&system.project_of(self.thread), list, layout);
+            self.transcript.replace(&Key::Separator, label, cx);
+        }
+        let context = if list {
+            thread::PROJECT_SCREEN
+        } else {
+            thread::SCREEN
+        };
         div()
-            .key_context(thread::SCREEN)
+            .id("thread")
+            .key_context(context)
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(colors.editor_background)
+            .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::send_only))
-            .on_action(cx.listener(Self::focus_composer))
-            .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::open_row))
-            .child(
-                div()
-                    .key_context(thread::LOG)
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.log.clone()),
-            )
-            .children(status.map(|status| {
-                div()
-                    .id("thread-status")
-                    .w_full()
-                    .flex_none()
-                    .px_2()
-                    .py_1()
-                    .truncate()
-                    .font_family(text_style.font_family)
-                    .font_weight(text_style.font_weight)
-                    .text_size(text_style.font_size)
-                    .line_height(text_style.line_height)
-                    .text_color(colors.text_muted)
-                    .child(status)
-            }))
-            .child(
-                div()
-                    .key_context(thread::COMPOSER)
-                    .flex_none()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(colors.border_variant)
-                    .px_2()
-                    .py_1()
-                    .child(self.composer.clone()),
-            )
+            .on_action(cx.listener(Self::quote_selection))
+            .on_action(cx.listener(Self::redo_draft_or_undo_verdict))
+            // The editor consumes text mouse-down even when its native
+            // selection is disabled. Capture the draft's pointer down
+            // before it; GPUI also routes a completed tap this way.
+            .capture_any_mouse_down(cx.listener(Self::tap_tail))
+            .child(self.editor.clone())
     }
 }
 
@@ -1358,48 +1460,31 @@ mod tests {
     }
 
     #[test]
-    fn replies_target_the_selected_incoming_mail_or_fall_back_to_the_dealt_ask() {
+    fn only_incoming_nondeleted_mail_can_receive_a_reply() {
         let agent = AgentId::from_counter(19, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let ask = mail(Party::Agent(agent), Revision::Original, "Ship it?");
-        let next = Message {
-            id: MessageId(rho_agent_types::ChatSeq(24)),
-            ..mail(
-                Party::Agent(agent),
-                Revision::Edited,
-                "Use the release branch.",
-            )
-        };
-        let user = Message {
-            id: MessageId(rho_agent_types::ChatSeq(25)),
-            ..mail(Party::User, Revision::Original, "Not yet.")
-        };
-        let removed = Message {
-            id: MessageId(rho_agent_types::ChatSeq(26)),
-            ..mail(Party::Agent(agent), Revision::Deleted, "Removed.")
-        };
-        let lookup = |id| {
-            [&ask, &next, &user, &removed]
-                .into_iter()
-                .find(|message| message.id == id)
-        };
-        assert_eq!(reply_target(None, Some(ask.id), lookup), Some(ask.id));
-        assert_eq!(
-            reply_target(Some(&Meta::Mail(user.id)), Some(ask.id), lookup),
-            Some(ask.id)
+        let incoming_mail = mail(
+            Party::Agent(agent),
+            Revision::Edited,
+            "Use the release branch.",
         );
-        let quote = Meta::Quote(QuoteId {
-            mail: next.id,
-            first_line: 2,
-        });
+        let sent = mail(Party::User, Revision::Original, "Not yet.");
+        let removed = mail(Party::Agent(agent), Revision::Deleted, "Removed.");
+        assert!(incoming(Some(&incoming_mail)));
+        assert!(!incoming(Some(&sent)));
+        assert!(!incoming(Some(&removed)));
+        assert!(!incoming(None));
+    }
+
+    #[test]
+    fn quoting_a_linewise_selection_omits_the_next_line_and_preserves_blank_lines() {
+        assert_eq!(selected_lines(Point::new(2, 0)..Point::new(5, 0)), 2..=4);
+        assert_eq!(selected_lines(Point::new(2, 4)..Point::new(5, 3)), 2..=5);
+        assert_eq!(selected_lines(Point::new(2, 0)..Point::new(2, 0)), 2..=2);
         assert_eq!(
-            reply_target(Some(&quote), Some(ask.id), lookup),
-            Some(next.id)
+            quote_lines("before\n\nafter", true),
+            "\n> before\n> \n> after\n"
         );
-        assert_eq!(
-            reply_target(Some(&Meta::Mail(removed.id)), Some(ask.id), lookup),
-            Some(ask.id)
-        );
-        assert_eq!(reply_target(Some(&Meta::Mail(user.id)), None, lookup), None);
+        assert_eq!(quote_lines("first", false), "> first\n");
     }
 
     #[test]

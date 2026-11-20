@@ -27,7 +27,7 @@ actions!(
         Desk,
         OpenRow,
         PromptIdea,
-        EditIdea,
+        RedoIdeaOrUndoVerdict,
         SendIdea,
         CancelIdea,
         /// `/`: search forward in what is in view.
@@ -126,17 +126,26 @@ fn bindings() -> Vec<KeyBinding> {
         ]);
     }
 
-    for context in normal_contexts("RhoDesk", "") {
+    for context in normal_contexts("RhoDesk", " && vim_operator == none") {
         bindings.extend([
             KeyBinding::new("enter", OpenRow, Some(&context)),
-            KeyBinding::new("i", EditIdea, Some(&context)),
+            KeyBinding::new("shift-u", RedoIdeaOrUndoVerdict, Some(&context)),
         ]);
+    }
+    for context in normal_contexts("RhoIdeaUnaddressed", " && vim_operator == none") {
+        for key in ["i", "shift-i", "a", "shift-a", "o", "shift-o"] {
+            bindings.push(KeyBinding::new(key, PromptIdea, Some(&context)));
+        }
     }
     bindings.extend([
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
-        KeyBinding::new("enter", editor::actions::Newline, Some("RhoIdea > Editor")),
-        KeyBinding::new("escape", CancelIdea, Some("RhoIdea > Editor")),
-        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),
+        KeyBinding::new(
+            "enter",
+            editor::actions::Newline,
+            Some("RhoIdeaOverlay > Editor"),
+        ),
+        KeyBinding::new("escape", CancelIdea, Some("RhoIdeaOverlay > Editor")),
+        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdeaOverlay > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),
