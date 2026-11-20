@@ -157,5 +157,11 @@ reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 The historical review above was of Start a thread. Start an agent from a message was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
+## rule the project's last mail is live
+status: not built; agents send a new mail for each change.
+when: the project has written a mail that the user has not answered
+then: that mail is live: the project edits it as the work changes, and the user sees `edited`; a new mail comes only when the live one has been answered, or for a different question, which is a tangent. An answered mail is frozen.
+why: a thread of ten mails that each supersede the last is a feed; one live mail is a state the user can read in one look.
+
 ## rule a cold mail stands alone
 when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; cold `Mail` stands alone by quoting rather than repeating, and warm mail is short.
