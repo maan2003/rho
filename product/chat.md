@@ -101,8 +101,59 @@ starts: `Start a thread`, `Answer an agent`
 With no threads yet, the channel reads `no threads yet · the composer starts one`.
 
 ## screen Thread
-shows: `Thread`, `Message`, `Draft` in the box to write in, `notes.Private reply`, `agents.Agent` in the `with` line
+answers: what was said here last, who is at work on it and how it goes, and whether the user owes an answer.
+shows:
+- the newest `Message`s, and the user's own place among them
+- the `with` line: each `agents.Agent` in the thread, what it is doing and for how long, such as `working 12m` or `failed 1h`
+- the first `Message`, the brief every agent started from
+- under a `Message` with replies, `↳ 2 replies · name · time`
+- the line of threads above this one, such as `fedi`, when there is one
+- the box to write in, holding the `Draft`, `message · ctrl-enter sends` while empty
+- the `window.Status line`: the thread's name, with its host before it when more than one is attached, and the card's words such as `asks · 2h` when the thread is one
+- a `notes.Private reply` under the message it answers, marked `🔒 you`
+states:
+- empty: a thread with only its first message and no agent: that message, no `with` line, the box
+- loading: the host is back but its chat is not here yet: `this host's chat is not held here`; a host on its way back says `reconnecting · 12s` on the status line
+- partial: a message of the user the host does not have yet reads `you · sending…`; one written while the host was away waits the same way until it is back
+- error: a thread the host no longer has: `this thread is gone`; in Slack, a failed send reads `send failed · Enter retries` under the box
+- full: the mock
+keys:
+- `i`, or `ctrl-down`: write; `escape`, or `ctrl-up`: back to the messages
+- `ctrl-enter`: send
+- `enter`: open what the cursor is on: the replies under a message, the thread above, an agent in the `with` line
+- `space`: the verdicts on this thread's card, `deal.Verdict`
+- `:`: the palette, with this thread's commands and, with the cursor on the `with` line, that agent's steering commands, `window.Palette`
+- `ctrl-k`, `tab`, `q`: back, home, close, `window.Screen`
 starts: `Answer an agent`, `slack.Answer Slack`, `agents.Start an agent from a message`, `notes.Reply privately`
+mock:
+```
+fedi › flaky test                                       asks · 2h             NOR
+fedi
+you · 09:12
+hey, fix the flaky test in sync_tests.rs, it fails one run in five
+with eng-q9tz · working 12m, eng-kjhi · failed 1h
+
+q9tz45g2bcvs · 09:13
+Reading sync_tests.rs. The failure is a race on the clock mock.
+  ↳ 2 replies · race on the clock mock · 09:40
+
+kjhi7w2mv4rd · 09:21
+Trying the fix on the branch. The suite is green so far.
+
+q9tz45g2bcvs · 09:52
+The mock must be per test. Two ways: a fixture, or a clock passed in.
+Which one?
+
+🔒 you · 09:53
+check the clock in sync_tests.rs is the same one the API uses
+
+you · sending…
+the fixture
+
+message · ctrl-enter sends
+```
+The last line is the box; the cursor lands in the messages, on the newest one. A `Channel` is the same screen with the list of its threads where the messages are, as its own `## screen` says.
+
 
 When a Slack conversation opens while it asks for the user, the cursor lands on the oldest message from someone else that the user has not dealt with.
 
