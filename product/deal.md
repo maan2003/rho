@@ -48,7 +48,7 @@ does:
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
 ## flow Clear what waits
-status: a host card opens at the newest message, not the mail that asks; a reply clears a host thread, and an empty deal opens Home.
+status: an empty deal opens Home rather than the desk.
 runs: 50 a day
 day: Know what wants them, and where they were.
 when: the user has a few minutes and wants to clear what asks for them

@@ -15,7 +15,7 @@ because: the user only needs what asks for them or returns a result, not each ag
 costs: a failure can still ask for the user when they have nothing to add.
 
 ## journey An idea becomes a merged result
-status: ideas are written in channels, agents answer in their own names, and result cards can expire without proof or a reply.
+status: ideas are written in channels, and a result carries no proof yet.
 goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:
@@ -55,7 +55,7 @@ does:
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
-status: a host message shows the agent's own name as sender; agents can edit and delete their own mails and an answered ask is protected, but the window does not yet show `edited` or proof on a result.
+status: a result does not yet carry designated proof.
 purpose: carry a brief, an ask, or a result in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the user or the project's address as sender, the time, the words, what the mail quotes, `edited` after an edit, and proof on a result.
@@ -143,7 +143,7 @@ Release notes                                                  Checking the link
 ```
 
 ## flow Answer a mail
-status: the user replies in host chat; a thread opens at its newest message and a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
+status: a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
 runs: 100 a day
 day: Keep the work moving.
 when: a project or the Slack bot has something that asks for the user, or the user opens a result
