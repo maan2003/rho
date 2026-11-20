@@ -285,7 +285,12 @@ impl rho_frame::System for PageSystem {
         true
     }
 
-    fn name(&self, address: &Address, _cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_dealer::Marks,
+        _cx: &App,
+    ) -> Option<(String, String)> {
         let page = PageId::from_address(address)?;
         Some((title(page), "web".to_owned()))
     }

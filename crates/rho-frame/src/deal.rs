@@ -53,7 +53,16 @@ impl Frame {
         self.systems
             .iter()
             .find(|system| system.opens(address, cx))
-            .and_then(|system| system.name(address, cx))
+            .and_then(|system| system.name(address, &self.attention.marks, cx))
+    }
+
+    /// The screen that shows `address` as one of its lines, from the
+    /// system that owns it.
+    pub fn shown_in(&self, address: &Address, cx: &gpui::App) -> Option<Address> {
+        self.systems
+            .iter()
+            .find(|system| system.opens(address, cx))
+            .and_then(|system| system.shown_in(address, cx))
     }
 
     fn with_sources<R>(
@@ -144,13 +153,9 @@ impl Frame {
         {
             return card.clone();
         }
-        // A note is called by its first line.
-        let (title, context) = match self.attention.marks.get(address).title() {
-            "" => self
-                .name_of(address, cx)
-                .unwrap_or_else(|| (address.key().to_owned(), String::new())),
-            title => (title.to_owned(), String::new()),
-        };
+        let (title, context) = self
+            .name_of(address, cx)
+            .unwrap_or_else(|| (address.key().to_owned(), String::new()));
         Card {
             address: address.clone(),
             title,

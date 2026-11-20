@@ -127,6 +127,8 @@ impl rho_transcript::Style for Class {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Meta {
     None,
+    /// The message the thread hangs under: the thread's own.
+    Head,
     /// A message under the thread: Enter opens the thread under it.
     Message(MessageId),
     Open(Address),
@@ -271,14 +273,26 @@ impl ThreadView {
         let items = items(system, thread, cx);
         view.transcript.reconcile(items, cx);
         if is_root(system, thread) {
-            // The list reads from the top. What is unread in it comes from
-            // the ledger, which is the frame's and is leased while it opens
-            // this: the first rows go without it, and the next draw has it.
+            // The list reads from the top.
             view.cursor_to_first_thread(cx);
-            cx.defer_in(window, |this, _, cx| this.refresh(cx));
         } else {
             view.cursor_to_end(cx);
         }
+        // What is unread and the user's private replies come from the
+        // ledger, which is the frame's and is leased while it opens this:
+        // the rows are read again as soon as that is over, before the
+        // first draw. Not `defer_in`: that runs inside the window's update,
+        // where the frame cannot be read.
+        let this = cx.weak_entity();
+        let list = is_root(system, thread);
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.refresh(cx);
+                if list {
+                    this.cursor_to_first_thread(cx);
+                }
+            });
+        });
         view
     }
 
@@ -430,7 +444,7 @@ fn items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class
     if let Some(message) = chat.message(thread.message)
         && !list
     {
-        items.push(message_item(message, Meta::None));
+        items.push(message_item(message, Meta::Head));
         items.extend(private.remove(&thread.message).unwrap_or_default());
     }
     if !head.members.is_empty() {
@@ -790,10 +804,28 @@ impl ThreadView {
                 Some(agent) => AgentRef(agent).address(),
                 None => return,
             },
-            Some(Meta::None) | None => return,
+            Some(Meta::None | Meta::Head) | None => return,
         };
         let frame = self.system.read(cx).frame.clone();
         frame.open(address, cx);
+    }
+}
+
+/// What the point is on, on a line of `thread` that holds `meta`: a
+/// message, or the thread itself on its head. On a line that is no
+/// message, such as a gap, a crumb, or a private reply, it is on nothing
+/// a remark could be under.
+fn line_subject(meta: Option<&Meta>, thread: ThreadId) -> Subject {
+    match meta {
+        Some(Meta::Message(id)) if *id != thread.message => Subject::Address(
+            ThreadId {
+                host: thread.host,
+                message: *id,
+            }
+            .address(),
+        ),
+        Some(Meta::Message(_) | Meta::Head) => Subject::Own,
+        Some(Meta::None | Meta::Open(_) | Meta::Agents(_)) | None => Subject::None,
     }
 }
 
@@ -904,16 +936,10 @@ impl Surface for ThreadView {
         if let Some(agent) = self.agent_under_cursor(cx) {
             return Subject::Address(AgentRef(agent).address());
         }
-        match self.transcript.line_meta(self.cursor_row(cx), cx) {
-            Some(Meta::Message(id)) if *id != self.thread.message => Subject::Address(
-                ThreadId {
-                    host: self.thread.host,
-                    message: *id,
-                }
-                .address(),
-            ),
-            _ => Subject::Own,
-        }
+        line_subject(
+            self.transcript.line_meta(self.cursor_row(cx), cx),
+            self.thread,
+        )
     }
 
     /// The thread the subject is in, as the dealer counts threads: in a
@@ -1032,6 +1058,37 @@ mod tests {
             },
         ];
         assert_eq!(body(&content), "hello\n[image · image/png]");
+    }
+
+    /// `reply privately` lands on what the point is on: a message, or the
+    /// thread on its head, and nothing on the blank line under `with`.
+    #[test]
+    fn the_point_is_on_a_message_only_on_a_message_line() {
+        let host = EndpointId([7; 32]);
+        let thread = ThreadId {
+            host,
+            message: MessageId(rho_agent_types::ChatSeq(10)),
+        };
+        let child = MessageId(rho_agent_types::ChatSeq(12));
+        assert_eq!(line_subject(Some(&Meta::Head), thread), Subject::Own);
+        assert_eq!(
+            line_subject(Some(&Meta::Message(child)), thread),
+            Subject::Address(
+                ThreadId {
+                    host,
+                    message: child
+                }
+                .address()
+            )
+        );
+        for nothing in [
+            Some(Meta::None),
+            Some(Meta::Open(Address::new("note", "x"))),
+            Some(Meta::Agents(Vec::new())),
+            None,
+        ] {
+            assert_eq!(line_subject(nothing.as_ref(), thread), Subject::None);
+        }
     }
 
     #[test]

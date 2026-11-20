@@ -606,7 +606,13 @@ impl System for ChatSystem {
                 }
             }));
         }
-        if let Some(thread) = point.subject.as_ref().and_then(|a| self.thread_of(a)) {
+        // The thread under the point, or, on a line that is no message, the
+        // thread in view.
+        let thread = match &point.subject {
+            Some(subject) => self.thread_of(subject),
+            None => self.thread_of(&point.surface),
+        };
+        if let Some(thread) = thread {
             let current = self
                 .chats
                 .get(&thread.host)
@@ -697,9 +703,34 @@ impl System for ChatSystem {
         claims
     }
 
-    fn name(&self, address: &Address, cx: &App) -> Option<(String, String)> {
+    fn name(
+        &self,
+        address: &Address,
+        _marks: &rho_dealer::Marks,
+        cx: &App,
+    ) -> Option<(String, String)> {
         let thread = self.thread_of(address)?;
         self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+    }
+
+    /// A message is read in the thread it was posted under, where a private
+    /// reply about it shows; a thread straight under a channel is read in
+    /// its own screen, under its head.
+    fn shown_in(&self, address: &Address, _cx: &App) -> Option<Address> {
+        let thread = self.thread_of(address)?;
+        let chat = self.chats.get(&thread.host)?;
+        let parent = chat.message(thread.message)?.parent?;
+        let in_channel = chat
+            .message(parent)
+            .is_some_and(|parent| parent.parent.is_none());
+        let message = if in_channel { thread.message } else { parent };
+        Some(
+            ThreadId {
+                host: thread.host,
+                message,
+            }
+            .address(),
+        )
     }
 
     /// What is unread moved: a root's list reads the marks on its next

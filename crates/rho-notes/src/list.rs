@@ -18,7 +18,7 @@ use rho_frame::{FrameLink, Row, Subject, Surface};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use crate::{NoteSystem, listed};
+use crate::{Listed, NoteSystem, listed};
 
 gpui::actions!(
     rho_notes,
@@ -39,7 +39,7 @@ enum Key {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Class {
+pub(crate) enum Class {
     Title,
     Muted,
 }
@@ -83,8 +83,8 @@ pub struct NotesView {
     frame: FrameLink,
     transcript: Transcript<Key, Class, Option<Address>>,
     editor: Entity<Editor>,
-    /// The notes as last read: each address and first line, in order.
-    notes: Option<Vec<(Address, String)>>,
+    /// The notes as last read, in order.
+    notes: Option<Vec<Listed>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -135,7 +135,13 @@ impl NotesView {
 
     /// Brings the list up to the marks.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(notes) = self.frame.read(cx, |frame, _| listed(frame.marks())) else {
+        let Some(notes) = self.frame.read(cx, |frame, cx| {
+            // A reply is listed with the thread it shows in, by name.
+            listed(frame.marks(), |about| {
+                let shown_in = frame.shown_in(about, cx).unwrap_or_else(|| about.clone());
+                frame.name_of(&shown_in, cx).map(|(name, _)| name)
+            })
+        }) else {
             return;
         };
         if self.notes.as_ref() == Some(&notes) {
@@ -182,25 +188,44 @@ impl NotesView {
     }
 }
 
-/// The notes as transcript items: one line each, its first line.
-fn items(notes: &[(Address, String)]) -> Vec<Item<Key, Class, Option<Address>>> {
+/// What `notes` reads with no note in it.
+const EMPTY: &str = "  no notes yet · new note from the palette (:)";
+
+/// The notes as transcript items: one line each, its first line, and for
+/// a private reply, dim, where it shows.
+fn items(notes: &[Listed]) -> Vec<Item<Key, Class, Option<Address>>> {
     if notes.is_empty() {
-        let text = "  no notes yet";
         return vec![
-            Item::new(Key::Empty, text)
-                .with_styles(vec![(Class::Muted, 0..text.len())])
+            Item::new(Key::Empty, EMPTY)
+                .with_styles(vec![(Class::Muted, 0..EMPTY.len())])
                 .with_lines(vec![None]),
         ];
     }
     notes
         .iter()
-        .map(|(address, title)| {
-            let text = format!("  {title}");
-            Item::new(Key::Note(address.clone()), text.clone())
-                .with_styles(vec![(Class::Title, 2..text.len())])
-                .with_lines(vec![Some(address.clone())])
+        .map(|listed| {
+            let (text, styles) = row(listed);
+            Item::new(Key::Note(listed.note.clone()), text)
+                .with_styles(styles)
+                .with_lines(vec![Some(listed.note.clone())])
         })
         .collect()
+}
+
+/// A note's line in `notes` and how it is styled.
+pub(crate) fn row(listed: &Listed) -> (String, Vec<(Class, std::ops::Range<usize>)>) {
+    let mut text = format!("  {}", listed.title);
+    let mut styles = vec![(Class::Title, 2..text.len())];
+    if let Some(place) = &listed.reply {
+        text.push_str("  ");
+        let start = text.len();
+        match place {
+            Some(name) => text.push_str(&format!("↳ in {name}")),
+            None => text.push_str("↳ private reply"),
+        }
+        styles.push((Class::Muted, start..text.len()));
+    }
+    (text, styles)
 }
 
 impl Surface for NotesView {

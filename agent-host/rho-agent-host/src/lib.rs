@@ -1286,10 +1286,14 @@ impl Services {
         Ok(resolved)
     }
 
-    /// Where the agent works: its workset's root.
+    /// Where the agent works, as it sees it: its own directory, else its
+    /// workset's root. A terminal or shell beside it starts there.
     fn cwd_of(&self, agent: AgentId) -> anyhow::Result<Utf8PathBuf> {
         let read = self.db.read();
         let head = read.agent(agent).context("no such agent")?;
+        if let Some(cwd) = rho_agent_types::agent_cwd(&head.spec.props) {
+            return Ok(cwd.to_owned());
+        }
         let workset = read.workset(head.workset).context("no such workset")?;
         Ok(rho_agent::host::pool::workset_root(&workset.kind))
     }

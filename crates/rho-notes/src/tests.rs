@@ -150,7 +150,9 @@ fn a_new_note_is_about_where_it_was_made_or_nothing() {
 
 /// `notes` lists every note, a reply under something too, by its first
 /// line, the one last written first: an older note edited last goes on
-/// top, a deleted one goes, and one never typed into is not there yet.
+/// top, a deleted one goes, and one never typed into is not there yet. A
+/// reply says where it shows, by the name `place` gives, or that it is a
+/// reply when nothing names the place.
 #[test]
 fn notes_lists_every_note_last_written_first() {
     let mut world = World::default();
@@ -159,6 +161,11 @@ fn notes_lists_every_note_last_written_first() {
     world.say(Fact::About {
         node: reply.address(),
         about: Some(thread(7)),
+    });
+    let stray = world.note("about a thread no host names");
+    world.say(Fact::About {
+        node: stray.address(),
+        about: Some(thread(8)),
     });
     let newer = world.note("");
     let gone = world.note("gone");
@@ -169,12 +176,57 @@ fn notes_lists_every_note_last_written_first() {
         about: Some(thread(7)),
     });
     world.write(older, "older, edited last", false);
+    let place = |about: &Address| (*about == thread(7)).then(|| "fix the flaky test".to_owned());
+    let listed = |note: NoteId, title: &str, reply: Option<Option<&str>>| Listed {
+        note: note.address(),
+        title: title.to_owned(),
+        reply: reply.map(|place| place.map(str::to_owned)),
+    };
     assert_eq!(
-        listed(&world.marks),
+        super::listed(&world.marks, place),
         [
-            (older.address(), "older, edited last".to_owned()),
-            (newer.address(), UNTITLED.to_owned()),
-            (reply.address(), "a reply".to_owned()),
+            listed(older, "older, edited last", None),
+            listed(newer, UNTITLED, None),
+            listed(stray, "about a thread no host names", Some(None)),
+            listed(reply, "a reply", Some(Some("fix the flaky test"))),
         ]
     );
+}
+
+/// A reply's line reads its first line, then, dim, where it shows; a note
+/// about nothing is its first line alone.
+#[test]
+fn a_reply_says_where_it_shows() {
+    let note = NoteId(uuid::Uuid::new_v4()).address();
+    let row = |reply: Option<Option<&str>>| {
+        list::row(&Listed {
+            note: note.clone(),
+            title: "verify on CI too".to_owned(),
+            reply: reply.map(|place| place.map(str::to_owned)),
+        })
+    };
+    let (text, styles) = row(Some(Some("fix the flaky test")));
+    assert_eq!(text, "  verify on CI too  ↳ in fix the flaky test");
+    let dim: Vec<_> = styles
+        .iter()
+        .filter(|(class, _)| *class == list::Class::Muted)
+        .map(|(_, range)| &text[range.clone()])
+        .collect();
+    assert_eq!(dim, ["↳ in fix the flaky test"]);
+    assert_eq!(row(Some(None)).0, "  verify on CI too  ↳ private reply");
+    let (text, styles) = row(None);
+    assert_eq!(text, "  verify on CI too");
+    assert!(styles.iter().all(|(class, _)| *class != list::Class::Muted));
+}
+
+/// The title follows the first line as it is typed, before it is written.
+#[test]
+fn a_note_is_called_by_its_first_line() {
+    assert_eq!(
+        title_of("Ask Sam about the freeze\nbefore Friday"),
+        "Ask Sam about the freeze"
+    );
+    assert_eq!(title_of("  padded  \nrest"), "padded");
+    assert_eq!(title_of(""), UNTITLED);
+    assert_eq!(title_of("\nsecond line only"), UNTITLED);
 }
