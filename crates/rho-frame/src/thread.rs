@@ -1,6 +1,5 @@
 //! The keys of a thread screen, the same on every thread the window
-//! shows: a channel or a thread on a host, and a Slack conversation or a
-//! Slack thread (`chat.Thread` in the product model).
+//! shows, whether a channel or a thread on a host.
 //!
 //! A thread screen is the messages, an editor drawn under [`LOG`], above a
 //! box to write in, an editor drawn under [`COMPOSER`], both inside

@@ -7,7 +7,7 @@
 //! of them. Source crates use it and add no primitives of their own.
 //!
 //! This crate names nothing above it: it knows buffers and editors, not
-//! agents, Slack or the desk.
+//! agents or the desk.
 
 pub mod editor_config;
 pub mod highlights;

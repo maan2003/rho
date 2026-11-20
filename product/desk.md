@@ -50,15 +50,15 @@ mock:
 desk                                                                        NOR
 
 3 wait
-  tide@lab       Flaky clock test                               asks · 2h
-  slack@harness  Release window                                asks · 20m
-  shoal@lab      Shoreline import                              result · 8m
+Flaky clock test            asks · 2h                         tide@lab
+Release window              asks · 20m                        slack@harness
+Shoreline import            result · 8m                       shoal@lab
 
 moving
-  tide@lab       Cache eviction tests                          Running the tests
-  shoal@lab      Release notes                                 Checking the links
+Cache eviction tests        running the tests · 3m            tide@lab
+Release notes               checking the links · 18m          shoal@lab
 
-idea to: tide@lab
+idea to tide@lab · ctrl-enter sends
 ```
 
 ## flow Glance at what moves

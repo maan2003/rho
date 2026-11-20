@@ -24,8 +24,7 @@ use crate::deal::Signals;
 use crate::home::{HomeTarget, HomeView};
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
-    CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
-    bottom_strip,
+    CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
 };
 use crate::phone::{Layout, Phone};
 use crate::search::Search;
@@ -919,25 +918,6 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_prompt_watching(prompt, complete, None, on_submit, on_cancel, window, cx);
-    }
-
-    /// A prompt that narrows what is behind it as the reader types:
-    /// `on_change` hears every edit.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a prompt is its callbacks, and gpui passes window and context explicitly"
-    )]
-    pub fn open_prompt_watching(
-        &mut self,
-        prompt: impl Into<gpui::SharedString>,
-        complete: CandidateSource,
-        on_change: Option<ChangeHandler>,
-        on_submit: SubmitHandler,
-        on_cancel: Option<CancelHandler>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         let prompt = prompt.into();
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
@@ -951,7 +931,6 @@ impl Frame {
             prompt,
             &text_style,
             complete,
-            on_change,
             on_submit,
             on_cancel,
             window,
@@ -972,17 +951,12 @@ impl Frame {
         self.minibuffer.as_mut()
     }
 
-    pub(crate) fn refresh_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
         minibuffer.refresh(self, cx);
-        let on_change = minibuffer.on_change();
-        let input = minibuffer.input(cx);
         self.minibuffer = Some(minibuffer);
-        if let Some(on_change) = on_change {
-            on_change(self, &input, window, cx);
-        }
         cx.notify();
     }
 

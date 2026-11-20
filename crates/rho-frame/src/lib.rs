@@ -12,7 +12,7 @@
 //! enough to be a phone's is laid out for touch by `phone`, over the
 //! same history and the same surfaces.
 //!
-//! Everything the user looks at belongs to a [`System`]: chat, Slack,
+//! Everything the user looks at belongs to a [`System`]: chat,
 //! agents, notes, files. A system plugs in under address
 //! kinds ([`rho_dealer::Address`]): it opens a surface for an address,
 //! offers menu rows for what is in view, claims the user's attention for
@@ -47,11 +47,11 @@ pub use frame::{Frame, Point};
 pub use keys::normal_contexts;
 pub use link::FrameLink;
 pub use menu::{Row, Rows};
-pub use minibuffer::{CancelHandler, Candidate, CandidateSource, ChangeHandler, SubmitHandler};
+pub use minibuffer::{CancelHandler, Candidate, CandidateSource, SubmitHandler};
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, Mode, Subject, Surface};
-pub use system::{AnySystem, Found, Reversal, RoomRow, Standing, System};
+pub use system::{AnySystem, Found, RoomRow, Standing, System};
 
 /// The key context every surface is drawn in. A system binds its keys
 /// under `RhoFrame` for the frame and under `RhoFrame > Editor` for keys

@@ -35,13 +35,13 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   Always-on hosts (hetzner) are where most agents live. A laptop may run
   a host beside the GUI, reachable only while it runs.
 - **GUI.** One fat app, connected to many hosts at once. Holds a copy of
-  every host's chat log it has seen, the user's own ledger log, the
-  Slack session, and the browser. The browser runs on the GUI machine
-  because it holds credentials. A GUI may later offer services to agents
-  (the browser, "did the user see this").
-- **Systems.** Slack, GitHub, agents, rho (chat, notes, reminders,
-  browser). A lens, not a technical abstraction: each has a host side, a
-  Python face for agents, and GUI surfaces.
+  every host's chat log it has seen, the user's own ledger log, and the
+  browser. The browser runs on the GUI machine and is where the user
+  signs into their own Slack account. A GUI may later offer services to
+  agents (the browser, "did the user see this").
+- **Systems.** Chat, agents, notes, browser, and other areas of the GUI.
+  Host integrations, such as the Slack bot or GitHub proxy, need not have
+  a system in the GUI.
 
 ## Chat: a forest of messages per host
 
@@ -89,8 +89,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - The draft page goes. Any message is what an agent starts from: one
   command `start agent`, a transient for where (`new on`, `join`,
   `here`) and the runtime, then the GUI sends the code. The compose box
-  gets `send and start`. The same later works from a Slack message.
-- Chat becomes one crate like `rho-slack`: `protocol` shared with the
+  gets `send and start`.
+- Chat becomes one crate: `protocol` shared with the
   host, fold/store/outbox behind `client`, surfaces behind `ui`.
 
 ## The user log
@@ -123,7 +123,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - This replaces notes as a screen of their own, labels, `notes for
   this`, and piles.
 - Reminders are not a new thing: a `Deadline` fact on any address (a
-  thread, a Slack thread, a note, a page). The text lives where the
+  thread, a note, a page). The text lives where the
   address lives; a bare reminder is a note with a deadline.
 - Timers: nothing stores one. The dealer derives what is due from facts
   and the clock, and the GUI wakes at `next_change`. An agent's own
@@ -135,22 +135,21 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the window, panes and their history, the minibuffer, transients, the
   keymap, the peer connections, the ledger. It knows no system.
 - One address scheme for every thing in every system (`thread`,
-  `slack`, `pr`, `note`, `agent`, `page`, `file`), as `NodeId` starts to
+  `pr`, `note`, `agent`, `page`, `file`), as `NodeId` starts to
   do. The shell opens an address; the system that owns the kind builds
   the surface. No closed `SurfaceKey` enum. Cards, links and search hits
   all carry an address, so one `open` serves them all.
 - A system plugs in five things: surfaces for its addresses, menu rows
   as data, card sources for the dealer, completion providers, search
-  providers. One crate per system with a `ui` feature, like `rho-slack`
-  today. The binary lists the systems.
-- State lives per system in its own model entity (chat, Slack, agents,
+  providers. The binary lists the systems.
+- State lives per system in its own model entity (chat, agents,
   browser, attention). Surfaces observe their model. The shell routes
   keys and opens addresses. Nothing touches two systems at once.
 - No sidebar and no fixed chrome. One surface at a time, the stack the
   phone has today, on every screen; panes may split where the editor
   allows. Home is the deal plus sections: unread threads, then the
-  channels (rho roots across hosts and the Slack channels followed, one
-  list with a tag). The find minibuffer reaches anything by address.
+  channels (roots across hosts, one list with a tag). The find minibuffer
+  reaches anything by address.
 - A thread surface: breadcrumb up, messages with subthreads folded under
   their anchors, participants, composer at the bottom. `start agent`
   from any message, `send and start` from the composer.
@@ -164,7 +163,7 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   message log screen go. Terminals, shells and desktops lose their
   address kinds and hang under the agent, reached from a room's
   participants (done: parts of the `agent:` address).
-- Open: pane rules, Slack, reminders, the browser as a service.
+- Open: pane rules, reminders, the browser as a service.
 
 ## Decided against
 
@@ -185,9 +184,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   `find`, `said`, `marks_moved`, `mutes_itself`) and builds `Surface`s
   (`title`, `editor`, `subject`, `rows`); `rho-gui` lists the systems. A
   system reaches the frame only through `FrameLink`.
-- Home is the list of rooms, since 2026-11-16: every root on every host,
-  the Slack conversations the user starred or Slack is asking them
-  about, and the notes about nothing, one row each with where it is and
+- Home is the list of rooms, since 2026-11-16: roots across hosts and
+  notes about nothing, one row each with where it is and
   what waits in it. A room with a card in the dealer's hand goes first,
   in the hand's order, wearing the card's words; then the rooms with
   something unread, newest first; then the rest. The cards' preview and
@@ -197,8 +195,8 @@ hold are Linked Specs beside the code (`agent-host/specs`,
 - Address kinds: `thread:<endpoint>/<id>`, `agent:<id>` with its
   terminals, shell and desktops as parts under it (`agent:<id>/term/<n>`,
   `agent:<id>/shell`, `agent:<id>/desktop/<name>`), `note:<uuid>`,
-  `slack:<ws>/...`, `usage:<chart>/<days>`, `page:<uuid>`. The forms that no one crate owns are Linked Specs
-  beside their crates.
+  `usage:<chart>/<days>`, `page:<uuid>`. The forms that no one crate owns
+  are Linked Specs beside their crates.
 - iroh is the one transport. A host always binds its endpoint; a peer on
   the same machine reaches it over the IPC transport
   (`vendor/iroh-ipc-transport`): a Unix datagram socket as a native iroh
@@ -254,4 +252,4 @@ hold are Linked Specs beside the code (`agent-host/specs`,
   the browser crates (`rho-browser`, `rho-browser-wayland`, the
   extension) came back on 2026-11-19, revived from `a79f5090`, for
   `browser.Page`: a link in a message opens as a page through the
-  frame's `open_link`, so chat and Slack never name the browser.
+  frame's `open_link`, so chat never names the browser.

@@ -52,7 +52,6 @@ members = [
   "crates/rho-desktop-client",
   "crates/rho-desktop-media",
   "crates/rho-desktop-proto",
-  "crates/rho-fake-slack",
   "crates/rho-files",
   "crates/rho-frame",
   "crates/rho-gui",
@@ -64,7 +63,6 @@ members = [
   "crates/rho-rpc",
   "crates/rho-rtc",
   "crates/rho-shell-view",
-  "crates/rho-slack",
   "crates/rho-terminal",
   "crates/rho-transcript",
   "crates/rho-window",
@@ -151,7 +149,6 @@ rho-desktop-media = { path = "crates/rho-desktop-media" }
 rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }
 rho-devshell = { path = "agent-host/rho-devshell" }
 rho-fake-model = { path = "agent-host/rho-fake-model" }
-rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
 rho-frame = { path = "crates/rho-frame" }
 rho-fs-view = { path = "agent-host/rho-fs-view" }
@@ -170,7 +167,6 @@ rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "agent-host/rho-shell" }
 rho-shell-view = { path = "crates/rho-shell-view" }
-rho-slack = { path = "crates/rho-slack", default-features = false }
 rho-terminal = { path = "crates/rho-terminal" }
 rho-tool-shell = { path = "agent-host/rho-tool-shell" }
 rho-transcript = { path = "crates/rho-transcript" }
