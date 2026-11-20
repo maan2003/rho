@@ -48,7 +48,7 @@ keys:
 - `:`: `window.Palette`
 starts: `Glance at what moves`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
 
-While the user writes an idea, changes above it leave the writing caret in place on screen.
+While the user writes an idea, the desk scrolls to keep the writing caret in place as rows above it change. If rows disappear with the view already at the top, the caret can move up.
 
 Built renders: [waiting and moving on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
 
