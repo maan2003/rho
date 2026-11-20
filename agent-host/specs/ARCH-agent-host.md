@@ -112,19 +112,24 @@ A move is a parent change (`Reparented`) and the subtree follows; a message
 is read in the thread it is in now, so `#41` always leads to it. Without a name the GUI shows the first line of the thread's message.
 An edit changes a mail's current body in place; a delete removes its visible
 content but keeps the anchor and descendants. Only the author can change
-a mail, and an answered ask cannot change. Search uses the current bodies
+a mail, and mail with a user reply cannot change. Search uses the current bodies
 and subjects, not the original text of edited or deleted mail. The host names a thread under a root once, when its
 second message arrives and nothing has named it, from a model's reading of
 those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
 `result` mention, and the user says so in the ledger, which is theirs
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
+The host derives replies from the original `Posted` events: a move does
+not undo an answer. When an agent sends into a thread whose latest project
+mail has no user reply, the send still posts and its receipt suggests
+editing the earlier mail if it is still live. It cannot see a ledger verdict.
 
 A thread's current status is host memory, sent outside the log. A stop
 clears that status only if the stopped agent wrote the current line. The GUI
 reports thread focus without changing its verdict; an open thread or a
 user reply keeps it warm. Once a thread cools, the next model request can
-carry a one-time writing notice without initiating a request of its own.
+carry a one-time notice to make live mail stand alone, without initiating a
+request of its own.
 A stop produces durable system mail in the agent's thread, not another
 kind of card, and never feeds back to an agent as fresh input.
 

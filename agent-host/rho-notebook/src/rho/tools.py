@@ -100,11 +100,14 @@ class Mail:
         """Send to a local project, #thread, agent handle, or "user".
         With reply_to=#id, you can pass None to address the writer.
         Mail to "user" needs kind and a thread or reply_to.
+        The returned id may carry a `notice` suggesting an edit.
         """
         message = rho_mail.send(self._agent, to, text, thread=thread, reply_to=reply_to, kind=kind)
-        if to != rho_mail.USER:
+        if to != rho_mail.USER or message.notice:
             print(f"Sent mail #{message}.")
-        return _MessageId(message)
+        if message.notice:
+            print(message.notice)
+        return message
 
     def status(self, thread, text):
         """Replace the thread's one-line status; pass "" to clear it."""
@@ -112,12 +115,12 @@ class Mail:
         return _DONE
 
     def edit(self, message, text):
-        """Replace the body of your mail #message; an answered ask is fixed."""
+        """Replace the body of your mail #message; answered mail is fixed."""
         _host(_rho.edit_message, self._agent, rho_mail.ident(message), _text(text))
         return _DONE
 
     def delete(self, message):
-        """Remove your mail #message; an answered ask is fixed."""
+        """Remove your mail #message; answered mail is fixed."""
         _host(_rho.delete_message, self._agent, rho_mail.ident(message))
         return _DONE
 
@@ -223,7 +226,9 @@ class Mail:
             mark = "→ " if record["id"] == id and thread != id else ""
             edited = " (edited)" if record.get("edited") else ""
             text = "[deleted]" if record.get("deleted") else record["text"]
-            lines.append(f"{mark}#{record['id']} {sender}{edited}: {text}")
+            target = record["reply_to"]
+            reply = f" (reply to #{target})" if target is not None else ""
+            lines.append(f"{mark}#{record['id']} {sender}{edited}{reply}: {text}")
         return report("\n".join(lines))
 
     def __repr__(self):

@@ -212,9 +212,9 @@ If you write prose without a call, the host reminds you to make one; repeated pr
 stop until the user writes.
 
 ```
-mail.send(to, text, *, thread=None, reply_to=None, kind=None) → int   Send mail and return its id.
+mail.send(to, text, *, thread=None, reply_to=None, kind=None) → int   Send mail; return its id and show any suggestion to edit.
 mail.status(thread, text)                                 Set one line on what is happening now; "" clears it.
-mail.edit(message, text) / mail.delete(message)             Change your own mail, except an answered ask.
+mail.edit(message, text) / mail.delete(message)             Change your own mail before the user replies.
 mail.fork(message, text) → int Start a tangent under that mail.
 mail.search(query, *, project=None, limit=20)              Search subjects and bodies; project is a root id.
 mail.read(id, last=20)                                    Read a thread or the mail around an id.
@@ -225,9 +225,9 @@ end_turn()                                                End this turn after th
 archive()                                                 Shut down the notebook until the user writes.
 ```
 
-Answer mail in the thread in its header, such as `#12`. In a warm thread, answer directly without recapping. Put progress in `mail.status`, never in a mail. Clear your status when it no longer applies. Fork tangents under the mail that raised them.
+Before you send or edit user mail, check the thread with `mail.read`. Your project's last mail stays live until the user replies or deals it. For the same question, use `mail.edit` for new findings, including the result. Send new mail only if none is live. Never edit answered mail. Follow-ups about the same work stay in the thread. For a different question, use `mail.fork(id, answer)` with the id of the mail that raised it. In a warm thread, answer directly without recapping. Put running status in `mail.status`; clear it when it no longer applies.
 
-To reach the user, use `mail.send("user", text, thread=thread, kind=...)`. An `ask` needs a decision, information, or action. A `result` answers the question or delivers the outcome. For a code change, put the proof in that mail: link to the PR or save and link the diff, give the check command and paste its last output lines verbatim in a code block, including the final summary, and include a screenshot if the change is visible. An `fyi` keeps a finding without asking for attention.
+For new user-addressed mail outside a fork, use `mail.send("user", text, thread=thread, kind=...)`. An `ask` needs a decision, information, or action. A `result` answers the question or delivers the outcome. For a code change, put the proof in that mail: link to the PR or save and link the diff, give the check command and paste its last output lines verbatim in a code block, including the final summary, and include a screenshot if the change is visible. An `fyi` keeps a finding without asking for attention.
 
 Address `mail.send` to a project such as `tide@local`, a thread such as `#12`, or an agent such as `eng-q9tz`. End your turn when the work is done or only someone else can move it.
 

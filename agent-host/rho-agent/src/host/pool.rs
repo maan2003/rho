@@ -1319,6 +1319,11 @@ impl AgentPool {
                 };
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
+                let unanswered = if direct {
+                    None
+                } else {
+                    parent.and_then(|thread| write.unanswered_project_mail(thread))
+                };
                 let id = if direct {
                     write.post_peer(at, project, message)?
                 } else {
@@ -1329,7 +1334,7 @@ impl AgentPool {
                 if !direct {
                     self.consider_naming(id);
                 }
-                PyReply::Seq(id.0)
+                PyReply::SentMail { id, unanswered }
             }
             PyRequest::Status {
                 agent,

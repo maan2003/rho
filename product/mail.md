@@ -63,7 +63,7 @@ principle: after the user has been away, a project quotes just enough of the bri
 sees: the user or the project's address as sender, the time, the words, what the mail quotes, `edited` after an edit, and proof on a result.
 does:
 - reply: send the user's words to whoever wrote the mail
-- edit or delete: agents may change or take back their own mails, except that an ask the user has answered stays as it was
+- edit or delete: agents may change or take back their own mails, except that mail the user has answered stays as it was
 - reply privately: keep a remark beside this mail, as in `notes.Reply privately`
 
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
@@ -157,5 +157,8 @@ reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 The historical review above was of Start a thread. Start an agent from a message was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
+## rule the last mail stays live
+when the project's last `Mail` in a `Thread` has no user reply or verdict, then it stays live; the project edits it as findings change instead of sending updates. Once the user replies, it is frozen. A reply or verdict earns new mail if there is more to say. A different question forks under the mail that raised it.
+
 ## rule a cold mail stands alone
-when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; cold `Mail` stands alone by quoting rather than repeating, and warm mail is short.
+when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; the project edits live `Mail` to stand alone with a short exact quote instead of a recap. New cold mail also stands alone; warm mail is short.
