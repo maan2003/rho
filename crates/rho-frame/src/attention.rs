@@ -264,7 +264,7 @@ impl Frame {
         if let LedgerEvent::SecretMade(secret) = &event {
             self.show_secret(
                 *secret,
-                "write down your secret phrase; it is not shown again · enter:",
+                "write down your secret phrase · enter:",
                 window,
                 cx,
             );
