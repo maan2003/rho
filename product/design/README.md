@@ -34,7 +34,7 @@ The address chooser's entry is `new project clock@lab`. On the default scenario,
 
 ## Laptop: card, palette, verdict, and agent
 
-Starting from the waiting clock ask, run the rows in order. `space` deals on Desk; only once a card is open does `space` show its verdicts.
+Starting from the waiting clock ask, run the rows in order. `space` deals on Desk when a card waits and shows the verdicts in the thread. After clearing the last card, `space` on Desk offers undo.
 
 | Render | Capture |
 | --- | --- |
