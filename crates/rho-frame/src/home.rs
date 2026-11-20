@@ -257,8 +257,9 @@ impl HomeView {
         cx.notify();
     }
 
-    /// Puts the cursor on the first row that stands for something.
-    fn focus_first_row(&mut self, cx: &mut Context<Self>) {
+    /// Puts the cursor on the first row that stands for something: the
+    /// top room, where the user lands each time Home opens.
+    pub(crate) fn focus_first_row(&mut self, cx: &mut Context<Self>) {
         let last = self.transcript.buffer().read(cx).snapshot().max_point().row;
         let row = (0..=last)
             .find(|row| {

@@ -25,6 +25,7 @@ gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 jiff.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+redb.workspace = true
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agent-types.workspace = true
 rho-db.workspace = true

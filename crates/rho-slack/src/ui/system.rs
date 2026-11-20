@@ -401,7 +401,8 @@ impl System for SlackSystem {
         let rows = Self::menu_rows(&cx.entity(), self.session.clone());
         let mut menu = Rows::new("slack");
         menu.extend(rows);
-        vec![Row::menu("s", "slack", menu)]
+        // Offered on every screen but Slack's own, so it is the window's.
+        vec![Row::menu("s", "slack", menu).window_wide()]
     }
 
     fn claims(

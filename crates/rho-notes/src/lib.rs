@@ -282,9 +282,14 @@ impl System for NoteSystem {
             },
         ));
         rows.push(Row::run("w", "new note", make_note));
-        rows.push(Row::run("shift-w", "notes", |frame, window, cx| {
-            frame.open(notes_address(), window, cx)
-        }));
+        // The one door to the notes, on every screen: one of the window's
+        // own commands.
+        rows.push(
+            Row::run("shift-w", "notes", |frame, window, cx| {
+                frame.open(notes_address(), window, cx)
+            })
+            .window_wide(),
+        );
         rows
     }
 
