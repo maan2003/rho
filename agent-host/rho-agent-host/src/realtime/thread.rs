@@ -36,7 +36,7 @@ impl Said {
             Address::Agent(from) if from == agent => {
                 Some(Self::Agent(content_text(&message.content)))
             }
-            Address::Agent(_) => None,
+            Address::Agent(_) | Address::System { .. } => None,
         }
     }
 }
@@ -238,6 +238,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
+            revision: rho_agent_types::Revision::Original,
         }
     }
 

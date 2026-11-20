@@ -181,9 +181,10 @@ class Tools(WorksetCase):
         first = fake_rho.post_user(rho_, "Do it.", [self.root])
         other = fake_rho.post_user(rho_, "Something else.", [self.root])
         printed, reply = run(lambda: ns["chat"].post(first, "On it."))
-        self.assertEqual((printed, reply), (f"Posted in #{first}.\n", f"Posted in #{first}."))
+        self.assertEqual(printed, f"Posted #{reply} in #{first}.\n")
+        self.assertEqual(reply, self.state.messages[-1]["id"])
         printed, reply = run(lambda: ns["chat"].post(first, "Done.", mention="user", kind="result"))
-        self.assertEqual((printed, reply), ("", ""))
+        self.assertEqual((printed, reply), ("", self.state.messages[-1]["id"]))
         run(lambda: ns["chat"].post(other, "Also done.", mention=["user", f"eng-{child}"], kind="ask"))
         posted = [(m["parent"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
         self.assertEqual(posted, [
@@ -225,7 +226,8 @@ class Tools(WorksetCase):
         ops = self.state.messages[-2]
         self.assertEqual((ops["parent"], ops["sender"], ops["text"]), (None, self.root, "ops"))
         self.assertEqual(self.state.messages[-1], {"id": started, "at": 0, "parent": ops["id"], "sender": self.root, "mentions": [(child, "ask")], "text": "Look.", "_to": {child}})
-        # (The user's mention joined the root to `thread` meanwhile.)
+        # The user's mention joins the root asynchronously.
+        wait_for(lambda: (thread, self.root) in self.state.members, "the user mention joins")
         self.assertEqual(self.state.members, {(thread, self.root): True, (started, self.root): True})
         # The same stream again is the same root.
         _, again = run(lambda: chat.start(" ops ", "More."))

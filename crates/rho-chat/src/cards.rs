@@ -533,8 +533,8 @@ mod tests {
                 .find(|card| card.address == w.address(thread))
                 .map(|card| card.cursor.clone())
         };
-        assert_eq!(cursor(root).as_deref(), Some(root.0.0.to_string().as_str()));
-        assert_eq!(cursor(a).as_deref(), Some(ask.0.0.to_string().as_str()));
+        assert_eq!(cursor(root).as_deref().and_then(attention_mail), Some(root));
+        assert_eq!(cursor(a).as_deref().and_then(attention_mail), Some(ask));
     }
 
     #[test]

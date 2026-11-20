@@ -952,9 +952,26 @@ impl AgentPool {
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
+        let mut mentions = self.user_mentions(mentions)?;
+        // On an explicitly addressed mail the GUI supplies the writer.
+        // A direct reply underneath an agent's mail can infer it even
+        // when the writer left the thread. Deleted agents receive nothing.
+        if let Some(parent) = parent
+            && let Some(mail) = self.db.read().message(parent)
+            && let Address::Agent(agent) = mail.from
+            && self.workset_of(agent).is_ok()
+            && mentions
+                .iter()
+                .all(|mention| mention.to != Address::Agent(agent))
+        {
+            mentions.push(Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            });
+        }
         let message = NewMessage {
             from: Address::User,
-            mentions: self.user_mentions(mentions)?,
+            mentions,
             content,
         };
         let mut write = self.db.write().await;

@@ -131,6 +131,18 @@ def new_cache_key(agent: str) -> None:
 # mention joins. Messages from the user come only from the GUI, so Python
 # cannot forge them. Agents mail each other outside the chat.
 
+class MailHit(TypedDict):
+    project: int
+    thread: int
+    message: int
+    subject: str
+    excerpt: str
+
+def thread_status(agent: str, thread: int, text: str) -> None: ...
+def edit_message(agent: str, id: int, text: str) -> None: ...
+def delete_message(agent: str, id: int) -> None: ...
+def search_mail(query: str, project: int | None, limit: int) -> list[MailHit]: ...
+
 def post(
     sender: str,
     parent: int | None,

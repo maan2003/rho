@@ -86,10 +86,7 @@ def _spawner_of(props: dict) -> str | None:
 
 
 class Chat:
-    """Posting in the host's chat, a forest of messages. A message reaches
-    the members of its thread and of the threads above, and the agents it
-    mentions. Agents join a thread to follow it. The user is reached by a
-    mention; another agent, by `agents.message`."""
+    """Mail and status on this host. Use `agents.message` to mail a peer."""
 
     def __init__(self, agent: str):
         self._agent = agent
@@ -118,15 +115,46 @@ class Chat:
         return mentions
 
     def post(self, thread, text, *, mention=None, kind=None):
-        """Post `text` in `thread`, the id each message arrives with. To reach
-        the user, mention "user" with a kind: "ask", "result" or "fyi"."""
+        """Send mail in `thread` and return its message id. Mention "user"
+        with kind="ask" or "result" to put it in the user's deal."""
         text = _text(text)
         mentions = self._mentions(mention, kind)
         self._thread(thread)
-        rho_chat.post(self._agent, int(thread), text, mentions)
-        if any(address == rho_chat.USER for address, _ in mentions):
-            return Reply("")
-        return report(f"Posted in #{int(thread)}.")
+        message = rho_chat.post(self._agent, int(thread), text, mentions)
+        if all(address != rho_chat.USER for address, _ in mentions):
+            print(f"Posted #{message} in #{int(thread)}.")
+        return message
+
+    def status(self, thread, text):
+        """Replace the thread's one-line status; pass "" to clear it."""
+        _host(_rho.thread_status, self._agent, int(thread), str(text))
+
+    def edit(self, message, text):
+        """Replace the body of your mail #message; an answered ask is fixed."""
+        _host(_rho.edit_message, self._agent, int(message), _text(text))
+
+    def delete(self, message):
+        """Remove your mail #message; an answered ask is fixed."""
+        _host(_rho.delete_message, self._agent, int(message))
+
+    def search(self, query, *, project=None, limit=20):
+        """Find mail by words in subjects and bodies, newest first. Set
+        `project` to a root id to scope it; omit for the whole host. Returns
+        hits with thread and message ids for `chat.read` or `chat.post`."""
+        results = _host(_rho.search_mail, _text(query), None if project is None else int(project), int(limit))
+        for hit in results:
+            print(f"#{hit['thread']} {_label_text(hit['subject'])} · mail #{hit['message']} · {hit['excerpt']}")
+        if not results:
+            print("No mail found.")
+        return results
+
+    def fork(self, message, text, *, mention=None, kind=None):
+        """Start a tangent under mail #message, then follow it; returns
+        the thread id. Use its id to send follow-ups."""
+        thread = int(message)
+        self.post(thread, text, mention=mention, kind=kind)
+        rho_chat.join(thread, self._agent)
+        return thread
 
     def start(self, stream, text, *, mention=None, kind=None):
         """Start a thread for a new subject in `stream`, a root of the chat
@@ -208,9 +236,12 @@ class Chat:
             records = _around([rho_chat.message(thread), *rho_chat.read(thread, 1 << 31)], id, last)
         lines = [where(head)]
         for record in records:
-            sender = "user" if record["sender"] == rho_chat.USER else label(record["sender"])
+            sender = record["sender"]
+            sender = sender if sender in (rho_chat.USER, "system") else label(sender)
             mark = "→ " if record["id"] == id and thread != id else ""
-            lines.append(f"{mark}#{record['id']} {sender}: {record['text']}")
+            edited = " (edited)" if record.get("edited") else ""
+            text = "[deleted]" if record.get("deleted") else record["text"]
+            lines.append(f"{mark}#{record['id']} {sender}{edited}: {text}")
         return report("\n".join(lines))
 
     def __repr__(self):
@@ -246,14 +277,14 @@ def _label_text(name):
 
 
 class Messages:
-    """Talking to other agents, outside the user's chat."""
+    """Mail to other agents, outside the user's project threads."""
 
     def __init__(self, agent: str):
         self._agent = agent
 
     def message(self, *, agent_id, message):
-        """Send `message` to the agent `agent_id`, any agent on this host. It
-        arrives as a message from you, and its answer as a message from it."""
+        """Mail a question or answer to `agent_id` on this host, such as
+        "eng-q9tz". The agent gets it in its next turn."""
         text = _text(message)
         other = resolve(str(agent_id))
         if other == self._agent:
