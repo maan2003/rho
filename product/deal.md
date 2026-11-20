@@ -19,7 +19,6 @@ done when: nothing waits and the user's place is on screen as they left it.
 day: Know what wants them, and where they were.
 
 ## concept Card
-status: new waiting mail after a reply comes before older unanswered mail in that thread. A stop reports a repeated error once with a count. The built card still reads `asks` or `result`.
 purpose: put a mail that wants the user in reach, without making them look through the whole thread.
 principle: a project asks whether a test can use a separate clock; the deal opens the thread on that mail, the user replies, and its card goes away.
 sees: the `mail.Project` address, the `mail.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `mail.Mail` that pings.

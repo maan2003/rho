@@ -20,7 +20,7 @@ use crate::attention::{Takeback, Undo, Verdict, Write};
 use crate::desk::desk_rows;
 use crate::frame::Frame;
 use crate::phone::Layout;
-use crate::when::{SnoozeUnit, snooze_target};
+use crate::when::{SnoozeUnit, snooze_said, snooze_target};
 
 /// What the echo line says when a pull finds nothing to deal.
 const NOTHING_WAITS: &str = "nothing waits";
@@ -352,14 +352,27 @@ impl Frame {
         // A pull ranks afresh: the skip just said moves it on, and time
         // has passed since the last change.
         let hand = self.rank(cx);
-        let card = hand.top(in_view.as_ref()).cloned();
+        let scope = self.desk_project(cx);
+        let scoped = hand.cards.iter().filter(|card| {
+            scope.as_ref().is_none_or(|project| {
+                self.project_for(&card.address, cx)
+                    .is_some_and(|(_, owner)| owner.address == project.address)
+            })
+        });
+        let card = scoped
+            .clone()
+            .find(|card| in_view.as_ref() != Some(&card.address))
+            .or_else(|| scoped.into_iter().next())
+            .cloned();
         if card.is_none() {
             // Focus Desk against the empty deal, not the previous hand.
-            self.refresh_desk(&hand, cx);
+            self.refresh_desk(&hand, true, cx);
         }
         self.signals.hand = hand;
         let Some(card) = card else {
-            self.open_desk(window, cx);
+            if !self.desk_in_view() {
+                self.open_desk(window, cx);
+            }
             return false;
         };
         self.journal_deal(Some(&card.address), cx);
@@ -381,7 +394,9 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (until, said) = snooze_target(unit, count.map_or(1, i64::from), &Zoned::now());
+        let now = Zoned::now();
+        let (until, _) = snooze_target(unit, count.map_or(1, i64::from), &now);
+        let said = snooze_said(&until.resolve(&now).to_zoned(now.time_zone().clone()), &now);
         self.verdict(address, Verdict::Snooze(until), said, window, cx);
     }
 
@@ -403,21 +418,16 @@ impl Frame {
 
     fn evaluate_signals(&mut self, cx: &mut Context<Self>) {
         let hand = self.rank(cx);
-        let next_age = self.refresh_desk(&hand, cx);
-        self.signals.next_change = hand
-            .next_change
-            .into_iter()
-            .chain(next_age)
-            .min()
-            .map(|at| {
-                // Ranked a moment ago, so a change already due is due now.
-                let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
-                    .unwrap_or_default();
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(wait).await;
-                    let _ = this.update(cx, |this, cx| this.systems_changed(cx));
-                })
-            });
+        self.refresh_desk(&hand, true, cx);
+        self.signals.next_change = hand.next_change.map(|at| {
+            // Ranked a moment ago, so a change already due is due now.
+            let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
+                .unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |this, cx| this.systems_changed(cx));
+            })
+        });
         // The lamp signals a card only when it cannot already be read here.
         // Desk is itself a view of the hand, including its overflow.
         let in_view = self.card_in_view(cx);
@@ -470,25 +480,48 @@ impl Frame {
     /// Desk is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated or the hand changes by itself, never on a timer of
     /// its own.
-    fn refresh_desk(&mut self, hand: &Hand, cx: &mut Context<Self>) -> Option<Timestamp> {
+    fn desk_project(&self, cx: &gpui::App) -> Option<crate::idea::IdeaProject> {
+        if !self.desk_in_view() {
+            return None;
+        }
+        self.project_for(self.current_address(), cx)
+            .map(|(_, project)| project)
+    }
+
+    pub(crate) fn refresh_desk(&mut self, hand: &Hand, hold: bool, cx: &mut Context<Self>) {
+        let project = self.desk_project(cx);
+        let belongs = |address: &Address| {
+            project.as_ref().is_none_or(|project| {
+                self.project_for(address, cx)
+                    .is_some_and(|(_, owner)| owner.address == project.address)
+            })
+        };
         let moving = self
             .systems
             .iter()
             .flat_map(|system| system.moving_threads(cx))
+            .filter(|thread| belongs(&thread.thread))
             .collect();
-        let rows = desk_rows(
-            hand,
-            moving,
-            |address| {
-                self.systems
+        let scoped;
+        let hand = if project.is_some() {
+            scoped = Hand {
+                cards: hand
+                    .cards
                     .iter()
-                    .find_map(|system| system.idea_project(address, cx))
-            },
-            Timestamp::now(),
-        );
-        let next_age = rows.next_age;
-        self.desk.update(cx, |desk, cx| desk.set_rows(rows, cx));
-        next_age
+                    .filter(|card| belongs(&card.address))
+                    .cloned()
+                    .collect(),
+                next_change: hand.next_change,
+            };
+            &scoped
+        } else {
+            hand
+        };
+        let rows = desk_rows(hand, moving, |address| {
+            self.project_for(address, cx).map(|(_, project)| project)
+        });
+        self.desk
+            .update(cx, |desk, cx| desk.set_rows(rows, project, hold, cx));
     }
 }
 

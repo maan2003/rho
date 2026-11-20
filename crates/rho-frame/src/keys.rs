@@ -33,6 +33,7 @@ actions!(
         PromptIdea,
         RedoEdit,
         SendIdea,
+        FocusIdeaAddress,
         CancelIdea,
         /// `/`: search forward in what is in view.
         SearchForward,
@@ -98,7 +99,7 @@ fn bindings() -> Vec<KeyBinding> {
         // Ordinary navigation chords belong to the site while a page has
         // focus. The negation checks the whole focus stack, not just the
         // context at which the binding would otherwise match.
-        let outside_page = format!("({context}) && !RhoBrowser");
+        let outside_page = format!("({context}) && !RhoBrowser && !RhoMinibuffer");
         bindings.extend([
             KeyBinding::new("ctrl-k", Back, Some(&outside_page)),
             KeyBinding::new("ctrl-j", Forward, Some(&outside_page)),
@@ -153,21 +154,15 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("enter", OpenRow, Some(&context)),
         ]);
     }
-    for context in normal_contexts("RhoIdeaUnaddressed", " && vim_operator == none") {
-        for key in ["i", "shift-i", "a", "shift-a", "o", "shift-o"] {
-            bindings.push(KeyBinding::new(key, PromptIdea, Some(&context)));
-        }
+    for context in normal_contexts("RhoDesk", " && vim_operator == none") {
+        bindings.push(KeyBinding::new("i", PromptIdea, Some(&context)));
     }
     bindings.extend([
         KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
+        KeyBinding::new("enter", PromptIdea, Some("RhoIdeaAddress > Editor")),
+        KeyBinding::new("shift-tab", FocusIdeaAddress, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
-        KeyBinding::new(
-            "enter",
-            editor::actions::Newline,
-            Some("RhoIdeaOverlay > Editor"),
-        ),
-        KeyBinding::new("escape", CancelIdea, Some("RhoIdeaOverlay > Editor")),
-        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdeaOverlay > Editor")),
+        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),

@@ -1,5 +1,5 @@
-//! One local idea draft: the tail of Desk's buffer, or a temporary strip
-//! elsewhere. The minibuffer addresses it. The project owns delivery.
+//! The full-window idea draft. Its address field completes against existing
+//! projects; creating one is a separate, explicit choice.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -7,7 +7,7 @@ use std::rc::Rc;
 use editor::{Editor, EditorMode};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
-use language::{Buffer, BufferEvent, Capability};
+use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
 use rho_agent_types::EndpointId;
 use rho_dealer::Address;
@@ -15,7 +15,6 @@ use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::{Candidate, CandidateSource};
-use crate::phone::Layout;
 use crate::place::{self, Write};
 use crate::system::AnySystem;
 use crate::{Frame, FrameLink};
@@ -65,46 +64,36 @@ pub struct IdeaMail {
 
 pub(crate) struct IdeaBox {
     pub(crate) text: Entity<Buffer>,
-    to: Addressee,
+    project: Option<Address>,
+    recipient: String,
     overlay: Option<Overlay>,
     _edits: gpui::Subscription,
 }
 
-enum Addressee {
-    Unaddressed,
-    Last(Address),
-    Fixed(Address),
-}
-
-impl Addressee {
-    fn address(&self) -> Option<&Address> {
-        match self {
-            Self::Unaddressed => None,
-            Self::Last(address) | Self::Fixed(address) => Some(address),
-        }
-    }
-}
-
 struct Overlay {
     editor: Entity<Editor>,
+    address: Entity<Editor>,
     return_focus: FocusHandle,
+    _edits: gpui::Subscription,
 }
 
 impl IdeaBox {
     pub(crate) fn new(cx: &mut Context<Frame>, db: &rho_db::RhoDb) -> Self {
-        let saved = place::idea_draft(db);
-        let (to, words) = saved.unzip();
-        let text = cx.new(|cx| {
-            let mut text = Buffer::local(words.unwrap_or_default(), cx);
-            if to.is_none() {
-                text.set_capability(Capability::Read, cx);
-            }
-            text
-        });
+        let (project, recipient, words) = place::idea_draft(db)
+            .map(|saved| {
+                (
+                    saved.address.and_then(|a| Address::parse(&a)),
+                    saved.recipient,
+                    saved.text,
+                )
+            })
+            .unwrap_or_default();
+        let text = cx.new(|cx| Buffer::local(words, cx));
         Self {
             _edits: Self::subscribe(&text, cx),
             text,
-            to: to.map_or(Addressee::Unaddressed, Addressee::Fixed),
+            project,
+            recipient,
             overlay: None,
         }
     }
@@ -112,13 +101,6 @@ impl IdeaBox {
     fn subscribe(text: &Entity<Buffer>, cx: &mut Context<Frame>) -> gpui::Subscription {
         cx.subscribe(text, |frame, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
-                if let Addressee::Last(address) = &frame.idea.to
-                    && !frame.idea.text.read(cx).is_empty()
-                {
-                    // From the first words, changing the last project must
-                    // not silently readdress what the user wrote.
-                    frame.idea.to = Addressee::Fixed(address.clone());
-                }
                 frame.save_idea(cx);
             }
         })
@@ -138,90 +120,87 @@ impl Frame {
             .or_else(|| self.last_idea_project(cx))
     }
 
-    fn project_for(&self, address: &Address, cx: &App) -> Option<(AnySystem, IdeaProject)> {
+    pub(crate) fn project_for(
+        &self,
+        address: &Address,
+        cx: &App,
+    ) -> Option<(AnySystem, IdeaProject)> {
         self.systems.iter().find_map(|system| {
             let project = system.idea_project(address, cx)?;
             Some((system.clone(), project))
         })
     }
 
-    fn draft_project(&self, cx: &App) -> Option<IdeaProject> {
-        match self.idea.to.address() {
-            // A missing project is not a reason to silently send an
-            // addressed draft somewhere else.
-            Some(address) => self.project_for(address, cx).map(|(_, project)| project),
-            None => self.last_idea_project(cx),
-        }
+    pub(crate) fn idea_here(&self, _cx: &App) -> bool {
+        self.idea.overlay.is_some()
     }
 
-    pub(crate) fn idea_here(&self, cx: &App) -> bool {
-        self.idea.overlay.is_some() || (self.desk_in_view() && self.desk.read(cx).on_draft(cx))
-    }
-
-    fn idea_label(&self, layout: Layout, cx: &App) -> String {
-        match (self.draft_project(cx), self.idea.to.address(), layout) {
-            (Some(project), _, Layout::Desktop) => {
-                format!(
-                    "idea to {} · ctrl-enter sends · ctrl-t project",
-                    project.name
-                )
-            }
-            (Some(project), _, Layout::Phone) => format!("idea to {}", project.name),
-            (None, Some(_), _) => "idea · project unavailable".into(),
-            (None, None, _) => "idea · choose a project".into(),
-        }
-    }
-
-    pub(crate) fn sync_desk_idea(&mut self, layout: Layout, cx: &mut Context<Self>) {
-        if !matches!(self.idea.to, Addressee::Fixed(_))
-            && let Some(project) = self.last_idea_project(cx)
+    fn resolved_idea_project(&self, cx: &App) -> Option<(AnySystem, IdeaProject)> {
+        let typed = self.idea.recipient.trim();
+        if let Some((system, project)) = self
+            .idea
+            .project
+            .as_ref()
+            .and_then(|address| self.project_for(address, cx))
+            && project.name.eq_ignore_ascii_case(typed)
         {
-            self.address_idea(Addressee::Last(project.address), cx);
+            return Some((system, project));
         }
-        let label = format!("── {}", self.idea_label(layout, cx));
-        self.desk
-            .update(cx, |desk, cx| desk.set_idea_label(label, cx));
-    }
-
-    fn address_idea(&mut self, to: Addressee, cx: &mut Context<Self>) {
-        let was_unaddressed = matches!(self.idea.to, Addressee::Unaddressed);
-        self.idea.to = to;
-        if was_unaddressed {
-            // An unaddressed tail can't receive words. Start a fresh buffer
-            // when it's addressed rather than changing an existing excerpt's
-            // capability; the multibuffer snapshots that with the excerpt.
-            self.replace_idea_text(cx);
+        for system in &self.systems {
+            let Some(project) = system
+                .idea_projects(cx)
+                .into_iter()
+                .find(|project| project.name.eq_ignore_ascii_case(typed))
+            else {
+                continue;
+            };
+            return Some((system.clone(), project));
         }
-    }
-
-    fn replace_idea_text(&mut self, cx: &mut Context<Self>) {
-        let text = cx.new(|cx| Buffer::local("", cx));
-        self.idea._edits = IdeaBox::subscribe(&text, cx);
-        self.idea.text = text.clone();
-        self.desk.update(cx, |desk, cx| desk.set_draft(text, cx));
+        None
     }
 
     fn save_idea(&self, cx: &App) {
         let text = self.idea.text.read(cx).text();
-        let draft = (!text.is_empty()).then(|| {
-            let address = self
-                .idea
-                .to
-                .address()
-                .expect("only an addressed idea can be edited")
-                .clone();
-            (address, text)
-        });
+        let draft =
+            (!text.is_empty() || !self.idea.recipient.is_empty()).then(|| place::IdeaDraft {
+                address: self.idea.project.as_ref().map(ToString::to_string),
+                recipient: self.idea.recipient.clone(),
+                text,
+            });
         self.place.write(Write::IdeaDraft(draft));
     }
 
-    fn overlay_editor(text: Entity<Buffer>, window: &mut Window, cx: &mut App) -> Entity<Editor> {
-        let buffer = cx.new(|cx| MultiBuffer::singleton(text, cx));
-        cx.new(|cx| {
+    pub(crate) fn prompt_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.minibuffer.is_some() || self.menu.is_some() {
+            return;
+        }
+        if self.idea.overlay.is_some() {
+            self.choose_idea_project(window, cx);
+            return;
+        }
+        // A saved addressee belongs to the draft; a default may only fill a
+        // draft that has not been written yet.
+        if self.idea.recipient.is_empty() {
+            let project = match &self.idea.project {
+                Some(address) => self.project_for(address, cx).map(|(_, project)| project),
+                None if self.idea.text.read(cx).is_empty() => self.default_idea_project(cx),
+                None => None,
+            };
+            if let Some(project) = project {
+                self.idea.recipient = project.name;
+                self.idea.project = Some(project.address);
+            }
+        }
+        let return_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.current_surface().focus_handle(cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(self.idea.text.clone(), cx));
+        let editor = cx.new(|cx| {
             let mut editor = Editor::new(
-                EditorMode::AutoHeight {
-                    min_lines: 1,
-                    max_lines: Some(8),
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: true,
+                    sizing_behavior: editor::SizingBehavior::default(),
                 },
                 buffer,
                 None,
@@ -229,24 +208,56 @@ impl Frame {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.set_use_modal_editing(false);
             editor
-        })
+        });
+        let address = cx.new(|cx| {
+            let mut address = Editor::single_line(window, cx);
+            rho_window::editor_config::configure(&mut address, window, cx);
+            address.set_use_modal_editing(false);
+            address.set_text(self.idea.recipient.as_str(), window, cx);
+            address
+        });
+        let address_edits = cx.subscribe(
+            &address,
+            |frame, address, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::Edited { .. }) {
+                    frame.idea.recipient = address.read(cx).text(cx);
+                    frame.save_idea(cx);
+                }
+            },
+        );
+        self.idea.overlay = Some(Overlay {
+            editor: editor.clone(),
+            address,
+            return_focus,
+            _edits: address_edits,
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        window.on_next_frame(move |window, cx| {
+            if editor.focus_handle(cx).is_focused(window) {
+                if editor.read(cx).is_empty(cx) {
+                    vim::enter_insert_mode(&editor, window, cx);
+                }
+            }
+        });
+        cx.notify();
     }
 
-    pub(crate) fn prompt_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.minibuffer.is_some() || self.menu.is_some() {
-            return;
+    pub(crate) fn focus_idea_address(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(overlay) = &self.idea.overlay {
+            let handle = if overlay.address.focus_handle(cx).is_focused(window) {
+                overlay.editor.focus_handle(cx)
+            } else {
+                overlay.address.focus_handle(cx)
+            };
+            window.focus(&handle, cx);
         }
-        let default = if self.idea.overlay.is_some() || self.desk_in_view() {
-            self.draft_project(cx)
-        } else {
-            self.default_idea_project(cx)
-        };
-        let label = match &default {
-            Some(project) => format!("to ({}):", project.name),
-            None => "to:".into(),
-        };
+    }
+
+    fn choose_idea_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let default = self.resolved_idea_project(cx).map(|(_, project)| project);
+        let prefill = default.is_none().then(|| self.idea.recipient.clone());
+        let label = "to:";
         let choices = Rc::new(RefCell::new(Vec::new()));
         let shown = choices.clone();
         let contextual = default.clone();
@@ -277,7 +288,7 @@ impl Frame {
                                 .downcast::<Frame>()
                                 .expect("the frame owns the window"),
                         );
-                        let before = frame.idea.to.address().cloned();
+                        let before = frame.idea.recipient.clone();
                         let place = frame.current_address().clone();
                         system.create_idea_project(
                             project,
@@ -285,7 +296,8 @@ impl Frame {
                                 let before = before.clone();
                                 let place = place.clone();
                                 link.with(cx, move |frame, window, cx| {
-                                    if frame.idea.to.address() == before.as_ref()
+                                    if frame.idea.overlay.is_some()
+                                        && frame.idea.recipient == before
                                         && frame.current_address() == &place
                                         && frame.minibuffer.is_none()
                                         && frame.menu.is_none()
@@ -306,6 +318,9 @@ impl Frame {
         // Tapping a project chooses it, just like Enter on its row.
         if let Some(prompt) = self.minibuffer_mut() {
             prompt.complete_project_address();
+            if let Some(prefill) = prefill {
+                prompt.set_input(prefill, window, cx);
+            }
         }
     }
 
@@ -345,7 +360,7 @@ impl Frame {
             };
             (key(a), &a.value).cmp(&(key(b), &b.value))
         });
-        if input.is_empty() {
+        if input.is_empty() || !rows.is_empty() {
             return rows;
         }
         let (name, requested_host) = input
@@ -397,33 +412,16 @@ impl Frame {
     }
 
     fn edit_idea_to(&mut self, project: IdeaProject, window: &mut Window, cx: &mut Context<Self>) {
-        let was_writable = self.idea.text.read(cx).capability() == Capability::ReadWrite;
-        self.address_idea(Addressee::Fixed(project.address), cx);
+        let Some(overlay) = &self.idea.overlay else {
+            return;
+        };
+        self.idea.project = Some(project.address);
+        self.idea.recipient = project.name;
+        overlay.address.update(cx, |address, cx| {
+            address.set_text(self.idea.recipient.as_str(), window, cx)
+        });
         self.save_idea(cx);
-        if self.desk_in_view() {
-            self.sync_desk_idea(Layout::of(window.viewport_size().width), cx);
-            if !was_writable || !self.desk.read(cx).on_draft(cx) {
-                let desk = self.desk.clone();
-                desk.update(cx, |desk, cx| desk.focus_draft(window, cx));
-            }
-        } else {
-            if self.idea.overlay.is_none() {
-                let return_focus = window
-                    .focused(cx)
-                    .unwrap_or_else(|| self.current_surface().focus_handle(cx));
-                let editor = Self::overlay_editor(self.idea.text.clone(), window, cx);
-                self.idea.overlay = Some(Overlay {
-                    editor,
-                    return_focus,
-                });
-            }
-            let overlay = self
-                .idea
-                .overlay
-                .as_ref()
-                .expect("the idea overlay is open");
-            window.focus(&overlay.editor.focus_handle(cx), cx);
-        }
+        window.focus(&overlay.editor.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -435,26 +433,15 @@ impl Frame {
     }
 
     pub(crate) fn cancel_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.idea.overlay.is_some() {
-            self.close_idea_overlay(window, cx);
-        } else if self.desk_in_view() {
-            vim::enter_normal_mode(&self.active_editor(cx), window, cx);
-            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-            cx.notify();
-        }
+        self.close_idea_overlay(window, cx);
     }
 
-    fn clear_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sent_to = self.idea.to.address().expect("the sent idea was addressed");
-        self.idea.to = Addressee::Last(sent_to.clone());
-        self.replace_idea_text(cx);
-        if let Some(overlay) = &mut self.idea.overlay {
-            let was_focused = overlay.editor.focus_handle(cx).is_focused(window);
-            overlay.editor = Self::overlay_editor(self.idea.text.clone(), window, cx);
-            if was_focused {
-                window.focus(&overlay.editor.focus_handle(cx), cx);
-            }
-        }
+    fn clear_idea(&mut self, cx: &mut Context<Self>) {
+        let text = cx.new(|cx| Buffer::local("", cx));
+        self.idea._edits = IdeaBox::subscribe(&text, cx);
+        self.idea.text = text;
+        self.idea.project = None;
+        self.idea.recipient.clear();
         self.save_idea(cx);
     }
 
@@ -467,27 +454,24 @@ impl Frame {
             self.echo("send: nothing written", StyleClass::SystemInfo, cx);
             return;
         }
-        let Some((system, project)) = self
-            .idea
-            .to
-            .address()
-            .and_then(|address| self.project_for(address, cx))
-        else {
-            self.echo(
-                "idea: choose an available project",
-                StyleClass::SystemInfo,
-                cx,
-            );
+        let Some((system, project)) = self.resolved_idea_project(cx) else {
+            self.choose_idea_project(window, cx);
             return;
         };
-        // Returning to the screen now also gives a first-start question a
-        // place to return to. The draft itself stays until the project posts.
-        if self.desk_in_view() {
-            vim::enter_normal_mode(&self.active_editor(cx), window, cx);
-        }
+        self.idea.project = Some(project.address.clone());
+        self.idea.recipient = project.name;
+        self.save_idea(cx);
+        // Keep the words until the project sends the mail, and restore the
+        // previous screen before asking any first-start questions.
         self.close_idea_overlay(window, cx);
         let sent_text = text.clone();
         let sent_to = project.address.clone();
+        let short = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let idea: String = short.chars().take(60).collect();
         let frame = FrameLink::new(
             window
                 .window_handle()
@@ -501,13 +485,19 @@ impl Frame {
                 sent: Rc::new(move |name, cx| {
                     let sent_to = sent_to.clone();
                     let sent_text = sent_text.clone();
-                    frame.with(cx, move |frame, window, cx| {
-                        if frame.idea.to.address() == Some(&sent_to)
+                    let idea = idea.clone();
+                    frame.with(cx, move |frame, _, cx| {
+                        if frame.idea.overlay.is_none()
+                            && frame.idea.project.as_ref() == Some(&sent_to)
                             && frame.idea.text.read(cx).text() == sent_text
                         {
-                            frame.clear_idea(window, cx);
+                            frame.clear_idea(cx);
                         }
-                        frame.echo(&format!("sent to {name}"), StyleClass::SystemInfo, cx);
+                        frame.echo(
+                            &format!("sent to {name}: {idea}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
                     });
                 }),
             },
@@ -522,40 +512,32 @@ impl Frame {
             .map(|overlay| overlay.editor.clone())
     }
 
-    pub(crate) fn render_idea(
-        &self,
-        text_style: &gpui::TextStyle,
-        layout: Layout,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let editor = self.idea_editor()?;
-        let label = self.idea_label(layout, cx);
+    pub(crate) fn render_idea(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let overlay = self.idea.overlay.as_ref()?;
         let colors = cx.theme().colors();
         Some(
             div()
-                .id("rho-idea-box")
-                .key_context("RhoIdea RhoIdeaOverlay")
-                .flex_none()
+                .id("rho-idea")
+                .key_context("RhoIdea")
+                .flex_1()
+                .min_h_0()
                 .w_full()
-                .border_t_1()
-                .border_color(colors.border_variant)
-                .px_2()
-                .py_1()
+                .flex()
+                .flex_col()
                 .child(
                     div()
-                        .id("rho-idea-address")
-                        .cursor_pointer()
-                        .font_family(text_style.font_family.clone())
-                        .text_size(text_style.font_size)
-                        .line_height(text_style.line_height)
+                        .key_context("RhoIdeaAddress")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
                         .text_color(colors.text_muted)
-                        .child(label)
-                        .on_click(cx.listener(|frame, _, window, cx| {
-                            frame.prompt_idea(window, cx);
-                            cx.stop_propagation();
-                        })),
+                        .child("to:")
+                        .child(div().flex_1().child(overlay.address.clone())),
                 )
-                .child(editor),
+                .child(div().flex_1().min_h_0().child(overlay.editor.clone()))
+                .into_any_element(),
         )
     }
 }

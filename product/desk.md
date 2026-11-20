@@ -24,7 +24,6 @@ does:
 - narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
 
 ## screen Desk
-status: narrowing to one project is not built; the project still has its own list of threads. The built Desk shows card words and ages on its rows and a draft tail at the bottom.
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits
@@ -51,7 +50,7 @@ rejected:
 
 On the phone, rows keep their place while the Desk is on screen, so a row does not move under the thumb; a new order shows when the Desk opens again.
 
-Built renders: [waiting and moving on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
+Built renders: [moving on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
 
 mock:
 ```text

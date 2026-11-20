@@ -187,6 +187,10 @@ impl<A> Transient<A> {
         &self.items
     }
 
+    pub fn set_description(&mut self, index: usize, description: String) {
+        self.items[index].description = description;
+    }
+
     /// The rows as the menu lays them out: columns of at most
     /// [`COLUMN_ROWS`], filled top to bottom and then left to right. The
     /// layout is answerable without a window, which is how it is tested.

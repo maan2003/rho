@@ -176,17 +176,6 @@ fn run() -> Result<()> {
             if let Some(profile) = &profile {
                 profile.keep_collecting(cx);
             }
-            const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-            cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
-                gpui::UserIdleEvent::Idle => {
-                    rho_journal::record(rho_journal::Event::UserIdle {
-                        timeout_s: USER_IDLE_TIMEOUT.as_secs(),
-                    });
-                }
-                gpui::UserIdleEvent::Resumed => {
-                    rho_journal::record(rho_journal::Event::UserResumed);
-                }
-            });
             cx.on_app_quit(move |_| {
                 if let Some(profile) = profile.take()
                     && let Err(error) = profile.finish(draw_tid)
@@ -294,6 +283,31 @@ fn run() -> Result<()> {
                     return;
                 }
             };
+            const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+            let mut idled = None::<std::time::Instant>;
+            let idle_cx = cx.to_async();
+            cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
+                gpui::UserIdleEvent::Idle => {
+                    idled = Some(std::time::Instant::now());
+                    rho_journal::record(rho_journal::Event::UserIdle {
+                        timeout_s: USER_IDLE_TIMEOUT.as_secs(),
+                    });
+                }
+                gpui::UserIdleEvent::Resumed => {
+                    rho_journal::record(rho_journal::Event::UserResumed);
+                    if let Some(idled) = idled.take() {
+                        let _ = idle_cx.update(|cx| {
+                            window.update(cx, |frame, window, cx| {
+                                frame.device_resumed(
+                                    USER_IDLE_TIMEOUT + idled.elapsed(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                        });
+                    }
+                }
+            });
             match application {
                 Some(service) => rho_gui::application::serve(service, window, cx),
                 None => {
