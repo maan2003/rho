@@ -3,7 +3,6 @@
 Notes are the user's memory: text only they write and only their devices hold. They live apart from the work, in a corner of their own with one door, the command `notes`. A note is about nothing, and is then listed in that corner, or about a message, and is then a private reply under it too.
 
 ## concept Note
-status: each note about nothing is a `home.Room` on Home, tagged `private`, and a place in the list of `ctrl-shift-f`; there is no `notes` command and no list of notes.
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
 principle: the user thinks of something to check tomorrow; they run `new note` and type it; it is kept a moment after they stop typing; the next day they run `notes`, and it is at the top of the list.
 sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text.
@@ -26,7 +25,7 @@ does:
 - open `enter` on it in the thread: open the note to edit it
 
 ## screen Notes
-shows: `Note`, by its first line, the last written first
+shows: `Note`, by its first line, the last written first, private replies too; with none, `no notes yet`
 starts: `Write something down`
 
 ## screen Note
@@ -60,7 +59,6 @@ system: keeps the remark with the message on every device.
 user: the remark.
 
 ## rule a note about nothing stays off Home
-status: a note about nothing is a `home.Room` on Home, tagged `private`, ordered by when it was last written.
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is never a `home.Room`.
 
 ## rule a note about a message shows in its thread

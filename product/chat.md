@@ -120,5 +120,4 @@ user: the channel and the words.
 cases: I want an agent to start at once: use `send and start agent` instead, as in `agents.Start an agent from a message`
 
 ## rule a channel is a room
-status: every message without a parent is a channel and a `home.Room`, so a host that posts one message per event, such as each deploy, fills Home with one room per event.
 when a host's `Channel` is one the user made or has written in, or holds a `deal.Card` or an unread mention of the user, then it is a `home.Room` on Home, tagged with the host's name; a channel the user never wrote in that asks nothing is not.
