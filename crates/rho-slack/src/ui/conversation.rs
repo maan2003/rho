@@ -621,7 +621,7 @@ impl ConversationView {
         // A conversation with nothing new opens at its newest message, as
         // every thread does. One with unread messages opens on the first of
         // them instead; `refresh` has already put the cursor there.
-        if !view.unread_placed && view.dealt.is_none() {
+        if !view.unread_placed && !view.dealt_placed {
             view.cursor_to_end(window, cx);
         }
         view
@@ -912,6 +912,24 @@ impl ConversationView {
     /// with no use for the answer can drop it without cancelling a message.
     pub fn submit(&mut self, cx: &mut Context<Self>) -> Task<Submitted> {
         self.submit_with_options(false, cx)
+    }
+
+    /// Sends what is in the box from the screen. A new message is followed
+    /// to where it lands, as in every thread; a rewrite stays where it was
+    /// made.
+    pub fn send(
+        &mut self,
+        also_send_to_channel: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Submitted> {
+        let new = self.editing_message.is_none()
+            && (!self.input.read(cx).text().trim().is_empty() || !self.attached.is_empty());
+        let submitting = self.submit_with_options(also_send_to_channel, cx);
+        if new {
+            self.cursor_to_end(window, cx);
+        }
+        submitting
     }
 
     /// Sends a thread reply and optionally broadcasts it to the channel.
@@ -1899,11 +1917,7 @@ impl ConversationView {
         self.refresh_unread(cx);
         self.place_dealt(window, cx);
         self.place_unread(window, cx);
-        if at_end
-            && placed == (self.dealt_placed, self.unread_placed)
-            && (self.dealt.is_none() || self.dealt_placed)
-            && !self.cursor_at_end(cx)
-        {
+        if at_end && placed == (self.dealt_placed, self.unread_placed) && !self.cursor_at_end(cx) {
             self.cursor_to_end(window, cx);
         }
         self.settle_images(cx);

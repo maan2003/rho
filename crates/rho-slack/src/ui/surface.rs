@@ -320,13 +320,13 @@ impl SlackSurface {
         });
     }
 
-    fn send(&mut self, _: &SendMessage, _window: &mut Window, cx: &mut Context<Self>) {
+    fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.conversation_view().cloned() else {
             return;
         };
         let channel = view.read(cx).source().channel().clone();
         let broadcast = view.read(cx).also_send_to_channel();
-        let submitting = view.update(cx, |view, cx| view.submit_with_options(broadcast, cx));
+        let submitting = view.update(cx, |view, cx| view.send(broadcast, window, cx));
         let session = self.session.downgrade();
         cx.spawn(async move |_, cx| {
             let submitted = submitting.await;
