@@ -9,7 +9,6 @@ because: between two places the user has a minute and no memory of what asked; a
 costs: whatever the user has not answered is behind the top card, and a verdict is a decision they must make.
 
 ## concept Card
-status: a stop the agent did not choose makes no card, so no card reads `failed`; see `chat.An agent reaches the user by mention, or by a stop it did not choose`.
 purpose: hand the user the one thing that wants them most, so they never scan a list.
 principle: an agent's message in a thread asks the user something; the thread becomes a card; the user presses `space` then `n`, and the thread opens; they answer it and say done; the next card opens.
 sees: where it is and its name, such as `rho › claude-tool-prompt-audit`; why it wants the user and since when, such as `asks · 2h`, `result · 5h ago`, `failed · 1h`, or `unread in @Barbara Liskov · needs reply · 0m`; then the thing itself, open on screen.
@@ -21,7 +20,7 @@ does:
 A card exists for one of three reasons, and its words say which:
 - an ask: an agent mentions the user because it needs something from them before its work can go on, such as `which repo should I use?`; the card reads `asks · 2h` and rises the longer it waits
 - a result: an agent mentions the user with what they asked for, done; the card reads `result · 5h ago`; if the user does not look, it sinks and is gone after about three days
-- a stop the agent did not choose: the agent failed, has retried for a long time, or its host lost it; the card reads `failed · 1h`
+- a stop the agent did not choose: the agent failed, has retried for an hour, or its host lost it; the card reads `failed · 1h`, `stuck · 2h`, or `lost · 5m` on the first thread the agent joined, and outranks a result; steering the agent, writing in the thread, or `Verdict.done` clears it
 
 In a channel's list of threads, a thread with a mention of the user waiting unread shows `@1` beside its name in yellow. A mention that is only for the record makes no card; the thread shows as unread on Home instead. A message that mentions nobody makes no card. From Slack, a direct message, a mention, and a reply in a followed thread make a card; see `slack.Answer Slack`.
 

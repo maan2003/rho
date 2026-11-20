@@ -9,7 +9,6 @@ because: the user runs many projects and many agents at once, and a thread keeps
 costs: an agent's progress is a stream of messages the user must read, not a status they can see at a glance.
 
 ## bet An agent reaches the user by mention, or by a stop it did not choose
-status: an agent that fails, retries for a long time, or is lost by its host makes no card; the user finds it on the agent's screen or by name in `window.Palette`.
 instead of: every message from an agent asking for the user's attention, or agent state driving attention.
 serves: Know what wants them, and where they were.
 because: agents write far more than the user can read; a mention that is an ask or a result is the agent's one way to say "you, now", and a stop it did not choose says the same without words.
@@ -41,7 +40,7 @@ does:
 - write `i`, or `ctrl-down`: put the cursor in the box at the bottom, which reads `message · ctrl-enter sends` while empty; `escape` or `ctrl-up` goes back to the messages
 - send `ctrl-enter`, or `send` on the phone: post what is in the box
 - name, from the palette as `name this thread`: ask `name (current):` and give the thread that name
-- open a participant `enter` on the `with` line: open the first agent's screen, `agents.Agent`
+- open a participant `enter` on an agent in the `with` line: open that agent's screen, `agents.Agent`
 - go up `enter` on the line of threads above: open the thread this one is under
 - star `z` in the `slack` menu, on a Slack conversation: make it a `home.Room`, or stop
 - follow thread `t` in the `slack` menu, on a Slack thread: let its replies make cards, or stop
@@ -52,9 +51,7 @@ A thread is named for the user: after its second message, the host gives it a sh
 
 The list of threads in a channel puts the threads with a mention of the user first, then the ones with something new, each group newest first.
 
-A thread shows what each of its agents is doing, and the user steers an agent from the thread, not from the agent's screen.
-
-status: the `with` line names the agents without their state, and steering is from the palette on the agent's screen.
+A thread shows what each of its agents is doing. The `with` line reads each agent with its state and age, such as `with eng-q9tz · working 12m, eng-kjhi · failed 1h`, refreshed each minute, and with the cursor on that line the palette offers that agent's steering commands, so the user steers from the thread.
 
 A Slack conversation is a thread whose messages are what was said in a Slack channel, group, or direct message, with the Slack thread under each message folded beneath it. Its name is such as `#design-24`, `@Barbara Liskov`, or the names of a group. It also shows a line for each new day and a `new` line above the first unread message; older messages load as the user scrolls up to `older messages not loaded`. A message being sent shows `sending…` under the box; one that failed shows `send failed · Enter retries`.
 
