@@ -28,7 +28,7 @@ sees: where the user is: the room and the thing under the cursor, and when that 
 
 The lamp is the only thing outside the user's place that pulls at them. When a card rises past a higher line, the window also chimes once.
 
-When a host drops, the line says `disconnected` in red, with the host's name when more than one is attached, until it is back.
+When a host drops, the line names it and says `reconnecting · 12s` in red, counting from the drop, until it is back; the echo line says why once, `rho: disconnected · connection lost`, or `cannot reach the host` when it never answered.
 
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
@@ -46,7 +46,7 @@ does:
 
 A note is not among the places. Notes have one door, the command `notes`; see `notes.Notes`.
 
-The keys shown beside a command are the keys inside its menu, such as `a` in `hosts › attach` after `hosts` is open. A command at the top of the list shows a key too, such as `shift-u` beside `usage…` or `a` beside `start agent here`, but no menu holds the top of the list, so outside the palette that key does something else or nothing.
+A command at the top of the list shows no key. A command inside a menu shows the key it has there, such as `a` in `hosts › attach`, once `hosts` is open. Two commands with one name are both listed; the second gets ` (2)`.
 
 ## concept Menu
 purpose: offer a short list of choices where the list itself is the information, such as how long to snooze or which agent to join.

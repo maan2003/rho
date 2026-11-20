@@ -30,6 +30,8 @@ A room is a place the user works in. It is one of two things: a `chat.Channel` t
 shows: `Room`, `deal.Card` words on the rooms that hold one
 starts: `Glance at what waits`, `deal.Clear what waits`, `window.Go to something by name`
 
+With no rooms, Home reads `no rooms yet · attach a host or register a Slack workspace from the palette (:)`.
+
 The rooms go in this order: first the rooms that hold a card, in the order the deal would hand them; then the rooms with something unread, newest first; then every other room, newest first. With no room at all, Home reads `no rooms yet`.
 
 ## flow Glance at what waits

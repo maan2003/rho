@@ -34,13 +34,13 @@ day: Turn ideas into work.
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
 principle: the user attaches the server as `rho`; its channels appear on Home, each tagged `rho`; when the connection drops, the top line says so in red until it is back.
-sees: its name, which the user chose, as the tag on its rooms on Home and in `window.Palette`; whether it is `online`, `connecting`, `reconnecting · 12s`, or `disconnected` with the reason; when more than one is attached, the thread's host before its name at the top.
+sees: its name, which the user chose, as the tag on its rooms on Home and in `window.Palette`; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; when more than one is attached, the thread's host before its name at the top.
 has:
 - many `chat.Channel`
 - many `agents.Agent`
 does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
-- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen; its rooms, agents, and their screens go from the window
+- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its rooms, agents, and their screens go from the window, and its messages come back from the host when it is attached again; drafts and unsent messages stay
 - status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
 
 A host is reached in one of three ways:

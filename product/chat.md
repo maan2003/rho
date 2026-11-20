@@ -36,7 +36,7 @@ sees: its name and its host; open, the list of its threads, one line each.
 has:
 - many `Thread`
 does:
-- new channel: ask `new channel:` and post the answer as the channel's first message; with more than one host attached, ask `on host:` first
+- new channel: ask `new channel:` and make a channel named by the answer; with more than one host attached, ask `on host:` first
 - open `enter` on Home: show its threads
 
 ## concept Thread
