@@ -10997,6 +10997,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         match event {
+            multi_buffer::Event::EditBlockedByReadOnly => {
+                cx.emit(EditorEvent::EditBlockedByReadOnly);
+            }
             multi_buffer::Event::Edited {
                 edited_buffer,
                 source,
@@ -13848,6 +13851,8 @@ pub enum EditorEvent {
         selections_by_buffer: HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,
         split: bool,
     },
+    /// An attempted edit was rejected because it touched read-only text.
+    EditBlockedByReadOnly,
     /// Emitted when an underlying buffer changes, including edits made through another editor.
     BufferEdited,
     /// Emitted when this editor creates, undoes, or redoes an edit transaction.

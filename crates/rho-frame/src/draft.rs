@@ -183,6 +183,53 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn only_an_attempt_to_change_mail_emits_the_read_only_event(cx: &mut gpui::TestAppContext) {
+        let blocked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (document, history, draft, _subscription) = cx.update(|cx| {
+            let history = cx.new(|cx| {
+                let mut history = Buffer::local("mail to keep\n── reply", cx);
+                history.set_capability(Capability::Read, cx);
+                history
+            });
+            let draft = cx.new(|cx| Buffer::local("some draft", cx));
+            let document = document(&history, &draft, cx);
+            let count = blocked.clone();
+            let subscription = cx.subscribe(&document, move |_, event: &multi_buffer::Event, _| {
+                if matches!(event, multi_buffer::Event::EditBlockedByReadOnly) {
+                    count.set(count.get() + 1);
+                }
+            });
+            (document, history, draft, subscription)
+        });
+        let mail = Point::new(0, 3);
+        let draft_point = Point::new(2, 5);
+        cx.update(|cx| {
+            document.update(cx, |doc, cx| {
+                doc.edit(
+                    [(mail..mail, ""), (draft_point..draft_point, "real ")],
+                    None,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(blocked.get(), 0, "a no-op in the mail did not count");
+        cx.update(|cx| {
+            document.update(cx, |doc, cx| {
+                doc.edit([(Point::new(1, 2)..Point::new(2, 5), "")], None, cx);
+            });
+        });
+        assert_eq!(
+            blocked.get(),
+            1,
+            "the cross-separator delete was partially blocked"
+        );
+        cx.update(|cx| {
+            assert_eq!(history.read(cx).text(), "mail to keep\n── reply");
+            assert_eq!(draft.read(cx).text(), "real draft");
+        });
+    }
+
+    #[gpui::test]
     fn editing_changes_only_the_draft_and_history_updates_keep_its_position(
         cx: &mut gpui::TestAppContext,
     ) {
