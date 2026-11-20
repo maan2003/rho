@@ -62,7 +62,6 @@ does:
 - start an agent from it: as `agents.Start an agent from a message`
 - reply privately: as `notes.Reply privately`
 - message actions… `e` in the `slack` menu, on a Slack message: `edit` and `delete…` on the user's own, `react…`, `copy link`, `forward…`, and `mark unread`
-- edit `e`, react `r`, mark unread `m`: the same, by key, on the Slack message under the cursor; `e` on someone else's message echoes `slack: only your own messages can be edited`
 - react…: a menu of the emoji already on the message and the user's recent ones, each on a key, with `/` `by name…` for any other; picking one the user already gave takes it away
 - delete…: ask `delete message? type delete:`; only the word `delete` deletes, for good
 - forward…: ask `forward to:` with the user's Slack conversations, and send the message there

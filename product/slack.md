@@ -14,11 +14,11 @@ principle: the user runs `register workspace…`, gives the name, the token, and
 sees: its name, as the tag on its rooms on Home; on the echo line, `slack unavailable:` and the reason when Slack refuses it.
 does:
 - register workspace…, from the palette under `slack`: ask `slack workspace:`, then `… xoxc token:`, then `… d cookie:`; the token and the cookie show on screen as they are pasted, and rho's history of prompts keeps neither
-- new message… `ctrl-n`: ask `new message — people (comma separated):` with one to eight people, and open a conversation with them
+- new message… `n` in the `slack` menu: ask `new message — people (comma separated):` with one to eight people, and open a conversation with them
 - browse channels… `c` in the `slack` menu: ask `browse channels — choose to join and open:` with the workspace's channels, and join and open the one chosen
-- next unread `shift-n`: open the next conversation with something unread
+- next unread `shift-n` in the `slack` menu: open the next conversation with something unread; with nothing unread the echo line reads `slack: nothing unread`
 - drafts… `d` in the `slack` menu: ask `slack drafts:` with every conversation that holds a `chat.Draft`, and open the one chosen at its box; with none, the echo line reads `slack: no drafts`
-- search messages… `shift-s`, search files… `ctrl-shift-s`, in the `slack` menu: as `Find something said in Slack`
+- search messages… `s`, search files… `f`, in the `slack` menu: as `Find something said in Slack`; started inside a conversation, the search covers that conversation only, and the prompt says so
 - mark read before… in the `slack` menu: as `Catch up after time away`
 
 Giving a registered name again replaces its token and cookie. The window answers a wrong token with what was wrong, never with the token.
@@ -47,7 +47,7 @@ when: I remember something was said or shared in Slack
 want: search for it
 so that: I find the message or file without scrolling
 flow:
-1. press `shift-s` for messages or `ctrl-shift-s` for files, or choose `search messages…` or `search files…` in the `slack` menu
+1. choose `search messages…` or `search files…` in the `slack` menu; inside a conversation, the search covers that conversation
 2. type the words and press `enter`; the results open
 3. `[` and `]` move between pages of results
 4. `enter` on a result opens it in its conversation
