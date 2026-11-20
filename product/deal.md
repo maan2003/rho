@@ -3,14 +3,12 @@
 The deal hands the user the one thing that wants them most. The usual answer is a reply; when there is nothing to say, the user says done.
 
 ## bet The deal, not an inbox
-status: the user deals one card at a time; Home offers a list of rooms, not the first cards in deal order.
 instead of: a list of unread things the user scans from top to bottom and marks read.
 serves: Know what wants them, and where they were.
 because: between two places the user has a minute and no memory of what asked; dealing hands them the next thing to answer, and the product remembers the rest.
 costs: the `desk.Desk` shows only the first cards; the rest are behind them.
 
 ## journey Back from an hour elsewhere
-status: the user can open Home, deal, and go back; Home lists rooms and there is no cold return to a desk.
 goal: the user clears what wants them and gets back to where they were.
 starts when: the user looks up after an hour in a terminal or a page.
 steps:
@@ -33,7 +31,7 @@ does:
 A result waits like an ask; nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 
 ## concept Verdict
-status: replying in host chat already clears the thread. The empty deal opens Home rather than the desk; Slack in the browser has no rho verdicts.
+status: Slack in the browser has no rho verdicts.
 purpose: let the user say once what a card means to them, so rho remembers their answer.
 principle: the user replies if they have words; otherwise they say done. If they change their mind about a verdict, they can take it back.
 sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`.
@@ -48,7 +46,6 @@ does:
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 
 ## flow Clear what waits
-status: an empty deal opens Home rather than the desk.
 runs: 50 a day
 day: Know what wants them, and where they were.
 when: the user has a few minutes and wants to clear what asks for them

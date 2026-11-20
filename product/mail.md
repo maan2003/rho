@@ -31,7 +31,7 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-status: a host has named channels that show their threads and remember where to start the next agent; the channel is not a mail address, and the user writes a new idea in its own box.
+status: the project's own screen is still the channel's list of threads, with agent names and counts on its rows.
 purpose: give each project one address to write to, without asking the user where its agents should work each time.
 principle: the user sends an idea to `tide@lab`; the project starts the work where its agents work and sends its asks and results from that address.
 sees: its name and host as an address, such as `tide@lab`; open, the threads of that project by subject.

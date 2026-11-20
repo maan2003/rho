@@ -16,7 +16,6 @@ because: the user does not edit code by hand and must still know whether a resul
 costs: a transcript is long, and the user reads it to find what went wrong.
 
 ## journey An agent in trouble gets back on track
-status: the window has no desk; the user reaches the stopped work from Home or the card.
 goal: the user gets the work going again so the result comes.
 starts when: an agent stops or goes quiet.
 steps:
@@ -137,7 +136,6 @@ user: which change, and what to tell it.
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
 
 ## flow Work beside an agent
-status: the terminal, shell and desktop open from the transcript as described; the way out to the desk goes to Home.
 runs: 3 a day
 day: Reach anything.
 when: the user wants to check or fix something in an agent's workset with their own hands
@@ -153,7 +151,6 @@ cases: the agent's host is a host on this machine, where its desktop does not op
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule an idea starts the work in its thread
-status: sending an idea from a channel starts an agent in its message's thread; the user cannot send an addressed idea from anywhere.
 when the user sends a `mail.Mail` as a new idea to a `mail.Project`, then the agent starts in the `mail.Thread` for that work and reads the idea first.
 
 ## flow Approve a push or a fetch

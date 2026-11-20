@@ -3,7 +3,6 @@
 The desk answers what waits and what is moving, and gives the user a place to write a new idea.
 
 ## journey Switching projects
-status: the user goes to a room on Home or finds a channel by name. A channel lists threads and unread counts, not how its work is moving.
 goal: the user picks up a different project where they left off.
 starts when: the user decides to work on a different project now.
 steps:

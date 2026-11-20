@@ -9,7 +9,6 @@ because: everything the user does should be a place with the same keys and the s
 costs: what has no place yet is reached through a terminal, the browser, or an agent.
 
 ## concept Screen
-status: `tab` reaches Home, the room list. When the window starts again it restores where the user was without a ten-minute cutoff.
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
 principle: the user opens a `mail.Project`, then one of its threads; `Screen.back` returns to the project exactly as they left it.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
@@ -101,7 +100,6 @@ A prompt for a secret, such as the phrase that pairs devices, shows what is type
 A question from a host, such as whether an agent may push, opens a prompt by itself, over whatever the user is doing; see `agents.Approve a push or a fetch`.
 
 ## concept Phone bar
-status: the built bar acts on Home's room rows; there is no desk or idea box from anywhere.
 purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
