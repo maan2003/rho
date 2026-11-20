@@ -10,12 +10,12 @@ use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div};
 use language::{Buffer, BufferEvent, Capability};
-use multi_buffer::MultiBuffer;
-use rho_dealer::Addressed as _;
-use rho_frame::{FrameLink, Surface};
+use multi_buffer::{Anchor, MultiBuffer};
+use rho_frame::draft::focus_writing_at;
+use rho_frame::{FrameLink, Surface, phone_editor_tap};
 use theme::ActiveTheme as _;
 
-use crate::{NoteId, NoteSystem, note_title, text_of};
+use crate::{NoteId, NoteSystem, text_of, title_of};
 
 /// Sets a buffer's whole text, when it differs.
 fn set_text(buffer: &Entity<Buffer>, text: &str, cx: &mut App) {
@@ -25,8 +25,14 @@ fn set_text(buffer: &Entity<Buffer>, text: &str, cx: &mut App) {
         }
         let capability = buffer.capability();
         buffer.set_capability(Capability::ReadWrite, cx);
-        let end = buffer.len();
-        buffer.edit([(0..end, text)], None, cx);
+        // Loading another device's revision is not a local editor edit.
+        // Isolate it so an immediate `u` cannot undo loading the note.
+        buffer.finalize_last_transaction();
+        buffer.start_transaction();
+        buffer.set_text(text, cx);
+        if let Some(transaction) = buffer.end_transaction(cx) {
+            buffer.forget_transaction(transaction);
+        }
         buffer.set_capability(capability, cx);
     });
 }
@@ -42,7 +48,6 @@ pub struct NoteView {
     /// only when it moved away from it, and a text from another device
     /// replaces the buffer only when it differs from it.
     synced: Option<String>,
-    title: String,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -103,27 +108,50 @@ impl NoteView {
             editor,
             body,
             synced: None,
-            title: String::new(),
             _subscriptions: subscriptions,
         }
     }
 
-    /// Brings the surface up to the marks: the text, unless the user is
-    /// typing.
+    /// Only a newly minted note starts in Insert. The optional starting
+    /// text came from the user's submitted query, so it is an editor edit.
+    pub(crate) fn begin(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.synced = Some(String::new());
+        if !text.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_text(text, window, cx);
+            });
+        }
+        self.focus_writing(None, window, cx);
+    }
+
+    fn focus_writing(&self, at: Option<Anchor>, window: &mut Window, cx: &mut App) {
+        let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+        let start = snapshot.anchor_after(language::Point::zero());
+        let at = at.unwrap_or_else(|| snapshot.anchor_after(snapshot.max_point()));
+        focus_writing_at(&self.editor, start, at, window, cx);
+    }
+
+    fn tap_text(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(at) = phone_editor_tap(self.editor.read(cx), event, window) {
+            self.focus_writing(Some(at), window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
+    /// Brings the surface up to the marks unless the user is typing.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let note = self.note;
-        let Some((text, title)) = self.frame.read(cx, |frame, _| {
-            let marks = frame.marks();
-            (text_of(marks, note), note_title(marks, &note.address()))
-        }) else {
+        let Some(text) = self.frame.read(cx, |frame, _| text_of(frame.marks(), note)) else {
             return;
         };
         if !self.system.read(cx).typing(note) && self.synced.as_ref() != Some(&text) {
-            self.synced = Some(text.clone());
             set_text(&self.body, &text, cx);
-        }
-        self.title = title;
-        if self.synced.is_none() {
             self.synced = Some(text);
         }
         cx.notify();
@@ -140,16 +168,20 @@ impl NoteView {
             return;
         }
         self.synced = Some(text.clone());
-        self.title = crate::title_of(&text);
         let note = self.note;
         self.system
             .update(cx, |system, cx| system.edited(note, text, cx));
+        cx.notify();
     }
 }
 
 impl Surface for NoteView {
-    fn title(&self, _cx: &App) -> String {
-        self.title.clone()
+    fn title(&self, cx: &App) -> String {
+        title_of(&self.body.read(cx).text())
+    }
+
+    fn edits_at_point(&self, _cx: &App) -> bool {
+        true
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -166,6 +198,7 @@ impl Focusable for NoteView {
 impl Render for NoteView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .capture_any_mouse_down(cx.listener(Self::tap_text))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())

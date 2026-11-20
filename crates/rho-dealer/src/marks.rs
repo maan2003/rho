@@ -175,7 +175,9 @@ impl Marks {
     /// Every note that has text and is not deleted.
     pub fn notes(&self) -> impl Iterator<Item = (&Address, &NodeMarks)> {
         self.nodes.iter().filter(|(node, marks)| {
-            node.as_note().is_some() && marks.body.is_some() && !marks.deleted
+            node.as_note().is_some()
+                && marks.body.as_ref().is_some_and(|body| !body.is_empty())
+                && !marks.deleted
         })
     }
 

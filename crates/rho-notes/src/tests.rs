@@ -148,49 +148,84 @@ fn a_new_note_is_about_where_it_was_made_or_nothing() {
     }
 }
 
-/// `notes` lists every note, a reply under something too, by its first
-/// line, the one last written first: an older note edited last goes on
-/// top, a deleted one goes, and one never typed into is not there yet. A
-/// reply says where it shows, by the name `place` gives, or that it is a
-/// reply when nothing names the place.
+/// Text far beyond the preview still narrows other matches; two terms
+/// can be on different lines, case and order do not matter, and the
+/// private mail's words are not part of the user's text.
 #[test]
-fn notes_lists_every_note_last_written_first() {
+fn notes_searches_the_whole_body_in_last_written_order() {
     let mut world = World::default();
-    let older = world.note("older\nand more");
-    let reply = world.note("a reply");
-    world.say(Fact::About {
-        node: reply.address(),
-        about: Some(thread(7)),
-    });
-    let stray = world.note("about a thread no host names");
-    world.say(Fact::About {
-        node: stray.address(),
-        about: Some(thread(8)),
-    });
-    let newer = world.note("");
-    let gone = world.note("gone");
-    world.write(gone, "gone", true);
+    let older = world
+        .note("Renew lease\nbefore Friday bring the thick red folder and the signed copy\nCAFÉ");
+    let both = world.note("Signed receipt\nTake it to the Café");
+    let one = world.note("A later note\nOnly the signed contract");
+    let legacy_empty = world.note("");
+    let deleted = world.note("signed CAFÉ");
+    world.write(deleted, "signed CAFÉ", true);
     let fresh = NoteId(uuid::Uuid::new_v4());
-    world.say(Fact::About {
-        node: fresh.address(),
-        about: Some(thread(7)),
-    });
-    world.write(older, "older, edited last", false);
-    let place = |about: &Address| (*about == thread(7)).then(|| "fix the flaky test".to_owned());
-    let listed = |note: NoteId, title: &str, reply: Option<Option<&str>>| Listed {
-        note: note.address(),
-        title: title.to_owned(),
-        reply: reply.map(|place| place.map(str::to_owned)),
-    };
-    assert_eq!(
-        super::listed(&world.marks, place),
-        [
-            listed(older, "older, edited last", None),
-            listed(newer, UNTITLED, None),
-            listed(stray, "about a thread no host names", Some(None)),
-            listed(reply, "a reply", Some(Some("fix the flaky test"))),
-        ]
+    for note in [one, fresh] {
+        world.say(Fact::About {
+            node: note.address(),
+            about: Some(thread(7)),
+        });
+    }
+    world.write(
+        older,
+        "Renew lease\nbefore Friday bring the thick red folder and the signed copy\nCAFÉ",
+        false,
     );
+    let context = |_: &Address| ReplyContext {
+        mail: Some("Meet at a café".into()),
+        thread: Some("Pick up the keys".into()),
+    };
+    let found = |query: &str| listed(&world.marks, query, context);
+    let all = found("");
+    assert_eq!(
+        all.iter().map(|listed| listed.note).collect::<Vec<_>>(),
+        [older, one, both],
+        "{legacy_empty:?} was a stored empty revision, not a visible note"
+    );
+    assert_eq!(all[0].preview, "before Friday bring the thick red folder…");
+    assert_eq!(
+        found("café SIGN")
+            .iter()
+            .map(|listed| listed.note)
+            .collect::<Vec<_>>(),
+        [older, both]
+    );
+    assert_eq!(found("signed copy")[0].note, older);
+    assert!(found("pick up").is_empty());
+    assert!(found("unmatched").is_empty());
+}
+
+#[test]
+fn a_cleared_reply_disappears_and_restores_at_the_same_identity() {
+    let mut world = World::default();
+    let text = "keep my old words\nà part";
+    let note = world.note(text);
+    let about = thread(31);
+    world.say(Fact::About {
+        node: note.address(),
+        about: Some(about.clone()),
+    });
+    assert!(matches!(
+        write_for(&world.marks, note, String::new()),
+        Some(Write::Note { note: id, body: None, deleted: Some(true) }) if id == note.0
+    ));
+    world.say(Fact::Deleted { note: note.0 });
+    assert_eq!(world.marks.get(&note.address()).body.as_deref(), Some(text));
+    assert_eq!(text_of(&world.marks, note), "");
+    assert!(world.marks.replies_to(&about).is_empty());
+    assert!(write_for(&world.marks, note, String::new()).is_none());
+    // Text undo says the same body again, even though it is still held
+    // under the deletion, and supersedes the tombstone.
+    assert!(matches!(
+        write_for(&world.marks, note, text.into()),
+        Some(Write::Note { note: id, body: Some(body), deleted: None })
+            if id == note.0 && body == text
+    ));
+    world.write(note, text, false);
+    assert_eq!(text_of(&world.marks, note), text);
+    assert_eq!(world.marks.replies_to(&about)[0].0, &note.address());
 }
 
 /// The palette lists every note that has text, by its first line, a
@@ -205,7 +240,7 @@ fn the_palette_finds_every_note_by_its_first_line() {
         node: reply.address(),
         about: Some(thread(7)),
     });
-    let untitled = world.note("");
+    let untitled = world.note("\nits first line is intentionally empty");
     let gone = world.note("gone");
     world.write(gone, "gone", true);
     world.write(older, "older, edited last", false);
@@ -233,30 +268,39 @@ fn the_palette_finds_every_note_by_its_first_line() {
     );
 }
 
-/// A reply's line reads its first line, then, dim, where it shows; a note
-/// about nothing is its first line alone.
 #[test]
-fn a_reply_says_where_it_shows() {
-    let note = NoteId(uuid::Uuid::new_v4()).address();
-    let row = |reply: Option<Option<&str>>| {
-        list::row(&Listed {
-            note: note.clone(),
-            title: "verify on CI too".to_owned(),
-            reply: reply.map(|place| place.map(str::to_owned)),
-        })
+fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
+    let now = Timestamp::from_second(1_800_000_000).unwrap();
+    let written = Timestamp::from_second(1_800_000_000 - 7 * 60).unwrap();
+    let mut listed = Listed {
+        note: NoteId(uuid::Uuid::new_v4()),
+        title: "verify on CI too".into(),
+        preview: "it failed last night".into(),
+        written,
+        reply: Some(ReplyContext {
+            mail: Some("Can this ship before noon on Friday?".into()),
+            thread: Some("Fix the flaky test".into()),
+        }),
     };
-    let (text, styles) = row(Some(Some("fix the flaky test")));
-    assert_eq!(text, "  verify on CI too  ↳ in fix the flaky test");
-    let dim: Vec<_> = styles
-        .iter()
-        .filter(|(class, _)| *class == list::Class::Muted)
-        .map(|(_, range)| &text[range.clone()])
-        .collect();
-    assert_eq!(dim, ["↳ in fix the flaky test"]);
-    assert_eq!(row(Some(None)).0, "  verify on CI too  ↳ private reply");
-    let (text, styles) = row(None);
-    assert_eq!(text, "  verify on CI too");
-    assert!(styles.iter().all(|(class, _)| *class != list::Class::Muted));
+    let (text, styles) = list::row(&listed, now);
+    assert_eq!(
+        text,
+        "  verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  ·\u{a0}7m"
+    );
+    assert_eq!(&text[styles[0].1.clone()], "verify on CI too");
+    assert_eq!(styles[1].0, list::Class::Muted);
+    assert_eq!(
+        &text[styles[1].1.clone()],
+        &text["  verify on CI too".len()..]
+    );
+
+    listed.reply = Some(ReplyContext::default());
+    assert!(list::row(&listed, now).0.contains("↳ private reply"));
+    listed.reply = None;
+    assert_eq!(
+        list::row(&listed, now).0,
+        "  verify on CI too  it failed last night  ·\u{a0}7m"
+    );
 }
 
 /// The title follows the first line as it is typed, before it is written.
@@ -269,4 +313,18 @@ fn a_note_is_called_by_its_first_line() {
     assert_eq!(title_of("  padded  \nrest"), "padded");
     assert_eq!(title_of(""), UNTITLED);
     assert_eq!(title_of("\nsecond line only"), UNTITLED);
+}
+
+#[test]
+fn previews_stop_at_word_or_character_limits_without_splitting_utf8() {
+    let long = "é".repeat(52);
+    assert_eq!(excerpt(long.split_whitespace()), long);
+    assert_eq!(
+        excerpt(format!("{long} after").split_whitespace()),
+        format!("{}…", "é".repeat(51))
+    );
+    assert_eq!(
+        excerpt("1 2 3 4 5 6 7 8".split_whitespace()),
+        "1 2 3 4 5 6 7…"
+    );
 }
