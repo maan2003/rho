@@ -1084,10 +1084,13 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
-        // The notice gives way to an echo, which answers the key just
-        // pressed; on a phone the two do not fit beside each other.
+        // The notice gives way to an echo. On a phone use the short form
+        // so an unpaired device can still show the card the user must answer.
         let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
-            .then_some("verdicts stay on this device until it is paired");
+            .then_some(match layout {
+                Layout::Desktop => "verdicts stay on this device until it is paired",
+                Layout::Phone => "unpaired",
+            });
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.

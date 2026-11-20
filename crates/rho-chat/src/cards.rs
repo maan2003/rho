@@ -312,7 +312,12 @@ mod tests {
         }
 
         fn root(&mut self) -> MessageId {
-            match self.chat.roots().first() {
+            match self
+                .chat
+                .roots()
+                .iter()
+                .find(|id| self.chat.is_project(**id))
+            {
                 Some(root) => *root,
                 None => self.post(None, Party::User, Vec::new(), "rho"),
             }
