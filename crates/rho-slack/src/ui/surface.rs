@@ -8,7 +8,7 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div};
 use rho_dealer::Address;
-use rho_frame::thread::{FocusComposer, FocusLog, SendMessage};
+use rho_frame::thread::{FocusComposer, FocusLog, SendMessage, SendOnly};
 use rho_frame::{Candidate, Frame, FrameLink, Row, Rows, Subject, Surface};
 use rho_window::style::StyleClass;
 
@@ -863,6 +863,10 @@ impl Render for SlackSurface {
             .on_action(cx.listener(Self::focus_composer))
             .on_action(cx.listener(Self::focus_log))
             .on_action(cx.listener(Self::send))
+            // A Slack message starts no agent: sending only is sending.
+            .on_action(
+                cx.listener(|this, _: &SendOnly, window, cx| this.send(&SendMessage, window, cx)),
+            )
             .on_action(cx.listener(Self::find_message))
             .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::previous_page))

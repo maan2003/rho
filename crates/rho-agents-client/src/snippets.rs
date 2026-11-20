@@ -30,13 +30,17 @@ const CLAUDE_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
 
 /// What the model picker cycles through, first the default. Any other
 /// pair the policy takes can be typed.
+///
+/// The default is the runtime the user picks for agents they start from a
+/// message: `opus-high`, decided once here rather than learned, so a start
+/// that asks nothing still runs where the user would have put it.
 pub const RUNTIMES: [&str; 7] = [
+    "opus-high",
     "sol-medium",
     "sol-high",
     "terra-medium",
     "astra-high",
     "hydrogen-high",
-    "opus-high",
     "fable-high",
 ];
 
@@ -268,9 +272,9 @@ mod tests {
         assert_eq!(
             Runtime::parse("").unwrap(),
             Runtime {
-                kind: RuntimeKind::Rho,
-                model: "sol".into(),
-                effort: "medium".into()
+                kind: RuntimeKind::Claude,
+                model: "opus".into(),
+                effort: "high".into()
             }
         );
         assert_eq!(
@@ -290,6 +294,8 @@ mod tests {
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");
         assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
+        assert_eq!(DEFAULT_RUNTIME, "opus-high");
+        assert_eq!(Runtime::parse("").unwrap().label(), "opus-high");
         assert_eq!(
             Runtime::parse("hydrogen-high").unwrap().kind,
             RuntimeKind::Rho

@@ -1,11 +1,14 @@
 //! Starting an agent from a message.
 //!
 //! Any message is what an agent starts from: the one under the point, or
-//! the one the composer is about to send. The user picks where (a new
-//! workset on a repository, a directory on the host as it is, or beside an
-//! agent already there) and the runtime; the GUI sends the code, which
-//! names the message as `origin`, so policy joins the agent to its thread
-//! and hands it the message first.
+//! the one the composer is about to send. An idea sent in a channel asks
+//! nothing it need not: it works where the channel's agents work, on the
+//! default runtime, and only a channel no agent started from yet asks
+//! where, once. The rare `start agent…` asks both: where (a new workset on
+//! a repository, a directory on the host as it is, or beside an agent
+//! already there) and the runtime. The GUI sends the code, which names the
+//! message as `origin`, so policy joins the agent to its thread and hands
+//! it the message first.
 
 use std::rc::Rc;
 
@@ -14,8 +17,8 @@ use futures::FutureExt as _;
 use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
 use rho_agent_types::MessageId;
-use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start};
-use rho_agents_client::snippets::{DEFAULT_FUNCTION, Function, RUNTIMES, Runtime};
+use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, channel_start};
+use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
 use rho_chat::ThreadId;
 use rho_frame::{Candidate, Frame, Row, Rows};
 use rho_window::style::StyleClass;
@@ -39,6 +42,68 @@ pub(crate) enum Origin {
     Draft,
 }
 
+/// What a start asks once it knows where.
+#[derive(Clone, Copy)]
+pub(crate) enum Runtimes {
+    /// `runtime (default):`, for the rare start that asks everything.
+    Ask,
+    /// Nothing: the default runtime, for an idea sent in a channel.
+    Default,
+}
+
+/// An idea sent in the channel `thread`: sent and started where the
+/// channel's agents work, on the default runtime. A channel no agent has
+/// started from asks where, once; the agent it starts is what the channel
+/// remembers.
+pub(crate) fn idea(system: &mut AgentsSystem, thread: ThreadId, cx: &mut Context<AgentsSystem>) {
+    let Some(host) = system.host_of(thread.host) else {
+        system.frame.echo(
+            "the thread's host is not attached",
+            StyleClass::SystemInfo,
+            cx,
+        );
+        return;
+    };
+    let registry = system.registry();
+    let chat = system.chat.read(cx);
+    let start = chat.chat(thread.host).and_then(|chat| {
+        let channel = chat.root_of(thread.message);
+        let agents = registry
+            .host_agents(host)
+            .into_iter()
+            .filter_map(|agent| registry.agent_identity(agent));
+        channel_start(agents, |message| {
+            chat.message(message).is_some() && chat.root_of(message) == channel
+        })
+    });
+    match start {
+        Some(start) => {
+            let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
+            send_and_start(
+                system,
+                thread,
+                Plan {
+                    host,
+                    start,
+                    runtime,
+                },
+                cx,
+            );
+        }
+        None => {
+            let rows = rows(
+                system,
+                cx.entity(),
+                thread,
+                Origin::Draft,
+                Runtimes::Default,
+                cx,
+            );
+            system.frame.menu(rows, cx);
+        }
+    }
+}
+
 /// The `start agent` menu for `thread`: where the agent works. `read` is
 /// the system as the caller holds it, leased, so it is not read through
 /// `system` here.
@@ -47,9 +112,15 @@ pub(crate) fn rows(
     system: Entity<AgentsSystem>,
     thread: ThreadId,
     origin: Origin,
+    runtimes: Runtimes,
     cx: &App,
 ) -> Rows {
-    let mut rows = Rows::new("start agent");
+    // The question an idea asks once: its answer is where the channel's
+    // agents work from then on.
+    let mut rows = Rows::new(match runtimes {
+        Runtimes::Ask => "start agent",
+        Runtimes::Default => "where this channel's agents work",
+    });
     let on_repo = system.clone();
     rows.push(Row::run(
         "n",
@@ -69,7 +140,16 @@ pub(crate) fn rows(
                         repo: Utf8PathBuf::from(repo),
                         rev: AUTO_BASE_REV.to_owned(),
                     };
-                    prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
+                    then(
+                        system.clone(),
+                        thread,
+                        origin,
+                        runtimes,
+                        start,
+                        frame,
+                        window,
+                        cx,
+                    );
                 }),
                 window,
                 cx,
@@ -94,7 +174,16 @@ pub(crate) fn rows(
                     let start = Start::Here {
                         cwd: Utf8PathBuf::from(cwd),
                     };
-                    prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
+                    then(
+                        system.clone(),
+                        thread,
+                        origin,
+                        runtimes,
+                        start,
+                        frame,
+                        window,
+                        cx,
+                    );
                 }),
                 window,
                 cx,
@@ -140,11 +229,41 @@ pub(crate) fn rows(
                     workset,
                     cwd: cwd.clone(),
                 };
-                prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
+                then(
+                    system.clone(),
+                    thread,
+                    origin,
+                    runtimes,
+                    start,
+                    frame,
+                    window,
+                    cx,
+                );
             },
         ));
     }
     rows
+}
+
+/// Where is answered: ask the runtime, or start on the default.
+#[allow(clippy::too_many_arguments)]
+fn then(
+    system: Entity<AgentsSystem>,
+    thread: ThreadId,
+    origin: Origin,
+    runtimes: Runtimes,
+    start: Start,
+    frame: &mut Frame,
+    window: &mut gpui::Window,
+    cx: &mut Context<Frame>,
+) {
+    match runtimes {
+        Runtimes::Ask => prompt_runtime(system, thread, origin, start, frame, window, cx),
+        Runtimes::Default => {
+            let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
+            begin(system, thread, origin, start, runtime, cx);
+        }
+    }
 }
 
 fn prompt_runtime(
@@ -157,7 +276,7 @@ fn prompt_runtime(
     cx: &mut Context<Frame>,
 ) {
     frame.open_prompt(
-        format!("runtime ({}):", RUNTIMES[0]),
+        format!("runtime ({DEFAULT_RUNTIME}):"),
         Rc::new(|_, needle, _| {
             RUNTIMES
                 .iter()
@@ -176,45 +295,64 @@ fn prompt_runtime(
                     return;
                 }
             };
-            let start = start.clone();
-            system.update(cx, |system, cx| {
-                let Some(host) = system.host_of(thread.host) else {
-                    system.frame.echo(
-                        "the thread's host is not attached",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                let plan = Plan {
-                    host,
-                    start,
-                    runtime,
-                };
-                match origin {
-                    Origin::Message => create(system, plan, thread.message, cx),
-                    Origin::Draft => {
-                        let endpoint = thread.host;
-                        let sent = system.chat.update(cx, |chat, cx| {
-                            chat.send_draft(endpoint, Some(thread.message), cx)
-                        });
-                        match sent {
-                            Some(client_id) => {
-                                system.starting.insert((endpoint, client_id), plan);
-                            }
-                            None => system.frame.echo(
-                                "send and start: nothing written",
-                                StyleClass::SystemInfo,
-                                cx,
-                            ),
-                        }
-                    }
-                }
-            });
+            begin(system.clone(), thread, origin, start.clone(), runtime, cx);
         }),
         window,
         cx,
     );
+}
+
+/// Starts the agent from `origin` once where and the runtime are known.
+fn begin(
+    system: Entity<AgentsSystem>,
+    thread: ThreadId,
+    origin: Origin,
+    start: Start,
+    runtime: Runtime,
+    cx: &mut App,
+) {
+    system.update(cx, |system, cx| {
+        let Some(host) = system.host_of(thread.host) else {
+            system.frame.echo(
+                "the thread's host is not attached",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let plan = Plan {
+            host,
+            start,
+            runtime,
+        };
+        match origin {
+            Origin::Message => create(system, plan, thread.message, cx),
+            Origin::Draft => send_and_start(system, thread, plan, cx),
+        }
+    });
+}
+
+/// Sends the draft under `thread`; the agent starts once the host logs it.
+fn send_and_start(
+    system: &mut AgentsSystem,
+    thread: ThreadId,
+    plan: Plan,
+    cx: &mut Context<AgentsSystem>,
+) {
+    let endpoint = thread.host;
+    let sent = system.chat.update(cx, |chat, cx| {
+        chat.send_draft(endpoint, Some(thread.message), cx)
+    });
+    match sent {
+        Some(client_id) => {
+            system.starting.insert((endpoint, client_id), plan);
+        }
+        None => system.frame.echo(
+            "send and start: nothing written",
+            StyleClass::SystemInfo,
+            cx,
+        ),
+    }
 }
 
 /// Sends the code that starts the agent from `origin`. The directory
@@ -232,6 +370,12 @@ pub(crate) fn create(
         return;
     };
     let function = Function::parse(DEFAULT_FUNCTION).expect("the default function parses");
+    // Where and on what, said back: an idea's start asked neither.
+    let at = match &plan.start {
+        Start::NewOn { repo, .. } => repo.to_string(),
+        Start::Join { cwd, .. } | Start::Here { cwd } => cwd.to_string(),
+    };
+    let on = format!("{} · {at}", plan.runtime.label());
     let reply = match plan.start.creation(&function, &plan.runtime, Some(origin)) {
         Creation::Workset(create) => {
             let reply = agents.call(create);
@@ -251,7 +395,7 @@ pub(crate) fn create(
         });
         cx.update(|cx| match reply {
             Ok(agent) => frame.echo(
-                format!("agent {} started", agent.encoded()),
+                format!("agent {} started · {on}", agent.encoded()),
                 StyleClass::SystemInfo,
                 cx,
             ),
