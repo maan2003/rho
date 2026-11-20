@@ -409,11 +409,14 @@ async fn mark_read_before_marks_what_it_counted_and_one_undo_takes_it_back(
     assert!(rig.attention(cx, &backlog_thread).is_some());
 
     // Slack's word that it marked them comes back over the socket after
-    // the undo; it must not stop the same catch-up from working again.
-    cx.run_until_parked();
-    let again = rig
-        .session
-        .read_with(cx, |session, _| session.mark_plan(cutoff));
-    assert_eq!(again.conversations, plan.conversations);
-    assert_eq!(again.threads, plan.threads);
+    // the undo, and the badge comes back with the counts the undo asks
+    // for, over the network rather than on this executor; neither may stop
+    // the same catch-up from working again.
+    until(cx, "the same catch-up planned again", |cx| {
+        let again = rig
+            .session
+            .read_with(cx, |session, _| session.mark_plan(cutoff));
+        again.conversations == plan.conversations && again.threads == plan.threads
+    })
+    .await;
 }
