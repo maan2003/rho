@@ -75,28 +75,6 @@ impl Quotas {
         !self.history.is_empty()
     }
 
-    /// The names of the hosts that answered for their history, when every
-    /// one of them answered with nothing because it has no account: what
-    /// the rate-limit chart says in place of an empty grid. `None` when any
-    /// of them has an account, a sample, or has not said which accounts it
-    /// has, since then the empty grid only means nothing was read yet.
-    pub fn without_accounts(&self, hosts: &impl HostNames) -> Option<Vec<String>> {
-        let names = hosts
-            .names()
-            .into_iter()
-            .filter(|(host, _)| self.history.contains_key(host))
-            .map(|(host, name)| {
-                let empty = self.history[&host].is_empty()
-                    && self
-                        .auth
-                        .get(&host)
-                        .is_some_and(|auth| auth.namespaces.is_empty());
-                empty.then_some(name)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        (!names.is_empty()).then_some(names)
-    }
-
     pub fn merged_summaries(&self, hosts: &impl HostNames) -> Vec<QuotaSummary> {
         let names = hosts.names();
         let mut merged: Vec<QuotaSummary> = Vec::new();
@@ -135,48 +113,45 @@ impl Quotas {
         merged
     }
 
-    /// ChatGPT history is one line per host/namespace. Claude history keeps
-    /// the previous tightest-host merge because it has no named auth scope.
+    /// Every host's allowances, kept separate by account. A configured GPT
+    /// account that has not reported yet can still be named beside the ones
+    /// that have, but don't treat a host's unanswered request as a report.
     pub fn merged_history(&self, hosts: &impl HostNames) -> Vec<QuotaSeries> {
         let names = hosts.names();
-        let mut merged: Vec<QuotaSeries> = Vec::new();
-        for (host, series_set) in &self.history {
-            for series in series_set {
-                if series.model == "gpt" {
-                    let Some(namespace) = &series.auth_namespace else {
-                        continue;
-                    };
-                    let mut series = series.clone();
-                    if names.len() > 1 {
-                        series.auth_namespace =
-                            Some(format!("{}/{}", label_of(&names, *host), namespace));
-                    }
-                    merged.push(series);
-                    continue;
+        let qualify = names.len() > 1;
+        let mut merged = Vec::new();
+        for (host, name) in names {
+            let Some(history) = self.history.get(&host) else {
+                continue;
+            };
+            let qualified = |namespace: &str| {
+                if qualify {
+                    format!("{name}/{namespace}")
+                } else {
+                    namespace.to_owned()
                 }
-                let Some(existing) = merged
-                    .iter_mut()
-                    .find(|existing| existing.model == series.model)
-                else {
-                    merged.push(series.clone());
-                    continue;
+            };
+            merged.extend(history.iter().filter_map(|series| {
+                let mut series = series.clone();
+                series.auth_namespace = match &series.auth_namespace {
+                    Some(namespace) => Some(qualified(namespace)),
+                    None if series.model == "gpt" => return None,
+                    None if qualify => Some(name.clone()),
+                    None => None,
                 };
-                for point in &series.points {
-                    match existing
-                        .points
-                        .iter_mut()
-                        .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
-                    {
-                        Some(candidate)
-                            if point.remaining_percent < candidate.remaining_percent =>
-                        {
-                            *candidate = *point;
-                        }
-                        Some(_) => {}
-                        None => existing.points.push(*point),
-                    }
-                }
-                existing.points.sort_by_key(|point| point.observed_at_ms);
+                Some(series)
+            }));
+            if let Some(auth) = self.auth.get(&host) {
+                merged.extend(auth.namespaces.iter().filter_map(|namespace| {
+                    (!history.iter().any(|series| {
+                        series.model == "gpt" && series.auth_namespace.as_ref() == Some(namespace)
+                    }))
+                    .then(|| QuotaSeries {
+                        model: "gpt".to_owned(),
+                        auth_namespace: Some(qualified(namespace)),
+                        points: Vec::new(),
+                    })
+                }));
             }
         }
         merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
@@ -237,42 +212,45 @@ mod tests {
     const DESK: HostId = HostId(2);
 
     #[test]
-    fn the_hosts_without_accounts_are_named_only_when_none_has_one() {
+    fn each_claude_account_keeps_its_own_history() {
         let hosts = Named(vec![(LAB, "lab".to_owned()), (DESK, "desk".to_owned())]);
         let mut quotas = Quotas::default();
-        quotas.set_history(LAB, Vec::new());
-        assert_eq!(
-            quotas.without_accounts(&hosts),
-            None,
-            "lab has not said which accounts it has"
-        );
+        let opus = |host, name: &str, remaining_percent| QuotaSeries {
+            model: "opus".to_owned(),
+            auth_namespace: Some(name.to_owned()),
+            points: vec![QuotaPoint {
+                observed_at_ms: host,
+                remaining_percent,
+                reset_at_unix: None,
+            }],
+        };
+        quotas.set_history(LAB, vec![opus(1, "work", 32), opus(1, "home", 75)]);
+        quotas.set_history(DESK, vec![opus(2, "work", 52)]);
 
-        quotas.set_auth(LAB, auth(&[], None));
+        let series = quotas.merged_history(&hosts);
+        let summary = crate::usage::quota_summary(&series, &[], 7, 3, 20);
+        let labels = summary
+            .legend
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            quotas.without_accounts(&hosts),
-            Some(vec!["lab".to_owned()])
+            labels,
+            [
+                "opus/desk/work  52% left · reset time not reported",
+                "opus/lab/home  75% left · reset time not reported",
+                "opus/lab/work  32% left · reset time not reported",
+            ]
         );
-
-        quotas.set_auth(DESK, auth(&[], None));
-        quotas.set_history(DESK, Vec::new());
-        assert_eq!(
-            quotas.without_accounts(&hosts),
-            Some(vec!["lab".to_owned(), "desk".to_owned()])
-        );
-
-        quotas.set_auth(DESK, auth(&["work"], None));
-        assert_eq!(
-            quotas.without_accounts(&hosts),
-            None,
-            "desk has an account it has not read yet"
-        );
+        assert_eq!(summary.lines.len(), 3);
+        assert_ne!(summary.lines[0].color, summary.lines[1].color);
     }
 
     #[test]
     fn the_active_account_is_named_the_way_its_line_is() {
         let hosts = Named(vec![(LAB, "lab".to_owned()), (DESK, "desk".to_owned())]);
         let mut quotas = Quotas::default();
-        quotas.set_auth(LAB, auth(&["work", "home"], Some("work")));
+        quotas.set_auth(LAB, auth(&["work", "home", "fresh"], Some("work")));
         quotas.set_auth(DESK, auth(&["work"], None));
         quotas.set_history(LAB, vec![gpt("home"), gpt("work")]);
         quotas.set_history(DESK, vec![gpt("work")]);
@@ -283,11 +261,16 @@ mod tests {
         let labels = summary
             .legend
             .iter()
-            .map(|entry| entry.label.split(' ').take(2).collect::<Vec<_>>().join(" "))
+            .map(|entry| entry.label.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
             labels,
-            ["gpt/desk/work 50%", "gpt/lab/home 50%", "★ gpt/lab/work"]
+            [
+                "gpt/desk/work  50% left · reset time not reported",
+                "gpt/lab/fresh  allowance not reported",
+                "gpt/lab/home  50% left · reset time not reported",
+                "★ gpt/lab/work  50% left · reset time not reported",
+            ]
         );
     }
 }

@@ -994,12 +994,6 @@ impl AgentsSystem {
         })
     }
 
-    /// The hosts that answered for their quota history and have no
-    /// account to read it from, when that is true of all of them.
-    pub(crate) fn hosts_without_accounts(&self) -> Option<Vec<String>> {
-        self.quotas.without_accounts(&self.registry)
-    }
-
     pub(crate) fn attached_hosts(&self) -> usize {
         self.links.len()
     }

@@ -10,6 +10,7 @@ use language::Point;
 use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
 use rho_frame::Surface;
+use text::Bias;
 use theme::ActiveTheme as _;
 
 use super::paint::{self, Summary};
@@ -29,14 +30,10 @@ pub struct UsageSurface {
     /// so a wider window rebuilds the summary once instead of drawing a
     /// coarser chart forever.
     columns: usize,
-    /// How tall the chart was drawn, compared with the width.
+    /// What is left under the header in the editor the frame actually laid out.
     height: Pixels,
     block: Option<CustomBlockId>,
 }
-
-/// Between two legend entries: wide enough that `opus $1.20   gpt $0.40`
-/// reads as two entries rather than four words.
-const LEGEND_GAP: &str = "   ";
 
 /// The legend's colours: one highlight per entry, at keys no other surface
 /// uses.
@@ -94,34 +91,28 @@ impl UsageSurface {
             0 => "no agent host is attached".to_owned(),
             _ => "waiting for the agent hosts' answer".to_owned(),
         };
-        match self.chart.chart {
+        let empty_spend = || format!("nothing spent in the last {days} days");
+        let summary = match self.chart.chart {
             Chart::RateLimit => {
                 let (series, active) = system.quota_history().ok_or_else(waiting)?;
-                // An empty grid cannot tell an account at its limit from no
-                // account at all; the words can.
                 if series.iter().all(|series| series.points.is_empty()) {
-                    return Err(match system.hosts_without_accounts() {
-                        Some(hosts) => format!("no accounts on {}", hosts.join(" or ")),
-                        None => "no usage yet".to_owned(),
-                    });
+                    return Err("no account has reported its allowance yet".to_owned());
                 }
-                Ok(Summary::Quota(usage::quota_summary(
-                    &series, &active, days, now, columns,
-                )))
+                Summary::Quota(usage::quota_summary(&series, &active, days, now, columns))
             }
-            Chart::ModelCost => Ok(Summary::Cost(usage::cost_summary(
+            Chart::ModelCost => Summary::Cost(usage::cost_summary(
                 &system.usage().spend(self.chart).ok_or_else(waiting)?,
                 days,
                 now,
                 columns,
-            ))),
-            Chart::UsageShare => Ok(Summary::Share(usage::share_summary(
+            )),
+            Chart::UsageShare => Summary::Share(usage::share_summary(
                 &system.usage().spend(self.chart).ok_or_else(waiting)?,
                 days,
                 now,
                 columns,
-            ))),
-            Chart::AgentCost => Ok(Summary::AgentCost(usage::agent_cost_summary(
+            )),
+            Chart::AgentCost => Summary::AgentCost(usage::agent_cost_summary(
                 &system
                     .usage()
                     .agent_cost(self.chart.days)
@@ -129,8 +120,12 @@ impl UsageSurface {
                 days,
                 now,
                 columns,
-            ))),
+            )),
+        };
+        if !matches!(summary, Summary::Quota(_)) && !summary.has_picture() {
+            return Err(empty_spend());
         }
+        Ok(summary)
     }
 
     /// Reduce what the system holds to the chart's width, write the header
@@ -139,14 +134,18 @@ impl UsageSurface {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let summary = self.summary(self.system.read(cx)).map(Arc::new);
         self.write_header(summary.as_deref().map_err(String::as_str), cx);
-        self.reinsert_block(summary.ok(), cx);
+        self.reinsert_block(
+            summary
+                .ok()
+                .filter(|summary| self.columns != 0 && summary.has_picture()),
+            cx,
+        );
         cx.notify();
     }
 
     /// The buffer's text: what the chart is, the totals, and what each
     /// colour stands for — everything that is words rather than picture.
-    /// The point goes to the legend, the first line that says something
-    /// about the picture under it, or to the words standing in for one.
+    /// The point goes to the answer, the first row after the title.
     fn write_header(&mut self, summary: Result<&Summary, &str>, cx: &mut Context<Self>) {
         let mut lines = vec![format!(
             "{} · last {} days",
@@ -155,37 +154,42 @@ impl UsageSurface {
         )];
         match summary {
             Ok(Summary::Cost(cost)) => lines.push(format!(
-                "${:.2} estimated API cost · {} requests{}",
-                cost.total,
+                "{} estimated API cost · {} request{}{}",
+                usage::dollars(cost.total),
                 cost.requests,
+                if cost.requests == 1 { "" } else { "s" },
                 paint::backfill_note(cost.approximate)
             )),
             Ok(Summary::Share(share)) => lines.push(format!(
-                "colors = share · height = smoothed weighted usage (p95-scaled) · {} requests{}",
+                "taller means more work · {} request{}{}",
                 share.requests,
+                if share.requests == 1 { "" } else { "s" },
                 paint::backfill_note(share.approximate)
             )),
-            Ok(Summary::Quota(_) | Summary::AgentCost(_)) => {}
+            Ok(Summary::AgentCost(_)) => {
+                lines.push("estimated API cost per agent over a week".to_owned());
+            }
+            Ok(Summary::Quota(_)) => {}
             Err(words) => lines.push(words.to_owned()),
         }
         let mut text = lines.join("\n");
         let legend = summary.map_or(&[][..], Summary::legend);
         let mut entries = Vec::new();
-        if !legend.is_empty() {
+        for entry in legend {
+            // One entry per editor line: a model and its value stay
+            // together at phone width, and each allowance has its own row.
             text.push('\n');
-        }
-        for (index, entry) in legend.iter().enumerate() {
-            if index > 0 {
-                text.push_str(LEGEND_GAP);
-            }
             entries.push((entry.color, text.len()..text.len() + entry.label.len()));
             text.push_str(&entry.label);
+        }
+        if self.buffer.read(cx).text() == text {
+            return;
         }
         self.buffer.update(cx, |buffer, cx| {
             let old = buffer.len();
             buffer.edit([(0..old, text.as_str())], None, cx);
         });
-        let home = Point::new(text.matches('\n').count() as u32, 0);
+        let home = Point::new(1, 0);
         self.editor.update(cx, |editor, cx| {
             // Every highlight in this editor is a legend entry's.
             editor.clear_highlights_with(
@@ -256,20 +260,43 @@ impl Focusable for UsageSurface {
 }
 
 impl Render for UsageSurface {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // One comparison per frame, and a rebuild only when the answer
-        // changes: the first frame, and a resize.
-        let columns = paint::columns_for(window);
-        let height = paint::height_for(window);
-        if columns != self.columns || height != self.height {
-            self.columns = columns;
-            self.height = height;
-            self.rebuild(cx);
-        }
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measure the actual editor area, not the window: the frame has
+        // already removed the phone bar and any prompt, and the editor
+        // knows how many displayed rows the header took at this width.
+        let editor = self.editor.clone();
+        let this = cx.weak_entity();
+        let (old_columns, old_height) = (self.columns, self.height);
         div()
             .key_context("RhoUsage")
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(bounds) = bounds.first() else {
+                    return;
+                };
+                let columns = bounds.size.width.as_f32().max(1.0) as usize;
+                let height = editor.update(cx, |editor, cx| {
+                    let line_height = editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size());
+                    let display = editor.display_snapshot(cx);
+                    let end = display.buffer_snapshot().max_point();
+                    let header_rows = display.point_to_display_point(end, Bias::Left).row().0 + 1;
+                    paint::height_for(bounds.size.height, line_height, header_rows)
+                });
+                if (columns, height) != (old_columns, old_height) {
+                    let this = this.clone();
+                    window.defer(cx, move |_, cx| {
+                        let _ = this.update(cx, |surface, cx| {
+                            surface.columns = columns;
+                            surface.height = height;
+                            surface.rebuild(cx);
+                        });
+                    });
+                }
+            })
     }
 }
