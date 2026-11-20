@@ -949,15 +949,16 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
         let mut mentions = self.user_mentions(mentions);
-        // On an explicitly addressed mail the GUI supplies the writer.
-        // A direct reply underneath an agent's mail can infer it even
-        // when the writer left the thread. Deleted agents receive nothing.
-        if let Some(parent) = parent
-            && let Some(mail) = self.db.read().message(parent)
+        // Resolve the writer on the host, even if they are no longer a
+        // thread member. A deleted agent cannot receive mail, but the answer
+        // still belongs in the thread.
+        if let Some(target) = reply_to
+            && let Some(mail) = self.db.read().message(target)
             && let Address::Agent(agent) = mail.from
             && self.workset_of(agent).is_ok()
             && mentions
@@ -971,6 +972,7 @@ impl AgentPool {
         }
         let message = NewMessage {
             from: Address::User,
+            reply_to,
             mentions,
             content,
         };
@@ -1308,6 +1310,7 @@ impl AgentPool {
                 self.known_mentions(&mentions)?;
                 let message = NewMessage {
                     from: Address::Agent(sender),
+                    reply_to: None,
                     mentions,
                     content,
                 };

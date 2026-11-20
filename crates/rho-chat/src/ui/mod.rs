@@ -351,8 +351,41 @@ impl ChatSystem {
         mentions: Vec<AgentId>,
         cx: &mut Context<Self>,
     ) -> u64 {
+        self.queue_mail(endpoint, parent, None, text, mentions, cx)
+    }
+
+    /// Writes in `thread` and answers one particular mail, even if its writer
+    /// is no longer a thread member or the client is offline.
+    pub fn reply(
+        &mut self,
+        thread: ThreadId,
+        to: MessageId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.queue_mail(
+            thread.host,
+            Some(thread.message),
+            Some(to),
+            text,
+            Vec::new(),
+            cx,
+        )
+    }
+
+    fn queue_mail(
+        &mut self,
+        endpoint: EndpointId,
+        parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
+        text: String,
+        mentions: Vec<AgentId>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let content = vec![ContentPart::Text { text }];
-        let (id, kept) = self.outbox.push(endpoint, parent, mentions, content);
+        let (id, kept) = self
+            .outbox
+            .push(endpoint, parent, reply_to, mentions, content);
         self.cache.write_outbox(endpoint, kept);
         self.send_unsent(endpoint, cx);
         cx.notify();

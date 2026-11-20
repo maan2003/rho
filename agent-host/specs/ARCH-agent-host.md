@@ -92,7 +92,10 @@ is not chat. The log lives on the host because the GUI is often offline and
 chat crosses worksets, and it survives workset deletion.
 
 Chat and agents are separate hierarchies. They meet only through
-membership and through mentions. Membership is per thread and covers the
+membership and through mentions. A user's addressed reply also records
+the exact mail it answers, independently of parentage: its writer receives
+it even if they left the thread, and a move does not undo the answer.
+Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
 leave on a subthread cuts that branch. A message reaches every member of

@@ -82,6 +82,9 @@ pub enum ChatEvent {
     /// Neither posting nor a mention makes anyone a member.
     Posted {
         parent: Option<MessageId>,
+        /// The specific mail the user answered; independent of where the answer
+        /// is posted.
+        reply_to: Option<MessageId>,
         from: Address,
         mentions: Vec<Mention>,
         content: Vec<ContentPart>,
@@ -144,6 +147,7 @@ pub struct Message {
     /// Its parent now: a later `Reparented` moved it from where it was
     /// posted.
     pub parent: Option<MessageId>,
+    pub reply_to: Option<MessageId>,
     pub from: Address,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
@@ -164,6 +168,7 @@ impl Message {
     pub fn from_record(record: &ChatRecord) -> Option<Self> {
         let ChatEvent::Posted {
             parent,
+            reply_to,
             from,
             mentions,
             content,
@@ -175,6 +180,7 @@ impl Message {
             id: MessageId(record.seq),
             at: record.at,
             parent: *parent,
+            reply_to: *reply_to,
             from: *from,
             mentions: mentions.clone(),
             content: content.clone(),
@@ -244,12 +250,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_post_written_before_reply_addresses_still_decodes() {
+        #[derive(Encode)]
+        enum OldChatEvent {
+            Posted {
+                parent: Option<MessageId>,
+                from: Address,
+                mentions: Vec<Mention>,
+                content: Vec<ContentPart>,
+            },
+        }
+        let parent = Some(MessageId(ChatSeq(3)));
+        let content = vec![ContentPart::Text {
+            text: "still here".into(),
+        }];
+        let bytes = senax_encoder::encode(&OldChatEvent::Posted {
+            parent,
+            from: Address::User,
+            mentions: Vec::new(),
+            content: content.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            senax_encoder::decode::<ChatEvent>(&mut bytes.as_ref()).unwrap(),
+            ChatEvent::Posted {
+                parent,
+                reply_to: None,
+                from: Address::User,
+                mentions: Vec::new(),
+                content
+            }
+        );
+    }
+
+    #[test]
     fn a_message_is_shown_by_its_first_line() {
         let record = ChatRecord {
             seq: ChatSeq(3),
             at: UnixMs(1),
             event: ChatEvent::Posted {
                 parent: Some(MessageId(ChatSeq(1))),
+                reply_to: None,
                 from: Address::User,
                 mentions: Vec::new(),
                 content: vec![

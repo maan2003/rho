@@ -9,9 +9,9 @@ use rho_agent_types::{
     Address, ChatEvent, ChatRecord, ContentPart, MentionKind, MessageId, Stop, WorksetKind,
 };
 use rho_agents_client::protocol::worksets::{CreateWorkset, Eval, EvalResult};
-use rho_chat::protocol::{ClientFrame, Open, Post, Project, ResolveProject, ServerFrame};
+use rho_chat::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
 use rho_rpc::protocol::client::{call, connect};
-use rho_rpc::protocol::{Opened, RuntimePaths, read_frame, write_frame, write_open};
+use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
 
 struct Host(Child);
 
@@ -91,10 +91,6 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         tokio::time::sleep(Duration::from_millis(30)).await;
     };
     write_open(&mut stream, &Open::Session).await?;
-    anyhow::ensure!(matches!(
-        read_frame::<_, Opened>(&mut stream).await?,
-        Opened::Ready
-    ));
     let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
         anyhow::bail!("no chat hello");
     };
@@ -139,6 +135,7 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         Post {
             client_id: 9,
             parent: Some(thread),
+            reply_to: None,
             mentions: vec![agent],
             content: vec![ContentPart::Text {
                 text: "Please run the check.".into(),
@@ -236,9 +233,45 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     let text = rho_agent_types::content_text(&content);
     assert!(text.starts_with("lost · "), "{text}");
     assert!(text.contains("Last transcript lines:"), "{text}");
+
+    // The user doesn't address an agent. The host delivers to the original
+    // writer, even after the writer leaves.
+    call(paths, Leave { thread, agent }).await?;
+    let reply_to = MessageId(origin_result.seq);
+    let answer = call(
+        paths,
+        Post {
+            client_id: 10,
+            parent: Some(thread),
+            reply_to: Some(reply_to),
+            mentions: vec![],
+            content: vec![ContentPart::Text {
+                text: "Thanks for checking.".into(),
+            }],
+        },
+    )
+    .await?;
+    let received = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
+    let ChatEvent::Posted {
+        parent,
+        reply_to: target,
+        mentions,
+        ..
+    } = received.event
+    else {
+        anyhow::bail!("the answer must be durable project mail")
+    };
+    assert_eq!((parent, target), (Some(thread), Some(reply_to)));
+    assert_eq!(
+        mentions,
+        [rho_agent_types::Mention {
+            to: Address::Agent(agent),
+            kind: MentionKind::Ask
+        }]
+    );
     Ok(format!(
-        "mail wire: project {}, fake model result #{}, status, edit/delete #{} and lost stop #{}",
-        project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0
+        "mail wire: project {}, fake model result #{}, status, edit/delete #{} lost stop #{}, and addressed reply #{}",
+        project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
 }
 
@@ -253,6 +286,7 @@ async fn post(
         Post {
             client_id,
             parent,
+            reply_to: None,
             mentions: vec![],
             content: vec![ContentPart::Text { text: text.into() }],
         },

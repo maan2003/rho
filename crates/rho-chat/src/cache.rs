@@ -303,6 +303,7 @@ mod tests {
             at: UnixMs(seq),
             event: ChatEvent::Posted {
                 parent: None,
+                reply_to: None,
                 from: Address::User,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text {
@@ -328,6 +329,7 @@ mod tests {
         let outgoing = Outgoing {
             at: UnixMs(5),
             parent: Some(MessageId(ChatSeq(2))),
+            reply_to: Some(MessageId(ChatSeq(1))),
             mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
         };

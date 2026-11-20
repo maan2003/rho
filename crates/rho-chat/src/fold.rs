@@ -383,6 +383,7 @@ mod tests {
             seq,
             ChatEvent::Posted {
                 parent: parent.map(id),
+                reply_to: None,
                 from,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: text.into() }],
