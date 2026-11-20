@@ -21,6 +21,7 @@ pub struct Outgoing {
     pub at: UnixMs,
     /// The thread it goes in; none starts a root.
     pub parent: Option<MessageId>,
+    pub reply_to: Option<MessageId>,
     /// Agents that receive it without being members of its thread.
     pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
@@ -31,6 +32,7 @@ impl Outgoing {
         Post {
             client_id,
             parent: self.parent,
+            reply_to: self.reply_to,
             mentions: self.mentions.clone(),
             content: self.content.clone(),
         }
@@ -71,6 +73,7 @@ impl Outbox {
         &mut self,
         endpoint: EndpointId,
         parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> (u64, Kept) {
@@ -78,6 +81,7 @@ impl Outbox {
         let outgoing = Outgoing {
             at: UnixMs::now(),
             parent,
+            reply_to,
             mentions,
             content,
         };
@@ -161,16 +165,27 @@ mod tests {
         let thread = Some(MessageId(ChatSeq(4)));
         let mut outbox = Outbox::default();
         let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let (first, kept) = outbox.push(a, thread, vec![agent], text("a1"));
+        let (first, kept) = outbox.push(
+            a,
+            thread,
+            Some(MessageId(ChatSeq(7))),
+            vec![agent],
+            text("a1"),
+        );
         assert!(matches!(kept, Kept::Put(id, _) if id == first));
-        outbox.push(b, None, vec![agent], text("b1"));
-        let (second, _) = outbox.push(a, thread, Vec::new(), text("a2"));
+        outbox.push(b, None, None, vec![agent], text("b1"));
+        let (second, _) = outbox.push(a, thread, None, Vec::new(), text("a2"));
         assert_eq!(outbox.hosts(), [a, b]);
 
         let to_a = outbox.next(a).expect("a post");
         assert_eq!(
-            (to_a.client_id, to_a.mentions.clone(), to_a.parent),
-            (first, vec![agent], thread)
+            (
+                to_a.client_id,
+                to_a.mentions.clone(),
+                to_a.parent,
+                to_a.reply_to
+            ),
+            (first, vec![agent], thread, Some(MessageId(ChatSeq(7))))
         );
         assert!(outbox.next(a).is_none(), "one post at a time");
         let to_b = outbox.next(b).expect("a post");
@@ -178,8 +193,8 @@ mod tests {
 
         outbox.failed(a);
         assert_eq!(
-            outbox.next(a).map(|post| post.client_id),
-            Some(first),
+            outbox.next(a).map(|post| (post.client_id, post.reply_to)),
+            Some((first, Some(MessageId(ChatSeq(7))))),
             "posted again under the same id"
         );
         let (id, outgoing, kept) = outbox.delivered(a).unwrap();
@@ -203,11 +218,35 @@ mod tests {
     }
 
     #[test]
+    fn mail_queued_before_reply_addresses_keeps_the_original_text() {
+        #[derive(Encode)]
+        struct OldOutgoing {
+            at: UnixMs,
+            parent: Option<MessageId>,
+            mentions: Vec<AgentId>,
+            content: Vec<ContentPart>,
+        }
+        let content = text("queued offline");
+        let bytes = senax_encoder::encode(&OldOutgoing {
+            at: UnixMs(9),
+            parent: Some(MessageId(ChatSeq(4))),
+            mentions: Vec::new(),
+            content: content.clone(),
+        })
+        .unwrap();
+        let decoded = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
+        assert_eq!(decoded.content, content);
+        assert_eq!(decoded.parent, Some(MessageId(ChatSeq(4))));
+        assert_eq!(decoded.reply_to, None);
+    }
+
+    #[test]
     fn what_was_left_unsent_goes_in_the_order_written() {
         let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let outgoing = |at: u64, text: &str| Outgoing {
             at: UnixMs(at),
             parent: None,
+            reply_to: None,
             mentions: vec![agent],
             content: vec![ContentPart::Text { text: text.into() }],
         };

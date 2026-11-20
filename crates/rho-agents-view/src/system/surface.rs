@@ -116,8 +116,7 @@ impl Surface for AgentSurface {
 }
 
 /// The rows that steer an agent, from its transcript or from a thread's
-/// `with` line. Each carries the change to the agent's host, and says the
-/// user has seen the stop the agent is in.
+/// `with` line. Each carries the change to the agent's host.
 pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Row> {
     let eval = |description: &'static str,
                 key: &'static str,
@@ -130,7 +129,6 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
             let done = done(count, &label);
             system.update(cx, |system, cx| {
                 system.eval(agent, description, code, done, cx);
-                system.steered(agent, cx);
             });
         })
     };
@@ -190,7 +188,6 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                             None,
                             cx,
                         );
-                        system.steered(agent, cx);
                     }),
                     Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
                 }),
@@ -223,7 +220,6 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                 }
             })
             .detach();
-            cancel_system.update(cx, |system, cx| system.steered(agent, cx));
         },
     ));
     rows

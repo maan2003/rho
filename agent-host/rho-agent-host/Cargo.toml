@@ -78,6 +78,10 @@ rho-shell.workspace = true
 senax-encoder.workspace = true
 
 [[test]]
+name = "mail"
+harness = false
+
+[[test]]
 name = "terminal_stream"
 harness = false
 

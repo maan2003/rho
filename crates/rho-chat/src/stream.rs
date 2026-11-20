@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_hosts::{Dialer, HostId, HostStream};
-use rho_agent_types::{ChatRecord, ChatSeq, EndpointId};
+use rho_agent_types::{ChatRecord, ChatSeq, EndpointId, MessageId, ThreadStatus};
 use rho_rpc::protocol::{Call, read_frame, write_frame, write_open};
 
 use crate::protocol::{ClientFrame, Open, ServerFrame};
@@ -33,6 +33,11 @@ pub enum ChatEvent {
     Records {
         host: HostId,
         records: Vec<ChatRecord>,
+    },
+    /// A replacement snapshot of the host's ephemeral thread statuses.
+    Statuses {
+        host: HostId,
+        statuses: Vec<ThreadStatus>,
     },
     /// The session ended; it opens again with the connection.
     Closed { host: HostId },
@@ -79,6 +84,7 @@ pub struct ChatStream {
     host: HostId,
     cursors: Cursors,
     events: futures_mpsc::UnboundedSender<ChatEvent>,
+    view: tokio::sync::watch::Receiver<Option<MessageId>>,
 }
 
 impl ChatStream {
@@ -86,11 +92,13 @@ impl ChatStream {
         host: HostId,
         cursors: Cursors,
         events: futures_mpsc::UnboundedSender<ChatEvent>,
+        view: tokio::sync::watch::Receiver<Option<MessageId>>,
     ) -> Self {
         Self {
             host,
             cursors,
             events,
+            view,
         }
     }
 }
@@ -106,6 +114,7 @@ impl HostStream for ChatStream {
         let host = self.host;
         let cursors = self.cursors.clone();
         let events = self.events.clone();
+        let mut view = self.view.clone();
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
@@ -138,16 +147,32 @@ impl HostStream for ChatStream {
                     return Ok(());
                 }
                 write_frame(&mut socket, &ClientFrame::Follow { since }).await?;
-                loop {
-                    let frame = read_frame::<_, ServerFrame>(&mut socket).await?;
-                    let event = match frame {
-                        ServerFrame::Chat { records } => ChatEvent::Records { host, records },
-                        ServerFrame::Hello { .. } => continue,
-                    };
-                    if events.unbounded_send(event).is_err() {
-                        return Ok(());
+                let (mut reader, mut writer) = tokio::io::split(socket);
+                let receive = async {
+                    loop {
+                        let frame = read_frame::<_, ServerFrame>(&mut reader).await?;
+                        let event = match frame {
+                            ServerFrame::Chat { records } => ChatEvent::Records { host, records },
+                            ServerFrame::Statuses { statuses } => {
+                                ChatEvent::Statuses { host, statuses }
+                            }
+                            ServerFrame::Hello { .. } => continue,
+                        };
+                        if events.unbounded_send(event).is_err() {
+                            return Ok(());
+                        }
                     }
-                }
+                };
+                let send = async {
+                    loop {
+                        let thread = *view.borrow_and_update();
+                        write_frame(&mut writer, &ClientFrame::View { thread }).await?;
+                        if view.changed().await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                };
+                tokio::select! { result = receive => result, result = send => result }
             }
             .await;
             let _ = events.unbounded_send(ChatEvent::Closed { host });

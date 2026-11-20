@@ -511,7 +511,7 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
 pub fn role_of(from: Address) -> Role {
     match from {
         Address::User => Role::User,
-        Address::Agent(_) => Role::Tool,
+        Address::Agent(_) | Address::System { .. } => Role::Tool,
     }
 }
 
@@ -519,7 +519,8 @@ pub(crate) mod agent_rows;
 pub mod chat;
 pub mod gccp;
 
-pub use chat::{ChatRead, ChatWrite, NewMessage, ThreadHead};
+pub(crate) use chat::migrate_mail;
+pub use chat::{ChatRead, ChatWrite, MailHit, NewMessage, ThreadHead};
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
 #[cfg(test)]
 mod tests;

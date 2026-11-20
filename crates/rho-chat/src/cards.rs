@@ -1,62 +1,13 @@
-//! What the chat claims of the user: the threads with a mention of them
-//! they have not seen.
-//!
-//! Agents and the user talk in threads. A message goes to a thread, not to
-//! a person, and draws the user only by mentioning them; a thread is the
-//! card, never an agent, and whether an agent is running never ranks; only
-//! a stop it did not choose does (A14). A mention of the user names its
-//! kind, picked by whether the user needs to read it now:
-//!
-//! ```text
-//! 1. Yes: it asks them for something the work needs: a decision, an
-//!    approval, information, or an action, even while the agent keeps
-//!    working. An offer of work beyond what they asked is not one. → ask
-//! 2. Yes: what they asked for is done, or it answers their question.
-//!    Not while part of it is still pending.                       → result
-//! 3. No, but it is worth keeping: a finding, an assumption, a report
-//!    while follow-through is pending.                             → fyi
-//! 4. No, and it is passing: "on it", "86% done".                  → no mention
-//! ```
-//!
-//! The user sees a thread explicitly: a done, or a message of their own in
-//! it, sees it through to its newest message. Opening it sees nothing.
-//! Done is also how the user says they read a thread, through its newest
-//! message or through one they pick: there is no separate read. A card is
-//! titled by the thread's name, and its context is its root, the stream.
-//!
-//! | # | History and facts | Card |
-//! |---|---|---|
-//! | A1 | An unseen ask | "asks", rises |
-//! | A2 | An unseen result | "result", below an ask, fades, gone after ~3 days |
-//! | A3 | An unseen fyi | nothing, and it hides no ask or result; the thread is unread on Home |
-//! | A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
-//! | A5 | Several unseen mentions | one card: an ask if any, counting from the first ask unseen, else the newest result |
-//! | A6 | Seen | nothing until a newer ask or result |
-//! | A7 | The user wrote in the thread within the hour before the mention | a bonus, fading over the hour; a reply within the hour comes through a snooze |
-//! | A8 | Done through a message before the mention | the mention still deals |
-//! | A9 | A mention in a reply deeper in the thread | the thread's card |
-//! | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
-//! | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
-//! | A12 | Its agents running, waiting, idle, finished, archived, or retrying for less than an hour | changes nothing: those are the agent's own choices, or soon over |
-//! | A13 | The thread muted, its host gone, or every one of its agents deleted | nothing |
-//! | A14 | Its agent failed, retried for an hour or more, or was lost by its host | "failed", "stuck" or "lost", ranked as an ask, counting from when it stopped |
-//! | A15 | A stop seen: done after it began, the user writing in the thread, or steering the agent | nothing until a newer stop |
-//! | A16 | An unseen ask and an unseen stop | one card, by whichever has waited longer |
-//!
-//! A stop the agent did not choose says "you, now" as an ask does, without
-//! a word: it is the card of the agent's own thread, the first it joined.
-//! The agents system says what each agent is doing and since when; a stop
-//! is no message, so how far the user has seen one is the instant its host
-//! gave it ([`rho_dealer::facts::Seen::Thread`]).
-//!
-//! Each row is a test here under its name.
+//! Each card is a thread's first waiting ask/stop or newest waiting result.
+//! A visible mail is the only source of a claim; a stop remains after its
+//! agent moves on, and no addressed result fades unread. Marks still belong
+//! to the user, and a reply settles the mail that preceded it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use jiff::Timestamp;
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, Doing, EndpointId, MentionKind, Message, MessageId, Stop,
-    UnixMs,
+    Address as Party, AgentId, ChatSeq, EndpointId, MentionKind, Message, MessageId,
 };
 use rho_dealer::curve::{self, Curve};
 use rho_dealer::rank::Trace;
@@ -96,48 +47,6 @@ pub struct Host<'a> {
     /// The host's name, said before a card's context when the window holds
     /// more than one host; `None` otherwise.
     pub name: Option<&'a str>,
-    /// Whether an agent still exists on the host.
-    pub alive: &'a dyn Fn(AgentId) -> bool,
-    /// What an agent is doing and since when, as its host last said;
-    /// `None` while it has said nothing.
-    pub doing: &'a dyn Fn(AgentId) -> Option<Doing>,
-    /// Why an agent stopped, in its host's few words, such as `not logged
-    /// in`; `None` when it said none.
-    pub reason: &'a dyn Fn(AgentId) -> Option<String>,
-}
-
-/// One agent's stop, when it began, and why, when its host said.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stopped {
-    pub agent: AgentId,
-    pub stop: Stop,
-    pub since: UnixMs,
-    pub reason: Option<String>,
-}
-
-/// The stops the agents of a host are in now, by the thread each draws
-/// the user to: the first each agent joined.
-pub fn stops(host: &Host<'_>, now: Timestamp) -> BTreeMap<MessageId, Vec<Stopped>> {
-    let now = UnixMs(now.as_millisecond().max(0) as u64);
-    let mut stops: BTreeMap<MessageId, Vec<Stopped>> = BTreeMap::new();
-    for (agent, joined) in host.chat.agent_threads() {
-        let Some(doing) = (host.doing)(agent) else {
-            continue;
-        };
-        let Some(stop) = doing.stop(now) else {
-            continue;
-        };
-        stops
-            .entry(host.chat.thread_of(joined))
-            .or_default()
-            .push(Stopped {
-                agent,
-                stop,
-                since: doing.since,
-                reason: (host.reason)(agent),
-            });
-    }
-    stops
 }
 
 fn unix(ms: u64) -> Timestamp {
@@ -156,143 +65,91 @@ pub fn claims(
     // of the user in log order, and the newest message the user wrote in
     // it. Ranking happens on every change, and a host's chat is long.
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
+    let mut answered = HashSet::new();
     for message in chat.messages() {
         let mentioned = message.mentions(Party::User).is_some();
         let from_user = message.from == Party::User;
         if !mentioned && !from_user {
             continue;
         }
-        let thread = threads.entry(chat.thread_of(message.id)).or_default();
+        let thread = threads.entry(chat.subthread_of(message.id)).or_default();
         if mentioned {
             thread.mentions.push(message);
         }
-        if from_user
-            && thread
-                .user_wrote
-                .is_none_or(|newest| message.id > newest.id)
-        {
+        if from_user {
             thread.user_wrote = Some(message);
+            if let Some(mail) = message.reply_to {
+                answered.insert(mail);
+            } else {
+                thread.plain_user_mail = Some(message.id);
+            }
         }
-    }
-    let mut stopped = stops(host, now);
-    for thread in stopped.keys() {
-        threads.entry(*thread).or_default();
     }
     let mut claims = Vec::new();
     for (thread, messages) in threads {
-        let stops = stopped.remove(&thread).unwrap_or_default();
-        // A thread nobody mentioned the user in, and no agent of which
-        // stopped, is only the user's own.
-        if messages.mentions.is_empty() && stops.is_empty() {
-            continue;
-        }
         let address = ThreadId {
             host: host.endpoint,
             message: thread,
         }
         .address();
-        // A13: nobody is left to answer, and what they said went with them.
-        let members = chat.members_under(Some(thread));
-        if !members.is_empty() && !members.iter().any(|agent| (host.alive)(*agent)) {
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.outcome(&address, "no card: its agents are gone".to_owned());
-            }
-            continue;
-        }
         let facts = marks.get(&address).facts();
-        // A mention is handled once the user is done with the thread
-        // through it, or wrote after it.
         let user_wrote = messages.user_wrote;
         let seen = facts
             .seen_topic()
             .map(|seen| MessageId(ChatSeq(seen)))
-            .max(user_wrote.map(|message| message.id));
-        // A15: a stop is seen by a done or a steer said after it began,
-        // or by the user's words in the thread after it began. Both are on
-        // the host's clock.
-        let seen_stopped = facts
-            .seen_stopped()
-            .max(user_wrote.map(|message| message.at.0));
-        let mentions = messages.mentions;
+            .max(messages.plain_user_mail);
+        let unseen = messages
+            .mentions
+            .into_iter()
+            .filter(|message| {
+                !answered.contains(&message.id) && seen.is_none_or(|seen| message.id > seen)
+            })
+            .collect::<Vec<_>>();
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
                 &address,
-                "mentions",
-                format!("{:?}", mentions.iter().map(|m| m.id).collect::<Vec<_>>()),
+                "unseen mentions",
+                format!(
+                    "{:?}",
+                    unseen.iter().map(|mail| mail.id).collect::<Vec<_>>()
+                ),
             );
             trace.input(&address, "seen through", format!("{seen:?}"));
-            if !stops.is_empty() {
-                trace.input(&address, "stops", format!("{stops:?}"));
-                trace.input(&address, "stops seen through", format!("{seen_stopped:?}"));
-            }
         }
-        let unseen: Vec<&Message> = mentions
-            .into_iter()
-            .filter(|message| seen.is_none_or(|seen| message.id > seen))
-            .collect();
-        // The stop that has waited longest of those not seen.
-        let stop = stops
+
+        let waiting = unseen
             .iter()
-            .filter(|stop| seen_stopped.is_none_or(|seen| stop.since.0 > seen))
-            .min_by_key(|stop| stop.since);
-        let kind = |message: &&Message| message.mentions(Party::User);
-        let ask = unseen
-            .iter()
-            .find(|message| kind(message) == Some(MentionKind::Ask));
+            .copied()
+            .find(|mail| mail.mentions(Party::User) == Some(MentionKind::Ask));
         let result = unseen
             .iter()
-            .rfind(|message| kind(message) == Some(MentionKind::Result));
-        // An ask waits from the first one unanswered, a stop from when it
-        // began, and of the two the one that has waited longer is the
-        // card (A16); a result fades from the newest.
-        let (since, curve, reason) = match (ask, stop) {
-            (Some(ask), Some(stop)) if stop.since.0 < ask.at.0 => waiting_on(stop),
-            (Some(ask), _) => {
-                let since = unix(ask.at.0);
-                (
-                    since,
-                    Curve::Waiting {
-                        head_start: curve::AGENT_BLOCKED_HEAD_START,
-                        since,
-                    },
-                    "asks · {age}".to_owned(),
-                )
+            .copied()
+            .rfind(|mail| mail.mentions(Party::User) == Some(MentionKind::Result));
+        let (mail, reason) = match (waiting, result) {
+            (Some(mail), _) => {
+                let reason = match mail.from {
+                    Party::System { stop, .. } => format!("{} · {{age}}", stop.word()),
+                    _ => "asks · {age}".to_owned(),
+                };
+                (mail, reason)
             }
-            (None, Some(stop)) => waiting_on(stop),
-            (None, None) => match result {
-                Some(result) => {
-                    let since = unix(result.at.0);
-                    (
-                        since,
-                        Curve::Fading {
-                            head_start: curve::AGENT_FINISHED_HEAD_START,
-                            since,
-                            gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-                        },
-                        "result · {age} ago".to_owned(),
-                    )
+            (None, Some(mail)) => (mail, "result · {age}".to_owned()),
+            (None, None) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.outcome(&address, "no card: nothing unread".to_owned());
                 }
-                None => {
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.outcome(&address, "no card: nothing unread".to_owned());
-                    }
-                    continue;
-                }
-            },
+                continue;
+            }
         };
-        // Where the card's source last moved: the newest mention unseen,
-        // and the newest stop unseen, which a skip holds on to as well.
-        let mut cursor = unseen
-            .last()
-            .map_or_else(String::new, |newest| newest.id.0.0.to_string());
-        if let Some(newest) = stops
-            .iter()
-            .filter(|stop| seen_stopped.is_none_or(|seen| stop.since.0 > seen))
-            .map(|stop| stop.since)
-            .max()
-        {
-            cursor = format!("{cursor}+{}", newest.0);
-        }
+        let since = unix(mail.at.0);
+        let curve = Curve::Waiting {
+            head_start: curve::AGENT_BLOCKED_HEAD_START,
+            since,
+        };
+        // The first part is where to open the card; the last part changes
+        // when more mail arrives, even if the trigger is still the same ask.
+        let newest = unseen.last().expect("the trigger is unseen");
+        let cursor = format!("{}/{}", mail.id.0.0, newest.id.0.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host, thread);
@@ -320,38 +177,6 @@ pub fn claims(
     claims
 }
 
-/// A card for a stop: it waits as an ask does, from when the stop began,
-/// in the stop's word.
-fn waiting_on(stop: &Stopped) -> (Timestamp, Curve, String) {
-    let since = unix(stop.since.0);
-    (
-        since,
-        Curve::Waiting {
-            head_start: curve::AGENT_BLOCKED_HEAD_START,
-            since,
-        },
-        match &stop.reason {
-            Some(reason) => format!("{} · {{age}} · {}", stop.stop.word(), brief(reason)),
-            None => format!("{} · {{age}}", stop.stop.word()),
-        },
-    )
-}
-
-/// A reason short enough to sit after a card's age: the first words of
-/// its first line, cut with `…`.
-fn brief(reason: &str) -> String {
-    const MOST: usize = 40;
-    let line = reason
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    match line.char_indices().nth(MOST) {
-        None => line.to_owned(),
-        Some((end, _)) => format!("{}…", line[..end].trim_end()),
-    }
-}
-
 /// Whether the user works in a channel: they made it or wrote in it, or
 /// a mention of them in it is unread. A channel that is neither, such as
 /// one a host posts each deploy as, is a room only while the deal holds a
@@ -376,7 +201,7 @@ pub fn worked_in(chat: &HostChat, host: EndpointId, root: MessageId, marks: &Mar
     mentions.into_iter().any(|mention| {
         let thread = ThreadId {
             host,
-            message: chat.thread_of(mention),
+            message: chat.subthread_of(mention),
         };
         let facts = marks.get(&thread.address()).facts();
         !facts.muted() && facts.seen_topic().is_none_or(|seen| mention.0.0 > seen)
@@ -406,20 +231,27 @@ fn context(host: &Host<'_>, thread: MessageId) -> String {
     }
 }
 
-/// The user's newest message in a thread or under it.
-/// What one thread holds that a card is made of, in log order.
+/// The mail a project card opens on, decoded from its source cursor.
+pub fn attention_mail(cursor: &str) -> Option<MessageId> {
+    let (trigger, _) = cursor.split_once('/')?;
+    Some(MessageId(ChatSeq(trigger.parse().ok()?)))
+}
+
 #[derive(Default)]
 struct ThreadMessages<'a> {
     mentions: Vec<&'a Message>,
     user_wrote: Option<&'a Message>,
+    plain_user_mail: Option<MessageId>,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use jiff::{SignedDuration, Zoned};
-    use rho_agent_types::{Activity, AgentIdDomain, ChatEvent, ChatRecord, ContentPart, Mention};
+    use rho_agent_types::{
+        AgentIdDomain, ChatEvent, ChatRecord, ContentPart, Mention, Stop, UnixMs,
+    };
     use rho_dealer::curve::*;
     use rho_dealer::facts::{Device, Entry, Fact, Seen};
     use rho_dealer::rank::{Hand, Sources};
@@ -432,17 +264,12 @@ mod tests {
         chat: HostChat,
         seq: u64,
         made: u64,
-        gone: BTreeSet<AgentId>,
         /// The one agent each thread was started with.
         agents: HashMap<MessageId, AgentId>,
         marks: Marks,
         skips: Skips,
         now: Zoned,
         hosts: usize,
-        /// What each agent is doing, as its host last said.
-        doing: HashMap<AgentId, Doing>,
-        /// Why each stopped agent stopped, when its host said.
-        reasons: HashMap<AgentId, String>,
     }
 
     fn mins(n: i64) -> SignedDuration {
@@ -458,7 +285,6 @@ mod tests {
             chat: HostChat::default(),
             seq: 0,
             made: 0,
-            gone: BTreeSet::new(),
             agents: HashMap::new(),
             marks: Marks::default(),
             skips: Skips::default(),
@@ -467,8 +293,6 @@ mod tests {
                 .unwrap()
                 .to_zoned(jiff::tz::TimeZone::UTC),
             hosts: 1,
-            doing: HashMap::new(),
-            reasons: HashMap::new(),
         }
     }
 
@@ -500,6 +324,7 @@ mod tests {
         ) -> MessageId {
             self.record(ChatEvent::Posted {
                 parent,
+                reply_to: None,
                 from,
                 mentions,
                 content: vec![ContentPart::Text { text: text.into() }],
@@ -587,6 +412,18 @@ mod tests {
             self.post(Some(thread), Party::User, Vec::new(), "go on");
         }
 
+        fn answers(&mut self, thread: MessageId, mail: MessageId) {
+            self.record(ChatEvent::Posted {
+                parent: Some(thread),
+                reply_to: Some(mail),
+                from: Party::User,
+                mentions: Vec::new(),
+                content: vec![ContentPart::Text {
+                    text: "answer".into(),
+                }],
+            });
+        }
+
         fn tell(&mut self, fact: Fact) {
             let at = self.marks.next_at(&self.now);
             self.now = at.clone();
@@ -602,8 +439,7 @@ mod tests {
         }
 
         fn done(&mut self, thread: MessageId) {
-            let seen = self.seen_now(thread);
-            self.done_through(thread, seen);
+            self.done_through(thread, self.newest(thread));
         }
 
         fn done_through(&mut self, thread: MessageId, seen: Seen) {
@@ -635,63 +471,27 @@ mod tests {
             });
         }
 
-        /// The thread's agent starts doing `activity` now.
-        fn turns(&mut self, thread: MessageId, activity: Activity) {
-            let since = UnixMs(self.ms());
-            self.doing
-                .insert(self.agents[&thread], Doing { activity, since });
-        }
-
-        /// What a done on the thread sees: through its newest message, and
-        /// through the stops its agents are in.
-        fn seen_now(&self, thread: MessageId) -> Seen {
-            let alive = |_: AgentId| true;
-            let doing = |agent: AgentId| self.doing.get(&agent).copied();
-            let reason = |agent: AgentId| self.reasons.get(&agent).cloned();
-            let host = Host {
-                endpoint: EndpointId([0; 32]),
-                chat: &self.chat,
-                name: None,
-                alive: &alive,
-                doing: &doing,
-                reason: &reason,
-            };
-            let newest = self.chat.newest_in(thread).map_or(0, |(id, _)| id.0.0);
-            match stops(&host, self.now.timestamp())
-                .remove(&thread)
-                .and_then(|stops| stops.iter().map(|stop| stop.since.0).max())
-            {
-                Some(stopped) => Seen::Thread {
-                    message: newest,
-                    stopped,
+        fn stop(&mut self, thread: MessageId, stop: Stop) -> MessageId {
+            self.post(
+                Some(thread),
+                Party::System {
+                    agent: self.agents[&thread],
+                    stop,
+                    since: UnixMs(self.ms()),
                 },
-                None => Seen::Topic(newest),
-            }
-        }
-
-        /// The user steers the thread's agent: the stop it is in is seen.
-        fn steers(&mut self, thread: MessageId) {
-            let doing = self.doing[&self.agents[&thread]];
-            self.tell(Fact::Read {
-                node: self.address(thread),
-                seen: Seen::Thread {
-                    message: 0,
-                    stopped: doing.since.0,
-                },
-            });
+                vec![Mention {
+                    to: Party::User,
+                    kind: MentionKind::Ask,
+                }],
+                "lost connection",
+            )
         }
 
         fn deal(&self) -> Hand {
-            let alive = |agent: AgentId| !self.gone.contains(&agent);
-            let doing = |agent: AgentId| self.doing.get(&agent).copied();
-            let reason = |agent: AgentId| self.reasons.get(&agent).cloned();
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: (self.hosts > 1).then_some("laptop"),
-                alive: &alive,
-                doing: &doing,
-                reason: &reason,
             };
             let claims = claims(&host, &self.marks, self.now.timestamp(), None);
             let names = |address: &Address| {
@@ -754,8 +554,30 @@ mod tests {
                 .find(|card| card.address == w.address(thread))
                 .map(|card| card.cursor.clone())
         };
-        assert_eq!(cursor(root).as_deref(), Some(root.0.0.to_string().as_str()));
-        assert_eq!(cursor(a).as_deref(), Some(ask.0.0.to_string().as_str()));
+        assert_eq!(cursor(root).as_deref().and_then(attention_mail), Some(root));
+        assert_eq!(cursor(a).as_deref().and_then(attention_mail), Some(ask));
+    }
+
+    #[test]
+    fn an_addressed_reply_does_not_settle_other_mail() {
+        let mut w = world();
+        let a = w.agent("a");
+        let first = w.asks(a);
+        let second = w.asks(a);
+        let result = w.finishes(a);
+        let trigger = |w: &World| {
+            w.deal()
+                .cards
+                .first()
+                .and_then(|card| attention_mail(&card.cursor))
+        };
+        assert_eq!(trigger(&w), Some(first));
+        w.answers(a, second);
+        assert_eq!(trigger(&w), Some(first));
+        w.answers(a, first);
+        assert_eq!(trigger(&w), Some(result));
+        w.writes_to(a);
+        assert_eq!(trigger(&w), None);
     }
 
     #[test]
@@ -771,18 +593,25 @@ mod tests {
     }
 
     #[test]
-    fn a2_a_result_is_below_an_ask_and_gone_in_three_days() {
+    fn a2_a_result_waits_at_the_same_rate_as_an_ask_and_does_not_fade() {
         let mut w = world();
         let a = w.agent("a");
         let b = w.agent("b");
-        w.finishes(a);
+        let result = w.finishes(a);
         w.asks(b);
-        assert_eq!(w.hand(), "rho › b · asks · 0m\nrho › a · result · 0m ago");
-        assert!(w.priority(a).unwrap() < LAMP_THRESHOLD);
-        w.pass(hours(71));
-        assert!(w.hand().ends_with("a · result · 3.0d ago"), "{}", w.hand());
-        w.pass(hours(1));
-        assert_eq!(w.hand(), "rho › b · asks · 3.0d");
+        assert_eq!(w.priority(a), w.priority(b));
+        w.pass(hours(144));
+        assert_eq!(w.priority(a), w.priority(b));
+        let hand = w.deal();
+        let card = hand
+            .cards
+            .iter()
+            .find(|card| card.address == w.address(a))
+            .unwrap();
+        assert_eq!(card.label, "result · 6.0d");
+        assert_eq!(attention_mail(&card.cursor), Some(result));
+        w.writes_to(a);
+        assert_eq!(w.hand(), "rho › b · asks · 6.0d");
     }
 
     #[test]
@@ -815,11 +644,7 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.finishes(a);
         w.works(a);
-        assert_eq!(
-            w.hand(),
-            "rho › a · result · 0m ago",
-            "and it hides nothing"
-        );
+        assert_eq!(w.hand(), "rho › a · result · 0m", "and it hides nothing");
     }
 
     #[test]
@@ -844,7 +669,7 @@ mod tests {
         w.finishes(b);
         assert_eq!(
             w.hand(),
-            "rho › a · asks · 50m\nrho › b · result · 0m ago",
+            "rho › a · asks · 50m\nrho › b · result · 0m",
             "from the newest result"
         );
     }
@@ -863,7 +688,7 @@ mod tests {
         w.writes_to(a);
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
-        assert_eq!(w.hand(), "rho › a · result · 0m ago");
+        assert_eq!(w.hand(), "rho › a · result · 0m");
     }
 
     #[test]
@@ -922,20 +747,18 @@ mod tests {
     }
 
     #[test]
-    fn a9_a_mention_deeper_in_the_thread_is_the_threads_card() {
+    fn a9_a_mention_on_a_tangent_is_the_tangent_threads_card() {
         let mut w = world();
         let a = w.agent("a");
         let reply = w.sends(a, MentionKind::Fyi);
-        w.sends_under(a, Some(reply), MentionKind::Ask);
-        assert_eq!(w.hand(), "rho › a · asks · 0m");
+        let trigger = w.sends_under(a, Some(reply), MentionKind::Ask);
         let hand = w.deal();
-        assert_eq!(hand.cards[0].address, w.address(a));
+        assert_eq!(hand.cards[0].address, w.address(reply));
+        assert_eq!(attention_mail(&hand.cards[0].cursor), Some(trigger));
         w.done(a);
-        assert_eq!(
-            w.hand(),
-            "",
-            "done with the thread is done with what is under it"
-        );
+        assert_eq!(w.deal().cards.len(), 1);
+        w.done(reply);
+        assert!(w.deal().cards.is_empty());
     }
 
     #[test]
@@ -967,179 +790,45 @@ mod tests {
         w.works(child);
         assert_eq!(w.hand(), "");
         w.asks(child);
-        // The child works in a subthread of its parent's thread, which is
-        // what the user opens: the ask is that thread's card.
-        assert_eq!(w.hand(), "rho › parent · asks · 0m");
+        let hand = w.deal();
+        assert_eq!(hand.cards[0].address, w.address(child));
+        assert_eq!(w.hand(), "rho › child · asks · 0m");
     }
 
     #[test]
-    fn a12_what_its_agents_choose_to_do_changes_nothing() {
-        // What a running agent says without a mention is A4.
+    fn a_stop_is_mail_until_answered_and_a_new_stop_waits_again() {
         let mut w = world();
         let a = w.agent("a");
         let b = w.agent("b");
-        w.asks(a);
-        let before = w.deal();
-        for activity in [
-            Activity::Working,
-            Activity::Waiting,
-            Activity::Idle,
-            Activity::Archived,
-        ] {
-            w.turns(a, activity);
-            w.turns(b, activity);
-            w.works(a);
-            assert_eq!(w.hand(), "rho › a · asks · 0m", "{activity:?}");
-        }
-        assert_eq!(w.deal().cards, before.cards);
-        // Retrying is not a stop until it has gone on for an hour.
-        w.turns(b, Activity::Retrying);
-        w.pass(mins(59));
-        assert_eq!(w.hand(), "rho › a · asks · 59m");
-    }
-
-    #[test]
-    fn a14_a_stop_the_agent_did_not_choose_is_its_threads_card() {
-        let mut w = world();
-        let a = w.agent("a");
-        let b = w.agent("b");
-        let c = w.agent("c");
-        w.turns(a, Activity::Failed);
-        w.pass(mins(30));
-        w.turns(c, Activity::Lost);
-        w.turns(b, Activity::Retrying);
-        w.pass(hours(1));
-        assert_eq!(
-            w.hand(),
-            "rho › a · failed · 1.5h\nrho › b · stuck · 1.0h\nrho › c · lost · 1.0h",
-            "each counts from when it stopped, and ranks as an ask does"
-        );
-        // A stop is ranked with the asks: an ask as old is level with it.
-        let d = w.agent("d");
-        w.asks(d);
-        w.turns(a, Activity::Failed);
-        assert_eq!(w.priority(a), w.priority(d));
-        // Once the agent moves on, the stop is gone.
-        w.turns(b, Activity::Working);
-        assert!(w.priority(b).is_none());
-    }
-
-    #[test]
-    fn a_stop_says_why_in_its_hosts_few_words() {
-        let mut w = world();
-        let a = w.agent("a");
-        let b = w.agent("b");
-        w.turns(a, Activity::Failed);
-        w.reasons.insert(w.agents[&a], "not logged in".to_owned());
-        w.turns(b, Activity::Lost);
-        w.reasons.insert(
-            w.agents[&b],
-            "the workset process exited with signal 9 while it ran a cell".to_owned(),
-        );
+        let first = w.stop(a, Stop::Failed);
         w.pass(mins(2));
-        assert_eq!(
-            w.hand(),
-            "rho › a · failed · 2m · not logged in\n\
-             rho › b · lost · 2m · the workset process exited with signal 9…"
-        );
-    }
-
-    #[test]
-    fn a14_the_card_is_the_first_thread_the_agent_joined() {
-        let mut w = world();
-        let a = w.agent("a");
-        let elsewhere = w.agent("elsewhere");
-        let agent = w.agents[&a];
-        w.record(ChatEvent::Joined {
-            thread: elsewhere,
-            agent,
-        });
-        w.turns(a, Activity::Failed);
-        assert_eq!(w.hand(), "rho › a · failed · 0m");
-    }
-
-    #[test]
-    fn a15_done_writing_or_steering_sees_the_stop_until_a_newer_one() {
-        let mut w = world();
-        let a = w.agent("a");
-        let b = w.agent("b");
-        let c = w.agent("c");
-        for thread in [a, b, c] {
-            w.turns(thread, Activity::Failed);
-        }
-        w.pass(mins(5));
+        w.stop(b, Stop::Lost);
+        assert_eq!(w.hand(), "rho › a · failed · 2m\nrho › b · lost · 0m");
+        let card = &w.deal().cards[0];
+        assert_eq!(attention_mail(&card.cursor), Some(first));
         w.done(a);
         w.writes_to(b);
-        w.steers(c);
         assert_eq!(w.hand(), "");
-        // Failing again is a stop the user has not seen.
-        w.pass(mins(5));
-        for thread in [a, b, c] {
-            w.turns(thread, Activity::Working);
-            w.turns(thread, Activity::Failed);
-        }
-        // b is on top: the user wrote in it minutes ago (A7).
-        assert_eq!(
-            w.hand(),
-            "rho › b · failed · 0m\nrho › a · failed · 0m\nrho › c · failed · 0m"
-        );
-        // A done through an older message, before the stop, sees nothing
-        // of it.
-        let old = w.newest(a);
-        w.done_through(a, old);
-        assert!(w.priority(a).is_some());
+        w.pass(mins(1));
+        let second = w.stop(a, Stop::Stuck);
+        w.done_through(a, Seen::Topic(first.0.0));
+        assert_eq!(w.hand(), "rho › a · stuck · 0m");
+        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(second));
     }
 
     #[test]
-    fn a15_steering_leaves_an_ask_after_what_it_saw() {
+    fn the_first_waiting_mail_anchors_the_card_even_as_new_mail_arrives() {
         let mut w = world();
         let a = w.agent("a");
-        w.turns(a, Activity::Failed);
-        w.pass(mins(5));
-        w.asks(a);
-        w.steers(a);
-        assert_eq!(w.hand(), "rho › a · asks · 0m", "the ask still waits");
+        let ask = w.asks(a);
+        w.pass(mins(2));
+        w.stop(a, Stop::Failed);
+        let deal = w.deal();
+        let card = &deal.cards[0];
+        assert_eq!(card.label, "asks · 2m");
+        assert_eq!(attention_mail(&card.cursor), Some(ask));
         w.mute(a);
         assert_eq!(w.hand(), "");
-    }
-
-    #[test]
-    fn a16_an_ask_and_a_stop_are_one_card_by_whichever_waited_longer() {
-        let mut w = world();
-        let a = w.agent("a");
-        let b = w.agent("b");
-        w.asks(a);
-        w.turns(b, Activity::Failed);
-        w.pass(mins(10));
-        w.turns(a, Activity::Failed);
-        w.asks(b);
-        assert_eq!(w.hand(), "rho › a · asks · 10m\nrho › b · failed · 10m",);
-        // A done sees both.
-        w.done(b);
-        assert_eq!(w.hand(), "rho › a · asks · 10m");
-    }
-
-    #[test]
-    fn a13_a_gone_agents_stop_is_no_card() {
-        let mut w = world();
-        let a = w.agent("a");
-        w.turns(a, Activity::Failed);
-        w.gone.insert(w.agents[&a]);
-        assert_eq!(w.hand(), "");
-    }
-
-    #[test]
-    fn a13_a_muted_thread_or_one_whose_agents_are_gone_has_nothing() {
-        let mut w = world();
-        let a = w.agent("a");
-        w.asks(a);
-        w.mute(a);
-        assert_eq!(w.hand(), "");
-        let b = w.agent("b");
-        w.asks(b);
-        assert_eq!(w.hand(), "rho › b · asks · 0m");
-        w.gone.insert(w.agents[&b]);
-        assert_eq!(w.hand(), "", "nobody is left to answer");
     }
 
     #[test]

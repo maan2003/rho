@@ -51,13 +51,18 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "e41b7c2a";
+const CURRENT_AGENT_DB_FORMAT: &str = "a8f02c31";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
 /// each from a savepoint `rho debug rollback` can put it back to. Oldest
-/// first. Empty: nothing has moved since `e41b7c2a`.
-const MIGRATIONS: &[Migration] = &[];
+/// first. Existing records retain their layout; seed the new projection and
+/// gate downgrade before older hosts encounter new event variants.
+const MIGRATIONS: &[Migration] = &[(
+    "e41b7c2a",
+    CURRENT_AGENT_DB_FORMAT,
+    crate::store::migrate_mail,
+)];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -559,6 +564,75 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mail_upgrade_preserves_names_ids_and_projects_the_first_join() {
+        use rho_agent_types::{Address, ContentPart};
+
+        use crate::store::{ChatRead as _, ChatWrite as _, NewMessage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent = write.alloc_agent_id();
+        let first = write
+            .post(
+                UnixMs(4),
+                None,
+                NewMessage {
+                    from: Address::User,
+                    reply_to: None,
+                    mentions: Vec::new(),
+                    content: vec![ContentPart::Text {
+                        text: "Legacy channel".into(),
+                    }],
+                },
+                Some(77),
+            )
+            .unwrap();
+        let later = write
+            .post(
+                UnixMs(5),
+                Some(first),
+                NewMessage {
+                    from: Address::Agent(agent),
+                    reply_to: None,
+                    mentions: Vec::new(),
+                    content: vec![ContentPart::Text {
+                        text: "Legacy body".into(),
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+        write.join(UnixMs(6), first, agent).unwrap();
+        write.join(UnixMs(7), later, agent).unwrap();
+        write
+            .name(UnixMs(8), first, "Renamed in old build".into())
+            .unwrap();
+        write
+            .open_table(redb::TableDefinition::<AgentId, u64>::new(
+                "chat_first_thread",
+            ))
+            .remove(agent);
+        write.open_table(FORMAT).insert((), "e41b7c2a".to_owned());
+        write.commit();
+        let original = db
+            .read()
+            .chat_since(rho_agent_types::ChatSeq::ZERO, usize::MAX);
+
+        prepare(&db).await;
+        let read = db.read();
+        assert_eq!(read.first_thread(agent), Some(first));
+        assert_eq!(read.message(later).unwrap().text(), "Legacy body");
+        assert_eq!(read.project_named("Renamed in old build"), Some(first));
+        assert_eq!(
+            read.chat_since(rho_agent_types::ChatSeq::ZERO, usize::MAX),
+            original
+        );
+        assert_eq!(savepoints(&db).await.len(), 1);
+    }
 
     /// A savepoint recorded for a hop this build does not know goes when
     /// the store is prepared: nothing could roll back to it.

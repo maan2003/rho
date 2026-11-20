@@ -7,7 +7,9 @@
 //! [`rho_agent_types::ChatEvent`]: the vocabulary is the host's, this is
 //! only how it crosses the wire.
 
-use rho_agent_types::{AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId};
+use rho_agent_types::{
+    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ThreadStatus,
+};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -38,6 +40,8 @@ rho_rpc::calls! {
         Leave(Leave) -> ();
         /// Names a thread; an empty name takes the name back.
         Name(Name) -> ();
+        /// Looks up the project part of `project@host`. The GUI owns host aliases.
+        ResolveProject(ResolveProject) -> Option<Project>;
     }
 }
 
@@ -48,6 +52,8 @@ pub struct Post {
     pub client_id: u64,
     /// The thread it goes in; none starts a root.
     pub parent: Option<MessageId>,
+    /// The mail this answers, if any; it need not be the parent.
+    pub reply_to: Option<MessageId>,
     /// Agents the message reaches whether or not they are members. It
     /// does not make them members.
     pub mentions: Vec<AgentId>,
@@ -72,12 +78,34 @@ pub struct Name {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ResolveProject {
+    pub name: String,
+}
+
+/// A project is a channel. An address combines its name with the client's
+/// alias for the host, not the host's machine or endpoint name.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct Project {
+    pub channel: MessageId,
+    pub name: String,
+}
+
+impl Project {
+    pub fn address(&self, host_alias: &str) -> String {
+        format!("{}@{host_alias}", self.name)
+    }
+}
+
 /// What a client says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
     /// After [`ServerFrame::Hello`]: the newest event this client holds
     /// (zero for none). The host sends every later one, then each new one.
     Follow { since: ChatSeq },
+    /// The one thread currently open on this session; `None` on leaving it.
+    /// Closing the session also removes its open thread.
+    View { thread: Option<MessageId> },
 }
 
 /// What a host says on its session.
@@ -90,11 +118,14 @@ pub enum ServerFrame {
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Chat { records: Vec<ChatRecord> },
+    /// Full replacement snapshot; an omitted thread has no status. This is
+    /// not part of the chat log and carries no cursor.
+    Statuses { statuses: Vec<ThreadStatus> },
 }
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind, UnixMs};
+    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, MentionKind, Stop, UnixMs};
 
     use super::*;
 
@@ -112,6 +143,30 @@ mod tests {
     fn frames_and_requests_round_trip() {
         let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
         round_trips(ClientFrame::Follow { since: ChatSeq(9) });
+        round_trips(ClientFrame::View {
+            thread: Some(MessageId(ChatSeq(4))),
+        });
+        round_trips(ClientFrame::View { thread: None });
+        round_trips(ServerFrame::Statuses {
+            statuses: vec![ThreadStatus {
+                thread: MessageId(ChatSeq(14)),
+                at: UnixMs(28),
+                text: "Waiting for the review".into(),
+            }],
+        });
+        round_trips(ServerFrame::Statuses {
+            statuses: Vec::new(),
+        });
+        round_trips(Open::Request(
+            ResolveProject {
+                name: "tide".into(),
+            }
+            .into(),
+        ));
+        round_trips(rho_rpc::protocol::Answer::Done(Some(Project {
+            channel: MessageId(ChatSeq(2)),
+            name: "tide".into(),
+        })));
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
@@ -123,6 +178,7 @@ mod tests {
                     at: UnixMs(5),
                     event: ChatEvent::Posted {
                         parent: Some(MessageId(ChatSeq(2))),
+                        reply_to: None,
                         from: Address::Agent(agent),
                         mentions: vec![Mention {
                             to: Address::User,
@@ -141,10 +197,52 @@ mod tests {
                 },
             ],
         });
+        round_trips(ServerFrame::Chat {
+            records: vec![
+                ChatRecord {
+                    seq: ChatSeq(8),
+                    at: UnixMs(19),
+                    event: ChatEvent::Edited {
+                        message: MessageId(ChatSeq(4)),
+                        content: vec![ContentPart::Text {
+                            text: "fixed".into(),
+                        }],
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(9),
+                    at: UnixMs(22),
+                    event: ChatEvent::Deleted {
+                        message: MessageId(ChatSeq(5)),
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(10),
+                    at: UnixMs(29),
+                    event: ChatEvent::Posted {
+                        parent: Some(MessageId(ChatSeq(7))),
+                        reply_to: None,
+                        from: Address::System {
+                            agent,
+                            stop: Stop::Stuck,
+                            since: UnixMs(23),
+                        },
+                        mentions: vec![Mention {
+                            to: Address::User,
+                            kind: MentionKind::Ask,
+                        }],
+                        content: vec![ContentPart::Text {
+                            text: "stuck · retries".into(),
+                        }],
+                    },
+                },
+            ],
+        });
         round_trips(Open::Request(
             Post {
                 client_id: 7,
-                parent: None,
+                parent: Some(MessageId(ChatSeq(2))),
+                reply_to: Some(MessageId(ChatSeq(4))),
                 mentions: vec![agent],
                 content: vec![ContentPart::Text {
                     text: "root".into(),

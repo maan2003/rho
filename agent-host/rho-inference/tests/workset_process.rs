@@ -212,6 +212,7 @@ async fn create(
         pool.post_user(
             client_id(),
             None,
+            None,
             agents.clone(),
             vec![rho_agent_types::ContentPart::Text {
                 text: text.to_owned(),
@@ -457,6 +458,7 @@ async fn streaming_crash() {
     );
     pool.post_user(
         client_id(),
+        None,
         None,
         vec![id],
         vec![rho_agent_types::ContentPart::Text {

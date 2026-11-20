@@ -176,6 +176,10 @@ pub enum RequestNotice {
     Waiting,
     Checkin,
     NothingNew,
+    ThreadCold {
+        thread: rho_agent_types::MessageId,
+        minutes: u64,
+    },
 }
 
 impl RequestNotice {
@@ -201,6 +205,10 @@ impl RequestNotice {
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
+            Self::ThreadCold { thread, minutes } => return format!(
+                "Thread #{} is cold: the user has not had it open for {minutes} minutes. Write its next mail so the reader needs nothing before it.",
+                thread.0.0
+            ).into(),
         };
         text.into()
     }

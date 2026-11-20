@@ -6,6 +6,7 @@
 //! about worksets, agents and chat; the pool holds only what runs.
 
 mod gccp;
+mod mail;
 mod naming;
 
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,7 @@ use anyhow::Context as _;
 pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
+pub use mail::MailView;
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role, UnixMs,
     WorksetKind,
@@ -84,6 +86,7 @@ pub struct AgentPool {
     /// What each agent is doing as its status last said, and since when:
     /// the one clock every device reads an agent's age by.
     doing: std::sync::Mutex<HashMap<AgentId, rho_agent_types::Doing>>,
+    mail: mail::Mail,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -205,6 +208,7 @@ impl AgentPool {
             live: std::sync::Mutex::new(HashSet::new()),
             statuses: std::sync::Mutex::new(Vec::new()),
             doing: std::sync::Mutex::new(HashMap::new()),
+            mail: mail::Mail::default(),
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             first_agent: std::sync::Mutex::default(),
@@ -683,7 +687,7 @@ impl AgentPool {
     /// The live set is the union over connections; a loaded agent entering
     /// it is told again with its response body, and one leaving it is told
     /// without from its next status on.
-    pub async fn set_live_wants(&self, connection: u64, wants: HashSet<AgentId>) {
+    pub async fn set_live_wants(self: &Arc<Self>, connection: u64, wants: HashSet<AgentId>) {
         let union = {
             let mut live_wants = self.live_wants.lock().expect("poison");
             if wants.is_empty() {
@@ -717,7 +721,7 @@ impl AgentPool {
 
     /// Tells every connection a loaded agent's status: once it is loaded,
     /// and again with its response body once it is live.
-    fn tell_status(&self, agent_id: AgentId, agent: &AgentClient) {
+    fn tell_status(self: &Arc<Self>, agent_id: AgentId, agent: &AgentClient) {
         self.status_changed(agent_id, agent.status_cell());
     }
 
@@ -760,12 +764,23 @@ impl AgentPool {
     /// It is read under the connections' lock, so of two calls racing, the
     /// later never puts an older status.
     pub(crate) fn status_changed(
-        &self,
+        self: &Arc<Self>,
         agent_id: AgentId,
         status: &tokio::sync::watch::Sender<AgentStatus>,
     ) {
         let mut watchers = self.statuses.lock().expect("poison");
-        let shown = self.shown(agent_id, &status.borrow());
+        let status = status.borrow();
+        let changed = {
+            let mut held = self.doing.lock().expect("poison");
+            let previous = held.get(&agent_id).copied();
+            stamp(&mut held, agent_id, &status.runtime, UnixMs::now());
+            let now = held[&agent_id];
+            (previous != Some(now)).then_some(now)
+        };
+        if let Some(doing) = changed {
+            self.observe_stop(agent_id, doing, &status.runtime);
+        }
+        let shown = self.shown(agent_id, &status);
         watchers.retain(|statuses| match statuses.upgrade() {
             Some(statuses) => {
                 statuses.put(agent_id, shown.clone());
@@ -776,10 +791,14 @@ impl AgentPool {
     }
 
     /// Only an agent someone is looking at shows its response body; its
-    /// runtime occupancy is useful everywhere. What it is doing is stamped
-    /// with when it started, here, where every status passes.
+    /// runtime occupancy is useful everywhere.
     fn shown(&self, agent_id: AgentId, status: &AgentStatus) -> Shown {
-        let since = self.since(agent_id, &status.runtime);
+        let since = self
+            .doing
+            .lock()
+            .expect("poison")
+            .get(&agent_id)
+            .map_or_else(UnixMs::now, |doing| doing.since);
         let status = Arc::new(if self.is_live(agent_id) {
             status.clone()
         } else {
@@ -791,11 +810,6 @@ impl AgentPool {
             }
         });
         Shown { status, since }
-    }
-
-    fn since(&self, agent_id: AgentId, runtime: &RuntimeState) -> UnixMs {
-        let mut doing = self.doing.lock().expect("poison");
-        stamp(&mut doing, agent_id, runtime, UnixMs::now())
     }
 
     fn touch(&self, agent_id: AgentId) {
@@ -935,17 +949,37 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
+        let mut mentions = self.user_mentions(mentions);
+        // Resolve the writer on the host, even if they are no longer a
+        // thread member. A deleted agent cannot receive mail, but the answer
+        // still belongs in the thread.
+        if let Some(target) = reply_to
+            && let Some(mail) = self.db.read().message(target)
+            && let Address::Agent(agent) = mail.from
+            && self.workset_of(agent).is_ok()
+            && mentions
+                .iter()
+                .all(|mention| mention.to != Address::Agent(agent))
+        {
+            mentions.push(Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            });
+        }
         let message = NewMessage {
             from: Address::User,
-            mentions: self.user_mentions(mentions)?,
+            reply_to,
+            mentions,
             content,
         };
         let mut write = self.db.write().await;
         let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
+        self.user_visited(id);
         self.wake_receivers(id, None);
         self.consider_naming(id);
         Ok(id)
@@ -980,22 +1014,20 @@ impl AgentPool {
         Ok(())
     }
 
-    /// The user's mentions of agents: each asks the agent to read it.
-    fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
-        let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
-        for agent in agents {
-            self.workset_of(agent)?;
-            if mentions
-                .iter()
-                .all(|mention| mention.to != Address::Agent(agent))
-            {
-                mentions.push(Mention {
-                    to: Address::Agent(agent),
-                    kind: MentionKind::Ask,
-                });
-            }
-        }
-        Ok(mentions)
+    /// Give the user's mail to a named writer if they still exist. A writer
+    /// can be removed after the mail was read or while the GUI was offline.
+    /// That cannot stop the user's reply from being saved in its thread.
+    fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
+        let read = self.db.read();
+        let mut seen = HashSet::new();
+        agents
+            .into_iter()
+            .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
+            .map(|agent| Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            })
+            .collect()
     }
 
     /// Start the process of every workset with an agent that receives
@@ -1012,7 +1044,7 @@ impl AgentPool {
                 .iter()
                 .filter_map(|mention| match mention.to {
                     Address::Agent(agent) => Some(agent),
-                    Address::User => None,
+                    Address::User | Address::System { .. } => None,
                 }),
         );
         let mut worksets: Vec<WorksetId> = receivers
@@ -1278,6 +1310,7 @@ impl AgentPool {
                 self.known_mentions(&mentions)?;
                 let message = NewMessage {
                     from: Address::Agent(sender),
+                    reply_to: None,
                     mentions,
                     content,
                 };
@@ -1288,6 +1321,42 @@ impl AgentPool {
                 self.consider_naming(id);
                 PyReply::Seq(id.0)
             }
+            PyRequest::Status {
+                agent,
+                thread,
+                text,
+            } => {
+                self.own_agent(workset, agent)?;
+                self.set_thread_status(thread, agent, text)?;
+                PyReply::Done
+            }
+            PyRequest::Edit {
+                agent,
+                message,
+                content,
+            } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.edit(UnixMs::now(), agent, message, content)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Delete { agent, message } => {
+                self.own_agent(workset, agent)?;
+                let mut write = self.db.write().await;
+                write.delete(UnixMs::now(), agent, message)?;
+                write.commit();
+                PyReply::Done
+            }
+            PyRequest::Search {
+                query,
+                project,
+                limit,
+            } => PyReply::Search(self.db.read().search_mail(
+                &query,
+                project,
+                limit.min(100) as usize,
+            )?),
             PyRequest::Mail { sender, to, text } => {
                 self.own_agent(workset, sender)?;
                 self.workset_of(to)?;

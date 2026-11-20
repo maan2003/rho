@@ -391,6 +391,11 @@ impl Services {
                 })
             }
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
+            Request::ColdNotice { incoming } => Reply::ColdNotice(
+                self.pool
+                    .upgrade()
+                    .and_then(|pool| pool.cold_notice(self.agent, incoming)),
+            ),
         };
         Ok(reply)
     }

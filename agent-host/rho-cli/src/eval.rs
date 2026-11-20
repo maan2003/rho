@@ -280,6 +280,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     pool.post_user(
         client_id,
         None,
+        None,
         vec![id],
         vec![ContentPart::Text { text: prompt }],
     )

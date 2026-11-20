@@ -369,6 +369,10 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(post, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(thread_status, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(edit_message, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(delete_message, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(reparent, &module)?)?;
@@ -415,6 +419,7 @@ fn address(text: &str) -> PyResult<Address> {
 fn address_text(address: Address) -> String {
     match address {
         Address::User => "user".to_owned(),
+        Address::System { .. } => "system".to_owned(),
         Address::Agent(agent) => agent.encoded().to_string(),
     }
 }
@@ -783,6 +788,94 @@ fn post(
     }
 }
 
+#[pyfunction]
+fn thread_status(py: Python<'_>, agent: &str, thread: u64, text: String) -> PyResult<()> {
+    match PyHost::block(
+        py,
+        PyRequest::Status {
+            agent: agent_id(agent)?,
+            thread: MessageId(ChatSeq(thread)),
+            text,
+        },
+    )? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn edit_message(py: Python<'_>, agent: &str, id: u64, text: String) -> PyResult<()> {
+    let message = MessageId(ChatSeq(id));
+    let agent = agent_id(agent)?;
+    let PyReply::Messages(existing) = PyHost::block(py, PyRequest::Message(message))? else {
+        return Err(unexpected());
+    };
+    let existing = existing
+        .first()
+        .ok_or_else(|| PyValueError::new_err(format!("no message #{id}")))?;
+    if existing.from != Address::Agent(agent) {
+        return Err(PyValueError::new_err("you can only change your own mail"));
+    }
+    let content = message_content(text, &existing.mentions)?;
+    match PyHost::block(
+        py,
+        PyRequest::Edit {
+            agent,
+            message,
+            content,
+        },
+    )? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn delete_message(py: Python<'_>, agent: &str, id: u64) -> PyResult<()> {
+    match PyHost::block(
+        py,
+        PyRequest::Delete {
+            agent: agent_id(agent)?,
+            message: MessageId(ChatSeq(id)),
+        },
+    )? {
+        PyReply::Done => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+#[pyfunction]
+fn search_mail(
+    py: Python<'_>,
+    query: String,
+    project: Option<u64>,
+    limit: u64,
+) -> PyResult<Py<PyAny>> {
+    match PyHost::block(
+        py,
+        PyRequest::Search {
+            query,
+            project: project.map(|id| MessageId(ChatSeq(id))),
+            limit,
+        },
+    )? {
+        PyReply::Search(hits) => {
+            let list = PyList::empty(py);
+            for hit in hits {
+                let entry = PyDict::new(py);
+                entry.set_item("project", hit.project.0.0)?;
+                entry.set_item("thread", hit.thread.0.0)?;
+                entry.set_item("message", hit.message.0.0)?;
+                entry.set_item("subject", hit.subject)?;
+                entry.set_item("excerpt", hit.excerpt)?;
+                list.append(entry)?;
+            }
+            Ok(list.into_any().unbind())
+        }
+        _ => Err(unexpected()),
+    }
+}
+
 /// Mail `text` from `sender` to another agent of this host, as it is: the
 /// caller writes the whole text, and the other agent holds it once this
 /// returns.
@@ -1009,6 +1102,14 @@ fn message_to_py<'py>(
         .collect::<Vec<_>>();
     out.set_item("mentions", mentions)?;
     out.set_item("text", text(&message.content))?;
+    out.set_item(
+        "edited",
+        message.revision == rho_agent_types::Revision::Edited,
+    )?;
+    out.set_item(
+        "deleted",
+        message.revision == rho_agent_types::Revision::Deleted,
+    )?;
     Ok(out)
 }
 

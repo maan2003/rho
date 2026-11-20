@@ -78,8 +78,7 @@ worker's memory, and a crash loses them
 ## Chat
 
 Chat is how people and agents talk: one forest of messages per host. Each
-host owns one append-only chat log, dense from 1, of five events: `Posted`
-(with an optional parent), `Reparented`, `Joined`, `Left` and `Named`. A
+host owns one append-only chat log, dense from 1, of posts, moves, membership, subject changes, and mail revisions. A
 message is named by the sequence number of the event that posted it, and
 the thread under `#41` is the message `41` with everything below it. A root
 message is what the GUI shows as a channel; a reply to it is what a topic
@@ -93,7 +92,10 @@ is not chat. The log lives on the host because the GUI is often offline and
 chat crosses worksets, and it survives workset deletion.
 
 Chat and agents are separate hierarchies. They meet only through
-membership and through mentions. Membership is per thread and covers the
+membership and through mentions. A user's addressed reply also records
+the exact mail it answers, independently of parentage: its writer receives
+it even if they left the thread, and a move does not undo the answer.
+Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
 leave on a subthread cuts that branch. A message reaches every member of
@@ -107,14 +109,23 @@ mentions it. A policy with other rules replaces the whole delivery, not one
 rule of it.
 
 A move is a parent change (`Reparented`) and the subtree follows; a message
-is read in the thread it is in now, so `#41` always leads to it. `Named` is
-the only thread metadata: without a name the GUI shows the first line of
-the thread's message. The host names a thread under a root once, when its
+is read in the thread it is in now, so `#41` always leads to it. Without a name the GUI shows the first line of the thread's message.
+An edit changes a mail's current body in place; a delete removes its visible
+content but keeps the anchor and descendants. Only the author can change
+a mail, and an answered ask cannot change. Search uses the current bodies
+and subjects, not the original text of edited or deleted mail. The host names a thread under a root once, when its
 second message arrives and nothing has named it, from a model's reading of
 those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
 `result` mention, and the user says so in the ledger, which is theirs
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
+
+A thread's current status is host memory, sent outside the log. The GUI
+reports thread focus without changing its verdict; an open thread or a
+user reply keeps it warm. Once a thread cools, the next model request can
+carry a one-time writing notice without initiating a request of its own.
+A stop produces durable system mail in the agent's thread, not another
+kind of card, and never feeds back to an agent as fresh input.
 
 Agent-to-agent messaging is not chat. `agents.message` is mail: the host
 hands the text to the receiving agent as an input and keeps no log of it;
