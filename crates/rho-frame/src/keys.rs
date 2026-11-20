@@ -30,7 +30,6 @@ actions!(
         EditIdea,
         SendIdea,
         CancelIdea,
-        FindAddress,
         /// `/`: search forward in what is in view.
         SearchForward,
         /// `?`: search back.
@@ -98,7 +97,6 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-shift-backspace", Close, Some(context)),
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
-            KeyBinding::new("ctrl-shift-f", FindAddress, Some(context)),
             KeyBinding::new("ctrl-alt-m", PromptIdea, Some(context)),
             // `ctrl-shift-;`, the palette where `:` would be typed: in a
             // terminal, on a desktop or a page. Spelled as gpui reads it on

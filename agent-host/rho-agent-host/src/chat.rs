@@ -205,13 +205,14 @@ where
                 |Post {
                      client_id,
                      parent,
+                     reply_to,
                      mentions,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .post_user(client_id, parent, mentions, content)
+                        .post_user(client_id, parent, reply_to, mentions, content)
                         .await
                 },
             )

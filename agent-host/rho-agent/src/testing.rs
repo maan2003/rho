@@ -182,6 +182,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         let mut write = db.write().await;
                         let message = NewMessage {
                             from: rho_agent_types::Address::Agent(sender),
+                            reply_to: None,
                             mentions,
                             content,
                         };

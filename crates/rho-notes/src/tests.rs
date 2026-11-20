@@ -193,6 +193,46 @@ fn notes_lists_every_note_last_written_first() {
     );
 }
 
+/// The palette lists every note that has text, by its first line, a
+/// private reply as one, with a later revision newer; a deleted note is
+/// not there.
+#[test]
+fn the_palette_finds_every_note_by_its_first_line() {
+    let mut world = World::default();
+    let older = world.note("older\nand more");
+    let reply = world.note("a reply");
+    world.say(Fact::About {
+        node: reply.address(),
+        about: Some(thread(7)),
+    });
+    let untitled = world.note("");
+    let gone = world.note("gone");
+    world.write(gone, "gone", true);
+    world.write(older, "older, edited last", false);
+    let mut found = super::found(&world.marks, |note| {
+        note_title(&world.marks, &note.address())
+    });
+    found.sort_by_key(|found| std::cmp::Reverse(found.recency));
+    let seen: Vec<(Address, &str, &str)> = found
+        .iter()
+        .map(|found| {
+            (
+                found.address.clone(),
+                found.title.as_str(),
+                found.description.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (older.address(), "older, edited last", "note"),
+            (untitled.address(), UNTITLED, "note"),
+            (reply.address(), "a reply", "private reply"),
+        ]
+    );
+}
+
 /// A reply's line reads its first line, then, dim, where it shows; a note
 /// about nothing is its first line alone.
 #[test]

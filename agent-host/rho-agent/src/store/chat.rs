@@ -33,6 +33,8 @@ const INBOX: TableDefinition<(AgentId, u64), ()> = TableDefinition::new("chat_in
 /// The user's posts by the client's own id for them, so a resend is
 /// logged once: the seq of the event the post made.
 const CLIENT_IDS: TableDefinition<u64, u64> = TableDefinition::new("chat_client_ids");
+/// The first Joined names where an agent's work began.
+const FIRST_THREAD: TableDefinition<AgentId, u64> = TableDefinition::new("chat_first_thread");
 /// A thread's given name, when it has one.
 const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 
@@ -47,6 +49,7 @@ const ROOT: u64 = 0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMessage {
     pub from: Address,
+    pub reply_to: Option<MessageId>,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
 }
@@ -318,15 +321,9 @@ impl ChatRead for ReadTxn {
     }
 
     fn first_thread(&self, agent: AgentId) -> Option<MessageId> {
-        self.open_table(CHAT_LOG)
-            .iter()
-            .find_map(|(_, row)| match row.value().into_owned().event {
-                ChatEvent::Joined {
-                    thread,
-                    agent: member,
-                } if agent == member => Some(thread),
-                _ => None,
-            })
+        self.open_table(FIRST_THREAD)
+            .get(agent)
+            .map(|thread| MessageId(ChatSeq(thread.value())))
     }
 
     fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
@@ -549,50 +546,21 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         id.0.0
     );
     if original.mentions(Address::User) == Some(MentionKind::Ask) {
-        // An answer remains an answer even if either mail is moved later.
-        // Follow the ask's location as it was when each reply was posted.
-        let mut thread = original.parent;
-        let mut is_reply = thread.is_some_and(|parent| {
-            log.get(parent.0.0).is_some_and(|row| {
-                matches!(
-                    row.value().into_owned().event,
-                    ChatEvent::Posted {
-                        parent: Some(_),
-                        ..
-                    }
-                )
-            })
-        });
+        // An explicit answer doesn't depend on either mail's current
+        // parent. Older clients could also reply directly under a mail.
         for (_, row) in log.range(id.0.0 + 1..) {
-            match row.value().into_owned().event {
-                ChatEvent::Reparented { message, parent } if message == id => {
-                    thread = parent;
-                    is_reply = thread.is_some_and(|parent| {
-                        log.get(parent.0.0).is_some_and(|row| {
-                            matches!(
-                                row.value().into_owned().event,
-                                ChatEvent::Posted {
-                                    parent: Some(_),
-                                    ..
-                                }
-                            )
-                        })
-                    });
-                }
-                ChatEvent::Reparented { message, parent } if Some(message) == thread => {
-                    is_reply = parent.is_some();
-                }
-                ChatEvent::Posted {
-                    from: Address::User,
-                    parent,
-                    ..
-                } if parent == Some(id) || (is_reply && parent == thread) => {
-                    anyhow::bail!(
-                        "you cannot change ask #{}: the user already answered it",
-                        id.0.0
-                    );
-                }
-                _ => {}
+            if let ChatEvent::Posted {
+                from: Address::User,
+                parent,
+                reply_to,
+                ..
+            } = row.value().into_owned().event
+                && reply_to.or(parent) == Some(id)
+            {
+                anyhow::bail!(
+                    "you cannot change ask #{}: the user already answered it",
+                    id.0.0
+                );
             }
         }
     }
@@ -609,6 +577,7 @@ impl ChatWrite for WriteTxn {
         self.open_table(CLIENT_IDS);
         self.open_table(NAMES);
         self.open_table(REVISIONS);
+        self.open_table(FIRST_THREAD);
     }
 
     fn post(
@@ -627,11 +596,16 @@ impl ChatWrite for WriteTxn {
         anyhow::ensure!(has_content(&message.content), "a message needs content");
         let NewMessage {
             from,
+            reply_to,
             mentions,
             content,
         } = message;
+        if let Some(reply_to) = reply_to {
+            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
+        }
         let event = ChatEvent::Posted {
             parent,
+            reply_to,
             from,
             mentions,
             content,
@@ -692,6 +666,7 @@ impl ChatWrite for WriteTxn {
             Some(thread),
             NewMessage {
                 from: sender,
+                reply_to: None,
                 mentions: vec![Mention {
                     to: Address::User,
                     kind: MentionKind::Ask,
@@ -840,6 +815,7 @@ impl ChatWrite for WriteTxn {
             }
             ChatEvent::Joined { thread, agent } => {
                 self.open_table(MEMBERS).insert((thread.0.0, *agent), true);
+                index_first_join(self, *agent, *thread);
             }
             ChatEvent::Left { thread, agent } => {
                 self.open_table(MEMBERS).insert((thread.0.0, *agent), false);
@@ -856,5 +832,28 @@ impl ChatWrite for WriteTxn {
                 }
             }
         }
+    }
+}
+
+fn index_first_join(write: &mut WriteTxn, agent: AgentId, thread: MessageId) {
+    let mut first = write.open_table(FIRST_THREAD);
+    if first.get(agent).is_none() {
+        first.insert(agent, thread.0.0);
+    }
+}
+
+/// Existing posts and workset rows keep their original encoding. Seed the
+/// first-thread projection from the same log old hosts wrote.
+pub(crate) fn migrate_mail(write: &mut WriteTxn) {
+    let joined = write
+        .open_table(CHAT_LOG)
+        .iter()
+        .filter_map(|(_, row)| match row.value().into_owned().event {
+            ChatEvent::Joined { thread, agent } => Some((agent, thread)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (agent, thread) in joined {
+        index_first_join(write, agent, thread);
     }
 }

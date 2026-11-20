@@ -37,7 +37,7 @@ When a host drops, the line names it and says `reconnecting · 12s` in red, coun
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
-status: `:` lists commands and `ctrl-shift-f` lists places, at most 40 by name. They are separate prompts, with no full-text search across mail and notes.
+status: one prompt lists the screen's commands, places and notes; there is no full-text search across mail and notes yet, and no `what waits` rows on an empty query.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
 sees: best matches first as the user types; with nothing typed, the screen's commands first, then recent places, then what waits. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its `mail.Status` or, when it waits, its `deal.Card` words. Commands show their keys where they have them.
@@ -49,7 +49,7 @@ does:
 When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
 ## screen Palette
-status: built as separate prompts, `command:` and `find:`, without a common list or full-text search of mails and notes.
+status: built as one prompt; full-text search of mails and notes is not built.
 answers: where can the user go, or what can they run, with these words?
 shows:
 - the query in the `Palette` prompt
@@ -117,7 +117,7 @@ does:
 The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
 
 ## flow Go to something by name
-status: the user opens `find:` with `ctrl-shift-f`; it lists places by name, separately from commands, and cannot search the full text of mails or notes.
+status: the prompt reaches places by name; it cannot search the full text of mails or notes yet.
 runs: 20 a day
 day: Reach anything.
 when: the user knows the place they want or remembers words from a mail or note

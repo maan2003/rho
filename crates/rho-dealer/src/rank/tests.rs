@@ -240,12 +240,11 @@ impl World {
                 } else if let Some(result) = unseen.last() {
                     (
                         *result,
-                        Curve::Fading {
-                            head_start: AGENT_FINISHED_HEAD_START,
+                        Curve::Waiting {
+                            head_start: AGENT_BLOCKED_HEAD_START,
                             since: result.at,
-                            gone_days: AGENT_FINISHED_GONE_DAYS,
                         },
-                        "result · {age} ago",
+                        "result · {age}",
                     )
                 } else {
                     if let Some(trace) = trace.as_deref_mut() {

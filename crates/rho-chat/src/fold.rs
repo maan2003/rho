@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, Revision, ThreadStatus,
-    UnixMs, one_line,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, MentionKind, Message, MessageId, Revision,
+    ThreadStatus, UnixMs, one_line,
 };
 
 /// What one record changed.
@@ -147,13 +147,24 @@ impl HostChat {
 
     /// One root channel by id, with the name used in a project address.
     pub fn project(&self, channel: MessageId) -> Option<crate::protocol::Project> {
-        let root = self.message(channel)?;
-        if root.parent.is_some() || root.revision == Revision::Deleted {
+        if !self.is_project(channel) {
             return None;
         }
         Some(crate::protocol::Project {
             channel,
             name: self.name(channel)?,
+        })
+    }
+
+    /// A root that was itself addressed to the user is mail, not a project.
+    pub fn is_project(&self, id: MessageId) -> bool {
+        self.message(id).is_some_and(|root| {
+            root.parent.is_none()
+                && root.revision != Revision::Deleted
+                && !matches!(
+                    root.mentions(Address::User),
+                    Some(MentionKind::Ask | MentionKind::Result)
+                )
         })
     }
 
@@ -201,21 +212,13 @@ impl HostChat {
         }
     }
 
-    /// The nearest head above a message: itself for a root or a thread,
-    /// its parent for anything deeper, where a reply to a reply is a
-    /// subthread of its own.
+    /// The screen that reads a mail: itself for a root or project row,
+    /// otherwise its parent, including an addressed root mail.
     pub fn subthread_of(&self, id: MessageId) -> MessageId {
         let Some(parent) = self.messages.get(&id).and_then(|message| message.parent) else {
             return id;
         };
-        match self
-            .messages
-            .get(&parent)
-            .and_then(|message| message.parent)
-        {
-            None => id,
-            Some(_) => parent,
-        }
+        if self.is_project(parent) { id } else { parent }
     }
 
     /// The root above a message, or the message when it is one.
@@ -383,6 +386,7 @@ mod tests {
             seq,
             ChatEvent::Posted {
                 parent: parent.map(id),
+                reply_to: None,
                 from,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: text.into() }],

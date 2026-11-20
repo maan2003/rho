@@ -214,9 +214,14 @@ impl ChatSystem {
     }
 
     pub fn project_address(&self, channel: ThreadId) -> Option<String> {
+        let alias = &self
+            .hosts
+            .values()
+            .find(|slot| slot.endpoint == Some(channel.host))?
+            .name;
         self.chat(channel.host)?
             .project(channel.message)
-            .map(|project| project.address(&self.host_name(channel.host)))
+            .map(|project| project.address(alias))
     }
 
     /// Resolves a project address against aliases this device owns and the
@@ -259,10 +264,12 @@ impl ChatSystem {
             .unwrap_or_else(|| format!("{endpoint}"))
     }
 
-    /// Whether the window holds more than one host: when it does, a
-    /// thread says which.
-    fn many_hosts(&self) -> bool {
-        self.chats.len() > 1
+    fn project_of(&self, thread: ThreadId) -> String {
+        let host = self.host_name(thread.host);
+        self.chat(thread.host).map_or_else(
+            || host.clone(),
+            |chat| cards::context(chat, thread.message, &host),
+        )
     }
 
     pub fn draft(&self, endpoint: EndpointId, parent: Option<MessageId>) -> &str {
@@ -359,8 +366,39 @@ impl ChatSystem {
         mentions: Vec<AgentId>,
         cx: &mut Context<Self>,
     ) -> u64 {
+        self.queue_mail(endpoint, parent, None, text, mentions, cx)
+    }
+
+    /// Writes in `thread` and answers one particular mail, even if its writer
+    /// is no longer a thread member or the client is offline.
+    pub fn reply(
+        &mut self,
+        thread: ThreadId,
+        to: MessageId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.queue_mail(
+            thread.host,
+            Some(thread.message),
+            Some(to),
+            text,
+            Vec::new(),
+            cx,
+        )
+    }
+
+    fn queue_mail(
+        &mut self,
+        endpoint: EndpointId,
+        parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
+        text: String,
+        mentions: Vec<AgentId>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let project = parent.and_then(|message| {
-            self.project_of(ThreadId {
+            self.project_root(ThreadId {
                 host: endpoint,
                 message,
             })
@@ -370,7 +408,9 @@ impl ChatSystem {
             self.frame.changed(cx);
         }
         let content = vec![ContentPart::Text { text }];
-        let (id, kept) = self.outbox.push(endpoint, parent, mentions, content);
+        let (id, kept) = self
+            .outbox
+            .push(endpoint, parent, reply_to, mentions, content);
         self.cache
             .write_outbox(endpoint, kept, project.map(|project| project.message));
         self.send_unsent(endpoint, cx);
@@ -431,7 +471,7 @@ impl ChatSystem {
         }
     }
 
-    fn project_of(&self, thread: ThreadId) -> Option<ThreadId> {
+    fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
         let chat = self.chat(thread.host)?;
         chat.message(thread.message)?;
         let root = chat.root_of(thread.message);
@@ -570,7 +610,7 @@ impl ChatSystem {
         let host = cards::Host {
             endpoint,
             chat,
-            name: self.many_hosts().then_some(name.as_str()),
+            name: &name,
         };
         Some(read(&host))
     }
@@ -617,6 +657,16 @@ impl System for ChatSystem {
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
+    }
+
+    fn active_surface(&mut self, address: Option<&Address>, _cx: &mut Context<Self>) {
+        let thread = address
+            .and_then(|address| self.thread_of(address))
+            .filter(|thread| {
+                self.chat(thread.host)
+                    .is_some_and(|chat| !chat.is_project(thread.message))
+            });
+        self.set_view(thread);
     }
 
     fn streams(
@@ -670,8 +720,7 @@ impl System for ChatSystem {
         let this = cx.entity();
         let mut rows = Vec::new();
         let hosts = self.hosts();
-        // On an agent in a thread's `with` line the palette is the
-        // agent's, whose `c` compacts its context.
+        // The agent's palette uses `c` to compact its context.
         let on_agent = point
             .subject
             .as_ref()
@@ -730,10 +779,8 @@ impl System for ChatSystem {
                 .get(&thread.host)
                 .and_then(|chat| chat.name(thread.message))
                 .unwrap_or_default();
-            rows.push(Row::run(
-                "shift-n",
-                "name this thread",
-                move |frame, window, cx| {
+            rows.push(
+                Row::run("shift-n", "name this thread", move |frame, window, cx| {
                     let this = this.clone();
                     let current = current.clone();
                     frame.open_prompt(
@@ -764,8 +811,9 @@ impl System for ChatSystem {
                         window,
                         cx,
                     );
-                },
-            ));
+                })
+                .also("rename"),
+            );
         }
         // A verdict is about the card; about one message of it alone is
         // rare, so it is reached by name from the palette and has no binding.
@@ -832,9 +880,7 @@ impl System for ChatSystem {
         let thread = self.thread_of(address)?;
         let chat = self.chats.get(&thread.host)?;
         let parent = chat.message(thread.message)?.parent?;
-        let in_channel = chat
-            .message(parent)
-            .is_some_and(|parent| parent.parent.is_none());
+        let in_channel = chat.is_project(parent);
         let message = if in_channel { thread.message } else { parent };
         Some(
             ThreadId {
@@ -868,7 +914,7 @@ impl System for ChatSystem {
                         host,
                         message: status.thread,
                     };
-                    let project = self.project_of(thread)?;
+                    let project = self.project_root(thread)?;
                     (project != thread).then_some(())?;
                     Some(MovingThread {
                         thread: thread.address(),
@@ -899,7 +945,7 @@ impl System for ChatSystem {
     }
 
     fn idea_project(&self, address: &Address, _cx: &App) -> Option<IdeaProject> {
-        let project = self.project_of(self.thread_of(address)?)?;
+        let project = self.project_root(self.thread_of(address)?)?;
         self.idea_project_at(project)
     }
 

@@ -285,6 +285,7 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
 fn said(from: Address, text: &str) -> NewMessage {
     NewMessage {
         from,
+        reply_to: None,
         mentions: Vec::new(),
         content: vec![ContentPart::Text { text: text.into() }],
     }
@@ -683,4 +684,248 @@ fn create_agent(write: &mut rho_db::WriteTxn, workset: WorksetId, n: u64) {
             },
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
+    use rho_agent_types::Revision;
+
+    let (_dir, db) = db().await;
+    let mut write = db.write().await;
+    let (a, b) = (agent(1), agent(2));
+    let at = UnixMs(20);
+    let channel = write
+        .post(at, None, said(Address::User, "rho"), None)
+        .unwrap();
+    let thread = write
+        .post(at, Some(channel), said(Address::User, "Fix it"), None)
+        .unwrap();
+    let other = write
+        .post(at, Some(channel), said(Address::User, "Other idea"), None)
+        .unwrap();
+    let mut asked = said(Address::Agent(a), "Which clock?");
+    asked.mentions.push(Mention {
+        to: Address::User,
+        kind: MentionKind::Ask,
+    });
+    let ask = write.post(at, Some(thread), asked.clone(), None).unwrap();
+    let spare_ask = write.post(at, Some(thread), asked, None).unwrap();
+    let revised = said(Address::Agent(a), "Which monotonic clock?").content;
+    write
+        .post(
+            at,
+            Some(other),
+            said(Address::User, "Use the old host"),
+            None,
+        )
+        .unwrap();
+    assert!(
+        write
+            .edit(at, b, ask, revised.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("own mail")
+    );
+    write.edit(at, a, ask, revised.clone()).unwrap();
+    write
+        .post(at, Some(thread), said(Address::User, "I'm back"), None)
+        .unwrap();
+    let answer = write
+        .post(
+            at,
+            Some(thread),
+            NewMessage {
+                reply_to: Some(ask),
+                ..said(Address::User, "Use mock time")
+            },
+            None,
+        )
+        .unwrap();
+    write.reparent(at, answer, Some(other)).unwrap();
+    write.reparent(at, ask, Some(other)).unwrap();
+    let err = write
+        .edit(at, a, ask, said(Address::Agent(a), "Ship it").content)
+        .unwrap_err();
+    assert!(err.to_string().contains("already answered"));
+    // Another ask by the same writer in the same thread is still editable.
+    write.edit(at, a, spare_ask, revised.clone()).unwrap();
+    assert!(
+        write
+            .delete(at, a, ask)
+            .unwrap_err()
+            .to_string()
+            .contains("already answered")
+    );
+
+    let note = write
+        .post(
+            at,
+            Some(thread),
+            said(Address::Agent(a), "Transient report"),
+            None,
+        )
+        .unwrap();
+    let reply = write
+        .post(
+            at,
+            Some(note),
+            said(Address::User, "Context to retain"),
+            None,
+        )
+        .unwrap();
+    write.delete(at, a, note).unwrap();
+    assert!(
+        write
+            .edit(at, a, note, revised)
+            .unwrap_err()
+            .to_string()
+            .contains("deleted")
+    );
+    write.commit();
+
+    let read = db.read();
+    let ask = read.message(ask).unwrap();
+    let answer = read.message(answer).unwrap();
+    assert_eq!(answer.reply_to, Some(ask.id));
+    assert_eq!(answer.parent, Some(other));
+    assert_eq!(ask.text(), "Which monotonic clock?");
+    assert_eq!(ask.revision, Revision::Edited);
+    assert_eq!(ask.mentions(Address::User), Some(MentionKind::Ask));
+    let removed = read.message(note).unwrap();
+    assert_eq!(removed.revision, Revision::Deleted);
+    assert!(removed.text().is_empty());
+    assert_eq!(read.message(reply).unwrap().parent, Some(note));
+}
+
+#[tokio::test]
+async fn a_stop_is_logged_once_per_agent_per_stop_and_is_not_in_the_inbox() {
+    let (_dir, db) = db().await;
+    let mut write = db.write().await;
+    let (a, b) = (agent(1), agent(2));
+    let at = UnixMs(90);
+    let root = write
+        .post(at, None, said(Address::User, "tide"), None)
+        .unwrap();
+    let work = write
+        .post(at, Some(root), said(Address::User, "Carry on"), None)
+        .unwrap();
+    write.join(at, work, a).unwrap();
+    write.join(at, work, b).unwrap();
+    let sender = Address::System {
+        agent: a,
+        stop: rho_agent_types::Stop::Lost,
+        since: UnixMs(75),
+    };
+    let stop = write
+        .post_stop(at, work, sender, "lost · worker exited".into())
+        .unwrap()
+        .unwrap();
+    write.reparent(at, stop, Some(root)).unwrap();
+    write.commit();
+
+    let mut write = db.write().await;
+    assert_eq!(
+        write
+            .post_stop(UnixMs(96), work, sender, "repeat".into())
+            .unwrap(),
+        None
+    );
+    let next = Address::System {
+        agent: a,
+        stop: rho_agent_types::Stop::Lost,
+        since: UnixMs(95),
+    };
+    let again = write
+        .post_stop(UnixMs(96), work, next, "lost again".into())
+        .unwrap()
+        .unwrap();
+    write.commit();
+    let read = db.read();
+    assert_eq!(read.message(stop).unwrap().from, sender);
+    assert_eq!(
+        read.message(again).unwrap().mentions(Address::User),
+        Some(MentionKind::Ask)
+    );
+    assert!(read.inbox(a, ChatSeq::ZERO).is_empty());
+    assert!(read.inbox(b, ChatSeq::ZERO).is_empty());
+}
+
+#[tokio::test]
+async fn mail_search_sees_the_current_subject_and_body_only_inside_scope() {
+    let (_dir, db) = db().await;
+    let mut write = db.write().await;
+    let at = UnixMs(7);
+    let a = agent(7);
+    let tide = write
+        .post(at, None, said(Address::User, "tide"), None)
+        .unwrap();
+    let reef = write
+        .post(at, None, said(Address::User, "reef"), None)
+        .unwrap();
+    let topic = write
+        .post(at, Some(tide), said(Address::User, "Set it up"), None)
+        .unwrap();
+    write
+        .name(at, topic, "NAPI socket strategy".into())
+        .unwrap();
+    let reply = write
+        .post(
+            at,
+            Some(topic),
+            said(Address::Agent(a), "Use protocol Polling."),
+            None,
+        )
+        .unwrap();
+    let removed = write
+        .post(
+            at,
+            Some(topic),
+            said(Address::Agent(a), "Never NAPI socket."),
+            None,
+        )
+        .unwrap();
+    write
+        .edit(
+            at,
+            a,
+            reply,
+            said(Address::Agent(a), "Use a native NAPI socket.").content,
+        )
+        .unwrap();
+    write.delete(at, a, removed).unwrap();
+    let different = write
+        .post(
+            at,
+            Some(reef),
+            said(Address::User, "Test NAPI socket."),
+            None,
+        )
+        .unwrap();
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.project_named(" tide "), Some(tide));
+    assert_eq!(
+        read.project_named("NAPI socket strategy"),
+        None,
+        "a subject is not a project address"
+    );
+    let scoped = read.search_mail("Socket NAPI", Some(tide), 10).unwrap();
+    assert_eq!(
+        scoped
+            .iter()
+            .map(|hit| (hit.thread, hit.message))
+            .collect::<Vec<_>>(),
+        [(topic, reply), (topic, topic)]
+    );
+    assert_eq!(
+        (&*scoped[0].subject, &*scoped[0].excerpt),
+        ("NAPI socket strategy", "Use a native NAPI socket.")
+    );
+    assert_eq!(
+        read.search_mail("socket NAPI", None, 1).unwrap()[0].message,
+        different
+    );
+    assert!(read.search_mail("polling", None, 10).unwrap().is_empty());
+    assert!(read.search_mail("NAPI", Some(topic), 10).is_err());
 }

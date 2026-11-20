@@ -181,9 +181,10 @@ class Tools(WorksetCase):
         first = fake_rho.post_user(rho_, "Do it.", [self.root])
         other = fake_rho.post_user(rho_, "Something else.", [self.root])
         printed, reply = run(lambda: ns["chat"].post(first, "On it."))
-        self.assertEqual((printed, reply), (f"Posted in #{first}.\n", f"Posted in #{first}."))
+        self.assertEqual(printed, f"Posted #{reply} in #{first}.\n")
+        self.assertEqual(reply, self.state.messages[-1]["id"])
         printed, reply = run(lambda: ns["chat"].post(first, "Done.", mention="user", kind="result"))
-        self.assertEqual((printed, reply), ("", ""))
+        self.assertEqual((printed, reply), ("", self.state.messages[-1]["id"]))
         run(lambda: ns["chat"].post(other, "Also done.", mention=["user", f"eng-{child}"], kind="ask"))
         posted = [(m["parent"], m["text"], m["mentions"]) for m in self.state.messages if m["sender"] == self.root]
         self.assertEqual(posted, [
@@ -194,6 +195,58 @@ class Tools(WorksetCase):
         # A mention reaches an agent outside the thread; posting joins no one.
         self.assertEqual([m["_to"] for m in self.state.messages if m["sender"] == self.root], [set(), set(), {child}])
         self.assertEqual(self.state.members, {})
+
+    def test_a_post_can_be_awaited_for_its_id_without_sending_twice(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+
+        _, posted = run(lambda: chat.post(thread, "Use the mock clock."))
+        self.assertEqual(len(self.state.messages), 3, "posting takes effect before await")
+        expected = self.state.messages[-1]["id"]
+        self.assertEqual(posted, expected)
+        awaited = asyncio.run(_await(posted))
+        self.assertEqual(awaited, expected)
+        self.assertIs(type(awaited), int)
+
+        async def reply():
+            return await chat.post(thread, "Done.", mention="user", kind="result")
+
+        self.assertEqual(asyncio.run(reply()), expected + 1)
+        self.assertEqual([mail["text"] for mail in self.state.messages[2:]], ["Use the mock clock.", "Done."])
+
+    def test_other_mail_tools_start_immediately_and_can_be_awaited(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        mail = fake_rho.post_user(thread, "Look at the kernel.")
+        _, forked = run(lambda: chat.fork(mail, "What about the timer?"))
+        self.assertEqual(self.state.messages[-1]["parent"], mail)
+        self.assertEqual(asyncio.run(_await(forked)), mail)
+        self.assertEqual(len(self.state.messages), 4, "awaiting a fork must not post again")
+
+        for name, method, args, expected in [
+            ("thread_status", chat.status, (thread, "Checking the clock"), (self.root, thread, "Checking the clock")),
+            ("edit_message", chat.edit, (mail, "A new body"), (self.root, mail, "A new body")),
+            ("delete_message", chat.delete, (mail,), (self.root, mail)),
+        ]:
+            with self.subTest(name=name), mock.patch.object(fake_rho, name, create=True, return_value=None) as host:
+                done = method(*args)
+                host.assert_called_once_with(*expected)
+                self.assertIsNone(asyncio.run(_await(done)))
+                host.assert_called_once_with(*expected)
+
+        hits = [{"message": mail, "thread": thread, "project": project, "subject": "Do it.", "excerpt": "kernel"}]
+        with mock.patch.object(fake_rho, "search_mail", create=True, return_value=hits) as search:
+            _, found = run(lambda: chat.search("kernel", project=project, limit=2))
+            search.assert_called_once_with("kernel", project, 2)
+            self.assertEqual(found[0]["message"], mail)
+            awaited = asyncio.run(_await(found))
+            self.assertEqual(awaited, hits)
+            self.assertIs(type(awaited), list)
+            search.assert_called_once_with("kernel", project, 2)
 
     def test_chat_rules(self):
         ns, _ = self.notebook(self.root)
@@ -225,7 +278,8 @@ class Tools(WorksetCase):
         ops = self.state.messages[-2]
         self.assertEqual((ops["parent"], ops["sender"], ops["text"]), (None, self.root, "ops"))
         self.assertEqual(self.state.messages[-1], {"id": started, "at": 0, "parent": ops["id"], "sender": self.root, "mentions": [(child, "ask")], "text": "Look.", "_to": {child}})
-        # (The user's mention joined the root to `thread` meanwhile.)
+        # The user's mention joins the root asynchronously.
+        wait_for(lambda: (thread, self.root) in self.state.members, "the user mention joins")
         self.assertEqual(self.state.members, {(thread, self.root): True, (started, self.root): True})
         # The same stream again is the same root.
         _, again = run(lambda: chat.start(" ops ", "More."))

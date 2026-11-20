@@ -949,12 +949,31 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         parent: Option<MessageId>,
+        reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
+        let mut mentions = self.user_mentions(mentions);
+        // Resolve the writer on the host, even if they are no longer a
+        // thread member. A deleted agent cannot receive mail, but the answer
+        // still belongs in the thread.
+        if let Some(target) = reply_to
+            && let Some(mail) = self.db.read().message(target)
+            && let Address::Agent(agent) = mail.from
+            && self.workset_of(agent).is_ok()
+            && mentions
+                .iter()
+                .all(|mention| mention.to != Address::Agent(agent))
+        {
+            mentions.push(Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            });
+        }
         let message = NewMessage {
             from: Address::User,
-            mentions: self.user_mentions(mentions)?,
+            reply_to,
+            mentions,
             content,
         };
         let mut write = self.db.write().await;
@@ -995,22 +1014,20 @@ impl AgentPool {
         Ok(())
     }
 
-    /// The user's mentions of agents: each asks the agent to read it.
-    fn user_mentions(&self, agents: Vec<AgentId>) -> anyhow::Result<Vec<Mention>> {
-        let mut mentions: Vec<Mention> = Vec::with_capacity(agents.len());
-        for agent in agents {
-            self.workset_of(agent)?;
-            if mentions
-                .iter()
-                .all(|mention| mention.to != Address::Agent(agent))
-            {
-                mentions.push(Mention {
-                    to: Address::Agent(agent),
-                    kind: MentionKind::Ask,
-                });
-            }
-        }
-        Ok(mentions)
+    /// Give the user's mail to a named writer if they still exist. A writer
+    /// can be removed after the mail was read or while the GUI was offline.
+    /// That cannot stop the user's reply from being saved in its thread.
+    fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
+        let read = self.db.read();
+        let mut seen = HashSet::new();
+        agents
+            .into_iter()
+            .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
+            .map(|agent| Mention {
+                to: Address::Agent(agent),
+                kind: MentionKind::Ask,
+            })
+            .collect()
     }
 
     /// Start the process of every workset with an agent that receives
@@ -1293,6 +1310,7 @@ impl AgentPool {
                 self.known_mentions(&mentions)?;
                 let message = NewMessage {
                     from: Address::Agent(sender),
+                    reply_to: None,
                     mentions,
                     content,
                 };

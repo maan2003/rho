@@ -25,7 +25,7 @@ use crate::idea::{IdeaMail, IdeaProject};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
-/// Something `find` can open.
+/// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub address: Address,
@@ -47,6 +47,10 @@ pub trait System: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface>;
+
+    /// The foreground surface, independent of where an overlay takes keys.
+    /// `None` means that the window is inactive.
+    fn active_surface(&mut self, _address: Option<&Address>, _cx: &mut Context<Self>) {}
 
     /// The streams this system keeps to a host, opened on every connect.
     /// `name` is what the user calls the host, `endpoint` its identity as
@@ -123,7 +127,7 @@ pub trait System: Sized + 'static {
 
     fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
-    /// Everything the system has that `find` lists by title, given what
+    /// Every place of the system's that the palette lists by title, given what
     /// the user has said about its things. Asked with the frame busy, so
     /// the marks are handed in.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
@@ -139,6 +143,7 @@ pub trait System: Sized + 'static {
 trait SystemHandle {
     fn kinds(&self, cx: &App) -> &'static [&'static str];
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface>;
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App);
     fn streams(
         &self,
         host: HostId,
@@ -181,6 +186,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.update(cx, |system, cx| system.open(address, window, cx))
+    }
+
+    fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.update(cx, |system, cx| system.active_surface(address, cx));
     }
 
     fn streams(
@@ -274,6 +283,10 @@ impl AnySystem {
 
     pub fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
         self.0.open(address, window, cx)
+    }
+
+    pub(crate) fn active_surface(&self, address: Option<&Address>, cx: &mut App) {
+        self.0.active_surface(address, cx);
     }
 
     pub fn streams(

@@ -339,13 +339,8 @@ impl Frame {
         true
     }
 
-    pub(crate) fn open_card(&mut self, card: Card, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_with(
-            card.address,
-            rho_journal::SurfaceShowMethod::Deal,
-            window,
-            cx,
-        );
+    pub fn open_card(&mut self, card: Card, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with(card.address.clone(), Some(&card), window, cx);
         self.systems_changed(cx);
     }
 
@@ -475,7 +470,7 @@ pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
         skip_cooldown_minutes: SKIP_HOLD.as_mins(),
         blocked_reply_head_start: AGENT_BLOCKED_HEAD_START,
         blocked_reply_slope_per_day: WAITING_SLOPE_PER_DAY,
-        fyi_reply_pace_days: AGENT_FINISHED_GONE_DAYS,
+        fyi_reply_pace_days: 0.0, // Results no longer fade.
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,

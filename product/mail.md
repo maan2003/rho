@@ -3,21 +3,19 @@
 The user writes a project a mail to put an idea to work. Each piece of work has one thread, with a subject, the mails so far, and one line about what is happening now.
 
 ## bet A mail is the medium
-status: built as chat in channels, with each agent writing under its own name, membership shown on a `with` line, and progress arriving as messages and agent states.
 instead of: chat in channels with a conversation among individually named agents.
 serves: Keep the work moving.
 because: one thread keeps one piece of work together. Its subject identifies the work, its status tells the user what is happening now, and the project speaks with one voice even when several agents do the work.
 costs: the user opens the transcript to see which agent did what.
 
 ## bet The project asks by mail, even when an agent stops
-status: an agent's mention can make an ask or a result card; a stop makes a card from the agent's state, without a message.
 instead of: attention coming from a mixture of named agents' chat mentions and notices about their state.
 serves: Know what wants them, and where they were.
 because: the user only needs what asks for them or returns a result, not each agent's progress. A stop is another mail to answer, not another kind of thing to watch.
 costs: a failure can still ask for the user when they have nothing to add.
 
 ## journey An idea becomes a merged result
-status: ideas are written in channels, agents answer in their own names, and result cards can expire without proof or a reply.
+status: ideas are written in channels, and a result carries no proof yet.
 goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:
@@ -44,7 +42,6 @@ does:
 - receive an idea: use the place already remembered for the project's agents
 
 ## concept Thread
-status: a host conversation has a name, messages from individually named agents, a `with` line, and replies folded beneath their parent messages; it has no one-line status for the work.
 purpose: keep one piece of work and the whole exchange about it together.
 principle: the user writes to `tide@lab` about a flaky test; the project asks about the test and later sends the result in the same thread, whatever agents did the work.
 sees: its subject and project; on a row, what waits or its `Status` if nothing waits; open, its mails in order, with history reached by scrolling and the status pinned above the reply box.
@@ -58,7 +55,7 @@ does:
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
-status: a host message shows the agent's own name or the user's label as sender; result messages do not carry designated proof, and there is no project mail edit marker or protection for an answered ask.
+status: a result does not yet carry designated proof.
 purpose: carry a brief, an ask, or a result in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
 sees: the user or the project's address as sender, the time, the words, what the mail quotes, `edited` after an edit, and proof on a result.
@@ -70,7 +67,6 @@ does:
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
 
 ## concept Status
-status: each agent's state and age appear on the thread's `with` line; there is no single status for the thread or a list of threads ordered by status change.
 purpose: say in one glance what the work is doing now, without asking the user to read another mail.
 principle: an agent reports `Checking the clock fix`, then another reports `Running the tests`; the user sees only the latter on the thread and on its row when nothing waits.
 sees: one line about what the work is doing now, replaced by the newest line rather than added to the mail history.
@@ -86,7 +82,6 @@ sees: the text in the thread's reply box, as it was left.
 A thread has one draft. Sending the mail ends that draft.
 
 ## screen Thread
-status: a host thread opens at its newest message and shows the agents and their states on a `with` line. There is no pinned status for the work.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the asking `Mail` at the cursor when a `deal.Card` opens, with any quoted text or result proof
@@ -148,7 +143,7 @@ Release notes                                                  Checking the link
 ```
 
 ## flow Answer a mail
-status: the user replies in host chat; a thread opens at its newest message and a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
+status: a result has no designated proof. The user's Slack is in the browser, and the bot is not built.
 runs: 100 a day
 day: Keep the work moving.
 when: a project or the Slack bot has something that asks for the user, or the user opens a result
@@ -187,5 +182,4 @@ The historical review above was of Start a thread. Start an agent from a message
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a cold mail stands alone
-status: the project is not told when the user last had a thread open; messages do not distinguish warm and cold visits.
 when more than ten minutes have passed since the user had a `Thread` open, then it is cold, rho tells the `Project` once; cold `Mail` stands alone by quoting rather than repeating, and warm mail is short.
