@@ -288,7 +288,9 @@ impl Frame {
             StyleClass::SystemInfo,
             cx,
         );
-        self.open(address, window, cx);
+        if !self.current_surface().inspects_card() {
+            self.open(address, window, cx);
+        }
         self.systems_changed(cx);
     }
 

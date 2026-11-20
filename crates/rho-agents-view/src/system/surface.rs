@@ -8,7 +8,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_types::{Activity, AgentId, Message, MessageId};
 use rho_agents_client::protocol::transcript::{RuntimeKind, RuntimeState};
-use rho_agents_client::protocol::worksets::Cancel;
+use rho_agents_client::protocol::worksets::{Cancel, RewindAgent};
 use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
 use rho_frame::{Addressed as _, Candidate, Row, Subject, Surface};
 use rho_window::style::StyleClass;
@@ -39,7 +39,6 @@ impl AgentSurface {
         system: Entity<AgentsSystem>,
         agent: AgentId,
         model: Entity<AgentModel>,
-        failed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -53,20 +52,22 @@ impl AgentSurface {
             &model,
             window,
             |this, _, event: &AgentModelEvent, window, cx| {
+                if let AgentModelEvent::RestorePoints(points) = event
+                    && let Some((_, point)) =
+                        points.iter().find(|(id, _)| *id == this.editor.entity_id())
+                {
+                    this.model.update(cx, |model, cx| {
+                        model.go_to_store_point(&this.editor, *point, window, cx)
+                    });
+                }
                 this.update_folds(window, cx);
                 if matches!(event, AgentModelEvent::Loaded) {
                     let mut landed = false;
                     if matches!(&this.inspect_mail, Some(Inspect::Ready(_))) {
                         landed = this.finish_inspection(window, cx);
                     }
-                    if !landed
-                        && this.inspect_mail.is_none()
-                        && this.default_landing
-                        && this
-                            .runtime(cx)
-                            .is_some_and(|state| state.activity() == Activity::Failed)
-                    {
-                        this.jump_error(None, false, window, cx);
+                    if !landed && this.inspect_mail.is_none() && this.default_landing {
+                        this.land(window, cx);
                     }
                     this.default_landing = false;
                     this.model
@@ -83,14 +84,11 @@ impl AgentSurface {
             editor,
             model,
             inspect_mail: None,
-            default_landing: !ready,
+            default_landing: false,
             folded_calls: HashSet::new(),
         };
         if ready {
             this.update_folds(window, cx);
-            if failed {
-                this.jump_error(None, false, window, cx);
-            }
         }
         this
     }
@@ -108,7 +106,7 @@ impl AgentSurface {
             .map_or(label.clone(), |host| {
                 format!("{} › {label}", registry.host_name(host))
             });
-        registry
+        let title = registry
             .working_directory(self.agent)
             .map_or(title.clone(), |directory| {
                 let folder = if compact {
@@ -117,6 +115,11 @@ impl AgentSurface {
                     directory.as_str()
                 };
                 format!("{title} · {folder}")
+            });
+        registry
+            .agent_spec(self.agent)
+            .map_or(title.clone(), |spec| {
+                format!("{title} · {}", spec.runtime_label())
             })
     }
 
@@ -178,6 +181,28 @@ impl AgentSurface {
         true
     }
 
+    fn land(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.land_at(
+            self.runtime(cx)
+                .is_some_and(|state| in_trouble(state.activity())),
+            window,
+            cx,
+        )
+    }
+
+    fn land_at(&self, trouble: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let error = (trouble && model.current_errors() != 0)
+            .then(|| model.errors().next_back())
+            .flatten()
+            .map(|(point, _, _)| point);
+        if let Some(point) = error.or_else(|| model.newest_step()) {
+            self.model.update(cx, |model, cx| {
+                model.go_to_store_point(&self.editor, point, window, cx)
+            });
+        }
+    }
+
     fn jump_error(
         &self,
         current: Option<usize>,
@@ -202,6 +227,19 @@ impl AgentSurface {
             self.model.update(cx, |model, cx| {
                 model.go_to_store_point(&self.editor, point, window, cx)
             });
+        } else {
+            let words = if model.errors().next().is_none() {
+                "no errors"
+            } else if forward {
+                "last error"
+            } else {
+                "first error"
+            };
+            self.system
+                .read(cx)
+                .frame
+                .clone()
+                .echo(words, StyleClass::SystemInfo, cx);
         }
     }
 
@@ -236,27 +274,64 @@ impl AgentSurface {
     }
 
     fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
+        let anchor = self.editor.read(cx).selections.newest_anchor().head();
+        self.toggle_at(anchor, false, window, cx);
+    }
+
+    fn tap_command(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(anchor) = rho_frame::phone_editor_tap(self.editor.read(cx), event, window)
+            && self.toggle_at(anchor, true, window, cx)
+        {
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
+    fn toggle_at(
+        &self,
+        anchor: multi_buffer::Anchor,
+        tapped: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         use multi_buffer::ToPoint as _;
         let ranges = self.model.read(cx).tool_output_ranges(cx);
         self.editor.update(cx, |editor, cx| {
             let snap = editor.buffer().read(cx).snapshot(cx);
-            let row = editor.selections.newest_anchor().head().to_point(&snap).row;
-            if let Some((_, _, range)) = ranges
+            let row = anchor.to_point(&snap).row;
+            let Some((_, _, range)) = ranges
                 .into_iter()
                 .find(|(_, _, range)| range.start.to_point(&snap).row == row)
-            {
-                let folded = editor
-                    .display_snapshot(cx)
-                    .folds_in_range(range.clone())
-                    .next()
-                    .is_some();
-                if folded {
-                    editor.unfold_ranges(&[range], false, false, cx);
-                } else {
-                    editor.fold_ranges(vec![range], false, window, cx);
-                }
+            else {
+                return false;
+            };
+            if tapped {
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_anchor_ranges([anchor..anchor]);
+                    },
+                );
             }
-        });
+            if editor
+                .display_snapshot(cx)
+                .folds_in_range(range.clone())
+                .next()
+                .is_some()
+            {
+                editor.unfold_ranges(&[range], false, false, cx);
+            } else {
+                editor.fold_ranges(vec![range], false, window, cx);
+            }
+            true
+        })
     }
 
     pub(super) fn bind_keys(cx: &mut App) {
@@ -271,22 +346,61 @@ impl AgentSurface {
 }
 
 impl Surface for AgentSurface {
+    fn opened(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.read(cx).initial_load_ready() {
+            self.land(window, cx);
+        } else {
+            self.default_landing = true;
+        }
+    }
+
     fn title(&self, cx: &App) -> String {
         self.title_with_folder(false, cx)
     }
 
-    fn phone_title(&self, cx: &App) -> String {
-        self.title_with_folder(true, cx)
+    fn phone_titles(&self, cx: &App) -> Vec<String> {
+        let registry = self.system.read(cx).registry();
+        let label = registry.agent_id_label(self.agent);
+        let title = registry
+            .host_of_agent(self.agent)
+            .map(|host| format!("{} › {label}", registry.host_name(host)));
+        let full = self.title_with_folder(true, cx);
+        let runtime = registry
+            .agent_spec(self.agent)
+            .map(|spec| spec.runtime_label());
+        let mut titles = Vec::new();
+        if let Some(runtime) = runtime {
+            titles.push(full);
+            titles.extend(title.iter().map(|title| format!("{title} · {runtime}")));
+            titles.push(format!("{label} · {runtime}"));
+        } else {
+            titles.push(full);
+            titles.extend(title);
+        }
+        titles.push(label);
+        if self.runtime(cx).is_some() {
+            for title in &mut titles {
+                title.push_str(" ·");
+            }
+        }
+        titles
+    }
+
+    fn phone_tools(&self, _: bool, cx: &App) -> Vec<rho_frame::PhoneTool> {
+        if self.model.read(cx).errors().next().is_none() {
+            return Vec::new();
+        }
+        vec![
+            rho_frame::PhoneTool::new("!", "error", |window, cx| {
+                window.dispatch_action(Box::new(NextError), cx);
+            })
+            .in_desk_slot(),
+        ]
     }
 
     fn status(&self, cx: &App) -> Option<String> {
         let activity = self.runtime(cx)?.activity().word();
-        let errors = self
-            .model
-            .read(cx)
-            .errors()
-            .map(|(_, times, _)| times)
-            .sum::<u32>();
+        let errors = self.model.read(cx).current_errors();
         Some(match errors {
             0 => activity.to_owned(),
             1 => format!("{activity} · 1 error"),
@@ -319,6 +433,10 @@ impl Surface for AgentSurface {
     }
 }
 
+fn in_trouble(activity: Activity) -> bool {
+    matches!(activity, Activity::Retrying | Activity::Failed)
+}
+
 /// The rows that steer an agent, from its transcript or from a thread's
 /// `with` line. Each carries the change to the agent's host.
 pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Row> {
@@ -336,13 +454,39 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
             });
         })
     };
+    let rewind_system = system.clone();
     let mut rows = vec![
-        eval(
-            "rewind turns",
-            "r",
-            Rc::new(move |count| snippets::rewind(agent, count.unwrap_or(1))),
-            |count, label| Some(rewound(label, count.unwrap_or(1))),
-        ),
+        Row::counted("r", "rewind turns", move |_, count, _, cx| {
+            let turns = count.unwrap_or(1);
+            let system = rewind_system.read(cx);
+            let frame = system.frame.clone();
+            let Some(agents) = system.agents_for(agent) else {
+                frame.echo(
+                    "the agent's host is not attached",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            };
+            let label = system.registry().agent_display_label(agent);
+            let reply = agents.call(RewindAgent { agent, turns });
+            cx.spawn(async move |_, cx| {
+                let result = reply.await;
+                cx.update(|cx| match result {
+                    Ok(undone) => frame.echo(
+                        rewound(&label, turns, &undone.taken_back),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                    Err(error) => frame.echo(
+                        format!("rewind turns: {error:#}"),
+                        StyleClass::SystemImportant,
+                        cx,
+                    ),
+                });
+            })
+            .detach();
+        }),
         eval(
             "compact context",
             "c",
@@ -371,7 +515,7 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                     frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
                     return;
                 };
-                let current = format!("{}-{}", spec.model, spec.effort);
+                let current = spec.runtime_label();
                 let can_change_kind = registry
                     .agent_facts(agent)
                     .runtime
@@ -405,8 +549,9 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                                 "set runtime",
                                 snippets::set_runtime(agent, &runtime),
                                 Some(format!(
-                                    "set runtime: {}",
-                                    system.registry().agent_display_label(agent)
+                                    "runtime: {} · {} (was {current})",
+                                    system.registry().agent_display_label(agent),
+                                    runtime.label(),
                                 )),
                                 cx,
                             );
@@ -493,12 +638,23 @@ fn switchable(
 
 /// What the echo says once `turns` of the turns of the agent called `label`
 /// are taken back: it does nothing until the user writes.
-fn rewound(label: &str, turns: u32) -> String {
+fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
     let turns = match turns {
         1 => "one turn".to_owned(),
         turns => format!("{turns} turns"),
     };
-    format!("rewound {turns}: {label} · waiting for you")
+    let mut echo = format!("rewound {turns}: {label}");
+    if let Some(words) = taken_back.first() {
+        echo.push_str(&format!(
+            " · took back \"{}\"",
+            crate::render::preview(words)
+        ));
+        if taken_back.len() > 1 {
+            echo.push_str(&format!(" and {} more", taken_back.len() - 1));
+        }
+    }
+    echo.push_str(" · waiting for you");
+    echo
 }
 
 impl Focusable for AgentSurface {
@@ -509,10 +665,15 @@ impl Focusable for AgentSurface {
 
 impl Render for AgentSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
         let colors = cx.theme().colors();
         let brief = self.system.read(cx).brief(self.agent, cx);
         div()
+            .id("rho-agent-transcript")
             .key_context("RhoAgent")
+            .capture_any_mouse_down(cx.listener(Self::tap_command))
             .on_action(
                 cx.listener(|this, _: &NextError, window, cx| this.move_error(true, window, cx)),
             )
@@ -532,6 +693,9 @@ impl Render for AgentSurface {
                     .py_1()
                     .border_b_1()
                     .border_color(colors.border_variant)
+                    .font_family(editor_text.font_family)
+                    .text_size(editor_text.font_size)
+                    .line_height(editor_text.line_height)
                     .child(div().text_color(colors.text_muted).child("brief"))
                     .child(div().line_clamp(4).child(brief))
             }))
@@ -542,6 +706,19 @@ impl Render for AgentSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_echo_uses_the_host_receipt_not_the_transcripts_current_text() {
+        let earlier = "Could you clarify the timer?";
+        assert_eq!(
+            rewound("eng-ka35", 1, &[earlier.into()]),
+            "rewound one turn: eng-ka35 · took back \"Could you clarify the timer?\" · waiting for you"
+        );
+        assert_eq!(
+            rewound("eng-ka35", 2, &[]),
+            "rewound 2 turns: eng-ka35 · waiting for you"
+        );
+    }
 
     #[test]
     fn runtime_prompt_lists_every_supported_effort_and_model_of_the_current_kind() {

@@ -401,8 +401,11 @@ impl Frame {
             };
             self.surfaces.insert(address.clone(), surface);
         }
+        let surface = self.surfaces[&address].clone();
         if let Some(card) = card {
-            self.surfaces[&address].clone().show_card(card, window, cx);
+            surface.show_card(card, window, cx);
+        } else {
+            surface.opened(window, cx);
         }
         rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: journal_surface(&address),
@@ -1224,13 +1227,39 @@ impl Frame {
         let mode = mode_word(&mode);
         let lamp = self.signals.lamp_on.then_some("●");
         let unwell = self.unwell_hosts();
-        // The notice gives way to an echo. On a phone use the short form
-        // so an unpaired device can still show the card the user must answer.
+        let surface = self.current_surface();
+        let phone_titles = match layout {
+            Layout::Phone => Some(surface.phone_titles(cx)),
+            Layout::Desktop => None,
+        };
+        let surface_status = surface.status(cx).unwrap_or_default();
+        let measured = crate::phone::measure(text_style, window);
+        // The pairing hint is secondary to a surface that has already
+        // shed everything but the name of the work and its condition.
+        let show_phone_notice = phone_titles.as_ref().is_none_or(|titles| {
+            titles.len() < 2
+                || titles.last().is_none_or(|title| {
+                    let reserve = lamp
+                        .into_iter()
+                        .chain(unwell.as_deref())
+                        .chain(["unpaired", mode.as_str()])
+                        .map(|words| measured(words) + px(12.))
+                        .fold(px(0.), |sum, width| sum + width);
+                    crate::phone::fit_heading(
+                        title,
+                        &surface_status,
+                        window.viewport_size().width - reserve,
+                        &measured,
+                    )
+                    .0 == *title
+                })
+        });
         let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
             .then_some(match layout {
-                Layout::Desktop => "verdicts stay on this device until it is paired",
-                Layout::Phone => "unpaired",
-            });
+                Layout::Desktop => Some("verdicts stay on this device until it is paired"),
+                Layout::Phone => show_phone_notice.then_some("unpaired"),
+            })
+            .flatten();
         // A heading is cut to what the line has room for: on the desk a
         // fixed length does, but a phone is too narrow to guess at, and a
         // cut by length there would push the card's state off the edge.
@@ -1261,7 +1290,6 @@ impl Frame {
         // a surface that is a card says which card and why; anything else,
         // a list or results included, says its own name, whatever card
         // the row under the point belongs to.
-        let surface = self.current_surface();
         let own_card = self
             .card_in_view(cx)
             .filter(|address| address == self.current_address());
@@ -1283,12 +1311,19 @@ impl Frame {
                     .into_any_element()
             }
             (None, None) => {
-                let status = surface.status(cx).unwrap_or_default();
-                let title = match layout {
-                    Layout::Desktop => surface.title(cx),
-                    Layout::Phone => surface.phone_title(cx),
+                let (title, status) = if let Some(titles) = phone_titles {
+                    titles
+                        .iter()
+                        .map(|title| (title, fit(title, &surface_status)))
+                        .find_map(|(title, (fitted, status))| {
+                            (fitted == *title).then_some((fitted, status))
+                        })
+                        .unwrap_or_else(|| {
+                            fit(titles.last().map_or("", String::as_str), &surface_status)
+                        })
+                } else {
+                    fit(&surface.title(cx), &surface_status)
                 };
-                let (title, status) = fit(&title, &status);
                 div()
                     .flex()
                     .gap_3()

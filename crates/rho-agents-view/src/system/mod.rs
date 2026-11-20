@@ -19,7 +19,7 @@ mod places;
 mod start;
 mod surface;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, System,
 };
-use rho_mail::ui::{Event as MailEvent, MailSystem, Participant};
+use rho_mail::ui::{Event as MailEvent, MailAudience, MailSystem, Participant};
 use rho_mail::{AgentRef, ThreadId};
 use rho_rpc::protocol::Call;
 use rho_shell_view::ui::ShellSurface;
@@ -52,6 +52,7 @@ use rho_window::style::StyleClass;
 use surface::AgentSurface;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
+use crate::render::{self, Label, Labels};
 use crate::transcript::{TranscriptFrame, Transcripts};
 use crate::usage::{Request, Usage, UsageChart, UsageMoved, UsageSurface};
 
@@ -178,7 +179,16 @@ impl AgentsSystem {
                     }
                 });
             }
-            MailEvent::Changed { .. } | MailEvent::DraftSent(_) => {}
+            MailEvent::Changed { endpoint } => {
+                let endpoint = *endpoint;
+                let system = cx.weak_entity();
+                cx.defer(move |cx| {
+                    if let Some(system) = system.upgrade() {
+                        system.update(cx, |system, cx| system.mail_caught_up(endpoint, cx));
+                    }
+                });
+            }
+            MailEvent::DraftSent(_) => {}
         });
         Self {
             client,
@@ -368,16 +378,130 @@ impl AgentsSystem {
         else {
             return;
         };
-        let registry = &self.registry;
         model.update(cx, |model, cx| {
             model.sync(
                 state,
                 summary,
                 now_ms(),
-                &|id| registry.agent_display_label(id),
+                &|needed, cx| self.labels(agent, needed, cx),
                 cx,
             )
         });
+    }
+
+    fn labels(&self, agent: AgentId, needed: HashSet<Label>, cx: &App) -> Labels {
+        let mut labels = Labels::new();
+        let mut writes = HashSet::new();
+        let endpoint = self
+            .registry
+            .host_of_agent(agent)
+            .and_then(|host| self.registry.host_endpoint(host));
+        let mail = self.mail.read(cx);
+        let log = endpoint.and_then(|endpoint| mail.host_mail(endpoint));
+        for name in needed {
+            match name {
+                Label::Agent(id) => {
+                    labels.insert(name, self.registry.agent_display_label(id));
+                }
+                Label::Delivery(id) => {
+                    let Some(mail) = log.and_then(|log| log.message(id)) else {
+                        continue;
+                    };
+                    let who = match mail.from {
+                        rho_agent_types::Address::User => "you".to_owned(),
+                        rho_agent_types::Address::Agent(from) => {
+                            self.registry.agent_display_label(from)
+                        }
+                        rho_agent_types::Address::System { .. }
+                        | rho_agent_types::Address::StartFailed => "the project".to_owned(),
+                    };
+                    labels.insert(
+                        name,
+                        format!("{who} · {}", rho_frame::thread::when(mail.at.0 as i64)),
+                    );
+                }
+                Label::Write(id, version) => {
+                    writes.insert((id, version));
+                }
+            }
+        }
+        if !writes.is_empty()
+            && let Some(endpoint) = endpoint
+        {
+            for ((id, version), written) in mail.written_mail(endpoint, &writes) {
+                let verb = match written.audience {
+                    MailAudience::System => "reported",
+                    MailAudience::User => "wrote to you",
+                    MailAudience::Direct => "wrote direct mail",
+                    MailAudience::Project => "wrote to the project",
+                };
+                let words = render::preview(&written.words);
+                let caption = if words.is_empty() {
+                    verb.to_owned()
+                } else {
+                    format!("{verb}: \"{words}\"")
+                };
+                labels.insert(Label::Write(id, version), caption);
+            }
+        }
+        labels
+    }
+
+    /// Mail and the workset use separate streams. Refresh only captions
+    /// that could not be resolved when their transcript rows arrived.
+    fn mail_caught_up(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
+        let Some(host) = self.host_of(endpoint) else {
+            return;
+        };
+        for (agent, model) in &self.models {
+            if self.registry.host_of_agent(*agent) != Some(host)
+                || !self.surfaces.contains_key(agent)
+            {
+                continue;
+            }
+            self.refresh_mail_labels(*agent, model, cx);
+        }
+    }
+
+    fn refresh_mail_labels(
+        &self,
+        agent: AgentId,
+        model: &Entity<AgentModel>,
+        cx: &mut Context<Self>,
+    ) {
+        let unresolved = model.read(cx).unresolved_mail().collect::<Vec<_>>();
+        let available = self.labels(
+            agent,
+            unresolved.iter().map(|(_, label)| *label).collect(),
+            cx,
+        );
+        if let Some(first) = unresolved
+            .iter()
+            .find_map(|(block, label)| available.contains_key(label).then_some(*block))
+            && let Some(state) = self.transcripts.state(&agent)
+        {
+            let summary = FrameSummary {
+                first_changed_block: Some(first),
+                incremental: None,
+            };
+            model.update(cx, |model, cx| {
+                model.sync(
+                    state,
+                    summary,
+                    now_ms(),
+                    &|needed, cx| {
+                        let missing = needed
+                            .into_iter()
+                            .filter(|name| !available.contains_key(name))
+                            .collect();
+                        let mut labels = available.clone();
+                        labels.extend(self.labels(agent, missing, cx));
+                        labels
+                    },
+                    cx,
+                )
+            });
+        }
     }
 
     /// A durable deletion removes host-owned history: the surfaces go too,
@@ -470,6 +594,7 @@ impl AgentsSystem {
                     && this.models.get(&agent) == Some(&model)
                 {
                     this.sync(agent, FrameSummary::nothing(), cx);
+                    this.refresh_mail_labels(agent, &model, cx);
                     this.ensure_timer(cx);
                 }
             },
@@ -486,12 +611,12 @@ impl AgentsSystem {
         if !model.read(cx).initial_load_started()
             && let Some(state) = self.transcripts.state(&agent).cloned()
         {
-            let labels = self
-                .registry
-                .known_agents()
-                .copied()
-                .map(|id| (id, self.registry.agent_display_label(id)))
+            let needed = state
+                .blocks
+                .iter()
+                .filter_map(|block| Label::for_block(block))
                 .collect();
+            let labels = self.labels(agent, needed, cx);
             model.update(cx, |model, cx| {
                 model.start_initial_load(state, labels, now_ms(), cx)
             });
@@ -689,12 +814,7 @@ impl AgentsSystem {
     ) -> AnySurface {
         let model = self.loaded_model(agent, cx);
         let system = cx.entity();
-        let failed = self
-            .registry
-            .agent_facts(agent)
-            .runtime
-            .is_some_and(|heard| heard.state.activity() == rho_agent_types::Activity::Failed);
-        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, failed, window, cx));
+        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, window, cx));
         self.surfaces.insert(agent, surface.downgrade());
         self._subscriptions
             .push(cx.observe_release(&surface, move |this, _, cx| {

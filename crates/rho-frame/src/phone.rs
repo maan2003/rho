@@ -590,7 +590,7 @@ impl Frame {
         let send = surface.phone_send(cx);
         let prompting = self.minibuffer.is_some();
         let composing_idea = self.idea_here(cx);
-        let tools = if prompting || composing_idea {
+        let mut tools = if prompting || composing_idea {
             Vec::new()
         } else {
             surface.phone_tools(self.mode(window, cx).contains("insert"), cx)
@@ -601,38 +601,18 @@ impl Frame {
             desk: self.desk_in_view(),
             // Working in a terminal or shell keeps the navigation bar and
             // its Palette; that still offers the same related verdicts.
-            card: (tools.is_empty() && self.phone_card(cx).is_some()).then(|| {
-                if surface.inspects_card() {
-                    OpenCard::Related
-                } else {
-                    OpenCard::Here
-                }
-            }),
+            card: (tools.iter().all(|tool| tool.replaces_desk) && self.phone_card(cx).is_some())
+                .then(|| {
+                    if surface.inspects_card() {
+                        OpenCard::Related
+                    } else {
+                        OpenCard::Here
+                    }
+                }),
             send: send.is_some(),
         };
         let colors = cx.theme().colors();
-        let items = buttons(state).into_iter().map(|button| {
-            let (icon, label) = button.face();
-            let send = send.clone();
-            div()
-                .id(button.id())
-                .cursor_pointer()
-                .h_full()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .text_color(colors.text_muted)
-                .child(div().text_size(px(18.)).child(icon))
-                .child(div().text_size(px(11.)).child(label))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.press(button, send.as_ref(), window, cx);
-                    cx.stop_propagation();
-                }))
-        });
-        let tools = tools.into_iter().map(|tool| {
+        let render_tool = |tool: crate::surface::PhoneTool| {
             let color = if tool.active {
                 colors.text_accent
             } else {
@@ -658,7 +638,40 @@ impl Frame {
                     }
                     cx.stop_propagation();
                 }))
-        });
+                .into_any_element()
+        };
+        let mut items = Vec::new();
+        for button in buttons(state) {
+            if button == Button::Desk
+                && let Some(index) = tools.iter().position(|tool| tool.replaces_desk)
+            {
+                items.push(render_tool(tools.remove(index)));
+                continue;
+            }
+            let (icon, label) = button.face();
+            let send = send.clone();
+            items.push(
+                div()
+                    .id(button.id())
+                    .cursor_pointer()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .text_color(colors.text_muted)
+                    .child(div().text_size(px(18.)).child(icon))
+                    .child(div().text_size(px(11.)).child(label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.press(button, send.as_ref(), window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        items.extend(tools.into_iter().map(render_tool));
         div()
             .id("rho-phone-bar")
             .flex_none()
@@ -668,7 +681,7 @@ impl Frame {
             .items_stretch()
             .border_t_1()
             .border_color(colors.border_variant)
-            .children(items.chain(tools))
+            .children(items)
             .into_any_element()
     }
 

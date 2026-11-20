@@ -41,6 +41,7 @@ pub struct PhoneTool {
     pub icon: &'static str,
     pub label: &'static str,
     pub active: bool,
+    pub(crate) replaces_desk: bool,
     run: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
@@ -54,8 +55,16 @@ impl PhoneTool {
             icon,
             label,
             active: false,
+            replaces_desk: false,
             run: Rc::new(run),
         }
+    }
+
+    /// Use the Desk slot when the bar has one. The card bar keeps its
+    /// own actions.
+    pub fn in_desk_slot(mut self) -> Self {
+        self.replaces_desk = true;
+        self
     }
 
     pub(crate) fn press(&self, window: &mut Window, cx: &mut App) {
@@ -69,8 +78,8 @@ impl PhoneTool {
 pub trait Surface: Render + Focusable + Sized + 'static {
     fn title(&self, cx: &App) -> String;
 
-    fn phone_title(&self, cx: &App) -> String {
-        self.title(cx)
+    fn phone_titles(&self, cx: &App) -> Vec<String> {
+        vec![self.title(cx)]
     }
 
     fn status(&self, _cx: &App) -> Option<String> {
@@ -118,6 +127,9 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
+    /// An explicit open, distinct from returning through history.
+    fn opened(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Positions the screen on what the card deals, including when the
     /// frame already holds the screen in history.
     fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -136,7 +148,7 @@ trait SurfaceHandle {
     fn view(&self) -> AnyView;
     fn entity_id(&self) -> EntityId;
     fn title(&self, cx: &App) -> String;
-    fn phone_title(&self, cx: &App) -> String;
+    fn phone_titles(&self, cx: &App) -> Vec<String>;
     fn status(&self, cx: &App) -> Option<String>;
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool>;
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
@@ -146,6 +158,7 @@ trait SurfaceHandle {
     fn card(&self, cx: &App) -> Subject;
     fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>>;
     fn heading(&self, cx: &App) -> Option<String>;
+    fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
@@ -164,8 +177,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).title(cx)
     }
 
-    fn phone_title(&self, cx: &App) -> String {
-        self.read(cx).phone_title(cx)
+    fn phone_titles(&self, cx: &App) -> Vec<String> {
+        self.read(cx).phone_titles(cx)
     }
 
     fn status(&self, cx: &App) -> Option<String> {
@@ -202,6 +215,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn heading(&self, cx: &App) -> Option<String> {
         self.read(cx).heading(cx)
+    }
+
+    fn opened(&self, window: &mut Window, cx: &mut App) {
+        self.update(cx, |surface, cx| surface.opened(window, cx));
     }
 
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
@@ -252,8 +269,8 @@ impl AnySurface {
         self.0.title(cx)
     }
 
-    pub(crate) fn phone_title(&self, cx: &App) -> String {
-        self.0.phone_title(cx)
+    pub(crate) fn phone_titles(&self, cx: &App) -> Vec<String> {
+        self.0.phone_titles(cx)
     }
 
     pub fn status(&self, cx: &App) -> Option<String> {
@@ -293,6 +310,10 @@ impl AnySurface {
 
     pub fn heading(&self, cx: &App) -> Option<String> {
         self.0.heading(cx)
+    }
+
+    pub(crate) fn opened(&self, window: &mut Window, cx: &mut App) {
+        self.0.opened(window, cx);
     }
 
     pub(crate) fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {

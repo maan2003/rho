@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::time::Duration;
 
 use editor::scroll::AutoscrollStrategy;
 use editor::{
@@ -10,6 +11,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use rho_agent_types::UnixMs;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use theme::ActiveTheme as _;
@@ -56,7 +58,7 @@ pub struct ShellModel {
     exited: bool,
     disconnected: bool,
     submitting: bool,
-    host_prompt: String,
+    running_tick: Option<gpui::Task<()>>,
     display_prompt: String,
     shell_state: crate::protocol::ShellState,
     recalled: Option<(u64, String)>,
@@ -131,7 +133,7 @@ impl ShellModel {
             exited: false,
             disconnected: false,
             submitting: false,
-            host_prompt: "> ".to_owned(),
+            running_tick: None,
             display_prompt: "> ".to_owned(),
             recalled: None,
             shell_state: crate::protocol::ShellState::default(),
@@ -218,8 +220,7 @@ impl ShellModel {
                         model.submitting = false;
                         if accepted {
                             if !model.exited && !model.disconnected {
-                                let prompt = model.host_prompt.clone();
-                                model.set_prompt(&prompt, cx);
+                                model.refresh_input_prompt(cx);
                             }
                         } else {
                             model.input_buffer.update(cx, |buffer, cx| {
@@ -390,12 +391,7 @@ impl ShellModel {
                     self.mark_disconnected(cx);
                     return;
                 }
-                self.host_prompt.clone_from(&state.prompt);
                 self.shell_state = state;
-                if !self.submitting {
-                    let prompt = self.host_prompt.clone();
-                    self.set_prompt(&prompt, cx);
-                }
             }
             ShellServerFrame::ExecutionQueued { execution } => {
                 if !output_styles_valid(&execution.styles, &execution.output, 0) {
@@ -406,6 +402,7 @@ impl ShellModel {
             }
             ShellServerFrame::ExecutionStarted {
                 execution,
+                since,
                 prompt,
                 cwd,
             } => {
@@ -415,7 +412,7 @@ impl ShellModel {
                     .iter_mut()
                     .find(|block| block.execution == execution)
                 {
-                    block.state = crate::protocol::ShellExecutionState::Running;
+                    block.state = crate::protocol::ShellExecutionState::Running { since };
                     block.prompt = prompt;
                     block.cwd = cwd;
                 }
@@ -545,13 +542,8 @@ impl ShellModel {
                 }
             }
             ShellServerFrame::Prompt { prompt, cwd } => {
-                self.shell_state.prompt.clone_from(&prompt);
+                self.shell_state.prompt = prompt;
                 self.shell_state.cwd = cwd;
-                self.host_prompt = prompt;
-                if !self.submitting {
-                    let prompt = self.host_prompt.clone();
-                    self.set_prompt(&prompt, cx);
-                }
             }
             ShellServerFrame::Exited { status } => {
                 self.exited = true;
@@ -567,7 +559,55 @@ impl ShellModel {
             }
         }
         self.render_transcript(cx);
+        self.refresh_input_prompt(cx);
+        if self.running_since().is_some() {
+            self.running_tick.get_or_insert_with(|| {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        if this
+                            .update(cx, |this, cx| this.refresh_input_prompt(cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                })
+            });
+        } else {
+            self.running_tick = None;
+        }
         cx.notify();
+    }
+
+    pub(crate) fn running_since(&self) -> Option<UnixMs> {
+        if self.exited || self.disconnected {
+            return None;
+        }
+        self.shell_state
+            .executions
+            .iter()
+            .rev()
+            .find_map(|execution| match execution.state {
+                crate::protocol::ShellExecutionState::Running { since } => Some(since),
+                _ => None,
+            })
+    }
+
+    fn refresh_input_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.submitting || self.exited || self.disconnected {
+            return;
+        }
+        let prompt = self.running_since().map_or_else(
+            || self.shell_state.prompt.clone(),
+            |since| {
+                format!(
+                    "running · {}s ",
+                    UnixMs::now().saturating_duration_since(since) / 1000
+                )
+            },
+        );
+        self.set_prompt(&prompt, cx);
     }
 
     fn render_transcript(&mut self, cx: &mut Context<Self>) {
@@ -673,6 +713,7 @@ impl ShellModel {
             return;
         }
         self.disconnected = true;
+        self.running_tick = None;
         self.submit = None;
         self.control = None;
         self.set_prompt("[shell disconnected] ", cx);
@@ -682,6 +723,9 @@ impl ShellModel {
     }
 
     fn set_prompt(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        if self.display_prompt == prompt {
+            return;
+        }
         self.display_prompt.clear();
         self.display_prompt.push_str(prompt);
         self.refresh_prompt(cx);
@@ -1016,7 +1060,12 @@ mod tests {
                     ShellExecutionState::Finished { status: 0 },
                 ),
                 execution(7, "queued", "", ShellExecutionState::Queued),
-                execution(12, "again", "", ShellExecutionState::Running),
+                execution(
+                    12,
+                    "again",
+                    "",
+                    ShellExecutionState::Running { since: UnixMs(78) },
+                ),
             ]
             .into_iter()
             .collect(),

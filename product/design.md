@@ -8,6 +8,7 @@ The built window puts the work in one editor. The top line tells the user where 
 - quiet · `oklch(56.0% 0.012 100)` · context that can wait: ages, settled things, host tags, placeholders, and hints.
 - attention · `oklch(63.1% 0.145 86.4)` · something to act on, here in the card's words or elsewhere as the lamp.
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach.
+- failed · `oklch(76.0% 0.140 25)` · a step that did not finish successfully.
 - answer · `oklch(63.1% 0.195 244.8)` · a short explanation, including the answer to the last key.
 - marked · `oklch(72.0% 0.110 105)` · text picked out from the reading line: the speaker, a link, or the key for a choice.
 - keys in motion · `oklch(78.0% 0.120 185)` · a visible key or mode that tells the user how the keyboard will act.
@@ -88,7 +89,7 @@ states:
 - delivered: `you` or the project's address, and the time; an edited mail adds `edited`.
 - sending: the header reads `you · sending…` in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
-used on: `mail.Thread`.
+used on: `mail.Thread` and `agents.Agent`.
 form: [you and clock@lab above their respective mails](design/laptop-card.png).
 
 ## part Quote

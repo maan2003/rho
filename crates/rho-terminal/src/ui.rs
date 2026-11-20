@@ -10,7 +10,7 @@ use editor::{Editor, SelectionEffects};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::keys::{Close, Desk, Palette, VerdictMenu};
+use rho_frame::keys::{Close, Desk, Palette, SearchForward, VerdictMenu};
 use rho_frame::{Mode, Surface};
 use theme::ActiveTheme as _;
 
@@ -144,16 +144,23 @@ impl Surface for TerminalSurface {
         title
     }
 
-    fn phone_tools(&self, typing: bool, _cx: &App) -> Vec<rho_frame::PhoneTool> {
+    fn phone_tools(&self, _: bool, _cx: &App) -> Vec<rho_frame::PhoneTool> {
         let State::Open(view) = &self.state else {
             return Vec::new();
         };
-        if !typing {
-            return Vec::new();
+        use rho_frame::PhoneTool;
+        if self.reader.is_some() {
+            return vec![
+                PhoneTool::new("⌕", "search", |window, cx| {
+                    window.dispatch_action(Box::new(SearchForward), cx)
+                }),
+                PhoneTool::new("✎", "type", |window, cx| {
+                    window.dispatch_action(Box::new(TerminalRawMode), cx)
+                }),
+            ];
         }
         let ctrl = self.phone_ctrl.clone();
-        let mut modifier =
-            rho_frame::PhoneTool::new("^", "ctrl", move |_, _| ctrl.set(!ctrl.get()));
+        let mut modifier = PhoneTool::new("^", "ctrl", move |_, _| ctrl.set(!ctrl.get()));
         modifier.active = self.phone_ctrl.get();
         let mut tools = vec![modifier];
         tools.extend(
@@ -168,11 +175,14 @@ impl Surface for TerminalSurface {
             .map(|(icon, label, key)| {
                 let ctrl = self.phone_ctrl.clone();
                 let view = view.clone();
-                rho_frame::PhoneTool::new(icon, label, move |_, cx| {
+                PhoneTool::new(icon, label, move |_, cx| {
                     view.update(cx, |view, cx| view.phone_key(key, ctrl.replace(false), cx));
                 })
             }),
         );
+        tools.push(PhoneTool::new("≡", "read", |window, cx| {
+            window.dispatch_action(Box::new(TerminalNormalMode), cx)
+        }));
         tools
     }
 

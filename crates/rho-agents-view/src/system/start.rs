@@ -506,8 +506,14 @@ pub(crate) fn create(
     let function = Function::parse(DEFAULT_FUNCTION).expect("the default function parses");
     // Where and on what, said back: an idea's start asked neither.
     let at = match &plan.start {
-        Start::NewOn { repo, .. } => repo.to_string(),
-        Start::Join { cwd, .. } | Start::Here { cwd } => cwd.to_string(),
+        Start::NewOn { repo, .. } => repo
+            .as_str()
+            .trim_end_matches('/')
+            .rsplit(['/', ':'])
+            .next()
+            .map(|tail| tail.strip_suffix(".git").unwrap_or(tail))
+            .unwrap_or(repo.as_str()),
+        Start::Join { cwd, .. } | Start::Here { cwd } => cwd.file_name().unwrap_or(cwd.as_str()),
     };
     let on = format!("{} · {at}", plan.runtime.label());
     let launch = match plan.start.creation(&function, &plan.runtime, Some(origin)) {
@@ -524,16 +530,21 @@ pub(crate) fn create(
         let reply = reply.await;
         cx.update(|cx| match reply {
             Ok(agent) => {
-                if matches!(plan.feedback, Feedback::Started) {
-                    frame.echo(
-                        format!("agent {} started · {on}", agent.encoded()),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
-                // Its first turn may still fail, such as for want of a
-                // login on the host; the echo line says so when it does.
-                let _ = this.update(cx, |system, cx| system.watch_first_turn(agent, cx));
+                let _ = this.update(cx, |system, cx| {
+                    if matches!(plan.feedback, Feedback::Started) {
+                        let label = system
+                            .registry()
+                            .agent_id_label_on_host(agent, Some(plan.host));
+                        frame.echo(
+                            format!("started {label} · {on}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    // Its first turn may still fail, such as for want of a
+                    // login on the host; the echo line says so when it does.
+                    system.watch_first_turn(agent, cx);
+                });
             }
             Err(error) => {
                 let reason = format!("{error:#}");

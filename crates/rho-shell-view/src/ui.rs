@@ -61,6 +61,7 @@ impl ShellSurface {
                             let model = cx.new(|cx| ShellModel::new(channel, cx));
                             let editor =
                                 model.update(cx, |model, cx| model.build_editor(window, cx));
+                            cx.observe(&model, |_, _, cx| cx.notify()).detach();
                             // The keyboard was on the placeholder; it
                             // moves to the shell it stood for.
                             if this.focus.is_focused(window) {
@@ -162,13 +163,16 @@ impl Surface for ShellSurface {
         format!("{} · shell", self.label)
     }
 
-    fn phone_tools(&self, typing: bool, _cx: &App) -> Vec<rho_frame::PhoneTool> {
-        if !matches!(self.state, State::Open { .. }) {
+    fn phone_tools(&self, typing: bool, cx: &App) -> Vec<rho_frame::PhoneTool> {
+        let State::Open { model, .. } = &self.state else {
             return Vec::new();
-        }
+        };
         use rho_frame::PhoneTool;
-        if typing {
+        let mut tools = if typing {
             vec![
+                PhoneTool::new("↑", "recall", |window, cx| {
+                    window.dispatch_action(Box::new(ShellPrevious), cx);
+                }),
                 PhoneTool::new("↵", "run", |window, cx| {
                     window.dispatch_action(Box::new(ShellSubmit), cx)
                 }),
@@ -182,7 +186,13 @@ impl Surface for ShellSurface {
             vec![PhoneTool::new("✎", "write", |window, cx| {
                 window.dispatch_action(Box::new(ShellWrite), cx)
             })]
+        };
+        if model.read(cx).running_since().is_some() {
+            tools.push(PhoneTool::new("■", "stop", |window, cx| {
+                window.dispatch_action(Box::new(ShellInterrupt), cx);
+            }));
         }
+        tools
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {

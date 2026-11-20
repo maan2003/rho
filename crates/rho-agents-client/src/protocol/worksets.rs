@@ -282,6 +282,12 @@ pub struct SpecView {
     pub props: Props,
 }
 
+impl SpecView {
+    pub fn runtime_label(&self) -> String {
+        format!("{}-{}", self.model, self.effort)
+    }
+}
+
 /// One thing a request carried, with its body left as text.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct InputView {
@@ -383,6 +389,9 @@ pub enum LogEvent {
     MailWritten {
         agent: AgentId,
         message: MessageId,
+        /// An old host log row may not identify which revision it wrote.
+        #[senax(default)]
+        version: Option<rho_agent_types::ChatSeq>,
         at: UnixMs,
     },
 }

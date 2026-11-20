@@ -225,10 +225,6 @@ pub fn set_runtime(id: AgentId, runtime: &Runtime) -> String {
 
 /// Branches the agent's history before its `turns`-th last input from the
 /// user.
-pub fn rewind(id: AgentId, turns: u32) -> String {
-    agent(id, &format!("rewind({turns})"))
-}
-
 /// Gives a native agent a fresh prompt cache key.
 pub fn new_cache_key(id: AgentId) -> String {
     agent(id, "new_cache_key()")
@@ -359,10 +355,6 @@ mod tests {
              runtime={\"kind\": \"claude\", \"model\": \"opus\", \"effort\": \"high\"})\n"
         );
         let id = AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(1)).unwrap();
-        assert_eq!(
-            rewind(id, 2),
-            format!("import rho\nrho.agent(\"{}\").rewind(2)\n", id.encoded())
-        );
         assert!(
             set_runtime(id, &Runtime::parse("sol-low").unwrap())
                 .contains("set_runtime({\"kind\": \"native\", \"model\": \"sol\", \"effort\": \"low\", \"fast\": False})")
