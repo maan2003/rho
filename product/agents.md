@@ -71,6 +71,8 @@ does:
 
 On the phone, the terminal bar has `esc`, `ctrl`, `tab`, the four arrows and `read` while typing; `ctrl` modifies the next key. While reading the bar is `back`, `desk`, `menu`, `search`, `type`. Closing a terminal's screen leaves the terminal running on the host. While it connects, the screen reads `connecting to term 0 of …`, and `q` still closes it. A terminal open on two devices is the same terminal; it takes the size of the window the user types in.
 
+Normal mode changes only the mode word in the top line; the program's own colours stay as they are.
+
 ## concept Shell
 purpose: give the user one line-at-a-time shell beside an agent, with its output as text they can search.
 principle: the user opens the agent's shell, runs `git status`, and searches the output with `/` like any other text.
@@ -107,7 +109,7 @@ A desktop of a known agent on an attached host is also a place in `window.Palett
 answers: what went wrong, on what brief?
 shows:
 - in the `window.Status line`, the agent, its host, folder and runtime, what it is doing, and the errors since its last successful step. On a phone the folder and host give way before the agent's name.
-- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands use the user's words, and output is folded except on errors
+- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands show their whole line, wrapped rather than cut, and output is folded except on errors; nothing the agent was given is shortened, since this screen is for finding out what happened
 keys:
 - `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
 - `enter` or a tap on a command: open or fold its output
@@ -174,7 +176,7 @@ want: change its course without starting over
 so that: its work goes on from a good point
 steps:
 1. the user opens the agent's screen, `Agent`
-2. the user opens the palette and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`
+2. the user opens the palette, here or on the mail's `mail.Thread`, and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`; on the `desk.Desk` the palette offers `look into the work` for the row's agent
 3. if the work needs new instructions, the user returns to the thread and writes to the project, `mail.Answer a mail`
 system: carries the change to the agent's host.
 user: which change, and what to tell it.

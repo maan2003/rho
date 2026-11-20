@@ -21,12 +21,12 @@ does:
 
 The way back keeps the user's earlier screens, as they were left. A screen that can no longer open is passed over. Returning after more than ten minutes opens the desk; see `desk.a cold return opens the desk`.
 
-Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end.
+Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end. A search selects the whole match, so `c` changes it and `d` deletes it.
 
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
-principle: the user opens a thread that asks for them; the line at the top names it and says `asks · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
-sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `asks · 48.4d` or `result · 5.4h ago`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Helix mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
+principle: the user opens a thread that asks for them; the line at the top names it and says `waits · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
+sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `waits · 2h`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Helix mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
 
 The lamp stays off on `desk.Desk`. Elsewhere, the card already in view does not light the lamp or ring the chime; another waiting card can. When that card rises past a higher line, the window chimes once.
 
@@ -38,11 +38,13 @@ On the phone, a long name is cut at a word so that the card's words stay whole.
 status: one prompt lists commands, places and notes, and a phone tap chooses a row. Full-text search across mail and notes is not built.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
-sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits, then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or its `mail.Status` otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently visited. The current place ranks last among matching places. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one.
+sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits (left out on `desk.Desk`, where it is already in view), then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or the project's latest words otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently visited. The current place ranks last among matching places. A place whose name starts with the typed word comes before a recent place that only contains it, and a match on words in order beats one out of order. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one; on a narrow window it shows its name only. The draft of the current thread is searched before the mail history.
 does:
 - open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a draft the user is typing: open the same prompt; the place under it does not see the keys
 - search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of mail and notes, with optional prefixes to narrow the search
-- run `enter`: open the chosen place or run the chosen command; a command that is a `Menu` opens that menu. With nothing typed, `enter` opens the last place when there is one
+- run `enter`: open the chosen place or run the chosen command; a command that needs an answer opens a `Prompt`. With nothing typed, `enter` opens the last place when there is one
+rejected:
+- menus for hosts, usage, and starting an agent · 2026-11-20 · each row is a palette row by its full name, such as `hosts › attach`; the palette is enough
 
 When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
@@ -51,7 +53,7 @@ status: full-text search across mail and notes is not built; the matching mail l
 answers: where can the user go, or what can they run, with these words?
 shows:
 - the query in the `Palette` prompt, with the selected position and total at its right end
-- the `Palette` rows in match order, with each command's key and the `mail.Status` or `deal.Card` words where a thread has them
+- the `Palette` rows in match order, with each command's key and the `deal.Card` words or the project's latest words where a thread has them
 states:
 - empty: an empty query lists recent places newest first, leaving out the current place, then what waits, then the screen's commands; a query with no match shows `no match`
 - loading: not agreed
@@ -69,13 +71,13 @@ mock:
 ```text
 : clock
 
-Flaky clock test         asks · 2.0h                  tide@lab
-Cache eviction tests     Running the clock tests    tide@lab
+Flaky clock test         waits · 2.0h                 tide@lab
+Cache eviction tests     running the clock tests    tide@lab
 Mail · Flaky clock test  The mock clock is shared between tests.
 ```
 
 ## concept Menu
-purpose: offer a short list of choices where the list itself is the information, such as how long to snooze or which agent to join.
+purpose: offer a short list of choices where the list itself is the information: the verdicts, and how long to snooze. Every other choice is a `Palette` row or a `Prompt`.
 principle: the user presses `space` on a card open in a thread; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `45` then `m`, and the card sleeps for 45 minutes.
 sees: the menu's title, then its rows as key and words, laid out in columns; a row that holds a value shows the value.
 does:
@@ -89,10 +91,10 @@ On the phone, a menu is a sheet of tall rows over the screen, with the key still
 
 ## concept Prompt
 purpose: ask the user for one line of text, with completion, so a question never needs a dialog.
-principle: the user chooses `hosts › detach`; the prompt line reads `detach host:` and lists the hosts; they press tab to complete one and enter to detach it.
+principle: the user runs `hosts › detach` from the palette; the prompt line reads `detach host:` and lists the hosts; they press tab to complete one and enter to detach it.
 sees: the question, such as `detach host:` or `runtime (sol-medium):`, the text typed so far, and below it the answers that fit, each with a word on what it is.
 does:
-- answer `enter`: take the highlighted answer, or the text typed
+- answer `enter`, or a tap on a row on the phone: take the highlighted answer, or the text typed
 - next and previous `ctrl-n`, `ctrl-p`, or the arrows: move through the answers (the Palette uses `up` to recall the last query)
 - delete word `ctrl-w`: delete the word before the cursor
 - start of line `ctrl-a`: move to the start without changing the text
@@ -110,17 +112,18 @@ purpose: give the thumb what the keys give on the laptop.
 principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
 - on `desk.Desk`: the bar reaches the desk's actions by thumb; the exact buttons are not agreed
-- with a card open in a thread: `back`, `menu`, `done`, `snooze`, and `more`; `send` appears only when there is a draft
+- with a card open in a thread: `back`, `menu`, `done`, `snooze`, and `more`; while writing, `undo` and `send` take their place
 - from the agent transcript belonging to an open card: `back`, `done`, `snooze`, `more`, and `menu`
-- reading elsewhere: `back`, `desk`, and `menu`; `send` appears only when there is a draft
+- reading elsewhere: `back`, `desk`, and `menu`; while writing, `undo` and `send` join
 - while a prompt is open: `cancel` and `enter`
 does:
 - flick up from the end of a screen: forward, and from the newest screen deal the next card, as `Screen.forward` does
 - flick down from the top of a screen: back, as `Screen.back` does
 - `menu`: open the `Palette`
 - `more`: open the menu of `deal.Verdict`, as `space` does
+- long press on a mail: quote the pressed lines into the draft, as `mail.Draft.quote`
 
-The snooze button opens the snooze times as a sheet. A thumb has no way to type a count there, so a tap snoozes for one minute, one hour, one day, or one week.
+The snooze button opens the snooze times as a sheet, the same rows as on the laptop, each with its time.
 
 ## flow Go to something by name
 status: the prompt reaches places by name; it cannot search the full text of mails or notes yet.
@@ -148,15 +151,15 @@ so that: the user does not need to remember a key for it
 steps:
 1. the user opens the `Palette` with `:`
 2. the user types a few letters of the command
-3. the user presses `enter`; the command runs, or its `Menu` opens
-4. the user answers the menu or the `Prompt` that follows
+3. the user presses `enter`; the command runs
+4. the user answers the `Prompt` that follows, if it asks for one
 system: shows only the commands that fit the screen and the thing under the cursor.
 user: the command's name, and any answer it asks for.
 cases: on the phone, tapping a command below the first row
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a menu or prompt takes the keys
-when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
+when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes; `ctrl-k` inside a prompt does nothing.
 
 ## flow Report a slow window
 runs: 1 a month
