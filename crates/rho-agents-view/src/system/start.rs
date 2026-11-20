@@ -4,11 +4,11 @@
 //! the one the composer is about to send. An idea sent in a channel asks
 //! nothing it need not: it works where the channel's agents work, on the
 //! default runtime, and only a channel no agent started from yet asks
-//! where, once. The rare `start agent…` asks both: where (a new workset on
-//! a repository, a directory on the host as it is, or beside an agent
-//! already there) and the runtime. The GUI sends the code, which names the
-//! message as `origin`, so policy joins the agent to its thread and hands
-//! it the message first.
+//! where, once. The rare `start agent, choosing where and runtime…` asks both:
+//! where (a new workset on a repository, a directory on the host as it is, or
+//! beside an agent already there) and the runtime. The GUI sends the code,
+//! which names the message as `origin`, so policy joins the agent to its thread
+//! and hands it the message first.
 
 use std::rc::Rc;
 
