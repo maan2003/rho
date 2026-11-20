@@ -78,7 +78,7 @@ Mail · Flaky clock test  The mock clock is shared between tests.
 
 ## concept Menu
 purpose: offer a short list of choices where the list itself is the information: the verdicts, and how long to snooze. Every other choice is a `Palette` row or a `Prompt`.
-principle: the user presses `space` on a card open in a thread; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `45` then `m`, and the card sleeps for 45 minutes.
+principle: the user presses `space` on a card open in a thread; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `3` then `h`, and the card sleeps for three hours. The rows show the resolved times.
 sees: the menu's title, then its rows as key and words, laid out in columns; a row that holds a value shows the value.
 does:
 - pick a key, or click or tap a row: run the row; a row that opens another menu replaces this one

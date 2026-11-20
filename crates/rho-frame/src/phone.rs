@@ -94,6 +94,31 @@ pub(crate) fn fit_heading(
     (cut_at_word(path, room, &measure), state.to_owned())
 }
 
+/// A long echo may use the state slot, but never the whole heading.
+pub(crate) fn fit_echo_heading(
+    path: &str,
+    echo: &str,
+    width: Pixels,
+    measure: impl Fn(&str) -> Pixels,
+) -> (String, String) {
+    let line = (width - HEADER_GUTTER).max(px(0.));
+    if measure(path) + measure(echo) <= line {
+        return (path.to_owned(), echo.to_owned());
+    }
+    let heading = if measure(path) > line * 0.45 {
+        cut_at_word(path, line * 0.45, &measure)
+    } else {
+        path.to_owned()
+    };
+    let room = (line - measure(&heading)).max(px(0.));
+    let echo = if measure(echo) > room {
+        cut_at_word(echo, room, &measure)
+    } else {
+        echo.to_owned()
+    };
+    (heading, echo)
+}
+
 /// `text` cut at the last word that leaves room for an ellipsis.
 pub(crate) fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
     let ellipsis = "…";
@@ -739,7 +764,7 @@ impl Frame {
             // How long is a question, the one the snooze menu asks.
             Button::Snooze => {
                 if let Some(target) = &target {
-                    let rows = journaled(snooze_rows(target, true), PhoneVerdict::Defer);
+                    let rows = journaled(snooze_rows(target), PhoneVerdict::Defer);
                     self.open_menu(rows, window, cx);
                 }
             }
@@ -844,7 +869,12 @@ impl Frame {
                 .gap_3()
                 .border_b_1()
                 .border_color(colors.border_variant)
-                .child(div().flex_1().min_w_0().child(row.pick.label().to_owned()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(open.transient.items()[index].description().to_owned()),
+                )
                 .children(
                     row.pick
                         .value()

@@ -342,6 +342,9 @@ impl Minibuffer {
             return false;
         }
         self.selected = index;
+        if let Some((candidate, occurrence)) = self.selected_candidate() {
+            self.completed_selection = Some(Completed::Text(candidate, occurrence));
+        }
         true
     }
 
@@ -408,6 +411,13 @@ impl Minibuffer {
     }
 
     pub(crate) fn rejection(&self, cx: &App) -> Option<&'static str> {
+        if matches!(self.completion_input, CompletionInput::Address)
+            && let Some((candidate, _)) = self.selected_candidate()
+            && candidate.description == crate::idea::NEW_PROJECT
+            && !matches!(&self.completed_selection, Some(Completed::Text(completed, _)) if *completed == candidate)
+        {
+            return Some("choose new project with tab, then enter");
+        }
         self.validate.and_then(|validate| validate(&self.input(cx)))
     }
 
@@ -487,7 +497,7 @@ impl Minibuffer {
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
-        let clickable = address || (layout == crate::Layout::Phone && self.is_palette());
+        let clickable = address || layout == crate::Layout::Phone;
         let measure = measure(text_style, window);
         let inset = rems(0.5);
         let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
@@ -584,7 +594,7 @@ impl Minibuffer {
                         }
                         (Choice::Command(_), _) => {
                             row = row.child(part(0, title, title.len())).children(
-                                (!beside.is_empty())
+                                (!beside.is_empty() && layout == crate::Layout::Desktop)
                                     .then(|| part(2, beside, beside.len()).flex_none()),
                             );
                         }

@@ -68,6 +68,7 @@ pub struct Row {
     pub pick: Pick,
     pub scope: Scope,
     pub(crate) shortcut: Option<Shortcut>,
+    pub(crate) snooze: Option<crate::when::SnoozeUnit>,
 }
 
 #[derive(Clone)]
@@ -93,6 +94,7 @@ impl Row {
             },
             scope: Scope::Here,
             shortcut: None,
+            snooze: None,
         }
     }
 
@@ -123,6 +125,7 @@ impl Row {
             },
             scope: Scope::Here,
             shortcut: None,
+            snooze: None,
         }
     }
 
@@ -142,6 +145,7 @@ impl Row {
             },
             scope: Scope::Here,
             shortcut: None,
+            snooze: None,
         }
     }
 
@@ -159,6 +163,7 @@ impl Row {
             pick: Pick::Menu(rows),
             scope: Scope::Here,
             shortcut: None,
+            snooze: None,
         }
     }
 }
@@ -243,4 +248,21 @@ pub(crate) struct OpenMenu {
     pub carried_count: Option<u32>,
     /// The menus this one is standing on, oldest first.
     pub under: Vec<Rows>,
+}
+
+impl OpenMenu {
+    pub fn resolve_times(&mut self) {
+        let now = jiff::Zoned::now();
+        let count = self
+            .transient
+            .count()
+            .or(self.carried_count)
+            .map_or(1, i64::from);
+        for (index, row) in self.rows.rows.iter().enumerate() {
+            if let Some(unit) = row.snooze {
+                self.transient
+                    .set_description(index, crate::when::snooze_target(unit, count, &now).1);
+            }
+        }
+    }
 }

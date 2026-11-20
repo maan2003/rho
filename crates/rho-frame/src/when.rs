@@ -7,40 +7,53 @@ use rho_dealer::Until;
 /// The units a snooze is counted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnoozeUnit {
-    Minutes,
     Hours,
     Days,
     Weeks,
 }
 
-/// Where a snooze lands and how the bar says it. Minutes and hours are a
-/// length of time, so a card can come back this afternoon; days and weeks
-/// land on the start of a day, which is what a defer has always been.
+/// The time a snooze names and the row as shown to the user. A calendar
+/// choice lands at 09:00 local time, not a count of hours across a clock
+/// change.
 pub fn snooze_target(unit: SnoozeUnit, count: i64, now: &Zoned) -> (Until, String) {
-    match unit {
-        SnoozeUnit::Minutes | SnoozeUnit::Hours => {
-            let ahead = match unit {
-                SnoozeUnit::Minutes => SignedDuration::from_mins(count),
-                _ => SignedDuration::from_hours(count),
-            };
-            let at = now.checked_add(ahead).unwrap_or_else(|_| now.clone());
-            (Until::In(ahead), snooze_said(&at, now))
-        }
+    let count = count.max(1);
+    let (until, name) = match unit {
+        SnoozeUnit::Hours => (
+            Until::In(SignedDuration::from_hours(count)),
+            if count == 1 {
+                "1 hour".to_owned()
+            } else {
+                format!("{count} hours")
+            },
+        ),
         SnoozeUnit::Days | SnoozeUnit::Weeks => {
-            let days = match unit {
-                SnoozeUnit::Days => count,
-                _ => count * 7,
+            let (days, name) = match unit {
+                SnoozeUnit::Days if count == 1 => (1, "tomorrow".to_owned()),
+                SnoozeUnit::Days => (count, format!("{count} days")),
+                SnoozeUnit::Weeks => (
+                    7 * count - i64::from(now.weekday().to_monday_zero_offset()),
+                    if count == 1 {
+                        "next week".to_owned()
+                    } else {
+                        format!("{count} weeks")
+                    },
+                ),
+                SnoozeUnit::Hours => unreachable!(),
             };
             let date = now
                 .date()
-                .checked_add(jiff::Span::new().days(days))
-                .unwrap_or(now.date());
-            let at = date
-                .to_zoned(now.time_zone().clone())
-                .unwrap_or_else(|_| now.clone());
-            (Until::Day(date), snooze_said(&at, now))
+                .checked_add(jiff::Span::new().days(days.clamp(1, 365_000)))
+                .unwrap_or(jiff::civil::Date::MAX);
+            (Until::At(date.at(9, 0, 0, 0)), name)
         }
-    }
+    };
+    let at = until.resolve(now).to_zoned(now.time_zone().clone());
+    let clock = match unit {
+        SnoozeUnit::Hours if at.date() == now.date() => "%H:%M",
+        SnoozeUnit::Days if count == 1 => "%H:%M",
+        _ => "%a %H:%M",
+    };
+    (until, format!("{name} · {}", at.strftime(clock)))
 }
 
 /// The bar's words for a snooze: `snooze until 05:17`.
@@ -85,20 +98,37 @@ mod tests {
                 until.resolve(&now),
                 now.timestamp() + SignedDuration::from_hours(1)
             );
-            assert_eq!(said, "snooze until 11:00");
+            assert_eq!(said, "1 hour · 11:00");
         }
     }
 
     #[test]
-    fn a_day_starts_at_the_users_own_midnight() {
+    fn tomorrow_is_nine_in_the_users_zone() {
         for hours in [5, -8, 0, 14] {
             let now = ten_am(hours);
             let (until, said) = snooze_target(SnoozeUnit::Days, 1, &now);
-            let midnight = jiff::civil::date(2026, 8, 24)
+            let nine = jiff::civil::date(2026, 8, 24)
+                .at(9, 0, 0, 0)
                 .to_zoned(now.time_zone().clone())
                 .unwrap();
-            assert_eq!(until.resolve(&now), midnight.timestamp(), "UTC{hours:+}");
-            assert_eq!(said, "snooze until Mon 24 Aug");
+            assert_eq!(until.resolve(&now), nine.timestamp(), "UTC{hours:+}");
+            assert_eq!(said, "tomorrow · 09:00");
         }
+    }
+    #[test]
+    fn the_week_row_counts_mondays_and_matches_the_actual_instant() {
+        let now = ten_am(-8);
+        let (first, name) = snooze_target(SnoozeUnit::Weeks, 1, &now);
+        let (third, third_name) = snooze_target(SnoozeUnit::Weeks, 3, &now);
+        assert_eq!(name, "next week · Mon 09:00");
+        assert_eq!(third_name, "3 weeks · Mon 09:00");
+        assert_eq!(
+            now.timestamp().duration_until(first.resolve(&now)),
+            SignedDuration::from_hours(23)
+        );
+        assert_eq!(
+            first.resolve(&now).duration_until(third.resolve(&now)),
+            SignedDuration::from_hours(14 * 24)
+        );
     }
 }

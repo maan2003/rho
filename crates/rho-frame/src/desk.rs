@@ -1,5 +1,4 @@
-//! The desk shows the dealer's hand, recent status changes, and an editable
-//! idea.
+//! The desk shows the dealer's hand and the latest words from work that moves.
 
 use std::any::TypeId;
 use std::cmp::Reverse;
@@ -12,12 +11,12 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorMode, FoldPlaceholder, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, MouseButton,
-    MouseDownEvent, Pixels, TextRun, Window, WindowTextSystem, div, px,
+    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, Pixels, TextRun, Window,
+    WindowTextSystem, div, px,
 };
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBufferOffset, ToPoint as _};
+use multi_buffer::{MultiBuffer, MultiBufferOffset, ToPoint as _};
 use rho_dealer::Address;
 use rho_dealer::rank::{CardKind, Hand};
 use rho_transcript::{Item, Transcript};
@@ -25,9 +24,9 @@ use text::{Bias, ToOffset as _, ToPoint as _};
 use theme::ActiveTheme as _;
 
 use crate::idea::IdeaProject;
+use crate::keys;
 use crate::phone::Layout;
 use crate::surface::{Subject, Surface};
-use crate::{Frame, FrameLink, draft, keys};
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
@@ -39,7 +38,7 @@ pub struct MovingThread {
     pub thread: Address,
     pub subject: String,
     pub project: String,
-    pub status: String,
+    pub words: String,
     pub changed: Timestamp,
 }
 
@@ -58,7 +57,6 @@ enum DeskKey {
     MovingHeader,
     Moving(Address),
     More,
-    Idea,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,7 +82,6 @@ pub(crate) struct DeskRows {
     moving: Vec<DeskRow>,
     overflow: Option<WaitingOverflow>,
     more: usize,
-    pub(crate) next_age: Option<Timestamp>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -93,11 +90,21 @@ struct WaitingOverflow {
     words: String,
 }
 
+impl DeskRows {
+    fn keep_order(rows: &mut [DeskRow], previous: &[DeskRow]) {
+        rows.sort_by_key(|row| {
+            previous
+                .iter()
+                .position(|old| old.key == row.key)
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
 pub(crate) fn desk_rows(
     hand: &Hand,
     mut moving: Vec<MovingThread>,
     project_of: impl Fn(&Address) -> Option<IdeaProject>,
-    now: Timestamp,
 ) -> DeskRows {
     // A project's stops occupy its first stop's place. Every pinging mail
     // remains a row, even when another came from the same project.
@@ -123,7 +130,7 @@ pub(crate) fn desk_rows(
             DeskRow {
                 key,
                 subject: card.title.clone(),
-                words: card.label.clone(),
+                words: String::new(),
                 project: project.map_or_else(|| card.context.clone(), |project| project.name),
                 target: DeskTarget::Card(card.address.clone()),
             },
@@ -134,31 +141,14 @@ pub(crate) fn desk_rows(
     }
     let overflow = waiting.get(WAITING_LIMIT..).and_then(|hidden| {
         let (first, ..) = hidden.first()?;
-        let mut positions = HashMap::new();
-        let mut groups = Vec::new();
-        let mut total = 0;
-        for (row, kind, count, _) in hidden {
-            let nouns = match kind {
-                CardKind::Waits => ("wait", "wait"),
-                CardKind::Stop(_) => ("stop", "stops"),
-                CardKind::Other => ("card", "cards"),
-            };
-            let index = *positions.entry((&row.project, nouns)).or_insert_with(|| {
-                let index = groups.len();
-                groups.push((&row.project, nouns, 0));
-                index
-            });
-            groups[index].2 += count;
-            total += count;
-        }
+        let total: usize = hidden.iter().map(|(_, _, count, _)| count).sum();
         let mut words = format!("and {total} more");
-        for (project, (one, many), count) in groups {
-            words.push_str(" · ");
-            if !project.is_empty() {
-                words.push_str(project);
-                words.push(' ');
+        let mut projects = HashSet::new();
+        for (row, ..) in hidden {
+            if !row.project.is_empty() && projects.insert(&row.project) {
+                words.push_str(" · ");
+                words.push_str(&row.project);
             }
-            words.push_str(&format!("{count} {}", if count == 1 { one } else { many }));
         }
         Some(WaitingOverflow {
             first: first.target.clone(),
@@ -173,9 +163,8 @@ pub(crate) fn desk_rows(
                 && count > 1
             {
                 row.subject = std::mem::take(&mut row.project);
-                let (_, age) = row.words.split_once(" · ").expect("a stop has an age");
                 let reason = if mixed { "stops" } else { reason };
-                row.words = format!("{count} {reason} · {age}");
+                row.words = format!("{count} {reason}");
             }
             row
         })
@@ -189,22 +178,15 @@ pub(crate) fn desk_rows(
     moving.retain(|thread| !waiting_threads.contains(&thread.thread));
     moving.sort_by(|a, b| (Reverse(a.changed), &a.thread).cmp(&(Reverse(b.changed), &b.thread)));
     let more = moving.len().saturating_sub(MOVING_LIMIT);
-    let mut next_age = None;
     let moving = moving
         .into_iter()
         .take(MOVING_LIMIT)
-        .map(|thread| {
-            let (age, next) = age(thread.changed, now);
-            if let Some(next) = next {
-                next_age = Some(next_age.map_or(next, |other: Timestamp| other.min(next)));
-            }
-            DeskRow {
-                target: DeskTarget::Thread(thread.thread.clone()),
-                key: DeskKey::Moving(thread.thread),
-                subject: thread.subject,
-                words: format!("{} · {age}", thread.status),
-                project: thread.project,
-            }
+        .map(|thread| DeskRow {
+            target: DeskTarget::Thread(thread.thread.clone()),
+            key: DeskKey::Moving(thread.thread),
+            subject: thread.subject,
+            words: thread.words,
+            project: thread.project,
         })
         .collect();
     DeskRows {
@@ -213,22 +195,7 @@ pub(crate) fn desk_rows(
         moving,
         overflow,
         more,
-        next_age,
     }
-}
-
-fn age(at: Timestamp, now: Timestamp) -> (String, Option<Timestamp>) {
-    let minutes = at.duration_until(now).as_mins();
-    let (label, next_minute) = match minutes {
-        ..=0 => ("now".into(), 1),
-        1..60 => (format!("{minutes}m"), minutes + 1),
-        60..1440 => (format!("{}h", minutes / 60), (minutes / 60 + 1) * 60),
-        _ => (format!("{}d", minutes / 1440), (minutes / 1440 + 1) * 1440),
-    };
-    (
-        label,
-        at.checked_add(SignedDuration::from_mins(next_minute)).ok(),
-    )
 }
 
 impl DeskClass {
@@ -267,9 +234,8 @@ impl rho_transcript::Style for DeskClass {
 pub(crate) struct DeskView {
     transcript: Transcript<DeskKey, DeskClass, DeskTarget>,
     editor: Entity<Editor>,
-    draft: Entity<Buffer>,
-    idea_label: String,
     rows: DeskRows,
+    project: Option<IdeaProject>,
     layout: DeskLayout,
     text_system: Arc<WindowTextSystem>,
 }
@@ -325,13 +291,13 @@ impl DeskLayout {
 }
 
 impl DeskView {
-    pub fn new(draft: Entity<Buffer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
             buffer
         });
-        let multi_buffer = draft::document(&buffer, &draft, cx);
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -347,38 +313,14 @@ impl DeskView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.disable_headers_for_buffers(
-                [buffer.read(cx).remote_id(), draft.read(cx).remote_id()],
-                cx,
-            );
-            let history = buffer.clone();
-            editor.set_prepare_for_insert(
-                Some(
-                    move |editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>| {
-                        if !draft::on_tail(editor, &history, cx) {
-                            let tail = draft::start(&history, cx);
-                            editor.change_selections(
-                                Default::default(),
-                                window,
-                                cx,
-                                |selections| {
-                                    selections.select_ranges([tail..tail]);
-                                },
-                            );
-                        }
-                    },
-                ),
-                cx,
-            );
             editor
         });
         let layout = DeskLayout::read(&editor, window, cx);
         let mut view = Self {
             transcript: Transcript::new(buffer),
             editor,
-            draft,
-            idea_label: String::new(),
             rows: DeskRows::default(),
+            project: None,
             layout,
             text_system: window.text_system().clone(),
         };
@@ -386,76 +328,6 @@ impl DeskView {
         view.reconcile(cx);
         view.focus_first_row(cx);
         view
-    }
-
-    pub(crate) fn set_idea_label(&mut self, label: String, cx: &mut Context<Self>) {
-        if label != self.idea_label {
-            let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
-            self.idea_label = label;
-            self.transcript.replace(
-                &DeskKey::Idea,
-                line(DeskKey::Idea, self.idea_label.clone()),
-                cx,
-            );
-            if let Some(writing) = writing {
-                writing.restore(&self.editor, cx);
-            }
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn set_draft(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
-        let on_draft = self.on_draft(cx);
-        draft::replace(&self.editor, &buffer, cx);
-        self.draft = buffer;
-        if on_draft {
-            self.select_row(draft::start(self.transcript.buffer(), cx).row, None, cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn on_draft(&self, cx: &App) -> bool {
-        draft::on_tail(self.editor.read(cx), self.transcript.buffer(), cx)
-    }
-
-    pub(crate) fn focus_draft(&self, window: &mut Window, cx: &mut App) {
-        draft::focus(&self.editor, self.transcript.buffer(), None, window, cx);
-    }
-
-    fn tap_idea(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.button != MouseButton::Left || event.modifiers.modified() {
-            return;
-        }
-        let Some(hit) = draft::hit(
-            self.editor.read(cx),
-            self.transcript.buffer(),
-            &self.draft,
-            event.position,
-            cx,
-        ) else {
-            return;
-        };
-        let ask = self.draft.read(cx).capability() == Capability::Read
-            || (matches!(hit, draft::Hit::Separator)
-                && (self.on_draft(cx)
-                    || Layout::of(window.viewport_size().width) == Layout::Phone));
-        if ask {
-            let frame = FrameLink::new(
-                window
-                    .window_handle()
-                    .downcast::<Frame>()
-                    .expect("the frame owns the desk"),
-            );
-            frame.with(cx, |frame, window, cx| frame.prompt_idea(window, cx));
-        } else {
-            let position = match hit {
-                draft::Hit::Text(anchor) => Some(anchor),
-                draft::Hit::Separator => None,
-            };
-            draft::focus(&self.editor, self.transcript.buffer(), position, window, cx);
-        }
-        window.prevent_default();
-        cx.stop_propagation();
     }
 
     pub(crate) fn cursor_target(&self, cx: &App) -> Option<DeskTarget> {
@@ -500,27 +372,35 @@ impl DeskView {
         true
     }
 
-    pub(crate) fn set_rows(&mut self, rows: DeskRows, cx: &mut Context<Self>) {
-        if rows == self.rows {
+    pub(crate) fn set_rows(
+        &mut self,
+        mut rows: DeskRows,
+        project: Option<IdeaProject>,
+        hold: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed_scope =
+            self.project.as_ref().map(|p| &p.address) != project.as_ref().map(|p| &p.address);
+        self.project = project;
+        if hold && !changed_scope && Layout::of(self.layout.viewport) == Layout::Phone {
+            // Update displayed words in place. A newly ranked row can't
+            // take the place of one the user is about to tap.
+            DeskRows::keep_order(&mut rows.waiting, &self.rows.waiting);
+            DeskRows::keep_order(&mut rows.moving, &self.rows.moving);
+        }
+        if rows == self.rows && !changed_scope {
             return;
         }
-        let was_empty = self.rows.waiting.is_empty() && self.rows.moving.is_empty();
         self.rows = rows;
-        let writing = self.reconcile(cx);
-        if !writing
-            && ((was_empty && self.draft.read(cx).is_empty())
-                || (!self.on_draft(cx) && self.cursor_target(cx).is_none()))
-        {
+        self.reconcile(cx);
+        if self.cursor_target(cx).is_none() {
             self.focus_first_row(cx);
         }
         cx.notify();
     }
 
     pub(crate) fn focus_first_row(&mut self, cx: &mut Context<Self>) {
-        let row = self
-            .selectable_rows(cx)
-            .next()
-            .expect("Desk always has a draft");
+        let row = self.selectable_rows(cx).next().unwrap_or(0);
         self.select_row(row, None, cx);
     }
 
@@ -528,44 +408,25 @@ impl DeskView {
     /// label's second line is part of the same stop, not one more keypress.
     fn selectable_rows<'a>(&'a self, cx: &'a App) -> impl DoubleEndedIterator<Item = u32> + 'a {
         let history = self.transcript.buffer().read(cx).snapshot();
-        let draft = draft::start(self.transcript.buffer(), cx).row;
-        self.transcript
-            .keys()
-            .filter_map(move |key| {
-                let row = self.transcript.range_of(key)?.start.to_point(&history).row;
-                self.transcript.line_meta(row, cx).map(|_| row)
-            })
-            .chain(std::iter::once(draft))
+        self.transcript.keys().filter_map(move |key| {
+            let row = self.transcript.range_of(key)?.start.to_point(&history).row;
+            self.transcript.line_meta(row, cx).map(|_| row)
+        })
     }
 
     fn step(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let tail = draft::start(self.transcript.buffer(), cx).row;
         let row = self.cursor_row(cx);
-        // Inside a multiline draft, preserve the editor's vertical motions.
-        // Up from its first line instead returns to the previous Desk row.
-        if row > tail || (row == tail && down) {
-            let action = cx
-                .build_action(if down { "vim::Down" } else { "vim::Up" }, None)
-                .expect("vim is initialised before the Desk opens");
-            self.editor
-                .focus_handle(cx)
-                .dispatch_action(action.as_ref(), window, cx);
-            return;
-        }
         let count = vim::take_count(cx).unwrap_or(1);
-        let current = if row < tail {
-            self.transcript
-                .key_at_row(row, cx)
-                .and_then(|key| self.transcript.range_of(key))
-                .map_or(row, |range| {
-                    range
-                        .start
-                        .to_point(&self.transcript.buffer().read(cx).snapshot())
-                        .row
-                })
-        } else {
-            row
-        };
+        let current = self
+            .transcript
+            .key_at_row(row, cx)
+            .and_then(|key| self.transcript.range_of(key))
+            .map_or(row, |range| {
+                range
+                    .start
+                    .to_point(&self.transcript.buffer().read(cx).snapshot())
+                    .row
+            });
         let selected = if down {
             self.selectable_rows(cx)
                 .filter(|&candidate| candidate > current)
@@ -604,8 +465,7 @@ impl DeskView {
         });
     }
 
-    fn reconcile(&mut self, cx: &mut Context<Self>) -> bool {
-        let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
         let rows = || self.rows.waiting.iter().chain(&self.rows.moving);
         let measure = |text: &str| self.layout.measure(&self.text_system, text);
         let phone = Layout::of(self.layout.viewport) == Layout::Phone;
@@ -663,7 +523,6 @@ impl DeskView {
                 waiting.push(line(DeskKey::More, format!("and {} more", self.rows.more)));
             }
         }
-        waiting.push(line(DeskKey::Idea, self.idea_label.clone()));
         self.transcript.reconcile(waiting, cx);
         let snapshot = self.transcript.buffer().read(cx).snapshot();
         // A separator is one buffer space, laid out at a measured width.
@@ -695,25 +554,18 @@ impl DeskView {
                 map.replace_folds_with_type(tag, columns, cx);
             });
         cx.notify();
-        if let Some(writing) = writing {
-            writing.restore(&self.editor, cx);
-            return true;
-        }
-        false
     }
 }
 
 impl Surface for DeskView {
     fn title(&self, _cx: &App) -> String {
-        "desk".to_owned()
+        self.project
+            .as_ref()
+            .map_or_else(|| "desk".into(), |project| project.name.clone())
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
         Some(self.editor.clone())
-    }
-
-    fn edits_at_point(&self, cx: &App) -> bool {
-        self.on_draft(cx)
     }
 
     fn subject(&self, cx: &App) -> Subject {
@@ -794,16 +646,16 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             &mut text,
             &mut styles,
             &mut gaps,
-            &words,
-            row.words_class(),
-            (!words.is_empty() && !project.is_empty()).then_some(words_cell),
+            &project,
+            DeskClass::Muted,
+            (!project.is_empty() && !words.is_empty()).then_some(project_cell),
         );
         self.cell(
             &mut text,
             &mut styles,
             &mut gaps,
-            &project,
-            DeskClass::Muted,
+            &words,
+            row.words_class(),
             None,
         );
         (
@@ -843,33 +695,32 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             DeskClass::Muted,
             None,
         );
-        text.push_str("\n  ");
+        let mut lines = vec![row.target.clone()];
         let words = self.words(row, room - 2. * self.space);
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &words,
-            row.words_class(),
-            None,
-        );
+        if !words.is_empty() {
+            text.push_str("\n  ");
+            self.cell(
+                &mut text,
+                &mut styles,
+                &mut gaps,
+                &words,
+                row.words_class(),
+                None,
+            );
+            lines.push(row.target.clone());
+        } else {
+            text.push('\n');
+        }
         (
             Item::new(row.key.clone(), text)
                 .with_styles(styles)
-                .with_lines(vec![row.target.clone(), row.target.clone()]),
+                .with_lines(lines),
             gaps,
         )
     }
 
     fn words(&self, row: &DeskRow, room: Pixels) -> String {
-        let text = first_line(&row.words);
-        if (self.measure)(text) <= room {
-            text.to_owned()
-        } else if let Some((words, age)) = text.rsplit_once(" · ") {
-            self.cut(words, room, &format!(" · {age}"))
-        } else {
-            self.cut(text, room, "")
-        }
+        self.cut(&row.words, room, "")
     }
 
     fn cell(
@@ -933,11 +784,7 @@ impl Render for DeskView {
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         let colors = cx.theme().colors();
         div()
-            .key_context(if self.draft.read(cx).capability() == Capability::Read {
-                "RhoDesk RhoIdea RhoIdeaUnaddressed"
-            } else {
-                "RhoDesk RhoIdea"
-            })
+            .key_context("RhoDesk")
             .on_action(
                 cx.listener(|this, _: &keys::DeskNext, window, cx| this.step(true, window, cx)),
             )
@@ -948,25 +795,14 @@ impl Render for DeskView {
             )
             .on_action(cx.listener(|this, _: &keys::DeskFirst, window, cx| {
                 vim::take_count(cx);
-                let row = this
-                    .selectable_rows(cx)
-                    .next()
-                    .expect("Desk always has a draft");
+                let row = this.selectable_rows(cx).next().unwrap_or(0);
                 this.select_row(row, Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &keys::DeskDraft, window, cx| {
                 vim::take_count(cx);
-                let row = this
-                    .editor
-                    .read(cx)
-                    .buffer()
-                    .read(cx)
-                    .snapshot(cx)
-                    .max_point()
-                    .row;
+                let row = this.selectable_rows(cx).next_back().unwrap_or(0);
                 this.select_row(row, Some(window), cx);
             }))
-            .capture_any_mouse_down(cx.listener(Self::tap_idea))
             .size_full()
             .flex()
             .flex_col()
@@ -987,6 +823,7 @@ impl Render for DeskView {
 
 #[cfg(test)]
 mod tests {
+    use jiff::SignedDuration;
     use rho_dealer::Card;
 
     use super::*;
@@ -1016,17 +853,12 @@ mod tests {
             cards: [7, 94, 2, 71, 28, 16, 48, 44, 12].map(card).to_vec(),
             next_change: None,
         };
-        let rows = desk_rows(
-            &hand,
-            Vec::new(),
-            |address| {
-                Some(IdeaProject {
-                    address: address.clone(),
-                    name: "shoal@lab".into(),
-                })
-            },
-            Timestamp::UNIX_EPOCH,
-        );
+        let rows = desk_rows(&hand, Vec::new(), |address| {
+            Some(IdeaProject {
+                address: address.clone(),
+                name: "shoal@lab".into(),
+            })
+        });
         assert_eq!(rows.wait_count, 9);
         assert_eq!(
             rows.waiting
@@ -1067,18 +899,18 @@ mod tests {
                 name: "reef@lab".into(),
             })
         };
-        let rows = desk_rows(&hand, vec![], project, Timestamp::UNIX_EPOCH);
+        let rows = desk_rows(&hand, vec![], project);
         assert_eq!(rows.wait_count, 12);
         assert_eq!(rows.waiting[0].subject, "reef@lab");
-        assert_eq!(rows.waiting[0].words, "2 failed · 0m");
+        assert_eq!(rows.waiting[0].words, "2 failed");
         assert_eq!(rows.waiting[0].target, DeskTarget::Card(address(7)));
         assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(85)));
         assert_eq!(rows.waiting[1].project, "reef@lab");
         assert_eq!(rows.waiting[6].target, DeskTarget::Card(address(44)));
-        assert_eq!(rows.waiting[6].words, "3 stops · 7m");
+        assert_eq!(rows.waiting[6].words, "3 stops");
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, DeskTarget::Card(address(12)));
-        assert_eq!(overflow.words, "and 2 more · unformatted channel 2 wait");
+        assert_eq!(overflow.words, "and 2 more · unformatted channel");
         let afterwards = Hand {
             cards: hand
                 .cards
@@ -1087,7 +919,7 @@ mod tests {
                 .collect(),
             next_change: None,
         };
-        let rows = desk_rows(&afterwards, vec![], project, Timestamp::UNIX_EPOCH);
+        let rows = desk_rows(&afterwards, vec![], project);
         assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(2)));
         assert_eq!(rows.waiting[1].subject, "idea 2");
     }
@@ -1109,18 +941,18 @@ mod tests {
                 name: "clock@lab".into(),
             })
         };
-        let rows = desk_rows(&hand, vec![], project, Timestamp::UNIX_EPOCH);
+        let rows = desk_rows(&hand, vec![], project);
         assert_eq!(rows.waiting[0].subject, "idea 7");
         assert_eq!(rows.waiting[1].subject, "idea 85");
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, DeskTarget::Card(address(44)));
-        assert_eq!(overflow.words, "and 3 more · clock@lab 3 wait");
+        assert_eq!(overflow.words, "and 3 more · clock@lab");
 
         let hand = Hand {
             cards: hand.cards[8..].into(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, vec![], project, Timestamp::UNIX_EPOCH);
+        let rows = desk_rows(&hand, vec![], project);
         assert_eq!(
             rows.waiting
                 .iter()
@@ -1142,21 +974,21 @@ mod tests {
         };
         let layout = RowLayout::new(|text: &str| px(text.chars().count() as f32 * 5.));
         let (fits, gaps) = layout.item(&row, px(155.));
-        assert_eq!(fits.text, "abcdefghijklmno asks · 2m a@b\n");
-        assert_eq!(gaps, [(15, px(10.)), (26, px(10.))]);
+        assert_eq!(fits.text, "abcdefghijklmno a@b asks · 2m\n");
+        assert_eq!(gaps, [(15, px(10.)), (19, px(10.))]);
         assert_eq!(
             layout.item(&row, px(150.)).0.text,
-            "abcdefghijklm… asks · 2m a@b\n"
+            "abcdefghijklm… a@b asks · 2m\n"
         );
     }
 
     #[test]
-    fn a_narrow_row_keeps_the_project_and_status_age_and_opens_from_either_line() {
+    fn a_narrow_moving_row_keeps_the_project_and_opens_from_either_line() {
         let thread = address(7);
         let row = DeskRow {
             key: DeskKey::Moving(thread.clone()),
             subject: "Clock correction edge cases".into(),
-            words: "Replaying the slower timezone tests · 16m".into(),
+            words: "Replaying the slower timezone tests".into(),
             project: "tide@lab".into(),
             target: DeskTarget::Thread(thread),
         };
@@ -1164,7 +996,7 @@ mod tests {
         let (item, gaps) = wide.compact(&row, px(150.), px(40.));
         assert_eq!(
             item.text,
-            "Clock correction ed… tide@lab\n  Replaying the slower… · 16m\n"
+            "Clock correction ed… tide@lab\n  Replaying the slower timezo…\n"
         );
         assert_eq!(gaps, [(22, px(10.))]);
         assert_eq!(item.lines, [row.target.clone(), row.target]);
@@ -1179,7 +1011,7 @@ mod tests {
                 thread: address(n),
                 subject: format!("thread {n}"),
                 project: "tide@mini".into(),
-                status: format!("running {n} tests"),
+                words: format!("running {n} tests"),
                 changed: now - SignedDuration::from_mins(i64::from(n)),
             })
             .collect();
@@ -1187,10 +1019,10 @@ mod tests {
             cards: [3, 42, 45, 61, 80, 19, 99, 6].map(card).to_vec(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, moving, |_| None, now);
+        let rows = desk_rows(&hand, moving, |_| None);
         assert_eq!(rows.wait_count, 8);
         assert_eq!(rows.waiting[0].target, DeskTarget::Card(address(3)));
-        assert_eq!(rows.moving[0].words, "running 4 tests · 4m");
+        assert_eq!(rows.moving[0].words, "running 4 tests");
         assert_eq!(rows.moving[0].target, DeskTarget::Thread(address(4)));
         assert_eq!(rows.more, 2);
         assert_eq!(
@@ -1247,7 +1079,7 @@ mod tests {
         for (room, moving_title) in [(72., "W…"), (84., "WW…"), (90., "WWWW")] {
             for (row, title) in [(&waiting, "WiWi"), (&moving, moving_title)] {
                 let (item, gaps) = row_layout.item(row, px(room));
-                let (class, range) = &item.styles[1];
+                let (class, range) = &item.styles[2];
                 assert_eq!(*class, row.words_class());
                 assert_eq!(&item.text[range.clone()], row.words);
                 assert_eq!(&item.text[item.styles[0].1.clone()], title);
@@ -1262,12 +1094,20 @@ mod tests {
     }
 
     #[test]
-    fn a_status_age_advances_without_another_status_change() {
-        let changed: Timestamp = "2026-11-19T22:45:23Z".parse().unwrap();
-        let now: Timestamp = "2026-11-20T00:05:13Z".parse().unwrap();
-        let (words, next) = age(changed, now);
-        assert_eq!(words, "1h");
-        assert_eq!(next.unwrap().to_string(), "2026-11-20T00:45:23Z");
-        assert_eq!(age(changed, next.unwrap()).0, "2h");
+    fn an_arrival_does_not_reorder_visible_rows() {
+        let row = |n| DeskRow {
+            key: DeskKey::Waiting(address(n)),
+            subject: format!("row {n}"),
+            words: String::new(),
+            project: "lab".into(),
+            target: DeskTarget::Card(address(n)),
+        };
+        let before = [row(5), row(9)];
+        let mut fresh = [row(3), row(9), row(5), row(2)];
+        DeskRows::keep_order(&mut fresh, &before);
+        assert_eq!(
+            fresh.map(|row| row.subject),
+            ["row 5", "row 9", "row 3", "row 2"]
+        );
     }
 }

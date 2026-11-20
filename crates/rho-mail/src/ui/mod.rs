@@ -1045,12 +1045,12 @@ impl System for MailSystem {
                         chat.children(Some(root))
                             .iter()
                             .filter_map(move |&message| {
-                                let (status, at) = chat.latest_words(message)?;
+                                let (words, at) = chat.latest_words(message)?;
                                 Some(MovingThread {
                                     thread: ThreadId { host, message }.address(),
                                     subject: chat.name(message)?,
                                     project: project.clone(),
-                                    status,
+                                    words,
                                     changed: Timestamp::from_millisecond(at.0.try_into().ok()?)
                                         .ok()?,
                                 })

@@ -34,14 +34,13 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-status: the project's own screen still lists its threads, with agent names and counts on its rows.
 purpose: give each project one address to write to, without asking the user where its agents should work each time.
 principle: the user sends an idea to `tide@lab`; the project starts the work where its agents work and sends its asks and results from that address.
-sees: its name and host as an address, such as `tide@lab`; open, the threads of that project by subject.
+sees: its name and host as an address, such as `tide@lab`; open, the Desk narrowed to that project.
 has:
 - many `Thread`
 does:
-- open: show the project's threads by name through `window.Go to something by name`
+- open: narrow `desk.Desk` to the project through `window.Go to something by name`
 - receive an idea: use the place already remembered for the project's agents
 
 ## concept Thread
@@ -176,7 +175,6 @@ The historical review above was of Answer an agent. Answer Slack was walked sepa
 > reviewed: 2026-11-20 · laptop · reviewer · 6 findings
 
 ## flow Write an idea
-status: the built idea is a one-line strip and a draft tail on the Desk; the full-window draft with a `to:` line is not built.
 runs: 12 a day
 day: Turn ideas into work.
 when: the user has an idea, wherever they are in the window
