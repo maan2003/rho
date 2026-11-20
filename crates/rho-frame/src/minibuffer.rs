@@ -313,9 +313,16 @@ impl Minibuffer {
                 }
             }
             Answer::Palette { listing, rows } => {
+                let query = input.trim().to_lowercase();
+                listing.search_text(workspace.find_text(&crate::TextQuery::parse(&query), cx));
                 *rows = listing.rank(&input);
                 match self.completed_selection {
-                    Some(Completed::Palette(id)) if input == listing.choices[id].name() => {
+                    Some(Completed::Palette(id))
+                        if listing
+                            .choices
+                            .get(id)
+                            .is_some_and(|choice| input == choice.name()) =>
+                    {
                         rows.iter().position(|row| row.index == id)
                     }
                     _ => None,
@@ -471,6 +478,7 @@ impl Minibuffer {
                         }
                         _ => frame.open(place.found.address.clone(), window, cx),
                     },
+                    Choice::Words(hit) => frame.open_text_match(hit, window, cx),
                     Choice::Command(entry) => match &entry.pick {
                         Pick::Run { run, .. } | Pick::Infix { run, .. } => {
                             run(frame, None, window, cx)
@@ -591,6 +599,13 @@ impl Minibuffer {
                                 .children((!beside.is_empty()).then(|| {
                                     part(2, beside, beside.len()).w(columns.beside).flex_none()
                                 }));
+                        }
+                        (Choice::Words(_), _) => {
+                            row = row
+                                .flex_col()
+                                .gap_0()
+                                .child(part(0, title, title.len()))
+                                .child(part(1, detail, detail.len()).pl(inset));
                         }
                         (Choice::Command(_), _) => {
                             row = row.child(part(0, title, title.len())).children(

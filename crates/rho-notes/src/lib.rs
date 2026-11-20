@@ -30,7 +30,10 @@ pub use list::NotesView;
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
-use rho_frame::{AnySurface, Found, Frame, FrameLink, Point, Row, System};
+use rho_frame::{
+    AnySurface, Found, FoundText, Frame, FrameLink, Point, Row, SearchPoint, System, TextKind,
+    TextQuery,
+};
 pub use view::NoteView;
 
 /// How long after the last keystroke a note's text is written.
@@ -407,6 +410,41 @@ impl System for NoteSystem {
             Some(pending) => title_of(&pending.text),
             None => note_title(marks, &note.address()),
         })
+    }
+
+    fn find_text(
+        &self,
+        query: &TextQuery<'_>,
+        _current: &Address,
+        marks: &Marks,
+        _cx: &App,
+    ) -> Vec<FoundText> {
+        if !query.includes(TextKind::Note) {
+            return Vec::new();
+        }
+        marks
+            .notes()
+            .filter_map(|(address, held)| {
+                let note = NoteId::from_address(address)?;
+                let body = self
+                    .pending
+                    .get(&note)
+                    .map(|pending| pending.text.as_str())
+                    .or(held.body.as_deref())?;
+                let (row, line) = query.matching_line(body)?;
+                Some(FoundText {
+                    address: address.clone(),
+                    title: format!("Note · {}", title_of(body)),
+                    line: line.to_owned(),
+                    point: SearchPoint::Line(row),
+                    time: held
+                        .written_ms
+                        .or(held.created_ms)
+                        .unwrap_or_default()
+                        .max(0) as u64,
+                })
+            })
+            .collect()
     }
 
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {

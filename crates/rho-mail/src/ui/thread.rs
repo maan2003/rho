@@ -19,7 +19,7 @@ use gpui::{
     MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
 use jiff::{SignedDuration, Timestamp};
-use language::{Buffer, BufferEvent, Capability, Point};
+use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
     Address as Party, ChatSeq, ContentPart, EndpointId, Mention, Message, MessageId, Revision,
@@ -1754,6 +1754,35 @@ impl Surface for ThreadView {
         thread::enter_normal_mode(&self.editor, window, cx);
         self.cursor_to_item(&Key::Message(mail), Autoscroll::fit(), cx);
         self.initial_scroll = Some(mail);
+    }
+
+    fn show_search_match(
+        &mut self,
+        point: &rho_frame::SearchPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = match point {
+            rho_frame::SearchPoint::Mail { message, line } => {
+                let Some(mail) = ThreadId::from_address(message) else {
+                    return;
+                };
+                let Some(range) = self.transcript.range_of(&Key::Message(mail.message)) else {
+                    return;
+                };
+                let buffer = self.transcript.buffer().read(cx).snapshot();
+                let start = range.start.to_point(&buffer).row;
+                let end = range.end.to_point(&buffer).row.saturating_sub(1);
+                start.saturating_add(*line).min(end.max(start))
+            }
+            rho_frame::SearchPoint::Draft(line) => draft::start(self.transcript.buffer(), cx)
+                .row
+                .saturating_add(*line),
+            _ => return,
+        };
+        self.initial_scroll = None;
+        thread::enter_normal_mode(&self.editor, window, cx);
+        self.cursor_to_row(row, Autoscroll::center(), cx);
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {

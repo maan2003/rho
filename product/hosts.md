@@ -77,7 +77,6 @@ cases: the user never pairs a device, and it keeps its own verdicts for good; th
 reviewed: 2026-11-20 · laptop · reviewer · ok
 
 ## flow Attach a host
-status: the rooms on Home are tagged by host; there are no project addresses.
 runs: 1 a month
 day: Keep the work moving.
 when: the user sets up a new device, or has a new host
@@ -103,7 +102,7 @@ want: know whether a host has dropped
 so that: the user does not wait on agents they cannot reach
 steps:
 1. the user looks at the top line; a host that is not connected shows there in red, such as `disconnected · …`, or `2 of 3 hosts not connected`
-2. if the user wants more, they open the palette and choose `hosts`; the menu lists each host and its state
+2. if the user wants more, they type `hosts` in the palette; matching rows list each host and its state
 system: reconnects by itself, waiting up to ten seconds between tries, and shows how long it has been trying; says on the echo line once when a host drops, with the reason.
 user: nothing, unless a host needs attaching again.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings

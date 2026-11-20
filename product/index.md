@@ -21,7 +21,6 @@ One place fills the window. Two places side by side is an expert flow, used rare
 While they are in a place, they do not watch the rest. The product keeps it for them: what waits and since when, and what they said about each card. It also keeps their unsent drafts, and where they were on each device.
 
 ## day
-status: the user answers named agents in threads, and can steer them from the thread itself.
 
 What the user does in rho, all day, in order of weight. Every flow in a module serves one of these.
 
@@ -76,7 +75,6 @@ A feed or inbox that the user scans from top to bottom to find what needs them. 
 A sidebar, tabs, or other fixed controls around the screen.
 
 ## non-goal An agent dashboard
-status: agents do not have a dashboard; they appear by name in host threads and in find.
 A list or dashboard of agents. Agents are reached one level down from the work, when the user needs to inspect it.
 
 ## non-goal Labels, piles, and to-do lists

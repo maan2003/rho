@@ -45,7 +45,7 @@ Starting from the waiting clock ask, run the rows in order. `space` deals on Des
 | Render | Capture |
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
-| [Filtered palette over the thread](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:start agent' 'wait:600'; form_shot laptop prompt` |
+| [Mail body search](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:mail: behavior' 'wait:600'; form_shot laptop prompt` |
 | [Verdict menu over the card](laptop-menu.png) | `form_way laptop input 'key:escape' 'wait:600' 'key:space' 'wait:700'; form_shot laptop menu` |
 | [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |
@@ -60,7 +60,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 | --- | --- |
 | [Project with wrapped unread row](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
 | [Verdict sheet over the card](phone-menu.png) | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55; form_shot phone menu`. |
-| [Blank palette over the card](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:550' 'text::' 'wait:600'; form_shot phone prompt`. |
+| [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
 
 For the card without the `unpaired` notice, reuse the laptop identity:
 
@@ -118,7 +118,7 @@ The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show work un
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk.
 - In a thread, the draft is the next mail; `reply` appears while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
-- The palette shows the matching name on the laptop and recent places before commands in the blank phone view. A menu's shortcut leads on the laptop and sits at the far edge on the phone.
+- The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 
 These renders cover the states named above, not pending or private delivery, host disconnection, a failed agent, alternate appearances, or motion timings.

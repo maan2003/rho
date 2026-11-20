@@ -44,6 +44,65 @@ pub struct FoundThread {
     pub status: Option<String>,
 }
 
+/// An exact location in the owning surface, not a separate place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchPoint {
+    Mail { message: Address, line: u32 },
+    Line(u32),
+    Draft(u32),
+}
+
+/// A matching line from a place's contents; searched on demand where those
+/// words already live, rather than copied into another catalogue.
+pub struct FoundText {
+    pub address: Address,
+    pub title: String,
+    pub line: String,
+    pub point: SearchPoint,
+    pub time: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    Mail,
+    Note,
+}
+
+pub struct TextQuery<'a> {
+    pub kind: Option<TextKind>,
+    pub terms: Vec<&'a str>,
+}
+
+impl<'a> TextQuery<'a> {
+    pub fn parse(query: &'a str) -> Self {
+        let (kind, text) = if let Some(text) = query.strip_prefix("mail:") {
+            (Some(TextKind::Mail), text)
+        } else if let Some(text) = query.strip_prefix("note:") {
+            (Some(TextKind::Note), text)
+        } else {
+            (None, query)
+        };
+        Self {
+            kind,
+            terms: text.split_whitespace().collect(),
+        }
+    }
+
+    pub fn includes(&self, kind: TextKind) -> bool {
+        !self.terms.is_empty() && self.kind.is_none_or(|only| only == kind)
+    }
+
+    pub fn matching_line<'b>(&self, text: &'b str) -> Option<(u32, &'b str)> {
+        text.lines().enumerate().find_map(|(row, line)| {
+            let folded = line.to_lowercase();
+            if !self.terms.iter().all(|term| folded.contains(term)) {
+                return None;
+            }
+            Some((row.try_into().ok()?, line.trim()))
+        })
+    }
+}
+
 pub trait System: Sized + 'static {
     /// The address kinds this system opens.
     fn kinds(&self) -> &'static [&'static str];
@@ -154,6 +213,16 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    fn find_text(
+        &self,
+        _query: &TextQuery<'_>,
+        _current: &Address,
+        _marks: &Marks,
+        _cx: &App,
+    ) -> Vec<FoundText> {
+        Vec::new()
+    }
+
     /// What the user said about these addresses moved, on this device or
     /// from another. Asked with the frame busy: a system reads the marks
     /// afterwards, through [`crate::FrameLink::read`].
@@ -200,6 +269,13 @@ trait SystemHandle {
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
+    fn find_text(
+        &self,
+        query: &TextQuery<'_>,
+        current: &Address,
+        marks: &Marks,
+        cx: &App,
+    ) -> Vec<FoundText>;
 }
 
 impl<S: System> SystemHandle for Entity<S> {
@@ -294,6 +370,16 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
         self.read(cx).find(marks, cx)
+    }
+
+    fn find_text(
+        &self,
+        query: &TextQuery<'_>,
+        current: &Address,
+        marks: &Marks,
+        cx: &App,
+    ) -> Vec<FoundText> {
+        self.read(cx).find_text(query, current, marks, cx)
     }
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
@@ -402,6 +488,16 @@ impl AnySystem {
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
         self.0.find(marks, cx)
+    }
+
+    pub(crate) fn find_text(
+        &self,
+        query: &TextQuery<'_>,
+        current: &Address,
+        marks: &Marks,
+        cx: &App,
+    ) -> Vec<FoundText> {
+        self.0.find_text(query, current, marks, cx)
     }
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {

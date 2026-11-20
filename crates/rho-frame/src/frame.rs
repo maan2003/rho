@@ -859,13 +859,38 @@ impl Frame {
                 found,
             })
             .collect();
-        self.open_minibuffer(
-            ":",
-            Answer::palette(palette::Listing::new(commands, places)),
-            None,
-            window,
-            cx,
-        );
+        let mut listing = palette::Listing::new(commands, places);
+        listing.desk = self.desk_in_view();
+        self.open_minibuffer(":", Answer::palette(listing), None, window, cx);
+    }
+
+    pub(crate) fn find_text(
+        &self,
+        query: &crate::TextQuery<'_>,
+        cx: &App,
+    ) -> Vec<crate::FoundText> {
+        self.systems
+            .iter()
+            .flat_map(|system| {
+                system.find_text(query, self.current_address(), &self.attention.marks, cx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn open_text_match(
+        &mut self,
+        hit: &crate::FoundText,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.current_address() != &hit.address {
+            self.open(hit.address.clone(), window, cx);
+        }
+        if self.current_address() == &hit.address {
+            self.current_surface()
+                .clone()
+                .show_search_match(&hit.point, window, cx);
+        }
     }
 
     fn screen_binding(
@@ -902,8 +927,13 @@ impl Frame {
             .bound_to(keys::PromptIdea)
             .window_wide(),
             undo,
-            Row::menu("", self.hosts_menu()).window_wide(),
         ];
+        rows.extend(
+            self.hosts_menu()
+                .into_commands()
+                .into_iter()
+                .map(Row::window_wide),
+        );
         let phrase = match self.attention.secret() {
             Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
                 frame.show_secret(secret, "your secret phrase · enter:", window, cx)
@@ -994,7 +1024,7 @@ impl Frame {
                 cx,
             );
         }));
-        for (index, host) in self.hosts.iter().enumerate().take(9) {
+        for (index, host) in self.hosts.iter().enumerate() {
             let id = host.id;
             rows.push(Row::run(
                 (index + 1).to_string(),

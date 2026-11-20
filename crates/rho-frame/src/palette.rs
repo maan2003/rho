@@ -1,5 +1,4 @@
-//! `:`: every command and place by name. The row's fields are also the
-//! search fields, so the match can point back to the letters the user sees.
+//! `:`: commands and places by name, and excerpts of remembered words.
 
 use std::cmp::Reverse;
 use std::ops::Range;
@@ -7,7 +6,7 @@ use std::ops::Range;
 use rho_dealer::Card;
 
 use crate::menu::{Pick, Row, Scope, Shortcut};
-use crate::system::Found;
+use crate::system::{Found, FoundText, SearchPoint};
 
 // Eight rows are visible. Beyond this many results the user types more.
 const LISTED: usize = 100;
@@ -50,6 +49,7 @@ pub(crate) struct Place {
 pub(crate) enum Choice {
     Command(Entry),
     Place(Place),
+    Words(FoundText),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,6 +58,8 @@ enum Group {
     ExactPlace,
     CommandAtWordStarts,
     OtherPlace,
+    DraftWords,
+    StoredWords,
     CurrentPlace,
     OtherCommand,
 }
@@ -65,7 +67,9 @@ enum Group {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Strength {
     ExactName,
+    NamePrefix,
     WordStarts,
+    WordsInOrder,
     Fuzzy,
 }
 
@@ -81,12 +85,14 @@ impl Choice {
         match self {
             Self::Command(entry) => entry.pick.label().trim_end_matches('…'),
             Self::Place(place) => &place.found.title,
+            Self::Words(found) => &found.title,
         }
     }
 
     fn detail(&self) -> &str {
         match self {
             Self::Command(_) => "",
+            Self::Words(found) => &found.line,
             Self::Place(place) => match &place.card {
                 Some(card) => &card.label,
                 None => place
@@ -102,6 +108,7 @@ impl Choice {
     fn beside(&self) -> &str {
         match self {
             Self::Command(entry) => &entry.keys,
+            Self::Words(_) => "",
             Self::Place(place) => place
                 .shortcut
                 .as_deref()
@@ -112,15 +119,16 @@ impl Choice {
     fn aliases(&self) -> &[String] {
         match self {
             Self::Command(entry) => &entry.also,
-            Self::Place(_) => &[],
+            Self::Place(_) | Self::Words(_) => &[],
         }
     }
 
     // Blank input lists only places we have been, places that wait, and
     // commands. A visited waiting place keeps its card words in both cases.
-    fn blank(&self) -> Option<(u8, usize)> {
+    fn blank(&self, desk: bool) -> Option<(u8, usize)> {
         match self {
-            Self::Place(Place { current: true, .. }) => None,
+            Self::Place(Place { current: true, .. }) | Self::Words(_) => None,
+            Self::Place(Place { card: Some(_), .. }) if desk => None,
             Self::Place(Place {
                 visit: Some(visit), ..
             }) => Some((0, *visit)),
@@ -140,8 +148,14 @@ impl Choice {
             (Self::Place(_), Strength::ExactName) => Group::ExactPlace,
             (Self::Place(_), _) => Group::OtherPlace,
             (Self::Command(_), Strength::ExactName) => Group::ExactCommand,
-            (Self::Command(_), Strength::WordStarts) => Group::CommandAtWordStarts,
-            (Self::Command(_), Strength::Fuzzy) => Group::OtherCommand,
+            (Self::Command(_), Strength::WordStarts | Strength::NamePrefix) => {
+                Group::CommandAtWordStarts
+            }
+            (Self::Command(_), _) => Group::OtherCommand,
+            (Self::Words(words), _) if matches!(words.point, SearchPoint::Draft(_)) => {
+                Group::DraftWords
+            }
+            (Self::Words(_), _) => Group::StoredWords,
         }
     }
 
@@ -160,6 +174,7 @@ impl Choice {
                 Reverse(place.found.recency),
             ),
             Self::Command(_) => (true, usize::MAX, Reverse(0)),
+            Self::Words(found) => (true, usize::MAX, Reverse(found.time)),
         }
     }
 
@@ -175,6 +190,7 @@ impl Choice {
         match self {
             Self::Command(_) => true,
             Self::Place(place) => place.shortcut.is_some(),
+            Self::Words(_) => false,
         }
     }
 
@@ -236,8 +252,19 @@ impl Choice {
         }
         let strength = if folded[0].text == query {
             Strength::ExactName
+        } else if folded[0].text.starts_with(query) {
+            Strength::NamePrefix
         } else if command_at_word_starts {
             Strength::WordStarts
+        } else if words
+            .iter()
+            .try_fold(folded[0].text.as_str(), |rest, word| {
+                let at = rest.find(word)?;
+                Some(&rest[at + word.len()..])
+            })
+            .is_some()
+        {
+            Strength::WordsInOrder
         } else {
             Strength::Fuzzy
         };
@@ -299,27 +326,43 @@ pub(crate) struct Matched {
 
 pub(crate) struct Listing {
     pub choices: Vec<Choice>,
+    named: usize,
+    pub(crate) desk: bool,
 }
 
 impl Listing {
     pub fn new(commands: Vec<Entry>, places: Vec<Place>) -> Self {
-        let choices = places
+        let choices: Vec<_> = places
             .into_iter()
             .map(Choice::Place)
             .chain(commands.into_iter().map(Choice::Command))
             .collect();
-        Self { choices }
+        Self {
+            named: choices.len(),
+            choices,
+            desk: false,
+        }
+    }
+
+    pub fn search_text(&mut self, hits: Vec<FoundText>) {
+        self.choices.truncate(self.named);
+        self.choices.extend(hits.into_iter().map(Choice::Words));
     }
 
     pub fn rank(&self, query: &str) -> Vec<Matched> {
         let query = query.trim().to_lowercase();
-        let words: Vec<_> = query.split_whitespace().collect();
+        let text = crate::TextQuery::parse(&query);
+        let words = &text.terms;
+        let only_text = text.kind.is_some();
         if words.is_empty() {
+            if only_text {
+                return Vec::new();
+            }
             let mut rows: Vec<_> = self
                 .choices
                 .iter()
                 .enumerate()
-                .filter_map(|(index, choice)| Some((choice.blank()?, index)))
+                .filter_map(|(index, choice)| Some((choice.blank(self.desk)?, index)))
                 .collect();
             rows.sort_unstable();
             return rows
@@ -336,7 +379,10 @@ impl Listing {
             .iter()
             .enumerate()
             .filter_map(|(index, choice)| {
-                let (strength, score, marks) = choice.matches(&query, &words)?;
+                if only_text && !matches!(choice, Choice::Words(_)) {
+                    return None;
+                }
+                let (strength, score, marks) = choice.matches(&query, words)?;
                 Some((
                     (
                         choice.group(strength),
@@ -414,8 +460,10 @@ mod tests {
             thread("recent", "foam@lab", Some(0), false, None),
         ];
         let rows = commands(&[Row::run("", "new project", |_, _, _| {})], |_| None);
-        let listing = Listing::new(rows, places);
+        let mut listing = Listing::new(rows, places);
         assert_eq!(ids(&listing, " "), [4, 0, 3, 5]);
+        listing.desk = true;
+        assert_eq!(ids(&listing, ""), [4, 5]);
         assert_eq!(ids(&listing, "urrent"), [1]);
     }
 
@@ -454,29 +502,52 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_is_one_command_whose_choices_are_not_search_results() {
-        let top = [
-            Row::menu(
-                "a",
-                Rows::new("start agent").row(Row::run("h", "here", |_, _, _| {})),
-            ),
+    fn ordinary_menus_flatten_but_verdict_choices_stay_nested() {
+        let mut top = Rows::new("start agent")
+            .row(Row::run("h", "here", |_, _, _| {}))
+            .into_commands();
+        top.push(
             Row::menu(
                 "s",
                 Rows::new("snooze").row(Row::run("m", "minutes", |_, _, _| {})),
             )
             .bound_to(crate::keys::VerdictMenu),
-        ];
+        );
         let rows = commands(&top, |_| Some("space s".to_owned()));
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].pick.label(), "start agent");
+        assert_eq!(rows[0].pick.label(), "start agent › here");
         assert!(rows[0].keys.is_empty());
         assert_eq!(rows[1].keys, "space s");
         assert!(
             matches!(&rows[1].pick, Pick::Menu(menu) if menu.rows[0].pick.label() == "minutes")
         );
         let listing = Listing::new(rows, vec![]);
+        assert_eq!(ids(&listing, "here"), [0]);
         assert_eq!(ids(&listing, "snooze"), [1]);
         assert!(ids(&listing, "minutes").is_empty());
+    }
+
+    #[test]
+    fn scoped_results_find_unprinted_words_and_rank_older_draft_first() {
+        let mut listing = Listing::new(
+            vec![],
+            vec![thread("Brass pins", "reef@lab", Some(0), false, None)],
+        );
+        let mut results = Vec::new();
+        for (point, time) in [(SearchPoint::Line(19), 99), (SearchPoint::Draft(2), 0)] {
+            results.push(FoundText {
+                address: Address::new("thread", "reef@lab"),
+                title: "Mail · Failing lever · reef@lab".into(),
+                line: "a brass pin sticks".into(),
+                point,
+                time,
+            });
+        }
+        listing.search_text(results);
+        assert_eq!(ids(&listing, "mail: PIN brass"), [2, 1]);
+        assert!(ids(&listing, "mail:").is_empty());
+        assert!(ids(&listing, "mail: BRASS shaft").is_empty());
+        assert_eq!(ids(&listing, "brass pin"), [0, 2, 1]);
     }
 
     #[test]
@@ -489,7 +560,7 @@ mod tests {
                 thread("Clockwork Build", "reef@lab", None, false, None),
             ],
         );
-        assert_eq!(ids(&listing, "clock"), [1, 2, 0, 3]);
+        assert_eq!(ids(&listing, "clock"), [2, 1, 0, 3]);
         assert_eq!(ids(&listing, "wave"), [0]);
     }
 
