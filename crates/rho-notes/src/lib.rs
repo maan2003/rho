@@ -284,11 +284,11 @@ impl System for NoteSystem {
 
     fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        if point.surface.kind() == rho_chat::ThreadId::KIND
+        if point.surface.kind() == rho_mail::ThreadId::KIND
             && let Some(subject) = point
                 .subject
                 .clone()
-                .filter(|at| at.kind() == rho_chat::ThreadId::KIND)
+                .filter(|at| at.kind() == rho_mail::ThreadId::KIND)
         {
             rows.push(Row::run("", "reply privately", move |frame, window, cx| {
                 reply_privately(&subject, frame, window, cx);

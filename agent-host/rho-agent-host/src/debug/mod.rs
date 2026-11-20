@@ -205,7 +205,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
                         .with_context(|| format!("agent id {agent}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let call = rho_chat::protocol::Post {
+            let call = rho_mail::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(thread))),
                 reply_to: None,
@@ -237,7 +237,7 @@ async fn start_debug_thread(
     agent: rho_agent_types::AgentId,
     text: String,
 ) -> anyhow::Result<rho_agent_types::MessageId> {
-    let call = rho_chat::protocol::Post {
+    let call = rho_mail::protocol::Post {
         client_id: uuid::Uuid::new_v4().as_u64_pair().0,
         parent: None,
         reply_to: None,

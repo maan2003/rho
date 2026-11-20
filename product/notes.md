@@ -20,13 +20,13 @@ While the user types a new note, the top line follows its first line as it is ty
 ## concept Private reply
 purpose: let the user keep a remark on a `mail.Mail` in its thread, where only they see it.
 principle: a project mails a result the user doubts; they put the cursor on it and run `reply privately`; a note opens; they type their doubt; back in the thread, it shows under the mail, dim, marked `🔒 you`.
-sees: in the thread, under its message: `🔒 you · time` and the text, dim and slanted.
+sees: in the thread, under its mail: `🔒 you · time` and the text, dim and slanted.
 does:
 - reply privately, from the palette: when the cursor is on a mail or thread, start a note about it and open it; the command does not appear on the desk or with nothing under the cursor
 - open `enter` on it in the thread: open the note to edit it
 
 ## screen Notes
-status: a private reply's row names a host chat message and thread rather than a project mail and subject.
+status: a private reply's row names the host and mail rather than the project and subject.
 shows: `Note`, by its first line, the last written first, private replies too; with none, `no notes yet · new note from the palette (:)`; a private reply names its mail's first words and the thread's subject
 starts: `Write something down`
 
@@ -50,7 +50,7 @@ cases: the same note open on the laptop and the phone at once, where the newest 
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Reply privately
-status: the user makes the reply beside a message in chat; the mail thread is not built.
+status: the user makes the reply beside a mail in its thread; the mail thread is not built.
 runs: 2 a week
 day: Keep their own memory.
 when: a `mail.Mail` needs a remark that is for the user only
@@ -70,5 +70,5 @@ status: notes already have their own list and are never rooms on Home; the desk 
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is not on the `desk.Desk`.
 
 ## rule a note about a mail shows in its thread
-status: a private note shows beside its chat message in a host thread.
+status: a private note shows beside its mail in a host thread.
 when a `Note` is about a `mail.Mail`, then the `mail.Thread` that shows the mail shows the note beside it as a `Private reply`.

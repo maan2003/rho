@@ -79,20 +79,20 @@ states:
 - prompt or palette: the candidate's name, its `attention` card words or `quiet` status if present, then its `quiet` address or key; query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
 used on: `desk.Desk`, `mail.Project`, and `window.Palette`.
-form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [wrapped unread project row](design/phone-channel.png), and [matched palette row](design/laptop-prompt.png).
+form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [wrapped unread project row](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
 
-## part Message header
-purpose: identify who wrote the message and when, before the user reads its words.
-looks: the name in `marked` with `emphasis`, then a centered dot and `quiet` time, on a line above the message in `editor text`.
+## part Mail header
+purpose: identify who wrote the mail and when, before the user reads its words.
+looks: the name in `marked` with `emphasis`, then a centered dot and `quiet` time, on a line above the mail in `editor text`.
 states:
 - delivered: `you` or the project's address, and the time; an edited mail adds `edited`.
-- sending: the header reads `you · sending…` in `quiet` until the host has the message.
+- sending: the header reads `you · sending…` in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `mail.Thread`.
 form: [you and clock@lab above their respective mails](design/laptop-card.png).
 
 ## part Quote
-purpose: let the user read the words another message is answering without mistaking them for new words.
+purpose: let the user read the words another mail is answering without mistaking them for new words.
 looks: quoted Markdown keeps its `>` marker in the reading line. The words use `editor text` on the `reading surface`, without a separate quote panel.
 states:
 - plain: the body has no quote marker.

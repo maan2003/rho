@@ -4,8 +4,8 @@
 use std::fmt;
 
 use rho_agent_types::AgentId;
-use rho_chat::AgentRef;
 use rho_frame::Addressed;
+use rho_mail::AgentRef;
 
 /// What of an agent an `agent:` address opens.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

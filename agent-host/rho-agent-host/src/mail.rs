@@ -1,4 +1,4 @@
-//! The mail part of the agent host ([`rho_chat::protocol`]): a session
+//! The mail part of the agent host ([`rho_mail::protocol`]): a session
 //! carries the host's log from where a client holds it; what the user does
 //! in the chat is a call on a stream of its own.
 
@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use rho_agent::store::{Appended, MailRead as _};
 use rho_agent_types::ChatSeq;
-use rho_chat::protocol::{
+use rho_db::RhoDb;
+use rho_mail::protocol::{
     ClientFrame, Leave, Name, Open, Post, Project, Reparent, Request, ResolveProject, ServerFrame,
 };
-use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, write_frame};
 use tokio::sync::{broadcast, mpsc};
 
@@ -159,7 +159,7 @@ async fn send_from(
             return true;
         };
         *sent = last.seq;
-        if outgoing_tx.send(ServerFrame::Chat { records }).is_err() {
+        if outgoing_tx.send(ServerFrame::Mail { records }).is_err() {
             return false;
         }
         // Catching up must never starve the connection's own traffic.
@@ -199,7 +199,7 @@ where
                     .db
                     .read()
                     .project_named(&name)
-                    .map(|channel| Project { channel, name }))
+                    .map(|root| Project { root, name }))
             })
             .await
         }

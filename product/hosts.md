@@ -21,7 +21,6 @@ because: the window is the user's own device, and an agent that needs the user's
 costs: a prompt that opens over whatever the user is doing, and a push that fails when they do not answer in a minute.
 
 ## journey A new machine
-status: a new idea is written in a channel; there is no addressed idea from anywhere.
 goal: the user can put their first idea to work within minutes on a new machine.
 starts when: the user has a new laptop or a new host.
 steps:
@@ -32,7 +31,6 @@ done when: the user's first idea is at work within minutes.
 day: Turn ideas into work.
 
 ## concept Host
-status: attaching a host brings its channels back, as rooms on Home; it does not give them project mail addresses.
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
 principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with addresses ending in `@rho`; when the connection drops, the top line says so in red until it is back.
 sees: its name, which the user chose, as the host part of its projects' addresses; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `mail.Project` address.
@@ -41,7 +39,7 @@ has:
 - many `agents.Agent`
 does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
-- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its mail comes back from the host when it is attached again; drafts and unsent messages stay
+- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its mail comes back from the host when it is attached again; drafts and unsent mail stay
 - status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
 
 A host is reached in one of three ways:

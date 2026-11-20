@@ -1,7 +1,7 @@
 //! A thread: read-only mail and an editable draft in one editor.
 //!
-//! A channel is the same surface over a root: its messages are the threads
-//! under it, each with its replies folded under it.
+//! A project is the same surface over a root: it lists its threads, each
+//! with its replies folded under it.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -28,8 +28,8 @@ use rho_transcript::{Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
-use super::{ChatSystem, Event, ago};
-use crate::{AgentRef, HostChat, ThreadId, cards};
+use super::{Event, MailSystem, ago};
+use crate::{AgentRef, HostMail, ThreadId, cards};
 
 /// This surface's highlight-key space, clear of the others'.
 const KEY_BASE: usize = usize::MAX / 5;
@@ -154,7 +154,7 @@ impl Meta {
     }
 }
 
-/// A thread the user just started in a channel, which the cursor follows
+/// A thread the user just started in a project, which the cursor follows
 /// until it stands in the list: by the id this client gave the message
 /// while it is on its way, then by its own once the host logged it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +164,7 @@ enum Follow {
 }
 
 pub struct ThreadView {
-    system: Entity<ChatSystem>,
+    system: Entity<MailSystem>,
     thread: ThreadId,
     transcript: Transcript<Key, Class, Meta>,
     layout: Layout,
@@ -182,7 +182,7 @@ pub struct ThreadView {
     _ages: Option<Task<()>>,
 }
 
-/// How often the ages in a channel's list move: their unit is the minute.
+/// How often the ages in a project's list move: their unit is the minute.
 const LIST_AGES_EVERY: SignedDuration = SignedDuration::from_secs(60);
 
 impl ThreadView {
@@ -190,8 +190,8 @@ impl ThreadView {
     /// holds it. The system is leased by the caller, so it is read here
     /// directly and never through its entity.
     pub fn new(
-        system: &ChatSystem,
-        entity: Entity<ChatSystem>,
+        system: &MailSystem,
+        entity: Entity<MailSystem>,
         thread: ThreadId,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -352,7 +352,7 @@ impl ThreadView {
         let system = self.system.read(cx);
         let list = self.is_list(system)
             && system
-                .chat(self.thread.host)
+                .host_mail(self.thread.host)
                 .is_some_and(|chat| !chat.children(Some(self.thread.message)).is_empty());
         self._ages = list.then(|| {
             let wait = std::time::Duration::try_from(LIST_AGES_EVERY).expect("positive interval");
@@ -394,12 +394,12 @@ impl ThreadView {
         editor.selections.newest_anchor().head().to_point(&snapshot)
     }
 
-    fn is_list(&self, system: &ChatSystem) -> bool {
+    fn is_list(&self, system: &MailSystem) -> bool {
         is_project(system, self.thread)
     }
 
     fn selected_reply_target(&self, row: u32, cx: &App) -> Option<MessageId> {
-        let chat = self.system.read(cx).chat(self.thread.host)?;
+        let chat = self.system.read(cx).host_mail(self.thread.host)?;
         let id = self.transcript.line_meta(row, cx)?.mail()?;
         incoming(chat.message(id)).then_some(id)
     }
@@ -409,7 +409,7 @@ impl ThreadView {
         if self.is_list(system) {
             return None;
         }
-        let chat = system.chat(self.thread.host)?;
+        let chat = system.host_mail(self.thread.host)?;
         let point = self.transcript.line_meta(self.cursor_row(cx), cx);
         self.reply_to
             .into_iter()
@@ -496,7 +496,7 @@ impl ThreadView {
 
 /// The rows of `thread` as `system` holds it.
 fn items(
-    system: &ChatSystem,
+    system: &MailSystem,
     thread: ThreadId,
     list: bool,
     layout: Layout,
@@ -534,17 +534,17 @@ fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class,
 }
 
 fn history_items(
-    system: &ChatSystem,
+    system: &MailSystem,
     thread: ThreadId,
     list: bool,
     expanded_quotes: &HashSet<QuoteId>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     let host = thread.host;
-    let Some(chat) = system.chat(host) else {
+    let Some(chat) = system.host_mail(host) else {
         return vec![line(
             Key::Gap(0),
-            "this host's chat is not held here",
+            "this host's mail is not held here",
             Class::Crumb,
         )];
     };
@@ -655,7 +655,7 @@ fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key,
 /// so and dim. Enter opens the note to edit it.
 fn private_items(
     marks: &Marks,
-    chat: &HostChat,
+    chat: &HostMail,
     host: EndpointId,
     head: MessageId,
 ) -> std::collections::HashMap<MessageId, Vec<Item<Key, Class, Meta>>> {
@@ -687,15 +687,15 @@ fn private_items(
 }
 
 /// Whether this place lists a project's threads rather than reading mail.
-fn is_project(system: &ChatSystem, thread: ThreadId) -> bool {
+fn is_project(system: &MailSystem, thread: ThreadId) -> bool {
     system
-        .chat(thread.host)
+        .host_mail(thread.host)
         .is_some_and(|chat| chat.is_project(thread.message))
 }
 
 /// The user's messages into `parent` that no host has logged yet.
 fn pending_items(
-    system: &ChatSystem,
+    system: &MailSystem,
     host: EndpointId,
     parent: MessageId,
     gap_item: &mut impl FnMut(&mut Vec<Item<Key, Class, Meta>>),
@@ -722,8 +722,8 @@ fn pending_items(
 /// group newest first. The words are in the thread; the list is for choosing
 /// one. Without `marks` nothing is known to be unread.
 fn thread_rows(
-    system: &ChatSystem,
-    chat: &HostChat,
+    system: &MailSystem,
+    chat: &HostMail,
     host: EndpointId,
     root: MessageId,
     marks: Option<&Marks>,
@@ -830,7 +830,7 @@ impl ThreadView {
         );
     }
 
-    /// In a channel, the idea goes to the agents system, which sends it
+    /// In a project, the idea goes to the agents system, which sends it
     /// and starts an agent from it; in a thread, the reply goes out.
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_list(self.system.read(cx)) {
@@ -846,7 +846,7 @@ impl ThreadView {
             cx.emit(Event::Idea {
                 endpoint: thread.host,
                 parent: thread.message,
-                source: super::IdeaSource::ChannelDraft,
+                source: super::IdeaSource::ProjectDraft,
             });
         });
     }
@@ -873,7 +873,7 @@ impl ThreadView {
         self.dealt_mail = None;
         self.refresh(cx);
         self.cursor_to_latest_mail(cx);
-        // In a channel the message is a new thread: the cursor goes to it in
+        // In a project the message is a new thread: the cursor goes to it in
         // the list, on its way and then where the list puts it, so `enter`
         // opens it.
         if list {
@@ -983,7 +983,7 @@ impl ThreadView {
             return None;
         }
         let id = self.transcript.line_meta(row, cx)?.mail()?;
-        let mail = system.chat(self.thread.host)?.message(id)?;
+        let mail = system.host_mail(self.thread.host)?.message(id)?;
         let agent = match mail.from {
             Party::Agent(agent) | Party::System { agent, .. } => agent,
             Party::User => return None,
@@ -1239,7 +1239,7 @@ impl Surface for ThreadView {
             return project;
         }
         let subject = system
-            .chat(self.thread.host)
+            .host_mail(self.thread.host)
             .and_then(|chat| chat.name(self.thread.message))
             .unwrap_or_default();
         match subject.is_empty() {
@@ -1274,7 +1274,7 @@ impl Surface for ThreadView {
     }
 
     /// The thread the subject is in, as the dealer counts threads: in a
-    /// thread, the thread wherever the point is in it; in a channel, the
+    /// thread, the thread wherever the point is in it; in a project, the
     /// thread under the point, as a row is on Home.
     fn card(&self, cx: &App) -> Subject {
         let system = self.system.read(cx);
@@ -1317,7 +1317,7 @@ impl Surface for ThreadView {
             }
             let system = self.system.read(cx);
             let members = system
-                .chat(self.thread.host)
+                .host_mail(self.thread.host)
                 .map(|chat| chat.members_under(Some(self.thread.message)))
                 .unwrap_or_default();
             let mail = (!self.on_draft(cx))

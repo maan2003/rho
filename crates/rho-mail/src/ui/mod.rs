@@ -1,12 +1,11 @@
-//! The chat as the frame shows it.
+//! Mail as the frame shows it.
 //!
-//! [`ChatSystem`] is the one entity behind every chat surface: each host's
-//! forest, the disk copy, the outbox, and the session to each host. It
-//! plugs into the frame as a [`System`] under the `thread` kind: a root
-//! message is a channel, a reply to a root is a thread, and every one of
-//! them opens as a [`ThreadView`]. What of the chat wants the user is
-//! [`crate::cards`]'s to say; its mail projects, moving threads and `find`'s
-//! rows are made here.
+//! [`MailSystem`] owns each host's forest, disk copy, outbox, and session.
+//! It plugs into the frame as a [`System`] under the `thread` kind: a
+//! root anchors a project, and each reply directly below it starts a
+//! thread. Both open as a [`ThreadView`]. [`crate::cards`] says which
+//! threads want the user; this module supplies projects, moving threads,
+//! and the rows for `find`.
 
 mod thread;
 
@@ -32,16 +31,16 @@ use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
 use crate::cache::Cache;
-use crate::fold::HostChat;
+use crate::fold::HostMail;
 use crate::outbox::Outbox;
 use crate::protocol::Name;
-use crate::stream::{ChatEvent, ChatStream, Cursors};
+use crate::stream::{Cursors, MailEvent, MailStream};
 use crate::{AgentRef, ThreadId, cards};
 
-/// What the chat tells whoever listens: the agents system starts an
-/// agent from a message once the host has logged it.
+/// What mail tells its listeners: the agents system starts an agent from a
+/// mail once the host has logged it.
 pub enum Event {
-    /// The user sent the draft under `parent`, a channel, as an idea: the
+    /// The user sent the draft under the project root `parent` as an idea: the
     /// agents system says where an agent starts from it, then sends it.
     /// The draft stays until then.
     Idea {
@@ -68,7 +67,7 @@ pub enum Event {
 /// start's question must not swap one draft for the other.
 #[derive(Clone)]
 pub enum IdeaSource {
-    ChannelDraft,
+    ProjectDraft,
     Box(IdeaMail),
 }
 
@@ -81,7 +80,7 @@ struct Slot {
     view: tokio::sync::watch::Sender<Option<MessageId>>,
 }
 
-/// An agent of a thread as the agents system tells the chat: what to
+/// An agent of a thread as the agents system describes it to mail: what to
 /// call it, and what it is doing as its host last said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
@@ -94,8 +93,8 @@ pub struct Participant {
     pub stopped_because: Option<String>,
 }
 
-/// What the chat knows of an agent of the host with this identity, and
-/// `None` once it is gone; the agents system answers, the chat only asks.
+/// What mail knows of an agent of the host with this identity, and `None`
+/// once it is gone; the agents system owns the answer.
 pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participant>>;
 
 enum CreatingProject {
@@ -117,11 +116,11 @@ enum CreatedProject {
     AddressDraft(ProjectCreated),
 }
 
-pub struct ChatSystem {
+pub struct MailSystem {
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
     /// Each log's forest, by the identity of the host that keeps it.
-    chats: HashMap<EndpointId, HostChat>,
+    logs: HashMap<EndpointId, HostMail>,
     cursors: Cursors,
     outbox: Outbox,
     creating_projects: Vec<(CreatingProject, CreatedProject)>,
@@ -131,7 +130,7 @@ pub struct ChatSystem {
     /// Threads whose agent did not start from this window, and why, in the
     /// host's words, while this window runs.
     failed_starts: HashMap<ThreadId, String>,
-    events: UnboundedSender<ChatEvent>,
+    events: UnboundedSender<MailEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
     /// doing; the agents system knows.
@@ -139,25 +138,25 @@ pub struct ChatSystem {
     _pump: Task<()>,
 }
 
-impl EventEmitter<Event> for ChatSystem {}
+impl EventEmitter<Event> for MailSystem {}
 
-impl ChatSystem {
+impl MailSystem {
     pub fn new(db: rho_db::RhoDb, frame: FrameLink, cx: &mut Context<Self>) -> Self {
-        let cache = Cache::open_on(db).expect("the chat copy opens");
+        let cache = Cache::open_on(db).expect("the mail copy opens");
         let loaded = cache.load();
-        let mut chats = HashMap::new();
+        let mut logs = HashMap::new();
         for (seed, _) in &loaded.cursors {
-            let mut chat = HostChat::default();
+            let mut chat = HostMail::default();
             for record in cache.read_log(*seed) {
                 chat.tell(&record);
             }
-            chats.insert(*seed, chat);
+            logs.insert(*seed, chat);
         }
-        let (events, mut incoming) = unbounded::<ChatEvent>();
+        let (events, mut incoming) = unbounded::<MailEvent>();
         let pump = cx.spawn(async move |this, cx| {
             while let Some(event) = incoming.next().await {
                 if this
-                    .update(cx, |this, cx| this.chat_event(event, cx))
+                    .update(cx, |this, cx| this.mail_event(event, cx))
                     .is_err()
                 {
                     break;
@@ -178,7 +177,7 @@ impl ChatSystem {
             view: None,
             failed_starts: HashMap::new(),
             hosts: HashMap::new(),
-            chats,
+            logs,
             events,
             frame,
             participants: Rc::new(|_, agent, _| {
@@ -194,7 +193,7 @@ impl ChatSystem {
         }
     }
 
-    /// Tells chat which agents still exist and how their transcripts are named.
+    /// Tells mail which agents still exist and how their transcripts are named.
     pub fn set_participants(&mut self, participants: Participants) {
         self.participants = participants;
     }
@@ -238,7 +237,7 @@ impl ChatSystem {
     }
 
     pub fn status(&self, thread: ThreadId) -> Option<&ThreadStatus> {
-        self.chat(thread.host)?.status(thread.message)
+        self.host_mail(thread.host)?.status(thread.message)
     }
 
     pub fn project_address(&self, channel: ThreadId) -> Option<String> {
@@ -247,13 +246,13 @@ impl ChatSystem {
             .values()
             .find(|slot| slot.endpoint == Some(channel.host))?
             .name;
-        self.chat(channel.host)?
+        self.host_mail(channel.host)?
             .project(channel.message)
             .map(|project| project.address(alias))
     }
 
     /// Resolves a project address against aliases this device owns and the
-    /// channels the host has sent us.
+    /// projects the host has sent us.
     pub fn project_named(&self, address: &str) -> Option<ThreadId> {
         let (project, host_alias) = address.rsplit_once('@')?;
         let endpoint = self
@@ -261,22 +260,22 @@ impl ChatSystem {
             .values()
             .find(|slot| slot.name == host_alias)?
             .endpoint?;
-        let message = self.chat(endpoint)?.root_named(project)?;
+        let message = self.host_mail(endpoint)?.root_named(project)?;
         Some(ThreadId {
             host: endpoint,
             message,
         })
     }
 
-    pub fn chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
-        self.chats.get(&endpoint)
+    pub fn host_mail(&self, endpoint: EndpointId) -> Option<&HostMail> {
+        self.logs.get(&endpoint)
     }
 
     /// The hosts whose logs are held, with their names: those attached
     /// under the name the user gave them, the rest by identity.
     pub fn hosts(&self) -> Vec<(EndpointId, String)> {
         let mut hosts: Vec<(EndpointId, String)> = self
-            .chats
+            .logs
             .keys()
             .map(|seed| (*seed, self.host_name(*seed)))
             .collect();
@@ -294,7 +293,7 @@ impl ChatSystem {
 
     fn project_of(&self, thread: ThreadId) -> String {
         let host = self.host_name(thread.host);
-        self.chat(thread.host).map_or_else(
+        self.host_mail(thread.host).map_or_else(
             || host.clone(),
             |chat| cards::context(chat, thread.message, &host),
         )
@@ -323,9 +322,9 @@ impl ChatSystem {
         self.outbox.waiting_under(endpoint, parent)
     }
 
-    fn chat_event(&mut self, event: ChatEvent, cx: &mut Context<Self>) {
+    fn mail_event(&mut self, event: MailEvent, cx: &mut Context<Self>) {
         match event {
-            ChatEvent::Hello {
+            MailEvent::Hello {
                 host,
                 endpoint,
                 fresh,
@@ -337,17 +336,17 @@ impl ChatSystem {
                 }
                 if fresh {
                     self.cache.reset(endpoint);
-                    self.chats.insert(endpoint, HostChat::default());
+                    self.logs.insert(endpoint, HostMail::default());
                 }
-                self.chats.entry(endpoint).or_default();
+                self.logs.entry(endpoint).or_default();
                 self.send_unsent(endpoint, cx);
                 self.changed(endpoint, cx);
             }
-            ChatEvent::Records { host, records } => {
+            MailEvent::Records { host, records } => {
                 let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) else {
                     return;
                 };
-                let chat = self.chats.entry(endpoint).or_default();
+                let chat = self.logs.entry(endpoint).or_default();
                 for record in &records {
                     chat.tell(record);
                 }
@@ -358,18 +357,18 @@ impl ChatSystem {
                 self.finish_project_creation(cx);
                 self.changed(endpoint, cx);
             }
-            ChatEvent::Statuses { host, statuses } => {
+            MailEvent::Statuses { host, statuses } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
-                    self.chats
+                    self.logs
                         .entry(endpoint)
                         .or_default()
                         .set_statuses(statuses);
                     self.changed(endpoint, cx);
                 }
             }
-            ChatEvent::Closed { host } => {
+            MailEvent::Closed { host } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint)
-                    && let Some(chat) = self.chats.get_mut(&endpoint)
+                    && let Some(chat) = self.logs.get_mut(&endpoint)
                 {
                     chat.set_statuses(Vec::new());
                     self.changed(endpoint, cx);
@@ -379,7 +378,8 @@ impl ChatSystem {
     }
 
     /// A post receipt and the matching log entry can arrive in either
-    /// order. Act on the address only once this host's chat owns the root.
+    /// order. Act on the address only once this host's mail log contains the
+    /// root.
     fn finish_project_creation(&mut self, cx: &mut Context<Self>) {
         let mut pending = std::mem::take(&mut self.creating_projects);
         pending.retain(|(creation, created)| {
@@ -496,14 +496,14 @@ impl ChatSystem {
 
     /// Post the selected idea, independent of the box that owns its
     /// draft. The agent still starts from the logged mail, not its text.
-    pub fn post_idea(
+    pub fn send_idea(
         &mut self,
         project: ThreadId,
         source: &IdeaSource,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         match source {
-            IdeaSource::ChannelDraft => self.send_project_draft(project, cx),
+            IdeaSource::ProjectDraft => self.send_project_draft(project, cx),
             IdeaSource::Box(idea) => {
                 let name = self.project_address(project)?;
                 let id = self.post(
@@ -520,7 +520,7 @@ impl ChatSystem {
     }
 
     fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
-        let chat = self.chat(thread.host)?;
+        let chat = self.host_mail(thread.host)?;
         chat.message(thread.message)?;
         let root = chat.root_of(thread.message);
         chat.project(root)?;
@@ -583,7 +583,7 @@ impl ChatSystem {
                 Err(error) => {
                     this.outbox.failed(endpoint);
                     this.frame
-                        .echo(format!("chat: {error:#}"), StyleClass::SystemImportant, cx);
+                        .echo(format!("mail: {error:#}"), StyleClass::SystemImportant, cx);
                 }
             });
         })
@@ -605,7 +605,7 @@ impl ChatSystem {
             .push((CreatingProject::Posting(endpoint, client), created));
     }
 
-    /// One call to a host's chat; `done` hears the answer.
+    /// One call to a host's mail service; `done` hears the answer.
     pub fn call<C>(
         &self,
         endpoint: EndpointId,
@@ -642,7 +642,7 @@ impl ChatSystem {
     /// first: those past what they settled through or wrote after.
     pub(crate) fn unread_ids_in(
         &self,
-        chat: &HostChat,
+        chat: &HostMail,
         thread: ThreadId,
         marks: &Marks,
     ) -> Vec<MessageId> {
@@ -674,7 +674,7 @@ impl ChatSystem {
         _cx: &App,
         read: impl FnOnce(&cards::Host<'_>) -> R,
     ) -> Option<R> {
-        let chat = self.chats.get(&endpoint)?;
+        let chat = self.logs.get(&endpoint)?;
         let name = self.host_name(endpoint);
         let host = cards::Host {
             endpoint,
@@ -685,7 +685,7 @@ impl ChatSystem {
     }
 
     /// Posts a root on `endpoint`: a new project.
-    fn prompt_new_root(
+    fn prompt_new_project(
         this: Entity<Self>,
         endpoint: EndpointId,
         frame: &mut rho_frame::Frame,
@@ -714,7 +714,7 @@ impl ChatSystem {
     }
 }
 
-impl System for ChatSystem {
+impl System for MailSystem {
     fn kinds(&self) -> &'static [&'static str] {
         &[ThreadId::KIND]
     }
@@ -726,7 +726,7 @@ impl System for ChatSystem {
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
         let thread = self.thread_of(address)?;
-        self.chats.get(&thread.host)?.message(thread.message)?;
+        self.logs.get(&thread.host)?.message(thread.message)?;
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
@@ -736,7 +736,7 @@ impl System for ChatSystem {
         let thread = address
             .and_then(|address| self.thread_of(address))
             .filter(|thread| {
-                self.chat(thread.host)
+                self.host_mail(thread.host)
                     .is_some_and(|chat| !chat.is_project(thread.message))
             });
         self.set_view(thread);
@@ -759,7 +759,7 @@ impl System for ChatSystem {
         };
         Self::sync_view(&slot, self.view);
         self.hosts.insert(host, slot);
-        vec![Arc::new(ChatStream::new(
+        vec![Arc::new(MailStream::new(
             host,
             self.cursors.clone(),
             self.events.clone(),
@@ -776,7 +776,7 @@ impl System for ChatSystem {
             cx.notify();
             return;
         };
-        self.chats.remove(&endpoint);
+        self.logs.remove(&endpoint);
         self.creating_projects
             .retain(|(creation, _)| creation.host() != endpoint);
         self.cursors.reset(endpoint);
@@ -801,15 +801,15 @@ impl System for ChatSystem {
             .as_ref()
             .is_some_and(|subject| subject.kind() == AgentRef::KIND);
         if !hosts.is_empty() && !on_agent {
-            let new_root = this.clone();
+            let new_project = this.clone();
             rows.push(Row::run("c", "new project", move |frame, window, cx| {
-                let hosts = new_root.read(cx).hosts();
+                let hosts = new_project.read(cx).hosts();
                 match hosts.as_slice() {
                     [(seed, _)] => {
-                        Self::prompt_new_root(new_root.clone(), *seed, frame, window, cx)
+                        Self::prompt_new_project(new_project.clone(), *seed, frame, window, cx)
                     }
                     _ => {
-                        let this = new_root.clone();
+                        let this = new_project.clone();
                         let choices = hosts.clone();
                         frame.open_prompt(
                             "on host:",
@@ -833,7 +833,7 @@ impl System for ChatSystem {
                                     frame.echo("no such host", StyleClass::SystemInfo, cx);
                                     return;
                                 };
-                                Self::prompt_new_root(this.clone(), seed, frame, window, cx);
+                                Self::prompt_new_project(this.clone(), seed, frame, window, cx);
                             }),
                             window,
                             cx,
@@ -847,7 +847,7 @@ impl System for ChatSystem {
         // thread row. A desk row and a blank line are not rename contexts.
         let rename = self.thread_of(&point.surface).and_then(|surface| {
             let at = self.thread_of(point.subject.as_ref()?)?;
-            let chat = self.chats.get(&surface.host)?;
+            let chat = self.logs.get(&surface.host)?;
             let thread = if chat.is_project(surface.message) {
                 at
             } else {
@@ -909,7 +909,7 @@ impl System for ChatSystem {
         cx: &App,
     ) -> Vec<Claim> {
         let mut claims = Vec::new();
-        let mut seeds: Vec<EndpointId> = self.chats.keys().copied().collect();
+        let mut seeds: Vec<EndpointId> = self.logs.keys().copied().collect();
         seeds.sort_unstable();
         for seed in seeds {
             claims.extend(
@@ -933,11 +933,11 @@ impl System for ChatSystem {
     }
 
     /// A message is read in the thread it was posted under, where a private
-    /// reply about it shows; a thread straight under a channel is read in
+    /// reply about it shows; a thread directly under a project is read in
     /// its own screen, under its head.
     fn shown_in(&self, address: &Address, _cx: &App) -> Option<Address> {
         let thread = self.thread_of(address)?;
-        let chat = self.chats.get(&thread.host)?;
+        let chat = self.logs.get(&thread.host)?;
         let parent = chat.message(thread.message)?.parent?;
         let in_channel = chat.is_project(parent);
         let message = if in_channel { thread.message } else { parent };
@@ -960,12 +960,12 @@ impl System for ChatSystem {
     /// in when any is: a done on a stop's card sees the stop.
     fn seen(&self, address: &Address, _cx: &App) -> Seen {
         self.thread_of(address)
-            .and_then(|thread| self.chats.get(&thread.host)?.newest_in(thread.message))
+            .and_then(|thread| self.logs.get(&thread.host)?.newest_in(thread.message))
             .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0.0))
     }
 
     fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
-        self.chats
+        self.logs
             .iter()
             .flat_map(|(&host, chat)| {
                 chat.statuses().filter_map(move |status| {
@@ -988,7 +988,7 @@ impl System for ChatSystem {
     }
 
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
-        self.chats
+        self.logs
             .iter()
             .flat_map(|(&host, chat)| {
                 chat.roots().iter().filter_map(move |&message| {
@@ -1045,7 +1045,7 @@ impl System for ChatSystem {
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         let mut found = Vec::new();
         for (host, alias) in self.hosts() {
-            let Some(chat) = self.chats.get(&host) else {
+            let Some(chat) = self.logs.get(&host) else {
                 continue;
             };
             let mut seen = BTreeSet::new();

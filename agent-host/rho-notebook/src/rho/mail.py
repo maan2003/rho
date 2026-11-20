@@ -163,7 +163,7 @@ def root(name: str) -> int | None:
 
 def origin(id: int) -> str:
     """The `origin` prop of an agent started from message `id`."""
-    return f"chat:{int(id)}"  # origin tag shared with the window until its protocol rename
+    return f"chat:{int(id)}"  # persisted origin tag, shared with the window
 
 
 def origin_message(props: dict) -> int | None:

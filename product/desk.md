@@ -24,7 +24,7 @@ does:
 - narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
 
 ## screen Desk
-status: narrowing to one project is not built; the old channel screen still exists in its place.
+status: narrowing to one project is not built; the project still has its own list of threads.
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits

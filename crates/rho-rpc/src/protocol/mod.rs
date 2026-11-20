@@ -189,8 +189,9 @@ pub enum Protocol {
     /// Worksets and the agent directory (`rho-agents-client`,
     /// `protocol::worksets`). Replaces `Agents`.
     Worksets,
-    /// The host's chat: its log, and what the user says in it (`rho-chat`).
-    Chat,
+    /// The host's mail log and what the user writes to it (`rho-mail`).
+    #[senax(rename = "Chat")]
+    Mail,
 }
 
 /// The first frame on every stream: which protocol it speaks, and that

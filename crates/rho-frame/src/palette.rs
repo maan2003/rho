@@ -385,7 +385,7 @@ mod tests {
             thread("waiting", "wave@lab", None, false, Some("asks · 1h")),
             thread("recent", "foam@lab", Some(0), false, None),
         ];
-        let rows = flatten(&[Row::run("", "new channel", |_, _, _| {})], |_| None);
+        let rows = flatten(&[Row::run("", "new project", |_, _, _| {})], |_| None);
         let listing = Listing::new(rows, places);
         assert_eq!(ids(&listing, " "), [4, 0, 3, 5]);
         assert_eq!(ids(&listing, "urrent"), [1]);
@@ -456,7 +456,7 @@ mod tests {
     fn an_exact_command_beats_a_more_specific_command_offered_first() {
         let rows = flatten(
             &[
-                Row::run("", "done with this message", |_, _, _| {}),
+                Row::run("", "done with this mail", |_, _, _| {}),
                 Row::run("d", "done", |_, _, _| {}),
             ],
             |_| None,
