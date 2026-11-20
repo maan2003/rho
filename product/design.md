@@ -1,6 +1,6 @@
 # design
 
-The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form, including Home and host chat. It does not specify a look for the future desk or project mail. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
+The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, the project list, mail, and the agent transcript. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
 
 ## token color
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
@@ -56,13 +56,10 @@ states:
 - card open: the reason and age sit beside the heading in `attention`.
 - attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing elsewhere is important enough.
 - host away: a named `lost connection` notice, or a count when more than one host is away.
-- unpaired: a `quiet` notice that the verdicts stay on this device; on the phone it can displace the heading and card words.
+- unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
 - echo: the left side reads the `Echo line`; mode, lamp, and host warning keep their places.
-used on: `window.Screen`, including the built Home, channel, and thread described by `desk.Desk`, `mail.Project`, and `mail.Thread`.
-form:
-```text
-Flaky clock test    result · 8m                                  ●   NOR
-```
+used on: `window.Screen`, including `desk.Desk`, `mail.Project`, `mail.Thread`, and `agents.Agent`.
+form: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on an unpaired phone](design/phone-menu.png); [agent with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
 purpose: answer the action the user just took without opening anything.
@@ -70,48 +67,36 @@ looks: one line of `answer` in `editor text`, occupying the left of the `Status 
 states:
 - quiet: absent; the normal heading is in view.
 - answer or refusal: the first line of the latest notice appears in the same place and color, then goes; an open prompt clears it.
-used on: `window.Screen`, including `mail.Thread` and the built Home under `desk.Desk`.
-form:
-```text
-done: Flaky clock test · nothing waits                                  NOR
-```
+used on: `window.Screen`, including `mail.Thread` and `desk.Desk`.
+form: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
 purpose: let the user pick a place, thread, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. The `Desk` sets subjects, card words, and addresses in separate columns, with `row air` between columns; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow desk row puts its words below the subject; a channel row can wrap. The channel uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+looks: one row of `editor text`; name first in `reading text`, then the quieter context. `desk.Desk` sets subjects, card words, and addresses in separate columns, with `row air` between columns; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts its words below the subject; the project list can wrap its counts. The list uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
 states:
 - desk: a subject, card words in `attention` or status in `quiet`, and a project address in `quiet`; a folded row uses the address instead of a subject.
-- channel: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then reply counts, participants, and age as available.
+- project list: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then mention, unread and reply counts, a status if present, and age.
 - prompt or palette: the candidate's name, its `attention` card words or `quiet` status if present, then its `quiet` address or key; query matches use `marked`; the chosen row keeps its fill all the way across.
-- empty: Home or a channel says there is nothing to open; a prompt with no answers shows just the input.
-used on: built Home (`desk.Desk`), channel (`mail.Project`), and the command and find prompts (`window.Palette`).
-form:
-```text
-  clock              result · 8m · lab
-Flaky clock test  @1 · 2 new · 1 reply · 8m
-Flaky clock test   clock · lab
-```
+- empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
+used on: `desk.Desk`, `mail.Project`, and `window.Palette`.
+form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [wrapped unread project row](design/phone-channel.png), and [matched palette row](design/laptop-prompt.png).
 
 ## part Message header
 purpose: identify who wrote the message and when, before the user reads its words.
 looks: the name in `marked` with `emphasis`, then a centered dot and `quiet` time, on a line above the message in `editor text`.
 states:
-- delivered: `you`, the agent's name, or `system`, and the time.
+- delivered: `you` or the project's address, and the time; an edited mail adds `edited`.
 - sending: the header reads `you · sending…` in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
-used on: built host thread (`mail.Thread`).
-form:
-```text
-you · 09:12
-Fix the clock test that fails one run in five.
-```
+used on: `mail.Thread`.
+form: [you and clock@lab above their respective mails](design/laptop-card.png).
 
 ## part Quote
 purpose: let the user read the words another message is answering without mistaking them for new words.
 looks: quoted Markdown keeps its `>` marker in the reading line. The words use `editor text` on the `reading surface`, without a separate quote panel.
 states:
 - plain: the body has no quote marker.
-- quoted: `>` starts the quoted line; the reply can follow in ordinary text.
+- quoted: `>` starts the quoted line; a block of several lines starts folded to its first line and `…`. The reply can follow in ordinary text.
 used on: built host thread (`mail.Thread`) and transcript (`agents.Agent`) when the writer includes quoted Markdown.
 form:
 ```text
@@ -121,17 +106,13 @@ A separate clock per test should do it.
 
 ## part Draft tail
 purpose: let the user write or answer without leaving the buffer.
-looks: one line in `quiet` after the last mail and any status (or the last Desk row), with a divider, the recipient, and the send key; the draft is ordinary `editor text` immediately below it on the same reading surface.
+looks: one line in `quiet` after the last mail and any status (or the last Desk row), with a divider, the recipient, and the send key on laptops. The phone omits the shortcut. The draft is ordinary `editor text` immediately below it on the same reading surface.
 states:
 - empty: the separator stays visible with a blank editor line below it.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - after send: the new mail is above the separator, marked while it is on its way; the tail is empty. On Desk the echo says where it went.
-used on: `desk.Desk`, `mail.Thread`, and the built channel (`mail.Project`).
-form:
-```text
-── reply to tide@lab · ctrl-enter sends
-Yes, use a separate clock.
-```
+used on: `desk.Desk`, `mail.Thread`, and the project list (`mail.Project`).
+form: [laptop idea tail](design/laptop-desk.png), [laptop reply tail](design/laptop-card.png), and [short phone reply tail](design/phone-card.png).
 
 ## part Menu
 purpose: offer a few keyed choices without taking the user away from the thing they are on.
@@ -141,15 +122,8 @@ states:
 - open: title, actions, keys, and any values; on the phone the sheet has `close` at the top.
 - sub-menu: it takes the same place; the phone sheet adds `‹ back`.
 - empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
-used on: `window.Screen` wherever `window.Menu` opens, including verdicts on the built `mail.Thread` and Home (`desk.Desk`).
-form:
-```text
-Flaky clock test
-  d  done       n  next card
-  m  mute
-  s  snooze
-  u  undo
-```
+used on: `window.Screen` wherever `window.Menu` opens, including verdicts in `mail.Thread` and `agents.Agent`. Desk does not offer verdicts.
+form: [laptop verdict grid](design/laptop-menu.png) and [phone verdict sheet](design/phone-menu.png).
 
 ## part Prompt
 purpose: ask for a line of text and offer answers without a dialog.
@@ -160,44 +134,31 @@ states:
 - no match: `no match` below the input when a choice is required and none fits.
 - closed: the strip goes away and the keys return.
 used on: `window.Palette` and other questions over `window.Screen`, as in `hosts.Attach a host`.
-form:
-```text
-command: start agent
-start agent, choosing where and runtime
-start agent › new workset on a repository
-start agent › here, in a directory on the host
-```
+form: [filtered laptop palette](design/laptop-prompt.png) and [blank phone palette](design/phone-prompt.png).
 
 ## part Phone bar
 purpose: give the thumb the actions that the current place can use.
 looks: one `thumb target` band with a `seam` above and equally wide buttons; each `thumb icon` sits over its `thumb label`, both in `quiet`.
 states:
 - desk: menu, open, and more; open deals the top card and a tap on a row opens that row.
-- card open: back, done, snooze, more, and send; verdicts land on the open card.
-- reading elsewhere: back, home, menu, and more or send where those act on the work.
+- card open: back, done, snooze, and more; send is added where there is a draft. Verdicts land on the card, including from the agent transcript that belongs to it.
+- reading elsewhere: back, desk, and menu; send is added where there is a draft.
+- writing an idea: cancel and send.
 - prompt: only cancel and enter.
 - menu sheet: the sheet takes taps in front of the work and bar.
-used on: `window.Screen` at `narrow window` width, including the built Home, host thread, and `window.Palette`.
-form:
-```text
-  ‹       ⌂       ☰       ⋯       ↑
- back    home    menu    more    send
-```
+used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `mail.Thread`, `agents.Agent`, and `window.Palette`.
+form: [Desk](design/phone-desk.png), [card with send](design/phone-card.png), [transcript without send](design/phone-agent.png), and [palette](design/phone-prompt.png).
 
 ## part Card's words
 purpose: say why something wants the user and how long it has waited.
-looks: a reason, centered dot, and age in `attention`, beside a room name in a `Row` and beside the heading in the `Status line`. On a phone the heading shortens before these words.
+looks: a reason, centered dot, and age in `attention`, beside a subject in a `Row` and beside the heading in the `Status line`. On a phone the heading shortens before these words.
 states:
 - ask, result, or stop: the reason and the age, not just the color.
-- snoozed room: the row says until when in `quiet` if no other card is waiting in it.
+- snoozed thread: it leaves the Desk waiting rows until it can be dealt again.
 - nothing waiting: no card words; ordinary row information remains.
 - echo: the words give way on the top line until the answer is gone.
-used on: built Home (`desk.Desk`) and open card thread (`mail.Thread`).
-form:
-```text
-asks · now     result · 1.5h      failed · 1.2d
-snoozed · until 05:17
-```
+used on: `desk.Desk` and `mail.Thread` when open as a card.
+form: [ask on the phone's top line](design/phone-card.png) and [grouped results on Desk](design/laptop-desk.png).
 
 ## motion An answer replaces the heading
 means: the last action has an answer; the ordinary name and card words return without the user doing anything.
@@ -220,10 +181,10 @@ means: a flick either turns the page or gives it back; the brief slide shows whi
 lasts: `thumb settle`.
 
 ## rule the echo takes the name's place
-when the `Echo line` answers, then the `Status line` gives up its heading and `Card's words`, not its lamp, connection warning, or mode.
+when the `Echo line` answers, then the `Status line` gives up its heading, `Card's words`, and pairing notice, not its lamp, connection warning, or mode.
 
-## rule a room wears its waiting card's words
-when a `Row` in Home has a waiting card, then `Card's words` take the place of the room's quiet waiting text rather than making a second row.
+## rule a thread wears its waiting card's words
+when a `mail.Thread` has a waiting card, then its `Row` on `desk.Desk` carries `Card's words` in the waiting section and does not also appear under `moving`.
 
 ## rule a prompt takes the phone bar
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.

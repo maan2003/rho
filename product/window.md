@@ -47,7 +47,7 @@ does:
 When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
 
 ## screen Palette
-status: full-text search across mail and notes is not built.
+status: full-text search across mail and notes is not built; the matching mail line in the mock does not appear.
 answers: where can the user go, or what can they run, with these words?
 shows:
 - the query in the `Palette` prompt
@@ -62,11 +62,14 @@ keys:
 - `enter`: `Palette.run`
 - `ctrl-n`, `ctrl-p`, `escape`: `Prompt`
 starts: `Go to something by name`, `Run a command I rarely use`
+
+Built renders: [filtered laptop palette](design/laptop-prompt.png) and [blank phone palette](design/phone-prompt.png).
+
 mock:
 ```text
 : clock
 
-Flaky clock test         asks · 2h                  tide@lab
+Flaky clock test         asks · 2.0h                  tide@lab
 Cache eviction tests     Running the clock tests    tide@lab
 Mail · Flaky clock test  The mock clock is shared between tests.
 ```

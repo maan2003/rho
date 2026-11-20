@@ -45,12 +45,15 @@ keys:
 - `ctrl-t` while writing: choose another project without losing the draft
 - `:`: `window.Palette`
 starts: `Glance at what moves`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
+
+Built renders: [waiting and moving on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
+
 mock:
 ```text
-desk                                                                        NOR
+desk                                                                  ●     NOR
 
 15 wait
-Flaky clock test            asks · 2h                         tide@lab
+Flaky clock test            asks · 2.0h                       tide@lab
 reef@lab                    6 failed · 5m
 Release window              asks · 20m                        slack@harness
 Shoreline import            result · 8m                       shoal@lab
@@ -69,10 +72,10 @@ Keep the asymmetric clock test in the suite.
 
 mock, phone:
 ```text
-desk                               NOR
+desk                          ●    NOR
 15 wait
 Flaky clock test               tide@lab
-  asks · 2h
+  asks · 2.0h
 reef@lab
   6 failed · 5m
 Release window            slack@harness
