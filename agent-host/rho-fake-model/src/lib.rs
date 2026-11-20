@@ -57,8 +57,10 @@ pub enum Scenario {
     FortyToolCalls,
     /// Emit encrypted reasoning followed by a compaction item.
     ReasoningCompaction,
-    /// Ask a question through exec/chat.post and await the user.
+    /// Ask a question through mail and await the user.
     ClarifyingQuestion,
+    /// Spawn a child, exchange direct mail, and ask the user for a reply.
+    MailChain,
 }
 
 impl Scenario {
@@ -73,6 +75,7 @@ impl Scenario {
             Self::FortyToolCalls => "forty-tool-calls",
             Self::ReasoningCompaction => "reasoning-compaction",
             Self::ClarifyingQuestion => "clarifying-question",
+            Self::MailChain => "mail-chain",
         }
     }
 }
@@ -619,7 +622,22 @@ fn openai_turn(
     }
     // A chain without a message answers in topic 0, which policy refuses.
     let topic = topic.unwrap_or(0);
-    if state.config.scenario == Scenario::RealToolRounds && (!tools.is_empty() || has_tool_result) {
+    if state.config.scenario == Scenario::MailChain {
+        if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
+            append_tool_call(
+                &mut events,
+                state,
+                request_number,
+                0,
+                tool,
+                Some(mail_chain(request, topic)),
+            );
+        } else {
+            append_text(&mut events, state, request_number, request, 0);
+        }
+    } else if state.config.scenario == Scenario::RealToolRounds
+        && (!tools.is_empty() || has_tool_result)
+    {
         let outputs: Vec<_> = request
             .input
             .iter()
@@ -766,6 +784,40 @@ fn openai_turn(
     events
 }
 
+/// This fixture reads only incoming mail, not text in its own earlier
+/// tool calls. An initial peer brief appears only after the first exec.
+fn mail_chain(request: &OpenAiRequest, topic: u64) -> String {
+    for item in request.input.iter().rev() {
+        if item.get("role").and_then(Value::as_str) == Some("user") {
+            let input = item.get("content").unwrap_or(item).to_string();
+            if input.contains("MAIL-RIG-USER-ANSWER") {
+                return "end_turn()".into();
+            }
+            if input.contains("MAIL-RIG-START") {
+                return format!(
+                    "mail_rig_thread = {topic}\nagents.spawn_new_engineer(task_name='check', prompt='MAIL-RIG-CHILD-BRIEF')\nend_turn()"
+                );
+            }
+        }
+        if let Some(output) = item.get("output") {
+            let output = output.to_string();
+            if output.contains("MAIL-RIG-PEER-RESULT") {
+                return "mail.send('user', 'Can I use the test clock?', thread=mail_rig_thread, kind='ask')\nend_turn()".into();
+            }
+            if let Some(brief) = output.rsplit_once("· mail #").and_then(|(_, tail)| {
+                let id = tail.split(|c: char| !c.is_ascii_digit()).next()?;
+                id.parse::<u64>().ok()
+            }) && output.contains("MAIL-RIG-CHILD-BRIEF")
+            {
+                return format!(
+                    "mail.send(None, 'MAIL-RIG-PEER-RESULT', reply_to={brief})\nend_turn()"
+                );
+            }
+        }
+    }
+    "print('Reading mail.')".into()
+}
+
 /// The topic of the newest message in the request's own input: policy heads
 /// each delivered message with `[#<topic> `.
 fn newest_topic(request: &OpenAiRequest) -> Option<u64> {
@@ -819,7 +871,7 @@ fn append_finish(
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
         let source =
-            format!("chat.post({topic}, {text:?}, mention=\"user\", kind=\"result\")\nend_turn()");
+            format!("mail.send(\"user\", {text:?}, thread={topic}, kind=\"result\")\nend_turn()");
         append_tool_call(
             events,
             state,

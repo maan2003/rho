@@ -18,7 +18,7 @@ pub use gccp::{
 };
 pub use mail::MailView;
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, Role, UnixMs,
+    Address, AgentId, ChatSeq, ContentPart, Mention, MentionKind, Message, MessageId, UnixMs,
     WorksetKind,
 };
 use rho_db::RhoDb;
@@ -33,7 +33,7 @@ use crate::ipc::workset::{PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    ChatRead as _, ChatWrite as _, GccpWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
+    GccpWrite as _, MailRead as _, MailWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
 };
 use crate::{AgentStatus, InferenceState, RuntimeState};
 
@@ -1037,19 +1037,9 @@ impl AgentPool {
         let Some(message) = read.message(message) else {
             return;
         };
-        let mut receivers: Vec<AgentId> = read.members_under(message.parent);
-        receivers.extend(
-            message
-                .mentions
-                .iter()
-                .filter_map(|mention| match mention.to {
-                    Address::Agent(agent) => Some(agent),
-                    Address::User | Address::System { .. } => None,
-                }),
-        );
-        let mut worksets: Vec<WorksetId> = receivers
+        let mut worksets: Vec<WorksetId> = read
+            .recipients_of(&message)
             .into_iter()
-            .filter(|agent| message.from != Address::Agent(*agent))
             .filter_map(|agent| read.agent(agent).map(|head| head.workset))
             .filter(|workset| Some(*workset) != except)
             .collect();
@@ -1300,25 +1290,45 @@ impl AgentPool {
                         .delivered,
                 )
             }
-            PyRequest::Post {
+            PyRequest::SendMail {
                 sender,
                 parent,
+                reply_to,
                 mentions,
                 content,
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
+                let direct = mentions
+                    .iter()
+                    .any(|mention| mention.kind == MentionKind::Direct);
+                let project = if direct {
+                    anyhow::ensure!(
+                        parent.is_none(),
+                        "direct mail chooses its own thread; address the agent"
+                    );
+                    self.mail_project(sender)
+                } else {
+                    None
+                };
                 let message = NewMessage {
                     from: Address::Agent(sender),
-                    reply_to: None,
+                    reply_to,
                     mentions,
                     content,
                 };
                 let mut write = self.db.write().await;
-                let id = write.post(UnixMs::now(), parent, message, None)?;
+                let at = UnixMs::now();
+                let id = if direct {
+                    write.post_peer(at, project, message)?
+                } else {
+                    write.post(at, parent, message, None)?
+                };
                 write.commit();
                 self.wake_receivers(id, Some(workset));
-                self.consider_naming(id);
+                if !direct {
+                    self.consider_naming(id);
+                }
                 PyReply::Seq(id.0)
             }
             PyRequest::Status {
@@ -1357,21 +1367,7 @@ impl AgentPool {
                 project,
                 limit.min(100) as usize,
             )?),
-            PyRequest::Mail { sender, to, text } => {
-                self.own_agent(workset, sender)?;
-                self.workset_of(to)?;
-                anyhow::ensure!(sender != to, "an agent does not mail itself");
-                anyhow::ensure!(!text.trim().is_empty(), "a message needs text");
-                let input = Control::Input {
-                    content: vec![ContentPart::Text { text }],
-                    role: Role::Tool,
-                    message: None,
-                };
-                // Handed means the agent holds it: its ack says so.
-                let (_, client, _) = self.load(to).await?;
-                client.control(input).await?;
-                PyReply::Done
-            }
+            PyRequest::ProjectNamed(name) => PyReply::Project(self.db.read().project_named(&name)),
             PyRequest::Message(id) => {
                 PyReply::Messages(self.db.read().message(id).into_iter().collect())
             }
@@ -1452,6 +1448,15 @@ impl AgentPool {
             }
             PyRequest::Models => PyReply::Models(models()),
             PyRequest::ResolveAgent(prefix) => PyReply::Agent(self.resolve_agent(&prefix)?),
+            PyRequest::AgentHandle(agent) => {
+                PyReply::Handle(self.db.read().agent(agent).map(|head| {
+                    let role = match head.spec.props.get("preset").map(String::as_str) {
+                        Some("advisor") => "adv",
+                        _ => "eng",
+                    };
+                    format!("{role}-{}", agent.encoded())
+                }))
+            }
             PyRequest::ExternalAddress(agent) => {
                 self.own_agent(workset, agent)?;
                 PyReply::Text(self.external_address(agent)?.to_string())
@@ -1501,7 +1506,7 @@ impl AgentPool {
             loop {
                 tokio::select! {
                     appended = feed.recv() => match appended {
-                        Ok(crate::store::Appended::Chat(_))
+                        Ok(crate::store::Appended::Mail(_))
                         | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return Vec::new(),

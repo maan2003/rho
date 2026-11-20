@@ -946,7 +946,7 @@ mod tests {
     fn a_host_draft_and_its_source_both_show() {
         let mut exec = tool(UiToolStatus::Running);
         exec.name = "exec".into();
-        exec.arguments = "chat.post(2, 'Hello')".into();
+        exec.arguments = "mail.send('user', 'Hello', thread=2, kind='fyi')".into();
         let source = UiBlock::Tool(exec);
         let writer = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let draft = UiBlock::MessageDraft {
@@ -962,7 +962,9 @@ mod tests {
         assert_eq!(drafted.spans[0].class, StyleClass::AgentLabel);
         assert_eq!(drafted.spans[1].class, StyleClass::Default);
         let sourced = render(&source, None, 0, &label);
-        assert!(text_of(&sourced.spans).contains("chat.post(2, 'Hello')"));
+        assert!(
+            text_of(&sourced.spans).contains("mail.send('user', 'Hello', thread=2, kind='fyi')")
+        );
         assert!(!text_of(&sourced.spans).contains("writing"));
     }
 

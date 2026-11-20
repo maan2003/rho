@@ -12,7 +12,7 @@ use super::*;
 use crate::inference::Item;
 use crate::inference::config::ReasoningEffort;
 use crate::record::AgentSpec;
-use crate::store::{ChatRead as _, StoreRead as _, StoreWrite as _};
+use crate::store::{MailRead as _, StoreRead as _, StoreWrite as _};
 
 struct Harness {
     _directory: tempfile::TempDir,
@@ -139,7 +139,7 @@ impl Harness {
     fn posted(&self) -> Vec<(String, Option<MentionKind>)> {
         self.db
             .read()
-            .chat_since(ChatSeq::ZERO, usize::MAX)
+            .mail_since(ChatSeq::ZERO, usize::MAX)
             .iter()
             .filter_map(Message::from_record)
             .filter(|message| matches!(message.from, Address::Agent(_)))

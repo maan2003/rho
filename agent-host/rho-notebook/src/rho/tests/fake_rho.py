@@ -19,7 +19,6 @@ class State:
         self.messages = []  # MessageRecord, in order, with `_to`: who receives it
         self.members = {}  # (thread, agent) -> joined (True) or left
         self.names = {}  # thread -> name
-        self.mail = []  # (sender, to, text) handed outside the chat
         self.inputs = []  # (agent, text, role, message)
         self.calls = []  # (name, args)
         self.endpoint = "ab" * 32  # the host's own; None for a host without iroh
@@ -170,7 +169,7 @@ def _members_under(parent):
     return [agent for agent, joined in decided.items() if joined]
 
 
-def _post(sender, parent, text, mentions):
+def _post(sender, parent, text, mentions, reply_to=None):
     """With the lock held. Who receives a message is fixed when it is
     posted, as the host's inbox index fixes it."""
     if parent is not None and _message(parent) is None:
@@ -178,11 +177,14 @@ def _post(sender, parent, text, mentions):
     if not text.strip():
         raise ValueError("a message needs text")
     for address, kind in mentions:
-        assert kind in ("ask", "result", "fyi"), kind
+        assert kind in ("ask", "result", "fyi", "direct"), kind
         assert address == "user" or address in STATE.agents or address in STATE.elsewhere, address
-    to = [agent for agent in _members_under(parent) + [address for address, _ in mentions] if agent not in ("user", sender)]
+    members = [] if any(kind == "direct" for _, kind in mentions) else _members_under(parent)
+    to = [agent for agent in members + [address for address, _ in mentions] if agent not in ("user", sender)]
     id = _event()
     STATE.messages.append({"id": id, "at": 0, "parent": parent, "sender": sender, "mentions": list(mentions), "text": text, "_to": set(to)})
+    if reply_to is not None:
+        STATE.messages[-1]["reply_to"] = reply_to
     return id
 
 
@@ -197,19 +199,59 @@ def post(sender, parent, text, *, mentions=None):
         return _post(sender, parent, text, mentions or [])
 
 
-def mail(sender, to, text):
+def send_mail(sender, parent, text, *, to=None, kind=None, reply_to=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
+        if to is None:
+            return _post(sender, parent, text, [], reply_to)
+        if to == "user":
+            return _post(sender, parent, text, [(to, kind)], reply_to)
         if to not in STATE.agents and to not in STATE.elsewhere:
             raise ValueError("agent was deleted or does not exist")
         if sender == to:
             raise ValueError("an agent does not mail itself")
-        if not text.strip():
-            raise ValueError("a message needs text")
-        STATE.mail.append((sender, to, text))
-        if to in STATE.agents:
-            STATE.inputs.append((to, text, "tool", None))
+
+        def root_of(id):
+            record = _message(id)
+            while record and record["parent"] is not None:
+                record = _message(record["parent"])
+            return record["id"] if record else None
+
+        peer_reply = _message(reply_to) if reply_to is not None else None
+        if peer_reply and any(k == "direct" for _, k in peer_reply["mentions"]):
+            project = root_of(reply_to)
+        else:
+            who = sender
+            project = None
+            while who in STATE.agents:
+                props = STATE.agents[who]["props"]
+                if props.get("origin"):
+                    project = root_of(int(props["origin"].split(":")[1]))
+                elif joined := next((thread for thread, name in STATE.members if name == who), None):
+                    project = root_of(joined)
+                if project:
+                    break
+                who = props.get("parent") or props.get("started_by")
+        if project is None:
+            project = next((m["id"] for m in STATE.messages if m["parent"] is None and m["text"] == "Agent mail"), None)
+            if project is None:
+                project = _post(sender, None, "Agent mail", [])
+        pair = {sender, to}
+        thread = next((m["id"] for m in STATE.messages
+            if m["parent"] == project and any(k == "direct" and {m["sender"], peer} == pair for peer, k in m["mentions"])), None)
+        id = _post(sender, thread or project, text, [(to, "direct")], reply_to)
+        if thread is None:
+            STATE.names[id] = " ↔ ".join(sorted(pair))
+        return id
+
+
+def agent_handle(agent):
+    spec = STATE.agents.get(agent)
+    if spec is None:
+        return f"eng-{agent}" if agent in STATE.elsewhere else None
+    role = "adv" if spec["props"].get("preset") == "advisor" else "eng"
+    return f"{role}-{agent}"
 
 
 def resolve_agent(prefix):
@@ -339,6 +381,22 @@ def read(thread, last):
         if thread is not None and _message(thread) is None:
             raise ValueError(f"no message {thread}")
         return [_public(m) for m in STATE.messages if m["parent"] == thread][-last:] if last else []
+
+
+def project_named(name):
+    def headline(text):
+        return next((" ".join(line.split()) for line in text.splitlines() if line.strip()), "")
+
+    wanted = headline(name)
+    with STATE.lock:
+        return next(
+            (
+                m["id"]
+                for m in reversed(STATE.messages)
+                if m["parent"] is None and not m.get("deleted") and headline(_name(m["id"])) == wanted
+            ),
+            None,
+        )
 
 
 def post_user(parent, text, mentions=()):

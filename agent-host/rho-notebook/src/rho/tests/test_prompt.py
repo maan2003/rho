@@ -31,10 +31,10 @@ class Templates(unittest.TestCase):
         for text in [gpt("engineer"), claude_t("engineer")]:
             self.assertIn("A cold mail stands alone; a warm mail is short.", text)
             self.assertIn("Quote the line you answer instead of repeating the mail.", text)
-            self.assertIn("Put progress in `chat.status`, never in a mail.", text)
+            self.assertIn("Put progress in `mail.status`, never in a mail.", text)
             self.assertIn("Fork tangents under the mail that raised them.", text)
             self.assertIn("the check you ran and its last lines", text)
-            self.assertIn("Mail an ask or answer to another agent with `agents.message`.", text)
+            self.assertIn("or an agent such as `eng-q9tz`.", text)
             for obsolete in ["human.", "message_agent", "chat.direct", "Post passing progress"]:
                 self.assertNotIn(obsolete, text)
 
@@ -67,19 +67,18 @@ class Templates(unittest.TestCase):
         collaboration = between(text, "## Working with other agents", "## Working with the user")
         self.assertTrue(collaboration.startswith("\n\nTEAM_SENTINEL\n\n"))
         self.assertLess(collaboration.index("### Advisor"), collaboration.index("### Engineers"))
-        self.assertLess(collaboration.index("agents.message(*, agent_id: str, message: str)"), collaboration.index("### Briefing and integrating work"))
         for needle in ["agents.spawn_new_advisor(msg: str)", "agents.spawn_new_engineer(*, task_name:",
                        "task_name is a short kebab-case label", "agents.cancel(",
                        "loads applicable AGENTS.md guidance and the skill catalogue",
                        "Without an explicit request, do NOT consult the Advisor for:"]:
             self.assertIn(needle, collaboration)
-        self.assertIn('chat.post(thread, text, *, mention=None, kind=None) → int', text)
-        self.assertIn('chat.status(thread, text)', text)
-        self.assertIn("Put progress in `chat.status`, never in a mail", text)
+        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, kind=None) → int', text)
+        self.assertIn('mail.status(thread, text)', text)
+        self.assertIn("Put progress in `mail.status`, never in a mail", text)
         self.assertNotIn("Post passing progress", text)
         self.assertIn("A cold mail stands alone; a warm mail is short.", text)
         self.assertIn("(ASD-STE100). The send refuses a sentence of more than 25 words", text)
-        self.assertIn("it reports back to you with agents.message.", text)
+        self.assertIn("it reports back to you with mail.send.", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)
         self.assertIn("def papercut(", text)
         self.assertTrue(text.endswith("WORKSPACE_SENTINEL"))
@@ -89,9 +88,9 @@ class Templates(unittest.TestCase):
     def test_advisor_prompt_has_only_its_capabilities(self):
         text = gpt("advisor", "TEAM_SENTINEL\n\n")
         self.assertIn("## Working with other agents\n\nTEAM_SENTINEL\n\n", text)
-        self.assertIn("focused result with agents.message", text)
-        self.assertIn("agents.message(*, agent_id: str, message: str) → Awaitable[str]", text)
-        self.assertIn("Use `agents.message` when a known agent has context", text)
+        self.assertIn("focused result with mail.send", text)
+        self.assertIn("mail.send(agent, text, *, reply_to=None) → int", text)
+        self.assertIn("Use `mail.send` when a known agent has context", text)
         for forbidden in ["spawn_new_advisor", "spawn_new_engineer", "agents.cancel(*", "human.",
                           "archive()", "## Diagrams", "chat.direct"]:
             self.assertNotIn(forbidden, text)
@@ -105,7 +104,7 @@ class Templates(unittest.TestCase):
             "## How time works", "## The notebook", "## Working with other agents",
             "## Reporting to your parent",
         ])
-        self.assertIn("Your parent agent sees only what you\nsend it with agents.message, not your code", text)
+        self.assertIn("Your parent agent sees only what you\nsend it with mail.send, not your code", text)
         for forbidden in ["human.", "archive()", "spawn_new_advisor", "spawn_new_engineer", "chat.direct"]:
             self.assertNotIn(forbidden, text)
 
@@ -209,7 +208,7 @@ class Instructions(unittest.TestCase):
             f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
             "\n\nYou were started directly and own the user\'s technical outcome."
             "\n\nAnother agent's message to you arrives in this format:\n```\n[message from <agent id>]\n<text>\n```"
-            '\n\nAnswer it with `agents.message(agent_id="<agent id>", message=text)`. An agent\'s post in a thread arrives like any chat message, after its thread.\n\n'
+            '\n\nAnswer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a card from it.\n\n'
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -232,7 +231,7 @@ class Instructions(unittest.TestCase):
         for runtime in [native(), claude()]:
             child = self.agent(runtime, preset="child", parent=parent.id)
             text = prompt.instructions(child)
-            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with agents.message(agent_id='eng-{parent.id}', message=text).", text)
+            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with mail.send('eng-{parent.id}', text).", text)
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
             for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
                               "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
@@ -246,12 +245,13 @@ class Instructions(unittest.TestCase):
             self.assertIn(
                 f"Your agent id is adv-{advisor.id}; your parent agent is eng-{parent.id}."
                 "\n\nMessages from your parent define your task. Report to your parent with "
-                f"agents.message(agent_id='eng-{parent.id}', message=text)."
-                f"\n\nComplete your independent analysis and send it to your parent with agents.message(agent_id='eng-{parent.id}', message=text). "
+                f"mail.send('eng-{parent.id}', text)."
+                f"\n\nComplete your independent analysis and send it to your parent with mail.send('eng-{parent.id}', text). "
                 "Ask a known agent for context the same way, and end your turn when blocked on a reply.\n",
                 text,
             )
-            self.assertNotIn("Another agent's message to you arrives", text)
+            self.assertIn("[message from <agent id>]", text)
+            self.assertEqual(text.count("the user can read it one level down and never gets a card from it."), 1)
             self.assertNotIn("agents.spawn_user_owned_engineer", text)
 
     def test_only_agents_the_user_manages_may_start_engineers_for_the_user(self):
@@ -262,8 +262,8 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
-            self.assertIn("chat.post(thread, text, *, mention=None, kind=None)", text)
-        note = (f"Engineer eng-{direct.id} started you for the user; ask it with agents.message(agent_id='eng-{direct.id}', message=text) if you "
+            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, kind=None)", text)
+        note = (f"Engineer eng-{direct.id} started you for the user; ask it with mail.send('eng-{direct.id}', text) if you "
                 "need more context. You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))
         self.assertNotIn("started you for the user", prompt.instructions(direct))

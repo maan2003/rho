@@ -35,19 +35,14 @@ def render(template: str, team: str, user_owned: str, context: str) -> str:
 
 
 def label(agent_id: str) -> str:
-    """How models and the GUI name an agent: its id behind "adv-" for an
-    Advisor and "eng-" otherwise. An agent of another workset has no known
-    role, so it is its bare id."""
-    spec = _rho.agents().get(agent_id)
-    if spec is None:
-        return agent_id
-    prefix = "adv" if spec["props"].get("preset") == "advisor" else "eng"
-    return f"{prefix}-{agent_id}"
+    """The agent's address, whether or not it works here. Deleted agents
+    have no address, but keep their id in existing mail."""
+    return _rho.agent_handle(agent_id) or agent_id
 
 
 def started_by_note(by: str) -> str:
     return (
-        f"Engineer {by} started you for the user; ask it with agents.message(agent_id={by!r}, message=text) if you "
+        f"Engineer {by} started you for the user; ask it with mail.send({by!r}, text) if you "
         "need more context."
     )
 
@@ -56,12 +51,13 @@ def team(agent_id: str, props: dict) -> str:
     """Who the agent is among the others, and how they talk."""
     me = label(agent_id)
     parent = props.get("parent")
-    if parent is not None:
+    parent_address = label(parent) if parent is not None else None
+    if parent_address is not None:
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
-            f"agent id is {me}; your parent agent is {label(parent)}.\n\nMessages from your "
+            f"agent id is {me}; your parent agent is {parent_address}.\n\nMessages from your "
             "parent define your task. Report to your parent with "
-            f"agents.message(agent_id={label(parent)!r}, message=text)."
+            f"mail.send({parent_address!r}, text)."
         )
     else:
         identity = (
@@ -69,15 +65,17 @@ def team(agent_id: str, props: dict) -> str:
             f"user's goals. Your agent id is {me}."
         )
     preset = props["preset"]
-    if preset == "advisor":
-        return (
-            f"{identity}\n\n"
-            "Complete your independent analysis and send it to your parent with "
-            f"agents.message(agent_id={label(parent)!r}, message=text). Ask a known agent for context the same way, "
-            "and end your turn when blocked on a reply.\n"
-        )
     started_by = props.get("started_by")
-    if preset == "child":
+    if preset == "advisor":
+        if parent_address is None:
+            ownership = "An Engineer has not asked you a question yet; wait for mail."
+        else:
+            ownership = (
+                "Complete your independent analysis and send it to your parent with "
+                f"mail.send({parent_address!r}, text). Ask a known agent for context the same way, "
+                "and end your turn when blocked on a reply."
+            )
+    elif preset == "child":
         ownership = (
             "You were spawned by another Engineer. Own the bounded assignment in the "
             "parent message."
@@ -98,7 +96,7 @@ Another agent's message to you arrives in this format:
 <text>
 ```
 
-Answer it with `agents.message(agent_id="<agent id>", message=text)`. An agent's post in a thread arrives like any chat message, after its thread.
+Answer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a card from it.
 
 """
 

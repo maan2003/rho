@@ -20,9 +20,9 @@ use crate::outbox::{Kept, Outgoing};
 type Host = [u8; 32];
 
 /// Every record, by the host and position.
-const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("chat3_log");
+const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("chat4_log");
 /// Where this client stands in each host's log.
-const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("chat3_cursor");
+const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("chat4_cursor");
 /// What the user wrote that no host has taken yet, by host and client id.
 const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new("chat3_outbox");
 /// What the user is writing under each parent and has not sent, by host
@@ -82,6 +82,11 @@ impl Cache {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
+            // Older clients cannot decode the new Direct mention. Replay
+            // the copy from each host; outbox and drafts are user state
+            // and keep their existing tables.
+            write.delete_table("chat3_log");
+            write.delete_table("chat3_cursor");
             open_or_rebuild(&mut write, LOG);
             open_or_rebuild(&mut write, CURSOR);
             write.open_table(OUTBOX);
@@ -315,6 +320,51 @@ mod tests {
 
     const H1: EndpointId = EndpointId([1; 32]);
     const H2: EndpointId = EndpointId([2; 32]);
+
+    #[test]
+    fn refreshing_the_copy_leaves_unsent_mail_and_drafts_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(dir.path()).unwrap();
+        let outgoing = Outgoing {
+            at: UnixMs(3),
+            parent: Some(MessageId(ChatSeq(2))),
+            reply_to: None,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: "unsent".into(),
+            }],
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut write = db.write().await;
+                write
+                    .open_table(TableDefinition::<(Host, u64), Sen<ChatRecord>>::new(
+                        "chat3_log",
+                    ))
+                    .insert((H1.0, 2), SenValue::borrowed(&record(2)));
+                write
+                    .open_table(TableDefinition::<Host, u64>::new("chat3_cursor"))
+                    .insert(H1.0, 2);
+                write
+                    .open_table(OUTBOX)
+                    .insert((H1.0, 17), SenValue::borrowed(&outgoing));
+                write
+                    .open_table(DRAFTS)
+                    .insert((H2.0, 8), "keep this draft");
+                write.commit();
+            });
+        let cache = Cache::open_on(db).unwrap();
+        let loaded = cache.load();
+        assert!(loaded.cursors.is_empty(), "the host log must replay");
+        assert!(cache.read_log(H1).is_empty());
+        assert_eq!(loaded.outbox, [(H1, 17, outgoing)]);
+        assert_eq!(
+            loaded.drafts,
+            [(H2, Some(MessageId(ChatSeq(8))), "keep this draft".into())]
+        );
+    }
 
     /// The log, cursor, outbox and drafts come back as written; a reset
     /// drops one host's log and cursor and leaves the other's.

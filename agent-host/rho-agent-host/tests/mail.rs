@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, ChatEvent, ChatRecord, ContentPart, MentionKind, MessageId, Stop, WorksetKind,
+    Address, AgentId, ChatEvent, ChatRecord, ContentPart, MentionKind, MessageId, Role, Stop,
+    WorksetKind, Wpos,
 };
-use rho_agents_client::protocol::worksets::{CreateWorkset, Eval, EvalResult};
+use rho_agents_client::protocol::worksets::{AgentLog, CreateWorkset, Eval, EvalResult, LogEvent};
 use rho_chat::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
+use rho_chat::{HostChat, cards};
 use rho_rpc::protocol::client::{call, connect};
 use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
 
@@ -44,10 +46,13 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    tokio::runtime::Runtime::new()?.block_on(mail_through_a_real_host_and_fake_model())
+    tokio::runtime::Runtime::new()?.block_on(async {
+        with_host(rho_fake_model::Scenario::RealToolRounds).await?;
+        with_host(rho_fake_model::Scenario::MailChain).await
+    })
 }
 
-async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
+async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
     let rig = tempfile::tempdir()?;
     let root = rig.path();
     let paths = RuntimePaths::new(Some(root.join("run")))?;
@@ -63,7 +68,7 @@ async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
         }))?,
     )?;
     let mut config = rho_fake_model::FakeModelConfig::seeded(51);
-    config.scenario = rho_fake_model::Scenario::RealToolRounds;
+    config.scenario = scenario;
     config.real_tool_rounds = 1;
     config.distribution.rate_limit_bps = 0;
     config.distribution.usage_limit_bps = 0;
@@ -89,9 +94,15 @@ async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
             .stdout(Stdio::null())
             .spawn()?,
     );
-    let result = tokio::time::timeout(Duration::from_secs(45), run(&paths, root))
-        .await
-        .context("mail session did not finish")??;
+    let result = tokio::time::timeout(Duration::from_secs(55), async {
+        if scenario == rho_fake_model::Scenario::MailChain {
+            run_peer_chain(&paths, root).await
+        } else {
+            run(&paths, root).await
+        }
+    })
+    .await
+    .with_context(|| format!("{} session did not finish", scenario.as_str()))??;
     assert!(
         model.metrics().requests >= 2,
         "the model must see both the brief and real tool output"
@@ -105,13 +116,7 @@ async fn mail_through_a_real_host_and_fake_model() -> anyhow::Result<()> {
 }
 
 async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
-    let mut stream = loop {
-        if let Ok(stream) = connect(paths).await {
-            break stream;
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    };
-    write_open(&mut stream, &Open::Session).await?;
+    let mut stream = connect_chat(paths).await?;
     let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
         anyhow::bail!("no chat hello");
     };
@@ -175,10 +180,10 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
             code: format!(
                 r#"
 import os
-from rho.tools import Chat
-mail = Chat("{}")
+from rho.tools import Mail
+mail = Mail("{}")
 mail.status({}, "Waiting for the capacity report")
-note = await mail.post({}, "Use polling for this check.")
+note = await mail.send({}, "Use polling for this check.")
 assert type(note) is int
 mail.edit(note, "Use sockets for this check.")
 hits = await mail.search("sockets", project={})
@@ -311,6 +316,187 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
         "mail wire: project {}, fake model result #{}, status set/cleared, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
+}
+
+async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, host } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no mail hello");
+    };
+    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
+    let project = post(paths, 1, None, "tide").await?;
+    let work = post(paths, 2, Some(project), "MAIL-RIG-START").await?;
+    let code = format!(
+        r#"new_agent(runtime={{"kind": "native", "model": "sol", "effort": "medium"}}, origin="chat:{}")"#,
+        work.0.0
+    );
+    let leader = call(
+        paths,
+        CreateWorkset {
+            kind: WorksetKind::Host {
+                cwd: root.to_str().unwrap().into(),
+            },
+            code,
+        },
+    )
+    .await?
+    .result
+    .agent
+    .context("no parent agent")?;
+
+    let mut history = HostChat::default();
+    let mut brief = None;
+    let mut peer = None;
+    let ask = loop {
+        if let ServerFrame::Chat { records } = read_frame(&mut stream).await? {
+            let mut ask = None;
+            for record in records {
+                history.tell(&record);
+                let Some(mail) = rho_agent_types::Message::from_record(&record) else {
+                    continue;
+                };
+                match mail.text().as_str() {
+                    "MAIL-RIG-CHILD-BRIEF" => {
+                        assert_eq!(mail.parent, Some(project));
+                        assert_eq!(mail.from, Address::Agent(leader));
+                        let [mention] = &mail.mentions[..] else {
+                            anyhow::bail!("bad child address")
+                        };
+                        let Address::Agent(child) = mention.to else {
+                            anyhow::bail!("not a child")
+                        };
+                        assert_eq!(mention.kind, MentionKind::Direct);
+                        brief = Some((mail.id, child));
+                    }
+                    "MAIL-RIG-PEER-RESULT" => {
+                        let (brief, child) = brief.context("child sent before brief")?;
+                        assert_eq!(mail.parent, Some(brief));
+                        assert_eq!(mail.reply_to, Some(brief));
+                        assert_eq!(mail.from, Address::Agent(child));
+                        assert_eq!(
+                            mail.mentions,
+                            [rho_agent_types::Mention {
+                                to: Address::Agent(leader),
+                                kind: MentionKind::Direct,
+                            }]
+                        );
+                        let claims = cards::claims(
+                            &cards::Host {
+                                endpoint: host,
+                                chat: &history,
+                                name: "local",
+                            },
+                            &rho_dealer::Marks::default(),
+                            jiff::Timestamp::now(),
+                            None,
+                        );
+                        assert!(claims.is_empty(), "peer mail made a card");
+                        peer = Some(mail.id);
+                    }
+                    "Can I use the test clock?" => {
+                        assert_eq!(mail.parent, Some(work));
+                        assert_eq!(mail.from, Address::Agent(leader));
+                        assert_eq!(mail.mentions(Address::User), Some(MentionKind::Ask));
+                        ask = Some(mail.id);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ask) = ask {
+                break ask;
+            }
+        }
+    };
+
+    let answer = call(
+        paths,
+        Post {
+            client_id: 3,
+            parent: Some(work),
+            reply_to: Some(ask),
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: "MAIL-RIG-USER-ANSWER".into(),
+            }],
+        },
+    )
+    .await?;
+    let row = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
+    let answer_msg = rho_agent_types::Message::from_record(&row).unwrap();
+    assert_eq!(
+        (answer_msg.parent, answer_msg.reply_to, answer_msg.from),
+        (Some(work), Some(ask), Address::User)
+    );
+
+    let peer = peer.context("parent sent an ask before receiving the child mail")?;
+    let brief = brief.unwrap().0;
+    let peer_delay = carried_after(paths, leader, peer, Role::Tool, "[message from eng-").await?;
+    let user_delay =
+        carried_after(paths, leader, answer, Role::User, "MAIL-RIG-USER-ANSWER").await?;
+    assert!(
+        (14_950..18_000).contains(&peer_delay),
+        "peer wake was {peer_delay}ms, not 15s"
+    );
+    assert!(
+        (1_950..3_500).contains(&user_delay),
+        "user wake was {user_delay}ms, not 2s"
+    );
+    Ok(format!(
+        "one record: brief #{}, peer reply #{} ({}ms, no card), user ask #{}, user answer #{} ({}ms)",
+        brief.0.0, peer.0.0, peer_delay, ask.0.0, answer.0.0, user_delay
+    ))
+}
+
+async fn carried_after(
+    paths: &RuntimePaths,
+    agent: AgentId,
+    mail: MessageId,
+    role: Role,
+    text: &str,
+) -> anyhow::Result<u64> {
+    loop {
+        let log = call(
+            paths,
+            AgentLog {
+                agent,
+                from: Wpos(0),
+            },
+        )
+        .await?;
+        let mut prev = None;
+        for (_, row) in log.rows {
+            match row {
+                LogEvent::Replied { at, .. } => prev = Some(at),
+                LogEvent::Request { at, inputs, .. } => {
+                    if let Some(input) =
+                        inputs.into_iter().find(|input| input.message == Some(mail))
+                    {
+                        assert_eq!(input.role, role);
+                        assert!(
+                            input.text.contains(text),
+                            "missing framing in {:?}",
+                            input.text
+                        );
+                        let at_prev = prev.context("no prior response for wake delay")?;
+                        return Ok(at.0 - at_prev.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn connect_chat(paths: &RuntimePaths) -> anyhow::Result<rho_rpc::Stream> {
+    let mut stream = loop {
+        if let Ok(stream) = connect(paths).await {
+            break stream;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+    write_open(&mut stream, &Open::Session).await?;
+    Ok(stream)
 }
 
 async fn post(

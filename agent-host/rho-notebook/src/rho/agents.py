@@ -82,3 +82,22 @@ def create(runtime: dict, props: dict) -> Agent:
 
 def all() -> list[Agent]:
     return [Agent(id) for id in _rho.agents()]
+
+
+def resolve(handle: str) -> str:
+    """The agent id a handle names: "eng-<id>", "adv-<id>" or the bare id,
+    where <id> may be any prefix of the id that names one agent of the
+    host. A role prefix must match the agent's role."""
+    from .prompt import label
+
+    handle = handle.strip()
+    role, dash, raw = handle.partition("-")
+    if not (dash and role in ("eng", "adv")):
+        role, raw = None, handle
+    try:
+        agent = _rho.resolve_agent(raw)
+    except RuntimeError as error:
+        raise ValueError(str(error)) from None
+    if role is not None and not (address := label(agent)).startswith(role + "-"):
+        raise ValueError(f"{handle} names {address}, whose role prefix differs")
+    return agent

@@ -11,7 +11,7 @@ mod thread;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent::store::{Appended, ChatRead as _, StoreRead as _};
+use rho_agent::store::{Appended, MailRead as _, StoreRead as _};
 use rho_agent_types::{AgentId, ContentPart, Message, MessageId};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
@@ -120,7 +120,7 @@ where
     // Replies are what the agent posts in the thread from here on, and a
     // stop.
     let mut feed = rho_agent::store::feed(services.pool.db());
-    let mut cursor = services.pool.db().read().chat_head();
+    let mut cursor = services.pool.db().read().mail_head();
     // The request the agent's messages answer: the latest one, until the
     // agent completes it.
     let mut active: Option<String> = None;
@@ -142,8 +142,8 @@ where
                         }
                     }
                     Ok(Appended::WorksetDeleted(_)) => continue,
-                    Ok(Appended::Chat(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let records = services.pool.db().read().chat_since(cursor, usize::MAX);
+                    Ok(Appended::Mail(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let records = services.pool.db().read().mail_since(cursor, usize::MAX);
                         if let Some(last) = records.last() {
                             cursor = last.seq;
                         }

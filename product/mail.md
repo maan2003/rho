@@ -3,10 +3,12 @@
 The user writes a project a mail to put an idea to work. Each piece of work has one thread, with a subject, the mails so far, and one line about what is happening now.
 
 ## bet A mail is the medium
-instead of: chat in channels with a conversation among individually named agents.
+instead of: separate conversations beside the project, or a channel full of individually named agents.
 serves: Keep the work moving.
 because: one thread keeps one piece of work together. Its subject identifies the work, its status tells the user what is happening now, and the project speaks with one voice even when several agents do the work.
 costs: the user opens the transcript to see which agent did what.
+
+An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a `deal.Card` from it.
 
 ## bet The project asks by mail, even when an agent stops
 instead of: attention coming from a mixture of named agents' chat mentions and notices about their state.

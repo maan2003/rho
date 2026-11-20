@@ -302,6 +302,86 @@ fn ids(messages: &[rho_agent_types::Message]) -> Vec<MessageId> {
     messages.iter().map(|message| message.id).collect()
 }
 
+#[tokio::test]
+async fn direct_mail_keeps_the_original_conversation_and_only_reaches_its_addressee() {
+    let (_dir, db) = db().await;
+    let (a, b, follower) = (agent(1), agent(2), agent(3));
+    let direct = |from, to, reply_to, text| NewMessage {
+        mentions: vec![Mention {
+            to: Address::Agent(to),
+            kind: MentionKind::Direct,
+        }],
+        reply_to,
+        ..said(Address::Agent(from), text)
+    };
+    let mut write = db.write().await;
+    let project_a = write
+        .post(UnixMs(1), None, said(Address::User, "A's project"), None)
+        .unwrap();
+    let project_b = write
+        .post(UnixMs(2), None, said(Address::User, "B's project"), None)
+        .unwrap();
+    let topic = write
+        .post(
+            UnixMs(3),
+            Some(project_a),
+            said(Address::User, "A's ongoing work"),
+            None,
+        )
+        .unwrap();
+    write.join(UnixMs(4), project_a, follower).unwrap();
+    let first = write
+        .post_peer(
+            UnixMs(5),
+            Some(project_a),
+            direct(a, b, None, "First brief"),
+        )
+        .unwrap();
+    let followup = write
+        .post_peer(
+            UnixMs(6),
+            Some(project_a),
+            direct(a, b, None, "Longer brief"),
+        )
+        .unwrap();
+    write.delete(UnixMs(7), a, first).unwrap();
+    write.reparent(UnixMs(8), first, Some(topic)).unwrap();
+    let elsewhere = write
+        .post_peer(
+            UnixMs(9),
+            Some(project_b),
+            direct(b, a, None, "Different job"),
+        )
+        .unwrap();
+    let answer = write
+        .post_peer(
+            UnixMs(10),
+            Some(project_b),
+            direct(b, a, Some(followup), "Read your second brief"),
+        )
+        .unwrap();
+    assert!(
+        write
+            .post_peer(
+                UnixMs(11),
+                Some(project_a),
+                direct(follower, b, Some(followup), "Wrong sender"),
+            )
+            .is_err()
+    );
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.message(answer).unwrap().parent, Some(first));
+    assert_eq!(read.message(answer).unwrap().reply_to, Some(followup));
+    assert_eq!(read.root_of(answer), Some(project_a));
+    assert_eq!(read.message(elsewhere).unwrap().parent, Some(project_b));
+    assert_eq!(read.recipients_of(&read.message(answer).unwrap()), [a]);
+    assert_eq!(received(&read, a, 0), [elsewhere.0.0, answer.0.0]);
+    assert_eq!(received(&read, b, 0), [followup.0.0]);
+    assert!(received(&read, follower, 0).is_empty());
+}
+
 /// A message reaches the members of the thread it is posted in and of the
 /// threads above it, by the nearest record for each agent, and whom it
 /// mentions, never its sender. A resend under a client id is one message.
@@ -434,7 +514,7 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.chat_head(), ChatSeq(seqs));
+    assert_eq!(read.mail_head(), ChatSeq(seqs));
     assert_eq!(
         received(&read, a, 0),
         [both, reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
@@ -597,7 +677,7 @@ async fn chat_moves_subtrees_and_names_threads() {
     // `a` heard what came while it was a member; the moves delivered
     // nothing.
     assert_eq!(received(&read, a, 0), vec![kept.0.0, aside.0.0]);
-    let events: Vec<_> = read.chat_since(ChatSeq::ZERO, 100);
+    let events: Vec<_> = read.mail_since(ChatSeq::ZERO, 100);
     let moves = events
         .iter()
         .filter(|record| matches!(record.event, ChatEvent::Reparented { .. }))
