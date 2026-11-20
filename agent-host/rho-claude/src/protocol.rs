@@ -207,9 +207,19 @@ pub struct AssistantMessage {
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
     pub timestamp: Option<String>,
+    /// Why the CLI wrote this message itself instead of the model, such as
+    /// `authentication_failed` when its account holds no login.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl AssistantMessage {
+    /// Whether the CLI said its account cannot reach the model: no login,
+    /// or one that expired and could not be renewed.
+    pub fn authentication_failed(&self) -> bool {
+        self.error.as_deref() == Some("authentication_failed")
+    }
+
     pub fn text(&self) -> String {
         self.message
             .content
