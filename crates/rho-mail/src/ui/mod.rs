@@ -119,6 +119,7 @@ enum CreatedProject {
 }
 
 pub struct MailSystem {
+    notes: Entity<rho_notes::NoteSystem>,
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
     /// Each log's forest, by the identity of the host that keeps it.
@@ -140,7 +141,13 @@ pub struct MailSystem {
 impl EventEmitter<Event> for MailSystem {}
 
 impl MailSystem {
-    pub fn new(db: rho_db::RhoDb, frame: FrameLink, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db: rho_db::RhoDb,
+        frame: FrameLink,
+        notes: Entity<rho_notes::NoteSystem>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        thread::bind(cx);
         let cache = Cache::open_on(db).expect("the mail copy opens");
         let loaded = cache.load();
         let mut logs = HashMap::new();
@@ -163,6 +170,7 @@ impl MailSystem {
             }
         });
         Self {
+            notes,
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
             creating_projects: Vec::new(),

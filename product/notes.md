@@ -11,7 +11,7 @@ does:
 - new note, from the palette: open a new, empty note with no question asked; it reads `a note · its first line is its title` until the user types
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit
 - notes, from the palette: open `Notes`, which lists every note
-- open `enter` on a note in `Notes`, or on a private reply: open the note
+- open `enter` on a note in `Notes`: open the note
 
 No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. The window has no way to delete a note.
 
@@ -19,11 +19,11 @@ While the user types a new note, the top line follows its first line as it is ty
 
 ## concept Private reply
 purpose: let the user keep a remark on a `mail.Mail` in its thread, where only they see it.
-principle: a project mails a result the user doubts; they put the cursor on it and run `reply privately`; a note opens; they type their doubt; back in the thread, it shows under the mail, dim, marked `🔒 you`.
-sees: in the thread, under its mail: `🔒 you · time` and the text, dim and slanted.
+principle: a project mails a result the user doubts; they press `alt-r` on the mail, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
+sees: directly under the mail, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
 does:
-- reply privately, from the palette: when the cursor is on a mail or thread, start a note about it and open it; the command does not appear on the desk or with nothing under the cursor
-- open `enter` on it in the thread: open the note to edit it
+- reply privately `alt-r` on the mail, or `reply privately` from the palette or phone menu: start writing beneath it; if the mail already has a private reply, edit the latest one there
+- edit `enter` or a tap on an existing private reply: write in place; `escape`, or `keep` on the phone, returns to reading
 
 ## screen Notes
 status: a private reply's row names the host and mail rather than the project and subject.
@@ -50,7 +50,6 @@ cases: the same note open on the laptop and the phone at once, where the newest 
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Reply privately
-status: the user makes the reply beside a mail in its thread; the mail thread is not built.
 runs: 2 a week
 day: Keep their own memory.
 when: a `mail.Mail` needs a remark that is for the user only
@@ -58,9 +57,8 @@ want: write it beside the mail
 so that: the user sees it the next time they read the thread, and no agent does
 steps:
 1. the user puts the cursor on the mail
-2. the user opens the palette and chooses `reply privately`; a new note opens
-3. the user types the remark
-4. the user goes back with `window.Screen.back`; the remark shows under the mail
+2. the user presses `alt-r`; a private tail opens directly under the mail
+3. the user types the remark and presses `escape`; the remark stays under the mail
 system: keeps the remark with the mail on every device.
 user: the remark.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
@@ -70,5 +68,4 @@ status: notes already have their own list and are never rooms on Home; the desk 
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is not on the `desk.Desk`.
 
 ## rule a note about a mail shows in its thread
-status: a private note shows beside its mail in a host thread.
 when a `Note` is about a `mail.Mail`, then the `mail.Thread` that shows the mail shows the note beside it as a `Private reply`.

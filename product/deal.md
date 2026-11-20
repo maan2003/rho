@@ -42,7 +42,7 @@ does:
 - mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user again; put the card away, and if it was on screen, open the next one
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; minutes and hours count from now, days and weeks end at the start of that day
 - next `space` then `n`: open the next card; with nothing waiting, open the `desk.Desk` and echo `nothing waits`
-- undo `space` then `u`, or `shift-u` outside a `mail.Draft`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
+- undo `space` then `u`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
 
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.
 

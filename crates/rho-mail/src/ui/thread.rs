@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use editor::scroll::Autoscroll;
 use editor::{
@@ -13,12 +14,12 @@ use editor::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent,
-    Subscription, Task, Window, div,
+    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
+    MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
 use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, BufferEvent, Capability, Point};
-use multi_buffer::ToPoint as _;
+use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
     Address as Party, ContentPart, EndpointId, Message, MessageId, Revision, StatusText,
 };
@@ -26,12 +27,42 @@ use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage, SendOnly};
 use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
-use rho_transcript::{Item, Transcript};
+use rho_notes::NoteId;
+use rho_transcript::{BlockSpec, Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use super::{Event, MailSystem, ago};
 use crate::{AgentRef, HostMail, ThreadId, cards};
+
+actions!(rho_private_reply, [ReplyPrivately, KeepPrivateReply]);
+
+const PRIVATE_SCREEN: &str = "RhoPrivateReply";
+const PRIVATE_KEY: &str = "alt-r";
+const PRIVATE_SEPARATOR: &str = "── private · only you see this · escape keeps it";
+
+pub(super) fn bind(cx: &mut App) {
+    let mut bindings = rho_frame::normal_contexts(thread::SCREEN, " && vim_operator == none")
+        .map(|context| KeyBinding::new(PRIVATE_KEY, ReplyPrivately, Some(&context)))
+        .to_vec();
+    bindings.push(KeyBinding::new(
+        "escape",
+        KeepPrivateReply,
+        Some(&format!("{PRIVATE_SCREEN} > Editor")),
+    ));
+    cx.bind_keys(bindings);
+}
+
+/// The one open private tail; its text lives only in the note editor,
+/// never in the public draft or a host's outbox.
+struct PrivateEdit {
+    note: NoteId,
+    mail: MessageId,
+    editor: Entity<Editor>,
+    block: BlockSpec,
+    _edited: Subscription,
+    _blur: Subscription,
+}
 
 /// This surface's highlight-key space, clear of the others'.
 const KEY_BASE: usize = usize::MAX / 5;
@@ -50,7 +81,7 @@ enum Key {
     Thread(MessageId),
     /// The user's private reply under a message: a note about it, which
     /// only their devices hold.
-    Private(Address),
+    Private(NoteId),
     Pending(u64),
     Gap(u32),
 }
@@ -137,6 +168,10 @@ enum Meta {
     Quote(QuoteId),
     /// A project row or a tangent below a mail.
     Thread(MessageId),
+    Private {
+        note: NoteId,
+        mail: MessageId,
+    },
     Open(Address),
 }
 
@@ -179,6 +214,7 @@ pub struct ThreadView {
     draft: Entity<Buffer>,
     /// The last caret in the draft, even while the user selects mail.
     draft_point: Option<Anchor>,
+    private_edit: Option<PrivateEdit>,
     draft_subscription: Subscription,
     follow: Option<Follow>,
     /// The mail dealt to this view, also the target when the cursor is
@@ -316,6 +352,7 @@ impl ThreadView {
             editor,
             draft,
             draft_point: None,
+            private_edit: None,
             draft_subscription,
             follow: None,
             dealt_mail: None,
@@ -331,6 +368,7 @@ impl ThreadView {
             view.is_list(system),
             view.layout,
             &view.expanded_quotes,
+            None,
             cx,
         );
         view.transcript.reconcile(items, cx);
@@ -368,6 +406,7 @@ impl ThreadView {
             list,
             self.layout,
             &self.expanded_quotes,
+            self.private_edit.as_ref(),
             cx,
         );
         let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
@@ -541,9 +580,10 @@ fn items(
     list: bool,
     layout: Layout,
     expanded_quotes: &HashSet<QuoteId>,
+    private_edit: Option<&PrivateEdit>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
-    let mut items = history_items(system, thread, list, expanded_quotes, cx);
+    let mut items = history_items(system, thread, list, expanded_quotes, private_edit, cx);
     if !list && let Some(status) = system.status(thread) {
         let text = status_words(status, Timestamp::now());
         items.push(line(Key::Status, &text, Class::Crumb));
@@ -583,6 +623,7 @@ fn history_items(
     thread: ThreadId,
     list: bool,
     expanded_quotes: &HashSet<QuoteId>,
+    private_edit: Option<&PrivateEdit>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     let host = thread.host;
@@ -627,7 +668,7 @@ fn history_items(
     let mut private = system
         .frame
         .read(cx, |frame, _| {
-            private_items(frame.marks(), chat, host, thread.message)
+            private_items(frame.marks(), chat, host, thread.message, private_edit)
         })
         .unwrap_or_default();
     let project = system.project_of(thread);
@@ -695,43 +736,78 @@ fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key,
     items
 }
 
-/// The user's private replies under the thread's head and under each
-/// message in it: the notes about each, as the user's own lines, marked
-/// so and dim. Enter opens the note to edit it.
+/// The user's own notes under each mail. The open one uses the same
+/// key and header but puts the private editor below its separator.
 fn private_items(
     marks: &Marks,
     chat: &HostMail,
     host: EndpointId,
     head: MessageId,
+    editing: Option<&PrivateEdit>,
 ) -> std::collections::HashMap<MessageId, Vec<Item<Key, Class, Meta>>> {
     let mut by_message = std::collections::HashMap::new();
-    for id in std::iter::once(&head).chain(chat.children(Some(head))) {
-        let address = ThreadId { host, message: *id }.address();
-        let replies: Vec<Item<Key, Class, Meta>> = marks
+    for &mail in std::iter::once(&head).chain(chat.children(Some(head))) {
+        let address = ThreadId {
+            host,
+            message: mail,
+        }
+        .address();
+        let mut replies: Vec<_> = marks
             .replies_to(&address)
             .into_iter()
-            .map(|(note, held)| {
-                let time = held.written_ms.map(thread::when).unwrap_or_default();
-                let header = format!("🔒 you · {time}");
-                let body = held.body.as_deref().unwrap_or_default().trim_end();
-                let text = format!("\n{header}\n{body}");
-                let aside = 1..text.len();
-                let lines = std::iter::once(Meta::None)
-                    .chain(text.lines().skip(1).map(|_| Meta::Open(note.clone())))
-                    .collect();
-                Item::new(Key::Private(note.clone()), text)
-                    .with_styles(vec![(Class::Private, aside)])
-                    .with_lines(lines)
+            .filter_map(|(address, held)| {
+                let note = NoteId::from_address(address)?;
+                let time = held.written_ms.map(thread::when);
+                let body = held.body.as_deref().unwrap_or_default();
+                let block = editing
+                    .filter(|open| open.note == note)
+                    .map(|open| open.block.clone());
+                Some(private_item(note, mail, time.as_deref(), body, block))
             })
             .collect();
+        if let Some(open) = editing.filter(|open| open.mail == mail)
+            && !replies
+                .iter()
+                .any(|item| item.key == Key::Private(open.note))
+        {
+            replies.push(private_item(
+                open.note,
+                mail,
+                None,
+                "",
+                Some(open.block.clone()),
+            ));
+        }
         if !replies.is_empty() {
-            by_message.insert(*id, replies);
+            by_message.insert(mail, replies);
         }
     }
     by_message
 }
 
-/// Whether this place lists a project's threads rather than reading mail.
+fn private_item(
+    note: NoteId,
+    mail: MessageId,
+    time: Option<&str>,
+    body: &str,
+    block: Option<BlockSpec>,
+) -> Item<Key, Class, Meta> {
+    let (time, body) = if block.is_some() {
+        ("now", PRIVATE_SEPARATOR)
+    } else {
+        (time.unwrap_or("now"), body.trim_end())
+    };
+    let text = format!("\n🔒 you · {time}\n{body}");
+    let aside = 1..text.len();
+    let lines = std::iter::once(Meta::None)
+        .chain(text.lines().skip(1).map(|_| Meta::Private { note, mail }))
+        .collect();
+    Item::new(Key::Private(note), text)
+        .with_styles(vec![(Class::Private, aside)])
+        .with_lines(lines)
+        .with_blocks(block.into_iter().collect())
+}
+
 fn is_project(system: &MailSystem, thread: ThreadId) -> bool {
     system
         .host_mail(thread.host)
@@ -897,6 +973,9 @@ impl ThreadView {
     }
 
     fn send_only(&mut self, _: &SendOnly, window: &mut Window, cx: &mut Context<Self>) {
+        if self.private_edit.is_some() {
+            return;
+        }
         let text = self.draft.read(cx).text();
         if text.trim().is_empty() {
             self.echo_empty_draft(cx);
@@ -929,6 +1008,9 @@ impl ThreadView {
     /// Place the point at the tapped column, including at the end of a
     /// line. A tap on the separator starts at the beginning of the draft.
     fn tap_tail(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.private_edit.is_some() {
+            return;
+        }
         if event.button != MouseButton::Left || event.modifiers.modified() {
             return;
         }
@@ -978,6 +1060,9 @@ impl ThreadView {
     }
 
     fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.private_edit.is_some() {
+            return;
+        }
         let Some(lines) = self.mail_selection(self.selection_range(cx), cx) else {
             self.system.read(cx).frame.clone().echo(
                 "select lines in one mail to quote",
@@ -1040,6 +1125,164 @@ impl ThreadView {
             .echo(confirmation, StyleClass::SystemInfo, cx);
     }
 
+    fn private_target(&self, cx: &App) -> Option<(MessageId, Option<NoteId>)> {
+        if self.is_list(self.system.read(cx)) {
+            return None;
+        }
+        let meta = self.transcript.line_meta(self.cursor_row(cx), cx)?;
+        match *meta {
+            Meta::Private { note, mail } => Some((mail, Some(note))),
+            _ => meta.mail().map(|mail| (mail, None)),
+        }
+    }
+
+    fn reply_privately(&mut self, _: &ReplyPrivately, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((mail, note)) = self.private_target(cx) {
+            self.open_private(mail, note, cx);
+        }
+    }
+
+    fn open_private(&mut self, mail: MessageId, note: Option<NoteId>, cx: &mut Context<Self>) {
+        if self.private_edit.is_some() {
+            return;
+        }
+        let subject = ThreadId {
+            host: self.thread.host,
+            message: mail,
+        }
+        .address();
+        let this = cx.weak_entity();
+        self.system
+            .read(cx)
+            .frame
+            .clone()
+            .with(cx, move |frame, window, cx| {
+                let Some(this) = this.upgrade() else { return };
+                let note = note
+                    .or_else(|| {
+                        frame
+                            .marks()
+                            .replies_to(&subject)
+                            .into_iter()
+                            .rev()
+                            .find_map(|(address, _)| NoteId::from_address(address))
+                    })
+                    .unwrap_or_else(|| rho_notes::create_private(frame, &subject, cx));
+                let notes = this.read(cx).system.read(cx).notes.clone();
+                let text = notes.read(cx).text(frame.marks(), note);
+                this.update(cx, |this, cx| {
+                    this.start_private(mail, note, notes, text, window, cx)
+                });
+            });
+    }
+
+    fn start_private(
+        &mut self,
+        mail: MessageId,
+        note: NoteId,
+        notes: Entity<rho_notes::NoteSystem>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.private_edit.is_some() {
+            return;
+        }
+        let body = cx.new(|cx| Buffer::local(&text, cx));
+        let document = cx.new(|cx| MultiBuffer::singleton(body.clone(), cx));
+        let input = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::SizeByContent,
+                },
+                document,
+                None,
+                window,
+                cx,
+            );
+            rho_window::editor_config::configure(&mut editor, window, cx);
+            editor.set_mouse_click_selection_enabled(true, cx);
+            editor.set_text_style_refinement(TextStyleRefinement {
+                font_style: Some(gpui::FontStyle::Italic),
+                color: Some(cx.theme().colors().text_muted.into()),
+                ..Default::default()
+            });
+            editor
+        });
+        let saves = notes.clone();
+        let edited = cx.subscribe(&body, move |_, body, event: &BufferEvent, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                let text = body.read(cx).text();
+                saves.update(cx, |notes, cx| notes.edited(note, text, cx));
+            }
+        });
+        let focus = input.focus_handle(cx);
+        let blur = cx.on_blur(&focus, window, move |_, _, cx| {
+            notes.update(cx, |notes, cx| notes.save(note, cx));
+        });
+        let block_input = input.clone();
+        let block = BlockSpec {
+            line: 2,
+            height: 1,
+            priority: 0,
+            render: Arc::new(move |block| {
+                div()
+                    .key_context(PRIVATE_SCREEN)
+                    .block_mouse_except_scroll()
+                    .w(block.max_width)
+                    .child(block_input.clone())
+                    .into_any_element()
+            }),
+        };
+        self.private_edit = Some(PrivateEdit {
+            note,
+            mail,
+            editor: input.clone(),
+            block,
+            _edited: edited,
+            _blur: blur,
+        });
+
+        // The frame was leased to read/create the note. Read the thread anew
+        // outside that window update, then focus the editor at the end.
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.refresh(cx);
+                if let Some(row) = this.item_row(&Key::Private(note), cx) {
+                    this.cursor_to_row(row + 3, Autoscroll::fit(), cx);
+                }
+                cx.with_window(this.editor.entity_id(), |window, cx| {
+                    let snapshot = input.read(cx).buffer().read(cx).snapshot(cx);
+                    let start = snapshot.anchor_after(Point::zero());
+                    let end = snapshot.anchor_after(snapshot.max_point());
+                    draft::focus_writing_at(&input, start, end, window, cx);
+                });
+            });
+        });
+    }
+
+    fn keep_private(&mut self, _: &KeepPrivateReply, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.private_edit.take() else {
+            return;
+        };
+        let note = edit.note;
+        let notes = self.system.read(cx).notes.clone();
+        notes.update(cx, |notes, cx| notes.save(note, cx));
+        window.focus(&self.editor.focus_handle(cx), cx);
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.refresh(cx);
+                if let Some(row) = this.item_row(&Key::Private(note), cx) {
+                    this.cursor_to_row(row + 1, Autoscroll::fit(), cx);
+                }
+            });
+        });
+    }
+
     fn agent_mail(&self, row: u32, cx: &App) -> Option<(rho_agent_types::AgentId, Message)> {
         let system = self.system.read(cx);
         if self.is_list(system) {
@@ -1065,11 +1308,20 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.private_edit.is_some() {
+            return;
+        }
         let editor = self.editor.read(cx);
         let Some(anchor) = rho_frame::phone_editor_tap(editor, event, window) else {
             return;
         };
         let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
+        if let Some(Meta::Private { note, mail }) = self.transcript.line_meta(row, cx) {
+            self.open_private(*mail, Some(*note), cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if let Some((agent, mail)) = self.agent_mail(row, cx)
             && self.item_row(&Key::Message(mail.id), cx) == Some(row)
         {
@@ -1099,6 +1351,9 @@ impl ThreadView {
     /// Enter opens the thing under the point: a quote, link, agent's mail,
     /// tangent or crumb.
     fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.private_edit.is_some() {
+            return;
+        }
         let selection = self.selection_range(cx);
         if !selection.is_empty()
             && let Some(lines) = self.mail_selection(selection, cx)
@@ -1107,6 +1362,10 @@ impl ThreadView {
             return;
         }
         let cursor = self.cursor(cx);
+        if let Some(Meta::Private { note, mail }) = self.transcript.line_meta(cursor.row, cx) {
+            self.open_private(*mail, Some(*note), cx);
+            return;
+        }
         if let Some(target) = self.inline_open(cursor, cx) {
             match target {
                 InlineOpen::Quote(quote) => self.toggle_quote(quote, cx),
@@ -1342,7 +1601,12 @@ impl Surface for ThreadView {
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
-        Some(self.editor.clone())
+        Some(
+            self.private_edit
+                .as_ref()
+                .map_or(&self.editor, |edit| &edit.editor)
+                .clone(),
+        )
     }
 
     /// A mail under the point anchors a tangent; the draft belongs to the
@@ -1369,11 +1633,20 @@ impl Surface for ThreadView {
     }
 
     fn edits_at_point(&self, cx: &App) -> bool {
-        self.on_draft(cx)
+        self.private_edit.is_some() || self.on_draft(cx)
+    }
+
+    fn phone_tools(&self, _: bool, _: &App) -> Vec<rho_frame::PhoneTool> {
+        if self.private_edit.is_none() {
+            return Vec::new();
+        }
+        vec![rho_frame::PhoneTool::new("✓", "keep", |window, cx| {
+            window.dispatch_action(Box::new(KeepPrivateReply), cx);
+        })]
     }
 
     fn phone_send(&mut self, cx: &mut Context<Self>) -> Option<PhoneSend> {
-        if !self.has_draft(cx) {
+        if self.private_edit.is_some() || !self.has_draft(cx) {
             return None;
         }
         let this = cx.entity();
@@ -1383,11 +1656,25 @@ impl Surface for ThreadView {
     }
 
     fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+        if self.private_edit.is_some() {
+            return Vec::new();
+        }
         let this = cx.entity();
         let has_draft = self.has_draft(cx);
         if !self.is_list(self.system.read(cx)) {
             let send = this.clone();
             let mut rows = Vec::new();
+            if self.private_target(cx).is_some() {
+                let view = this.clone();
+                rows.push(
+                    Row::run(PRIVATE_KEY, "reply privately", move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.reply_privately(&ReplyPrivately, window, cx)
+                        });
+                    })
+                    .bound_to(ReplyPrivately),
+                );
+            }
             if has_draft {
                 rows.push(
                     Row::run("ctrl-enter", "send", move |_, window, cx| {
@@ -1524,7 +1811,10 @@ impl Surface for ThreadView {
 
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor.focus_handle(cx)
+        self.private_edit
+            .as_ref()
+            .map_or(&self.editor, |edit| &edit.editor)
+            .focus_handle(cx)
     }
 }
 
@@ -1552,6 +1842,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::send_only))
             .on_action(cx.listener(Self::open_row))
             .on_action(cx.listener(Self::quote_selection))
+            .on_action(cx.listener(Self::reply_privately))
+            .on_action(cx.listener(Self::keep_private))
             // The editor consumes text mouse-down even when its native
             // selection is disabled. Capture the draft's pointer down
             // before it; GPUI also routes a completed tap this way.
@@ -1566,6 +1858,42 @@ mod tests {
     use rho_agent_types::{AgentId, ChatSeq, UnixMs};
 
     use super::*;
+
+    #[test]
+    fn the_open_private_note_has_the_same_identity_but_no_body_in_mail_history() {
+        let note = NoteId::from_address(&Address::new(
+            Address::NOTE,
+            "0000000000000000000000000000002f",
+        ))
+        .unwrap();
+        let mail = MessageId(ChatSeq(17));
+        let body = "check the cache\nthen the lease";
+        let saved = private_item(note, mail, Some("10:15"), body, None);
+        let editing = private_item(
+            note,
+            mail,
+            None,
+            body,
+            Some(BlockSpec {
+                line: 2,
+                height: 1,
+                render: Arc::new(|_| gpui::Empty.into_any_element()),
+                priority: 0,
+            }),
+        );
+        assert_eq!(
+            saved.text,
+            "\n🔒 you · 10:15\ncheck the cache\nthen the lease\n"
+        );
+        assert_eq!(editing.key, saved.key);
+        assert_eq!(
+            editing.text,
+            "\n🔒 you · now\n── private · only you see this · escape keeps it\n"
+        );
+        assert_eq!(editing.blocks[0].line, 2);
+        assert_eq!(editing.lines[2], Meta::Private { note, mail });
+        assert_eq!(saved.lines[3], Meta::Private { note, mail });
+    }
 
     #[test]
     fn working_and_stuck_show_their_own_words_and_clock() {

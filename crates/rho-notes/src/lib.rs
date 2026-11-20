@@ -198,6 +198,13 @@ impl NoteSystem {
         }
     }
 
+    /// The current text when another surface starts editing this note.
+    pub fn text(&self, marks: &Marks, note: NoteId) -> String {
+        self.pending
+            .get(&note)
+            .map_or_else(|| text_of(marks, note), |pending| pending.text.clone())
+    }
+
     /// Whether the user typed into `note` and it is not written yet: then
     /// their text is the newest, whatever else arrives.
     pub fn typing(&self, note: NoteId) -> bool {
@@ -205,7 +212,7 @@ impl NoteSystem {
     }
 
     /// The user typed: `text` is written once they stop.
-    fn edited(&mut self, note: NoteId, text: String, cx: &mut Context<Self>) {
+    pub fn edited(&mut self, note: NoteId, text: String, cx: &mut Context<Self>) {
         let save = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_AFTER).await;
             let _ = this.update(cx, |this, cx| this.save(note, cx));
@@ -216,7 +223,7 @@ impl NoteSystem {
     /// Writes what was typed into `note`, if anything. It leaves the pending
     /// set only as it is written, so a surface never takes another device's
     /// text over it in between.
-    pub(crate) fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
+    pub fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
         let this = cx.entity();
         self.frame.with(cx, move |frame, _, cx| {
             let Some(pending) = this.update(cx, |this, _| this.pending.remove(&note)) else {
@@ -234,16 +241,9 @@ fn write(frame: &mut Frame, note: NoteId, text: String, cx: &mut Context<Frame>)
     }
 }
 
-/// `reply privately`: a new note about what the point is on, which the
-/// thread shows under it as the user's own line.
-fn reply_privately(
-    subject: &Address,
-    frame: &mut Frame,
-    window: &mut Window,
-    cx: &mut Context<Frame>,
-) {
-    let note = new_note(frame, Some(subject), cx);
-    frame.open(note.address(), window, cx);
+/// Makes a note about a mail without opening a separate screen.
+pub fn create_private(frame: &mut Frame, subject: &Address, cx: &mut Context<Frame>) -> NoteId {
+    new_note(frame, Some(subject), cx)
 }
 
 /// A new note about `about`, or about nothing. It has no text, and is
@@ -282,18 +282,8 @@ impl System for NoteSystem {
         Some(AnySurface::new(view))
     }
 
-    fn rows(&mut self, point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        if point.surface.kind() == rho_mail::ThreadId::KIND
-            && let Some(subject) = point
-                .subject
-                .clone()
-                .filter(|at| at.kind() == rho_mail::ThreadId::KIND)
-        {
-            rows.push(Row::run("", "reply privately", move |frame, window, cx| {
-                reply_privately(&subject, frame, window, cx);
-            }));
-        }
         rows.push(Row::run("w", "new note", make_note));
         // The one door to the notes, on every screen: one of the window's
         // own commands.
