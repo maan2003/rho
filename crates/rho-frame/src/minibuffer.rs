@@ -142,7 +142,10 @@ pub type CancelHandler = Rc<dyn Fn(&mut Frame, &mut Window, &mut Context<Frame>)
 #[derive(Clone, Copy)]
 enum CompletionInput {
     Word,
-    Whole { select_first: bool },
+    Whole,
+    /// The empty field means the explicit default in the question;
+    /// tapping a project is an explicit choice, not the default.
+    Address,
 }
 
 pub struct Minibuffer {
@@ -305,10 +308,7 @@ impl Minibuffer {
     pub fn accepts_selected(&self, cx: &App) -> bool {
         !self.input(cx).trim().is_empty()
             || self.selection_moved
-            || matches!(
-                self.completion_input,
-                CompletionInput::Whole { select_first: true }
-            )
+            || matches!(self.completion_input, CompletionInput::Whole)
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with
@@ -322,7 +322,7 @@ impl Minibuffer {
             let text = editor.text(cx);
             let start = completion_start(
                 &text,
-                matches!(self.completion_input, CompletionInput::Whole { .. }),
+                !matches!(self.completion_input, CompletionInput::Word),
             );
             let new_text = format!("{}{}", &text[..start], candidate.value);
             let end = multi_buffer::MultiBufferOffset(new_text.len());
@@ -334,13 +334,11 @@ impl Minibuffer {
     }
 
     pub fn set_complete_whole_input(&mut self) {
-        self.completion_input = CompletionInput::Whole { select_first: true };
+        self.completion_input = CompletionInput::Whole;
     }
 
-    pub(crate) fn complete_whole_input_without_default(&mut self) {
-        self.completion_input = CompletionInput::Whole {
-            select_first: false,
-        };
+    pub(crate) fn complete_project_address(&mut self) {
+        self.completion_input = CompletionInput::Address;
     }
 
     /// Which row is highlighted, for a caller that needs the row itself
@@ -398,7 +396,19 @@ impl Minibuffer {
                 if selected {
                     row = row.bg(colors.element_selected);
                 }
-                row
+                let row = row.id(("rho-prompt-candidate", index));
+                if matches!(self.completion_input, CompletionInput::Address) {
+                    row.cursor_pointer()
+                        .on_click(cx.listener(move |frame, _, window, cx| {
+                            if let Some(prompt) = frame.minibuffer_mut() {
+                                prompt.select(index);
+                                frame.minibuffer_confirm(window, cx);
+                            }
+                            cx.stop_propagation();
+                        }))
+                } else {
+                    row
+                }
             })
             .collect::<Vec<_>>();
         // Input first, candidates beneath it, like emacs completing-read.

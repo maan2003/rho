@@ -179,7 +179,7 @@ impl Frame {
         // Completion replaces the whole address, including project names
         // with spaces. Enter on untouched input uses the label's default.
         if let Some(prompt) = self.minibuffer_mut() {
-            prompt.complete_whole_input_without_default();
+            prompt.complete_project_address();
         }
     }
 

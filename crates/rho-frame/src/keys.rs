@@ -135,6 +135,7 @@ fn bindings() -> Vec<KeyBinding> {
     }
     bindings.extend([
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
+        KeyBinding::new("enter", editor::actions::Newline, Some("RhoIdea > Editor")),
         KeyBinding::new("escape", CancelIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
