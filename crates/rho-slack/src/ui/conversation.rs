@@ -3514,7 +3514,7 @@ fn plan(updates: &[Update], shown: &[&Message], placed: &impl Placed) -> Vec<Op>
                 if !held(&key, &added, &gone) {
                     continue;
                 }
-                let above = placed.above(&key);
+                let above = rule_side(placed.above(&key), placed);
                 let below = placed.below(&key);
                 ops.push(Op::Remove(key.clone()));
                 gone.insert(key);
@@ -3557,6 +3557,7 @@ fn plan_inserts(
     };
     let mut keys: Vec<Row> = Vec::new();
     let mut before: Option<Row> = None;
+    let mut landing: Option<Row> = None;
     let mut follows: Option<String> = None;
     let mut previous_day: Option<i64> = None;
     let mut last_day: Option<i64> = None;
@@ -3571,7 +3572,7 @@ fn plan_inserts(
         if !keys.is_empty() && next != before {
             close_run(
                 std::mem::take(&mut keys),
-                before.clone(),
+                landing.take(),
                 follows.take(),
                 last_day,
                 ops,
@@ -3580,10 +3581,11 @@ fn plan_inserts(
         }
         if keys.is_empty() {
             before = next;
+            landing = before.clone().map(|before| landing_over(before, placed));
             // The day rule heading the message the run lands on. It stays
             // where it is when the run starts on that same day, and is dealt
             // with by `close_run` when the run reaches back further.
-            let rule = match before.as_ref().and_then(|before| placed.above(before)) {
+            let rule = match landing.as_ref().and_then(|landing| placed.above(landing)) {
                 Some(Row::Day(label)) => Some(label),
                 _ => None,
             };
@@ -3611,7 +3613,29 @@ fn plan_inserts(
         keys.push(key.clone());
         added.insert(key);
     }
-    close_run(keys, before, follows, last_day, ops);
+    close_run(keys, landing, follows, last_day, ops);
+}
+
+/// What a run arriving over `message` goes in front of: the message, or the
+/// unread rule when that sits on it. The rule heads the first unread message
+/// from under its day rule, so a run of history that arrives older than that
+/// message goes above the rule, and the day rule is found above the rule.
+/// Looking for it on the message instead finds no day rule, and the run
+/// brings a second one with the same key.
+fn landing_over(message: Row, placed: &impl Placed) -> Row {
+    match placed.above(&message) {
+        Some(Row::Unread) => Row::Unread,
+        _ => message,
+    }
+}
+
+/// The row above a message, looking past the unread rule, which sits
+/// between a day rule and the first message under it.
+fn rule_side(above: Option<Row>, placed: &impl Placed) -> Option<Row> {
+    match above {
+        Some(Row::Unread) => placed.above(&Row::Unread),
+        above => above,
+    }
 }
 
 /// Puts one run in, around the day rule that heads the message it lands on.
@@ -5041,6 +5065,76 @@ mod tests {
                 Op::Remove(Row::Day(day_label(only.ts.epoch_seconds() as i64))),
             ],
             "nothing is left under the rule, so the rule goes"
+        );
+    }
+
+    /// The transcript's order after `ops`, as `Transcript` applies them.
+    fn applied(mut keys: Vec<Row>, ops: &[Op]) -> Vec<Row> {
+        for op in ops {
+            match op {
+                Op::Insert { before, keys: run } => {
+                    let at = before.as_ref().map_or(keys.len(), |before| {
+                        keys.iter().position(|key| key == before).unwrap()
+                    });
+                    keys.splice(at..at, run.iter().cloned());
+                }
+                Op::Remove(gone) => keys.retain(|key| key != gone),
+                Op::Replace(_) => {}
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn a_page_arriving_over_the_unread_rule_goes_above_it_with_no_second_day_rule() {
+        // The first unread message is the first of its day, so the unread
+        // rule sits between the day rule and it.
+        let unread = message("1700000600.0", None, "the first unread");
+        let older = message("1700000000.0", None, "earlier the same day");
+        let day = Row::Day(day_label(unread.ts.epoch_seconds() as i64));
+        let before = vec![
+            Row::Gap,
+            day.clone(),
+            Row::Unread,
+            Row::Message(unread.ts.clone()),
+        ];
+        let shown = [older.clone(), unread.clone()];
+
+        let ops = plan(
+            &[Update::Inserted(older.ts.clone())],
+            &borrowed(&shown),
+            &Held(before.clone()),
+        );
+
+        assert_eq!(
+            applied(before, &ops),
+            vec![
+                Row::Gap,
+                day,
+                Row::Message(older.ts.clone()),
+                Row::Unread,
+                Row::Message(unread.ts.clone()),
+            ],
+            "history lands above the rule, under the one day rule: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_first_unread_takes_its_day_rule_from_over_the_unread_rule() {
+        let only = message("1700000000.0", None, "hello");
+        let day = Row::Day(day_label(only.ts.epoch_seconds() as i64));
+        let held = Held(vec![
+            day.clone(),
+            Row::Unread,
+            Row::Message(only.ts.clone()),
+        ]);
+
+        let ops = plan(&[Update::Removed(only.ts.clone())], &[], &held);
+
+        assert_eq!(
+            ops,
+            vec![Op::Remove(Row::Message(only.ts.clone())), Op::Remove(day)],
+            "nothing is left under the day rule, so it goes"
         );
     }
 
