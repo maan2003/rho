@@ -19,8 +19,8 @@ sees: `N wait` and up to seven `deal.Card` rows, in the deal’s order; `moving`
 does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
-- open a row `enter` or one tap: open the selected card or thread
-- write an idea: address and send a new idea, as `mail.Write an idea`
+- open a row `enter` or one tap: open the selected card or thread; the waiting overflow opens the first hidden card
+- write an idea `i` on any row: write in the draft, as `mail.Write an idea`; on the phone, tap the address to open `to:`
 - narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
 
 ## screen Desk
@@ -28,11 +28,11 @@ status: narrowing to one project is not built; the project still has its own lis
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits
-- `deal.Card`: up to seven waiting rows, in deal order; the same project and reason share a row at the first card’s place; a line below counts the unseen cards and any results among them
+- `deal.Card`: up to seven waiting rows, in deal order; every ask and result shows its own subject. Repeated stops in one project share a row at the first stop's place. The overflow names what it hides, such as `and 2 more · clock@lab 2 results`
 - `mail.Thread`: up to ten rows under `moving`, in order of their latest status change; threads with a waiting card are excluded, even when their card isn't shown
 - `mail.Project`: the address on the `design.Draft tail`
 states:
-- empty: `0 wait`; no waiting or moving rows; the idea tail remains
+- empty: `0 wait`; no waiting or moving rows; the cursor rests on the blank draft line below the address
 - loading: not agreed
 - partial: not agreed
 - error: not agreed
@@ -40,31 +40,35 @@ states:
 keys:
 - `space`: deal the first card, `Desk.deal`
 - `enter`: open the selected row, `Desk.open a row`
-- `G`: go to the idea; `i`, `A`, `o`, or tap: write in place; `esc`: Normal in the same draft; `ctrl-enter` or `send`: send the idea
+- `j` and `k`: move between waiting, overflow, moving, and draft rows, skipping labels and blank lines; `gg`: first row, or the draft when empty; `G`: draft
+- `i` on any row, `A`, `o`, or tap in the draft: write in place; `esc`: Normal in the same draft; `ctrl-enter` or `send`: send the idea
+- tap the draft address on the phone: open `to:`
 - `tab`: `window.Screen`
 - `ctrl-t` while writing: choose another project without losing the draft
 - `:`: `window.Palette`
 starts: `Glance at what moves`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
 
+While the user writes an idea, changes above it leave the writing caret in place on screen.
+
 Built renders: [waiting and moving on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
 
 mock:
 ```text
-desk                                                                  ●     NOR
+desk                                                                        NOR
 
 15 wait
-Flaky clock test            asks · 2.0h                       tide@lab
-reef@lab                    6 failed · 5m
-Release window              asks · 20m                        slack@harness
-Shoreline import            result · 8m                       shoal@lab
-Switch the mail runtime     asks · 3m                         dune@lab
-Limit the retry window      asks · 2m                         mire@lab
-Rename the fixture          asks · now                        sand@lab
-and 3 more · 1 result
+Flaky clock test  asks · 2.0h  tide@lab
+Release window  asks · 20m  slack@harness
+reef@lab  6 failed · 5m
+Switch the mail runtime  asks · 3m  dune@lab
+Limit the retry window  asks · 2m  mire@lab
+Rename the fixture  asks · now  sand@lab
+Shoreline import  result · 8m  shoal@lab
+and 3 more · clock@lab 3 results
 
 moving
-Cache eviction tests        working · 3m                      tide@lab
-Release notes               checking the links · 18m          shoal@lab
+Cache eviction tests  working · 3m  tide@lab
+Release notes  checking the links · 18m  shoal@lab
 
 ── idea to tide@lab · ctrl-enter sends · ctrl-t project
 Keep the asymmetric clock test in the suite.
@@ -72,23 +76,23 @@ Keep the asymmetric clock test in the suite.
 
 mock, phone:
 ```text
-desk                          ●    NOR
+desk                               NOR
 15 wait
 Flaky clock test               tide@lab
   asks · 2.0h
-reef@lab
-  6 failed · 5m
 Release window            slack@harness
   asks · 20m
-Shoreline import              shoal@lab
-  result · 8m
+reef@lab
+  6 failed · 5m
 Switch the mail runtime        dune@lab
   asks · 3m
 Limit the retry window         mire@lab
   asks · 2m
 Rename the fixture             sand@lab
   asks · now
-and 3 more · 1 result
+Shoreline import              shoal@lab
+  result · 8m
+and 3 more · clock@lab 3 results
 
 moving
 Cache eviction tests           tide@lab

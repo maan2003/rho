@@ -347,6 +347,7 @@ mod tests {
                 title: title.into(),
                 context: project.into(),
                 label: words.into(),
+                kind: rho_dealer::rank::CardKind::Other,
                 priority: 1.,
                 cursor: "".into(),
                 skipped: false,

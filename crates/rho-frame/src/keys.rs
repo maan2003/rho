@@ -26,6 +26,10 @@ actions!(
         /// `tab`: Desk, and from Desk the way back.
         Desk,
         OpenRow,
+        DeskNext,
+        DeskPrevious,
+        DeskFirst,
+        DeskDraft,
         PromptIdea,
         RedoIdeaOrUndoVerdict,
         SendIdea,
@@ -128,8 +132,15 @@ fn bindings() -> Vec<KeyBinding> {
         ]);
     }
 
-    for context in normal_contexts("RhoDesk", " && vim_operator == none") {
+    for context in normal_contexts(
+        "RhoDesk",
+        " && vim_operator == none && !showing_completions",
+    ) {
         bindings.extend([
+            KeyBinding::new("j", DeskNext, Some(&context)),
+            KeyBinding::new("k", DeskPrevious, Some(&context)),
+            KeyBinding::new("g g", DeskFirst, Some(&context)),
+            KeyBinding::new("shift-g", DeskDraft, Some(&context)),
             KeyBinding::new("enter", OpenRow, Some(&context)),
             KeyBinding::new("shift-u", RedoIdeaOrUndoVerdict, Some(&context)),
         ]);

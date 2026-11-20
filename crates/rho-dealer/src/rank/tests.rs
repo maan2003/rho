@@ -235,7 +235,7 @@ impl World {
                             head_start: AGENT_BLOCKED_HEAD_START,
                             since: ask.at,
                         },
-                        "asks · {age}",
+                        CardKind::Ask,
                     )
                 } else if let Some(result) = unseen.last() {
                     (
@@ -244,7 +244,7 @@ impl World {
                             head_start: AGENT_BLOCKED_HEAD_START,
                             since: result.at,
                         },
-                        "result · {age}",
+                        CardKind::Result,
                     )
                 } else {
                     if let Some(trace) = trace.as_deref_mut() {

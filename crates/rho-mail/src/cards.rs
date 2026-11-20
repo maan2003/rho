@@ -11,7 +11,7 @@ use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, EndpointId, MentionKind, Message, MessageId,
 };
 use rho_dealer::curve::{self, Curve};
-use rho_dealer::rank::Trace;
+use rho_dealer::rank::{CardKind, Trace};
 use rho_dealer::{Addressed, Claim, Marks};
 
 use crate::fold::HostMail;
@@ -147,10 +147,10 @@ pub fn claims(
             continue;
         };
         let reason = match (mail.from, mail.mentions(Party::User)) {
-            (Party::System { stop, .. }, _) => format!("{} · {{age}}", stop.word()),
-            (Party::StartFailed, _) => "failed · {age}".to_owned(),
-            (_, Some(MentionKind::Result)) => "result · {age}".to_owned(),
-            _ => "asks · {age}".to_owned(),
+            (Party::System { stop, .. }, _) => CardKind::Stop(stop.word()),
+            (Party::StartFailed, _) => CardKind::Stop("failed"),
+            (_, Some(MentionKind::Result)) => CardKind::Result,
+            _ => CardKind::Ask,
         };
         let since = unix(
             match mail.from {
@@ -642,6 +642,35 @@ mod tests {
     }
 
     #[test]
+    fn asks_and_stops_deal_oldest_first_before_even_older_results() {
+        let mut w = world();
+        let old_result = w.agent("later-alphabetically");
+        let new_result = w.agent("earlier-alphabetically");
+        let old_ask = w.agent("old ask");
+        let stop = w.agent("stop");
+        let new_ask = w.agent("new ask");
+        w.finishes(old_result);
+        w.pass(mins(10));
+        w.finishes(new_result);
+        w.pass(mins(10));
+        w.asks(old_ask);
+        w.pass(mins(15));
+        w.stop(stop, Stop::Failed);
+        w.pass(mins(12));
+        w.writes_to(new_ask);
+        w.asks(new_ask);
+        let hand = w.deal();
+        assert_eq!(
+            hand.cards
+                .iter()
+                .map(|card| card.address.clone())
+                .collect::<Vec<_>>(),
+            [old_ask, stop, new_ask, old_result, new_result].map(|thread| w.address(thread)),
+        );
+        assert!(w.priority(new_ask).unwrap() > w.priority(old_ask).unwrap());
+    }
+
+    #[test]
     fn a5_several_unseen_mentions_are_one_card_an_ask_above_a_result() {
         let mut w = world();
         let a = w.agent("a");
@@ -740,7 +769,29 @@ mod tests {
     }
 
     #[test]
-    fn a7_a_thread_the_user_just_wrote_in_comes_back_on_top_and_chimes() {
+    fn refused_start_is_a_stop_not_an_ask() {
+        let mut w = world();
+        let thread = w.agent("a");
+        let failure = w.post(
+            Some(thread),
+            Party::StartFailed,
+            vec![Mention {
+                to: Party::User,
+                kind: MentionKind::Ask,
+            }],
+            "Could not start.",
+        );
+        let hand = w.deal();
+        let [card] = hand.cards.as_slice() else {
+            panic!("{:?}", hand.cards)
+        };
+        assert_eq!(card.kind, CardKind::Stop("failed"));
+        assert_eq!(card.label, "failed · now");
+        assert_eq!(attention_mail(&card.cursor), Some(failure));
+    }
+
+    #[test]
+    fn a7_a_recent_reply_raises_chime_pressure_without_jumping_the_hand() {
         let mut w = world();
         let a = w.agent("a");
         let b = w.agent("b");
@@ -748,8 +799,12 @@ mod tests {
         w.writes_to(a);
         w.pass(mins(5));
         w.finishes(a);
-        assert!(w.hand().starts_with("rho@lab › a ·"), "{}", w.hand());
+        assert_eq!(
+            w.hand(),
+            "rho@lab › b · asks · 5m\nrho@lab › a · result · now"
+        );
         assert!(w.priority(a).unwrap() >= CHIME_THRESHOLD);
+        assert!(w.priority(b).unwrap() < CHIME_THRESHOLD);
         // Through a snooze said before the user wrote.
         w.snooze(a, hours(4));
         w.pass(mins(30));
