@@ -178,9 +178,10 @@ import os
 from rho.tools import Chat
 mail = Chat("{}")
 mail.status({}, "Waiting for the capacity report")
-note = mail.post({}, "Use polling for this check.")
+note = await mail.post({}, "Use polling for this check.")
+assert type(note) is int
 mail.edit(note, "Use sockets for this check.")
-hits = mail.search("sockets", project={})
+hits = await mail.search("sockets", project={})
 assert [row["message"] for row in hits] == [note]
 mail.delete(note)
 assert not mail.search("sockets", project={})
