@@ -113,18 +113,39 @@ keys:
 - `space`: `deal.Verdict` on the agent's thread; the transcript stays open
 - `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`
+
+Built renders: [mail's writing step on the laptop](design/laptop-agent.png) and [on the phone](design/phone-agent.png).
+
 mock:
 ```text
-lab › eng-boqk · /src/clock                     failed · 1 error     NOR
+lab › eng-boqk · /src/clock   waiting                              NOR
 
 brief
 Fix the clock test that fails one run in five.
+─────────────────────────────────────────────────────────────────────
+[#2 clock › Fix the clock test that fails one run in five.] Mail from the user:
+Fix the clock test that fails one run in five.
 
-$ git status · ok 15ms …
-$ cargo test clock · error 1s
-  src/clock.rs:42:5: clock_ticks failed 1 of 5 runs
-  cargo exited 101
-wrote to you: Could you clarify which clock to use? · ok 10ms …
+ran code: mail.status(2, "Waiting for clarification")… · ok 1s…
+wrote mail #4
+```
+
+mock, phone:
+```text
+lab › eng-boqk · clock  waiting             NOR
+
+brief
+Fix the clock test that fails one run in five.
+──────────────────────────────────────────────
+[#2 clock › Fix the clock test that fails
+one run in five.] Mail from the user:
+Fix the clock test that fails one run in five.
+
+ran code: mail.status(2, "Waiting for
+clarification")… · ok 1s…
+wrote mail #4
+
+      back        done       snooze       more
 ```
 
 ## flow Look into the work

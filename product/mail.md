@@ -111,9 +111,12 @@ keys:
 - `:`: `window.Palette`
 - `ctrl-k`, `tab`, `q`: `window.Screen`
 starts: `Answer a mail`, `agents.Look into the work`, `notes.Reply privately`
+
+Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png).
+
 mock:
 ```text
-tide@lab › Flaky clock test                                     asks · 2h     NOR
+tide@lab › Flaky clock test                                     asks · 2.0h   NOR
 
 you · 09:12
 Fix the clock test that fails one run in five.
@@ -125,6 +128,20 @@ The mock clock is shared between tests. Is a separate clock per test enough?
 Running the tests with a separate clock
 ── reply to tide@lab · ctrl-enter sends
 Yes, use a separate clock.
+```
+
+mock, phone:
+```text
+clock@lab › Fix the clock test…  asks · 3m  NOR
+you · 09:12
+Fix the clock test that fails one run in five.
+
+clock@lab · 09:15
+Could you clarify which behavior you want me
+to implement?
+── reply to clock@lab
+
+    back     done     snooze     more     send
 ```
 
 ## flow Answer a mail
