@@ -118,6 +118,10 @@ The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show work un
 Run `FAKE_SCENARIO=real-tool-rounds FAKE_ARGS='--seed 899421 --rounds 2' bash product/design/capture.sh /tmp/rho-form-proof target/debug`.
 Use **Put a clock idea to work** with `Run the clock acceptance checks.` for the idea. When the result waits, deal it with `space` and capture [proof](laptop-proof.png). Press `enter` on the project's words for the [transcript](laptop-agent.png). The command source, including each last shell argument, and the successful output are visible without opening a fold.
 
+## Find a bookmark after closing its tab
+
+Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `target/debug/examples/fake_browser` in the fixture shell. Open `https://guide.example.invalid/clock#checks`, choose `bookmark this page…`, and name it `Acceptance guide`. Choose `close page` in the palette, stop the laptop window, and reuse that identity at phone width. Type `Acceptance guide` in the palette and capture with `form_shot phone bookmark`. Tapping the row opens the saved address in a fresh tab.
+
 ## What the renders expose
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.

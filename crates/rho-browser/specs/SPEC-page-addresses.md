@@ -20,3 +20,5 @@ one of them can own the format alone.
   with its id, so an address in the ledger still names that tab after a
   restart. An address whose tab is gone still parses; opening it shows the
   browser's own error rather than nothing.
+
+- A bookmark is not a tab and does not keep its `page:` address alive. Choosing one opens its URL and records the resulting page, not the bookmark, in window history.
