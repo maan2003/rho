@@ -10,7 +10,8 @@ use rho_agent_types::{
     WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::worksets::{
-    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset,
+    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
+    StartFromMail, StopAgent,
 };
 use rho_mail::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
 use rho_mail::{HostMail, cards};
@@ -100,9 +101,11 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
         if scenario == rho_fake_model::Scenario::MailChain {
             run_peer_chain(&paths, root).await
         } else {
+            let refused = run_refused_start(&paths, root).await?;
             let mail = run(&paths, root).await?;
+            let live = run_live_ask(&paths, root).await?;
             let recovery = run_startup_failure(&paths, root).await?;
-            anyhow::Ok(format!("{mail}\n{recovery}"))
+            anyhow::Ok(format!("{refused}\n{mail}\n{live}\n{recovery}"))
         }
     })
     .await
@@ -117,6 +120,209 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
     }
     let _ = host.0.wait();
     Ok(())
+}
+
+async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, host } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no mail hello");
+    };
+    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
+    let project = post(paths, 100, None, "reef").await?;
+    let thread = post(paths, 101, Some(project), "Check the tide clock.").await?;
+    let missing = root.join("does-not-exist");
+    let error = call(
+        paths,
+        StartFromMail {
+            origin: thread,
+            launch: MailLaunch::New(CreateWorkset {
+                kind: WorksetKind::Host {
+                    cwd: missing.to_str().unwrap().into(),
+                },
+                code: "raise AssertionError('directory check did not run')".into(),
+            }),
+            host_label: "lab".into(),
+        },
+    )
+    .await
+    .expect_err("the requested directory is missing");
+    let reason = format!("{} does not exist on lab", missing.display());
+    assert_eq!(error.to_string(), reason);
+    let mut history = HostMail::default();
+    let mail = loop {
+        let ServerFrame::Mail { records } = read_frame(&mut stream).await? else {
+            continue;
+        };
+        let mut failure = None;
+        for record in records {
+            history.tell(&record);
+            failure = failure.or_else(|| {
+                rho_agent_types::Message::from_record(&record)
+                    .filter(|mail| mail.from == Address::StartFailed)
+            });
+        }
+        if let Some(mail) = failure {
+            break mail;
+        }
+    };
+    assert_eq!(mail.parent, Some(thread));
+    assert_eq!(mail.reply_to, Some(thread));
+    assert_eq!(
+        mail.text(),
+        format!(
+            "failed · did not start · {reason}\n\nTo carry on, run start agent here and choose where reef's agents work."
+        )
+    );
+    let claims = cards::claims(
+        &cards::Host {
+            endpoint: host,
+            chat: &history,
+            name: "lab",
+        },
+        &rho_dealer::Marks::default(),
+        jiff::Timestamp::now(),
+        None,
+    );
+    let [claim] = claims.as_slice() else {
+        anyhow::bail!("refused start did not deal one card")
+    };
+    assert_eq!(cards::attention_mail(&claim.cursor), Some(mail.id));
+    assert_eq!(claim.title, "Check the tide clock.");
+    Ok(format!(
+        "a missing directory refused the start and dealt stop mail #{}",
+        mail.id.0.0
+    ))
+}
+
+async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no mail hello");
+    };
+    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
+    let project = post(paths, 110, None, "lighthouse").await?;
+    let thread = post(paths, 111, Some(project), "Check the clock offsets.").await?;
+    let make_agent = || async {
+        let created = call(
+            paths,
+            CreateWorkset {
+                kind: WorksetKind::Host {
+                    cwd: root.to_str().unwrap().into(),
+                },
+                code:
+                    r#"new_agent(runtime={"kind": "native", "model": "sol", "effort": "medium"})"#
+                        .into(),
+            },
+        )
+        .await?;
+        let agent = created.result.agent.context("no agent")?;
+        anyhow::Ok((agent, created.workset))
+    };
+    let (a, aw) = make_agent().await?;
+    let (b, bw) = make_agent().await?;
+    let eval = |workset, code| async move {
+        let result = call(paths, Eval { workset, code }).await?;
+        anyhow::ensure!(result.error.is_none(), "{:?}", result.error);
+        Ok::<_, anyhow::Error>(result.output)
+    };
+    for (agent, workset) in [(a, aw), (b, bw)] {
+        eval(
+            workset,
+            format!(
+                "from rho import mail\nmail.join({}, {:?})",
+                thread.0.0,
+                agent.encoded()
+            ),
+        )
+        .await?;
+    }
+    let send = |workset, agent: AgentId, words: &str| {
+        eval(
+            workset,
+            format!(
+                "from rho import mail\nprint(int(mail.send({:?}, 'user', {:?}, thread={}, kind='ask')))",
+                agent.encoded(),
+                words,
+                thread.0.0
+            ),
+        )
+    };
+    let first = send(aw, a, "Can I use clock A?").await?;
+    let repeat = send(bw, b, "Can I use clock A?").await?;
+    let changed = send(bw, b, "Can I use clock B?").await?;
+    assert_eq!(first, repeat);
+    assert_eq!(first, changed);
+    let id = MessageId(rho_agent_types::ChatSeq(first.trim().parse()?));
+    let revision = wait_for_mail(&mut stream, |row|
+        matches!(row.event, ChatEvent::Revised { message, author, .. } if message == id && author == b)
+    ).await?;
+    let ChatEvent::Revised { content, .. } = revision.event else {
+        unreachable!()
+    };
+    assert_eq!(
+        content,
+        [ContentPart::Text {
+            text: "Can I use clock B?".into()
+        }]
+    );
+    // The second agent was a member of the same thread at the time of the
+    // first ask. Neither workset is sent a wake for mail to the user.
+    for agent in [a, b] {
+        let log = call(
+            paths,
+            AgentLog {
+                agent,
+                from: Wpos(0),
+            },
+        )
+        .await?;
+        assert!(
+            !log.rows
+                .iter()
+                .any(|(_, row)| matches!(row, LogEvent::Request { .. }))
+        );
+    }
+    // The new writer's address is resolved by the host, even after leaving.
+    eval(bw, format!("mail.leave({}, {:?})", thread.0.0, b.encoded())).await?;
+    eval(aw, format!("mail.leave({}, {:?})", thread.0.0, a.encoded())).await?;
+    let answer = call(
+        paths,
+        Post {
+            client_id: 112,
+            parent: Some(thread),
+            reply_to: Some(id),
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: "Use clock B.".into(),
+            }],
+        },
+    )
+    .await?;
+    let answer = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
+    let ChatEvent::Posted { mentions, .. } = answer.event else {
+        unreachable!()
+    };
+    assert_eq!(
+        mentions.into_iter().map(|m| m.to).collect::<Vec<_>>(),
+        [Address::Agent(b)]
+    );
+    // An explicit stop leaves a status, not another mail.
+    call(paths, StopAgent { agent: b }).await?;
+    loop {
+        match read_frame(&mut stream).await? {
+            ServerFrame::Statuses { statuses } if statuses.iter().any(|status|
+                status.thread == thread && status.state == rho_agent_types::StatusText::StoppedByYou
+            ) => break,
+            ServerFrame::Mail { records } => assert!(!records.into_iter().any(|row| {
+                matches!(row.event, ChatEvent::Posted { from: Address::System { agent, .. }, .. } if agent == b)
+            })),
+            _ => {}
+        }
+    }
+    Ok(format!(
+        "two agents, one live ask #{}; the answer named the new writer",
+        id.0.0
+    ))
 }
 
 async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
@@ -225,14 +431,14 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     while !(edited && deleted && status) {
         match read_frame(&mut stream).await? {
             ServerFrame::Statuses { statuses } => {
-                status |= statuses
-                    .iter()
-                    .any(|s| s.thread == thread && s.text == "Waiting for the capacity report")
+                status |= statuses.iter().any(|s| {
+                    s.thread == thread && s.state.words() == "Waiting for the capacity report"
+                })
             }
             ServerFrame::Mail { records } => {
                 for row in records {
                     match row.event {
-                        ChatEvent::Edited { message, .. } if message == note => edited = true,
+                        ChatEvent::Revised { message, .. } if message == note => edited = true,
                         ChatEvent::Deleted { message } if message == note => deleted = true,
                         _ => {}
                     }
@@ -599,6 +805,55 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
         (1_950..3_500).contains(&user_delay),
         "user wake was {user_delay}ms, not 2s"
     );
+    // The request carrying the reply and the completion are separate rows.
+    // Rewind only after the last response stopped.
+    loop {
+        let log = call(
+            paths,
+            AgentLog {
+                agent: leader,
+                from: Wpos(0),
+            },
+        )
+        .await?;
+        let mut saw_answer = false;
+        let mut completed = false;
+        for (_, row) in log.rows {
+            match row {
+                LogEvent::Request { inputs, .. }
+                    if inputs.iter().any(|input| input.message == Some(answer)) =>
+                {
+                    saw_answer = true
+                }
+                LogEvent::Replied { .. } if saw_answer => completed = true,
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rewound = call(
+        paths,
+        RewindAgent {
+            agent: leader,
+            turns: 2,
+        },
+    )
+    .await?;
+    assert!(
+        rewound
+            .taken_back
+            .iter()
+            .any(|title| title == "Can I use the test clock?")
+    );
+    wait_for_mail(&mut stream, |row| {
+        matches!(row.event,
+            ChatEvent::TakenBack { message, author, .. } if message == ask && author == leader
+        )
+    })
+    .await?;
     Ok(format!(
         "one record: brief #{}, peer reply #{} ({}ms, no card), user ask #{}, user answer #{} ({}ms)",
         brief.0.0, peer.0.0, peer_delay, ask.0.0, answer.0.0, user_delay

@@ -6,9 +6,9 @@
 //! read as a range and a move rewrites two rows. Membership is explicit per
 //! thread ([`MEMBERS`]) and read up the chain of parents: the nearest
 //! record for an agent decides, so a join on a root is a bot in a channel
-//! and a leave on a subthread cuts that branch. A message is in the inbox of
-//! every member and every agent it mentions, but not its sender's. The inbox
-//! is written with the message, so an agent's delivery reads only its own.
+//! and a leave on a subthread cuts that branch. User-facing mail is readable
+//! in its thread but never delivered to agents. Other mail goes to its
+//! recipients' inboxes when written, so delivery reads only its own inbox.
 
 use redb::TableDefinition;
 use rho_agent_types::{
@@ -40,7 +40,7 @@ const FIRST_THREAD: TableDefinition<AgentId, u64> = TableDefinition::new("chat_f
 const NAMES: TableDefinition<u64, String> = TableDefinition::new("chat_names");
 
 /// `(message, latest edit/delete event)`, pointing into the log rather than
-/// copying its body. The original posting still owns the identity and sender.
+/// copying its body. The original posting still owns the identity.
 const REVISIONS: TableDefinition<u64, u64> = TableDefinition::new("chat_revisions");
 
 const AGENT_MAIL_PROJECT: &str = "Agent mail";
@@ -153,7 +153,13 @@ impl MailRead for ReadTxn {
                 .expect("a revision is a mail event")
                 .value()
                 .into_owned();
-            message.apply_revision(&record.event);
+            apply_revision(&mut message, &record, |seq| {
+                self.open_table(MAIL_LOG)
+                    .get(seq.0)
+                    .expect("mail version")
+                    .value()
+                    .into_owned()
+            });
         }
         Some(message)
     }
@@ -228,7 +234,11 @@ impl MailRead for ReadTxn {
                 self.message(MessageId(ChatSeq(seq)))
                     .expect("an inbox names a message")
             })
-            .filter(|message| message.revision != Revision::Deleted)
+            .filter(|message| {
+                !matches!(message.revision, Revision::Deleted | Revision::TakenBack { .. })
+                    // Older inbox indexes can still contain project mail.
+                    && !user_facing(message.from, &message.mentions)
+            })
             .collect()
     }
 
@@ -386,6 +396,13 @@ impl MailRead for ReadTxn {
     }
 }
 
+/// Project mail speaks to the user, not to every agent reading the thread.
+fn user_facing(sender: Address, mentions: &[Mention]) -> bool {
+    matches!(sender, Address::System { .. } | Address::StartFailed)
+        || matches!(sender, Address::Agent(_))
+            && mentions.iter().any(|mention| mention.to == Address::User)
+}
+
 /// Delivery is fixed by the record, not by which process happens to be
 /// running. Directed mail never fans out to inherited thread members.
 fn recipients(
@@ -393,7 +410,7 @@ fn recipients(
     mentions: &[Mention],
     members: impl FnOnce() -> Vec<AgentId>,
 ) -> Vec<AgentId> {
-    if matches!(sender, Address::System { .. }) {
+    if user_facing(sender, mentions) {
         return Vec::new();
     }
     let mut agents = if mentions.iter().any(|m| m.kind == MentionKind::Direct) {
@@ -491,6 +508,28 @@ pub trait MailWrite {
     ) -> anyhow::Result<MessageId>;
     /// The latest project mail in this thread, if it has no user reply.
     fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)>;
+    /// Reuses the current unanswered ask, if the thread has one, and whether
+    /// its words changed.
+    fn restate_ask(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        message: &NewMessage,
+    ) -> anyhow::Result<Option<(MessageId, bool)>>;
+    /// The current writer in the same transaction that records the answer.
+    fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId>;
+    fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq>;
+    /// Mark a still-current version taken back, without erasing its words.
+    fn take_back_mail(
+        &mut self,
+        at: UnixMs,
+        author: AgentId,
+        mail: MessageId,
+        version: Option<ChatSeq>,
+    );
+    /// Settle a stuck streak's durable stop when the model answered again.
+    fn recover_stuck(&mut self, at: UnixMs, author: AgentId, since: UnixMs);
+
     /// Change an agent's own posted mail, except mail the user answered.
     fn edit(
         &mut self,
@@ -671,42 +710,121 @@ fn has_user_reply(write: &mut WriteTxn, id: MessageId) -> bool {
         })
 }
 
-fn is_deleted(write: &mut WriteTxn, id: MessageId) -> bool {
+fn apply_revision(
+    mail: &mut Message,
+    revision: &ChatRecord,
+    read: impl FnOnce(ChatSeq) -> ChatRecord,
+) {
+    if let ChatEvent::TakenBack { version, .. } = revision.event
+        && version != mail.id.0
+    {
+        mail.apply_revision(&read(version));
+    }
+    mail.apply_revision(revision);
+}
+
+fn current_message(write: &mut WriteTxn, id: MessageId) -> Option<Message> {
+    let record = write.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
+    let mut message = Message::from_record(&record)?;
     let revision = write
         .open_table(REVISIONS)
         .get(id.0.0)
         .map(|seq| seq.value());
-    revision.is_some_and(|seq| {
-        matches!(
+    if let Some(seq) = revision {
+        let record = write
+            .open_table(MAIL_LOG)
+            .get(seq)
+            .expect("a revision is a mail event")
+            .value()
+            .into_owned();
+        apply_revision(&mut message, &record, |seq| {
             write
                 .open_table(MAIL_LOG)
-                .get(seq)
-                .expect("a revision is a mail event")
+                .get(seq.0)
+                .expect("mail version")
                 .value()
                 .into_owned()
-                .event,
-            ChatEvent::Deleted { .. }
-        )
-    })
+        });
+    }
+    message.parent = parent_now(write, id);
+    Some(message)
 }
 
-fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow::Result<()> {
-    let original = write
-        .open_table(MAIL_LOG)
-        .get(id.0.0)
-        .and_then(|record| Message::from_record(&record.value().into_owned()))
-        .ok_or_else(|| anyhow::anyhow!("no message #{}", id.0.0))?;
+fn last_project_mail(
+    write: &mut WriteTxn,
+    thread: MessageId,
+    matches: impl Fn(&Message) -> bool,
+) -> Option<Message> {
+    let anchor = current_message(write, thread)?;
+    // A project root is a collection of threads, not a single conversation.
+    if anchor.parent.is_none() && anchor.mentions(Address::User).is_none() {
+        return None;
+    }
+    let mut candidates: Vec<_> = write
+        .open_table(CHILDREN)
+        .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
+        .rev()
+        .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
+        .collect();
+    // A deeper branch's anchor is mail in its enclosing conversation.
+    if anchor
+        .parent
+        .is_none_or(|parent| parent_now(write, parent).is_none())
+    {
+        candidates.insert(candidates.partition_point(|id| *id > thread), thread);
+    }
+    candidates
+        .into_iter()
+        .filter_map(|id| current_message(write, id))
+        .find(|mail| {
+            !matches!(
+                mail.revision,
+                Revision::Deleted | Revision::TakenBack { .. }
+            ) && matches(mail)
+        })
+}
+
+fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow::Result<Message> {
+    let mail =
+        current_message(write, id).ok_or_else(|| anyhow::anyhow!("no message #{}", id.0.0))?;
     anyhow::ensure!(
-        original.from == Address::Agent(agent),
+        mail.from == Address::Agent(agent),
         "you can only change your own mail"
     );
-    anyhow::ensure!(!is_deleted(write, id), "mail #{} was deleted", id.0.0);
+    anyhow::ensure!(
+        !matches!(
+            mail.revision,
+            Revision::Deleted | Revision::TakenBack { .. }
+        ),
+        "mail #{} was deleted or taken back",
+        id.0.0
+    );
     anyhow::ensure!(
         !has_user_reply(write, id),
         "you cannot change mail #{}: the user already answered it",
         id.0.0
     );
-    Ok(())
+    Ok(mail)
+}
+
+fn revise(
+    write: &mut WriteTxn,
+    at: UnixMs,
+    mail: &Message,
+    writer: AgentId,
+    content: Vec<ContentPart>,
+) -> bool {
+    if mail.content == content {
+        return false;
+    }
+    let event = ChatEvent::Revised {
+        message: mail.id,
+        author: writer,
+        content,
+    };
+    let seq = append(write, at, event.clone());
+    write.index_mail_event(seq, &event);
+    true
 }
 
 impl MailWrite for WriteTxn {
@@ -818,36 +936,122 @@ impl MailWrite for WriteTxn {
     }
 
     fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)> {
-        if !is_message(self, thread) {
-            return None; // post reports an unknown parent
-        }
-        // A root holds work threads, not a single conversation.
-        let parent = parent_now(self, thread)?;
-        let mut candidates: Vec<_> = self
-            .open_table(CHILDREN)
-            .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
-            .rev()
-            .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
-            .collect();
-        // The anchor is the first mail of a branch under a project root.
-        // A deeper branch's anchor is mail in its enclosing conversation.
-        if parent_now(self, parent).is_none() {
-            candidates.insert(candidates.partition_point(|id| *id > thread), thread);
-        }
-        let latest = candidates.into_iter().find_map(|id| {
-            let row = self.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
-            let ChatEvent::Posted {
-                from: Address::Agent(author),
-                mentions,
-                ..
-            } = row.event
-            else {
-                return None;
-            };
-            (!mentions.iter().any(|m| m.kind == MentionKind::Direct) && !is_deleted(self, id))
-                .then_some((id, author))
+        let latest = last_project_mail(self, thread, |mail| {
+            matches!(mail.from, Address::Agent(_))
+                && !mail.mentions.iter().any(|m| m.kind == MentionKind::Direct)
         })?;
-        (!has_user_reply(self, latest.0)).then_some(latest)
+        let Address::Agent(writer) = latest.from else {
+            unreachable!()
+        };
+        (!has_user_reply(self, latest.id)).then_some((latest.id, writer))
+    }
+
+    fn restate_ask(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        message: &NewMessage,
+    ) -> anyhow::Result<Option<(MessageId, bool)>> {
+        let Address::Agent(writer) = message.from else {
+            return Ok(None);
+        };
+        let ask = Mention {
+            to: Address::User,
+            kind: MentionKind::Ask,
+        };
+        if message.mentions != [ask] {
+            return Ok(None);
+        }
+        let Some(mail) = last_project_mail(self, thread, |mail| {
+            matches!(mail.from, Address::Agent(_))
+                && matches!(
+                    mail.mentions(Address::User),
+                    Some(MentionKind::Ask | MentionKind::Result)
+                )
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(mail.from, Address::Agent(_))
+            || mail.mentions != [ask]
+            || has_user_reply(self, mail.id)
+        {
+            return Ok(None);
+        }
+        if let Some(reply_to) = message.reply_to {
+            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
+        }
+        anyhow::ensure!(has_content(&message.content), "a message needs content");
+        let changed = revise(self, at, &mail, writer, message.content.clone());
+        Ok(Some((mail.id, changed)))
+    }
+
+    fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId> {
+        match current_message(self, mail)?.from {
+            Address::Agent(writer) => Some(writer),
+            _ => None,
+        }
+    }
+
+    fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq> {
+        current_message(self, mail).map(|mail| mail.version().0)
+    }
+
+    fn take_back_mail(
+        &mut self,
+        at: UnixMs,
+        author: AgentId,
+        mail: MessageId,
+        version: Option<ChatSeq>,
+    ) {
+        let Some(current) = current_message(self, mail) else {
+            return;
+        };
+        if current.from != Address::Agent(author)
+            || matches!(
+                current.revision,
+                Revision::Deleted | Revision::TakenBack { .. }
+            )
+            || version.is_some_and(|version| version != current.version().0)
+        {
+            return;
+        }
+        let version = self
+            .open_table(REVISIONS)
+            .get(mail.0.0)
+            .map_or(mail.0, |found| ChatSeq(found.value()));
+        let event = ChatEvent::TakenBack {
+            message: mail,
+            version,
+            author,
+        };
+        let seq = append(self, at, event.clone());
+        self.index_mail_event(seq, &event);
+    }
+
+    fn recover_stuck(&mut self, at: UnixMs, author: AgentId, since: UnixMs) {
+        let sender = Address::System {
+            agent: author,
+            stop: rho_agent_types::Stop::Stuck,
+            since,
+        };
+        let id = self.open_table(MAIL_LOG).iter().rev().find_map(|(key, row)| {
+            matches!(row.value().into_owned().event, ChatEvent::Posted { from, .. } if from == sender)
+                .then(|| MessageId(ChatSeq(key.value())))
+        });
+        let Some(mail) = id.and_then(|id| current_message(self, id)) else {
+            return;
+        };
+        if mail.mentions(Address::User).is_none() || has_user_reply(self, mail.id) {
+            return;
+        }
+        let event = ChatEvent::Recovered {
+            message: mail.id,
+            content: vec![ContentPart::Text {
+                text: "The model answered again. Work carried on.".into(),
+            }],
+        };
+        let seq = append(self, at, event.clone());
+        self.index_mail_event(seq, &event);
     }
 
     fn edit(
@@ -857,11 +1061,9 @@ impl MailWrite for WriteTxn {
         message: MessageId,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<()> {
-        check_revision(self, agent, message)?;
+        let mail = check_revision(self, agent, message)?;
         anyhow::ensure!(has_content(&content), "a message needs content");
-        let event = ChatEvent::Edited { message, content };
-        let seq = append(self, at, event.clone());
-        self.index_mail_event(seq, &event);
+        revise(self, at, &mail, agent, content);
         Ok(())
     }
 
@@ -1039,7 +1241,11 @@ impl MailWrite for WriteTxn {
             ChatEvent::Left { thread, agent } => {
                 self.open_table(MEMBERS).insert((thread.0.0, *agent), false);
             }
-            ChatEvent::Edited { message, .. } | ChatEvent::Deleted { message } => {
+            ChatEvent::Edited { message, .. }
+            | ChatEvent::Revised { message, .. }
+            | ChatEvent::TakenBack { message, .. }
+            | ChatEvent::Recovered { message, .. }
+            | ChatEvent::Deleted { message } => {
                 self.open_table(REVISIONS).insert(message.0.0, seq.0);
             }
             ChatEvent::Named { thread, name } => {

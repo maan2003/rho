@@ -177,6 +177,53 @@ pub struct Evaluated {
     pub agent: Option<AgentId>,
 }
 
+/// Why a requested host directory cannot be used. Callers may describe
+/// it with the name the user gave this host.
+#[derive(Debug)]
+pub struct HostDirectoryError {
+    path: camino::Utf8PathBuf,
+    reason: DirectoryProblem,
+}
+
+#[derive(Debug)]
+enum DirectoryProblem {
+    Relative,
+    Missing,
+    NotDirectory,
+    Unreadable(std::io::Error),
+}
+
+impl std::fmt::Display for HostDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = &self.path;
+        match &self.reason {
+            DirectoryProblem::Relative => write!(f, "{path} is not an absolute path"),
+            DirectoryProblem::Missing => write!(f, "{path} does not exist"),
+            DirectoryProblem::NotDirectory => write!(f, "{path} is not a directory"),
+            DirectoryProblem::Unreadable(error) => write!(f, "cannot read {path}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for HostDirectoryError {}
+
+fn check_host_directory(path: &camino::Utf8Path) -> Result<(), HostDirectoryError> {
+    let reason = if !path.is_absolute() {
+        DirectoryProblem::Relative
+    } else {
+        match std::fs::metadata(path) {
+            Ok(info) if info.is_dir() => return Ok(()),
+            Ok(_) => DirectoryProblem::NotDirectory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirectoryProblem::Missing,
+            Err(error) => DirectoryProblem::Unreadable(error),
+        }
+    };
+    Err(HostDirectoryError {
+        path: path.to_owned(),
+        reason,
+    })
+}
+
 impl AgentPool {
     /// Opens the pool over `db`, initializing its tables.
     pub async fn new(
@@ -900,10 +947,7 @@ impl AgentPool {
         code: String,
     ) -> anyhow::Result<(WorksetId, Evaluated)> {
         if let WorksetKind::Host { cwd } = &kind {
-            anyhow::ensure!(
-                cwd.is_absolute() && cwd.is_dir(),
-                "a host workset needs an absolute directory: {cwd}"
-            );
+            check_host_directory(cwd)?;
         }
         // Every workset has a directory: its state lives there, and an
         // isolated one's `/src`.
@@ -952,7 +996,11 @@ impl AgentPool {
             .expect("poison")
             .remove(&workset)
             .flatten();
-        let (output, error) = result?;
+        let (output, error) = match result {
+            Ok(evaluated) => evaluated,
+            Err(error) if agent.is_some() => (String::new(), Some(format!("{error:#}"))),
+            Err(error) => return Err(error),
+        };
         Ok(Evaluated {
             output,
             error,
@@ -971,12 +1019,12 @@ impl AgentPool {
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
         let mut mentions = self.user_mentions(mentions);
+        let mut write = self.db.write().await;
         // Resolve the writer on the host, even if they are no longer a
         // thread member. A deleted agent cannot receive mail, but the answer
         // still belongs in the thread.
         if let Some(target) = reply_to
-            && let Some(mail) = self.db.read().message(target)
-            && let Address::Agent(agent) = mail.from
+            && let Some(agent) = write.mail_writer(target)
             && self.workset_of(agent).is_ok()
             && mentions
                 .iter()
@@ -993,7 +1041,6 @@ impl AgentPool {
             mentions,
             content,
         };
-        let mut write = self.db.write().await;
         let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
         self.user_visited(id);
@@ -1066,6 +1113,68 @@ impl AgentPool {
         for workset in worksets {
             self.wake_workset(workset);
         }
+    }
+
+    /// End this agent's work without stopping its workset or posting mail.
+    pub async fn stop_agent(self: &Arc<Self>, agent: AgentId) -> anyhow::Result<()> {
+        let lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent)
+            .or_default()
+            .clone();
+        let _ownership = lock.lock().await;
+        let workset = self.workset_of(agent)?;
+        let removed = { self.agents.lock().await.remove(&agent) };
+        if let Some(client) = removed {
+            client.shutdown().await;
+        }
+        let at = UnixMs::now();
+        let mut write = self.db.write().await;
+        write.append(
+            workset,
+            &Record {
+                at,
+                event: Event::Notice {
+                    agent,
+                    notice: crate::entry::Notice::Archived,
+                },
+            },
+        )?;
+        write.commit();
+        let (status, _) = tokio::sync::watch::channel(AgentStatus {
+            runtime: RuntimeState {
+                archived: true,
+                ..RuntimeState::default()
+            },
+            ..AgentStatus::default()
+        });
+        self.status_changed(agent, &status);
+        self.user_stopped(agent, at);
+        Ok(())
+    }
+
+    /// Rewind the visible turn, returning the headlines marked taken back.
+    pub async fn rewind_agent(
+        self: &Arc<Self>,
+        agent: AgentId,
+        turns: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let (_, client, _) = self.load(agent).await?;
+        let before = self.db.read().mail_head();
+        client.control(Control::Rewind(turns)).await?;
+        let read = self.db.read();
+        Ok(read
+            .mail_since(before, usize::MAX)
+            .into_iter()
+            .filter_map(|row| match row.event {
+                rho_agent_types::ChatEvent::TakenBack {
+                    message, author, ..
+                } if author == agent => read.message(message).map(|mail| mail.headline()),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Cut off an agent's turn, if it is loaded; one that is not has none.
@@ -1379,30 +1488,46 @@ impl AgentPool {
                 };
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
-                let unanswered = if direct {
-                    None
+                let is_ask = message
+                    .mentions
+                    .iter()
+                    .any(|mention| mention.to == Address::User && mention.kind == MentionKind::Ask);
+                let (id, changed, unanswered) = if direct {
+                    (write.post_peer(at, project, message)?, true, None)
                 } else {
-                    parent.and_then(|thread| write.unanswered_project_mail(thread))
+                    let revised = match parent {
+                        Some(thread) if is_ask => write.restate_ask(at, thread, &message)?,
+                        _ => None,
+                    };
+                    let unanswered = if is_ask {
+                        None
+                    } else {
+                        parent.and_then(|thread| write.unanswered_project_mail(thread))
+                    };
+                    let (id, changed) = match revised {
+                        Some(revised) => revised,
+                        None => (write.post(at, parent, message, None)?, true),
+                    };
+                    (id, changed, unanswered)
                 };
-                let id = if direct {
-                    write.post_peer(at, project, message)?
-                } else {
-                    write.post(at, parent, message, None)?
-                };
-                write.append(
-                    workset,
-                    &Record {
-                        at,
-                        event: Event::MailWritten {
-                            agent: sender,
-                            message: id,
+                if changed {
+                    let version = write.mail_version(id);
+                    write.append(
+                        workset,
+                        &Record {
+                            at,
+                            event: Event::MailWritten {
+                                agent: sender,
+                                message: id,
+                                version,
+                            },
                         },
-                    },
-                )?;
-                write.commit();
-                self.wake_receivers(id, Some(workset));
-                if !direct {
-                    self.consider_naming(id);
+                    )?;
+                    write.commit();
+                    self.wake_receivers(id, Some(workset));
+                    if !direct {
+                        self.consider_naming(id);
+                    }
                 }
                 PyReply::SentMail { id, unanswered }
             }
@@ -1423,12 +1548,21 @@ impl AgentPool {
                 self.own_agent(workset, agent)?;
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
+                let before = write.mail_version(message);
                 write.edit(at, agent, message, content)?;
+                let version = write.mail_version(message);
+                if version == before {
+                    return Ok(PyReply::Done);
+                }
                 write.append(
                     workset,
                     &Record {
                         at,
-                        event: Event::MailWritten { agent, message },
+                        event: Event::MailWritten {
+                            agent,
+                            message,
+                            version,
+                        },
                     },
                 )?;
                 write.commit();

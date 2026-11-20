@@ -107,11 +107,15 @@ impl HostMail {
                 self.members.insert((*thread, *agent), false);
                 Told::Thread(*thread)
             }
-            ChatEvent::Edited { message, .. } | ChatEvent::Deleted { message } => {
+            ChatEvent::Edited { message, .. }
+            | ChatEvent::Revised { message, .. }
+            | ChatEvent::TakenBack { message, .. }
+            | ChatEvent::Recovered { message, .. }
+            | ChatEvent::Deleted { message } => {
                 let Some(mail) = self.messages.get_mut(message) else {
                     return Told::Nothing;
                 };
-                mail.apply_revision(&record.event);
+                mail.apply_revision(record);
                 Told::Thread(self.subthread_of(*message))
             }
             ChatEvent::Named { thread, name } => {
@@ -310,21 +314,16 @@ impl HostMail {
             .map(|joined| self.thread_of(*joined))
     }
 
-    /// The newest message in a thread or under it, the thread's own
-    /// message included.
-    pub fn newest_in(&self, thread: MessageId) -> Option<(MessageId, UnixMs)> {
-        let mut newest = self
-            .messages
-            .get(&thread)
-            .map(|message| (message.id, message.at));
+    /// The newest words in a thread or under it, the thread's own mail
+    /// included.
+    pub fn newest_in(&self, thread: MessageId) -> Option<(ChatSeq, UnixMs)> {
+        let mut newest = self.message(thread).map(Message::version);
         let mut stack = vec![thread];
         while let Some(at) = stack.pop() {
-            for child in self.children(Some(at)) {
-                if let Some(message) = self.messages.get(child) {
-                    if newest.is_none_or(|(id, _)| message.id > id) {
-                        newest = Some((message.id, message.at));
-                    }
-                    stack.push(*child);
+            for &child in self.children(Some(at)) {
+                if let Some(message) = self.message(child) {
+                    newest = newest.max(Some(message.version()));
+                    stack.push(child);
                 }
             }
         }
@@ -339,13 +338,16 @@ impl HostMail {
         while let Some(at) = stack.pop() {
             if let Some(message) = self.messages.get(&at)
                 && message.from != Address::User
-                && message.revision != Revision::Deleted
+                && !matches!(
+                    message.revision,
+                    Revision::Deleted | Revision::TakenBack { .. }
+                )
             {
                 found.push(at);
             }
             stack.extend(self.children(Some(at)).iter().copied());
         }
-        found.sort_unstable_by(|a, b| b.cmp(a));
+        found.sort_unstable_by_key(|id| std::cmp::Reverse(self.messages[id].version().0));
         found
     }
 
@@ -505,7 +507,7 @@ mod tests {
         assert_eq!(thread.members, [a], "b left this branch");
         assert_eq!(mail.members_under(Some(id(2))), [a, b]);
         assert_eq!(mail.members_under(Some(id(1))), [b]);
-        assert_eq!(mail.newest_in(id(2)), Some((id(5), UnixMs(5))));
+        assert_eq!(mail.newest_in(id(2)), Some((id(5).0, UnixMs(5))));
         assert_eq!(mail.others_in(id(2)), [id(4)]);
         assert_eq!(mail.root_named(" rho "), Some(id(1)));
         assert_eq!(mail.root_named("ops"), None);
@@ -540,7 +542,7 @@ mod tests {
         assert_eq!(mail.children(Some(id(10))), [id(4)]);
         assert_eq!(mail.root_of(id(5)), id(10));
         assert_eq!(mail.thread(id(5)).unwrap().path[0], (id(10), "ops".into()));
-        assert_eq!(mail.newest_in(id(2)), Some((id(2), UnixMs(2))));
+        assert_eq!(mail.newest_in(id(2)), Some((id(2).0, UnixMs(2))));
         assert_eq!(
             mail.tell(&record(
                 12,

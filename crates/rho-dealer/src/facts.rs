@@ -229,7 +229,7 @@ pub enum Seen {
     Agent(u64),
     /// A note: there is nothing more to see.
     Whole,
-    /// A chat topic, through this message.
+    /// A mail thread, through this position in its host's log.
     Topic(u64),
     /// A chat thread, through this message, and through every stop its
     /// agents were in that began by `stopped`, in unix milliseconds on
@@ -285,7 +285,7 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// The newest message of a topic the user had seen when done with it:
+    /// The newest mail version the user had seen when done with the thread:
     /// where its unread starts, and what its card has handled.
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()

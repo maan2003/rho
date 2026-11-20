@@ -2320,7 +2320,10 @@ mod tests {
             from: Address::Agent(agent),
             mentions: Vec::new(),
             content: Vec::new(),
-            revision: Revision::Edited,
+            revision: Revision::Edited {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+            },
         };
         let mark = |message| Arc::new(UiBlock::MailWritten { message });
         let failure = |at| {

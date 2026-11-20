@@ -21,9 +21,9 @@ use crate::outbox::{Kept, Outgoing};
 type Host = [u8; 32];
 
 /// Every record, by the host and position.
-const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("chat4_log");
+const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("mail5_log");
 /// Where this client stands in each host's log.
-const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("chat4_cursor");
+const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("mail5_cursor");
 /// What the user wrote that no host has taken yet, by host and client id.
 const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new("chat3_outbox");
 /// What the user is writing under each parent and has not sent, by host
@@ -85,9 +85,9 @@ impl Cache {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
-            // Older clients cannot decode the new Direct mention. Replay
-            // the copy from each host; outbox and drafts are user state
-            // and keep their existing tables.
+            // Older clients cannot decode live revisions or the new stop.
+            // Give the new copy its own tables. Drafts and unsent mail
+            // are user state and keep their existing tables.
             write.delete_table("chat3_log");
             write.delete_table("chat3_cursor");
             open_or_rebuild(&mut write, LOG);

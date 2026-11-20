@@ -412,7 +412,7 @@ fn agent_id(text: &str) -> PyResult<AgentId> {
 fn address_text(address: Address) -> String {
     match address {
         Address::User => "user".to_owned(),
-        Address::System { .. } => "system".to_owned(),
+        Address::System { .. } | Address::StartFailed => "system".to_owned(),
         Address::Agent(agent) => agent.encoded().to_string(),
     }
 }
@@ -1124,7 +1124,7 @@ fn message_to_py<'py>(
     out.set_item("text", text(&message.content))?;
     out.set_item(
         "edited",
-        message.revision == rho_agent_types::Revision::Edited,
+        matches!(message.revision, rho_agent_types::Revision::Edited { .. }),
     )?;
     out.set_item(
         "deleted",

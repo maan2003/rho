@@ -120,7 +120,12 @@ pub enum Event<'a> {
     /// Mail this agent (or the host on its behalf) posted or edited in this
     /// transaction. Its words live in the chat log; this marks its exact
     /// transcript step.
-    MailWritten { agent: AgentId, message: MessageId },
+    MailWritten {
+        agent: AgentId,
+        message: MessageId,
+        #[senax(default)]
+        version: Option<rho_agent_types::ChatSeq>,
+    },
 }
 
 impl Event<'_> {

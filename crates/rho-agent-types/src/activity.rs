@@ -40,9 +40,9 @@ impl Activity {
 }
 
 /// How long an agent retries its model before it counts as stuck. A
-/// provider that is down for minutes comes back on its own; one that
-/// fails for an hour needs the user to change the runtime or give up.
-pub const STUCK_AFTER: Duration = Duration::from_secs(60 * 60);
+/// transient error can recover on its own, but work blocked for three
+/// minutes needs to be visible to the user.
+pub const STUCK_AFTER: Duration = Duration::from_secs(3 * 60);
 
 /// A stop the agent did not choose: what draws the user to its thread
 /// without a word from it.
@@ -105,11 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn retrying_is_a_stop_only_from_an_hour_on() {
+    fn retrying_is_a_stop_only_from_three_minutes_on() {
         let retrying = doing(Activity::Retrying);
-        let hour = STUCK_AFTER.as_millis() as u64;
-        assert_eq!(retrying.stop(UnixMs(1_000_000 + hour - 1)), None);
-        assert_eq!(retrying.stop(UnixMs(1_000_000 + hour)), Some(Stop::Stuck));
+        let limit = 180_000;
+        assert_eq!(retrying.stop(UnixMs(1_000_000 + limit - 1)), None);
+        assert_eq!(retrying.stop(UnixMs(1_000_000 + limit)), Some(Stop::Stuck));
     }
 
     #[test]

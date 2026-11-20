@@ -43,6 +43,7 @@ does:
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind; the echo reads `compacted: eng-rb89`
 - new cache key, from the palette: make it start its model's cache afresh; the echo reads `new cache key: eng-rb89`
+- stop agent, from the palette: end its work and keep the transcript; the thread says `stopped by you`, with no new mail.
 - set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent. The echo line confirms the switch.
 - cancel the request, from the palette: stop what it is asking its model now; the echo reads `cancelled: eng-rb89` or `not cancelled: eng-rb89 · it was not asking its model` when there was no request
 
@@ -216,3 +217,9 @@ cases: two agents push at once, where the second question waits for the first; a
 
 ## rule a push waits for the user
 when an `Agent` pushes to or fetches from a repository through the user's ssh login, then the window asks the user first, and without a `y` the push or fetch does not happen.
+
+## rule a stuck agent asks
+when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop mail. When the model answers again, the project edits that stop and it no longer deals.
+
+## rule rewinding takes back its mail
+when `rewind turns` takes back a turn that wrote mail, then the withdrawn mail is still readable as `taken back` but no longer deals. Mail since changed by another turn is not withdrawn.

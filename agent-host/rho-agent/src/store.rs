@@ -418,6 +418,30 @@ impl StoreWrite for WriteTxn {
                         "a rewind stays within the agent's history"
                     );
                 }
+
+                if let Event::Rewound { to, .. } = record.event {
+                    for (old, row) in visible(agent_history_in_write(self, agent, workset))
+                        .into_iter()
+                        .rev()
+                    {
+                        if old < to {
+                            break;
+                        }
+                        if let Event::MailWritten {
+                            message, version, ..
+                        } = row.event
+                        {
+                            self.take_back_mail(record.at, agent, message, version);
+                        }
+                    }
+                }
+                if let Event::Notice {
+                    notice: Notice::Recovered(since),
+                    ..
+                } = record.event
+                {
+                    self.recover_stuck(record.at, agent, since);
+                }
                 agent_head.fold(pos, &record.event);
                 self.open_table(AGENT_HEADS)
                     .insert(agent, SenValue::borrowed(&agent_head));
@@ -488,6 +512,25 @@ impl StoreWrite for WriteTxn {
     }
 }
 
+fn agent_history_in_write(
+    write: &mut WriteTxn,
+    agent: AgentId,
+    workset: WorksetId,
+) -> Vec<(Wpos, Record<'static>)> {
+    agent_rows::positions_in_write(write, agent)
+        .into_iter()
+        .map(|pos| {
+            let record = write
+                .open_table(WORKSET_LOG)
+                .get((workset.0, pos.0))
+                .expect("an indexed row")
+                .value()
+                .into_owned();
+            (pos, record)
+        })
+        .collect()
+}
+
 /// Fold the native cursor again from the agent's visible rows.
 fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
     let mut head = write
@@ -496,18 +539,7 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         .expect("agent head")
         .value()
         .into_owned();
-    let rows: Vec<(Wpos, Record<'static>)> = agent_rows::positions_in_write(write, agent)
-        .into_iter()
-        .map(|pos| {
-            let record = write
-                .open_table(WORKSET_LOG)
-                .get((head.workset.0, pos.0))
-                .expect("an indexed row")
-                .value()
-                .into_owned();
-            (pos, record)
-        })
-        .collect();
+    let rows = agent_history_in_write(write, agent, head.workset);
     let mut cursor = NativeCursor {
         from: head.created,
         ..NativeCursor::default()
@@ -525,7 +557,7 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
 pub fn role_of(from: Address) -> Role {
     match from {
         Address::User => Role::User,
-        Address::Agent(_) | Address::System { .. } => Role::Tool,
+        Address::Agent(_) | Address::System { .. } | Address::StartFailed => Role::Tool,
     }
 }
 

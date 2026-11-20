@@ -96,15 +96,17 @@ pub fn claims(
         let user_wrote = messages.user_wrote;
         let seen = facts
             .seen_topic()
-            .map(|seen| MessageId(ChatSeq(seen)))
-            .max(messages.plain_user_mail);
-        let unseen = messages
+            .map(ChatSeq)
+            .max(messages.plain_user_mail.map(|id| id.0));
+        let mut unseen = messages
             .mentions
             .into_iter()
             .filter(|message| {
-                !answered.contains(&message.id) && seen.is_none_or(|seen| message.id > seen)
+                !answered.contains(&message.id)
+                    && seen.is_none_or(|seen| message.version().0 > seen)
             })
             .collect::<Vec<_>>();
+        unseen.sort_by_key(|message| message.version().0);
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
                 &address,
@@ -131,7 +133,7 @@ pub fn claims(
             .filter(|reply| reply.id != thread)
             .and_then(|reply| {
                 unseen.iter().copied().find(|mail| {
-                    mail.id > reply.id
+                    mail.version().0 > reply.id.0
                         && matches!(
                             mail.mentions(Party::User),
                             Some(MentionKind::Ask | MentionKind::Result)
@@ -146,10 +148,21 @@ pub fn claims(
         };
         let reason = match (mail.from, mail.mentions(Party::User)) {
             (Party::System { stop, .. }, _) => format!("{} · {{age}}", stop.word()),
+            (Party::StartFailed, _) => "failed · {age}".to_owned(),
             (_, Some(MentionKind::Result)) => "result · {age}".to_owned(),
             _ => "asks · {age}".to_owned(),
         };
-        let since = unix(mail.at.0);
+        let since = unix(
+            match mail.from {
+                Party::System {
+                    stop: rho_agent_types::Stop::Stuck,
+                    since,
+                    ..
+                } => since,
+                _ => mail.version().1,
+            }
+            .0,
+        );
         let curve = Curve::Waiting {
             head_start: curve::AGENT_BLOCKED_HEAD_START,
             since,
@@ -157,7 +170,7 @@ pub fn claims(
         // The first part is where to open the card; the last part changes
         // when more mail arrives, even if the trigger is still the same ask.
         let newest = unseen.last().expect("the trigger is unseen");
-        let cursor = format!("{}/{}", mail.id.0.0, newest.id.0.0);
+        let cursor = format!("{}/{}", mail.id.0.0, newest.version().0.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
@@ -406,7 +419,7 @@ mod tests {
         }
 
         fn newest(&self, thread: MessageId) -> Seen {
-            Seen::Topic(self.chat.newest_in(thread).map_or(0, |(id, _)| id.0.0))
+            Seen::Topic(self.chat.newest_in(thread).map_or(0, |(seq, _)| seq.0))
         }
 
         fn done(&mut self, thread: MessageId) {
@@ -670,6 +683,60 @@ mod tests {
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
         assert_eq!(w.hand(), "rho@lab › a · result · now");
+    }
+
+    #[test]
+    fn new_words_after_done_redeal_the_same_mail() {
+        let mut w = world();
+        let a = w.agent("a");
+        let older = w.finishes(a);
+        let ask = w.asks(a);
+        w.done(a);
+        w.pass(mins(7));
+        assert_eq!(w.hand(), "");
+        w.record(ChatEvent::Revised {
+            message: ask,
+            author: w.agents[&a],
+            content: vec![ContentPart::Text {
+                text: "I need a monotonic clock.".into(),
+            }],
+        });
+        let hand = w.deal();
+        let [card] = hand.cards.as_slice() else {
+            panic!("{:?}", hand.cards)
+        };
+        assert_eq!(attention_mail(&card.cursor), Some(ask));
+        assert_ne!(attention_mail(&card.cursor), Some(older));
+        assert_eq!(card.label, "asks · now", "age is the revision's");
+        w.done(a);
+        assert_eq!(w.hand(), "");
+        w.answers(a, ask);
+        assert_eq!(w.hand(), "");
+    }
+
+    #[test]
+    fn taken_back_words_and_recovered_stops_stay_readable_without_cards() {
+        let mut w = world();
+        let a = w.agent("a");
+        let b = w.agent("b");
+        let ask = w.asks(a);
+        let stop = w.stop(b, Stop::Stuck);
+        assert_eq!(w.deal().cards.len(), 2);
+        w.record(ChatEvent::TakenBack {
+            message: ask,
+            version: ask.0,
+            author: w.agents[&a],
+        });
+        assert_eq!(w.hand(), "rho@lab › b · stuck · now");
+        w.record(ChatEvent::Recovered {
+            message: stop,
+            content: vec![ContentPart::Text {
+                text: "Work carried on.".into(),
+            }],
+        });
+        assert_eq!(w.hand(), "");
+        assert!(!w.chat.message(ask).unwrap().text().is_empty());
+        assert_eq!(w.chat.message(stop).unwrap().text(), "Work carried on.");
     }
 
     #[test]

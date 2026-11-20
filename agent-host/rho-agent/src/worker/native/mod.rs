@@ -961,7 +961,6 @@ impl Agent {
     }
 
     async fn respond(&mut self, mut turn: PreparedTurn) -> anyhow::Result<()> {
-        let previous_backoff = self.backoff.take();
         self.responding = true;
         self.response_id = uuid::Uuid::new_v4().to_string();
         self.writing = None;
@@ -1045,7 +1044,15 @@ impl Agent {
                 self.publish_stream(streaming.as_ref(), stream_needs_runtime);
             }
             match result {
-                Ok(step) => Ok((step, streaming)),
+                Ok(step) => {
+                    if let Some(backoff) = self.backoff.take()
+                        && backoff.elapsed() >= rho_agent_types::STUCK_AFTER
+                    {
+                        self.publish().await?;
+                        self.notice(Notice::Recovered(backoff.since)).await?;
+                    }
+                    Ok((step, streaming))
+                }
                 Err(error) => {
                     let retryable = crate::inference::is_retryable(&error);
                     let error = format!("{error:#}");
@@ -1054,6 +1061,7 @@ impl Agent {
                     if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
                         && let Some(ran) = latest.cell.interrupt()
                     {
+                        self.backoff = None;
                         self.notice(Notice::Error(error.clone())).await?;
                         Err((
                             streaming.carry,
@@ -1069,7 +1077,7 @@ impl Agent {
                         // stops on is said once, as its stop.
                         if retryable {
                             self.notice(Notice::Error(error.clone())).await?;
-                            self.backoff = Some(Backoff::failed(previous_backoff, error));
+                            self.backoff = Some(Backoff::failed(self.backoff.take(), error));
                             return Ok(());
                         }
                         return self.fail(error).await;

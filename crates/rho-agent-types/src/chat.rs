@@ -53,6 +53,8 @@ pub enum Address {
         stop: Stop,
         since: UnixMs,
     },
+    /// A start declined before there was an agent to own the stop.
+    StartFailed,
 }
 
 /// What a mention asks of the one it names. A mention of the user is how
@@ -123,6 +125,24 @@ pub enum ChatEvent {
     Deleted {
         message: MessageId,
     },
+    /// The project replaces the live mail without making a new mail.
+    /// Replies to it go to the writer of these words.
+    Revised {
+        message: MessageId,
+        author: AgentId,
+        content: Vec<ContentPart>,
+    },
+    /// The turn that wrote this version was rewound. Keep its words readable.
+    TakenBack {
+        message: MessageId,
+        version: ChatSeq,
+        author: AgentId,
+    },
+    /// A system stop no longer needs an answer because work resumed.
+    Recovered {
+        message: MessageId,
+        content: Vec<ContentPart>,
+    },
 }
 
 /// The current status of a thread, separate from its durable mail.
@@ -130,7 +150,26 @@ pub enum ChatEvent {
 pub struct ThreadStatus {
     pub thread: MessageId,
     pub at: UnixMs,
-    pub text: String,
+    pub state: StatusText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum StatusText {
+    Written(String),
+    Working,
+    Stuck,
+    StoppedByYou,
+}
+
+impl StatusText {
+    pub fn words(&self) -> &str {
+        match self {
+            Self::Written(text) => text,
+            Self::Working => "working",
+            Self::Stuck => "stuck · can't reach its model",
+            Self::StoppedByYou => "stopped by you",
+        }
+    }
 }
 
 /// One entry of a host's chat log.
@@ -159,9 +198,16 @@ pub struct Message {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Revision {
     Original,
-    Edited,
+    Edited {
+        seq: ChatSeq,
+        at: UnixMs,
+    },
     /// Retains the anchor for replies and old references, but no visible mail.
     Deleted,
+    TakenBack {
+        seq: ChatSeq,
+        at: UnixMs,
+    },
 }
 
 impl Message {
@@ -190,18 +236,48 @@ impl Message {
         })
     }
 
-    pub fn apply_revision(&mut self, event: &ChatEvent) {
-        match event {
+    pub fn apply_revision(&mut self, record: &ChatRecord) {
+        let (content, writer, seq, at) = match &record.event {
+            // Old edits changed the words on screen but were never part of
+            // the verdict cursor. Do not reopen historical mail on upgrade.
             ChatEvent::Edited { message, content } if *message == self.id => {
-                self.content.clone_from(content);
-                self.revision = Revision::Edited;
+                (content, None, self.id.0, self.at)
+            }
+            ChatEvent::Revised {
+                message,
+                author,
+                content,
+            } if *message == self.id => (content, Some(*author), record.seq, record.at),
+            ChatEvent::TakenBack { message, .. } if *message == self.id => {
+                self.mentions.clear();
+                let (seq, at) = self.version();
+                self.revision = Revision::TakenBack { seq, at };
+                return;
+            }
+            ChatEvent::Recovered { message, content } if *message == self.id => {
+                self.mentions.clear();
+                (content, None, record.seq, record.at)
             }
             ChatEvent::Deleted { message } if *message == self.id => {
                 self.content.clear();
                 self.mentions.clear();
                 self.revision = Revision::Deleted;
+                return;
             }
-            _ => {}
+            _ => return,
+        };
+        self.content.clone_from(content);
+        if let Some(writer) = writer {
+            self.from = Address::Agent(writer);
+        }
+        self.revision = Revision::Edited { seq, at };
+    }
+
+    /// The position and time of the words now shown, not of the mail's anchor.
+    pub fn version(&self) -> (ChatSeq, UnixMs) {
+        match self.revision {
+            Revision::Edited { seq, at } | Revision::TakenBack { seq, at } => (seq, at),
+            _ => (self.id.0, self.at),
         }
     }
 

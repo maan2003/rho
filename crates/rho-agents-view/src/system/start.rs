@@ -13,10 +13,10 @@
 use std::rc::Rc;
 
 use camino::Utf8PathBuf;
-use futures::FutureExt as _;
 use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
 use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, project_start};
+use rho_agents_client::protocol::worksets::{MailLaunch, StartFromMail};
 use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
 use rho_frame::{Candidate, Frame, Row, Rows};
 use rho_mail::ThreadId;
@@ -392,7 +392,12 @@ fn prompt_runtime(
                 .filter(|runtime| runtime.contains(needle))
                 .map(|runtime| Candidate {
                     value: (*runtime).to_owned(),
-                    description: "runtime".to_owned(),
+                    description: if *runtime == DEFAULT_RUNTIME {
+                        "default"
+                    } else {
+                        ""
+                    }
+                    .to_owned(),
                 })
                 .collect()
         }),
@@ -482,7 +487,14 @@ pub(crate) fn create(
     thread: ThreadId,
     cx: &mut Context<AgentsSystem>,
 ) {
-    let origin = thread.message;
+    let origin = system
+        .mail
+        .read(cx)
+        .host_mail(thread.host)
+        .and_then(|chat| chat.message(thread.message))
+        .filter(|mail| mail.from == rho_agent_types::Address::StartFailed)
+        .and_then(|mail| mail.reply_to)
+        .unwrap_or(thread.message);
     let Some(agents) = system.agents_on(plan.host) else {
         system
             .frame
@@ -496,23 +508,18 @@ pub(crate) fn create(
         Start::Join { cwd, .. } | Start::Here { cwd } => cwd.to_string(),
     };
     let on = format!("{} · {at}", plan.runtime.label());
-    let reply = match plan.start.creation(&function, &plan.runtime, Some(origin)) {
-        Creation::Workset(create) => {
-            let reply = agents.call(create);
-            async move { reply.await.map(|created| created.result) }.boxed_local()
-        }
-        Creation::Eval(eval) => agents.call(eval).boxed_local(),
+    let launch = match plan.start.creation(&function, &plan.runtime, Some(origin)) {
+        Creation::Workset(create) => MailLaunch::New(create),
+        Creation::Eval(eval) => MailLaunch::Existing(eval),
     };
+    let reply = agents.call(StartFromMail {
+        origin,
+        launch,
+        host_label: system.registry.host_name(plan.host).to_owned(),
+    });
     let frame = system.frame.clone();
     cx.spawn(async move |this, cx| {
-        let reply = reply.await.and_then(|result| {
-            if let Some(raised) = result.raised() {
-                anyhow::bail!("{raised}");
-            }
-            result
-                .agent
-                .ok_or_else(|| anyhow::anyhow!("the creation code made no agent"))
-        });
+        let reply = reply.await;
         cx.update(|cx| match reply {
             Ok(agent) => {
                 if matches!(plan.feedback, Feedback::Started) {
@@ -533,11 +540,6 @@ pub(crate) fn create(
                     StyleClass::SystemImportant,
                     cx,
                 );
-                let _ = this.update(cx, |system, cx| {
-                    system
-                        .mail
-                        .update(cx, |chat, cx| chat.note_failed_start(thread, reason, cx))
-                });
             }
         });
     })

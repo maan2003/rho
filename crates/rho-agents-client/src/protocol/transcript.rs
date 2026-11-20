@@ -109,7 +109,7 @@ pub enum InferenceState {
         at: UnixMs,
         error: String,
         /// When the first of these failures came: the runtime keeps one
-        /// streak across its attempts, which its status shows as working.
+        /// streak across its attempts, including when an attempt is in flight.
         since: UnixMs,
     },
     Failed {

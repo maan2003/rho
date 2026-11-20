@@ -947,6 +947,40 @@ impl AgentsSystem {
         }
     }
 
+    pub(crate) fn stop_row(system: Entity<Self>, agent: AgentId) -> rho_frame::Row {
+        rho_frame::Row::run("shift-c", "stop agent", move |_, _, cx| {
+            system.update(cx, |system, cx| {
+                let Some(agents) = system.agents_for(agent) else {
+                    system.frame.echo(
+                        "the agent's host is not attached",
+                        StyleClass::SystemImportant,
+                        cx,
+                    );
+                    return;
+                };
+                let reply = agents.call(rho_agents_client::protocol::worksets::StopAgent { agent });
+                let frame = system.frame.clone();
+                let label = system.registry.agent_display_label(agent);
+                cx.spawn(async move |_, cx| {
+                    let reply = reply.await;
+                    cx.update(|cx| match reply {
+                        Ok(()) => frame.echo(
+                            format!("stopped by you: {label}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
+                        Err(error) => frame.echo(
+                            format!("did not stop {label}: {error:#}"),
+                            StyleClass::SystemImportant,
+                            cx,
+                        ),
+                    });
+                })
+                .detach();
+            });
+        })
+    }
+
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
         let chat = self.mail.read(cx);
         point
