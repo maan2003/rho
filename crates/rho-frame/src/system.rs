@@ -2,9 +2,9 @@
 //!
 //! A system owns a few kinds of address and everything about them: the
 //! surfaces that open them, the rows a menu offers over them, what of
-//! them wants the user, the rooms Home lists, what `find` finds, and the
-//! streams it keeps to each host. The frame holds systems as a list and asks
-//! each in turn; a system never names another.
+//! them wants the user, the status changes the desk lists, what `find` finds,
+//! and the streams it keeps to each host. The frame holds systems as a list and
+//! asks each in turn; a system never names another.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -20,7 +20,9 @@ use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
 use crate::attention::Verdict;
+use crate::desk::MovingThread;
 use crate::frame::Point;
+use crate::idea::{IdeaMail, IdeaProject};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 
@@ -145,6 +147,24 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
+        Vec::new()
+    }
+
+    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
+        Vec::new()
+    }
+
+    fn idea_project(&self, _address: &Address, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
+        None
+    }
+
+    fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
+
     /// Everything the system has that `find` lists by title, given what
     /// the user has said about its things. Asked with the frame busy, so
     /// the marks are handed in.
@@ -200,6 +220,16 @@ trait SystemHandle {
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread>;
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject>;
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject>;
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App);
+
     fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
@@ -261,6 +291,26 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.read(cx).seen(address, cx)
+    }
+
+    fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.read(cx).moving_threads(cx)
+    }
+
+    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.read(cx).idea_projects(cx)
+    }
+
+    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).idea_project(address, cx)
+    }
+
+    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.read(cx).last_idea_project(cx)
+    }
+
+    fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.update(cx, |system, cx| system.send_idea(mail, cx))
     }
 
     fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {
@@ -344,6 +394,26 @@ impl AnySystem {
 
     pub fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.0.seen(address, cx)
+    }
+
+    pub(crate) fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
+        self.0.moving_threads(cx)
+    }
+
+    pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
+        self.0.idea_projects(cx)
+    }
+
+    pub(crate) fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
+        self.0.idea_project(address, cx)
+    }
+
+    pub(crate) fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
+        self.0.last_idea_project(cx)
+    }
+
+    pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
+        self.0.send_idea(mail, cx)
     }
 
     pub fn rooms(&self, marks: &Marks, cx: &App) -> Vec<RoomRow> {

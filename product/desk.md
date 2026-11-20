@@ -15,7 +15,6 @@ done when: the user knows what moved and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
-status: built as Home, a list of rooms by project. It has no face-up deck, moving section, addressed idea box, or cold return.
 purpose: show what wants the user, what has moved, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting and a test run under `moving`, and writes a new idea to `tide@lab`.
 sees: `N wait` and the top seven `deal.Card` rows at most, in the deal's order; `moving`, with up to ten `mail.Thread` rows with `mail.Status`, newest status change first, then `and N more` for the rest; an idea box addressed to a `mail.Project`, with completion.
@@ -26,7 +25,6 @@ does:
 - write an idea: address and send a new idea, as `mail.Write an idea`
 
 ## screen Desk
-status: built as Home. The rows are rooms ranked by card, then unread, then recent; the window restores the previous screen without a ten-minute cutoff.
 answers: what needs the user now, and what has moved?
 shows:
 - `Desk`: the count of everything that waits
@@ -62,7 +60,6 @@ idea to tide@lab · ctrl-enter sends
 ```
 
 ## flow Glance at what moves
-status: Home puts rooms with cards first and does not show a face-up deck or the current status of work.
 runs: 30 a day
 day: Know what wants them, and where they were.
 when: the user has a moment or comes back after a while
@@ -80,5 +77,4 @@ reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 The historical review was of Glance at what waits on Home.
 
 ## rule a cold return opens the desk
-status: the window restores its previous screen when reopened, however long it was away; Home is reached with `tab`.
 when the user returns within ten minutes away, then their `window.Screen` is where they left it; after more than ten minutes away, the `Desk` is on screen.

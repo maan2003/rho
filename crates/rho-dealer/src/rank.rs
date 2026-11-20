@@ -82,9 +82,6 @@ pub struct Card {
     /// Passed over this sitting: behind every card that was not, until its
     /// source moves or the skip runs out.
     pub skipped: bool,
-    /// The room the card is in, when its claim said one: what a list of
-    /// rooms orders by.
-    pub room: Option<Address>,
 }
 
 impl Card {
@@ -429,7 +426,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 priority,
                 cursor: part.cursor.clone(),
                 skipped: skip.is_some(),
-                room: under.get(&address).cloned(),
                 address,
             },
         ));

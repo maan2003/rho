@@ -21,11 +21,15 @@ actions!(
         /// by name.
         Palette,
         /// `space`: the verdicts over the card in view; `space` again is
-        /// Home.
+        /// Desk.
         VerdictMenu,
-        /// `tab`: Home, and from Home the way back.
-        Home,
+        /// `tab`: Desk, and from Desk the way back.
+        Desk,
         OpenRow,
+        PromptIdea,
+        EditIdea,
+        SendIdea,
+        CancelIdea,
         FindAddress,
         /// `/`: search forward in what is in view.
         SearchForward,
@@ -45,7 +49,7 @@ actions!(
 );
 
 /// The contexts a normal-mode key of `surface` (a key context such as
-/// `RhoFrame` or `RhoHome`) is bound under, with `more` appended to each.
+/// `RhoFrame` or `RhoDesk`) is bound under, with `more` appended to each.
 pub fn normal_contexts(surface: &str, more: &str) -> [String; 2] {
     ["normal", "helix_normal"].map(|mode| format!("{surface} > Editor && vim_mode == {mode}{more}"))
 }
@@ -95,6 +99,7 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
             KeyBinding::new("ctrl-shift-f", FindAddress, Some(context)),
+            KeyBinding::new("ctrl-alt-m", PromptIdea, Some(context)),
             // `ctrl-shift-;`, the palette where `:` would be typed: in a
             // terminal, on a desktop or a page. Spelled as gpui reads it on
             // Linux and macOS: shift turns `;` into `:` and is dropped, so
@@ -106,7 +111,7 @@ fn bindings() -> Vec<KeyBinding> {
         bindings.extend([
             KeyBinding::new(":", Palette, Some(&context)),
             KeyBinding::new("space", VerdictMenu, Some(&context)),
-            KeyBinding::new("tab", Home, Some(&context)),
+            KeyBinding::new("tab", Desk, Some(&context)),
             KeyBinding::new("q", Close, Some(&context)),
         ]);
     }
@@ -122,10 +127,16 @@ fn bindings() -> Vec<KeyBinding> {
         ]);
     }
 
-    for context in normal_contexts("RhoHome", "") {
-        bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
+    for context in normal_contexts("RhoDesk", "") {
+        bindings.extend([
+            KeyBinding::new("enter", OpenRow, Some(&context)),
+            KeyBinding::new("i", EditIdea, Some(&context)),
+        ]);
     }
     bindings.extend([
+        KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
+        KeyBinding::new("escape", CancelIdea, Some("RhoIdea > Editor")),
+        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),
@@ -146,8 +157,6 @@ mod tests {
 
     /// What the window hears when `ctrl-shift-;` is pressed in `surface`.
     fn chord_in(surface: &str) -> Vec<KeyBinding> {
-        let mut keymap = Keymap::default();
-        keymap.add_bindings(bindings());
         // As gpui on Linux delivers it: shift made `;` into `:`, and is
         // dropped because `:` is already the shifted key.
         let typed = Keystroke {
@@ -158,6 +167,12 @@ mod tests {
             key: ":".into(),
             key_char: Some(":".into()),
         };
+        bindings_for(surface, typed)
+    }
+
+    fn bindings_for(surface: &str, typed: Keystroke) -> Vec<KeyBinding> {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings());
         let stack = [
             KeyContext::parse("RhoFrame").unwrap(),
             KeyContext::parse(surface).unwrap(),
@@ -180,6 +195,36 @@ mod tests {
                     .iter()
                     .map(|b| b.action().name())
                     .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_idea_chord_reaches_raw_places_and_typing_editors() {
+        for surface in [
+            "RhoTerminal",
+            "RhoDesktop",
+            "RhoBrowser",
+            "Editor vim_mode=insert",
+            "Editor vim_mode=helix_normal",
+        ] {
+            let matches = bindings_for(
+                surface,
+                Keystroke {
+                    key: "m".into(),
+                    key_char: None,
+                    modifiers: Modifiers {
+                        control: true,
+                        alt: true,
+                        ..Modifiers::default()
+                    },
+                },
+            );
+            assert!(
+                matches
+                    .first()
+                    .is_some_and(|binding| binding.action().as_any().is::<PromptIdea>()),
+                "the idea action must win in {surface}"
             );
         }
     }

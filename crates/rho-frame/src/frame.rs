@@ -11,6 +11,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window, div, px,
 };
+use jiff::Timestamp;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostEvent, HostSpec};
 use rho_dealer::Address;
@@ -21,7 +22,8 @@ use theme::ActiveTheme as _;
 
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
-use crate::home::{HomeTarget, HomeView};
+use crate::desk::{DeskTarget, DeskView};
+use crate::idea::IdeaBox;
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
     CancelHandler, Candidate, CandidateSource, ChangeHandler, Echo, Minibuffer, SubmitHandler,
@@ -34,7 +36,7 @@ use crate::system::{AnySystem, Found};
 use crate::when::SnoozeUnit;
 use crate::{keys, palette, place};
 
-/// The kind of the frame's own surface: Home.
+/// The kind of the frame's own surface: Desk.
 pub const FRAME_KIND: &str = "frame";
 
 /// Where the reader is: the surface in view, what the point in it is
@@ -57,10 +59,11 @@ pub struct Frame {
     pub(crate) systems: Vec<AnySystem>,
     pub(crate) attention: Attention,
     /// The surfaces the reader has been on, by address. The newest entry
-    /// is where down deals; Home is the oldest and never closes.
+    /// is where down deals; Desk is the oldest and never closes.
     history: History<Address, ()>,
     surfaces: HashMap<Address, AnySurface>,
-    pub(crate) home: Entity<HomeView>,
+    pub(crate) desk: Entity<DeskView>,
+    pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
@@ -79,7 +82,8 @@ pub struct Frame {
     /// A flick or a snap in progress, while the window is a phone's.
     pub(crate) phone: Phone,
     /// Writes down where the user is after each move, for the next start.
-    place: place::Writer,
+    pub(crate) place: place::Writer,
+    last_input: Option<Timestamp>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -98,34 +102,50 @@ impl Frame {
         keys::bind(cx);
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
-        let home = cx.new(|cx| HomeView::new(window, cx));
+        let desk = cx.new(|cx| DeskView::new(window, cx));
+        let idea = IdeaBox::new(window, cx, &db);
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);
             editor
         });
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
-        let home_address = Self::home_address();
+        let desk_address = Self::desk_address();
         let mut surfaces = HashMap::new();
-        surfaces.insert(home_address.clone(), AnySurface::new(home.clone()));
+        surfaces.insert(desk_address.clone(), AnySurface::new(desk.clone()));
         // A menu owns its keys before gpui resolves bindings: vim binds `g`
         // as a prefix, and an ordinary key handler would not see a menu's
         // one-stroke `g` until another key arrived.
-        let menu_keys = cx.listener(|this, event: &gpui::KeystrokeEvent, window, cx| {
+        let window_id = window.window_handle().window_id();
+        let menu_keys = cx.listener(move |this, event: &gpui::KeystrokeEvent, window, cx| {
+            if window.window_handle().window_id() != window_id {
+                return;
+            }
+            this.note_input();
             if this.menu.is_some() && this.menu_focus.is_focused(window) {
                 this.menu_keystroke(&event.keystroke, window, cx);
             }
         });
         let menu_keys = cx.intercept_keystrokes(menu_keys);
         let saved_place = place::Saved::load(&db);
+        let last_input = place::last_input(&db);
+        let return_focus = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active()
+                && !this.desk_in_view()
+                && place::is_cold(this.last_input, Timestamp::now())
+            {
+                this.open_desk(window, cx);
+            }
+        });
         let mut frame = Self {
             db: db.clone(),
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
-            history: History::new(home_address, ()),
+            history: History::new(desk_address, ()),
             surfaces,
-            home,
+            desk,
+            idea,
             minibuffer: None,
             menu: None,
             menu_focus: cx.focus_handle(),
@@ -139,7 +159,8 @@ impl Frame {
             search: None,
             phone: Phone::default(),
             place: place::Writer::spawn(db.clone()),
-            _subscriptions: vec![menu_keys],
+            last_input,
+            _subscriptions: vec![menu_keys, return_focus],
             _tasks: Vec::new(),
         };
         let ledger = cx.spawn_in(window, async move |this, cx| {
@@ -179,6 +200,9 @@ impl Frame {
         }
         if let Some(saved) = saved_place {
             frame.return_to(saved, window, cx);
+            // In particular a warm restart after a cold one must restore
+            // the desk, not the screen now behind it.
+            frame.moved();
         }
         frame.systems_changed(cx);
         frame.focus_surface(window, cx);
@@ -188,9 +212,14 @@ impl Frame {
     /// Opens the window where the user was when it last ran on this
     /// device, with the way back and forward as it was. The screens behind
     /// and ahead are made when the user reaches them; the one they were on
-    /// is made now, and when it no longer opens the window opens on Home.
+    /// is made now, and when it no longer opens the window opens on Desk.
     fn return_to(&mut self, saved: place::Saved, window: &mut Window, cx: &mut Context<Self>) {
-        self.history = saved.history(&Self::home_address());
+        self.history = place::return_history(
+            &saved,
+            &Self::desk_address(),
+            self.last_input,
+            Timestamp::now(),
+        );
         let address = self.current_address().clone();
         if self.surfaces.contains_key(&address) {
             return;
@@ -201,8 +230,8 @@ impl Frame {
             }
             None => {
                 self.history.forget(&address);
-                self.home.update(cx, |home, cx| home.focus_first_row(cx));
-                self.history.show(Self::home_address(), ());
+                self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
+                self.history.show(Self::desk_address(), ());
             }
         }
     }
@@ -224,7 +253,7 @@ impl Frame {
     /// Makes the screen the cursor came to, when the history holds it by
     /// address alone, as one it was given back at start does. One that no
     /// longer opens leaves the history and the walk goes on the way it
-    /// went, or the other way from the end; Home always opens.
+    /// went, or the other way from the end; Desk always opens.
     fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         loop {
             let address = self.current_address().clone();
@@ -241,18 +270,27 @@ impl Frame {
                 false => self.history.back().is_some() || self.history.forward().is_some(),
             };
             if !stepped {
-                self.history.show(Self::home_address(), ());
+                self.history.show(Self::desk_address(), ());
             }
         }
     }
 
     /// Writes down where the user is now, for the next start.
     fn moved(&self) {
-        self.place.write(place::Saved::of(&self.history));
+        self.place
+            .write(place::Write::Place(place::Saved::of(&self.history)));
     }
 
-    pub fn home_address() -> Address {
-        Address::new(FRAME_KIND, "home")
+    /// A key or deliberate pointer/touch input is activity by the user;
+    /// focuses and host/network activity are not.
+    pub(crate) fn note_input(&mut self) {
+        let at = Timestamp::now();
+        self.last_input = Some(at);
+        self.place.write(place::Write::Input(at));
+    }
+
+    pub fn desk_address() -> Address {
+        Address::new(FRAME_KIND, "desk")
     }
 
     // ---- surfaces ----
@@ -300,8 +338,8 @@ impl Frame {
         self.point(cx).card
     }
 
-    /// The card the surface in view stands for, which is nothing on Home:
-    /// Home is a list, so a pull from it opens the top card rather than
+    /// The card the surface in view stands for, which is nothing on Desk:
+    /// Desk is a list, so a pull from it opens the top card rather than
     /// passing over the row.
     pub fn card_in_view(&self, cx: &App) -> Option<Address> {
         match self.current_address().kind() == FRAME_KIND {
@@ -310,8 +348,8 @@ impl Frame {
         }
     }
 
-    pub fn home_in_view(&self) -> bool {
-        *self.current_address() == Self::home_address()
+    pub fn desk_in_view(&self) -> bool {
+        *self.current_address() == Self::desk_address()
     }
 
     /// Opens `address`: the system that owns its kind makes the surface,
@@ -342,10 +380,10 @@ impl Frame {
             surface: journal_surface(&address),
             method,
         });
-        // Home opens on its top room, the one that wants the user most;
+        // Desk opens on its first waiting or moving row;
         // only the way back returns to it as it was left.
-        if address == Self::home_address() {
-            self.home.update(cx, |home, cx| home.focus_first_row(cx));
+        if address == Self::desk_address() {
+            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
         }
         self.history.show(address, ());
         self.moved();
@@ -367,12 +405,12 @@ impl Frame {
         }
     }
 
-    pub fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open(Self::home_address(), window, cx);
+    pub fn open_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(Self::desk_address(), window, cx);
     }
 
     /// Closes `address`: its surface goes, and no walk reaches it again.
-    /// Home only steps out of view.
+    /// Desk only steps out of view.
     pub fn close(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_address() == address;
         if address.kind() != FRAME_KIND {
@@ -385,12 +423,12 @@ impl Frame {
         }
         if current {
             if self.history.back().is_none() && self.history.forward().is_none() {
-                self.history.show(Self::home_address(), ());
+                self.history.show(Self::desk_address(), ());
             }
             // A forgotten entry under the cursor is left on the first step
             // either way; a frame surface closes by stepping off it.
             if address.kind() == FRAME_KIND && self.current_address() == address {
-                self.history.show(Self::home_address(), ());
+                self.history.show(Self::desk_address(), ());
             }
             self.settle(false, window, cx);
             self.close_overlays(window, cx);
@@ -504,6 +542,7 @@ impl Frame {
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
+        self.cancel_idea(window, cx);
         self.overlay_return = None;
     }
 
@@ -696,7 +735,11 @@ impl Frame {
         let point = self.point(cx);
         // The window's own rows: the palette lists them after the screen's.
         let mut rows = vec![
-            Row::run("", "home", |frame, window, cx| frame.open_home(window, cx)).window_wide(),
+            Row::run("", "desk", |frame, window, cx| frame.open_desk(window, cx)).window_wide(),
+            Row::run("", "write an idea", |frame, window, cx| {
+                frame.prompt_idea(window, cx)
+            })
+            .window_wide(),
             Row::run("", "find", |frame, window, cx| frame.find(window, cx)).window_wide(),
             Row::run("", "undo", |frame, window, cx| {
                 frame.undo_verdict(window, cx)
@@ -797,12 +840,11 @@ impl Frame {
         rows
     }
 
-    /// `space`: the verdicts, over whatever card is in view. With no card
-    /// it goes Home, and from Home it is the way back.
+    /// The verdicts over the card under the cursor.
     pub(crate) fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(window, cx);
-            self.toggle_home(window, cx);
+            self.toggle_desk(window, cx);
             return;
         }
         let Some(target) = self.card_target(cx) else {
@@ -841,10 +883,10 @@ impl Frame {
         self.open_menu(rows, window, cx);
     }
 
-    pub(crate) fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.home_in_view() {
+    pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.desk_in_view() {
             true => self.back(window, cx),
-            false => self.open_home(window, cx),
+            false => self.open_desk(window, cx),
         }
     }
 
@@ -1039,11 +1081,23 @@ impl Frame {
         }
     }
 
-    /// Enter on Home: the row under the cursor.
+    /// Enter on Desk: the row under the cursor.
     pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.home.read(cx).cursor_target(cx) {
-            HomeTarget::Address(address) => self.open(address, window, cx),
-            HomeTarget::None => {}
+        match self.desk.read(cx).cursor_target(cx) {
+            Some(DeskTarget::Card(address)) => {
+                if let Some(card) = self
+                    .hand()
+                    .cards
+                    .iter()
+                    .find(|card| card.address == address)
+                    .cloned()
+                {
+                    self.journal_deal(Some(&address), cx);
+                    self.open_card(card, window, cx);
+                }
+            }
+            Some(DeskTarget::Thread(address)) => self.open(address, window, cx),
+            None => {}
         }
     }
 
@@ -1300,7 +1354,7 @@ impl Focusable for Frame {
 
 impl Render for Frame {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = self.active_editor(cx);
+        let editor = self.idea_editor().unwrap_or_else(|| self.active_editor(cx));
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
         let layout = Layout::of(window.viewport_size().width);
@@ -1314,6 +1368,9 @@ impl Render for Frame {
             .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .key_context(crate::KEY_CONTEXT)
+            .capture_any_mouse_down(
+                cx.listener(|this, _: &gpui::MouseDownEvent, _, _| this.note_input()),
+            )
             .on_action(cx.listener(|this, _: &keys::Back, window, cx| this.back(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::Forward, window, cx| this.forward_or_deal(window, cx)),
@@ -1326,12 +1383,20 @@ impl Render for Frame {
                 this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
+            .on_action(cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
+                if this.desk_in_view() {
+                    this.pull_card(window, cx);
+                } else {
+                    this.verdict_menu(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keys::Desk, window, cx| this.toggle_desk(window, cx)))
             .on_action(
-                cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
-                    this.verdict_menu(window, cx)
-                }),
+                cx.listener(|this, _: &keys::PromptIdea, window, cx| this.prompt_idea(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &keys::Home, window, cx| this.toggle_home(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &keys::EditIdea, window, cx| this.edit_desk_idea(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
             .on_action(cx.listener(|this, _: &keys::FindAddress, window, cx| this.find(window, cx)))
             .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
@@ -1377,6 +1442,7 @@ impl Render for Frame {
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
                 .child(body)
+                .children(self.render_idea(&text_style, cx))
                 .children(
                     self.minibuffer
                         .as_ref()
@@ -1387,6 +1453,7 @@ impl Render for Frame {
         }
         frame
             .child(div().flex_1().min_h_0().w_full().child(surface.view()))
+            .children(self.render_idea(&text_style, cx))
             // The menu, pinned to the bottom edge and drawn over the buffer
             // rather than in it: nothing reflows, and the point stays where
             // the reader left it.

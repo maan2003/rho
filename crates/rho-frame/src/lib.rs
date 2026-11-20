@@ -8,7 +8,7 @@
 //! minibuffer ([`minibuffer`]), the menus ([`menu`]), the keymap
 //! ([`keys`]), the attached agent hosts ([`hosts`]), the user's own facts
 //! in the ledger and the dealer that ranks what wants them
-//! ([`attention`], [`deal`]), and Home ([`home`]). A window narrow
+//! ([`attention`], [`deal`]), and Desk ([`desk`]). A window narrow
 //! enough to be a phone's is laid out for touch by `phone`, over the
 //! same history and the same surfaces.
 //!
@@ -16,19 +16,20 @@
 //! agents, notes, files. A system plugs in under address
 //! kinds ([`rho_dealer::Address`]): it opens a surface for an address,
 //! offers menu rows for what is in view, claims the user's attention for
-//! the things of its own that want it, lists what it has for Home and for
-//! `find`, and runs its own streams to each host. The frame knows no
-//! system by name, so the list of systems is the binary's, and a system
-//! is written once for the desk and the phone alike.
+//! the things of its own that want it, lists what has moved for the desk and
+//! what it has for `find`, and runs its own streams to each host. The frame
+//! knows no system by name, so the list of systems is the binary's, and a
+//! system is written once for the desk and the phone alike.
 //!
 //! One surface is in view at a time, on every device. Back and forward
 //! walk the one history; down from the newest entry deals the next card.
 
 pub mod attention;
 pub mod deal;
+pub mod desk;
 pub mod frame;
-pub mod home;
 pub mod hosts;
+pub mod idea;
 pub mod keys;
 pub mod link;
 pub mod menu;

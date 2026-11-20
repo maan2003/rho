@@ -149,6 +149,12 @@ pub type CancelHandler = Rc<dyn Fn(&mut Frame, &mut Window, &mut Context<Frame>)
 /// `None` check per keystroke and nothing else.
 pub type ChangeHandler = Rc<dyn Fn(&mut Frame, &str, &mut Window, &mut Context<Frame>)>;
 
+#[derive(Clone, Copy)]
+enum CompletionInput {
+    Word,
+    Whole { select_first: bool },
+}
+
 pub struct Minibuffer {
     prompt: SharedString,
     editor: Entity<Editor>,
@@ -161,7 +167,7 @@ pub struct Minibuffer {
     /// The user moved the selection since the last edit, making the
     /// highlighted candidate an explicit choice even on empty input.
     selection_moved: bool,
-    complete_whole_input: bool,
+    completion_input: CompletionInput,
     completed_selection: Option<(Candidate, usize)>,
     /// What is typed here is a credential: the journal keeps none of it.
     secret: bool,
@@ -230,7 +236,7 @@ impl Minibuffer {
             candidates: Vec::new(),
             selected: 0,
             selection_moved: false,
-            complete_whole_input: false,
+            completion_input: CompletionInput::Word,
             completed_selection: None,
             secret: false,
             _edits: edits,
@@ -320,7 +326,12 @@ impl Minibuffer {
     }
 
     pub fn accepts_selected(&self, cx: &App) -> bool {
-        !self.input(cx).trim().is_empty() || self.selection_moved || self.complete_whole_input
+        !self.input(cx).trim().is_empty()
+            || self.selection_moved
+            || matches!(
+                self.completion_input,
+                CompletionInput::Whole { select_first: true }
+            )
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with
@@ -332,7 +343,10 @@ impl Minibuffer {
         self.completed_selection = Some((candidate.clone(), occurrence));
         self.editor.update(cx, |editor, cx| {
             let text = editor.text(cx);
-            let start = completion_start(&text, self.complete_whole_input);
+            let start = completion_start(
+                &text,
+                matches!(self.completion_input, CompletionInput::Whole { .. }),
+            );
             let new_text = format!("{}{}", &text[..start], candidate.value);
             let end = multi_buffer::MultiBufferOffset(new_text.len());
             editor.set_text(new_text, window, cx);
@@ -343,7 +357,13 @@ impl Minibuffer {
     }
 
     pub fn set_complete_whole_input(&mut self) {
-        self.complete_whole_input = true;
+        self.completion_input = CompletionInput::Whole { select_first: true };
+    }
+
+    pub(crate) fn complete_whole_input_without_default(&mut self) {
+        self.completion_input = CompletionInput::Whole {
+            select_first: false,
+        };
     }
 
     /// Which row is highlighted, for a caller that needs the row itself

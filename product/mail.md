@@ -168,7 +168,6 @@ The historical review above was of Answer an agent. Answer Slack was walked sepa
 > reviewed: 2026-11-20 · laptop · reviewer · 6 findings
 
 ## flow Write an idea
-status: the user opens a channel and sends from its composer to start an agent. There is no idea key that works from elsewhere or picks the project from context.
 runs: 12 a day
 day: Turn ideas into work.
 when: the user has an idea, wherever they are in the window

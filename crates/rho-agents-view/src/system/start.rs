@@ -19,6 +19,7 @@ use rho_agent_hosts::HostId;
 use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, channel_start};
 use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
 use rho_chat::ThreadId;
+use rho_chat::ui::IdeaSource;
 use rho_frame::{Candidate, Frame, Row, Rows};
 use rho_window::style::StyleClass;
 
@@ -29,16 +30,33 @@ pub(crate) struct Plan {
     pub host: HostId,
     pub start: Start,
     pub runtime: Runtime,
+    feedback: Feedback,
+}
+
+/// The idea box already acknowledges posting; successful creation must
+/// not replace that receipt. Failures remain visible in both flows.
+enum Feedback {
+    Started,
+    Sent,
 }
 
 /// Which message the agent starts from.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum Origin {
     /// The thread's message under the point: it exists, so the start goes
     /// out at once.
     Message,
     /// The composer's draft: sent first, started once the host logs it.
-    Draft,
+    Draft(IdeaSource),
+}
+
+impl Origin {
+    fn feedback(&self) -> Feedback {
+        match self {
+            Self::Draft(IdeaSource::Box(_)) => Feedback::Sent,
+            _ => Feedback::Started,
+        }
+    }
 }
 
 /// What a start asks once it knows where.
@@ -54,7 +72,12 @@ pub(crate) enum Runtimes {
 /// channel's agents work, on the default runtime. A channel no agent has
 /// started from asks where, once; the agent it starts is what the channel
 /// remembers.
-pub(crate) fn idea(system: &mut AgentsSystem, thread: ThreadId, cx: &mut Context<AgentsSystem>) {
+pub(crate) fn idea(
+    system: &mut AgentsSystem,
+    thread: ThreadId,
+    source: IdeaSource,
+    cx: &mut Context<AgentsSystem>,
+) {
     let Some(host) = system.host_of(thread.host) else {
         system.frame.echo(
             "the thread's host is not attached",
@@ -81,13 +104,16 @@ pub(crate) fn idea(system: &mut AgentsSystem, thread: ThreadId, cx: &mut Context
     match start {
         Some(start) => {
             let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
+            let origin = Origin::Draft(source);
             send_and_start(
                 system,
                 thread,
+                &origin,
                 Plan {
                     host,
                     start,
                     runtime,
+                    feedback: origin.feedback(),
                 },
                 cx,
             );
@@ -97,7 +123,7 @@ pub(crate) fn idea(system: &mut AgentsSystem, thread: ThreadId, cx: &mut Context
                 system,
                 cx.entity(),
                 thread,
-                Origin::Draft,
+                Origin::Draft(source),
                 Runtimes::Default,
                 cx,
             );
@@ -130,11 +156,13 @@ pub(crate) fn rows(
     let repositories = Rc::new(known.repositories);
     let directories = Rc::new(known.directories);
     let on_repo = system.clone();
+    let repo_origin = origin.clone();
     rows.push(Row::run(
         "n",
         "new workset on a repository…",
         move |frame, window, cx| {
             let system = on_repo.clone();
+            let origin = repo_origin.clone();
             frame.open_prompt(
                 "repository (url or host path):",
                 completions(repositories.clone()),
@@ -151,7 +179,7 @@ pub(crate) fn rows(
                     then(
                         system.clone(),
                         thread,
-                        origin,
+                        origin.clone(),
                         runtimes,
                         start,
                         frame,
@@ -165,11 +193,13 @@ pub(crate) fn rows(
         },
     ));
     let here = system.clone();
+    let here_origin = origin.clone();
     rows.push(Row::run(
         "h",
         "here, in a directory on the host…",
         move |frame, window, cx| {
             let system = here.clone();
+            let origin = here_origin.clone();
             frame.open_prompt(
                 "directory on the host:",
                 completions(directories.clone()),
@@ -185,7 +215,7 @@ pub(crate) fn rows(
                     then(
                         system.clone(),
                         thread,
-                        origin,
+                        origin.clone(),
                         runtimes,
                         start,
                         frame,
@@ -229,6 +259,7 @@ pub(crate) fn rows(
             continue;
         };
         let system = system.clone();
+        let origin = origin.clone();
         rows.push(Row::run(
             (index + 1).to_string(),
             format!("join {}", registry.agent_display_label(agent)),
@@ -240,7 +271,7 @@ pub(crate) fn rows(
                 then(
                     system.clone(),
                     thread,
-                    origin,
+                    origin.clone(),
                     runtimes,
                     start,
                     frame,
@@ -371,7 +402,14 @@ fn prompt_runtime(
                     return;
                 }
             };
-            begin(system.clone(), thread, origin, start.clone(), runtime, cx);
+            begin(
+                system.clone(),
+                thread,
+                origin.clone(),
+                start.clone(),
+                runtime,
+                cx,
+            );
         }),
         window,
         cx,
@@ -400,10 +438,11 @@ fn begin(
             host,
             start,
             runtime,
+            feedback: origin.feedback(),
         };
         match origin {
             Origin::Message => create(system, plan, thread, cx),
-            Origin::Draft => send_and_start(system, thread, plan, cx),
+            Origin::Draft(_) => send_and_start(system, thread, &origin, plan, cx),
         }
     });
 }
@@ -412,12 +451,14 @@ fn begin(
 fn send_and_start(
     system: &mut AgentsSystem,
     thread: ThreadId,
+    origin: &Origin,
     plan: Plan,
     cx: &mut Context<AgentsSystem>,
 ) {
     let endpoint = thread.host;
-    let sent = system.chat.update(cx, |chat, cx| {
-        chat.send_draft(endpoint, Some(thread.message), cx)
+    let sent = system.chat.update(cx, |chat, cx| match origin {
+        Origin::Draft(source) => chat.post_idea(thread, source, cx),
+        Origin::Message => unreachable!("the origin already exists"),
     });
     match sent {
         Some(client_id) => {
@@ -472,11 +513,13 @@ pub(crate) fn create(
         });
         cx.update(|cx| match reply {
             Ok(agent) => {
-                frame.echo(
-                    format!("agent {} started · {on}", agent.encoded()),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
+                if matches!(plan.feedback, Feedback::Started) {
+                    frame.echo(
+                        format!("agent {} started · {on}", agent.encoded()),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
                 // Its first turn may still fail, such as for want of a
                 // login on the host; the echo line says so when it does.
                 let _ = this.update(cx, |system, cx| system.watch_first_turn(agent, cx));

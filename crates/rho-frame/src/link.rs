@@ -71,7 +71,7 @@ impl FrameLink {
         });
     }
 
-    /// What the frame draws from a system changed: its claims, its Home
+    /// What the frame draws from a system changed: its claims, its Desk
     /// sections, its channels.
     pub fn changed(&self, cx: &mut App) {
         self.with(cx, |frame, _, cx| frame.systems_changed(cx));
