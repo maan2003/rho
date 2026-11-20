@@ -233,7 +233,7 @@ enum Button {
     Desk,
     Menu,
     /// The row under the cursor, as `enter` opens it: on Desk, or on a
-    /// list that offers `open`.
+    /// row that names a thread.
     Open,
     Done,
     Mute,
@@ -286,7 +286,6 @@ struct BarState {
     composing_idea: bool,
     desk: bool,
     /// The cursor is on a row that opens: on the desk, a card or a thread;
-    /// elsewhere, a row the surface offers `open` for.
     row: bool,
     /// The point is on something a verdict lands on.
     card: bool,
@@ -319,9 +318,6 @@ fn buttons(state: BarState) -> Vec<Button> {
         }
         false => {
             buttons.extend([Button::Desk, Button::Menu]);
-            if state.row {
-                buttons.push(Button::Open);
-            }
             if state.card {
                 buttons.push(Button::Verdicts);
             }
@@ -353,9 +349,6 @@ fn record_verdict(verdict: PhoneVerdict) {
 
 /// The row a surface offers for sending what is in its composer.
 const SEND_ROW: &str = "send";
-/// The row a list surface offers for opening the row under the cursor,
-/// as `enter` does.
-const OPEN_ROW: &str = "open";
 
 impl Frame {
     /// Which ends the surface in view is scrolled to. A surface that is no
@@ -564,21 +557,17 @@ impl Frame {
             surface
                 .rows(window, cx)
                 .into_iter()
-                .filter(|row| [SEND_ROW, OPEN_ROW].contains(&row.description.as_str()))
+                .filter(|row| row.description == SEND_ROW)
                 .collect(),
         );
-        let offers = |name: &str| rows.iter().any(|row| row.description == name);
         let desk = self.desk_in_view();
         let state = BarState {
             prompting: self.minibuffer.is_some(),
             composing_idea: self.idea.active(),
             desk,
-            row: match desk {
-                true => self.desk.read(cx).cursor_target(cx).is_some(),
-                false => offers(OPEN_ROW),
-            },
+            row: desk && self.desk.read(cx).cursor_target(cx).is_some(),
             card: self.card_target(cx).is_some(),
-            send: offers(SEND_ROW),
+            send: !rows.is_empty(),
         };
         let colors = cx.theme().colors();
         let items = buttons(state).into_iter().map(|button| {
@@ -635,8 +624,7 @@ impl Frame {
             Button::Back => self.back(window, cx),
             Button::Desk => self.toggle_desk(window, cx),
             Button::Menu => self.palette(window, cx),
-            Button::Open if self.desk_in_view() => self.open_row(window, cx),
-            Button::Open => run_row(self, OPEN_ROW, window, cx),
+            Button::Open => self.open_row(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     record_verdict(PhoneVerdict::Done);
@@ -924,13 +912,8 @@ mod tests {
             ..BarState::default()
         };
         assert_eq!(buttons(thread), [Back, Desk, Menu, Verdicts, Send]);
-        // A list elsewhere, such as `notes`, opens its row from the bar.
-        let list = BarState {
-            row: true,
-            card: true,
-            ..BarState::default()
-        };
-        assert_eq!(buttons(list), [Back, Desk, Menu, Open, Verdicts]);
+        assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
+        assert_eq!(buttons(BarState { composing_idea: true, ..thread }), [Cancel, Send]);
         assert_eq!(
             buttons(BarState {
                 prompting: true,

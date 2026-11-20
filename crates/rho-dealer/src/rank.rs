@@ -38,11 +38,8 @@ pub struct Claim {
     /// A reply this soon after the user's own words comes through a
     /// snooze said before them (Z4).
     pub breaks_snooze_set_by: Option<Timestamp>,
-    /// When the other side wrote: a snooze that slept through some of it
-    /// brings the card back a little higher (Z5).
-    pub others: Vec<Timestamp>,
     /// An address a snooze on which holds this one too: the room a thread
-    /// is in (S7).
+    /// is in.
     pub under: Option<Address>,
 }
 
@@ -62,7 +59,6 @@ impl Claim {
             cursor: cursor.into(),
             bonus: 0.0,
             breaks_snooze_set_by: None,
-            others: Vec::new(),
             under: None,
         }
     }
@@ -205,7 +201,6 @@ struct Part {
     cursor: String,
     bonus: f64,
     breaks_snooze_set_by: Option<Timestamp>,
-    others: Vec<Timestamp>,
     /// From a source, which a snooze's end moves; the user's own dates
     /// stand where they were said.
     from_source: bool,
@@ -219,7 +214,6 @@ impl Part {
             cursor: claim.cursor.clone(),
             bonus: claim.bonus,
             breaks_snooze_set_by: claim.breaks_snooze_set_by,
-            others: claim.others.clone(),
             from_source: true,
         }
     }
@@ -231,7 +225,6 @@ impl Part {
             cursor,
             bonus: 0.0,
             breaks_snooze_set_by: None,
-            others: Vec::new(),
             from_source: false,
         }
     }
@@ -299,14 +292,13 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 .iter()
                 .map(|part| {
                     format!(
-                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} others {} breaks_snooze_set_by {:?}",
+                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} breaks_snooze_set_by {:?}",
                         part.reason,
                         part.curve,
                         part.curve.priority(at),
                         part.bonus,
                         part.cursor,
                         part.from_source,
-                        part.others.len(),
                         part.breaks_snooze_set_by,
                     )
                 })
@@ -347,27 +339,18 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 continue;
             }
         }
-        // Z2 and Z5: an address back from a snooze counts from the
-        // snooze's end, a little higher for every message it slept through.
+        // Z2: an address back from a snooze counts from the snooze's end.
         if let Some(snooze) = snoozes
             .iter()
             .filter(|snooze| snooze.until <= at)
             .max_by_key(|snooze| snooze.until)
         {
-            let set = snooze.set.timestamp();
             for part in address_parts.iter_mut().filter(|part| part.from_source) {
                 match &mut part.curve {
                     Curve::Waiting { since, .. } | Curve::Fading { since, .. }
                         if *since < snooze.until =>
                     {
                         *since = snooze.until;
-                        let slept = part
-                            .others
-                            .iter()
-                            .filter(|wrote| set < **wrote && **wrote <= snooze.until)
-                            .count();
-                        part.bonus += (curve::SNOOZED_MESSAGE_BUMP * slept as f64)
-                            .min(curve::SNOOZED_MESSAGE_BUMP_CAP);
                     }
                     _ => {}
                 }

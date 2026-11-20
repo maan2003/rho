@@ -149,8 +149,7 @@ fn run() -> Result<()> {
     // opened here, before anything else: the hosts to attach are in it, and
     // everything that keeps a cache is handed it now. A second rho stops at
     // the door rather than running on with none of its own state.
-    let db = rho_db::client::open_shared(&client_state_dir)
-        .context("open the client database; exit the other rho first")?;
+    let db = rho_db::client::open_shared(&client_state_dir).context("open the client database")?;
     if let Err(error) = rho_journal::init(db.clone(), rho_frame::dealer_policy_snapshot()) {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
@@ -253,15 +252,12 @@ fn run() -> Result<()> {
                     rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
                 });
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
-                let slack =
-                    cx.new(|cx| rho_slack::ui::SlackSystem::new(db.clone(), frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
                     AnySystem::new(notes),
-                    AnySystem::new(slack),
                     AnySystem::new(telemetry),
                 ];
                 let chime = rho_gui::chime::Chime;
