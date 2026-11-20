@@ -510,20 +510,25 @@ fn items(
 ) -> Vec<Item<Key, Class, Meta>> {
     let mut items = history_items(system, thread, list, expanded_quotes, cx);
     if !list && let Some(status) = system.status(thread) {
-        let text = match &status.state {
-            StatusText::Written(_) | StatusText::StoppedByYou => status.state.words().to_owned(),
-            StatusText::Working | StatusText::Stuck => {
-                let since = Timestamp::from_millisecond(status.at.0 as i64).expect("a status time");
-                format!(
-                    "working · {}",
-                    rho_dealer::curve::age(since, Timestamp::now())
-                )
-            }
-        };
+        let text = status_words(status, Timestamp::now());
         items.push(line(Key::Status, &text, Class::Crumb));
     }
     items.push(separator_item(&system.project_of(thread), list, layout));
     items
+}
+
+fn status_words(status: &rho_agent_types::ThreadStatus, now: Timestamp) -> String {
+    match &status.state {
+        StatusText::Written(_) | StatusText::StoppedByYou => status.state.words().to_owned(),
+        StatusText::Working | StatusText::Stuck => {
+            let since = Timestamp::from_millisecond(status.at.0 as i64).expect("a status time");
+            format!(
+                "{} · {}",
+                status.state.words(),
+                rho_dealer::curve::age(since, now)
+            )
+        }
+    }
 }
 
 fn separator_item(project: &str, list: bool, layout: Layout) -> Item<Key, Class, Meta> {
@@ -1492,6 +1497,24 @@ mod tests {
     use rho_agent_types::{AgentId, ChatSeq, UnixMs};
 
     use super::*;
+
+    #[test]
+    fn working_and_stuck_show_their_own_words_and_clock() {
+        let first = 1_000_000;
+        let mut status = rho_agent_types::ThreadStatus {
+            thread: MessageId(ChatSeq(7)),
+            at: UnixMs(first),
+            state: StatusText::Working,
+        };
+        let now = Timestamp::from_millisecond(first as i64 + 5_000).unwrap();
+        assert_eq!(status_words(&status, now), "working · now");
+        status.state = StatusText::Stuck;
+        let now = Timestamp::from_millisecond(first as i64 + 258_000).unwrap();
+        assert_eq!(
+            status_words(&status, now),
+            "stuck · can't reach its model · 4m"
+        );
+    }
 
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
