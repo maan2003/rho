@@ -7,13 +7,14 @@
 //! highlighted answer or the typed input if none fits, tab completes
 //! without submitting, ctrl-n/p or arrows move the selection, escape cancels.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use editor::Editor;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, SharedString, StyledText,
-    Subscription, Window, div, px,
+    AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, Pixels, SharedString,
+    StyledText, Subscription, Window, div, px, rems,
 };
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -21,6 +22,7 @@ use theme::ActiveTheme as _;
 use crate::frame::Frame;
 use crate::menu::Pick;
 use crate::palette::{Choice, Listing, Matched};
+use crate::phone::{cut_at_word, measure};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -473,6 +475,8 @@ impl Minibuffer {
         &self,
         text_style: &gpui::TextStyle,
         layout: crate::Layout,
+        width: Pixels,
+        window: &Window,
         cx: &Context<Frame>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -482,13 +486,17 @@ impl Minibuffer {
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
         let clickable = address || (layout == crate::Layout::Phone && self.is_palette());
+        let measure = measure(text_style, window);
+        let gap = rems(0.5);
+        let gap_px = gap.to_pixels(window.rem_size());
+        let row_width = (width - gap_px * 2.).max(px(0.));
         let rows = (window_start..self.answer.len())
             .take(VISIBLE_CANDIDATES)
             .map(|index| {
                 let selected = index == self.selected;
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
-                let mut row = div().flex().flex_row().gap_2().w_full().px_2();
+                let mut row = div().flex().flex_row().gap(gap).w_full().px(gap);
                 if let Answer::Palette { listing, rows } = &self.answer {
                     let matched = &rows[index];
                     let choice = &listing.choices[matched.index];
@@ -501,26 +509,60 @@ impl Minibuffer {
                         },
                         colors.text_muted,
                     ];
-                    for (field, value) in choice.fields().iter().enumerate() {
-                        if value.is_empty() {
-                            continue;
-                        }
-                        let marks = matched.marks[field].iter().cloned().map(|range| {
-                            (
-                                range,
-                                HighlightStyle {
-                                    color: Some(colors.text_accent.into()),
-                                    ..HighlightStyle::default()
-                                },
+                    let part = |field: usize, value: &str, retained: usize| {
+                        let marks = matched.marks[field]
+                            .iter()
+                            .filter(|range| range.start < retained)
+                            .map(|range| {
+                                (
+                                    range.start..range.end.min(retained),
+                                    HighlightStyle {
+                                        color: Some(colors.text_accent.into()),
+                                        ..HighlightStyle::default()
+                                    },
+                                )
+                            });
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(field_colors[field])
+                            .child(StyledText::new(value.to_owned()).with_highlights(marks))
+                    };
+                    let fields @ [title, detail, beside] = choice.fields();
+                    if layout == crate::Layout::Phone && !detail.is_empty() {
+                        // As on Desk, the subject and address share the first
+                        // line; the card or status words get their own line.
+                        let beside_width = measure(beside).min(row_width * 0.45);
+                        let title_room = if beside.is_empty() {
+                            row_width
+                        } else {
+                            (row_width - beside_width - gap_px).max(px(0.))
+                        };
+                        let (title, retained) = fit_title(title, title_room, &measure);
+                        row = row
+                            .flex_col()
+                            .gap_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .w_full()
+                                    .gap(gap)
+                                    .child(part(0, &title, retained))
+                                    .children((!beside.is_empty()).then(|| {
+                                        part(2, beside, beside.len()).w(beside_width).flex_none()
+                                    })),
                             )
-                        });
-                        let mut part = div().min_w_0().truncate().text_color(field_colors[field]);
-                        if field == 2 {
-                            part = part.flex_none();
+                            .child(part(1, detail, detail.len()).pl(gap));
+                    } else {
+                        for (field, value) in fields.into_iter().enumerate() {
+                            if !value.is_empty() {
+                                row = row.child(
+                                    part(field, value, value.len())
+                                        .when(field == 2, |part| part.flex_none()),
+                                );
+                            }
                         }
-                        row = row.child(
-                            part.child(StyledText::new(value.to_string()).with_highlights(marks)),
-                        );
                     }
                 } else if let Answer::Text { rows, .. } = &self.answer {
                     let candidate = &rows[index];
@@ -588,5 +630,38 @@ impl Minibuffer {
                 no_match.then(|| div().px_2().text_color(colors.text_muted).child("no match")),
             )
             .into_any_element()
+    }
+}
+
+/// The displayed heading and its retained byte count, excluding the added
+/// ellipsis, so match highlights stop at the cut.
+fn fit_title<'a>(
+    title: &'a str,
+    room: Pixels,
+    measure: &impl Fn(&str) -> Pixels,
+) -> (Cow<'a, str>, usize) {
+    if measure(title) <= room {
+        return (Cow::Borrowed(title), title.len());
+    }
+    let clipped = cut_at_word(title, room, measure);
+    let retained = clipped.strip_suffix('…').unwrap_or(&clipped).len();
+    (Cow::Owned(clipped), retained)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fitted_title_cuts_at_a_word_without_highlighting_its_ellipsis() {
+        let measure = |text: &str| px(text.chars().count() as f32);
+        let title = "Réparer le chronomètre";
+        assert_eq!(
+            fit_title(title, px(11.), &measure),
+            ("Réparer le…".into(), 11)
+        );
+        assert_eq!(fit_title(title, px(10.), &measure), ("Réparer…".into(), 8));
+        assert_eq!(fit_title(title, px(22.), &measure), (title.into(), 24));
+        assert_eq!(fit_title(title, px(0.), &measure), ("".into(), 0));
     }
 }

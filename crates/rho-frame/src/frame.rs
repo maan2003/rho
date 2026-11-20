@@ -1504,13 +1504,14 @@ impl Render for Frame {
         if self.desk_in_view() {
             self.sync_desk_idea(layout, cx);
         }
+        let inset = px(2.);
         let frame = div()
             .id("rho-frame")
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .p(px(2.))
+            .p(inset)
             .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .key_context(crate::KEY_CONTEXT)
@@ -1608,6 +1609,15 @@ impl Render for Frame {
                 this.minibuffer_clear(window, cx);
             }))
             .child(self.render_status_line(&text_style, layout, window, cx));
+        let minibuffer = self.minibuffer.as_ref().map(|minibuffer| {
+            minibuffer.render(
+                &text_style,
+                layout,
+                window.viewport_size().width - inset * 2.,
+                window,
+                cx,
+            )
+        });
         if layout == Layout::Phone {
             let body = self.render_phone_surface(&surface, cx);
             let bar = self.render_phone_bar(window, cx);
@@ -1615,11 +1625,7 @@ impl Render for Frame {
             return frame
                 .child(body)
                 .children(self.render_idea(&text_style, layout, cx))
-                .children(
-                    self.minibuffer
-                        .as_ref()
-                        .map(|minibuffer| minibuffer.render(&text_style, layout, cx)),
-                )
+                .children(minibuffer)
                 .child(bar)
                 .children(sheet);
         }
@@ -1652,10 +1658,6 @@ impl Render for Frame {
                         )),
                     )
             }))
-            .children(
-                self.minibuffer
-                    .as_ref()
-                    .map(|minibuffer| minibuffer.render(&text_style, layout, cx)),
-            )
+            .children(minibuffer)
     }
 }

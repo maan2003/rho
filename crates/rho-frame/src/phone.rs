@@ -95,7 +95,7 @@ pub(crate) fn fit_heading(
 }
 
 /// `text` cut at the last word that leaves room for an ellipsis.
-fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
+pub(crate) fn cut_at_word(text: &str, room: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
     let ellipsis = "…";
     let mut cut = String::new();
     for (boundary, character) in text.char_indices() {
