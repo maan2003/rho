@@ -111,7 +111,7 @@ shows:
 keys:
 - `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
 - `enter` or a tap on a command: open or fold its output
-- `shift-u`: undo the last verdict without leaving the transcript
+- `space` then `u`: undo the last verdict without leaving the transcript
 - `space`: `deal.Verdict` on the agent's thread; the transcript stays open
 - `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`

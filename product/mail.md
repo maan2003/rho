@@ -66,7 +66,7 @@ does:
 - look into the work `enter` or a tap on the header: open the `agents.Agent` that wrote the mail at the step that produced its current words; a failed stop opens its error
 - reply: send the user's words to whoever wrote the mail
 - edit or delete: agents may change or take back their own mails, except that mail the user has answered stays as it was
-- reply privately: keep a remark beside this mail, as in `notes.Reply privately`
+- reply privately `alt-r`: write a remark directly beneath this mail, as in `notes.Reply privately`
 
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
 
@@ -96,7 +96,7 @@ shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words when it waits
 - other `Mail` in order, readable and copyable with the same motions and search as the `Draft`, but not editable
 - `Status`, then a quiet separator naming the recipient and send key, then the `Draft`, all in the same buffer
-- a `notes.Private reply` beside the mail it answers; tangents open as their own `Thread`, not folded into the main history
+- a `notes.Private reply` below its mail, editable there; tangents open as their own `Thread`, not folded into the main history
 states:
 - empty: the opening mail and a blank line below the separator; a thread begins with a mail
 - loading: the thread's mail is not yet available; wording not agreed
@@ -107,6 +107,8 @@ keys:
 - `enter` with no selection on an agent's mail: `Mail.look into the work`
 - `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
 - `enter` on a selection in one mail: `Draft.quote`
+- `alt-r` on a mail: `notes.Private reply.reply privately`
+- `shift-u` in the draft: redo the last undone edit
 - `space`: `deal.Verdict`, anywhere in Normal mode
 - `:`: `window.Palette`
 - `ctrl-k`, `tab`, `q`: `window.Screen`

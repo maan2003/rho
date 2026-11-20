@@ -223,8 +223,10 @@ fn run() -> Result<()> {
                     .downcast::<Frame>()
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
-                let mail =
-                    cx.new(|cx| rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), cx));
+                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
+                let mail = cx.new(|cx| {
+                    rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), notes.clone(), cx)
+                });
                 let agents = cx.new(|cx| {
                     rho_agents_view::AgentsSystem::new(db.clone(), mail.clone(), frame.clone(), cx)
                 });
@@ -253,7 +255,6 @@ fn run() -> Result<()> {
                 let browser = cx.new(|_| {
                     rho_browser::ui::PageSystem::new(client_state_dir.clone(), frame.clone())
                 });
-                let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(mail),

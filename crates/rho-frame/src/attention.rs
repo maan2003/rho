@@ -70,7 +70,7 @@ impl Verdict {
     }
 }
 
-/// What `shift-u` takes back.
+/// What verdict undo takes back.
 pub struct Undo {
     pub verb: String,
     pub takeback: Vec<Takeback>,
@@ -105,9 +105,13 @@ impl Attention {
         (attention, events)
     }
 
-    /// Keeps a verdict for `shift-u`.
+    /// Keeps a verdict for `space u`.
     pub fn push_undo(&mut self, undo: Undo) {
         self.undo.push(undo);
+    }
+
+    pub(crate) fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
     }
 
     pub fn pop_undo(&mut self) -> Option<Undo> {

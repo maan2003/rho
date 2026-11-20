@@ -19,8 +19,6 @@ actions!(
         OpenRow,
         /// Quotes the selected lines of a mail in the draft.
         QuoteSelection,
-        /// Helix redo in the draft, or undo verdict on the history.
-        RedoDraftOrUndoVerdict,
     ]
 );
 
@@ -56,13 +54,6 @@ pub(crate) fn bind(cx: &mut App) {
     {
         bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
     }
-    bindings.push(KeyBinding::new(
-        "shift-u",
-        RedoDraftOrUndoVerdict,
-        Some(&format!(
-            "{screen} && vim_mode == helix_normal && vim_operator == none"
-        )),
-    ));
     for mode in ["visual", "helix_select"] {
         let context = format!("{screen} && vim_mode == {mode}");
         bindings.push(KeyBinding::new("enter", QuoteSelection, Some(&context)));

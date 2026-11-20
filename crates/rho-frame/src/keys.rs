@@ -31,7 +31,7 @@ actions!(
         DeskFirst,
         DeskDraft,
         PromptIdea,
-        RedoIdeaOrUndoVerdict,
+        RedoEdit,
         SendIdea,
         CancelIdea,
         /// `/`: search forward in what is in view.
@@ -42,7 +42,6 @@ actions!(
         SearchNext,
         /// `N`: the last search again, the other way.
         SearchPrevious,
-        UndoVerdict,
         MinibufferConfirm,
         MinibufferCancel,
         MinibufferNext,
@@ -132,7 +131,7 @@ fn bindings() -> Vec<KeyBinding> {
     }
     for context in normal_contexts("RhoFrame", " && vim_operator == none") {
         bindings.extend([
-            KeyBinding::new("shift-u", UndoVerdict, Some(&context)),
+            KeyBinding::new("shift-u", RedoEdit, Some(&context)),
             // vim's search keys reach for a Zed pane's search bar, which no
             // surface has; the frame searches the surface's editor instead.
             KeyBinding::new("/", SearchForward, Some(&context)),
@@ -152,7 +151,6 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("g g", DeskFirst, Some(&context)),
             KeyBinding::new("shift-g", DeskDraft, Some(&context)),
             KeyBinding::new("enter", OpenRow, Some(&context)),
-            KeyBinding::new("shift-u", RedoIdeaOrUndoVerdict, Some(&context)),
         ]);
     }
     for context in normal_contexts("RhoIdeaUnaddressed", " && vim_operator == none") {

@@ -695,7 +695,12 @@ impl Vim {
         });
     }
 
-    fn insert_before(&mut self, _: &InsertBefore, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn insert_before(
+        &mut self,
+        _: &InsertBefore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.start_recording(cx);
         self.prepare_for_insert(window, cx);
         if self.mode.is_visual() {

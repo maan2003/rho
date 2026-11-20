@@ -4,9 +4,7 @@
 use std::rc::Rc;
 
 use editor::Editor;
-use gpui::{
-    Action, AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window,
-};
+use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window};
 use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
@@ -113,10 +111,10 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         self.subject(cx)
     }
 
-    /// The key action that undoes a verdict here. A draft can give the same
-    /// keys a different meaning without advertising them for a verdict.
-    fn undo_verdict_action(&self, _cx: &App) -> Option<Box<dyn Action>> {
-        Some(Box::new(crate::keys::UndoVerdict))
+    /// Whether the point is in the surface's writable text rather than on
+    /// the reading side. Only there does the frame redo an editor edit.
+    fn edits_at_point(&self, _cx: &App) -> bool {
+        false
     }
 
     /// What the status line calls the surface while it is the card in
@@ -156,7 +154,7 @@ trait SurfaceHandle {
     fn subject(&self, cx: &App) -> Subject;
     fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
-    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>>;
+    fn edits_at_point(&self, cx: &App) -> bool;
     fn heading(&self, cx: &App) -> Option<String>;
     fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
@@ -209,8 +207,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).card(cx)
     }
 
-    fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>> {
-        self.read(cx).undo_verdict_action(cx)
+    fn edits_at_point(&self, cx: &App) -> bool {
+        self.read(cx).edits_at_point(cx)
     }
 
     fn heading(&self, cx: &App) -> Option<String> {
@@ -304,8 +302,8 @@ impl AnySurface {
         )
     }
 
-    pub(crate) fn undo_verdict_action(&self, cx: &App) -> Option<Box<dyn Action>> {
-        self.0.undo_verdict_action(cx)
+    pub(crate) fn edits_at_point(&self, cx: &App) -> bool {
+        self.0.edits_at_point(cx)
     }
 
     pub fn heading(&self, cx: &App) -> Option<String> {
