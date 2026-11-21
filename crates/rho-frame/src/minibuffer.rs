@@ -246,6 +246,18 @@ pub struct Minibuffer {
 /// window rather than growing unbounded.
 const VISIBLE_CANDIDATES: usize = 8;
 
+fn candidate_window(
+    selected: usize,
+    total: usize,
+    layout: crate::Layout,
+) -> std::ops::Range<usize> {
+    let start = match layout {
+        crate::Layout::Desktop => selected.saturating_sub(VISIBLE_CANDIDATES - 1),
+        crate::Layout::Phone => selected / VISIBLE_CANDIDATES * VISIBLE_CANDIDATES,
+    };
+    start..(start + VISIBLE_CANDIDATES).min(total)
+}
+
 impl Minibuffer {
     pub fn prompt(&self) -> &str {
         &self.prompt
@@ -607,10 +619,8 @@ impl Minibuffer {
         cx: &Context<Frame>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        // Keep the selection visible: scroll the window, not the list.
-        let window_start = self
-            .selected
-            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
+        let total = self.answer.len();
+        let visible = candidate_window(self.selected, total, layout);
         let address = matches!(self.completion_input, CompletionInput::Address);
         let clickable = address
             || matches!(self.completion_input, CompletionInput::Explicit)
@@ -632,8 +642,47 @@ impl Minibuffer {
             )),
             Answer::Text { .. } => None,
         };
-        let rows = (window_start..self.answer.len())
-            .take(VISIBLE_CANDIDATES)
+        let pages = (layout == crate::Layout::Phone && total > VISIBLE_CANDIDATES).then(|| {
+            let page = |id, title, index: Option<usize>| {
+                div().flex_1().children(index.map(|index| {
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .id(id)
+                        .justify_center()
+                        .text_color(colors.text_accent)
+                        .cursor_pointer()
+                        .child(title)
+                        .on_click(cx.listener(move |frame, _, _, cx| {
+                            if let Some(prompt) = frame.minibuffer_mut()
+                                && index < prompt.answer.len()
+                            {
+                                prompt.selected = index;
+                                prompt.moved_selection = true;
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }))
+                }))
+            };
+            div()
+                .flex()
+                .h(px(56.))
+                .border_t_1()
+                .border_color(colors.border)
+                .child(page(
+                    "rho-prompt-previous-page",
+                    "‹ previous",
+                    visible.start.checked_sub(VISIBLE_CANDIDATES),
+                ))
+                .child(page(
+                    "rho-prompt-next-page",
+                    "next ›",
+                    (visible.end < total).then_some(visible.end),
+                ))
+        });
+        let rows = visible
             .map(|index| {
                 let selected = index == self.selected && self.takes_candidate();
                 // Padding lives on the row, not the strip, so the
@@ -765,7 +814,6 @@ impl Minibuffer {
         // A prompt whose rows are its answers says when none answers, so
         // an empty list does not read as one still loading.
         let palette = self.is_palette();
-        let total = self.answer.len();
         let missing = if total == 0 && palette && !self.input(cx).trim().is_empty() {
             Some(
                 if matches!(
@@ -812,6 +860,7 @@ impl Minibuffer {
                     })),
             )
             .children(rows)
+            .children(pages)
             .children(missing.map(|words| div().px_2().text_color(colors.text_muted).child(words)))
             .into_any_element()
     }
@@ -879,6 +928,15 @@ fn fit_title<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phone_exposes_whole_pages_and_the_last_partial_page() {
+        use crate::Layout::{Desktop, Phone};
+        assert_eq!(candidate_window(7, 17, Phone), 0..8);
+        assert_eq!(candidate_window(8, 17, Phone), 8..16);
+        assert_eq!(candidate_window(16, 17, Phone), 16..17);
+        assert_eq!(candidate_window(8, 17, Desktop), 1..9);
+    }
 
     #[test]
     fn card_words_and_addresses_have_stable_columns_for_asymmetric_titles() {
