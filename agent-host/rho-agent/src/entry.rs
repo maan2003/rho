@@ -191,6 +191,7 @@ pub enum RequestNotice {
     Waiting,
     Checkin,
     NothingNew,
+    /// Historical notice kept so saved turns remain readable.
     ThreadCold {
         thread: rho_agent_types::MessageId,
         minutes: u64,

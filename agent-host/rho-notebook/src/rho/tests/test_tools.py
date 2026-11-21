@@ -41,7 +41,7 @@ class Tools(WorksetCase):
     def test_on_notebook_gives_tools_by_preset_and_enters_the_directory(self):
         ns, cwd = self.notebook(self.root)
         self.assertEqual(cwd, os.path.realpath(self.tmp))
-        self.assertEqual(sorted(ns), ["agents", "mail", "skills"])
+        self.assertEqual(sorted(ns), ["agents", "chat", "mail", "skills"])
         self.assertTrue(hasattr(ns["agents"], "spawn_user_owned_engineer"))
         child = add_agent(self.state, native(), preset="child", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(child)
@@ -49,7 +49,7 @@ class Tools(WorksetCase):
         self.assertTrue(hasattr(ns["agents"], "spawn_new_engineer"))
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         ns, _ = self.notebook(advisor)
-        self.assertEqual(sorted(ns), ["mail", "skills"])
+        self.assertEqual(sorted(ns), ["agents", "chat", "mail", "skills"])
 
     def test_spawn_new_engineer(self):
         ns, _ = self.notebook(self.root)
@@ -200,8 +200,8 @@ class Tools(WorksetCase):
         self.assertEqual(fake_rho.message(reply)["reply_to"], direct)
         _, project_mail = run(lambda: mailbox.send("rho@local", "New work."))
         self.assertEqual(fake_rho.message(project_mail)["parent"], project)
-        self.assertNotIn("chat", ns)
-        self.assertFalse(hasattr(ns["agents"], "message"))
+        self.assertIn("chat", ns)
+        self.assertTrue(hasattr(ns["agents"], "message"))
 
     def test_a_post_can_be_awaited_for_its_id_without_sending_twice(self):
         ns, _ = self.notebook(self.root)
@@ -230,6 +230,35 @@ class Tools(WorksetCase):
         )
         with self.assertRaisesRegex(ValueError, "replace_last is True or False"):
             mailbox.send("user", "New words.", thread=thread, replace_last=1)
+
+    def test_chat_requires_kind_without_changing_mail_for_existing_notebooks(self):
+        ns, _ = self.notebook(self.root)
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        chat = ns["chat"]
+        with mock.patch.object(fake_rho, "send_chat", return_value=41) as post:
+            with self.assertRaises(TypeError):
+                chat.send("Missing kind.", thread=thread)
+            with self.assertRaises(TypeError):
+                chat.send("No ping flag.", "message", thread=thread, ping=False)
+            with self.assertRaisesRegex(ValueError, "kind is 'message' or 'flash'"):
+                chat.send("Unknown kind.", "draft", thread=thread)
+            post.assert_not_called()
+            self.assertEqual(chat.send("Trying another seed.", "flash", thread=thread), 41)
+            post.assert_called_once_with(self.root, thread, "Trying another seed.", "flash")
+
+        with mock.patch.object(fake_rho, "send_mail", return_value=53) as old_post:
+            self.assertEqual(ns["mail"].send("user", "Old update.", thread=thread, ping=False), 53)
+            old_post.assert_called_once_with(self.root, thread, "Old update.", to="user",
+                                             ping=False, reply_to=None, replace_last=False)
+
+    def test_agent_message_addresses_only_the_other_agent(self):
+        advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
+        ns, _ = self.notebook(advisor)
+        result = ns["agents"].message(agent_id=self.root, message="Look at the boundary.")
+        self.assertIn("Sent to eng-", asyncio.run(_await(result)))
+        record = self.state.messages[-1]
+        self.assertEqual(record["mentions"], [(self.root, "direct")])
 
     def test_send_propagates_the_hosts_edit_instruction_without_posting(self):
         ns, _ = self.notebook(self.root)
@@ -372,7 +401,8 @@ class Tools(WorksetCase):
         self.assertEqual(run(theirs_too["agents"].external.contacts)[0], "You have accepted no address.\n")
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
         adv, _ = self.notebook(advisor)
-        self.assertNotIn("agents", adv)
+        self.assertTrue(hasattr(adv["agents"], "message"))
+        self.assertFalse(hasattr(adv["agents"], "spawn_new_engineer"))
         with self.assertRaises((ValueError, RuntimeError)):
             ns["mail"].send(theirs, "Hello.")
         self.assertEqual(len(self.state.sent), 2)

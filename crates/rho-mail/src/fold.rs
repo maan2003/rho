@@ -589,6 +589,7 @@ mod tests {
         record(
             seq,
             ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent: parent.map(id),
                 reply_to: None,
                 from,

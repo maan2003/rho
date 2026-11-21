@@ -12,8 +12,8 @@
 
 use redb::TableDefinition;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, Mention, Message, MessageId,
-    Revision, UnixMs,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, FLASH_LIFETIME, Mention,
+    Message, MessageId, MessageKind, Revision, UnixMs,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
@@ -131,6 +131,7 @@ mod prior_ping {
                     mentions,
                     content,
                 } => super::ChatEvent::Posted {
+                    kind: super::MessageKind::Kept,
                     parent,
                     reply_to,
                     from,
@@ -355,7 +356,7 @@ pub trait MailRead {
     ) -> anyhow::Result<Vec<MailHit>>;
     fn mail_thread(&self, message: &Message) -> MessageId;
     fn first_thread(&self, agent: AgentId) -> Option<MessageId>;
-    fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs>;
+    fn flash_deadlines(&self) -> Vec<(MessageId, UnixMs)>;
 }
 
 impl MailRead for ReadTxn {
@@ -600,26 +601,36 @@ impl MailRead for ReadTxn {
             .map(|thread| MessageId(ChatSeq(thread.value())))
     }
 
-    fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
+    fn flash_deadlines(&self) -> Vec<(MessageId, UnixMs)> {
         let log = self.open_table(MAIL_LOG);
-        self.open_table(CHILDREN)
-            .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
-            .rev()
-            .find_map(|(key, _)| {
-                let record = log
-                    .get(key.value().1)
-                    .expect("a child is a message")
-                    .value()
-                    .into_owned();
-                matches!(
+        let revisions = self.open_table(REVISIONS);
+        log.iter()
+            .filter_map(|(_, row)| {
+                let record = row.value().into_owned();
+                if !matches!(
                     record.event,
                     ChatEvent::Posted {
-                        from: Address::User,
+                        kind: MessageKind::Flash,
                         ..
                     }
-                )
-                .then_some(record.at)
+                ) {
+                    return None;
+                }
+                if revisions.get(record.seq.0).is_some_and(|seq| {
+                    matches!(
+                        log.get(seq.value())
+                            .expect("a revision is a chat event")
+                            .value()
+                            .into_owned()
+                            .event,
+                        ChatEvent::Deleted { .. }
+                    )
+                }) {
+                    return None;
+                }
+                Some((MessageId(record.seq), record.at + FLASH_LIFETIME))
             })
+            .collect()
     }
 
     fn mail_thread(&self, message: &Message) -> MessageId {
@@ -735,6 +746,15 @@ pub trait MailWrite {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId>;
+    fn post_flash(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        author: AgentId,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<MessageId>;
+    /// Apply the original post's deadline even after edits or a host restart.
+    fn expire_flash(&mut self, at: UnixMs, id: MessageId) -> bool;
     /// The trial reply already exists when a retry creates its recipient.
     /// Its words and position do not change when it reaches the new agent.
     fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId);
@@ -1000,7 +1020,7 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         id.0.0
     );
     anyhow::ensure!(
-        !has_user_reply(write, id),
+        mail.kind == MessageKind::Flash || !has_user_reply(write, id),
         "you cannot change mail #{}: the user already answered it",
         id.0.0
     );
@@ -1033,6 +1053,99 @@ fn revise(
     write.index_mail_event(seq, &event);
 }
 
+fn post_kind(
+    write: &mut WriteTxn,
+    at: UnixMs,
+    parent: Option<MessageId>,
+    message: NewMessage,
+    kind: MessageKind,
+    client_id: Option<u64>,
+) -> anyhow::Result<MessageId> {
+    if let Some(seq) = sent_before(write, client_id) {
+        return Ok(MessageId(seq));
+    }
+    if let Some(parent) = parent {
+        anyhow::ensure!(is_message(write, parent), "no message {}", parent.0.0);
+    }
+    anyhow::ensure!(has_content(&message.content), "a message needs content");
+    let NewMessage {
+        from,
+        reply_to,
+        mentions,
+        content,
+    } = message;
+    if let Some(reply_to) = reply_to {
+        anyhow::ensure!(is_message(write, reply_to), "no mail #{}", reply_to.0.0);
+    }
+    if let Some(parent) = parent
+        && let Some((_, pair)) = peer_thread(write, parent)
+        && let Address::Agent(agent) = from
+    {
+        anyhow::ensure!(
+            peer_pair(from, &mentions) == Some(pair) && pair.contains(&agent),
+            "address the other agent to reply in a direct conversation"
+        );
+    }
+    let event = ChatEvent::Posted {
+        parent,
+        reply_to,
+        from,
+        kind,
+        mentions,
+        content,
+    };
+    let seq = append(write, at, event.clone());
+    write.index_mail_event(seq, &event);
+    if let Some(client_id) = client_id {
+        write.open_table(CLIENT_IDS).insert(client_id, seq.0);
+    }
+    if let Some(thread) = parent {
+        expire_older_flashes(write, at, thread, MessageId(seq));
+    }
+    Ok(MessageId(seq))
+}
+
+fn mark_deleted(write: &mut WriteTxn, at: UnixMs, message: MessageId) {
+    let event = ChatEvent::Deleted { message };
+    let seq = append(write, at, event.clone());
+    write.index_mail_event(seq, &event);
+}
+
+fn earlier_messages(write: &mut WriteTxn, thread: MessageId, after: MessageId) -> Vec<MessageId> {
+    write
+        .open_table(CHILDREN)
+        .range((thread.0.0, 0)..(thread.0.0, after.0.0))
+        .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
+        .collect()
+}
+
+// SPEC-chat-flash: a new item and any flash deletion commit as one log update.
+fn expire_older_flashes(write: &mut WriteTxn, at: UnixMs, thread: MessageId, newer: MessageId) {
+    for id in earlier_messages(write, thread, newer) {
+        if flash_due(write, at, id).is_some() {
+            mark_deleted(write, at, id);
+        }
+    }
+}
+
+fn flash_due(write: &mut WriteTxn, at: UnixMs, id: MessageId) -> Option<MessageId> {
+    let flash = current_message(write, id)?;
+    flash.flash_deadline().filter(|deadline| *deadline <= at)?;
+    flash.parent
+}
+
+fn newer_visible(write: &mut WriteTxn, thread: MessageId, than: MessageId) -> bool {
+    let newer: Vec<_> = write
+        .open_table(CHILDREN)
+        .range((thread.0.0, than.0.next().0)..=(thread.0.0, u64::MAX))
+        .rev()
+        .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
+        .collect();
+    newer.into_iter().any(|id| {
+        current_message(write, id).is_some_and(|message| message.revision != Revision::Deleted)
+    })
+}
+
 impl MailWrite for WriteTxn {
     fn init_mail_tables(&mut self) {
         self.open_table(MAIL_LOG);
@@ -1053,44 +1166,41 @@ impl MailWrite for WriteTxn {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId> {
-        if let Some(seq) = sent_before(self, client_id) {
-            return Ok(MessageId(seq));
-        }
-        if let Some(parent) = parent {
-            anyhow::ensure!(is_message(self, parent), "no message {}", parent.0.0);
-        }
-        anyhow::ensure!(has_content(&message.content), "a message needs content");
-        let NewMessage {
-            from,
-            reply_to,
-            mentions,
-            content,
-        } = message;
-        if let Some(reply_to) = reply_to {
-            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
-        }
-        if let Some(parent) = parent
-            && let Some((_, pair)) = peer_thread(self, parent)
-            && let Address::Agent(agent) = from
-        {
-            anyhow::ensure!(
-                peer_pair(from, &mentions) == Some(pair) && pair.contains(&agent),
-                "address the other agent to reply in a direct conversation"
-            );
-        }
-        let event = ChatEvent::Posted {
-            parent,
-            reply_to,
-            from,
-            mentions,
+        post_kind(self, at, parent, message, MessageKind::Kept, client_id)
+    }
+
+    fn post_flash(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        author: AgentId,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<MessageId> {
+        anyhow::ensure!(
+            current_message(self, thread).is_some_and(|anchor| {
+                anchor.kind == MessageKind::Kept
+                    && (anchor.parent.is_some() || anchor.to_user())
+                    && anchor.revision != Revision::Deleted
+            }),
+            "a flash needs a thread"
+        );
+        let message = NewMessage {
+            from: Address::Agent(author),
+            reply_to: None,
+            mentions: vec![Mention::User { ping: false }],
             content,
         };
-        let seq = append(self, at, event.clone());
-        self.index_mail_event(seq, &event);
-        if let Some(client_id) = client_id {
-            self.open_table(CLIENT_IDS).insert(client_id, seq.0);
+        post_kind(self, at, Some(thread), message, MessageKind::Flash, None)
+    }
+
+    fn expire_flash(&mut self, at: UnixMs, id: MessageId) -> bool {
+        if let Some(thread) = flash_due(self, at, id)
+            && newer_visible(self, thread, id)
+        {
+            mark_deleted(self, at, id);
+            return true;
         }
-        Ok(MessageId(seq))
+        false
     }
 
     fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId) {
@@ -1173,6 +1283,7 @@ impl MailWrite for WriteTxn {
                 break;
             }
             if mail.from == Address::Agent(agent)
+                && mail.kind == MessageKind::Kept
                 && !matches!(
                     mail.revision,
                     Revision::Deleted | Revision::TakenBack { .. }
@@ -1268,6 +1379,9 @@ impl MailWrite for WriteTxn {
     ) -> anyhow::Result<()> {
         let mail = check_revision(self, agent, message)?;
         anyhow::ensure!(has_content(&content), "a message needs content");
+        if mail.kind == MessageKind::Flash {
+            anyhow::ensure!(ping != Some(true), "a flash cannot ping");
+        }
         anyhow::ensure!(
             ping.is_none() || mail.to_user(),
             "only mail to the user pings"
@@ -1278,9 +1392,7 @@ impl MailWrite for WriteTxn {
 
     fn delete(&mut self, at: UnixMs, agent: AgentId, message: MessageId) -> anyhow::Result<()> {
         check_revision(self, agent, message)?;
-        let event = ChatEvent::Deleted { message };
-        let seq = append(self, at, event.clone());
-        self.index_mail_event(seq, &event);
+        mark_deleted(self, at, message);
         Ok(())
     }
 
@@ -1341,6 +1453,12 @@ impl MailWrite for WriteTxn {
         let event = ChatEvent::Reparented { message, parent };
         let seq = append(self, at, event.clone());
         self.index_mail_event(seq, &event);
+        if let Some(thread) = parent
+            && current_message(self, message).is_some_and(|item| item.revision != Revision::Deleted)
+        {
+            expire_older_flashes(self, at, thread, message);
+            self.expire_flash(at, message);
+        }
         Ok(())
     }
 

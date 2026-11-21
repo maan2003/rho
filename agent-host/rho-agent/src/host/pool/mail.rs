@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rho_agent_types::{
-    Activity, Address, AgentId, ContentPart, Doing, Mention, Message, MessageId, Stop,
-    THREAD_COLD_AFTER as COLD_AFTER, ThreadWork, UnixMs,
+    Activity, Address, AgentId, ContentPart, Doing, FLASH_LIFETIME, Mention, Message, MessageId,
+    Stop, ThreadWork, UnixMs, WorksetId,
 };
 use tokio::sync::watch;
 
@@ -21,12 +21,7 @@ pub(super) struct Mail {
     /// works there again.
     stopped: Mutex<BTreeMap<MessageId, AgentId>>,
     work_changed: watch::Sender<()>,
-    presence: Mutex<Presence>,
-    visits: watch::Sender<()>,
     retry_checks: Mutex<HashMap<AgentId, tokio::task::JoinHandle<()>>>,
-    /// Pinging mail with no recap that rho has reminded its writer about,
-    /// or will once its thread is cold: once per mail.
-    recap_reminders: Mutex<HashSet<MessageId>>,
 }
 
 impl Mail {
@@ -37,76 +32,6 @@ impl Mail {
         if stopped.len() != before {
             self.work_changed.send_replace(());
         }
-    }
-}
-
-#[derive(Default)]
-struct Presence(HashMap<MessageId, Visit>);
-
-struct Visit {
-    last: UnixMs,
-    open: usize,
-    warned: bool,
-}
-
-impl Presence {
-    fn warm(&mut self, thread: MessageId, now: UnixMs) -> &mut Visit {
-        let visit = self.0.entry(thread).or_insert_with(|| Visit {
-            last: now,
-            open: 0,
-            warned: false,
-        });
-        if now > visit.last {
-            visit.last = now;
-            visit.warned = false;
-        }
-        visit
-    }
-
-    fn cold(&mut self, thread: MessageId, now: UnixMs, last: UnixMs) -> Option<u64> {
-        let visit = self.0.entry(thread).or_insert_with(|| Visit {
-            last,
-            open: 0,
-            warned: false,
-        });
-        let age = now.0.saturating_sub(visit.last.0);
-        if visit.open != 0 || age <= COLD_AFTER.as_millis() as u64 || visit.warned {
-            return None;
-        }
-        visit.warned = true;
-        Some(age / 60_000)
-    }
-}
-
-/// The thread in view on a single session. Closing the stream (or the
-/// connection) counts as leaving it, even when no final frame arrived.
-pub struct MailView {
-    pool: Arc<AgentPool>,
-    current: Option<MessageId>,
-}
-
-impl MailView {
-    pub fn set(&mut self, thread: Option<MessageId>) {
-        let thread = thread.filter(|id| self.pool.db.read().message(*id).is_some());
-        if self.current == thread {
-            return;
-        }
-        let now = UnixMs::now();
-        let mut presence = self.pool.mail.presence.lock().expect("poison");
-        if let Some(old) = self.current {
-            presence.warm(old, now).open -= 1;
-        }
-        if let Some(new) = thread {
-            presence.warm(new, now).open += 1;
-        }
-        self.current = thread;
-        self.pool.mail.visits.send_replace(());
-    }
-}
-
-impl Drop for MailView {
-    fn drop(&mut self) {
-        self.set(None);
     }
 }
 
@@ -155,7 +80,6 @@ impl AgentPool {
                 },
             )?;
             write.commit();
-            self.watch_recap(message);
         }
         Ok(())
     }
@@ -198,13 +122,6 @@ impl AgentPool {
             None,
         )?;
         Ok(())
-    }
-
-    pub fn mail_view(self: &Arc<Self>) -> MailView {
-        MailView {
-            pool: self.clone(),
-            current: None,
-        }
     }
 
     pub fn watch_thread_work(&self) -> watch::Receiver<()> {
@@ -294,122 +211,128 @@ impl AgentPool {
         None
     }
 
-    pub(super) fn user_visited(&self, message: MessageId) {
-        let read = self.db.read();
-        if let Some(mail) = read.message(message) {
-            let thread = read.mail_thread(&mail);
-            self.mail
-                .presence
-                .lock()
-                .expect("poison")
-                .warm(thread, mail.at);
-        }
-    }
-
-    /// Run as an existing model request is prepared; never wake an idle or
-    /// stopped agent solely to tell it the thread is cold.
-    pub(crate) fn cold_notice(
-        &self,
-        agent: AgentId,
-        incoming: Option<MessageId>,
-    ) -> Option<(MessageId, u64)> {
-        let read = self.db.read();
-        let thread = incoming
-            .and_then(|id| read.message(id))
-            .or_else(|| origin(&read, agent))
-            .map(|mail| read.mail_thread(&mail))
-            .or_else(|| read.first_thread(agent))?;
-        let anchor = read.message(thread)?;
-        let now = UnixMs::now();
-        let mut presence = self.mail.presence.lock().expect("poison");
-        let last = if presence.0.contains_key(&thread) {
-            // Only used to initialize an unknown thread.
-            anchor.at
+    pub(super) async fn send_agent_message(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        parent: Option<MessageId>,
+        message: NewMessage,
+        replace: Option<Option<bool>>,
+        api: &str,
+    ) -> anyhow::Result<MessageId> {
+        let Address::Agent(sender) = message.from else {
+            unreachable!("agent messages have an agent author");
+        };
+        self.own_agent(workset, sender)?;
+        self.known_mentions(&message.mentions)?;
+        let direct = message
+            .mentions
+            .iter()
+            .any(|mention| matches!(mention, Mention::Direct(_)));
+        let project = if direct {
+            anyhow::ensure!(
+                parent.is_none(),
+                "direct mail chooses its own thread; address the agent"
+            );
+            self.mail_project(sender)
         } else {
-            read.last_user_mail(thread).unwrap_or(anchor.at)
+            None
         };
-        presence
-            .cold(thread, now, last)
-            .map(|minutes| (thread, minutes))
+        let mut write = self.db.write().await;
+        let at = UnixMs::now();
+        if !direct
+            && let Some(thread) = parent
+            && let Some(live) = write.live_project_mail(thread, sender)
+        {
+            if let Some(ping) = replace {
+                use anyhow::Context as _;
+                let current = self.db.read().message(live).context("no live message")?;
+                check_agent_text(&message.content, &current.mentions)?;
+                self.revise_agent_mail(write, workset, at, sender, live, message.content, ping)?;
+                return Ok(live);
+            }
+            if api == "mail" {
+                anyhow::bail!(
+                    "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
+                    live.0.0,
+                    live.0.0,
+                );
+            }
+            anyhow::bail!(
+                "chat.send refused: you already sent message #{} since the user's last message in this thread. Use chat.edit({}, text), or use kind=\"flash\" for anything that does not need the user.",
+                live.0.0,
+                live.0.0,
+            );
+        }
+        if replace.is_some() {
+            check_agent_text(&message.content, &message.mentions)?;
+        }
+        let id = if direct {
+            write.post_peer(at, project, message)?
+        } else {
+            write.post(at, parent, message, None)?
+        };
+        record_agent_post(&mut write, workset, at, sender, id)?;
+        write.commit();
+        self.wake_receivers(id, Some(workset));
+        if !direct {
+            self.consider_naming(id);
+        }
+        Ok(id)
     }
 
-    /// A ping left cold without its recap gets at most one reminder.
-    pub(super) fn watch_recap(self: &Arc<Self>, id: MessageId) {
-        let needs_recap = |mail: &Message| {
-            mail.pings_user()
-                && matches!(mail.from, Address::Agent(_))
-                && rho_agent_types::recap_section(&mail.text()).is_none()
-        };
-        let read = self.db.read();
-        if !read.message(id).is_some_and(|mail| needs_recap(&mail))
-            || !self.mail.recap_reminders.lock().expect("poison").insert(id)
-        {
-            return;
+    pub(super) async fn send_flash(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        sender: AgentId,
+        thread: MessageId,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<MessageId> {
+        self.own_agent(workset, sender)?;
+        let mut write = self.db.write().await;
+        let at = UnixMs::now();
+        let id = write.post_flash(at, thread, sender, content)?;
+        record_agent_post(&mut write, workset, at, sender, id)?;
+        write.commit();
+        self.schedule_flash_expiry(id, at + FLASH_LIFETIME);
+        Ok(id)
+    }
+
+    pub(super) async fn restore_flash_expiry(self: &Arc<Self>) {
+        let deadlines = self.db.read().flash_deadlines();
+        let now = UnixMs::now();
+        let (ready, after): (Vec<_>, Vec<_>) = deadlines
+            .into_iter()
+            .partition(|(_, deadline)| *deadline <= now);
+        if !ready.is_empty() {
+            let mut write = self.db.write().await;
+            let mut changed = false;
+            for (id, _) in ready {
+                changed |= write.expire_flash(now, id);
+            }
+            if changed {
+                write.commit();
+            }
         }
+        for (id, deadline) in after {
+            self.schedule_flash_expiry(id, deadline);
+        }
+    }
+
+    fn schedule_flash_expiry(self: &Arc<Self>, id: MessageId, deadline: UnixMs) {
         let weak = Arc::downgrade(self);
-        let mut visits = self.mail.visits.subscribe();
         tokio::spawn(async move {
-            tokio::time::sleep(COLD_AFTER).await;
             loop {
-                visits.borrow_and_update();
-                let Some(pool) = weak.upgrade() else { return };
-                let now = UnixMs::now();
-                let (agent, thread, last_user) = {
-                    let read = pool.db.read();
-                    let Some(mail) = read.message(id).filter(|mail| needs_recap(mail)) else {
-                        return;
-                    };
-                    let Address::Agent(agent) = mail.from else {
-                        return;
-                    };
-                    let thread = read.mail_thread(&mail);
-                    let last = read.last_user_mail(thread).unwrap_or(mail.at);
-                    if last > mail.version().1 {
-                        // The user already returned to the conversation to
-                        // write.
-                        return;
-                    }
-                    (agent, thread, last)
-                };
-                let (open, last) = pool
-                    .mail
-                    .presence
-                    .lock()
-                    .expect("poison")
-                    .0
-                    .get(&thread)
-                    .map_or((false, last_user), |visit| {
-                        (visit.open != 0, visit.last.max(last_user))
-                    });
-                if open {
-                    drop(pool);
-                    if visits.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-                if let Some(left) = (last + COLD_AFTER).0.checked_sub(now.0)
-                    && left > 0
-                {
-                    drop(pool);
+                let left = deadline.0.saturating_sub(UnixMs::now().0);
+                if left != 0 {
                     tokio::time::sleep(Duration::from_millis(left)).await;
                     continue;
                 }
-                // An explicitly stopped or unloaded agent is not restarted
-                // just to rephrase something it already wrote.
-                let client = pool.agents.lock().await.get(&agent).cloned();
-                if let Some(client) = client {
-                    let _ = client.control(crate::ipc::protocol::Control::Input {
-                        role: rho_agent_types::Role::Tool,
-                        message: None,
-                        content: vec![ContentPart::Text {
-                            text: format!(
-                                "Mail #{} still waits without a recap. Edit it to include a ## recap section so the user can answer without reading the thread.",
-                                id.0.0
-                            ),
-                        }],
-                    }).await;
+                let Some(pool) = weak.upgrade() else { return };
+                let mut write = pool.db.write().await;
+                if write.expire_flash(UnixMs::now(), id) {
+                    write.commit();
                 }
+                // If it is still the newest, the next post checks it.
                 return;
             }
         });
@@ -472,6 +395,28 @@ impl AgentPool {
             checks.insert(agent, check);
         }
     }
+}
+
+fn record_agent_post(
+    write: &mut rho_db::WriteTxn,
+    workset: WorksetId,
+    at: UnixMs,
+    agent: AgentId,
+    message: MessageId,
+) -> anyhow::Result<()> {
+    let version = write.mail_version(message);
+    write.append(
+        workset,
+        &Record {
+            at,
+            event: Event::MailWritten {
+                agent,
+                message,
+                version,
+            },
+        },
+    )?;
+    Ok(())
 }
 
 fn is_working(doing: Doing, now: UnixMs) -> bool {
@@ -684,7 +629,6 @@ fn stop_line(line: &str, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::ChatSeq;
 
     use super::*;
 
@@ -739,38 +683,5 @@ mod tests {
             },
             UnixMs(15)
         ));
-    }
-
-    #[test]
-    fn cold_notice_is_once_per_thread_and_resets_after_a_return() {
-        let mut presence = Presence::default();
-        let thread = MessageId(ChatSeq(11));
-        let elsewhere = MessageId(ChatSeq(12));
-        let first = UnixMs(23);
-        let edge = first + COLD_AFTER;
-        assert_eq!(presence.cold(thread, edge, first), None);
-        assert_eq!(presence.cold(thread, UnixMs(edge.0 + 1), first), Some(10));
-        assert_eq!(presence.cold(thread, UnixMs(edge.0 + 183_000), first), None);
-
-        let opened = UnixMs(edge.0 + 200_000);
-        presence.warm(thread, opened).open += 2;
-        let leaves = UnixMs(opened.0 + 1_200_000);
-        presence.warm(thread, leaves).open -= 1;
-        assert_eq!(
-            presence.cold(thread, leaves + COLD_AFTER + Duration::from_secs(10), first),
-            None
-        );
-        assert_eq!(presence.cold(elsewhere, leaves, first), Some(33));
-        let last_left = UnixMs(leaves.0 + 700_000);
-        presence.warm(thread, last_left).open -= 1;
-        assert_eq!(presence.cold(thread, last_left + COLD_AFTER, first), None);
-        assert_eq!(
-            presence.cold(
-                thread,
-                last_left + COLD_AFTER + Duration::from_millis(1),
-                first
-            ),
-            Some(10)
-        );
     }
 }

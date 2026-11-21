@@ -1,4 +1,4 @@
-//! The mail protocol ([`rho_rpc::protocol::Protocol::Mail`]): a host's log
+//! The chat protocol ([`rho_rpc::protocol::Protocol::Chat`]): a host's log
 //! as it grows, and what the user says in it.
 //!
 //! The session ([`Open::Session`]) carries the log from where the client
@@ -20,7 +20,7 @@ pub enum Open {
 }
 
 impl rho_rpc::protocol::ProtocolOpen for Open {
-    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Mail;
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Chat;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -156,9 +156,6 @@ pub enum ClientFrame {
     /// After [`ServerFrame::Hello`]: the newest event this client holds
     /// (zero for none). The host sends every later one, then each new one.
     Follow { since: ChatSeq },
-    /// The one thread currently open on this session; `None` on leaving it.
-    /// Closing the session also removes its open thread.
-    View { thread: Option<MessageId> },
 }
 
 /// What a host says on its session.
@@ -170,7 +167,7 @@ pub enum ServerFrame {
     Hello { head: ChatSeq, host: EndpointId },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
-    Mail { records: Vec<ChatRecord> },
+    Messages { records: Vec<ChatRecord> },
     /// What the agents of each thread do now, as a full replacement; an
     /// omitted thread has no agent at work. This is not part of the mail
     /// log and carries no cursor.
@@ -204,10 +201,6 @@ mod tests {
     fn frames_and_requests_round_trip() {
         let agent = AgentId::from_counter(3, &AgentIdDomain(7)).unwrap();
         round_trips(ClientFrame::Follow { since: ChatSeq(9) });
-        round_trips(ClientFrame::View {
-            thread: Some(MessageId(ChatSeq(4))),
-        });
-        round_trips(ClientFrame::View { thread: None });
         let project = ProjectId(MessageId(ChatSeq(2)));
         let config = ProjectConfig {
             place: rho_agent_types::ProjectPlace::parse("git@github.com:owner/reef").unwrap(),
@@ -266,12 +259,13 @@ mod tests {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
         });
-        round_trips(ServerFrame::Mail {
+        round_trips(ServerFrame::Messages {
             records: vec![
                 ChatRecord {
                     seq: ChatSeq(4),
                     at: UnixMs(5),
                     event: ChatEvent::Posted {
+                        kind: rho_agent_types::MessageKind::Kept,
                         parent: Some(MessageId(ChatSeq(2))),
                         reply_to: None,
                         from: Address::Agent(agent),
@@ -289,7 +283,7 @@ mod tests {
                 },
             ],
         });
-        round_trips(ServerFrame::Mail {
+        round_trips(ServerFrame::Messages {
             records: vec![
                 ChatRecord {
                     seq: ChatSeq(8),
@@ -324,6 +318,7 @@ mod tests {
                     seq: ChatSeq(11),
                     at: UnixMs(29),
                     event: ChatEvent::Posted {
+                        kind: rho_agent_types::MessageKind::Kept,
                         parent: Some(MessageId(ChatSeq(7))),
                         reply_to: None,
                         from: Address::System {

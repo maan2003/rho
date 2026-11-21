@@ -416,6 +416,7 @@ mod tests {
             seq: ChatSeq(seq),
             at: UnixMs(seq),
             event: ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
                 reply_to: None,
                 from: Address::User,

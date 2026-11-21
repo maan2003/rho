@@ -74,7 +74,6 @@ where
         feed,
         follow_rx,
     ));
-    let mut view = services.pool.mail_view();
     let result = loop {
         let frame =
             match rho_rpc::protocol::read_frame_optional::<_, ClientFrame>(&mut reader).await {
@@ -86,7 +85,6 @@ where
             ClientFrame::Follow { since } => {
                 let _ = follow_tx.send(since);
             }
-            ClientFrame::View { thread } => view.set(thread),
         }
     };
     follower.abort();
@@ -179,7 +177,7 @@ async fn send_from(
             return true;
         };
         *sent = last.seq;
-        if outgoing_tx.send(ServerFrame::Mail { records }).is_err() {
+        if outgoing_tx.send(ServerFrame::Messages { records }).is_err() {
             return false;
         }
         // Catching up must never starve the connection's own traffic.

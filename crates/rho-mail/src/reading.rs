@@ -116,6 +116,7 @@ mod tests {
             seq: id(n).0,
             at,
             event: ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent: (n != 1).then_some(id(1)),
                 from,
                 reply_to: None,

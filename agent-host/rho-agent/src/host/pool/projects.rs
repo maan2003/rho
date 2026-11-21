@@ -342,7 +342,6 @@ impl AgentPool {
             write.commit();
             message
         };
-        self.user_visited(message);
         self.consider_naming(message);
 
         if let Some(agent) = standing {

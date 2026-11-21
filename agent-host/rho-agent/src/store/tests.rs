@@ -926,6 +926,143 @@ async fn live_project_mail_tracks_each_writer_until_the_next_user_post() {
 }
 
 #[tokio::test]
+async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_thread() {
+    use rho_agent_types::{FLASH_LIFETIME, MessageKind};
+    let (_dir, db) = db().await;
+    let (a, b) = (agent(1), agent(2));
+    let mut write = db.write().await;
+    let posted = UnixMs(3_000);
+    let deadline = posted + FLASH_LIFETIME;
+    let root = write
+        .post(UnixMs(1), None, said(Address::User, "Atlas"), None)
+        .unwrap();
+    let thread = write
+        .post(
+            UnixMs(2),
+            Some(root),
+            said(Address::User, "Fix the clock"),
+            None,
+        )
+        .unwrap();
+    let elsewhere = write
+        .post(
+            UnixMs(3),
+            Some(root),
+            said(Address::User, "Fix the printer"),
+            None,
+        )
+        .unwrap();
+    write.join(UnixMs(4), thread, b).unwrap();
+
+    assert!(
+        write
+            .post_flash(posted, root, a, said(Address::Agent(a), "progress").content)
+            .is_err()
+    );
+    let first = write
+        .post_flash(
+            posted,
+            thread,
+            a,
+            said(Address::Agent(a), "trying monotonic").content,
+        )
+        .unwrap();
+    assert_eq!(write.live_project_mail(thread, a), None);
+    let second = write
+        .post_flash(
+            UnixMs(posted.0 + 180_000),
+            thread,
+            b,
+            said(Address::Agent(b), "testing now").content,
+        )
+        .unwrap();
+    let edited_at = UnixMs(deadline.0 - 1);
+    let edited = said(Address::Agent(a), "trying the overflow case").content;
+    assert!(
+        write
+            .edit(edited_at, a, first, edited.clone(), Some(true))
+            .is_err(),
+        "a flash cannot ping"
+    );
+    write.edit(edited_at, a, first, edited, None).unwrap();
+    assert!(!write.expire_flash(edited_at, first));
+    write.commit();
+    let read = db.read();
+    let decoded = read.message(first).unwrap();
+    assert_eq!(decoded.kind, MessageKind::Flash);
+    assert_eq!(decoded.at, posted);
+    assert_eq!(decoded.version().1, edited_at);
+    assert_eq!(decoded.flash_deadline(), Some(deadline));
+    assert!(!decoded.pings_user());
+    assert!(
+        read.inbox(b, ChatSeq::ZERO)
+            .iter()
+            .all(|item| item.id != first),
+        "a flash never reaches agents"
+    );
+    assert_eq!(
+        read.flash_deadlines().first(),
+        Some(&(first, deadline)),
+        "restart restores the original deadline"
+    );
+    drop(read);
+
+    let mut write = db.write().await;
+    assert!(
+        write.expire_flash(deadline, first),
+        "a newer flash from another writer qualifies"
+    );
+    let later = deadline + FLASH_LIFETIME;
+    write
+        .post(
+            later,
+            Some(elsewhere),
+            said(Address::User, "Not that printer"),
+            None,
+        )
+        .unwrap();
+    assert!(
+        !write.expire_flash(later, second),
+        "an item in another thread doesn't qualify"
+    );
+    let third = write
+        .post(
+            UnixMs(later.0 + 1),
+            Some(thread),
+            NewMessage {
+                reply_to: Some(second),
+                ..said(Address::User, "Try a second clock")
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        write.mail_writer(second),
+        Some(b),
+        "a reply can still identify the writer"
+    );
+    assert!(
+        !write.expire_flash(later, second),
+        "the post emits one tombstone, not two"
+    );
+    write.commit();
+
+    let read = db.read();
+    assert!(read.flash_deadlines().is_empty());
+    assert_eq!(read.message(first).unwrap().revision, Revision::Deleted);
+    assert_eq!(read.message(second).unwrap().revision, Revision::Deleted);
+    assert_eq!(read.message(third).unwrap().text(), "Try a second clock");
+    let rows = read.mail_since(ChatSeq(third.0.0 - 1), 4);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].event, ChatEvent::Deleted { message: second });
+    assert!(
+        read.search_mail("testing now", Some(root), 8)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
     let (_dir, db) = db().await;
     let mut write = db.write().await;
