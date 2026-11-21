@@ -21,7 +21,7 @@ does:
 - deal `space`: open the first waiting card
 - open a row `enter` or one tap: open the selected card or thread; the waiting overflow opens the first hidden card
 - write an idea `i` on any row: open the idea draft, as `mail.Write an idea`
-- narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name; a project has no screen of its own
+- narrow: show only one `mail.Project`'s waiting and moving rows, chosen by name, with where the project works and its mode in the top line, such as `tide@lab · on tide · one agent`; a project has no screen of its own
 
 ## screen Desk
 answers: what needs the user now, and what has moved?

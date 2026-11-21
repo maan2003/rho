@@ -32,14 +32,20 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-purpose: give each project one address to write to, without asking the user where its agents should work each time.
-principle: the user sends an idea to `tide@lab`; the project starts the work where its agents work and sends its asks and results from that address.
-sees: its name and host as an address, such as `tide@lab`; open, the Desk narrowed to that project.
+status: the built product makes a project from a name alone and asks where its agents work in a menu at the first idea; nothing shows the place, there is no mode, and every idea joins the newest agent's workset.
+purpose: give each project one address to write to, and one answer, asked once, to where and how its agents work.
+principle: the user sends an idea to `tide@lab`; the project starts the work at its place, in its mode, and sends its asks and results from that address.
+sees: its name and host as an address, such as `tide@lab`; where it works and its mode, such as `on tide · one agent`, in the top line of the Desk narrowed to it; open, the Desk narrowed to that project.
 has:
 - many `Thread`
 does:
 - open: narrow `desk.Desk` to the project through `window.Go to something by name`
-- receive an idea: use the place already remembered for the project's agents
+- receive an idea: start the work at the project's place in its mode. `one agent`: the project's agent reads the idea in its new thread, and starts when none runs. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
+- works on…, from the palette on the project: ask `tide@lab works on:` and change where the next idea starts; agents already running stay where they are
+- agents, from the palette on the project, as `agents: one` or `agents: per idea`: change the mode for the next idea; agents already running stay as they are
+rejected:
+- the place read off the project's newest agent · 2026-11-21 · nothing could show it or change it
+- the kind of place deciding the mode, a repository per idea and a directory shared · 2026-11-21 · one standing agent on a repository is useful too
 
 ## concept Thread
 purpose: keep one piece of work and the whole exchange about it together.
@@ -184,9 +190,9 @@ so that: work starts and the user can carry on where they were
 steps:
 1. the user presses the idea key, `i` on a `desk.Desk` row or the idea key elsewhere; a `Draft` fills the window, with a `to:` line already addressed to the project picked from context
 2. the user writes, in the usual modes
-   - if it is for a different project, the user edits the `to:` line with project completion, or `ctrl-t` asks for the project; `to:` never creates a project, and a name with no match offers a `new project …` row that makes the project first
+   - if it is for a different project, the user edits the `to:` line with project completion, or `ctrl-t` asks for the project; a name with no match offers a `new project …` row, which is `Start a project`
 3. the user sends with `ctrl-enter` or `send`; the echo names the idea and the project, and the screen before is back
-system: picks the thread's project, or the last project the user wrote to; starts the work where that project's agents work.
+system: picks the thread's project, or the last project the user wrote to; starts the work at that project's place, in its mode, as `Project.receive an idea`.
 user: the words and, if different from the automatic choice, the project.
 cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; the idea comes while reading a page; the current thread belongs to a different project.
 rejected:
@@ -195,6 +201,35 @@ rejected:
 - a draft tail at the bottom of the Desk · 2026-11-20 · the same draft is one key away, without a line of chrome on the Desk
 - two send keys, one that starts an agent and one that only sends · 2026-11-20 · one wording and one key everywhere; the project decides what the mail starts
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
+
+## flow Start a project
+status: not built. The built product has `new project` on the Desk palette and under `to:`, which make a bare address; the first idea then opens a menu, `where this project's agents work`, with a prompt behind each row and an `on host:` prompt first when several hosts are attached.
+runs: 1 a week
+day: Turn ideas into work.
+when: the user has an idea for work that no project holds yet
+want: name the project and say once where and how its agents work
+so that: the idea starts now, and every later idea to that address starts with no question
+steps:
+1. in an idea, the user writes `to: tide@lab`; a name with no match offers `new project tide@lab`, and `enter` takes it
+2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; a URL or a `git@` address is a repository, a path is a directory on `lab`
+3. `tide@lab agents:` asks for the mode, `one` under the point and `per idea` below it
+4. the idea sends and the work starts, as in `Write an idea`
+   - from the Desk palette, `new project` asks the same three lines and opens the empty project
+system: the host keeps the project's name, place and mode, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
+user: the name, the place, and the mode.
+cases: the host is offline; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves mail`; a second project on the same repository; a project made from the Desk with no idea yet.
+mock:
+```
+to: tide@lab                                        new project tide@lab
+tide@lab works on: git@github.com:maan2003/tide     repository
+tide@lab agents: one                                every idea goes to the same agent
+                 per idea                           each idea gets a fresh agent in its own workset
+```
+rejected:
+- a menu `where this project's agents work` with two rows and a prompt behind each · 2026-11-21 · three kinds of UI for one answer, and the place stayed invisible
+- an `on host:` prompt · 2026-11-21 · the address names the host
+- the mode asked only for a repository · 2026-11-21 · several agents in one directory are fine too
+- a second question at the second idea · 2026-11-21 · a surprise later costs more than one more line now
 
 The historical review above was of Start a thread. Starting an agent from a mail was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
