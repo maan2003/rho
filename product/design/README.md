@@ -181,7 +181,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
-- In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
+- In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent mail, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
 - The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 

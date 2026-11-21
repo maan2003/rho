@@ -93,7 +93,7 @@ form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Mail` for
 
 ## part Mail
 purpose: let the user read an exchange and know who said what, with nothing between the mails but a blank line.
-looks: the words in `editor text` on the `reading surface`; the user's own mail in `marked`, the project's in `reading text`; one blank line between mails; a `quiet` name line above a mail from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`; a `## recap` section in `recap`.
+looks: the words in `editor text` on the `reading surface`; the user's own mail in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's mail in `reading text` with no bar; one blank line between mails; a `quiet` name line above a mail from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`; a `## recap` section in `recap`.
 states:
 - recap anchor: the heading and recap are drawn in `recap`, before the body of the mail.
 - other mail: the recap section is not drawn.
