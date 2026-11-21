@@ -8,6 +8,8 @@
 //! and the rows for `find`.
 
 mod projects;
+#[cfg(test)]
+mod search_bench;
 mod thread;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -29,7 +31,7 @@ use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{
     AnySurface, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint, System,
-    TextKind, TextQuery,
+    TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
@@ -106,7 +108,7 @@ pub struct MailSystem {
     known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
-    drafts: HashMap<(EndpointId, Option<MessageId>), String>,
+    drafts: TextIndex<(EndpointId, Option<MessageId>)>,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
@@ -136,6 +138,10 @@ impl MailSystem {
             }
             logs.insert(*seed, chat);
         }
+        let mut drafts = TextIndex::default();
+        for (seed, parent, text) in loaded.drafts {
+            drafts.update((seed, parent), text, 0);
+        }
         let (events, mut incoming) = unbounded::<MailEvent>();
         let pump = cx.spawn(async move |this, cx| {
             while let Some(event) = incoming.next().await {
@@ -156,11 +162,7 @@ impl MailSystem {
             legacy_places,
             known_places: Rc::new(|_, _| Vec::new()),
             last_project: loaded.last_project,
-            drafts: loaded
-                .drafts
-                .into_iter()
-                .map(|(seed, parent, text)| ((seed, parent), text))
-                .collect(),
+            drafts,
             cache,
             view: None,
             hosts: HashMap::new(),
@@ -317,12 +319,16 @@ impl MailSystem {
         hosts
     }
 
-    pub fn host_name(&self, endpoint: EndpointId) -> String {
+    fn attached_alias(&self, endpoint: EndpointId) -> Option<&str> {
         self.hosts
             .values()
             .find(|slot| slot.endpoint == Some(endpoint))
-            .map(|slot| slot.name.clone())
-            .unwrap_or_else(|| format!("{endpoint}"))
+            .map(|slot| slot.name.as_str())
+    }
+
+    pub fn host_name(&self, endpoint: EndpointId) -> String {
+        self.attached_alias(endpoint)
+            .map_or_else(|| endpoint.to_string(), str::to_owned)
     }
 
     fn project_of(&self, thread: ThreadId) -> String {
@@ -334,17 +340,16 @@ impl MailSystem {
     }
 
     pub fn draft(&self, endpoint: EndpointId, parent: Option<MessageId>) -> &str {
-        self.drafts
-            .get(&(endpoint, parent))
-            .map_or("", String::as_str)
+        self.drafts.body(&(endpoint, parent)).unwrap_or("")
     }
 
     pub fn set_draft(&mut self, endpoint: EndpointId, parent: Option<MessageId>, text: String) {
         self.cache.write_draft(endpoint, parent, text.clone());
-        match text.is_empty() {
-            true => self.drafts.remove(&(endpoint, parent)),
-            false => self.drafts.insert((endpoint, parent), text),
-        };
+        if text.is_empty() {
+            self.drafts.remove(&(endpoint, parent));
+        } else {
+            self.drafts.update((endpoint, parent), text, 0);
+        }
     }
 
     /// What the user wrote under `parent` that the host has not logged.
@@ -991,78 +996,88 @@ impl System for MailSystem {
         (mail.sent)(name, cx);
     }
 
-    fn find_text(
-        &self,
-        query: &TextQuery<'_>,
-        current: &Address,
-        _marks: &Marks,
-        _cx: &App,
-    ) -> Vec<FoundText> {
-        if !query.includes(TextKind::Mail) {
-            return Vec::new();
+    fn text_sources(&self, search: &mut TextSearch, current: &Address, _cx: &App) {
+        if !search.includes(TextKind::Mail) {
+            return;
         }
-        let mut results = Vec::new();
-        if let Some(thread) = self.thread_of(current)
-            && let Some((row, line)) =
-                query.matching_line(self.draft(thread.host, Some(thread.message)))
-        {
-            results.push(FoundText {
-                address: current.clone(),
-                title: "Draft".into(),
-                line: line.to_owned(),
-                point: SearchPoint::Draft(row),
-                time: 0,
+        if let Some(thread) = self.thread_of(current) {
+            search.add_draft(
+                &self.drafts,
+                &(thread.host, Some(thread.message)),
+                current.clone(),
+            );
+        }
+        for (host, _) in self.hosts() {
+            search.add(self.logs[&host].text.clone(), move |message| {
+                TextTarget::Mail { host, message }
             });
         }
-        for (host, alias) in self.hosts() {
-            let Some(chat) = self.logs.get(&host) else {
-                continue;
-            };
-            for mail in chat.messages() {
-                if chat.is_project(mail.id)
-                    || mail.revision == rho_agent_types::Revision::Deleted
-                    || chat.agent_only(mail.id)
-                    || chat.agent_only(chat.root_of(mail.id))
-                {
-                    continue;
+    }
+
+    fn text_presenter(&self, _cx: &App) -> Option<TextPresenter<'_>> {
+        let mut hosts = HashMap::new();
+        let mut threads = HashMap::new();
+        let mut projects = HashMap::new();
+        Some(Box::new(move |hit| {
+            let id = match &hit.target {
+                TextTarget::Draft(address) => {
+                    let id = self.thread_of(address)?;
+                    return hit
+                        .is_from(&self.drafts, &(id.host, Some(id.message)))
+                        .then(|| FoundText {
+                            address: address.clone(),
+                            title: "Draft".into(),
+                            line: hit.line().to_owned(),
+                            point: SearchPoint::Draft(hit.row),
+                        });
                 }
-                let words = crate::reading::body(&mail.content);
-                let Some((row, line)) = query.matching_line(&words) else {
-                    continue;
-                };
-                let thread = mail
-                    .parent
-                    .filter(|parent| !chat.is_project(*parent))
-                    .unwrap_or(mail.id);
-                let id = ThreadId {
-                    host,
-                    message: thread,
-                };
-                let Some(subject) = chat.name(chat.thread_of(thread)) else {
-                    continue;
-                };
-                let project = cards::context(chat, thread, &alias);
-                results.push(FoundText {
-                    address: id.address(),
-                    title: if project.is_empty() {
+                &TextTarget::Mail { host, message } => ThreadId { host, message },
+                TextTarget::Note(_) => return None,
+            };
+            let chat = self.logs.get(&id.host)?;
+            if !hit.is_from(&chat.text, &id.message) {
+                return None;
+            }
+            let (host_key, host_alias) = hosts.entry(id.host).or_insert_with(|| {
+                let key = id.host.to_string();
+                let alias = self.attached_alias(id.host).unwrap_or(&key).to_owned();
+                (key, alias)
+            });
+            let address = |id| Address::new(ThreadId::KIND, ThreadId::key_under(host_key, id));
+            let thread = chat.subthread_of(id.message);
+            let thread_id = ThreadId {
+                message: thread,
+                ..id
+            };
+            let (owner, title) = match threads.entry(thread_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let subject = chat.name(chat.thread_of(thread))?;
+                    let root = chat.root_of(thread);
+                    let project = projects
+                        .entry(ThreadId {
+                            message: root,
+                            ..id
+                        })
+                        .or_insert_with(|| cards::context_at_root(chat, root, host_alias));
+                    let title = if project.is_empty() {
                         format!("Mail · {subject}")
                     } else {
                         format!("Mail · {subject} · {project}")
-                    },
-                    line: line.to_owned(),
-                    point: SearchPoint::Mail {
-                        message: ThreadId {
-                            host,
-                            message: mail.id,
-                        }
-                        .address(),
-                        line: row,
-                    },
-                    time: mail.version().1.0,
-                });
-            }
-        }
-        results
+                    };
+                    entry.insert((address(thread), title))
+                }
+            };
+            Some(FoundText {
+                address: owner.clone(),
+                title: title.clone(),
+                line: hit.line().to_owned(),
+                point: SearchPoint::Mail {
+                    message: address(id.message),
+                    line: hit.row,
+                },
+            })
+        }))
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
@@ -1087,14 +1102,21 @@ impl System for MailSystem {
                 };
                 let project = cards::context(chat, id, &alias);
                 let is_project = chat.is_project(id);
+                let (thread, recency) = if is_project {
+                    (None, 0)
+                } else {
+                    let (words, latest) = chat.thread_activity(id);
+                    (
+                        Some(FoundThread { status: words }),
+                        latest.map_or(0, |at| at.0),
+                    )
+                };
                 found.push(Found {
                     address: ThreadId { host, message: id }.address(),
                     title: if is_project { project.clone() } else { subject },
                     description: if is_project { String::new() } else { project },
-                    thread: (!is_project).then(|| FoundThread {
-                        status: chat.latest_words(id).map(|(words, _)| words),
-                    }),
-                    recency: chat.newest_in(id).map_or(mail.at.0, |(_, at)| at.0),
+                    thread,
+                    recency,
                 });
             }
         }

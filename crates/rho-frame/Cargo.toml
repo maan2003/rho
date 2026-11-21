@@ -23,6 +23,8 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 ] }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 jiff.workspace = true
+memchr = "2"
+sum_tree = { path = "../../vendor/zed/crates/sum_tree" }
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 redb.workspace = true
@@ -48,6 +50,7 @@ vim = { path = "../../vendor/zed/crates/vim", default-features = false, features
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
 [dev-dependencies]
+criterion = "0.8.2"
 assets = { path = "../../vendor/zed/crates/assets" }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",

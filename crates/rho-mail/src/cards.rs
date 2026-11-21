@@ -196,7 +196,11 @@ pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
 
 /// Where a thread is: the address of the project above it.
 pub(crate) fn context(chat: &HostMail, thread: MessageId, host_name: &str) -> String {
-    chat.project(chat.root_of(thread)).map_or_else(
+    context_at_root(chat, chat.root_of(thread), host_name)
+}
+
+pub(crate) fn context_at_root(chat: &HostMail, root: MessageId, host_name: &str) -> String {
+    chat.project(root).map_or_else(
         || host_name.to_owned(),
         |project| project.address(host_name),
     )

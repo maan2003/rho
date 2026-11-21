@@ -370,36 +370,73 @@ impl Message {
     /// What the thread under this message is called when nothing named it:
     /// its first line.
     pub fn headline(&self) -> String {
-        one_line(&self.text())
+        // A thread's name only needs its first nonempty line. Do not
+        // concatenate (or even walk) the rest of a long mail to name it.
+        first_line(text_parts(&self.content).flat_map(str::lines))
     }
+}
+
+fn text_parts(content: &[ContentPart]) -> impl Iterator<Item = &str> {
+    content.iter().filter_map(|part| match part {
+        ContentPart::Text { text } => Some(text.as_str()),
+        ContentPart::Image { .. } => None,
+    })
 }
 
 /// The text of a message's parts, joined.
 pub fn content_text(content: &[ContentPart]) -> String {
-    content
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    text_parts(content).collect::<Vec<_>>().join("\n")
 }
 
 /// The first line, whitespace folded: the words a person remembers.
 pub fn one_line(text: &str) -> String {
-    text.lines()
+    first_line(text.lines())
+}
+
+fn first_line<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut words = lines
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .split_whitespace();
+    let mut first = words.next().unwrap_or_default().to_owned();
+    for word in words {
+        first.push(' ');
+        first.push_str(word);
+    }
+    first
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headline_takes_the_first_nonempty_line_across_parts() {
+        let message = Message {
+            id: MessageId(ChatSeq(1)),
+            at: UnixMs(1),
+            parent: None,
+            reply_to: None,
+            from: Address::User,
+            mentions: Vec::new(),
+            content: vec![
+                ContentPart::Text {
+                    text: "\n \t\r".into(),
+                },
+                ContentPart::Text {
+                    text: "\n  Réparer\t l’horloge\r\nfollow-ups".into(),
+                },
+                ContentPart::Text {
+                    text: "unrelated later part".into(),
+                },
+            ],
+            ping_started: None,
+            revision: Revision::Original,
+        };
+        assert_eq!(message.headline(), "Réparer l’horloge");
+        assert_eq!(message.headline(), one_line(&message.text()));
+    }
 
     #[test]
     fn a_post_written_before_reply_addresses_still_decodes() {

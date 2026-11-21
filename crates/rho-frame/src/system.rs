@@ -23,6 +23,7 @@ use crate::frame::Point;
 use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
 use crate::surface::AnySurface;
+use crate::text_search::{TextHit, TextSearch};
 
 /// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,56 +52,15 @@ pub enum SearchPoint {
     Draft(u32),
 }
 
-/// A matching line from a place's contents; searched on demand where those
-/// words already live, rather than copied into another catalogue.
+/// The displayed words of a shortlisted text hit and its place.
 pub struct FoundText {
     pub address: Address,
     pub title: String,
     pub line: String,
     pub point: SearchPoint,
-    pub time: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TextKind {
-    Mail,
-    Note,
-}
-
-pub struct TextQuery<'a> {
-    pub kind: Option<TextKind>,
-    pub terms: Vec<&'a str>,
-}
-
-impl<'a> TextQuery<'a> {
-    pub fn parse(query: &'a str) -> Self {
-        let (kind, text) = if let Some(text) = query.strip_prefix("mail:") {
-            (Some(TextKind::Mail), text)
-        } else if let Some(text) = query.strip_prefix("note:") {
-            (Some(TextKind::Note), text)
-        } else {
-            (None, query)
-        };
-        Self {
-            kind,
-            terms: text.split_whitespace().collect(),
-        }
-    }
-
-    pub fn includes(&self, kind: TextKind) -> bool {
-        !self.terms.is_empty() && self.kind.is_none_or(|only| only == kind)
-    }
-
-    pub fn matching_line<'b>(&self, text: &'b str) -> Option<(u32, &'b str)> {
-        text.lines().enumerate().find_map(|(row, line)| {
-            let folded = line.to_lowercase();
-            if !self.terms.iter().all(|term| folded.contains(term)) {
-                return None;
-            }
-            Some((row.try_into().ok()?, line.trim()))
-        })
-    }
-}
+pub type TextPresenter<'a> = Box<dyn FnMut(&TextHit) -> Option<FoundText> + 'a>;
 
 pub trait System: Sized + 'static {
     /// The address kinds this system opens.
@@ -214,14 +174,10 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
-    fn find_text(
-        &self,
-        _query: &TextQuery<'_>,
-        _current: &Address,
-        _marks: &Marks,
-        _cx: &App,
-    ) -> Vec<FoundText> {
-        Vec::new()
+    fn text_sources(&self, _search: &mut TextSearch, _current: &Address, _cx: &App) {}
+
+    fn text_presenter(&self, _cx: &App) -> Option<TextPresenter<'_>> {
+        None
     }
 
     /// What the user said about these addresses moved, on this device or
@@ -271,13 +227,8 @@ trait SystemHandle {
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
-    fn find_text(
-        &self,
-        query: &TextQuery<'_>,
-        current: &Address,
-        marks: &Marks,
-        cx: &App,
-    ) -> Vec<FoundText>;
+    fn text_sources(&self, search: &mut TextSearch, current: &Address, cx: &App);
+    fn text_presenter<'a>(&'a self, cx: &'a App) -> Option<TextPresenter<'a>>;
 }
 
 impl<S: System> SystemHandle for Entity<S> {
@@ -374,14 +325,12 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).find(marks, cx)
     }
 
-    fn find_text(
-        &self,
-        query: &TextQuery<'_>,
-        current: &Address,
-        marks: &Marks,
-        cx: &App,
-    ) -> Vec<FoundText> {
-        self.read(cx).find_text(query, current, marks, cx)
+    fn text_sources(&self, search: &mut TextSearch, current: &Address, cx: &App) {
+        self.read(cx).text_sources(search, current, cx);
+    }
+
+    fn text_presenter<'a>(&'a self, cx: &'a App) -> Option<TextPresenter<'a>> {
+        self.read(cx).text_presenter(cx)
     }
 
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {
@@ -492,14 +441,12 @@ impl AnySystem {
         self.0.find(marks, cx)
     }
 
-    pub(crate) fn find_text(
-        &self,
-        query: &TextQuery<'_>,
-        current: &Address,
-        marks: &Marks,
-        cx: &App,
-    ) -> Vec<FoundText> {
-        self.0.find_text(query, current, marks, cx)
+    pub(crate) fn text_sources(&self, search: &mut TextSearch, current: &Address, cx: &App) {
+        self.0.text_sources(search, current, cx);
+    }
+
+    pub(crate) fn text_presenter<'a>(&'a self, cx: &'a App) -> Option<TextPresenter<'a>> {
+        self.0.text_presenter(cx)
     }
 
     pub fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App) {

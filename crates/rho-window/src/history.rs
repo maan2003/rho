@@ -47,6 +47,14 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Visit order breaks ties when several keys land in the same millisecond.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Visit {
+    pub order: u64,
+    pub wall_ms: Option<u64>,
+}
 
 struct Entry<K, S> {
     key: K,
@@ -59,7 +67,7 @@ struct Entry<K, S> {
     /// comparing two entries' `order` says which side of the cursor an
     /// entry is on without walking to find out.
     order: u64,
-    visited: u64,
+    visited: Visit,
 }
 
 /// The reader's history: one list across every context, with a cursor.
@@ -97,7 +105,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
                 prev: None,
                 next: None,
                 order: 0,
-                visited: 0,
+                visited: Visit::default(),
             })],
             free: Vec::new(),
             newest: 0,
@@ -176,7 +184,7 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             prev: Some(newest),
             next: None,
             order,
-            visited: self.visit,
+            visited: Visit::default(),
         });
         self.entry_mut(newest).next = Some(slot);
         self.newest = slot;
@@ -288,13 +296,36 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
             .filter(|slot| *slot != self.cursor)
             .map(|slot| self.entry(slot))
             .collect();
-        visited.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.visited));
+        visited.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.visited.order));
         visited.into_iter().map(|entry| &entry.key).collect()
+    }
+
+    pub fn visit(&self, key: &K) -> Option<Visit> {
+        Some(self.entry(*self.live.get(key)?).visited)
+    }
+
+    /// Restores visit information after reconstructing the navigation stack.
+    /// A legacy entry has known stack order but no wall-clock time.
+    pub fn restore_visits(&mut self, visits: impl IntoIterator<Item = (K, Visit)>) {
+        self.visit = 0;
+        for (key, visit) in visits {
+            if let Some(&slot) = self.live.get(&key) {
+                self.entry_mut(slot).visited = visit;
+                self.visit = self.visit.max(visit.order);
+            }
+        }
     }
 
     fn note_visit(&mut self) {
         self.visit += 1;
-        self.entry_mut(self.cursor).visited = self.visit;
+        let wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        self.entry_mut(self.cursor).visited = Visit {
+            order: self.visit,
+            wall_ms,
+        };
     }
 
     /// Move the cursor to a neighbour, taking the entry it was on out of

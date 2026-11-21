@@ -67,7 +67,6 @@ pub struct Frame {
     pub(crate) desk: Entity<DeskView>,
     pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
-    last_palette_query: Option<String>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
@@ -177,7 +176,6 @@ impl Frame {
             desk,
             idea,
             minibuffer: None,
-            last_palette_query: None,
             menu: None,
             menu_focus: cx.focus_handle(),
             overlay_return: None,
@@ -859,6 +857,10 @@ impl Frame {
             .into_iter()
             .map(|found| palette::Place {
                 visit: visits.get(&found.address).copied(),
+                visited_ms: self
+                    .history
+                    .visit(&found.address)
+                    .and_then(|visit| visit.wall_ms),
                 current: self.current_address() == &found.address,
                 shortcut: if found.address == desk_address {
                     desk_key.clone()
@@ -874,17 +876,45 @@ impl Frame {
         self.open_minibuffer(":", Answer::palette(listing), None, window, cx);
     }
 
-    pub(crate) fn find_text(
+    pub(crate) fn text_search(&self, query: String, limit: usize, cx: &App) -> crate::TextSearch {
+        let mut search = crate::TextSearch::new(query, limit);
+        if limit != 0 {
+            for system in &self.systems {
+                system.text_sources(&mut search, self.current_address(), cx);
+            }
+        }
+        search
+    }
+
+    pub(crate) fn describe_palette_text(
         &self,
-        query: &crate::TextQuery<'_>,
+        hits: Vec<crate::TextHit>,
         cx: &App,
-    ) -> Vec<crate::FoundText> {
-        self.systems
+    ) -> Vec<(crate::FoundText, Vec<std::ops::Range<usize>>)> {
+        let mut presenters: Vec<_> = self
+            .systems
             .iter()
-            .flat_map(|system| {
-                system.find_text(query, self.current_address(), &self.attention.marks, cx)
+            .filter_map(|system| system.text_presenter(cx))
+            .collect();
+        hits.into_iter()
+            .filter_map(|hit| {
+                let row = presenters.iter_mut().find_map(|describe| describe(&hit))?;
+                Some((row, hit.marks))
             })
             .collect()
+    }
+
+    pub(crate) fn finish_palette_search(
+        &mut self,
+        input: &str,
+        hits: Vec<crate::TextHit>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut prompt) = self.minibuffer.take() {
+            prompt.finish_text(self, input, hits, cx);
+            self.minibuffer = Some(prompt);
+            cx.notify();
+        }
     }
 
     pub(crate) fn open_text_match(
@@ -1187,13 +1217,9 @@ impl Frame {
             return;
         }
         let minibuffer = self.minibuffer.take().expect("the prompt is open");
-        let is_palette = minibuffer.is_palette();
         let prompt = minibuffer.prompt().to_owned();
         let secret = minibuffer.is_secret();
         let (input, submission) = minibuffer.into_submission(cx);
-        if is_palette && !input.trim().is_empty() {
-            self.last_palette_query = Some(input.clone());
-        }
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
             input: match secret {
@@ -1210,12 +1236,6 @@ impl Frame {
         let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
-        if minibuffer.is_palette() {
-            let input = minibuffer.input(cx);
-            if !input.trim().is_empty() {
-                self.last_palette_query = Some(input);
-            }
-        }
         rho_journal::record(rho_journal::Event::MinibufferCancelled {
             prompt: minibuffer.prompt().to_owned(),
             input: match minibuffer.is_secret() {
@@ -1236,20 +1256,6 @@ impl Frame {
             minibuffer.select_by_delta(delta);
             cx.notify();
         }
-    }
-
-    fn minibuffer_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.minibuffer.as_mut() else {
-            return;
-        };
-        if prompt.is_palette() {
-            if let Some(query) = self.last_palette_query.clone() {
-                prompt.set_input(query, window, cx);
-            }
-        } else {
-            prompt.select_by_delta(-1);
-        }
-        cx.notify();
     }
 
     fn minibuffer_complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1668,9 +1674,6 @@ impl Render for Frame {
             )
             .on_action(cx.listener(|this, _: &keys::MinibufferPrevious, _, cx| {
                 this.minibuffer_select(-1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &keys::MinibufferUp, window, cx| {
-                this.minibuffer_up(window, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
