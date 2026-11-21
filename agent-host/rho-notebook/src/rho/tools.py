@@ -96,14 +96,17 @@ class Mail:
     def __init__(self, agent: str):
         self._agent = agent
 
-    def send(self, to, text, *, thread=None, reply_to=None, ping=True):
+    def send(self, to, text, *, thread=None, reply_to=None, ping=None, replace_last: bool = False):
         """Send to a local project, #thread, agent handle, or "user".
         With reply_to=#id, you can pass None to address the writer.
-        Mail to "user" needs a thread or reply_to; it pings the user unless
-        ping=False. Since the user's last mail in a thread, send once
-        and use mail.edit(id, text) for updates.
+        Mail to "user" needs a thread or reply_to. New mail pings by default.
+        Set replace_last=True to update your live mail in the thread, or
+        send if you have none. An update keeps its ping unless you set ping.
         """
-        message = rho_mail.send(self._agent, to, text, thread=thread, reply_to=reply_to, ping=ping)
+        message = rho_mail.send(
+            self._agent, to, text, thread=thread, reply_to=reply_to,
+            ping=ping, replace_last=replace_last,
+        )
         if to != rho_mail.USER:
             print(f"Sent mail #{message}.")
         return message

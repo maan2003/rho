@@ -34,7 +34,8 @@ class Templates(unittest.TestCase):
                 "check the thread with `mail.read`",
                 "send with `ping=False` and edit that mail as the work moves",
                 "`mail.edit(id, text, ping=True)` makes it wait for the user",
-                "do not edit mail the user answered",
+                "an answered mail is frozen",
+                "`replace_last=True` edits yours if it exists, or sends a new mail",
                 "a `## recap` section that lets the user answer without reading the history",
             ]:
                 self.assertIn(rule, text)
@@ -80,7 +81,7 @@ class Templates(unittest.TestCase):
                        "loads applicable AGENTS.md guidance and the skill catalogue",
                        "Without an explicit request, do NOT consult the Advisor for:"]:
             self.assertIn(needle, collaboration)
-        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, ping=True) → int', text)
+        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, ping=None, replace_last=False) → int', text)
         self.assertNotIn('mail.status', text)
         self.assertNotIn("Post passing progress", text)
         self.assertIn("(ASD-STE100). The send refuses a sentence of more than 25 words", text)
@@ -268,7 +269,7 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
-            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, ping=True)", text)
+            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, ping=None, replace_last=False)", text)
         note = (f"Engineer eng-{direct.id} started you for the user; ask it with mail.send('eng-{direct.id}', text) if you "
                 "need more context. You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))
