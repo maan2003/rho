@@ -13729,7 +13729,7 @@ dependencies = [
  "rho-inference",
  "rho-iroh-auth",
  "rho-ledger-server",
- "rho-mail",
+ "rho-chat",
  "rho-openai-realtime",
  "rho-profiling",
  "rho-rpc",
@@ -13837,7 +13837,7 @@ dependencies = [
  "rho-db",
  "rho-desktop-client",
  "rho-frame",
- "rho-mail",
+ "rho-chat",
  "rho-rpc",
  "rho-shell-view",
  "rho-terminal",
@@ -13969,7 +13969,7 @@ dependencies = [
  "rho-fs-view",
  "rho-inference",
  "rho-ledger",
- "rho-mail",
+ "rho-chat",
  "rho-rpc",
  "rho-rtc",
  "rho-shell-view",
@@ -14254,7 +14254,7 @@ dependencies = [
  "rho-frame",
  "rho-iroh-auth",
  "rho-journal",
- "rho-mail",
+ "rho-chat",
  "rho-notes",
  "rho-profiling",
  "rho-window",
@@ -14405,7 +14405,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-mail"
+name = "rho-chat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -14426,7 +14426,7 @@ dependencies = [
  "rho-db",
  "rho-dealer",
  "rho-frame",
- "rho-mail",
+ "rho-chat",
  "rho-notes",
  "rho-rpc",
  "rho-transcript",

@@ -18,13 +18,13 @@ use rho_frame::{Candidate, Frame, Point, Row};
 use rho_window::style::StyleClass;
 use senax_encoder::{Decode, Encode};
 
-use super::{CreatedProject, MailSystem};
+use super::{ChatSystem, CreatedProject};
 use crate::protocol::{ChangeProject, CreateProject, ImportProject};
 use crate::{AgentRef, ThreadId};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
-impl MailSystem {
+impl ChatSystem {
     pub fn set_known_places(&mut self, places: KnownPlaces) {
         self.known_places = places;
     }
@@ -57,7 +57,7 @@ impl MailSystem {
         let Some(settings) = self.settings.get(&endpoint) else {
             return;
         };
-        let Some(log) = self.host_mail(endpoint) else {
+        let Some(log) = self.host_chat(endpoint) else {
             return;
         };
         let pending: Vec<_> = self
@@ -533,7 +533,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let (window, mail, _db) =
-            super::super::search_bench::fixture(cx, crate::HostMail::default());
+            super::super::search_bench::fixture(cx, crate::HostChat::default());
         let endpoint = EndpointId([3; 32]);
         cx.update(|cx| {
             mail.update(cx, |mail, _| {
@@ -554,7 +554,7 @@ mod tests {
             let result = picked.clone();
             window
                 .update(cx, |frame, window, cx| {
-                    MailSystem::prompt_place(
+                    ChatSystem::prompt_place(
                         &mail,
                         endpoint,
                         "reef@lab",

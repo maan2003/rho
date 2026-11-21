@@ -33,7 +33,7 @@ rho-agent.workspace = true
 rho-agent-hosts.workspace = true
 rho-agent-types.workspace = true
 rho-agents-client.workspace = true
-rho-mail.workspace = true
+rho-chat.workspace = true
 rho-claude.workspace = true
 rho-claude-usage.workspace = true
 rho-db.workspace = true
@@ -73,7 +73,7 @@ uuid.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 jiff.workspace = true
 moq-net.workspace = true
-rho-mail = { workspace = true, features = ["client"] }
+rho-chat = { workspace = true, features = ["client"] }
 rho-dealer.workspace = true
 rho-fake-model.workspace = true
 rho-rpc = { workspace = true, features = ["native-client", "server"] }

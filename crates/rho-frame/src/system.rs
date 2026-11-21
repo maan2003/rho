@@ -46,7 +46,7 @@ pub struct FoundThread {
 /// An exact location in the owning surface, not a separate place.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchPoint {
-    Mail { message: Address, line: u32 },
+    Message { message: Address, line: u32 },
     Line(u32),
     Draft(u32),
 }

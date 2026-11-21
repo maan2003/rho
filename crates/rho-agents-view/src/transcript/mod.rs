@@ -2330,7 +2330,7 @@ mod tests {
     #[test]
     fn mail_lands_on_the_latest_write_or_the_failure_of_its_own_run() {
         use rho_agent_types::{
-            Address, AgentId, ChatSeq, Message, MessageId, Revision, Stop, UnixMs,
+            Address, AgentId, ChatSeq, Message, MessageId, MessageKind, Revision, Stop, UnixMs,
         };
 
         let agent = AgentId::from_counter(15, &rho_agent_types::AgentIdDomain(0)).unwrap();
@@ -2340,6 +2340,8 @@ mod tests {
             at: UnixMs(32),
             parent: None,
             reply_to: None,
+            thread_reply: None,
+            kind: MessageKind::Kept,
             from: Address::Agent(agent),
             mentions: Vec::new(),
             content: Vec::new(),

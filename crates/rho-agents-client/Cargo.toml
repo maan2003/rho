@@ -1,5 +1,5 @@
 # The agents as the client holds them: the fold, the disk copy and the host
-# session. Mail is rho-mail's. Without the `client` feature it is the agents protocol alone, for
+# session. Mail is rho-chat's. Without the `client` feature it is the agents protocol alone, for
 # the host.
 [package]
 edition.workspace = true

@@ -29,7 +29,7 @@ redb.workspace = true
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-agent-types.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
-rho-mail = { workspace = true, features = ["ui"] }
+rho-chat = { workspace = true, features = ["ui"] }
 rho-db.workspace = true
 rho-desktop-client = { workspace = true, features = ["ui"] }
 rho-frame.workspace = true

@@ -17,7 +17,7 @@ Agents and the user talk in mail: each host holds a forest of messages,
 and the thread under a message is every reply below it. A message goes to
 a thread, not to a person, and draws the user only by pinging them.
 Each thread is a node; an agent is never a card. What the mail claims for
-each of its cases is the mail's own, in `rho-mail/src/cards.rs`, tested
+each of its cases is the mail's own, in `rho-chat/src/cards.rs`, tested
 there. The rows below are what the dealer makes of a source shaped like
 it, with a stand-in thread that asks and answers.
 

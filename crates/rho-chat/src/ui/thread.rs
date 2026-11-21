@@ -34,12 +34,12 @@ use rho_transcript::{BlockLine, BlockSpec, Item, Transcript};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
-use super::{Event, MailSystem, Participant, ago};
+use super::{ChatSystem, Event, Participant, ago};
 use crate::reading::body;
-use crate::{AgentRef, HostMail, ThreadId, cards};
+use crate::{AgentRef, HostChat, ThreadId, cards};
 
 actions!(rho_private_reply, [ReplyPrivately, KeepPrivateReply]);
-actions!(rho_mail, [GoToDraft, GoToOldestMail]);
+actions!(rho_chat, [GoToDraft, GoToOldestMessage]);
 
 const PRIVATE_SCREEN: &str = "RhoPrivateReply";
 const PRIVATE_KEY: &str = "alt-r";
@@ -59,7 +59,11 @@ pub(super) fn bind(cx: &mut App) {
         " && !RhoProjectThread && !RhoPrivateReply && vim_operator == none && !showing_completions",
     ) {
         bindings.push(KeyBinding::new("g g", GoToDraft, Some(&context)));
-        bindings.push(KeyBinding::new("shift-g", GoToOldestMail, Some(&context)));
+        bindings.push(KeyBinding::new(
+            "shift-g",
+            GoToOldestMessage,
+            Some(&context),
+        ));
     }
     cx.bind_keys(bindings);
 }
@@ -237,7 +241,7 @@ enum Follow {
 struct UserMailGutter;
 
 pub struct ThreadView {
-    system: Entity<MailSystem>,
+    system: Entity<ChatSystem>,
     thread: ThreadId,
     transcript: Transcript<Key, Class, Meta, UserMailGutter>,
     layout: Layout,
@@ -266,8 +270,8 @@ struct Expanded {
 
 /// New project posts count even when a sync batch ends with the user's
 /// mail. A revision counts only if it is on the newest visible mail.
-fn latest_project_activity(system: &MailSystem, thread: ThreadId) -> Option<ChatSeq> {
-    let chat = system.host_mail(thread.host)?;
+fn latest_project_activity(system: &ChatSystem, thread: ThreadId) -> Option<ChatSeq> {
+    let chat = system.host_chat(thread.host)?;
     let mut newest = None;
     let mut project_post = None;
     for mail in chat
@@ -298,8 +302,8 @@ impl ThreadView {
     /// holds it. The system is leased by the caller, so it is read here
     /// directly and never through its entity.
     pub fn new(
-        system: &MailSystem,
-        entity: Entity<MailSystem>,
+        system: &ChatSystem,
+        entity: Entity<ChatSystem>,
         thread: ThreadId,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -416,7 +420,7 @@ impl ThreadView {
                     }
                 } else if matches!(event, EditorEvent::EditBlockedByReadOnly) {
                     this.system.read(cx).frame.clone().echo(
-                        "mail cannot be edited · write in the draft",
+                        "this message cannot be edited · write in the draft",
                         StyleClass::SystemInfo,
                         cx,
                     );
@@ -551,7 +555,7 @@ impl ThreadView {
         let system = self.system.read(cx);
         let thread = self.thread.message;
         let now = UnixMs::now().0;
-        let wait = system.host_mail(self.thread.host).and_then(|chat| {
+        let wait = system.host_chat(self.thread.host).and_then(|chat| {
             if self.is_list() {
                 return (!chat.children(Some(thread)).is_empty()).then_some(MINUTE_MS);
             }
@@ -688,8 +692,8 @@ impl ThreadView {
         self.cursor_to_row(start.row, Autoscroll::top().for_anchor(Anchor::Min), cx);
     }
 
-    fn go_to_oldest_mail(&mut self, _: &GoToOldestMail, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(chat) = self.system.read(cx).host_mail(self.thread.host) else {
+    fn go_to_oldest_mail(&mut self, _: &GoToOldestMessage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.system.read(cx).host_chat(self.thread.host) else {
             return;
         };
         let row = chat
@@ -739,7 +743,7 @@ impl ThreadView {
 
 /// The rows of `thread` as `system` holds it.
 fn items(
-    system: &MailSystem,
+    system: &ChatSystem,
     thread: ThreadId,
     list: bool,
     layout: Layout,
@@ -783,7 +787,7 @@ fn gap(key: Key) -> Item<Key, Class, Meta> {
 }
 
 fn history_items(
-    system: &MailSystem,
+    system: &ChatSystem,
     thread: ThreadId,
     list: bool,
     expanded: &Expanded,
@@ -791,10 +795,10 @@ fn history_items(
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     let host = thread.host;
-    let Some(chat) = system.host_mail(host) else {
+    let Some(chat) = system.host_chat(host) else {
         return vec![line(
             Key::Unavailable,
-            "this host's mail is not held here",
+            "this host's messages are not held here",
             Class::Crumb,
         )];
     };
@@ -960,7 +964,7 @@ fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key,
 
 fn private_items(
     marks: &Marks,
-    chat: &HostMail,
+    chat: &HostChat,
     host: EndpointId,
     head: MessageId,
     editing: Option<&PrivateEdit>,
@@ -1028,15 +1032,15 @@ fn private_item(
         .with_blocks(block.into_iter().collect())
 }
 
-fn is_project(system: &MailSystem, thread: ThreadId) -> bool {
+fn is_project(system: &ChatSystem, thread: ThreadId) -> bool {
     system
-        .host_mail(thread.host)
+        .host_chat(thread.host)
         .is_some_and(|chat| chat.is_project(thread.message))
 }
 
 /// The user's messages into `parent` that no host has logged yet.
 fn pending_items(
-    system: &MailSystem,
+    system: &ChatSystem,
     host: EndpointId,
     parent: MessageId,
     newest_first: bool,
@@ -1080,8 +1084,8 @@ fn pending_items(
 /// group newest first. The words are in the thread; the list is for choosing
 /// one. Without `marks` nothing is known to be unread.
 fn thread_rows(
-    system: &MailSystem,
-    chat: &HostMail,
+    system: &ChatSystem,
+    chat: &HostChat,
     host: EndpointId,
     root: MessageId,
     marks: Option<&Marks>,
@@ -1335,7 +1339,7 @@ impl ThreadView {
         }
         let Some(lines) = self.mail_selection(self.selection_range(cx), cx) else {
             self.system.read(cx).frame.clone().echo(
-                "select lines in one mail to quote",
+                "select lines in one message to quote",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -1567,7 +1571,7 @@ impl ThreadView {
         let mail = self
             .system
             .read(cx)
-            .host_mail(self.thread.host)?
+            .host_chat(self.thread.host)?
             .message(id)?;
         let agent = match mail.from {
             Party::Agent(agent) | Party::System { agent, .. } => agent,
@@ -1587,7 +1591,7 @@ impl ThreadView {
         let system = self.system.read(cx);
         let thread = self.thread;
         system
-            .host_mail(thread.host)
+            .host_chat(thread.host)
             .map(|chat| chat.members_under(Some(thread.message)))
             .unwrap_or_default()
             .into_iter()
@@ -1956,7 +1960,7 @@ impl Surface for ThreadView {
             return project;
         }
         let subject = system
-            .host_mail(self.thread.host)
+            .host_chat(self.thread.host)
             .and_then(|chat| chat.name(self.thread.message))
             .unwrap_or_default();
         match subject.is_empty() {
@@ -1972,7 +1976,7 @@ impl Surface for ThreadView {
         cx: &mut Context<Self>,
     ) {
         let row = match point {
-            rho_frame::SearchPoint::Mail { message, line } => {
+            rho_frame::SearchPoint::Message { message, line } => {
                 let Some(mail) = ThreadId::from_address(message) else {
                     return;
                 };
@@ -2088,7 +2092,7 @@ impl Surface for ThreadView {
                 .is_some()
             {
                 let view = this.clone();
-                rows.push(Row::run("", "quote mail line", move |_, window, cx| {
+                rows.push(Row::run("", "quote message line", move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         let row = view.cursor_row(cx);
                         let lines = view
@@ -2381,7 +2385,7 @@ mod tests {
             message: MessageId(ChatSeq(2)),
         };
         let ask = MessageId(ChatSeq(3));
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         for (id, parent, from, words, mentions) in [
             (1, None, Party::User, "Clock", Vec::new()),
             (2, Some(root), Party::User, "Check the clocks.", Vec::new()),
@@ -2555,7 +2559,7 @@ mod tests {
         let mail = cx.update(|cx| {
             let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
             cx.new(|cx| {
-                let mut system = MailSystem::new(db, frame.clone(), notes, cx);
+                let mut system = ChatSystem::new(db, frame.clone(), notes, cx);
                 system.set_participants(Rc::new(move |host, id, _| {
                     (host == thread.host && (id == worker || id == other)).then(|| Participant {
                         label: if id == worker { "worker" } else { "other" }.into(),
@@ -2942,7 +2946,7 @@ mod tests {
 
         window
             .update(cx, |view, window, cx| {
-                view.go_to_oldest_mail(&GoToOldestMail, window, cx);
+                view.go_to_oldest_mail(&GoToOldestMessage, window, cx);
                 assert_eq!(
                     view.line_meta(view.cursor_row(cx), cx).and_then(Meta::mail),
                     Some(MessageId(ChatSeq(2)))

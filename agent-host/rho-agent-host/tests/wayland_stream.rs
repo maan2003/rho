@@ -276,7 +276,7 @@ async fn create_agent(
     if let Some(text) = message {
         rho_rpc::protocol::client::call(
             paths,
-            rho_mail::protocol::Post {
+            rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,
                 settles: None,

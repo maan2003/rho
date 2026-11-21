@@ -1,6 +1,6 @@
 //! The agents protocol
 //! ([ARCH-agent-host](../../../../agent-host/specs/ARCH-agent-host.md)):
-//! worksets and the agent directory. Mail is its own protocol (`rho-mail`).
+//! worksets and the agent directory. Mail is its own protocol (`rho-chat`).
 //!
 //! The session ([`Open::Session`]) carries the directory, the rows of the
 //! worksets a client follows, and the live tails of the agents it looks at.
