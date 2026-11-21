@@ -87,12 +87,12 @@ principle: an agent writes `I plan to drop the cache layer, say no in 20 min` an
 sees: the words in `design.quiet` under the draft, newest first among the thread's messages, with the age at the end of the first line, `12m`; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the project's row, the newest flash's first line as the project's latest words
 does:
 - post, by an agent with `ephemeral=True`: show it in the thread for twenty minutes from its first post, or until the same agent sends a `Message`, whichever is first; then it is gone from every device, not kept as history
-- soft ask, by an agent with `ephemeral=True, ping=True`: deal it as a `deal.Card` that reads `fades · 14m`; when it fades, the card goes with it, answered or not
 - reply: the user's reply is an ordinary `Message` to the writer; it does not keep the flash
 - edit: the agent can change its words; the clock runs from the first post
 rejected:
 - one flash per agent, each replacing the last · 2026-11-21 · they vanish anyway; folding the earlier ones costs nothing and keeps a short plan readable
 - an `expires_in` parameter · 2026-11-21 · one clock is easier to trust than a number each agent tunes
+- a soft ask, a flash that pings and takes its card with it when it fades · 2026-11-21 · a card that vanishes breaks `nothing addressed to the user disappears unread`; what needs the user is a `Message`, so one bit, `ephemeral`, is the whole choice
 - a kept message that does not ping, for progress · 2026-11-21 · see `Message`
 
 ## concept Draft
