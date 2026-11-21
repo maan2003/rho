@@ -234,9 +234,8 @@ impl NotesView {
             let waiting_to_list = self.return_to.is_some_and(|note| {
                 !active
                     || system
-                        .pending
-                        .get(&note)
-                        .is_some_and(|edit| !edit.text.is_empty())
+                        .pending_text(note)
+                        .is_some_and(|text| !text.is_empty())
             });
             let notes = listed(frame.marks(), &query, |about| ReplyContext {
                 mail: system

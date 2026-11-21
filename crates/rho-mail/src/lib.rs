@@ -50,7 +50,20 @@ impl ThreadId {
 
     /// The thread as text after `thread:`.
     pub fn key(&self) -> String {
-        format!("{}/{}", self.host, self.message.0.0)
+        Self::key_under(&self.host, self.message).to_string()
+    }
+
+    fn key_under(
+        host: &impl std::fmt::Display,
+        message: rho_agent_types::MessageId,
+    ) -> impl std::fmt::Display {
+        struct Key<'a, H>(&'a H, u64);
+        impl<H: std::fmt::Display> std::fmt::Display for Key<'_, H> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}/{}", self.0, self.1)
+            }
+        }
+        Key(host, message.0.0)
     }
 
     pub fn parse(rest: &str) -> Option<Self> {

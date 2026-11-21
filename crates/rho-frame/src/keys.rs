@@ -47,7 +47,6 @@ actions!(
         MinibufferCancel,
         MinibufferNext,
         MinibufferPrevious,
-        MinibufferUp,
         MinibufferDeleteWord,
         MinibufferComplete,
         MinibufferClear,
@@ -162,7 +161,7 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-n", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
-        KeyBinding::new("up", MinibufferUp, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
         KeyBinding::new(
             "ctrl-w",
             MinibufferDeleteWord,
@@ -254,6 +253,25 @@ mod tests {
         }
         assert_eq!(action_at(page, "ctrl-shift-j"), None);
         assert_eq!(action_at(editor, "ctrl-shift-j"), Some(CloseAndDeal.name()));
+    }
+
+    #[test]
+    fn prompt_arrows_bind_to_the_same_row_motion_as_ctrl_p_n() {
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings());
+        let stack = [
+            KeyContext::parse("RhoMinibuffer").unwrap(),
+            KeyContext::parse("Editor").unwrap(),
+        ];
+        for (key, expected) in [
+            ("up", MinibufferPrevious.name()),
+            ("ctrl-p", MinibufferPrevious.name()),
+            ("down", MinibufferNext.name()),
+            ("ctrl-n", MinibufferNext.name()),
+        ] {
+            let (matches, _) = keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], &stack);
+            assert_eq!(matches[0].action().name(), expected, "{key}");
+        }
     }
 
     #[test]

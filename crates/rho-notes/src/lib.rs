@@ -3,10 +3,11 @@
 //! A note is the user's own text, a private message: the ledger keeps a
 //! revision per save and the newest is the note. It is the user's marks,
 //! which the frame holds ([`Frame::marks`]), so [`NoteSystem`] keeps
-//! nothing of it: it reads the marks when it needs them and says what the
-//! user typed through [`Frame::write_marks`]. All it holds is what was
-//! typed and not yet written. The machine never writes a note's text:
-//! every revision this crate says is a buffer's text as the user left it.
+//! no disk copy of it: it reads the marks and says what the user typed
+//! through [`Frame::write_marks`]. The palette's in-memory projection
+//! follows those marks and the text not yet written. The machine never writes a
+//! note's text: every revision this crate says is a buffer's text as the user
+//! left it.
 //!
 //! Notes stay off Desk. The `notes` command opens [`NotesView`], where the
 //! user can find or start a note without sending their words anywhere.
@@ -31,8 +32,8 @@ use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{
-    AnySurface, Found, FoundText, Frame, FrameLink, Point, Row, SearchPoint, System, TextKind,
-    TextQuery,
+    AnySurface, Found, FoundText, Frame, FrameLink, Point, Row, SearchPoint, System, TextIndex,
+    TextKind, TextPresenter, TextSearch, TextTarget,
 };
 pub use view::NoteView;
 
@@ -51,7 +52,7 @@ fn notes_address() -> Address {
 }
 
 /// A note, by the id it was minted under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteId(pub uuid::Uuid);
 
 impl Addressed for NoteId {
@@ -223,7 +224,6 @@ fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
 
 /// What the user typed and has not been written yet.
 struct Pending {
-    text: String,
     _save: Task<()>,
 }
 
@@ -236,6 +236,7 @@ pub struct NoteSystem {
     frame: FrameLink,
     mail_excerpt: Option<MailExcerpt>,
     pending: HashMap<NoteId, Pending>,
+    search: TextIndex<NoteId>,
     _quit: Subscription,
 }
 
@@ -244,17 +245,37 @@ impl EventEmitter<NoteViewed> for NoteSystem {}
 impl NoteSystem {
     pub fn new(frame: FrameLink, cx: &mut Context<Self>) -> Self {
         let this = cx.weak_entity();
+        let initialize = this.clone();
+        frame.with(cx, move |frame, _, cx| {
+            let _ = initialize.update(cx, |system, _| {
+                for (address, _) in frame.marks().notes() {
+                    system.index_note(frame.marks(), address);
+                }
+            });
+        });
         let app: &App = cx;
         // What was typed in the last moment before quitting is written
         // now: the window is gone by the time a deferred write would run.
         let quit = app.on_app_quit(move |cx| {
             if let Some(this) = this.upgrade() {
                 let (frame, pending) = this.update(cx, |this, _| {
-                    (this.frame.clone(), std::mem::take(&mut this.pending))
+                    let pending: Vec<_> = std::mem::take(&mut this.pending)
+                        .into_keys()
+                        .map(|note| {
+                            (
+                                note,
+                                this.search
+                                    .body(&note)
+                                    .expect("pending note has text")
+                                    .to_owned(),
+                            )
+                        })
+                        .collect();
+                    (this.frame.clone(), pending)
                 });
                 frame.update(cx, |frame, _, cx| {
                     for (note, pending) in pending {
-                        write(frame, note, pending.text, cx);
+                        write(frame, note, pending, cx);
                     }
                 });
             }
@@ -266,6 +287,7 @@ impl NoteSystem {
             frame,
             mail_excerpt: None,
             pending: HashMap::new(),
+            search: TextIndex::default(),
             _quit: quit,
         }
     }
@@ -276,9 +298,8 @@ impl NoteSystem {
 
     /// The current text when another surface starts editing this note.
     pub fn text(&self, marks: &Marks, note: NoteId) -> String {
-        self.pending
-            .get(&note)
-            .map_or_else(|| text_of(marks, note), |pending| pending.text.clone())
+        self.pending_text(note)
+            .map_or_else(|| text_of(marks, note), str::to_owned)
     }
 
     /// Whether the user typed into `note` and it is not written yet: then
@@ -293,7 +314,9 @@ impl NoteSystem {
             cx.background_executor().timer(SAVE_AFTER).await;
             let _ = this.update(cx, |this, cx| this.save(note, cx));
         });
-        self.pending.insert(note, Pending { text, _save: save });
+        self.search
+            .update(note, text, Timestamp::now().as_millisecond().max(0) as u64);
+        self.pending.insert(note, Pending { _save: save });
     }
 
     /// Writes what was typed into `note`, if anything. It leaves the pending
@@ -302,11 +325,46 @@ impl NoteSystem {
     pub fn save(&mut self, note: NoteId, cx: &mut Context<Self>) {
         let this = cx.entity();
         self.frame.with(cx, move |frame, _, cx| {
-            let Some(pending) = this.update(cx, |this, _| this.pending.remove(&note)) else {
+            let Some(text) = this.update(cx, |this, _| {
+                this.pending.remove(&note)?;
+                Some(
+                    this.search
+                        .body(&note)
+                        .expect("pending note has text")
+                        .to_owned(),
+                )
+            }) else {
                 return;
             };
-            write(frame, note, pending.text, cx);
+            write(frame, note, text, cx);
+            this.update(cx, |this, _| {
+                this.index_note(frame.marks(), &note.address())
+            });
         });
+    }
+
+    fn pending_text(&self, note: NoteId) -> Option<&str> {
+        self.typing(note)
+            .then(|| self.search.body(&note).expect("pending note has text"))
+    }
+
+    fn index_note(&mut self, marks: &Marks, address: &Address) {
+        let Some(note) = NoteId::from_address(address) else {
+            return;
+        };
+        if self.typing(note) {
+            // The pending editor is the newest text, even when a remote
+            // revision or deletion arrives before it has been saved.
+            return;
+        }
+        let text = revision_of(marks, address);
+        if text.is_empty() {
+            self.search.remove(&note);
+        } else {
+            let held = marks.get(address);
+            let time = held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64;
+            self.search.update(note, text.to_owned(), time);
+        }
     }
 }
 
@@ -396,8 +454,8 @@ impl System for NoteSystem {
     /// user types, else the one written.
     fn name(&self, address: &Address, marks: &Marks, _cx: &App) -> Option<(String, String)> {
         let note = NoteId::from_address(address)?;
-        let title = match self.pending.get(&note) {
-            Some(pending) => title_of(&pending.text),
+        let title = match self.pending_text(note) {
+            Some(text) => title_of(text),
             None => note_title(marks, address),
         };
         Some((title, String::new()))
@@ -406,50 +464,50 @@ impl System for NoteSystem {
     /// Every note, by its first line as the user is typing it, for the
     /// palette.
     fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
-        found(marks, |note| match self.pending.get(&note) {
-            Some(pending) => title_of(&pending.text),
+        found(marks, |note| match self.pending_text(note) {
+            Some(text) => title_of(text),
             None => note_title(marks, &note.address()),
         })
     }
 
-    fn find_text(
-        &self,
-        query: &TextQuery<'_>,
-        _current: &Address,
-        marks: &Marks,
-        _cx: &App,
-    ) -> Vec<FoundText> {
-        if !query.includes(TextKind::Note) {
-            return Vec::new();
+    fn text_sources(&self, search: &mut TextSearch, _current: &Address, _cx: &App) {
+        if search.includes(TextKind::Note) {
+            search.add(self.search.clone(), |id| TextTarget::Note(id.address()));
         }
-        marks
-            .notes()
-            .filter_map(|(address, held)| {
-                let note = NoteId::from_address(address)?;
-                let body = self
-                    .pending
-                    .get(&note)
-                    .map(|pending| pending.text.as_str())
-                    .or(held.body.as_deref())?;
-                let (row, line) = query.matching_line(body)?;
-                Some(FoundText {
-                    address: address.clone(),
-                    title: format!("Note · {}", title_of(body)),
-                    line: line.to_owned(),
-                    point: SearchPoint::Line(row),
-                    time: held
-                        .written_ms
-                        .or(held.created_ms)
-                        .unwrap_or_default()
-                        .max(0) as u64,
-                })
-            })
-            .collect()
     }
 
-    fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
-        // A note surface reads its text from the marks, and the list its
-        // notes.
+    fn text_presenter(&self, _cx: &App) -> Option<TextPresenter<'_>> {
+        Some(Box::new(|hit| {
+            let TextTarget::Note(address) = &hit.target else {
+                return None;
+            };
+            let id = NoteId::from_address(address)?;
+            hit.is_from(&self.search, &id).then(|| FoundText {
+                address: address.clone(),
+                title: format!("Note · {}", title_of(hit.body())),
+                line: hit.line().to_owned(),
+                point: SearchPoint::Line(hit.row),
+            })
+        }))
+    }
+
+    fn marks_moved(&mut self, touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
+        let changed: Vec<_> = touched
+            .iter()
+            .filter(|address| address.kind() == Address::NOTE)
+            .cloned()
+            .collect();
+        if !changed.is_empty() {
+            let this = cx.weak_entity();
+            self.frame.with(cx, move |frame, _, cx| {
+                let _ = this.update(cx, |system, _| {
+                    for address in changed {
+                        system.index_note(frame.marks(), &address);
+                    }
+                });
+            });
+        }
+        // A note surface reads its text from the marks, and the list its notes.
         cx.notify();
     }
 }

@@ -9,6 +9,8 @@
 
 use std::borrow::Cow;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use editor::Editor;
 use gpui::prelude::*;
@@ -23,6 +25,7 @@ use crate::frame::Frame;
 use crate::menu::Pick;
 use crate::palette::{Choice, Listing, Matched};
 use crate::phone::{cut_at_word, measure};
+use crate::text_search::{TextHit, TextQuery, TextScope, TextSearch};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -145,6 +148,7 @@ pub(crate) enum Answer {
     Palette {
         listing: Listing,
         rows: Vec<Matched>,
+        search: Option<PendingText>,
     },
 }
 
@@ -161,6 +165,7 @@ impl Answer {
         Self::Palette {
             listing,
             rows: Vec::new(),
+            search: None,
         }
     }
 
@@ -174,7 +179,37 @@ impl Answer {
 
 enum Completed {
     Text(Candidate, usize),
-    Palette(usize),
+    Palette { index: usize, input: String },
+}
+
+pub(crate) struct PendingText {
+    cancelled: Arc<AtomicBool>,
+    _task: gpui::Task<()>,
+}
+
+impl PendingText {
+    fn start(search: TextSearch, input: String, cx: &Context<Frame>) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = cancelled.clone();
+        let task = cx.spawn(async move |frame, cx| {
+            let hits = cx.background_spawn(async move { search.find(&stop) }).await;
+            let _ = frame.update(cx, |frame, cx| {
+                frame.finish_palette_search(&input, hits, cx)
+            });
+        });
+        Self {
+            cancelled,
+            _task: task,
+        }
+    }
+}
+
+impl Drop for PendingText {
+    fn drop(&mut self) {
+        // Dropping the GPUI task prevents delivery; the flag also stops a
+        // scan already running on a worker instead of delaying the next key.
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A closed prompt's answer, run once focus is back where it was.
@@ -197,6 +232,7 @@ pub struct Minibuffer {
     on_cancel: Option<CancelHandler>,
     validate: Option<fn(&str) -> Option<&'static str>>,
     selected: usize,
+    moved_selection: bool,
     completion_input: CompletionInput,
     completed_selection: Option<Completed>,
     /// What is typed here is a credential: the journal keeps none of it.
@@ -256,6 +292,7 @@ impl Minibuffer {
             on_cancel,
             validate: None,
             selected: 0,
+            moved_selection: false,
             completed_selection: None,
             secret: false,
             _edits: edits,
@@ -290,7 +327,8 @@ impl Minibuffer {
 
     /// Recomputes candidates against `workspace`; called by the workspace
     /// on open and after every edit.
-    pub fn refresh(&mut self, workspace: &Frame, cx: &App) {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub fn refresh(&mut self, workspace: &Frame, cx: &Context<Frame>) {
         let input = self.input(cx);
         let completed_row = match &mut self.answer {
             Answer::Text { complete, rows, .. } => {
@@ -306,23 +344,35 @@ impl Minibuffer {
                     _ => None,
                 }
             }
-            Answer::Palette { listing, rows } => {
-                let query = input.trim().to_lowercase();
-                listing.search_text(workspace.find_text(&crate::TextQuery::parse(&query), cx));
-                *rows = listing.rank(&input);
-                match self.completed_selection {
-                    Some(Completed::Palette(id))
-                        if listing
-                            .choices
-                            .get(id)
-                            .is_some_and(|choice| input == choice.name()) =>
-                    {
-                        rows.iter().position(|row| row.index == id)
+            Answer::Palette {
+                listing,
+                rows,
+                search,
+            } => {
+                // Cancel before preparing the new rows. Named results don't
+                // depend on the mailbox, so show them immediately.
+                *search = None;
+                listing.clear_text();
+                let folded = input.trim().to_lowercase();
+                let query = TextQuery::parse(&folded);
+                *rows = listing.rank_query(&query);
+                if query.wants_text() {
+                    let slots = crate::palette::LISTED - listing.text_position(rows);
+                    let batch = workspace.text_search(folded, slots, cx);
+                    if !batch.is_empty() {
+                        *search = Some(PendingText::start(batch, input.clone(), cx));
                     }
+                }
+                match &self.completed_selection {
+                    Some(Completed::Palette {
+                        index,
+                        input: value,
+                    }) if input == *value => rows.iter().position(|row| row.index == *index),
                     _ => None,
                 }
             }
         };
+        self.moved_selection = completed_row.is_some();
         if let Some(index) = completed_row {
             self.selected = index;
         } else {
@@ -331,10 +381,44 @@ impl Minibuffer {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) fn finish_text(
+        &mut self,
+        workspace: &Frame,
+        input: &str,
+        hits: Vec<TextHit>,
+        cx: &App,
+    ) {
+        if self.input(cx) != input {
+            return;
+        }
+        let Answer::Palette {
+            listing,
+            rows,
+            search,
+        } = &mut self.answer
+        else {
+            return;
+        };
+        if search.take().is_none() {
+            return;
+        }
+        let selected = self
+            .moved_selection
+            .then(|| rows.get(self.selected).map(|row| row.index))
+            .flatten();
+        let resolved = workspace.describe_palette_text(hits, cx);
+        listing.append_text(rows, resolved);
+        self.selected = selected
+            .and_then(|index| rows.iter().position(|row| row.index == index))
+            .unwrap_or(0);
+    }
+
     pub fn select_by_delta(&mut self, delta: isize) {
         let count = self.answer.len() as isize;
         if count != 0 {
             self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
+            self.moved_selection = true;
         }
     }
 
@@ -369,12 +453,28 @@ impl Minibuffer {
                 self.completed_selection = Some(Completed::Text(candidate, occurrence));
                 value
             }
-            Answer::Palette { listing, rows } => {
+            Answer::Palette { listing, rows, .. } => {
                 let Some(row) = rows.get(self.selected) else {
                     return;
                 };
-                self.completed_selection = Some(Completed::Palette(row.index));
-                listing.choices[row.index].name().to_owned()
+                let choice = &listing.choices[row.index];
+                if matches!(choice, Choice::Words(_)) {
+                    // A body hit is not a completion of the typed words.
+                    return;
+                }
+                let input = self.input(cx);
+                let folded = input.trim().to_lowercase();
+                let prefix = if TextQuery::parse(&folded).scope == TextScope::Commands {
+                    "> "
+                } else {
+                    ""
+                };
+                let value = format!("{prefix}{}", choice.name());
+                self.completed_selection = Some(Completed::Palette {
+                    index: row.index,
+                    input: value.clone(),
+                });
+                value
             }
         };
         self.set_input(value, window, cx);
@@ -455,7 +555,7 @@ impl Minibuffer {
                 let input = input.clone();
                 Box::new(move |frame, window, cx| submit(frame, input, window, cx))
             }
-            Answer::Palette { listing, rows } => {
+            Answer::Palette { listing, rows, .. } => {
                 let index = rows[self.selected].index;
                 let blank = input.trim().is_empty();
                 Box::new(move |frame, window, cx| match &listing.choices[index] {
@@ -478,6 +578,7 @@ impl Minibuffer {
         (input, submission)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn render(
         &self,
         text_style: &gpui::TextStyle,
@@ -497,11 +598,13 @@ impl Minibuffer {
         let inset = rems(0.5);
         let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
         let columns = match &self.answer {
-            Answer::Palette { listing, rows } => Some(PaletteColumns::new(
-                rows.iter().filter_map(|row| {
-                    let choice = &listing.choices[row.index];
-                    matches!(choice, Choice::Place(_)).then(|| choice.fields())
-                }),
+            Answer::Palette { listing, rows, .. } => Some(PaletteColumns::new(
+                rows.iter()
+                    .filter_map(|row| {
+                        let choice = &listing.choices[row.index];
+                        matches!(choice, Choice::Place(_)).then(|| choice.fields())
+                    })
+                    .take(VISIBLE_CANDIDATES),
                 row_width,
                 layout,
                 &measure,
@@ -515,7 +618,7 @@ impl Minibuffer {
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
                 let mut row = div().flex().flex_row().gap(inset).w_full().px(inset);
-                if let Answer::Palette { listing, rows } = &self.answer {
+                if let Answer::Palette { listing, rows, .. } = &self.answer {
                     let matched = &rows[index];
                     let choice = &listing.choices[matched.index];
                     let field_colors = [
@@ -642,7 +745,23 @@ impl Minibuffer {
         // an empty list does not read as one still loading.
         let palette = self.is_palette();
         let total = self.answer.len();
-        let no_match = total == 0 && palette && !self.input(cx).trim().is_empty();
+        let missing = if total == 0 && palette && !self.input(cx).trim().is_empty() {
+            Some(
+                if matches!(
+                    self.answer,
+                    Answer::Palette {
+                        search: Some(_),
+                        ..
+                    }
+                ) {
+                    "searching…"
+                } else {
+                    "no match"
+                },
+            )
+        } else {
+            None
+        };
         let position = if total == 0 { 0 } else { self.selected + 1 };
         // Input first, candidates beneath it, like emacs completing-read.
         bottom_strip(text_style, cx)
@@ -672,9 +791,7 @@ impl Minibuffer {
                     })),
             )
             .children(rows)
-            .children(
-                no_match.then(|| div().px_2().text_color(colors.text_muted).child("no match")),
-            )
+            .children(missing.map(|words| div().px_2().text_color(colors.text_muted).child(words)))
             .into_any_element()
     }
 }

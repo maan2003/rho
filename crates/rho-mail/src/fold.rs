@@ -51,6 +51,8 @@ pub struct HostMail {
     pub head: ChatSeq,
     messages: BTreeMap<MessageId, Message>,
     recaps: crate::reading::Recaps,
+    #[cfg(feature = "ui")]
+    pub(crate) text: rho_frame::TextIndex<MessageId>,
     /// Each message's children in log order; `None` holds the roots.
     children: BTreeMap<Option<MessageId>, Vec<MessageId>>,
     names: HashMap<MessageId, String>,
@@ -77,6 +79,8 @@ impl HostMail {
                 self.children.entry(*parent).or_default().push(id);
                 self.recaps.observe(&message, record);
                 self.messages.insert(id, message);
+                #[cfg(feature = "ui")]
+                self.refresh_text_tree(id, true);
                 Told::Posted {
                     message: id,
                     thread: self.thread_of(id),
@@ -94,6 +98,8 @@ impl HostMail {
                 }
                 self.children.entry(*parent).or_default().push(*message);
                 self.messages.get_mut(message).expect("checked").parent = *parent;
+                #[cfg(feature = "ui")]
+                self.refresh_text_tree(*message, false);
                 Told::Moved {
                     message: *message,
                     from,
@@ -114,11 +120,20 @@ impl HostMail {
             | ChatEvent::TakenBack { message, .. }
             | ChatEvent::Recovered { message, .. }
             | ChatEvent::Deleted { message } => {
+                #[cfg(feature = "ui")]
+                let was_agent_only = self.agent_only(*message);
                 let Some(mail) = self.messages.get_mut(message) else {
                     return Told::Nothing;
                 };
                 mail.apply_revision(record);
                 self.recaps.observe(mail, record);
+                #[cfg(feature = "ui")]
+                if was_agent_only != self.agent_only(*message) && self.root_of(*message) == *message
+                {
+                    self.refresh_text_tree(*message, true);
+                } else {
+                    self.refresh_text(*message, true);
+                }
                 Told::Thread(self.subthread_of(*message))
             }
             ChatEvent::Named { thread, name } => {
@@ -136,41 +151,73 @@ impl HostMail {
         }
     }
 
+    // Visibility depends on the containing root. A move or a root's audience
+    // change can expose or hide descendants without changing their bodies.
+    #[cfg(feature = "ui")]
+    fn refresh_text_tree(&mut self, root: MessageId, changed: bool) {
+        self.refresh_text(root, changed);
+        let mut descendants = self.children(Some(root)).to_vec();
+        while let Some(id) = descendants.pop() {
+            self.refresh_text(id, false);
+            descendants.extend_from_slice(self.children(Some(id)));
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    fn refresh_text(&mut self, id: MessageId, changed: bool) {
+        let visible = self.messages.get(&id).filter(|mail| {
+            mail.revision != Revision::Deleted
+                && !self.is_project(id)
+                && !self.agent_only(id)
+                && !self.agent_only(self.root_of(id))
+        });
+        match visible {
+            Some(mail) if changed || !self.text.contains(&id) => {
+                self.text
+                    .update(id, crate::reading::body(&mail.content), mail.version().1.0)
+            }
+            None => self.text.remove(&id),
+            _ => {}
+        }
+    }
+
     /// Applies the current ephemeral snapshot from the host, never from disk.
     pub fn set_work(&mut self, work: Vec<(MessageId, ThreadWork)>) {
         self.work = work.into_iter().collect();
     }
 
-    /// The latest project mail, even if it does not ping. Agent-to-agent
-    /// mail is never the project's words to the user.
-    pub fn latest_words(&self, thread: MessageId) -> Option<(String, UnixMs)> {
+    /// The status words and the latest time the project wrote to this
+    /// thread. A new user idea can change the status to `working` without
+    /// changing when the project last wrote.
+    #[cfg(feature = "ui")]
+    pub(crate) fn thread_activity(&self, thread: MessageId) -> (Option<String>, Option<UnixMs>) {
         let mut latest = None;
         let mut latest_user = None;
-        for mail in std::iter::once(thread)
-            .chain(self.children(Some(thread)).iter().copied())
-            .filter_map(|id| self.message(id))
-            .filter(|mail| {
-                !matches!(
-                    mail.revision,
-                    Revision::Deleted | Revision::TakenBack { .. }
-                )
-            })
-        {
+        let mut project_at = None;
+        for mail in self.reading_order(thread).filter(|mail| {
+            !matches!(
+                mail.revision,
+                Revision::Deleted | Revision::TakenBack { .. }
+            )
+        }) {
             if mail.from == Address::User {
                 latest_user = Some(mail);
-            } else if mail.to_user()
-                && latest.is_none_or(|old: &Message| old.version().0 < mail.version().0)
-            {
-                latest = Some(mail);
+            } else if mail.to_user() {
+                project_at = project_at.max(Some(mail.version().1));
+                if latest.is_none_or(|old: &Message| old.version().0 < mail.version().0) {
+                    latest = Some(mail);
+                }
             }
         }
-        if self.work.get(&thread) == Some(&ThreadWork::Working)
+        let words = if self.work.get(&thread) == Some(&ThreadWork::Working)
             && latest_user
                 .is_some_and(|user| latest.is_none_or(|mail| mail.version().0 < user.id.0))
         {
-            return latest_user.map(|mail| ("working".into(), mail.at));
-        }
-        latest.map(|mail| (mail.headline(), mail.version().1))
+            Some("working".into())
+        } else {
+            latest.map(Message::headline)
+        };
+        (words, project_at)
     }
 
     /// The opening mail and its immediate replies are shown in a thread.
@@ -431,6 +478,62 @@ mod tests {
     use rho_agent_types::{AgentIdDomain, ContentPart};
 
     use super::*;
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn text_projection_follows_edits_deletion_and_moves_into_or_out_of_private_roots() {
+        use rho_agent_types::Mention;
+
+        let mut log = HostMail::default();
+        log.tell(&posted(1, None, Address::User, "visible project"));
+        log.tell(&posted(
+            2,
+            Some(1),
+            Address::Agent(agent(3)),
+            "Clock report",
+        ));
+        log.tell(&posted(3, Some(2), Address::User, "loose winding"));
+        let mut direct = posted(4, None, Address::Agent(agent(3)), "private root");
+        let ChatEvent::Posted { mentions, .. } = &mut direct.event else {
+            unreachable!()
+        };
+        mentions.push(Mention::Direct(agent(7)));
+        log.tell(&direct);
+        assert_eq!(log.text.body(&id(1)), None);
+        assert_eq!(log.text.body(&id(2)), Some("Clock report"));
+        assert_eq!(log.text.body(&id(3)), Some("loose winding"));
+        assert_eq!(log.text.body(&id(4)), None);
+
+        log.tell(&record(
+            5,
+            ChatEvent::Reparented {
+                message: id(2),
+                parent: Some(id(4)),
+            },
+        ));
+        assert!(!log.text.contains(&id(2)));
+        assert!(!log.text.contains(&id(3)));
+        log.tell(&record(
+            6,
+            ChatEvent::Edited {
+                message: id(3),
+                content: vec![ContentPart::Text {
+                    text: "wind restored".into(),
+                }],
+            },
+        ));
+        assert!(!log.text.contains(&id(3)));
+        log.tell(&record(
+            7,
+            ChatEvent::Reparented {
+                message: id(2),
+                parent: Some(id(1)),
+            },
+        ));
+        assert_eq!(log.text.body(&id(3)), Some("wind restored"));
+        log.tell(&record(8, ChatEvent::Deleted { message: id(3) }));
+        assert!(!log.text.contains(&id(3)));
+    }
 
     fn agent(n: u64) -> AgentId {
         AgentId::from_counter(n, &AgentIdDomain(0)).unwrap()

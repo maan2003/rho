@@ -41,6 +41,7 @@ mod place;
 mod search;
 pub mod surface;
 pub mod system;
+mod text_search;
 pub mod thread;
 pub mod when;
 
@@ -54,9 +55,8 @@ pub use phone::{Layout, phone_editor_tap};
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, Mode, PhoneTool, Subject, Surface};
-pub use system::{
-    AnySystem, Found, FoundText, FoundThread, SearchPoint, System, TextKind, TextQuery,
-};
+pub use system::{AnySystem, Found, FoundText, FoundThread, SearchPoint, System, TextPresenter};
+pub use text_search::{TextHit, TextIndex, TextKind, TextSearch, TextTarget};
 
 /// The key context every surface is drawn in. A system binds its keys
 /// under `RhoFrame` for the frame and under `RhoFrame > Editor` for keys

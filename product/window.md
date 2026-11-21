@@ -43,13 +43,13 @@ When a host drops, the line names it and says `reconnecting · 12s` in red, coun
 On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
-status: the built palette ranks places and commands as below but without the recency bonus and without the `>` and `/` prefixes, and its text search is slow on a large mail history.
 purpose: reach any place, command, or remembered words in one prompt.
 principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
 sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits (left out on `desk.Desk`, where it is already in view), then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or the project's latest words otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently active: a thread the user visited or the project wrote to today comes before one from last week, and recency can lift a thread one step of match strength, never over a whole-name match or a command. The current place ranks last among matching places. A place whose name starts with the typed word comes before a recent place that only contains it, and a match on words in order beats one out of order. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one; on a narrow window it shows its name only. The draft of the current thread is searched before the mail history.
 does:
 - open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a draft the user is typing: open the same prompt; the place under it does not see the keys
 - search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of mail and notes. A query that starts with `>` lists commands only; one that starts with `/` searches the text of mail and notes only; `mail:` and `note:` narrow the text search to one kind. The rows follow every keystroke without a pause the user can feel, on a history of ten thousand mails
+- choose `up`, `down`: move through the rows, wrapping at both ends without changing the typed words
 - run `enter`: open the chosen place or run the chosen command; a command that needs an answer opens a `Prompt`. With nothing typed, `enter` opens the last place when there is one
 rejected:
 - menus for hosts, usage, and starting an agent · 2026-11-20 · each row is a palette row by its full name, such as `hosts › attach`; the palette is enough
@@ -64,16 +64,17 @@ shows:
 - the `Palette` rows in match order, with each command's key and the `deal.Card` words or the project's latest words where a thread has them
 states:
 - empty: an empty query lists recent places newest first, leaving out the current place, then what waits, then the screen's commands; a query with no match shows `no match`
-- loading: not agreed
-- partial: not agreed
+- loading: `searching…` if the text search is still running and no named rows match yet
+- partial: named matches appear while the text search is still running
 - error: not agreed
 - full: the rows that match the query
 keys:
 - `enter`: `Palette.run`
-- `ctrl-n`, `ctrl-p`, `escape`: `Prompt`
+- `up`, `down`, `ctrl-p`, `ctrl-n`: `Palette.choose`
+- `escape`: `Prompt`
 starts: `Go to something by name`, `Run a command I rarely use`
 
-Built renders: [filtered laptop palette](design/laptop-prompt.png) and [blank phone palette](design/phone-prompt.png).
+Built renders: [mail search on laptop](design/laptop-prompt.png), [blank phone palette](design/phone-prompt.png), and the phone with [commands only](design/phone-palette-commands.png) or [text only](design/phone-palette-text.png).
 
 mock:
 ```text

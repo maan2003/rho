@@ -13,7 +13,7 @@ use jiff::{SignedDuration, Timestamp};
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_dealer::Address;
-use rho_window::history::History;
+use rho_window::history::{History, Visit};
 use senax_encoder::{Decode, Encode};
 
 const PLACE: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_place_v1");
@@ -74,19 +74,42 @@ pub(crate) fn idea_draft(db: &RhoDb) -> Option<IdeaDraft> {
 pub(crate) struct Saved {
     screens: Vec<String>,
     at: u32,
+    /// Same order as `screens`. Before the Palette recorded timestamps the
+    /// stack was all that was saved; those screens have no known visit time.
+    visits: Option<Vec<SavedVisit>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct SavedVisit {
+    order: u64,
+    wall_ms: Option<u64>,
 }
 
 impl Saved {
     pub(crate) fn of(history: &History<Address, ()>) -> Self {
-        let mut screens: Vec<String> = history
-            .keys_back()
-            .map(|address| address.to_string())
-            .collect();
-        screens.reverse();
-        let at = screens.len() as u32;
-        screens.push(history.current_key().to_string());
-        screens.extend(history.keys_forward().map(|address| address.to_string()));
-        Self { screens, at }
+        let mut keys: Vec<_> = history.keys_back().collect();
+        keys.reverse();
+        let at = keys.len() as u32;
+        keys.push(history.current_key());
+        keys.extend(history.keys_forward());
+        let (screens, visits) = keys
+            .into_iter()
+            .map(|key| {
+                let visit = history.visit(key).unwrap_or_default();
+                (
+                    key.to_string(),
+                    SavedVisit {
+                        order: visit.order,
+                        wall_ms: visit.wall_ms,
+                    },
+                )
+            })
+            .unzip();
+        Self {
+            screens,
+            at,
+            visits: Some(visits),
+        }
     }
 
     /// The history it describes, by address alone, with the desk in it
@@ -117,6 +140,30 @@ impl Saved {
         }
         let at = at.unwrap_or_else(|| desk.clone());
         while history.current_key() != &at && history.back().is_some() {}
+        let visits = self
+            .screens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                let key = address(key)?;
+                let visit = self
+                    .visits
+                    .as_ref()
+                    .and_then(|visits| visits.get(index))
+                    .map_or_else(
+                        || Visit {
+                            order: history.visit(&key).map_or(0, |visit| visit.order),
+                            wall_ms: None,
+                        },
+                        |saved| Visit {
+                            order: saved.order,
+                            wall_ms: saved.wall_ms,
+                        },
+                    );
+                Some((key, visit))
+            })
+            .collect::<Vec<_>>();
+        history.restore_visits(visits);
         history
     }
 
@@ -261,6 +308,73 @@ mod tests {
         assert!(restored.back().is_some(), "ctrl-k is not at the oldest");
     }
 
+    #[test]
+    fn visited_times_survive_restart_and_legacy_history_does_not_invent_them() {
+        #[derive(Encode, Decode)]
+        struct Legacy {
+            screens: Vec<String>,
+            at: u32,
+        }
+        let mut bytes = bytes::BytesMut::new();
+        use senax_encoder::{Decoder as _, Encoder as _};
+        Legacy {
+            screens: vec![
+                "frame:desk".into(),
+                "thread:old".into(),
+                "thread:recent".into(),
+            ],
+            at: 1,
+        }
+        .encode(&mut bytes)
+        .unwrap();
+        let saved = Saved::decode(&mut bytes.clone().freeze()).unwrap();
+        let desk = address("frame:desk");
+        let old = address("thread:old");
+        let recent = address("thread:recent");
+        let mut history = saved.history(&desk);
+        assert_eq!(history.current_key(), &old);
+        assert_eq!(history.visit(&old).unwrap().wall_ms, None);
+        assert_eq!(history.visit(&recent).unwrap().wall_ms, None);
+        history.restore_visits([
+            (
+                desk.clone(),
+                Visit {
+                    order: 1,
+                    wall_ms: Some(20),
+                },
+            ),
+            (
+                old.clone(),
+                Visit {
+                    order: 4,
+                    wall_ms: Some(70),
+                },
+            ),
+            (
+                recent.clone(),
+                Visit {
+                    order: 3,
+                    wall_ms: Some(70),
+                },
+            ),
+        ]);
+        let saved = Saved::of(&history);
+        let mut bytes = bytes::BytesMut::new();
+        saved.encode(&mut bytes).unwrap();
+        let downgrade = Legacy::decode(&mut bytes.clone().freeze()).unwrap();
+        assert_eq!(downgrade.at, 1);
+        assert_eq!(
+            downgrade.screens,
+            ["frame:desk", "thread:old", "thread:recent"]
+        );
+        let restored = Saved::decode(&mut bytes.clone().freeze())
+            .unwrap()
+            .history(&desk);
+        assert_eq!(restored.visit(&old), history.visit(&old));
+        assert_eq!(restored.visit(&recent), history.visit(&recent));
+        assert_eq!(restored.recent(), [&recent, &desk]);
+    }
+
     /// The desk moved to the front of the stack stays where it was; one
     /// written without it, or with a screen this build cannot read, still
     /// has the desk at the oldest end.
@@ -274,6 +388,7 @@ mod tests {
                 "note:n".into(),
             ],
             at: 2,
+            visits: None,
         };
         let history = saved.history(&desk);
         assert_eq!(history.current_key(), &address("note:n"));
@@ -305,6 +420,7 @@ mod tests {
                 .map(str::to_owned)
                 .to_vec(),
             at: 2,
+            visits: None,
         };
         for warm in ["2026-11-20T12:09:59.999Z", "2026-11-20T12:10:00Z"] {
             let history = return_history(&saved, &desk, Some(last), warm.parse().unwrap());

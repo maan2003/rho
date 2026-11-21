@@ -81,6 +81,8 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 | [Narrow Desk (per idea)](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
 | Verdict sheet over the unpaired card | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55`. |
 | [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
+| [Command-only palette](phone-palette-commands.png) | From the blank palette, `form_way phone input 'text:> note' 'wait:550'; form_shot phone palette-commands`. Only commands appear, without shortcut hints. |
+| [Text-only palette](phone-palette-text.png) | From the command-only palette, `form_way phone input 'key:escape' 'wait:320' 'text::' 'wait:280' 'text:/ behavior' 'wait:550'; form_shot phone palette-text`. Tap the mail row to open its matching line. |
 
 For the card without the `unpaired` notice, reuse the laptop identity:
 
@@ -195,7 +197,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk shows the wait count, waiting subjects with their projects, and any overflow. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
 - In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent mail, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
-- The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
+- The palette can match mail body words absent from the subject. `>` limits rows to commands, `/` to mail and note text; `mail:` and `note:` retain their narrower scopes. Up and Down wrap the selection without changing the query. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 
 These renders cover the states named above, not pending or private delivery, host disconnection, a failed agent, alternate appearances, or motion timings.
