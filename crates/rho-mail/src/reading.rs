@@ -1,6 +1,4 @@
-//! Derive the thread's initial reading position and recap from its history.
-//! The two anchors are independent: the latest user's words can put the
-//! opening position below a recap that still belongs to an earlier mail.
+//! Derive the recap from the thread's version history and user activity.
 
 use std::collections::BTreeMap;
 
@@ -9,32 +7,12 @@ use rho_agent_types::{
     THREAD_COLD_AFTER, UnixMs, recap_section,
 };
 
-fn visible(mail: &Message) -> bool {
-    mail.revision != Revision::Deleted
-}
-
 fn project_mail(mail: &Message) -> bool {
     !matches!(mail.from, Address::User)
         && !mail
             .mentions
             .iter()
             .any(|mention| matches!(mention, Mention::Direct(_)))
-}
-
-/// SPEC-mail-thread-entry: the first project mail since the most recent user
-/// mail, or the latest mail when the project has not replied.
-pub(crate) fn open_anchor<'a>(history: impl IntoIterator<Item = &'a Message>) -> Option<MessageId> {
-    let mut first = None;
-    let mut latest = None;
-    for mail in history.into_iter().filter(|mail| visible(mail)) {
-        latest = Some(mail.id);
-        if mail.from == Address::User {
-            first = None;
-        } else if project_mail(mail) {
-            first.get_or_insert(mail.id);
-        }
-    }
-    first.or(latest)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,18 +209,5 @@ mod tests {
             mail.recap(id(1), [verdict].into_iter()),
             Some((id(14), "## recap\nNew stretch"))
         );
-    }
-
-    #[test]
-    fn opening_reads_the_first_project_mail_since_the_latest_user_mail() {
-        let mut mail = HostMail::default();
-        post(&mut mail, 1, at(1), Address::User, "First brief");
-        assert_eq!(open_anchor(mail.reading_order(id(1))), Some(id(1)));
-        post(&mut mail, 2, at(2), project(), "Old words");
-        post(&mut mail, 3, at(3), Address::User, "New brief");
-        assert_eq!(open_anchor(mail.reading_order(id(1))), Some(id(3)));
-        post(&mut mail, 4, at(4), project(), "Start reading here");
-        post(&mut mail, 5, at(5), project(), "Later words");
-        assert_eq!(open_anchor(mail.reading_order(id(1))), Some(id(4)));
     }
 }

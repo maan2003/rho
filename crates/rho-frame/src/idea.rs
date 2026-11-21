@@ -7,7 +7,7 @@ use std::rc::Rc;
 use editor::{Editor, EditorMode};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
-use language::{Buffer, BufferEvent};
+use language::{Buffer, BufferEvent, Point};
 use multi_buffer::MultiBuffer;
 use rho_agent_types::EndpointId;
 use rho_dealer::Address;
@@ -97,9 +97,23 @@ impl IdeaBox {
     fn subscribe(text: &Entity<Buffer>, cx: &mut Context<Frame>) -> gpui::Subscription {
         cx.subscribe(text, |frame, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
+                if let Some(overlay) = &frame.idea.overlay {
+                    overlay.editor.update(cx, Self::style_draft);
+                }
                 frame.save_idea(cx);
             }
         })
+    }
+
+    fn style_draft(editor: &mut Editor, cx: &mut Context<Editor>) {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let buffer = snapshot.as_singleton().expect("the idea has one buffer");
+        let range = snapshot
+            .buffer_anchor_range_to_anchor_range(
+                buffer.anchor_before(Point::zero())..buffer.anchor_after(buffer.max_point()),
+            )
+            .expect("the idea excerpt contains its buffer");
+        crate::draft::style(editor, range, "idea", cx);
     }
 }
 
@@ -204,6 +218,7 @@ impl Frame {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            IdeaBox::style_draft(&mut editor, cx);
             editor
         });
         let address = cx.new(|cx| {

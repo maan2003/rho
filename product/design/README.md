@@ -1,6 +1,6 @@
 # Built rho renders
 
-The thread, project and idea captures were updated 2026-11-21; the full Desk captures are from 2026-11-20. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The thread and idea captures show the leading draft and newest-first mail; the full Desk captures are from 2026-11-20. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -40,8 +40,8 @@ form_way laptop input 'key:enter' 'wait:800'
 The [address chooser](laptop-idea.png) offers `new project clock@lab`; Enter
 takes that row. After `clock@lab works on:`, the [mode prompt](laptop-project-mode.png)
 starts on `one`. Accepting it sends the idea and returns to Desk without
-another prompt. The [same chooser at phone width](phone-idea.png) also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
-on Desk (the work may briefly appear under `moving`).
+another prompt. For the [same chooser at phone width](phone-idea.png), start an idea on the unpaired phone, type its words, open the address chooser with `ctrl-t`, then type `foam@lab`. The chooser also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
+on Desk (the work may briefly appear under `moving`). Open `i` from Desk once again to capture the [empty idea](laptop-idea-empty.png) with `form_shot laptop idea-empty`.
 
 ### Start an empty project and change the next idea's mode
 
@@ -60,14 +60,14 @@ lets you replace it without moving that agent.
 
 ## Laptop: card, palette, verdict, and agent
 
-Starting from the waiting clock ask, run the rows in order. `space` deals on Desk when a card waits and shows the verdicts in the thread. After clearing the last card, `space` on Desk offers undo.
+Starting from the waiting clock ask, capture the card, verdict, and agent in order. Capture the palette separately from Desk. `space` deals on Desk when a card waits and shows the verdicts in the thread. After clearing the last card, `space` on Desk offers undo.
 
 | Render | Capture |
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
-| [Mail body search](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:mail: behavior' 'wait:600'; form_shot laptop prompt` |
-| [Verdict menu below the card](laptop-menu.png) | `form_way laptop input 'key:escape' 'wait:600' 'key:space' 'wait:700'; form_shot laptop menu` |
-| [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:k' 'key:k' 'key:enter' 'wait:850'; form_shot laptop agent` |
+| [Mail body search](laptop-prompt.png) | From Desk, `form_way laptop input 'text::' 'wait:400' 'text:mail: behavior' 'wait:600'; form_shot laptop prompt`. |
+| [Verdict menu below the card](laptop-menu.png) | `form_way laptop input 'key:space' 'wait:700'; form_shot laptop menu` |
+| [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:g' 'key:g' 'key:j' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |
 
 The echo says `nothing waits` when the last card is cleared. Use `space` then `u` to undo the verdict, then `form_way laptop stop`.
@@ -79,7 +79,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 | Render | Capture |
 | --- | --- |
 | [Project with wrapped unread row](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
-| [Verdict sheet over the card](phone-menu.png) | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55; form_shot phone menu`. |
+| Verdict sheet over the unpaired card | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55`. |
 | [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
 
 For the card without the `unpaired` notice, reuse the laptop identity:
@@ -94,12 +94,12 @@ form_way phone click 390 1640
 sleep .7
 form_shot phone card-empty
 # Tap the project's words to inspect their writing step.
-form_way phone click 165 1425
+form_way phone click 165 164
 sleep .75
 form_shot phone agent
 ```
 
-This makes the phone card and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action. To capture a [card with `send`](phone-card.png), return to the card, tap anywhere below the project’s words, and type a reply without sending it before taking the screenshot.
+This makes the phone card and the [phone transcript](phone-agent.png). The transcript carries the same verdicts as the thread but has no `send` action. To capture a [card with `send`](phone-card.png), return to the card, tap the draft (`form_way phone click 95 77`), and type `Use a separate clock for each test.` without sending it. For the paired verdict sheet, press Escape to leave Insert mode, then tap **more** (`form_way phone click 702 1640`), pause, and `form_shot phone menu`.
 
 ## Read long history while drafting
 
@@ -113,14 +113,14 @@ form_gui laptop
 # Once the first prompt is ready, pair and deal:
 form_way laptop input 'key:enter' 'wait:1000' 'key:space' 'wait:650'
 form_shot laptop reading
-form_way laptop input 'key:ctrl+u' 'wait:450' 'key:i' \
+form_way laptop input 'key:g' 'key:g' 'key:i' \
     'text:Use the reference clock for both.' 'wait:550'
 form_way laptop stop
 form_gui phone laptop
 # After the thread restores, scroll back and tap inside its projected draft:
-form_way phone input 'key:ctrl+u' 'key:ctrl+u' 'wait:550'
-form_way phone click 153 1550
-form_way phone input 'text:only ' 'wait:550'
+form_way phone input 'key:ctrl+d' 'key:ctrl+d' 'wait:550'
+form_way phone click 155 77
+form_way phone input 'text:only ' 'wait:550' 'key:escape'
 fixture="$bins/examples/thread_reading_fixture"
 read -r ws worker mid < <("$fixture" send "$rig/runtime" "$rig/repo" 2 \
     $'Both checks pass.\n\nThe retry policy did not change.')
@@ -128,13 +128,13 @@ sleep .6
 form_shot phone reading-notice
 ```
 
-The [open thread](laptop-reading.png) shows today's recap before the cold mail's
-body, and no March or warm recap. The short tail sits at the window edge.
+The [open thread](laptop-reading.png) puts the draft above the warm mail. Today's
+cold mail has a recap before its body; March and warm mail don't.
 The [phone notice](phone-reading-notice.png) leaves the reading position and
-the full draft in place, even when the notice doesn't fit beside the draft.
-Scroll back down with `ctrl-d`; the notice clears when the draft comes inline.
+the full draft in place, even when the notice needs its own line.
+Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
-history moves up, but the draft and caret stay put.
+history grows below the draft, but the draft and caret stay put.
 
 ## Desk on laptop and phone: what moves
 
@@ -171,7 +171,7 @@ The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show work un
 ## Inspect an outcome mail and a transcript with full commands
 
 Run `FAKE_SCENARIO=real-tool-rounds FAKE_ARGS='--seed 899421 --rounds 2' bash product/design/capture.sh /tmp/rho-form-proof target/debug`.
-Use **Put a clock idea to work** with `Run the clock acceptance checks.` for the idea. When the result waits, deal it with `space` and capture [proof](laptop-proof.png). Move `k` from the draft to the project's words, then press `enter` for the [transcript](laptop-agent.png). The command source, including each last shell argument, and the successful output are visible without opening a fold.
+Use **Put a clock idea to work** with `Run the clock acceptance checks.` for the idea. When the result waits, deal it with `space` and capture [proof](laptop-proof.png). Move `j` from the draft to the project's words, then press `enter` for the [transcript](laptop-agent.png). The command source, including each last shell argument, and the successful output are visible without opening a fold.
 
 ## Find a bookmark after closing its tab
 
@@ -181,7 +181,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
-- In a thread, the draft is the next mail; `reply` appears while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
+- In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
 - The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 

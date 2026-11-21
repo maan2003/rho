@@ -1,16 +1,20 @@
 use super::*;
 
-pub(crate) struct BottomExcerptText {
+pub(crate) struct StuckExcerptText {
     pub(crate) rows: Range<DisplayRow>,
     pub(crate) lines: Vec<LineWithInvisibles>,
     pub(crate) bounds: Bounds<Pixels>,
-    pub(crate) chrome_top: Pixels,
     pub(crate) top_y: f64,
     pub(crate) max_offset: f64,
 }
 
-pub(super) struct BottomExcerptLayout {
-    pub(super) text: Rc<BottomExcerptText>,
+pub(super) struct StuckExcerptLayout {
+    pub(super) text: Rc<StuckExcerptText>,
+    pub(super) edge: StuckEdge,
+    pub(super) chrome: Bounds<Pixels>,
+    background: Hsla,
+    gutter: Vec<(Range<DisplayPoint>, Hsla)>,
+    notice_y: Pixels,
     origin: gpui::Point<Pixels>,
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
     cursors: Vec<CursorLayout>,
@@ -20,7 +24,7 @@ pub(super) struct BottomExcerptLayout {
 }
 
 impl EditorElement {
-    pub(super) fn layout_bottom_excerpt(
+    pub(super) fn layout_stuck_excerpt(
         &self,
         snapshot: &EditorSnapshot,
         text_hitbox: &Hitbox,
@@ -33,16 +37,23 @@ impl EditorElement {
         em_advance: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<BottomExcerptLayout> {
+    ) -> Option<StuckExcerptLayout> {
         let height = f64::from(text_hitbox.size.height / line_height);
         let top = snapshot.row_y(scroll.y);
-        let (panel, notice, label_rows, start, end, redacted, highlights) =
+        let (panel, edge, background, notice, label_rows, start, end, redacted, highlights, gutter) =
             self.editor.update(cx, |editor, cx| {
-                let rows = editor.bottom_excerpt_range(&snapshot.display_snapshot)?;
-                let state = editor.bottom_excerpt.as_ref()?;
+                let rows = editor.stuck_excerpt_range(&snapshot.display_snapshot)?;
+                let state = editor.stuck_excerpt.as_ref()?;
+                let edge = state.edge;
+                let background = (state.background)(cx);
                 let mut label_rows = 0.0;
                 let mut notice = None;
-                if snapshot.row_y(rows.start.as_f64()) >= top + height {
+                if edge.is_outside(
+                    snapshot.row_y(rows.start.as_f64()),
+                    snapshot.row_y(rows.end.as_f64()),
+                    top,
+                    height,
+                ) {
                     let text = state.label.clone();
                     let label = window.text_system().shape_line(
                         text.clone(),
@@ -72,7 +83,7 @@ impl EditorElement {
                         notice = Some(label);
                     }
                 }
-                let panel = editor.layout_bottom_excerpt_rows(
+                let panel = editor.layout_stuck_excerpt_rows(
                     &snapshot.display_snapshot,
                     top,
                     height,
@@ -92,7 +103,12 @@ impl EditorElement {
                     cx.theme(),
                 );
                 let redacted = editor.redacted_ranges(start..end, &snapshot.display_snapshot, cx);
-                Some((panel, notice, label_rows, start, end, redacted, highlights))
+                let gutter =
+                    editor.gutter_highlights_in_range(start..end, &snapshot.display_snapshot, cx);
+                Some((
+                    panel, edge, background, notice, label_rows, start, end, redacted, highlights,
+                    gutter,
+                ))
             })?;
         let rows = panel.rows;
         if rows.is_empty() {
@@ -114,7 +130,26 @@ impl EditorElement {
         );
         let mut hitbox = text_hitbox.clone();
         hitbox.bounds.size.height = line_height * panel.height as f32;
-        hitbox.bounds.origin.y = text_hitbox.bottom() - hitbox.bounds.size.height;
+        let label_height = line_height * label_rows as f32;
+        hitbox.bounds.origin.y = match edge {
+            StuckEdge::Top => text_hitbox.top(),
+            StuckEdge::Bottom => text_hitbox.bottom() - hitbox.bounds.size.height,
+        };
+        let chrome = match edge {
+            StuckEdge::Top => Bounds::from_corners(
+                hitbox.bounds.origin,
+                hitbox.bounds.bottom_right() + point(px(0.), label_height),
+            ),
+            StuckEdge::Bottom => Bounds::from_corners(
+                hitbox.bounds.origin - point(px(0.), label_height),
+                hitbox.bounds.bottom_right(),
+            ),
+        };
+        let notice_y = match (edge, label_height > px(0.)) {
+            (StuckEdge::Top, true) => hitbox.bottom(),
+            (StuckEdge::Top, false) => hitbox.top(),
+            (StuckEdge::Bottom, _) => chrome.top(),
+        };
         let origin = point(origin.x, hitbox.top());
         let scroll = point(scroll.x, snapshot.row_at_y(panel.top_y));
         let pixels = point(pixels.x, panel.top_y * f64::from(line_height));
@@ -173,38 +208,42 @@ impl EditorElement {
             window,
             cx,
         );
-        Some(BottomExcerptLayout {
-            text: Rc::new(BottomExcerptText {
+        Some(StuckExcerptLayout {
+            text: Rc::new(StuckExcerptText {
                 rows,
                 lines,
                 bounds: hitbox.bounds,
-                chrome_top: hitbox.top() - line_height * label_rows as f32,
                 top_y: panel.top_y,
                 max_offset: panel.max_offset,
             }),
+            edge,
+            chrome,
+            background,
+            gutter,
             origin,
             selections,
             cursors,
             highlights,
             hints,
             notice,
+            notice_y,
         })
     }
 
-    pub(super) fn paint_bottom_excerpt(
+    pub(super) fn paint_stuck_excerpt(
         &self,
         layout: &mut EditorLayout,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(mut panel) = layout.bottom_excerpt.take() else {
+        let Some(mut panel) = layout.stuck_excerpt.take() else {
             return;
         };
         let line_height = layout.position_map.line_height;
         let snapshot = &layout.position_map.snapshot;
         let bounds = Bounds::from_corners(
-            point(layout.hitbox.left(), panel.text.chrome_top),
-            point(layout.hitbox.right(), panel.text.bounds.bottom()),
+            point(layout.hitbox.left(), panel.chrome.top()),
+            point(layout.hitbox.right(), panel.chrome.bottom()),
         );
         let whitespaces = self
             .editor
@@ -222,7 +261,16 @@ impl EditorElement {
             );
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_layer(|window| {
-                window.paint_quad(fill(bounds, self.style.background));
+                window.paint_quad(fill(bounds, panel.background));
+                self.paint_gutter_highlight_ranges(
+                    &panel.gutter,
+                    &panel.text.rows,
+                    panel.text.bounds.top(),
+                    panel.text.top_y * f64::from(line_height),
+                    layout,
+                    window,
+                    cx,
+                );
                 for (row, line) in panel.text.rows.iter_rows().zip(&panel.text.lines) {
                     line.draw_background(layout, row, text_origin, window, cx);
                 }
@@ -277,13 +325,13 @@ impl EditorElement {
                 }
                 if let Some(notice) = panel.notice {
                     let right = panel.text.bounds.right() - layout.position_map.em_advance;
-                    let at = point(right - notice.width, panel.text.chrome_top);
+                    let at = point(right - notice.width, panel.notice_y);
                     window.paint_quad(fill(
                         Bounds::new(
                             at,
                             size(notice.width + layout.position_map.em_advance, line_height),
                         ),
-                        self.style.background,
+                        panel.background,
                     ));
                     notice
                         .paint(at, line_height, TextAlign::Left, None, window, cx)

@@ -84,7 +84,6 @@ mod signature_help;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
-mod bottom_excerpt;
 mod clipboard;
 #[cfg(feature = "native")]
 mod code_actions;
@@ -103,6 +102,7 @@ mod markdown_actions;
 mod navigation;
 mod rewrap;
 mod selection;
+mod stuck_excerpt;
 
 pub use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -125,6 +125,7 @@ pub use display_map::{
 };
 #[cfg(feature = "native")]
 pub use edit_prediction::make_suggestion_styles;
+pub use stuck_excerpt::StuckEdge;
 
 #[derive(Clone)]
 pub struct EditorRightPrompt {
@@ -1303,7 +1304,7 @@ pub struct Editor {
     last_bounds: Option<Bounds<Pixels>>,
     defer_paint_until_initial_wrap: bool,
     last_position_map: Option<Rc<PositionMap>>,
-    bottom_excerpt: Option<bottom_excerpt::BottomExcerpt>,
+    stuck_excerpt: Option<stuck_excerpt::StuckExcerpt>,
     /// The right margin (vertical scrollbar + minimap width) the editor was
     /// last laid out with, updated on every prepaint.
     /// Used later in the frame by `SplitBufferHeadersElement` to shrink the
@@ -2807,7 +2808,7 @@ impl Editor {
             last_bounds: None,
             defer_paint_until_initial_wrap: false,
             last_position_map: None,
-            bottom_excerpt: None,
+            stuck_excerpt: None,
             last_right_margin: Pixels::ZERO,
             last_horizontal_scrollbar_visible: false,
             expect_bounds_change: None,
@@ -12348,15 +12349,11 @@ impl Editor {
     ) -> Option<gpui::Point<Pixels>> {
         let map = self.last_position_map.as_ref()?;
         let origin = map.text_hitbox.bounds.origin;
-        let projected_y = map.bottom_excerpt_y(source.row());
+        if let Some(position) = map.stuck_excerpt_position(source) {
+            return Some(position);
+        }
         self.display_to_pixel_point(source, editor_snapshot, window, cx)
-            .map(|position| {
-                let mut position = origin + position;
-                if let Some(y) = projected_y {
-                    position.y = y;
-                }
-                position
-            })
+            .map(|position| origin + position)
     }
 
     pub fn register_addon<T: Addon>(&mut self, instance: T) {

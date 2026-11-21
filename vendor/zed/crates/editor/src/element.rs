@@ -1,8 +1,9 @@
-mod bottom_excerpt;
 #[cfg(feature = "native")]
 mod header;
 mod mouse;
-use self::bottom_excerpt::{BottomExcerptLayout, BottomExcerptText};
+mod stuck_excerpt;
+use self::stuck_excerpt::{StuckExcerptLayout, StuckExcerptText};
+use crate::StuckEdge;
 
 #[cfg(all(test, feature = "native"))]
 pub(crate) use header::StickyHeader;
@@ -3481,8 +3482,8 @@ impl EditorElement {
             return Vec::new();
         }
 
-        // Show the placeholder when the editor is empty
-        if snapshot.is_empty() {
+        // An empty buffer can still draw display text supplied by an inlay.
+        if snapshot.is_empty() && snapshot.line_len(DisplayRow(0)) == 0 {
             let font_size = style.text.font_size.to_pixels(window.rem_size());
             let placeholder_color = cx.theme().colors().text_placeholder;
             let placeholder_text = snapshot.placeholder_text();
@@ -6162,6 +6163,27 @@ impl EditorElement {
             },
         );
 
+        self.paint_gutter_highlight_ranges(
+            &layout.highlighted_gutter_ranges,
+            &layout.visible_display_row_range,
+            layout.gutter_hitbox.top(),
+            layout.position_map.scroll_pixel_position.y,
+            layout,
+            window,
+            cx,
+        );
+    }
+
+    fn paint_gutter_highlight_ranges(
+        &self,
+        highlights: &[(Range<DisplayPoint>, Hsla)],
+        visible_rows: &Range<DisplayRow>,
+        gutter_origin_y: Pixels,
+        scroll_y_pixels: ScrollPixelOffset,
+        layout: &EditorLayout,
+        window: &mut Window,
+        cx: &App,
+    ) {
         let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
         let image_gutter = layout.position_map.snapshot.has_gutter_images;
         let highlight_width = if compact_gutter || image_gutter {
@@ -6172,29 +6194,29 @@ impl EditorElement {
         let highlight_corner_radii = Corners::all(0.05 * layout.position_map.line_height);
         let text_inset = self.editor.read(cx).gutter_highlight_text_inset;
         window.paint_layer(|window| {
-            for (range, color) in &layout.highlighted_gutter_ranges {
-                let start_row = if range.start.row() < layout.visible_display_row_range.start {
-                    layout.visible_display_row_range.start - DisplayRow(1)
+            for (range, color) in highlights {
+                let start_row = if range.start.row() < visible_rows.start {
+                    visible_rows.start - DisplayRow(1)
                 } else {
                     range.start.row()
                 };
-                let end_row = if range.end.row() > layout.visible_display_row_range.end {
-                    layout.visible_display_row_range.end + DisplayRow(1)
+                let end_row = if range.end.row() > visible_rows.end {
+                    visible_rows.end + DisplayRow(1)
                 } else {
                     range.end.row()
                 };
 
-                let start_y = layout.gutter_hitbox.top()
+                let start_y = gutter_origin_y
                     + Pixels::from(
                         layout.position_map.snapshot.row_y(start_row.as_f64())
                             * ScrollPixelOffset::from(layout.position_map.line_height)
-                            - layout.position_map.scroll_pixel_position.y,
+                            - scroll_y_pixels,
                     );
-                let end_y = layout.gutter_hitbox.top()
+                let end_y = gutter_origin_y
                     + Pixels::from(
                         (layout.position_map.snapshot.row_y(end_row.as_f64()) + 1.)
                             * ScrollPixelOffset::from(layout.position_map.line_height)
-                            - layout.position_map.scroll_pixel_position.y,
+                            - scroll_y_pixels,
                     );
                 let highlight_left = if let Some(inset) = text_inset {
                     layout.content_origin.x + layout.position_map.em_advance * inset
@@ -10652,8 +10674,8 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
-                    let bottom_excerpt = if !is_minimap {
-                        self.layout_bottom_excerpt(
+                    let stuck_excerpt = if !is_minimap {
+                        self.layout_stuck_excerpt(
                             &snapshot,
                             &text_hitbox,
                             content_origin,
@@ -11082,7 +11104,7 @@ impl Element for EditorElement {
                         scroll_pixel_position,
                         scroll_max,
                         line_layouts,
-                        bottom_excerpt: bottom_excerpt.as_ref().map(|p| p.text.clone()),
+                        stuck_excerpt: stuck_excerpt.as_ref().map(|p| p.text.clone()),
                         line_height,
                         em_advance,
                         em_layout_width,
@@ -11133,7 +11155,7 @@ impl Element for EditorElement {
                         mode,
                         defer_paint_until_rewrapped,
                         position_map,
-                        bottom_excerpt,
+                        stuck_excerpt,
                         visible_display_row_range: start_row..end_row,
                         wrap_guides,
                         indent_guides,
@@ -11281,10 +11303,17 @@ impl Element for EditorElement {
                     #[cfg(not(feature = "native"))]
                     let below_sticky_headers_mask = None;
 
-                    let history_mask = layout.bottom_excerpt.as_ref().map(|panel| {
-                        let mut visible = bounds;
-                        visible.size.height = (panel.text.chrome_top - bounds.top()).max(px(0.));
-                        ContentMask { bounds: visible }
+                    let history_mask = layout.stuck_excerpt.as_ref().map(|panel| {
+                        let (top, bottom) = match panel.edge {
+                            StuckEdge::Top => (panel.chrome.bottom(), bounds.bottom()),
+                            StuckEdge::Bottom => (bounds.top(), panel.chrome.top()),
+                        };
+                        ContentMask {
+                            bounds: Bounds::new(
+                                point(bounds.left(), top),
+                                size(bounds.size.width, (bottom - top).max(px(0.))),
+                            ),
+                        }
                     });
                     window.with_content_mask(below_sticky_headers_mask, |window| {
                         window.with_content_mask(history_mask, |window| {
@@ -11319,7 +11348,7 @@ impl Element for EditorElement {
                         });
                     });
 
-                    self.paint_bottom_excerpt(layout, window, cx);
+                    self.paint_stuck_excerpt(layout, window, cx);
 
                     #[cfg(feature = "native")]
                     window.with_element_namespace("blocks", |window| {
@@ -11398,7 +11427,7 @@ impl ScrollbarLayoutInformation {
 
 pub struct EditorLayout {
     position_map: Rc<PositionMap>,
-    bottom_excerpt: Option<BottomExcerptLayout>,
+    stuck_excerpt: Option<StuckExcerptLayout>,
     defer_paint_until_rewrapped: bool,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -11946,7 +11975,7 @@ pub(crate) struct PositionMap {
     pub em_layout_width: Pixels,
     pub visible_row_range: Range<DisplayRow>,
     pub line_layouts: Vec<LineWithInvisibles>,
-    pub(super) bottom_excerpt: Option<Rc<BottomExcerptText>>,
+    pub(super) stuck_excerpt: Option<Rc<StuckExcerptText>>,
     pub snapshot: EditorSnapshot,
     pub text_align: TextAlign,
     pub content_width: Pixels,
@@ -12028,7 +12057,7 @@ impl PositionMap {
     }
 
     pub(crate) fn point_for_position(&self, position: gpui::Point<Pixels>) -> PointForPosition {
-        if let Some(panel) = &self.bottom_excerpt
+        if let Some(panel) = &self.stuck_excerpt
             && panel.bounds.contains(&position)
         {
             let row = DisplayRow(
@@ -12063,12 +12092,28 @@ impl PositionMap {
         self.point_for_position_on_row(position.x, row, line)
     }
 
-    pub(crate) fn bottom_excerpt_y(&self, row: DisplayRow) -> Option<Pixels> {
-        let panel = self.bottom_excerpt.as_ref()?;
+    pub(crate) fn stuck_excerpt_y(&self, row: DisplayRow) -> Option<Pixels> {
+        let panel = self.stuck_excerpt.as_ref()?;
         panel.rows.contains(&row).then(|| {
             panel.bounds.top()
                 + self.line_height * (self.snapshot.row_y(row.as_f64()) - panel.top_y) as f32
         })
+    }
+
+    pub(crate) fn stuck_excerpt_position(
+        &self,
+        source: DisplayPoint,
+    ) -> Option<gpui::Point<Pixels>> {
+        let panel = self.stuck_excerpt.as_ref()?;
+        let y = self.stuck_excerpt_y(source.row())?;
+        let line = panel
+            .lines
+            .get(source.row().minus(panel.rows.start) as usize)?;
+        let x = self.text_hitbox.left()
+            + line.alignment_offset(self.text_align, self.content_width)
+            + line.x_for_index(source.column() as usize)
+            - self.scroll_position.x as f32 * self.em_layout_width;
+        Some(point(x, y))
     }
 
     fn point_for_position_on_row(

@@ -3179,7 +3179,7 @@ impl EntityInputHandler for Editor {
         let y = self
             .last_position_map
             .as_ref()
-            .and_then(|map| map.bottom_excerpt_y(start.row()))
+            .and_then(|map| map.stuck_excerpt_y(start.row()))
             .map(|y| y - element_bounds.top())
             .unwrap_or_else(|| {
                 line_height

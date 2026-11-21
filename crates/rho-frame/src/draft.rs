@@ -1,77 +1,141 @@
-//! An editor over read-only history followed by a writable draft. The last
-//! history row is the separator; the next row belongs to the draft buffer.
+//! One editor with a writable draft and read-only history in separate excerpts.
 
 use editor::display_map::{DisplaySnapshot, ToDisplayPoint as _};
-use editor::{Anchor, Bias, Editor, RowExt as _};
+use editor::{Anchor, Bias, Editor, HighlightKey, Inlay, RowExt as _, StuckEdge};
 use gpui::{App, AppContext as _, Context, Entity, Focusable, Pixels, Window};
-use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+use language::{Buffer, Capability, InlayId, Point};
+use multi_buffer::{MultiBuffer, MultiBufferSnapshot, PathKey, ToPoint as _};
 
-pub fn document(
-    history: &Entity<Buffer>,
-    draft: &Entity<Buffer>,
-    cx: &mut App,
-) -> Entity<MultiBuffer> {
-    cx.new(|cx| {
-        let mut doc = MultiBuffer::without_headers(Capability::ReadWrite);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Top,
+    Bottom,
+}
+
+impl Placement {
+    fn path(self) -> PathKey {
+        PathKey::sorted(match self {
+            Self::Top => 0,
+            Self::Bottom => 1,
+        })
+    }
+
+    fn history_path(self) -> PathKey {
+        match self {
+            Self::Top => Self::Bottom.path(),
+            Self::Bottom => Self::Top.path(),
+        }
+    }
+
+    pub fn document(
+        self,
+        history: &Entity<Buffer>,
+        draft: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Entity<MultiBuffer> {
+        cx.new(|cx| {
+            let mut doc = MultiBuffer::without_headers(Capability::ReadWrite);
+            Self::set_excerpt(&mut doc, self.history_path(), history, cx);
+            Self::set_excerpt(&mut doc, self.path(), draft, cx);
+            doc
+        })
+    }
+
+    fn set_excerpt(
+        doc: &mut MultiBuffer,
+        path: PathKey,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<MultiBuffer>,
+    ) {
         doc.set_excerpts_for_path(
-            PathKey::sorted(0),
-            history.clone(),
-            [Point::zero()..history.read(cx).max_point()],
+            path,
+            buffer.clone(),
+            [Point::zero()..buffer.read(cx).max_point()],
             0,
             cx,
         );
-        set_excerpt(&mut doc, draft, cx);
-        doc
-    })
+    }
+
+    pub fn stick(self, editor: &mut Editor, notice: gpui::SharedString, cx: &mut Context<Editor>) {
+        let edge = match self {
+            Self::Top => StuckEdge::Top,
+            Self::Bottom => StuckEdge::Bottom,
+        };
+        editor.set_stuck_excerpt(
+            self.path(),
+            edge,
+            notice,
+            rho_window::style::command_strip_background,
+            cx,
+        );
+    }
+
+    /// A sent draft isn't the next draft's undo history.
+    pub fn replace(self, editor: &Entity<Editor>, draft: &Entity<Buffer>, cx: &mut App) {
+        let doc = editor.read(cx).buffer().clone();
+        doc.update(cx, |doc, cx| self.replace_excerpt(doc, draft, cx));
+        editor.update(cx, |editor, cx| {
+            editor.disable_header_for_buffer(draft.read(cx).remote_id(), cx);
+        });
+    }
+
+    fn replace_excerpt(
+        self,
+        doc: &mut MultiBuffer,
+        draft: &Entity<Buffer>,
+        cx: &mut Context<MultiBuffer>,
+    ) {
+        doc.remove_excerpts(self.path(), cx);
+        Self::set_excerpt(doc, self.path(), draft, cx);
+    }
+
+    pub fn range(self, snapshot: &MultiBufferSnapshot) -> std::ops::Range<Anchor> {
+        snapshot
+            .single_excerpt_range(&self.path())
+            .expect("document has one draft excerpt")
+    }
+
+    pub fn history_start(self, snapshot: &MultiBufferSnapshot) -> Point {
+        snapshot
+            .single_excerpt_range(&self.history_path())
+            .expect("document has one history excerpt")
+            .start
+            .to_point(snapshot)
+    }
 }
 
-fn set_excerpt(doc: &mut MultiBuffer, draft: &Entity<Buffer>, cx: &mut Context<MultiBuffer>) {
-    doc.set_excerpts_for_path(
-        path(),
-        draft.clone(),
-        [Point::zero()..draft.read(cx).max_point()],
-        0,
+struct DraftGutter;
+const PLACEHOLDER: usize = usize::MAX;
+
+pub fn style(
+    editor: &mut Editor,
+    range: std::ops::Range<Anchor>,
+    placeholder: &'static str,
+    cx: &mut Context<Editor>,
+) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let empty = range.start.to_point(&snapshot) == range.end.to_point(&snapshot);
+    let inlay = empty.then(|| Inlay::custom(PLACEHOLDER, range.end, placeholder));
+    editor.splice_inlays(
+        &[InlayId::Custom(PLACEHOLDER)],
+        inlay.into_iter().collect(),
         cx,
     );
-}
-
-fn path() -> PathKey {
-    PathKey::sorted(1)
-}
-
-/// Keep this document's designated draft excerpt on screen while reading.
-pub fn stick(editor: &mut Editor, notice: gpui::SharedString, cx: &mut Context<Editor>) {
-    editor.set_bottom_stuck_excerpt(path(), notice, cx);
-}
-
-/// A sent draft isn't the next draft's undo history.
-pub fn replace(editor: &Entity<Editor>, draft: &Entity<Buffer>, cx: &mut App) {
-    let doc = editor.read(cx).buffer().clone();
-    doc.update(cx, |doc, cx| replace_excerpt(doc, draft, cx));
-    editor.update(cx, |editor, cx| {
-        editor.disable_header_for_buffer(draft.read(cx).remote_id(), cx);
-    });
-}
-
-fn replace_excerpt(doc: &mut MultiBuffer, draft: &Entity<Buffer>, cx: &mut Context<MultiBuffer>) {
-    doc.remove_excerpts(path(), cx);
-    set_excerpt(doc, draft, cx);
-}
-
-pub fn start(history: &Entity<Buffer>, cx: &App) -> Point {
-    Point::new(history.read(cx).max_point().row + 1, 0)
-}
-
-pub fn on_tail(editor: &Editor, history: &Entity<Buffer>, cx: &App) -> bool {
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
-    editor
-        .selections
-        .newest_anchor()
-        .head()
-        .to_point(&snapshot)
-        .row
-        >= start(history, cx).row
+    editor.highlight_text(
+        HighlightKey::SyntaxTreeView(rho_window::style::PROMPT_DRAFT_HIGHLIGHT_KEY),
+        if empty {
+            Vec::new()
+        } else {
+            vec![range.clone()]
+        },
+        rho_window::style::StyleClass::UserMessage.resolve(cx),
+        cx,
+    );
+    editor.highlight_gutter::<DraftGutter>(
+        vec![range],
+        rho_window::style::user_prompt_gutter_color,
+        cx,
+    );
 }
 
 /// A visible Insert caret before the history above it changes.
@@ -81,18 +145,18 @@ pub struct WritingCaret {
 }
 
 impl WritingCaret {
-    pub fn capture(
-        editor: &Entity<Editor>,
-        history: &Entity<Buffer>,
-        cx: &mut App,
-    ) -> Option<Self> {
-        if !vim::editor_in_insert_mode(editor, cx) || !on_tail(editor.read(cx), history, cx) {
+    pub fn capture(editor: &Entity<Editor>, draft: &Entity<Buffer>, cx: &mut App) -> Option<Self> {
+        if !vim::editor_in_insert_mode(editor, cx) {
             return None;
         }
         editor.update(cx, |editor, cx| {
             let anchor = editor.selections.newest_anchor().head();
             let scroll = editor.scroll_position(cx);
             let display = editor.display_snapshot(cx);
+            let (_, buffer) = display.buffer_snapshot().anchor_to_buffer_anchor(anchor)?;
+            if buffer.remote_id() != draft.read(cx).remote_id() {
+                return None;
+            }
             let screen_y = Self::row_y(anchor, &display) - display.row_y(scroll.y);
             (0. <= screen_y && screen_y < editor.visible_line_count()?)
                 .then_some(Self { anchor, screen_y })
@@ -138,6 +202,7 @@ pub enum Hit {
 }
 
 pub fn hit(
+    placement: Placement,
     editor: &Editor,
     history: &Entity<Buffer>,
     draft: &Entity<Buffer>,
@@ -150,8 +215,11 @@ pub fn hit(
         Some(Hit::Text(anchor))
     } else {
         let history = history.read(cx);
-        (buffer_id == history.remote_id()
-            && history.offset_to_point(offset).row == history.max_point().row)
+        let separator = match placement {
+            Placement::Top => 0,
+            Placement::Bottom => history.max_point().row,
+        };
+        (buffer_id == history.remote_id() && history.offset_to_point(offset).row == separator)
             .then_some(Hit::Separator)
     }
 }
@@ -160,15 +228,14 @@ pub fn hit(
 /// inside the draft before invoking Vim so it doesn't jump in from history,
 /// then place the exact caret without Normal's end-of-line clipping.
 pub fn focus(
+    placement: Placement,
     editor: &Entity<Editor>,
-    history: &Entity<Buffer>,
     position: Option<Anchor>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let tail = start(history, cx);
     let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-    let start = snapshot.anchor_after(tail);
+    let start = placement.range(&snapshot).start;
     focus_writing_at(editor, start, position.unwrap_or(start), window, cx);
 }
 
@@ -202,6 +269,10 @@ pub fn focus_writing_at(
 mod tests {
     use super::*;
 
+    fn start(history: &Entity<Buffer>, cx: &App) -> Point {
+        Point::new(history.read(cx).max_point().row + 1, 0)
+    }
+
     #[gpui::test]
     fn a_short_tail_clamps_and_the_stuck_draft_resolves_to_its_real_buffer(
         cx: &mut gpui::TestAppContext,
@@ -227,7 +298,7 @@ mod tests {
                 buffer
             });
             let draft = cx.new(|cx| Buffer::local("one line\nlonger second row", cx));
-            let doc = document(&history, &draft, cx);
+            let doc = Placement::Bottom.document(&history, &draft, cx);
             (history, draft, doc)
         });
         let window = cx.add_window(|window, cx| {
@@ -242,7 +313,7 @@ mod tests {
                 window,
                 cx,
             );
-            stick(&mut editor, "↓ new mail".into(), cx);
+            Placement::Bottom.stick(&mut editor, "↓ new mail".into(), cx);
             editor
         });
         cx.simulate_window_resize(window.into(), size(px(600.), px(338.)));
@@ -271,7 +342,7 @@ mod tests {
             let top = display.row_y(editor.scroll_position(cx).y);
             assert!((top + viewport - bottom).abs() < 0.1,
                 "the viewport must end at the draft, not the requested top: {top} + {viewport} != {bottom}");
-            assert!(!editor.bottom_stuck_excerpt_is_visible());
+            assert!(!editor.stuck_excerpt_is_visible());
             top
         }).unwrap();
 
@@ -286,7 +357,7 @@ mod tests {
             .update(cx, |editor, window, cx| {
                 let display = editor.snapshot(window, cx);
                 assert!(
-                    editor.bottom_stuck_excerpt_is_visible(),
+                    editor.stuck_excerpt_is_visible(),
                     "half-page up sticks the draft"
                 );
                 let top = display.row_y(editor.scroll_position(cx).y);
@@ -324,7 +395,7 @@ mod tests {
         cx.draw_window(window.into());
         window
             .update(cx, |editor, _, cx| {
-                assert!(!editor.bottom_stuck_excerpt_is_visible());
+                assert!(!editor.stuck_excerpt_is_visible());
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
                 assert_eq!(
                     editor.selections.newest_anchor().head().to_point(&snapshot),
@@ -341,7 +412,7 @@ mod tests {
             .join("\n");
         let tall = cx.update(|cx| cx.new(|cx| Buffer::local(&long, cx)));
         let editor = window.root(cx).unwrap();
-        cx.update(|cx| replace(&editor, &tall, cx));
+        cx.update(|cx| Placement::Bottom.replace(&editor, &tall, cx));
         window
             .update(cx, |editor, window, cx| {
                 let caret = Anchor::Max;
@@ -355,7 +426,7 @@ mod tests {
         let (over_draft, history_top) = window
             .update(cx, |editor, window, cx| {
                 let display = editor.snapshot(window, cx);
-                assert!(editor.bottom_stuck_excerpt_is_visible());
+                assert!(editor.stuck_excerpt_is_visible());
                 let end = editor
                     .window_position_for_display_point(display.max_point(), &display, window, cx)
                     .unwrap();
@@ -442,8 +513,111 @@ mod tests {
                     (height - f64::from(xy.y) - line).abs() < 1.0,
                     "the short document is bottom-aligned"
                 );
-                assert!(!editor.bottom_stuck_excerpt_is_visible());
+                assert!(!editor.stuck_excerpt_is_visible());
                 assert_eq!(editor.scroll_position(cx).y, 0.0);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_top_projection_keeps_a_tall_drafts_real_caret_and_leaves_room_for_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use editor::scroll::ScrollAmount;
+        use editor::{EditorMode, SizingBehavior};
+        use gpui::{point, px, size};
+
+        let (draft, history, document, last_offset) = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+
+            let text = (0..27)
+                .map(|i| format!("draft line {i}\n"))
+                .collect::<String>();
+            let draft = cx.new(|cx| Buffer::local(&text, cx));
+            let history = cx.new(|cx| {
+                let mut buffer = Buffer::local(&"history under the draft\n".repeat(48), cx);
+                buffer.set_capability(Capability::Read, cx);
+                buffer
+            });
+            let doc = Placement::Top.document(&history, &draft, cx);
+            (draft, history, doc, text.len())
+        });
+        let window = cx.add_window(|window, cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                document.clone(),
+                None,
+                window,
+                cx,
+            );
+            Placement::Top.stick(&mut editor, "↑ new mail".into(), cx);
+            editor
+        });
+        cx.simulate_window_resize(window.into(), size(px(600.), px(338.)));
+        cx.draw_window(window.into());
+        let caret = cx.update(|cx| Placement::Top.range(&document.read(cx).snapshot(cx)).end);
+        window
+            .update(cx, |editor, window, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([caret..caret]);
+                });
+                editor.set_scroll_position(point(0., 35.), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        let before = window
+            .update(cx, |editor, window, cx| {
+                let display = editor.snapshot(window, cx);
+                assert!(editor.stuck_excerpt_is_visible());
+                let at = editor
+                    .window_position_for_display_point(
+                        caret.to_display_point(&display),
+                        &display,
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                let (_, buffer, offset) = editor
+                    .buffer_location_for_window_position(
+                        point(at.x + px(1.), at.y + px(4.)),
+                        Bias::Left,
+                    )
+                    .unwrap();
+                assert_eq!((buffer, offset), (draft.read(cx).remote_id(), last_offset));
+                let below = point(at.x + px(3.), window.viewport_size().height / 2. + px(2.));
+                let (_, buffer, _) = editor
+                    .buffer_location_for_window_position(below, Bias::Left)
+                    .unwrap();
+                assert_eq!(buffer, history.read(cx).remote_id());
+                editor.scroll_position(cx).y
+            })
+            .unwrap();
+        window
+            .update(cx, |editor, window, cx| {
+                editor.scroll_screen_with_cursor_margin(&ScrollAmount::Page(0.5), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        window
+            .update(cx, |editor, _, cx| {
+                assert!(editor.scroll_position(cx).y > before);
+                assert_eq!(
+                    editor
+                        .selections
+                        .newest_anchor()
+                        .head()
+                        .to_point(&document.read(cx).snapshot(cx)),
+                    caret.to_point(&document.read(cx).snapshot(cx))
+                );
             })
             .unwrap();
     }
@@ -458,7 +632,7 @@ mod tests {
                 history
             });
             let draft = cx.new(|cx| Buffer::local("some draft", cx));
-            let document = document(&history, &draft, cx);
+            let document = Placement::Bottom.document(&history, &draft, cx);
             let count = blocked.clone();
             let subscription = cx.subscribe(&document, move |_, event: &multi_buffer::Event, _| {
                 if matches!(event, multi_buffer::Event::EditBlockedByReadOnly) {
@@ -506,7 +680,7 @@ mod tests {
                 history
             });
             let draft = cx.new(|cx| Buffer::local("one\ntwo words\nthree", cx));
-            let document = document(&history, &draft, cx);
+            let document = Placement::Bottom.document(&history, &draft, cx);
             assert_eq!(
                 document.read(cx).snapshot(cx).text(),
                 "old mail\n── reply\none\ntwo words\nthree"
@@ -554,7 +728,7 @@ mod tests {
 
             let next_draft = cx.new(|cx| Buffer::local("", cx));
             document.update(cx, |doc, cx| {
-                replace_excerpt(doc, &next_draft, cx);
+                Placement::Bottom.replace_excerpt(doc, &next_draft, cx);
                 assert!(doc.redo(cx).is_none(), "the sent draft is discarded");
             });
             let snapshot = document.read(cx).snapshot(cx);
@@ -583,7 +757,7 @@ mod tests {
                 buffer.set_capability(Capability::Read, cx);
                 buffer
             });
-            let doc = document(&history, &draft, cx);
+            let doc = Placement::Bottom.document(&history, &draft, cx);
             let start = start(&history, cx);
             let separator = Point::new(start.row - 1, 3);
             let snapshot = doc.read(cx).snapshot(cx);
@@ -593,7 +767,7 @@ mod tests {
 
             let addressed = cx.new(|cx| Buffer::local("", cx));
             doc.update(cx, |doc, cx| {
-                replace_excerpt(doc, &addressed, cx);
+                Placement::Bottom.replace_excerpt(doc, &addressed, cx);
                 let snapshot = doc.snapshot(cx);
                 assert!(Editor::point_is_editable(&snapshot, start));
                 assert!(!Editor::point_is_editable(&snapshot, separator));

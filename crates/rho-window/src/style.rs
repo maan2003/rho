@@ -140,6 +140,17 @@ pub fn hint_color(cx: &App) -> Hsla {
         .unwrap_or(cx.theme().status().hint.into())
 }
 
+/// The command strip sits one shade above the reading surface.
+pub fn command_strip_background(cx: &App) -> Hsla {
+    let mut background: Hsla = cx.theme().colors().editor_background.into();
+    if background.l < 0.5 {
+        background.l += 0.04;
+    } else {
+        background.l -= 0.04;
+    }
+    background
+}
+
 pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
     cx.theme().colors().text_accent.into()
 }

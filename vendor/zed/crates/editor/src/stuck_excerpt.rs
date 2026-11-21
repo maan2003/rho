@@ -1,17 +1,34 @@
-//! A bottom projection of one excerpt of the editor's own MultiBuffer.
+//! An edge projection of one excerpt of the editor's own MultiBuffer.
 //! Layout uses real display rows; the document, anchors, search and
 //! selections never include a second copy of the excerpt.
 
 use std::ops::Range;
 
-use gpui::{App, Context, SharedString};
+use gpui::{App, Context, Hsla, SharedString};
 use multi_buffer::{Anchor, PathKey, ToPoint as _};
 
 use crate::display_map::{DisplaySnapshot, ToDisplayPoint as _};
 use crate::{DisplayRow, Editor, RowExt as _};
 
-pub(crate) struct BottomExcerpt {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StuckEdge {
+    Top,
+    Bottom,
+}
+
+impl StuckEdge {
+    pub(crate) fn is_outside(self, start: f64, end: f64, scroll: f64, viewport: f64) -> bool {
+        match self {
+            Self::Top => end <= scroll,
+            Self::Bottom => start >= scroll + viewport,
+        }
+    }
+}
+
+pub(crate) struct StuckExcerpt {
     path: PathKey,
+    pub(crate) edge: StuckEdge,
+    pub(crate) background: fn(&App) -> Hsla,
     /// Offset within the excerpt, in vertical display units.
     offset: f64,
     followed_head: Option<Anchor>,
@@ -20,7 +37,7 @@ pub(crate) struct BottomExcerpt {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct BottomExcerptRows {
+pub(crate) struct StuckExcerptRows {
     pub(crate) rows: Range<DisplayRow>,
     pub(crate) top_y: f64,
     pub(crate) height: f64,
@@ -28,17 +45,21 @@ pub(crate) struct BottomExcerptRows {
 }
 
 impl Editor {
-    /// Project one single-excerpt path onto the bottom of this editor
-    /// when its first display row would otherwise be below the viewport.
+    /// Project one single-excerpt path onto this edge when none of its
+    /// display rows is visible in the ordinary viewport.
     /// The path remains designated when its excerpt is replaced.
-    pub fn set_bottom_stuck_excerpt(
+    pub fn set_stuck_excerpt(
         &mut self,
         path: PathKey,
+        edge: StuckEdge,
         pending_label: SharedString,
+        background: fn(&App) -> Hsla,
         cx: &mut Context<Self>,
     ) {
-        self.bottom_excerpt = Some(BottomExcerpt {
+        self.stuck_excerpt = Some(StuckExcerpt {
             path,
+            edge,
+            background,
             offset: 0.0,
             followed_head: None,
             label: pending_label,
@@ -49,8 +70,8 @@ impl Editor {
 
     /// Have a short end-aligned label in the stuck excerpt until the
     /// excerpt comes back inline. The label is outside the document.
-    pub fn mark_bottom_stuck_excerpt(&mut self, cx: &mut Context<Self>) {
-        if let Some(excerpt) = &mut self.bottom_excerpt {
+    pub fn mark_stuck_excerpt(&mut self, cx: &mut Context<Self>) {
+        if let Some(excerpt) = &mut self.stuck_excerpt {
             excerpt.pending = true;
             cx.notify();
         }
@@ -58,19 +79,21 @@ impl Editor {
 
     /// Whether this editor needs its lower edge kept above surrounding UI.
     pub fn keeps_bottom_visible(&self) -> bool {
-        self.bottom_excerpt.is_some()
+        self.stuck_excerpt
+            .as_ref()
+            .is_some_and(|state| state.edge == StuckEdge::Bottom)
     }
 
-    pub fn bottom_stuck_excerpt_is_visible(&self) -> bool {
+    pub fn stuck_excerpt_is_visible(&self) -> bool {
         self.last_position_map
             .as_ref()
-            .is_some_and(|map| map.bottom_excerpt.is_some())
+            .is_some_and(|map| map.stuck_excerpt.is_some())
     }
 
     /// Preserve a point in the excerpt on viewport (rather than point)
     /// motions, even when the excerpt is currently inline.
-    pub fn point_in_bottom_stuck_excerpt(&self, cx: &App) -> bool {
-        self.bottom_excerpt.as_ref().is_some_and(|excerpt| {
+    pub fn point_in_stuck_excerpt(&self, cx: &App) -> bool {
+        self.stuck_excerpt.as_ref().is_some_and(|excerpt| {
             let buffer = self.buffer.read(cx).snapshot(cx);
             let Some(range) = buffer.single_excerpt_range(&excerpt.path) else {
                 return false;
@@ -80,11 +103,11 @@ impl Editor {
         })
     }
 
-    pub(crate) fn bottom_excerpt_range(
+    pub(crate) fn stuck_excerpt_range(
         &self,
         snapshot: &DisplaySnapshot,
     ) -> Option<Range<DisplayRow>> {
-        let state = self.bottom_excerpt.as_ref()?;
+        let state = self.stuck_excerpt.as_ref()?;
         let range = snapshot
             .buffer_snapshot()
             .single_excerpt_range(&state.path)?;
@@ -94,25 +117,26 @@ impl Editor {
         )
     }
 
-    pub(crate) fn scroll_bottom_excerpt(&mut self, delta: f64, max: f64, cx: &mut Context<Self>) {
-        if let Some(state) = &mut self.bottom_excerpt {
+    pub(crate) fn scroll_stuck_excerpt(&mut self, delta: f64, max: f64, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.stuck_excerpt {
             state.offset = (state.offset + delta).clamp(0.0, max);
             cx.notify();
         }
     }
 
-    pub(crate) fn layout_bottom_excerpt_rows(
+    pub(crate) fn layout_stuck_excerpt_rows(
         &mut self,
         snapshot: &DisplaySnapshot,
         scroll_y: f64,
         viewport: f64,
         label_rows: f64,
-    ) -> Option<BottomExcerptRows> {
-        let rows = self.bottom_excerpt_range(snapshot)?;
+    ) -> Option<StuckExcerptRows> {
+        let rows = self.stuck_excerpt_range(snapshot)?;
         let start_y = snapshot.row_y(rows.start.as_f64());
         let end_y = snapshot.row_y(rows.end.as_f64());
-        let state = self.bottom_excerpt.as_mut()?;
-        let Some((height, max_offset)) = panel_size(start_y, end_y, scroll_y, viewport, label_rows)
+        let state = self.stuck_excerpt.as_mut()?;
+        let Some((height, max_offset)) =
+            panel_size(state.edge, start_y, end_y, scroll_y, viewport, label_rows)
         else {
             state.pending = false;
             state.followed_head = None;
@@ -136,7 +160,7 @@ impl Editor {
         let top_y = start_y + state.offset;
         let first = DisplayRow(snapshot.row_at_y(top_y).floor() as u32).max(rows.start);
         let last = DisplayRow(snapshot.row_at_y(top_y + height).ceil() as u32).min(rows.end);
-        Some(BottomExcerptRows {
+        Some(StuckExcerptRows {
             rows: first..last,
             top_y,
             height,
@@ -146,6 +170,7 @@ impl Editor {
 }
 
 fn panel_size(
+    edge: StuckEdge,
     start: f64,
     end: f64,
     scroll: f64,
@@ -153,17 +178,38 @@ fn panel_size(
     label_rows: f64,
 ) -> Option<(f64, f64)> {
     let height = (end - start).min((viewport / 2.0).floor() - label_rows);
-    (start >= scroll + viewport && height > 0.0).then_some((height, end - start - height))
+    (edge.is_outside(start, end, scroll, viewport) && height > 0.0)
+        .then_some((height, end - start - height))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::panel_size;
+    use super::{StuckEdge, panel_size};
 
     #[test]
     fn the_same_excerpt_sticks_only_below_the_view_and_caps_at_half() {
-        assert_eq!(panel_size(45.0, 49.0, 14.0, 31.0, 0.0), Some((4.0, 0.0)));
-        assert_eq!(panel_size(45.0, 49.0, 14.01, 31.0, 0.0), None);
-        assert_eq!(panel_size(45.0, 71.0, 14.0, 31.0, 0.0), Some((15.0, 11.0)));
+        assert_eq!(
+            panel_size(StuckEdge::Bottom, 45.0, 49.0, 14.0, 31.0, 0.0),
+            Some((4.0, 0.0))
+        );
+        assert_eq!(
+            panel_size(StuckEdge::Bottom, 45.0, 49.0, 14.01, 31.0, 0.0),
+            None
+        );
+        assert_eq!(
+            panel_size(StuckEdge::Bottom, 45.0, 71.0, 14.0, 31.0, 0.0),
+            Some((15.0, 11.0))
+        );
+    }
+
+    #[test]
+    fn a_top_excerpt_sticks_only_when_its_last_row_has_left_the_view() {
+        let top = StuckEdge::Top;
+        assert_eq!(panel_size(top, 0.0, 5.0, 4.99, 19.0, 1.0), None);
+        assert_eq!(panel_size(top, 0.0, 5.0, 5.0, 19.0, 1.0), Some((5.0, 0.0)));
+        assert_eq!(
+            panel_size(top, 0.0, 21.0, 23.0, 19.0, 1.0),
+            Some((8.0, 13.0))
+        );
     }
 }
