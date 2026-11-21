@@ -234,10 +234,15 @@ impl TaffyLayoutEngine {
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+                |input, _id, node_context, style| {
+                    taffy::compute_leaf_layout(
+                        input,
+                        style,
+                        |_, _| 0.0,
+                        |known_dimensions, available_space| {
+                            let Some(node_context) = node_context else {
+                                return taffy::geometry::Size::default();
+                            };
 
                     let known_dimensions = Size {
                         width: known_dimensions.width.map(|e| Pixels(e / scale.width)),
@@ -253,6 +258,8 @@ impl TaffyLayoutEngine {
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
                     snap_measured_size_to_device_pixels(measured_size, scale).into()
+                        },
+                    )
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -506,10 +513,10 @@ impl ToTaffyAxes<taffy::style::Style> for Style {
             margin: self.margin.to_taffy(rem_size, scale),
             padding: self.padding.to_taffy(rem_size, scale),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale),
-            align_items: self.align_items.map(|x| x.into()),
+            align_items: self.align_items.map(Into::into).unwrap_or_default(),
             align_self: self.align_self.map(|x| x.into()),
-            align_content: self.align_content.map(|x| x.into()),
-            justify_content: self.justify_content.map(|x| x.into()),
+            align_content: self.align_content.map(Into::into).unwrap_or_default(),
+            justify_content: self.justify_content.map(Into::into).unwrap_or_default(),
             gap: self.gap.to_taffy(rem_size, scale),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),

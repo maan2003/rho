@@ -447,7 +447,7 @@ impl FoldMapWriter<'_> {
         for range in ranges.into_iter() {
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
             let mut folds_cursor =
-                intersecting_folds(&snapshot, &self.0.snapshot.folds, range.clone(), inclusive);
+                intersecting_folds(&snapshot, &self.0.snapshot.folds, range, inclusive);
             while let Some(fold) = folds_cursor.item() {
                 let offset_range =
                     fold.range.start.to_offset(buffer)..fold.range.end.to_offset(buffer);
@@ -508,7 +508,7 @@ impl FoldMapWriter<'_> {
                     ..inlay_snapshot.to_inlay_offset(buffer_end);
                 edits.push(InlayEdit {
                     old: inlay_range.clone(),
-                    new: inlay_range.clone(),
+                    new: inlay_range,
                 });
 
                 self.0.snapshot.fold_metadata_by_id.insert(

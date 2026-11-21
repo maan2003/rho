@@ -3,7 +3,6 @@ pub mod agent_server_store;
 pub mod bookmark_store;
 pub mod buffer_store;
 pub mod color_extractor;
-pub mod connection_manager;
 pub mod context_server_store;
 pub mod debounced_delay;
 pub mod debugger;
@@ -41,20 +40,20 @@ use crate::{
     git_store::GitStore,
     lsp_store::{SymbolLocation, log_store::LogKind},
     project_search::SearchResultsHandle,
-    trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
+    trusted_worktrees::{PathTrust, TrustedWorktrees},
     worktree_store::WorktreeIdCounter,
 };
 pub use agent_registry_store::{AgentRegistryStore, RegistryAgent};
 pub use agent_server_store::{AgentId, AgentServerStore, AgentServersUpdated, ExternalAgentSource};
 pub use git_store::{
-    ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,
+    ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate, delta_checkout_short_name,
     git_traversal::{ChildEntriesGitIter, GitEntry, GitEntryRef, GitTraversal},
     is_submodule_git_dir, linked_worktree_short_name, repo_identity_path,
-    repo_identity_path_if_local, worktrees_directory_for_repo,
+    worktrees_directory_for_repo,
 };
 pub use manifest_tree::ManifestTree;
 pub use project_search::{Search, SearchResults};
-pub use worktree_store::WorktreePaths;
+pub use worktree_store::{DeltaClone, WorktreePaths};
 
 use anyhow::{Context as _, Result, anyhow};
 use buffer_store::{BufferStore, BufferStoreEvent};
@@ -63,7 +62,7 @@ use client::{
 };
 use clock::ReplicaId;
 
-use dap::client::DebugAdapterClient;
+use dap::{VariableReference, client::SessionId};
 
 use collections::{BTreeSet, HashMap, HashSet, IndexSet};
 use debounced_delay::DebouncedDelay;
@@ -110,7 +109,7 @@ pub use prettier_store::PrettierStore;
 use project_settings::{ProjectSettings, SettingsObserver, SettingsObserverEvent};
 #[cfg(target_os = "windows")]
 use remote::wsl_path_to_windows_path;
-use remote::{RemoteClient, RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{RemoteClient, RemoteConnectionIdentity, RemoteConnectionOptions};
 use rpc::{
     AnyProtoClient, ErrorCode,
     proto::{LanguageServerPromptResponse, REMOTE_SERVER_PROJECT_ID},
@@ -202,11 +201,10 @@ pub trait ProjectItem: 'static {
     fn is_dirty(&self) -> bool;
 }
 
-#[derive(Clone)]
-pub enum OpenedBufferEvent {
-    Disconnected,
-    Ok(BufferId),
-    Err(BufferId, Arc<anyhow::Error>),
+#[derive(Debug, Clone)]
+pub enum ProjectHost<'a> {
+    Local,
+    Remote(&'a RemoteConnectionOptions),
 }
 
 /// Semantics-aware entity that is relevant to one or more [`Worktree`] with the files.
@@ -438,17 +436,14 @@ pub enum Event {
     },
     WorkspaceEditApplied(ProjectTransaction),
     AgentLocationChanged,
+    /// The remote server's `~/.agents/skills` changed.
+    GlobalSkillsChanged,
     BufferEdited {
         source: BufferEditSource,
     },
 }
 
 pub struct AgentLocationChanged;
-
-pub enum DebugAdapterClientState {
-    Starting(Task<Option<Arc<DebugAdapterClient>>>),
-    Running(Arc<DebugAdapterClient>),
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct ProjectPath {
@@ -929,6 +924,57 @@ pub enum HoverBlockKind {
     Code { language: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebuggerHoverVariable {
+    pub name: String,
+    pub evaluate_name: Option<String>,
+    pub value: String,
+    pub type_name: Option<String>,
+    pub variables_reference: VariableReference,
+}
+
+impl DebuggerHoverVariable {
+    fn from_evaluate_response(expression: String, response: &dap::EvaluateResponse) -> Self {
+        Self {
+            evaluate_name: Some(expression.clone()),
+            name: expression,
+            value: response.result.clone(),
+            type_name: response
+                .type_
+                .clone()
+                .filter(|type_name| !type_name.is_empty()),
+            variables_reference: response.variables_reference,
+        }
+    }
+
+    fn from_dap_variable(variable: dap::Variable) -> Self {
+        Self {
+            evaluate_name: variable.evaluate_name.filter(|name| !name.is_empty()),
+            name: variable.name,
+            value: variable.value,
+            type_name: variable.type_.filter(|type_name| !type_name.is_empty()),
+            variables_reference: variable.variables_reference,
+        }
+    }
+
+    pub fn has_children(&self) -> bool {
+        self.variables_reference != 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebuggerHoverData {
+    pub session_id: SessionId,
+    pub session_name: SharedString,
+    pub root: DebuggerHoverVariable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebuggerHover {
+    pub range: Range<language::Anchor>,
+    pub data: DebuggerHoverData,
+}
+
 #[derive(Debug, Clone)]
 pub struct Hover {
     pub contents: Vec<HoverBlock>,
@@ -1048,11 +1094,22 @@ impl DirectoryLister {
         project
             .visible_worktrees(cx)
             .next()
-            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                let abs_path = worktree.abs_path();
+                let directory = if worktree.root_entry().is_some_and(|entry| entry.is_file()) {
+                    path_style.parent(&abs_path).unwrap_or(&abs_path)
+                } else {
+                    &abs_path
+                };
+                directory.to_string_lossy().into_owned()
+            })
             .or_else(|| std::env::home_dir().map(|dir| dir.to_string_lossy().into_owned()))
-            .map(|mut s| {
-                s.push_str(path_style.primary_separator());
-                s
+            .map(|mut query| {
+                if !query.ends_with(path_style.separators_ch()) {
+                    query.push_str(path_style.primary_separator());
+                }
+                query
             })
             .unwrap_or_else(|| {
                 if path_style.is_windows() {
@@ -1174,8 +1231,6 @@ impl DisableAiSettings {
 
 impl Project {
     pub fn init(client: &Arc<Client>, cx: &mut App) {
-        connection_manager::init(client.clone(), cx);
-
         let client: AnyProtoClient = client.clone().into();
         client.add_entity_message_handler(Self::handle_add_collaborator);
         client.add_entity_message_handler(Self::handle_update_project_collaborator);
@@ -1431,14 +1486,13 @@ impl Project {
                 .detach();
             let snippets = SnippetProvider::new(fs.clone(), BTreeSet::from_iter([]), cx);
 
-            let (remote_proto, path_style, connection_options) =
-                remote.read_with(cx, |remote, _| {
-                    (
-                        remote.proto_client(),
-                        remote.path_style(),
-                        remote.connection_options(),
-                    )
-                });
+            let (remote_proto, path_style, remote_host) = remote.read_with(cx, |remote, _| {
+                (
+                    remote.proto_client(),
+                    remote.path_style(),
+                    remote.connection_options().identity().into_owned(),
+                )
+            });
             let worktree_store = cx.new(|cx| {
                 WorktreeStore::remote(
                     false,
@@ -1454,7 +1508,7 @@ impl Project {
             if init_worktree_trust {
                 trusted_worktrees::track_worktree_trust(
                     worktree_store.clone(),
-                    Some(RemoteHostLocation::from(connection_options)),
+                    Some(remote_host),
                     None,
                     Some((remote_proto.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
                     cx,
@@ -1673,6 +1727,7 @@ impl Project {
             remote_proto.add_entity_message_handler(Self::handle_update_worktree);
             remote_proto.add_entity_message_handler(Self::handle_update_project);
             remote_proto.add_entity_message_handler(Self::handle_toast);
+            remote_proto.add_entity_message_handler(Self::handle_global_skills_changed);
             remote_proto.add_entity_message_handler(Self::handle_telemetry_event);
             remote_proto.add_entity_request_handler(Self::handle_language_server_prompt_request);
             remote_proto
@@ -2340,10 +2395,20 @@ impl Project {
     }
 
     #[inline]
-    pub fn remote_connection_options(&self, cx: &App) -> Option<RemoteConnectionOptions> {
+    pub fn remote_connection_options<'a>(
+        &self,
+        cx: &'a App,
+    ) -> Option<&'a RemoteConnectionOptions> {
         self.remote_client
             .as_ref()
             .map(|remote| remote.read(cx).connection_options())
+    }
+
+    pub fn remote_connection_identity<'a>(
+        &self,
+        cx: &'a App,
+    ) -> Option<RemoteConnectionIdentity<'a>> {
+        self.remote_connection_options(cx).map(|o| o.identity())
     }
 
     /// Reveals the given path in the system file manager.
@@ -2354,11 +2419,11 @@ impl Project {
         #[cfg(target_os = "windows")]
         if let Some(RemoteConnectionOptions::Wsl(wsl_options)) = self.remote_connection_options(cx)
         {
-            let path = path.to_path_buf();
+            let windows_path = wsl_path_to_windows_path(wsl_options, path);
             cx.spawn(async move |_, cx| {
-                wsl_path_to_windows_path(&wsl_options, &path)
+                windows_path
                     .await
-                    .map(|windows_path| cx.update(|cx| cx.reveal_path(&windows_path)))
+                    .map(|path| cx.update(|cx| cx.reveal_path(&path)))
             })
             .detach_and_log_err(cx);
             return;
@@ -2540,15 +2605,14 @@ impl Project {
     #[inline]
     pub fn visibility_for_paths(
         &self,
-        paths: &[PathBuf],
+        paths: &[impl AsRef<Path>],
         exclude_sub_dirs: bool,
         cx: &App,
     ) -> Option<bool> {
         paths
             .iter()
-            .map(|path| self.visibility_for_path(path, exclude_sub_dirs, cx))
+            .filter_map(|path| self.visibility_for_path(path.as_ref(), exclude_sub_dirs, cx))
             .max()
-            .flatten()
     }
 
     pub fn visibility_for_path(
@@ -2563,10 +2627,8 @@ impl Project {
             .filter_map(|worktree| {
                 let worktree = worktree.read(cx);
                 let abs_path = worktree.abs_path();
-                let relative_path = path_style
-                    .strip_prefix(path, abs_path.as_ref())
-                    .ok()
-                    .and_then(|path| RelPath::new(path, path_style).ok())?;
+                let relative_path = path_style.strip_prefix(path, abs_path.as_ref()).ok()?;
+                let relative_path = RelPath::new(relative_path, path_style).ok()?;
                 // Don't exclude the worktree root itself, only actual subdirectories
                 let is_subpath = !relative_path.is_empty();
                 // Gitignored subtrees aren't scanned, so their contents don't
@@ -2585,12 +2647,11 @@ impl Project {
             .max()
     }
 
-    pub fn visibility_for_subpaths(&self, paths: &[PathBuf], cx: &App) -> Option<bool> {
+    pub fn visibility_for_subpaths(&self, paths: &[impl AsRef<Path>], cx: &App) -> Option<bool> {
         paths
             .iter()
-            .map(|path| self.visibility_for_subpath(path, cx))
+            .filter_map(|path| self.visibility_for_subpath(path.as_ref(), cx))
             .max()
-            .flatten()
     }
 
     fn visibility_for_subpath(&self, path: &Path, cx: &App) -> Option<bool> {
@@ -2600,10 +2661,8 @@ impl Project {
             .filter_map(|worktree| {
                 let worktree = worktree.read(cx);
                 let abs_path = worktree.abs_path();
-                let relative_path = path_style
-                    .strip_prefix(path, abs_path.as_ref())
-                    .ok()
-                    .and_then(|path| RelPath::new(path, path_style).ok())?;
+                let relative_path = path_style.strip_prefix(path, abs_path.as_ref()).ok()?;
+                let relative_path = RelPath::new(relative_path, path_style).ok()?;
                 let is_subpath =
                     !relative_path.is_empty() && !worktree.is_path_ignored(&relative_path);
                 is_subpath.then(|| worktree.is_visible())
@@ -4654,6 +4713,75 @@ impl Project {
             .update(cx, |lsp_store, cx| lsp_store.hover(buffer, position, cx))
     }
 
+    pub fn debugger_hover<T: ToPointUtf16>(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: T,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<DebuggerHover>> {
+        let Some((session, active_stack_frame)) = self.active_debug_session(cx) else {
+            return Task::ready(None);
+        };
+        // The frame's source has already been resolved to a buffer. Its reported path
+        // may differ from the local path, for example when debugging a relocated build.
+        if buffer.read(cx).remote_id() != active_stack_frame.position.buffer_id {
+            return Task::ready(None);
+        }
+
+        let snapshot = buffer.read(cx).snapshot();
+        let position = position.to_point_utf16(buffer.read(cx));
+        let Some((expression, range)) = hovered_debug_expression(&snapshot, position) else {
+            return Task::ready(None);
+        };
+        let session_id = session.read(cx).session_id();
+        let session_name = session
+            .read(cx)
+            .label()
+            .unwrap_or_else(|| session.read(cx).adapter().0);
+        let evaluate = session.update(cx, |session, cx| {
+            session.evaluate_hover_expression(
+                active_stack_frame.stack_frame_id,
+                expression.clone(),
+                cx,
+            )
+        });
+
+        cx.background_spawn(async move {
+            let response = evaluate.await?;
+            Some(DebuggerHover {
+                range,
+                data: DebuggerHoverData {
+                    session_id,
+                    session_name,
+                    root: DebuggerHoverVariable::from_evaluate_response(expression, &response),
+                },
+            })
+        })
+    }
+
+    pub fn load_debugger_hover_children(
+        &self,
+        session_id: SessionId,
+        variables_reference: VariableReference,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<DebuggerHoverVariable>>> {
+        let Some(session) = self.dap_store.read(cx).session_by_id(session_id) else {
+            return Task::ready(Err(anyhow!("debug session is no longer available")));
+        };
+
+        let task = session.update(cx, |session, cx| {
+            session.load_hover_children(variables_reference, cx)
+        });
+
+        cx.spawn(async move |_, _| {
+            let variables = task.await?;
+            Ok(variables
+                .into_iter()
+                .map(DebuggerHoverVariable::from_dap_variable)
+                .collect())
+        })
+    }
+
     pub fn linked_edits(
         &self,
         buffer: &Entity<Buffer>,
@@ -5012,9 +5140,8 @@ impl Project {
                 path
             };
             let Ok(candidate) = project.update(cx, |project, cx| {
-                let lexical_path = project.path_style(cx).normalize(&path);
-                let project_path =
-                    project.project_path_for_absolute_path(Path::new(&lexical_path), cx)?;
+                let lexical_path = project.path_style(cx).normalize_lexically(&path);
+                let project_path = project.project_path_for_absolute_path(&lexical_path, cx)?;
                 let abs_path = project.absolute_path(&project_path, cx)?;
                 let task = project.resolve_abs_file_path_canonical(abs_path.to_str()?, cx);
                 Some((project_path, abs_path, task))
@@ -5136,6 +5263,40 @@ impl Project {
         }
     }
 
+    /// Like [`Self::resolve_abs_path`], but reports errors. Returns `None` for collab guests,
+    /// who can't check the host.
+    pub fn host_path_is_dir(
+        &self,
+        abs_path: &Path,
+        cx: &App,
+    ) -> Option<Task<Result<Option<bool>>>> {
+        if self.is_local() {
+            let fs = self.fs.clone();
+            let abs_path = abs_path.to_path_buf();
+            Some(cx.background_spawn(async move {
+                Ok(fs
+                    .metadata(&abs_path)
+                    .await?
+                    .map(|metadata| metadata.is_dir))
+            }))
+        } else if let Some(remote_client) = self.remote_client.as_ref() {
+            let request = remote_client
+                .read(cx)
+                .proto_client()
+                .request(proto::GetPathMetadata {
+                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    path: abs_path.to_string_lossy().into_owned(),
+                    canonicalize: false,
+                });
+            Some(cx.background_spawn(async move {
+                let response = request.await?;
+                Ok(response.exists.then_some(response.is_dir))
+            }))
+        } else {
+            None
+        }
+    }
+
     fn resolve_path_in_worktrees(
         &self,
         path: &str,
@@ -5151,9 +5312,8 @@ impl Project {
         if let Some(file) = buffer.read(cx).file()
             && let Some(dir) = file.path().parent()
         {
-            if let Some(joined) = path_style.join(&*dir.display(path_style), path)
-                && let Some(joined) = RelPath::new(joined.as_ref(), path_style).ok()
-            {
+            let joined = path_style.join(&*dir.display(path_style), path);
+            if let Some(joined) = RelPath::new(joined.as_ref(), path_style).ok() {
                 candidates.push(joined.into_arc());
             }
         }
@@ -5298,19 +5458,6 @@ impl Project {
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.remove_worktree(id_to_remove, cx);
-        });
-    }
-
-    pub fn remove_worktree_for_main_worktree_path(
-        &mut self,
-        path: impl AsRef<Path>,
-        cx: &mut Context<Self>,
-    ) {
-        let path = path.as_ref();
-        self.worktree_store.update(cx, |worktree_store, cx| {
-            if let Some(worktree) = worktree_store.worktree_for_main_worktree_path(path, cx) {
-                worktree_store.remove_worktree(worktree.read(cx).id(), cx);
-            }
         });
     }
 
@@ -5498,15 +5645,6 @@ impl Project {
             .project_path_for_absolute_path(abs_path, cx)
     }
 
-    pub fn get_workspace_root(&self, project_path: &ProjectPath, cx: &App) -> Option<PathBuf> {
-        Some(
-            self.worktree_for_id(project_path.worktree_id, cx)?
-                .read(cx)
-                .abs_path()
-                .to_path_buf(),
-        )
-    }
-
     pub fn blame_buffer(
         &self,
         buffer: &Entity<Buffer>,
@@ -5685,6 +5823,15 @@ impl Project {
             });
             Ok(())
         })
+    }
+
+    async fn handle_global_skills_changed(
+        this: Entity<Self>,
+        _: TypedEnvelope<proto::GlobalSkillsChanged>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        this.update(&mut cx, |_, cx| cx.emit(Event::GlobalSkillsChanged));
+        Ok(())
     }
 
     async fn handle_telemetry_event(
@@ -6685,20 +6832,12 @@ impl Project {
         self.worktree_store.read(cx).path_style()
     }
 
-    pub fn contains_local_settings_file(
-        &self,
-        worktree_id: WorktreeId,
-        rel_path: &RelPath,
-        cx: &App,
-    ) -> bool {
-        self.worktree_for_id(worktree_id, cx)
-            .map_or(false, |worktree| {
-                worktree.read(cx).entry_for_path(rel_path).is_some()
-            })
-    }
-
     pub fn worktree_paths(&self, cx: &App) -> WorktreePaths {
         self.worktree_store.read(cx).paths(cx)
+    }
+
+    pub fn git_worktree_paths(&self, cx: &App) -> WorktreePaths {
+        self.worktree_store.read(cx).git_paths(cx)
     }
 
     pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {
@@ -6728,7 +6867,7 @@ impl ProjectGroupKey {
 
     pub fn from_project(project: &Project, cx: &App) -> Self {
         let paths = project.worktree_paths(cx);
-        let host = project.remote_connection_options(cx);
+        let host = project.remote_connection_options(cx).cloned();
         Self {
             paths: paths.main_worktree_path_list().clone(),
             host,
@@ -6775,13 +6914,13 @@ impl ProjectGroupKey {
         }
     }
 
-    pub fn host(&self) -> Option<RemoteConnectionOptions> {
-        self.host.clone()
+    pub fn host(&self) -> Option<&RemoteConnectionOptions> {
+        self.host.as_ref()
     }
 
-    pub fn matches(&self, other: &ProjectGroupKey) -> bool {
+    pub fn matches_identity(&self, other: &Self) -> bool {
         self.paths == other.paths
-            && same_remote_connection_identity(self.host.as_ref(), other.host.as_ref())
+            && self.host.as_ref().map(|o| o.identity()) == other.host.as_ref().map(|o| o.identity())
     }
 }
 
@@ -7136,6 +7275,115 @@ fn proto_to_prompt(level: proto::language_server_prompt_request::Level) -> gpui:
         proto::language_server_prompt_request::Level::Warning(_) => gpui::PromptLevel::Warning,
         proto::language_server_prompt_request::Level::Critical(_) => gpui::PromptLevel::Critical,
     }
+}
+
+fn hovered_debug_expression(
+    snapshot: &language::BufferSnapshot,
+    position: PointUtf16,
+) -> Option<(String, Range<Anchor>)> {
+    hovered_debug_variable_expression(snapshot, position)
+        .or_else(|| hovered_debug_member_expression(snapshot, position))
+        .or_else(|| hovered_debug_identifier_expression(snapshot, position))
+}
+
+fn hovered_debug_identifier_expression(
+    snapshot: &language::BufferSnapshot,
+    position: PointUtf16,
+) -> Option<(String, Range<Anchor>)> {
+    let offset = snapshot.point_utf16_to_offset(position);
+    let (range, _) = snapshot.surrounding_word(offset, None);
+    if range.is_empty() || !range.contains(&offset) {
+        return None;
+    }
+    let node = snapshot.syntax_ancestor(offset..offset)?;
+    if node.kind() != "identifier" || node.byte_range() != range {
+        return None;
+    }
+    let expression = snapshot.text_for_range(range.clone()).collect::<String>();
+    if !expression
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || character == '_')
+        || !expression
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some((
+        expression,
+        snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+    ))
+}
+
+fn hovered_debug_variable_expression(
+    snapshot: &language::BufferSnapshot,
+    position: PointUtf16,
+) -> Option<(String, Range<Anchor>)> {
+    let offset = snapshot.point_utf16_to_offset(position);
+
+    snapshot
+        .debug_variables_query(offset..offset)
+        .filter_map(|(range, capture_kind)| {
+            (capture_kind == language::DebuggerTextObject::Variable
+                && range.start <= offset
+                && offset <= range.end)
+                .then(|| {
+                    let expression = snapshot.text_for_range(range.clone()).collect::<String>();
+                    let anchor_range =
+                        snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+                    (expression, anchor_range, range.end - range.start)
+                })
+        })
+        .min_by_key(|(_, _, len)| *len)
+        .map(|(expression, range, _)| (expression, range))
+}
+
+fn hovered_debug_member_expression(
+    snapshot: &language::BufferSnapshot,
+    position: PointUtf16,
+) -> Option<(String, Range<Anchor>)> {
+    let offset = snapshot.point_utf16_to_offset(position);
+    let mut node = snapshot.syntax_ancestor(offset..offset)?;
+    let mut best_match = None;
+
+    loop {
+        let byte_range = node.byte_range();
+        if byte_range.start > offset || offset > byte_range.end {
+            break;
+        }
+
+        let expression = snapshot
+            .text_for_range(byte_range.clone())
+            .collect::<String>();
+        if looks_like_debug_hover_member_expression(&expression) {
+            best_match = Some((
+                expression,
+                snapshot.anchor_before(byte_range.start)..snapshot.anchor_after(byte_range.end),
+            ));
+        }
+
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
+    }
+
+    best_match
+}
+
+fn looks_like_debug_hover_member_expression(expression: &str) -> bool {
+    !expression.is_empty()
+        && expression.len() <= 128
+        && !expression.contains(char::is_whitespace)
+        && (expression.contains('.') || expression.contains('[') || expression.contains("->"))
+        && expression.chars().all(|char| {
+            char.is_alphanumeric()
+                || matches!(
+                    char,
+                    '_' | '.' | '[' | ']' | '(' | ')' | '"' | '\'' | '-' | '>'
+                )
+        })
 }
 
 fn provide_inline_values(

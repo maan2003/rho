@@ -38,7 +38,6 @@ use worktree::{File, PathChange, ProjectEntryId, Worktree, WorktreeId, WorktreeS
 /// A set of open buffers.
 pub struct BufferStore {
     state: BufferStoreState,
-    #[allow(clippy::type_complexity)]
     loading_buffers: HashMap<ProjectPath, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
     worktree_store: Entity<WorktreeStore>,
     opened_buffers: HashMap<BufferId, OpenBuffer>,
@@ -409,6 +408,8 @@ impl RemoteBufferStore {
 }
 
 impl LocalBufferStore {
+    /// `old_file` is given when saving the buffer to a new path, holding the file the buffer had
+    /// before, if any.
     fn save_local_buffer(
         &mut self,
         buffer_handle: Entity<Buffer>,
@@ -459,6 +460,7 @@ impl LocalBufferStore {
             } else {
                 None
             };
+            let old_file = matches!(&target, SaveTarget::Explicit { .. }).then(|| file.clone());
             let (worktree, path) = match target {
                 SaveTarget::Current => {
                     let file = File::from_dyn(file.as_ref())
@@ -516,10 +518,17 @@ impl LocalBufferStore {
                         .log_err();
                 }
             })?;
+            if has_changed_file {
+                buffer_handle.update(cx, |buffer, cx| buffer.file_updated(new_file, cx));
+            }
+            // Report the new path before the save, so that observers like language servers know
+            // the document by its new path when they learn about the save.
+            if let Some(old_file) = old_file {
+                this.update(cx, |this, cx| {
+                    this.did_change_buffer_file_path(buffer_handle.clone(), old_file, cx)
+                })?;
+            }
             buffer_handle.update(cx, |buffer, cx| {
-                if has_changed_file {
-                    buffer.file_updated(new_file, cx);
-                }
                 buffer.did_save(version.clone(), mtime, cx);
             });
             Ok(())
@@ -1099,26 +1108,35 @@ impl BufferStore {
         path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let old_file = buffer.read(cx).file().cloned();
-        let task = match &mut self.state {
-            BufferStoreState::Local(this) => this.save_buffer_as(buffer.clone(), path, cx),
+        match &mut self.state {
+            BufferStoreState::Local(this) => this.save_buffer_as(buffer, path, cx),
             BufferStoreState::Remote(this) => {
-                this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), false, cx)
-            }
-        };
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            this.update(cx, |this, cx| {
-                old_file.clone().and_then(|file| {
-                    this.path_to_buffer_id.remove(&ProjectPath {
-                        worktree_id: file.worktree_id(cx),
-                        path: file.path().clone(),
+                let old_file = buffer.read(cx).file().cloned();
+                let task =
+                    this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), false, cx);
+                cx.spawn(async move |this, cx| {
+                    task.await?;
+                    this.update(cx, |this, cx| {
+                        this.did_change_buffer_file_path(buffer, old_file, cx)
                     })
-                });
+                })
+            }
+        }
+    }
 
-                cx.emit(BufferStoreEvent::BufferChangedFilePath { buffer, old_file });
-            })
-        })
+    fn did_change_buffer_file_path(
+        &mut self,
+        buffer: Entity<Buffer>,
+        old_file: Option<Arc<dyn language::File>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(file) = &old_file {
+            self.path_to_buffer_id.remove(&ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            });
+        }
+        cx.emit(BufferStoreEvent::BufferChangedFilePath { buffer, old_file });
     }
 
     fn add_buffer(&mut self, buffer_entity: Entity<Buffer>, cx: &mut Context<Self>) -> Result<()> {

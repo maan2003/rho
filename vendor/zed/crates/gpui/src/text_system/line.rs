@@ -96,7 +96,6 @@ impl ShapedLine {
     }
 
     /// The length of the line in utf-8 bytes.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.layout.len
     }
@@ -235,6 +234,9 @@ impl ShapedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        if !has_background(&self.decoration_runs) {
+            return Ok(());
+        }
         paint_line_background(
             origin,
             &self.layout,
@@ -493,6 +495,9 @@ impl LineLayout {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        if !has_background(decoration_runs) {
+            return Ok(());
+        }
         paint_line_background(
             origin,
             self,
@@ -520,7 +525,6 @@ pub struct WrappedLine {
 
 impl WrappedLine {
     /// The length of the underlying, unwrapped layout, in utf-8 bytes.
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.layout.len()
     }
@@ -571,6 +575,9 @@ impl WrappedLine {
             None => self.layout.wrap_width,
         };
 
+        if !has_background(&self.decoration_runs) {
+            return Ok(());
+        }
         paint_line_background(
             origin,
             &self.layout.unwrapped_layout,
@@ -605,15 +612,7 @@ fn paint_line(
         &mut Window,
     ),
 ) -> Result<()> {
-    let line_bounds = line_paint_bounds(
-        origin,
-        layout,
-        line_height,
-        align,
-        align_width,
-        wrap_boundaries,
-    );
-    window.paint_layer(line_bounds, |window| {
+    window.paint_layer(|window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
@@ -857,6 +856,14 @@ fn paint_line(
     })
 }
 
+/// Painting backgrounds walks every glyph and opens a layer, so callers skip it when there's
+/// nothing to paint.
+fn has_background(decoration_runs: &[DecorationRun]) -> bool {
+    decoration_runs
+        .iter()
+        .any(|run| run.background_color.is_some())
+}
+
 fn paint_line_background(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -868,15 +875,7 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = line_paint_bounds(
-        origin,
-        layout,
-        line_height,
-        align,
-        align_width,
-        wrap_boundaries,
-    );
-    window.paint_layer(line_bounds, |window| {
+    window.paint_layer(|window| {
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -968,7 +967,7 @@ fn paint_line_background(
                 }
 
                 if let Some((mut background_origin, background_color)) = finished_background {
-                    let mut width = glyph_origin.x - background_origin.x;
+                    let width = glyph_origin.x - background_origin.x;
                     if background_origin.x == glyph_origin.x {
                         background_origin.x -= max_glyph_size.width.half();
                     };
@@ -1005,51 +1004,6 @@ fn paint_line_background(
 
         Ok(())
     })
-}
-
-fn line_paint_bounds(
-    origin: Point<Pixels>,
-    layout: &LineLayout,
-    line_height: Pixels,
-    align: TextAlign,
-    align_width: Option<Pixels>,
-    wrap_boundaries: &[WrapBoundary],
-) -> Bounds<Pixels> {
-    let mut bounds = Bounds::new(
-        origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
-    );
-    if align == TextAlign::Left || layout.len == 0 {
-        return bounds;
-    }
-
-    let align_width = align_width.unwrap_or(layout.width);
-    let mut row_start = Pixels::ZERO;
-    let row_ends = wrap_boundaries
-        .iter()
-        .map(|boundary| {
-            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
-                .position
-                .x
-        })
-        .chain([layout.width]);
-    for (row, row_end) in row_ends.enumerate() {
-        let width = row_end - row_start;
-        let offset = match align {
-            TextAlign::Left => Pixels::ZERO,
-            TextAlign::Center => (align_width - width) / 2.,
-            TextAlign::Right => align_width - width,
-        };
-        bounds = bounds.union(&Bounds::new(
-            point(origin.x + offset, origin.y + line_height * row as f32),
-            size(width, line_height),
-        ));
-        row_start = row_end;
-    }
-    bounds
 }
 
 fn aligned_origin_x(

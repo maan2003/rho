@@ -15,7 +15,7 @@ use serde::Deserialize;
 #[cfg(feature = "native")]
 use workspace::searchable::Direction;
 
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, rc::Rc};
 
 /// Defines search strategy for items in `movement` module.
 /// `FindRange::SingeLine` only looks for a match on a single line at a time, whereas
@@ -29,7 +29,7 @@ pub enum FindRange {
 /// TextLayoutDetails encompasses everything we need to move vertically
 /// taking into account variable width characters.
 pub struct TextLayoutDetails {
-    pub(crate) text_system: Arc<WindowTextSystem>,
+    pub(crate) text_system: Rc<WindowTextSystem>,
     pub(crate) editor_style: EditorStyle,
     pub(crate) rem_size: Pixels,
     pub scroll_anchor: SharedScrollAnchor,

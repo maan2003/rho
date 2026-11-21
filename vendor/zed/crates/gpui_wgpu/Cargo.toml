@@ -53,9 +53,10 @@ pollster.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38"
 libc = "0.2"
-wgpu-hal = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["vulkan"] }
+wgpu-hal = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", features = ["vulkan"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+js-sys.workspace = true
 web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
 wgpu = { workspace = true, features = ["webgl"] }
 
@@ -64,7 +65,7 @@ criterion.workspace = true
 gpui = { workspace = true, features = ["bench-support"] }
 image.workspace = true
 # Validate shaders with the same Naga revision that wgpu uses at runtime.
-naga = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["wgsl-in"] }
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", features = ["wgsl-in"] }
 
 [[bench]]
 name = "layout_line"
