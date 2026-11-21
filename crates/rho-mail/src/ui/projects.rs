@@ -101,8 +101,7 @@ impl MailSystem {
         let mut rows = Vec::new();
         let this = cx.entity();
         let on_agent = point
-            .subject
-            .as_ref()
+            .subject()
             .is_some_and(|subject| subject.kind() == AgentRef::KIND);
         if !self.hosts().is_empty() && !on_agent {
             let this = this.clone();

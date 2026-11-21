@@ -155,7 +155,7 @@ so that: the user can trust the result or understand where the work is stuck
 steps:
 1. the user opens the work's `mail.Thread`
 2. the user presses `enter` on the mail or taps its header to go one level down to the `Agent` transcript
-   - away from an agent's mail, `look into the work` asks which agent, newest first and with its runtime
+   - away from an agent's mail, `look into the work` opens the sole participant or asks which agent if more than one is available, newest first and with its runtime. From the draft it takes the dealt mail's writer or an explicitly chosen reply target first.
 3. the user reads what the agent ran and what came back
 4. the user goes back to the thread with `window.Screen.back`
 system: keeps the transcript with the work it explains.
@@ -174,6 +174,7 @@ so that: its work goes on from a good point
 steps:
 1. the user opens the agent's screen, `Agent`
 2. the user opens the palette, here or on the mail's `mail.Thread`, and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`; on the `desk.Desk` the palette offers `look into the work` for the row's agent
+   - from the thread draft, steering addresses the writer of the dealt mail or explicitly chosen reply; without one, it addresses the sole participant. If the thread has several possible workers, first select a mail or open the agent's transcript.
 3. if the work needs new instructions, the user returns to the thread and writes to the project, `mail.Answer a mail`
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
