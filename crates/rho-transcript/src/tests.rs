@@ -536,7 +536,7 @@ fn replacement_cost(
         match block_every {
             Some(every) if index.is_multiple_of(every) => {
                 shown.with_blocks(vec![crate::BlockSpec {
-                    line: 0,
+                    line: crate::BlockLine::Below(0),
                     height: 4,
                     render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
                     priority: 0,
@@ -619,7 +619,7 @@ fn a_block_survives_an_edit_that_is_not_its_own(cx: &mut TestAppContext) {
     let (buffer, editor) = on_screen(cx);
     let mut sheet = Sheet::new(buffer.clone());
     let with_picture = item("a", "alice hello\n").with_blocks(vec![crate::BlockSpec {
-        line: 0,
+        line: crate::BlockLine::Below(0),
         height: 4,
         render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
         priority: 0,
@@ -672,7 +672,7 @@ fn every_block_the_sheet_records_is_one_the_editor_is_holding(cx: &mut TestAppCo
 
     let with_picture = |key: &str, text: &str, line: u32| {
         item(key, text).with_blocks(vec![crate::BlockSpec {
-            line,
+            line: crate::BlockLine::Below(line),
             height: 4,
             render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
             priority: 0,
