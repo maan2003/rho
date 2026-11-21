@@ -7,6 +7,7 @@
 //! threads want the user; this module supplies projects, moving threads,
 //! and the rows for `find`.
 
+mod pending;
 mod projects;
 #[cfg(test)]
 mod search_bench;
@@ -20,6 +21,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
+use pending::{PendingIdea, PendingIdeaId};
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
@@ -393,6 +395,7 @@ impl MailSystem {
                     self.cursors.advance(endpoint, last.seq);
                 }
                 self.cache.write_records(endpoint, records);
+                self.finish_posted(endpoint, cx);
                 self.finish_project_creation(cx);
                 self.changed(endpoint, cx);
             }
@@ -605,6 +608,47 @@ impl MailSystem {
             .map(|slot| slot.link.clone())
     }
 
+    /// A receipt and the corresponding mail can arrive in either order.
+    /// Retire the optimistic copy only when the host log can replace it.
+    fn finish_posted(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
+        let Some(message) = self.outbox.receipt(endpoint) else {
+            return;
+        };
+        if !self
+            .host_mail(endpoint)
+            .is_some_and(|chat| chat.message(message).is_some())
+        {
+            return;
+        }
+        let Some((client_id, outgoing, kept)) = self.outbox.answered(endpoint) else {
+            return;
+        };
+        self.cache.write_outbox(endpoint, kept, None);
+        cx.emit(Event::Delivered {
+            endpoint,
+            client_id,
+            message,
+        });
+        if outgoing.delivery == Delivery::Idea {
+            let pending = PendingIdeaId(client_id).address();
+            let posted = ThreadId {
+                host: endpoint,
+                message,
+            }
+            .address();
+            self.frame.with(cx, move |frame, window, cx| {
+                let reading = frame.current_address() == &pending;
+                frame.close_all(|address| address == &pending, window, cx);
+                if reading {
+                    frame.open(posted, window, cx);
+                }
+                frame.finish_idea(client_id, Ok(()), cx);
+            });
+        }
+        cx.notify();
+        self.send_unsent(endpoint, cx);
+    }
+
     /// Posts the host's oldest unsent message, unless one is on its way.
     /// The rest go one by one as each is answered; a retry carries the
     /// same client id, so the host keeps one copy.
@@ -649,33 +693,33 @@ impl MailSystem {
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
-                Ok(reply) => {
-                    if let Some((client_id, outgoing, kept)) = this.outbox.answered(endpoint) {
+                Ok(PostIdeaReply::Posted(message)) => {
+                    this.outbox.posted(endpoint, message);
+                    this.finish_posted(endpoint, cx);
+                }
+                Ok(PostIdeaReply::RuntimeRefused(reason)) => {
+                    if let Some((client_id, _, kept)) = this.outbox.answered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
-                        let result = match reply {
-                            PostIdeaReply::Posted(message) => {
-                                cx.emit(Event::Delivered {
-                                    endpoint,
-                                    client_id,
-                                    message,
-                                });
-                                Ok(())
-                            }
-                            PostIdeaReply::RuntimeRefused(reason) => Err(reason),
-                        };
-                        if outgoing.delivery == Delivery::Idea {
-                            this.frame.with(cx, move |frame, _, cx| {
-                                frame.finish_idea(client_id, result, cx);
-                            });
-                        }
+                        let pending = PendingIdeaId(client_id).address();
+                        this.frame.with(cx, move |frame, window, cx| {
+                            frame.close_all(|address| address == &pending, window, cx);
+                            frame.finish_idea(client_id, Err(reason), cx);
+                        });
                     }
                     cx.notify();
                     this.send_unsent(endpoint, cx);
                 }
                 Err(error) => {
                     this.outbox.failed(endpoint);
-                    this.frame
-                        .echo(format!("mail: {error:#}"), StyleClass::SystemImportant, cx);
+                    // Transport errors did not refuse a durable idea. The
+                    // reconnect indicator and queued receipt tell the truth.
+                    if delivery != Delivery::Idea {
+                        this.frame.echo(
+                            format!("mail: {error:#}"),
+                            StyleClass::SystemImportant,
+                            cx,
+                        );
+                    }
                 }
             });
         })
@@ -759,9 +803,24 @@ impl MailSystem {
     }
 }
 
+impl MailSystem {
+    fn pending_ideas(&self) -> impl Iterator<Item = (PendingIdeaId, String, &Outgoing)> {
+        self.outbox.ideas().filter_map(|(host, id, outgoing)| {
+            let project = outgoing.parent?;
+            let chat = self.host_mail(host)?;
+            let alias = self.host_name(host);
+            Some((
+                PendingIdeaId(id),
+                chat.project(project)?.address(&alias),
+                outgoing,
+            ))
+        })
+    }
+}
+
 impl System for MailSystem {
     fn kinds(&self) -> &'static [&'static str] {
-        &[ThreadId::KIND]
+        &[ThreadId::KIND, PendingIdeaId::KIND]
     }
 
     fn open(
@@ -770,6 +829,13 @@ impl System for MailSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
+        if let Some(id) = PendingIdeaId::from_address(address) {
+            let (_, project, outgoing) = self.pending_ideas().find(|(queued, ..)| *queued == id)?;
+            let content = rho_agent_types::content_text(&outgoing.content);
+            return Some(AnySurface::new(
+                cx.new(|cx| PendingIdea::new(project, content, window, cx)),
+            ));
+        }
         let thread = self.thread_of(address)?;
         self.logs.get(&thread.host)?.message(thread.message)?;
         let system = cx.entity();
@@ -1114,7 +1180,18 @@ impl System for MailSystem {
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
-        let mut found = Vec::new();
+        let mut found = self
+            .pending_ideas()
+            .map(|(id, project, outgoing)| Found {
+                address: id.address(),
+                title: pending::title(&rho_agent_types::content_text(&outgoing.content)),
+                description: project,
+                thread: Some(FoundThread {
+                    status: Some("queued".to_owned()),
+                }),
+                recency: outgoing.at.0,
+            })
+            .collect::<Vec<_>>();
         for (host, alias) in self.hosts() {
             let Some(chat) = self.logs.get(&host) else {
                 continue;
@@ -1172,6 +1249,89 @@ pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_queued_idea_is_findable_until_its_post_is_in_the_log(cx: &mut gpui::TestAppContext) {
+        let endpoint = EndpointId([3; 32]);
+        let project = MessageId(ChatSeq(1));
+        let mut log = HostMail::default();
+        log.tell(&rho_agent_types::ChatRecord {
+            seq: project.0,
+            at: UnixMs(1),
+            event: rho_agent_types::ChatEvent::Posted {
+                parent: None,
+                reply_to: None,
+                from: Party::User,
+                mentions: vec![],
+                content: vec![ContentPart::Text {
+                    text: "tide".into(),
+                }],
+            },
+        });
+        let (_, mail, _db) = search_bench::fixture(cx, log);
+        let title = "Test the thermocouple offline.";
+        cx.update(|cx| {
+            mail.update(cx, |mail, cx| {
+                let id = mail.queue_idea(
+                    ThreadId {
+                        host: endpoint,
+                        message: project,
+                    },
+                    title.into(),
+                    cx,
+                );
+                let pending = PendingIdeaId(id).address();
+                let queued = |mail: &MailSystem, cx: &App| {
+                    mail.find(&Marks::default(), cx)
+                        .into_iter()
+                        .filter(|row| row.title == title)
+                        .collect::<Vec<_>>()
+                };
+                let check_queued = |mail: &MailSystem, cx: &App| {
+                    let matches = queued(mail, cx);
+                    assert_eq!(matches.len(), 1);
+                    assert_eq!(&matches[0].address, &pending);
+                    assert_eq!(
+                        matches[0].thread.as_ref().unwrap().status.as_deref(),
+                        Some("queued")
+                    );
+                };
+                check_queued(mail, cx);
+                let post = mail.outbox.next(endpoint).expect("the idea is durable").0;
+                assert_eq!(post.client_id, id);
+                let posted = MessageId(ChatSeq(mail.logs[&endpoint].head.0 + 1));
+                mail.outbox.posted(endpoint, posted);
+                mail.finish_posted(endpoint, cx);
+                check_queued(mail, cx);
+                mail.logs
+                    .get_mut(&endpoint)
+                    .unwrap()
+                    .tell(&rho_agent_types::ChatRecord {
+                        seq: posted.0,
+                        at: UnixMs(12),
+                        event: rho_agent_types::ChatEvent::Posted {
+                            parent: Some(project),
+                            reply_to: None,
+                            from: Party::User,
+                            mentions: vec![],
+                            content: post.content,
+                        },
+                    });
+                mail.finish_posted(endpoint, cx);
+                let matches = queued(mail, cx);
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0].address,
+                    ThreadId {
+                        host: endpoint,
+                        message: posted
+                    }
+                    .address()
+                );
+                assert!(!mail.outbox.contains(id));
+            })
+        });
+    }
 
     #[test]
     fn ago_reads_in_the_bars_units() {
