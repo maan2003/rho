@@ -7,6 +7,7 @@
 //! threads want the user; this module supplies projects, moving threads,
 //! and the rows for `find`.
 
+mod projects;
 mod thread;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -20,7 +21,7 @@ use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
-    ThreadWork,
+    ProjectConfig, ProjectId, ThreadWork,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -28,8 +29,8 @@ use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::desk::MovingThread;
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{
-    AnySurface, Candidate, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint,
-    System, TextKind, TextQuery,
+    AnySurface, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint, System,
+    TextKind, TextQuery,
 };
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
@@ -37,23 +38,15 @@ pub use thread::ThreadView;
 use crate::cache::Cache;
 pub use crate::cache::{MailAudience, WrittenMail};
 use crate::fold::HostMail;
-use crate::outbox::Outbox;
-use crate::protocol::Name;
+use crate::outbox::{Delivery, Outbox};
+use crate::protocol::{Name, PostIdea, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
-use crate::{AgentRef, ThreadId, cards};
+use crate::{ThreadId, cards};
 
 /// What mail tells its listeners: the agents system starts an agent from a
 /// mail once the host has logged it.
 pub enum Event {
-    /// The user sent the draft under the project root `parent` as an idea: the
-    /// agents system says where an agent starts from it, then sends it.
-    /// The draft stays until then.
-    Idea {
-        endpoint: EndpointId,
-        parent: MessageId,
-        source: IdeaSource,
-    },
-    /// The user confirmed sending the draft from a project start prompt.
+    /// An explicit start with options took the thread's draft.
     DraftSent(ThreadId),
     /// The host logged a message the user wrote, under the id this client
     /// gave it when it was written.
@@ -66,14 +59,6 @@ pub enum Event {
     Inspect { mail: Message, agent: AgentId },
     /// A host's forest changed.
     Changed { endpoint: EndpointId },
-}
-
-/// Which box supplied the idea. Each has a separate draft; a first
-/// start's question must not swap one draft for the other.
-#[derive(Clone)]
-pub enum IdeaSource {
-    ProjectDraft,
-    Box(IdeaMail),
 }
 
 /// One attached host: what the user calls it, how to call it, and whose
@@ -102,20 +87,7 @@ pub struct Participant {
 /// once it is gone; the agents system owns the answer.
 pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participant>>;
 
-enum CreatingProject {
-    Posting(EndpointId, u64),
-    Posted(ThreadId),
-}
-
-impl CreatingProject {
-    fn host(&self) -> EndpointId {
-        match self {
-            Self::Posting(host, _) => *host,
-            Self::Posted(thread) => thread.host,
-        }
-    }
-}
-
+#[derive(Clone)]
 enum CreatedProject {
     Open,
     AddressDraft(ProjectCreated),
@@ -129,7 +101,10 @@ pub struct MailSystem {
     logs: HashMap<EndpointId, HostMail>,
     cursors: Cursors,
     outbox: Outbox,
-    creating_projects: Vec<(CreatingProject, CreatedProject)>,
+    creating_projects: Vec<(ThreadId, CreatedProject)>,
+    settings: HashMap<EndpointId, HashMap<ProjectId, ProjectConfig>>,
+    legacy_places: HashMap<(EndpointId, ProjectId), ProjectConfig>,
+    known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
@@ -151,6 +126,7 @@ impl MailSystem {
         cx: &mut Context<Self>,
     ) -> Self {
         thread::bind(cx);
+        let legacy_places = projects::legacy_places(&db);
         let cache = Cache::open_on(db).expect("the mail copy opens");
         let loaded = cache.load();
         let mut logs = HashMap::new();
@@ -177,6 +153,9 @@ impl MailSystem {
             cursors: Cursors::new(loaded.cursors),
             outbox: Outbox::load(loaded.outbox),
             creating_projects: Vec::new(),
+            settings: HashMap::new(),
+            legacy_places,
+            known_places: Rc::new(|_, _| Vec::new()),
             last_project: loaded.last_project,
             drafts: loaded
                 .drafts
@@ -391,6 +370,7 @@ impl MailSystem {
                     Self::sync_view(slot, self.view);
                 }
                 if fresh {
+                    self.settings.remove(&endpoint);
                     self.cache.reset(endpoint);
                     self.logs.insert(endpoint, HostMail::default());
                 }
@@ -419,6 +399,15 @@ impl MailSystem {
                     self.changed(endpoint, cx);
                 }
             }
+            MailEvent::Projects { host, configured } => {
+                if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
+                    self.settings
+                        .insert(endpoint, configured.into_iter().collect());
+                    self.import_legacy_projects(endpoint, cx);
+                    self.finish_project_creation(cx);
+                    self.changed(endpoint, cx);
+                }
+            }
             MailEvent::Closed { host } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint)
                     && let Some(chat) = self.logs.get_mut(&endpoint)
@@ -436,8 +425,8 @@ impl MailSystem {
     fn finish_project_creation(&mut self, cx: &mut Context<Self>) {
         let mut pending = std::mem::take(&mut self.creating_projects);
         pending.retain(|(creation, created)| {
-            if let CreatingProject::Posted(project) = creation
-                && let Some(project) = self.idea_project_at(*project)
+            if self.project_config(*creation).is_some()
+                && let Some(project) = self.idea_project_at(*creation)
             {
                 let echo = format!("created project: {}", project.name);
                 match created {
@@ -470,7 +459,7 @@ impl MailSystem {
         mentions: Vec<AgentId>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        self.queue_mail(endpoint, parent, None, text, mentions, cx)
+        self.queue_mail(endpoint, parent, None, text, mentions, Delivery::Mail, cx)
     }
 
     /// Writes in `thread` and answers one particular mail, even if its writer
@@ -482,16 +471,23 @@ impl MailSystem {
         text: String,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let delivery = self
+            .host_mail(thread.host)
+            .and_then(|chat| chat.message(to))
+            .filter(|mail| mail.from == Party::StartFailed)
+            .map_or(Delivery::Mail, |_| Delivery::Retry);
         self.queue_mail(
             thread.host,
             Some(thread.message),
             Some(to),
             text,
             Vec::new(),
+            delivery,
             cx,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_mail(
         &mut self,
         endpoint: EndpointId,
@@ -499,6 +495,7 @@ impl MailSystem {
         reply_to: Option<MessageId>,
         text: String,
         mentions: Vec<AgentId>,
+        delivery: Delivery,
         cx: &mut Context<Self>,
     ) -> u64 {
         let project = parent.and_then(|message| {
@@ -514,7 +511,7 @@ impl MailSystem {
         let content = vec![ContentPart::Text { text }];
         let (id, kept) = self
             .outbox
-            .push(endpoint, parent, reply_to, mentions, content);
+            .push(endpoint, parent, reply_to, mentions, content, delivery);
         self.cache
             .write_outbox(endpoint, kept, project.map(|project| project.message));
         self.send_unsent(endpoint, cx);
@@ -522,42 +519,35 @@ impl MailSystem {
         id
     }
 
-    /// Posts the project's draft after the start prompt is confirmed.
-    fn send_project_draft(&mut self, project: ThreadId, cx: &mut Context<Self>) -> Option<u64> {
-        let parent = Some(project.message);
-        let text = self.draft(project.host, parent).trim().to_owned();
+    /// The project starts work on the host after this durable local post.
+    fn queue_idea(&mut self, project: ThreadId, text: String, cx: &mut Context<Self>) -> u64 {
+        self.queue_mail(
+            project.host,
+            Some(project.message),
+            None,
+            text,
+            Vec::new(),
+            Delivery::Idea,
+            cx,
+        )
+    }
+
+    /// The explicit options path sends an ordinary post and starts the
+    /// user-selected agent once the mail is logged.
+    pub fn post_draft_with_options(
+        &mut self,
+        thread: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let parent = Some(thread.message);
+        let text = self.draft(thread.host, parent).trim().to_owned();
         if text.is_empty() {
             return None;
         }
-        self.set_draft(project.host, parent, String::new());
-        let id = self.post(project.host, parent, text, Vec::new(), cx);
-        cx.emit(Event::DraftSent(project));
+        let id = self.post(thread.host, parent, text, Vec::new(), cx);
+        self.set_draft(thread.host, parent, String::new());
+        cx.emit(Event::DraftSent(thread));
         Some(id)
-    }
-
-    /// Post the selected idea, independent of the box that owns its
-    /// draft. The agent still starts from the logged mail, not its text.
-    pub fn send_idea(
-        &mut self,
-        project: ThreadId,
-        source: &IdeaSource,
-        cx: &mut Context<Self>,
-    ) -> Option<u64> {
-        match source {
-            IdeaSource::ProjectDraft => self.send_project_draft(project, cx),
-            IdeaSource::Box(idea) => {
-                let name = self.project_address(project)?;
-                let id = self.post(
-                    project.host,
-                    Some(project.message),
-                    idea.text.trim().to_owned(),
-                    Vec::new(),
-                    cx,
-                );
-                (idea.sent)(name, cx);
-                Some(id)
-            }
-        }
     }
 
     fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
@@ -579,6 +569,7 @@ impl MailSystem {
         Some(IdeaProject {
             address: project.address(),
             name,
+            details: self.project_details(project),
         })
     }
 
@@ -596,22 +587,44 @@ impl MailSystem {
         let Some(link) = self.link_for(endpoint) else {
             return;
         };
-        let Some(post) = self.outbox.next(endpoint) else {
+        let Some((post, delivery)) = self.outbox.next(endpoint) else {
             return;
         };
-        let reply = link.run(move |dialer| async move { crate::stream::call(&dialer, post).await });
+        let host_label = self.host_name(endpoint);
+        let reply = link.run(move |dialer| async move {
+            match delivery {
+                Delivery::Mail => crate::stream::call(&dialer, post).await,
+                Delivery::Idea => {
+                    let project = ProjectId(post.parent.expect("an idea is under a project"));
+                    crate::stream::call(
+                        &dialer,
+                        PostIdea {
+                            client_id: post.client_id,
+                            project,
+                            content: post.content,
+                            host_label,
+                        },
+                    )
+                    .await
+                }
+                Delivery::Retry => {
+                    crate::stream::call(
+                        &dialer,
+                        RetryIdea {
+                            posted: post,
+                            host_label,
+                        },
+                    )
+                    .await
+                }
+            }
+        });
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
                 Ok(message) => {
                     if let Some((client_id, _, kept)) = this.outbox.delivered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
-                        for (creation, _) in &mut this.creating_projects {
-                            if matches!(creation, CreatingProject::Posting(host, id) if *host == endpoint && *id == client_id) {
-                                *creation = CreatingProject::Posted(ThreadId { host: endpoint, message });
-                            }
-                        }
-                        this.finish_project_creation(cx);
                         cx.emit(Event::Delivered {
                             endpoint,
                             client_id,
@@ -629,21 +642,6 @@ impl MailSystem {
             });
         })
         .detach();
-    }
-
-    fn create_project(
-        &mut self,
-        endpoint: EndpointId,
-        name: String,
-        created: CreatedProject,
-        cx: &mut Context<Self>,
-    ) {
-        if self.link_for(endpoint).is_none() {
-            return;
-        }
-        let client = self.post(endpoint, None, name, Vec::new(), cx);
-        self.creating_projects
-            .push((CreatingProject::Posting(endpoint, client), created));
     }
 
     /// One call to a host's mail service; `done` hears the answer.
@@ -727,35 +725,6 @@ impl MailSystem {
         };
         Some(read(&host))
     }
-
-    /// Posts a root on `endpoint`: a new project.
-    fn prompt_new_project(
-        this: Entity<Self>,
-        endpoint: EndpointId,
-        frame: &mut rho_frame::Frame,
-        window: &mut Window,
-        cx: &mut Context<rho_frame::Frame>,
-    ) {
-        frame.open_prompt(
-            "new project:",
-            Rc::new(|_, _, _| Vec::new()),
-            Rc::new(move |_frame, input, _, cx| {
-                let text = rho_agent_types::one_line(&input);
-                this.update(cx, |chat, cx| {
-                    chat.create_project(endpoint, text, CreatedProject::Open, cx);
-                });
-            }),
-            window,
-            cx,
-        );
-        if let Some(prompt) = frame.minibuffer_mut() {
-            prompt.validate(|text| {
-                text.trim()
-                    .is_empty()
-                    .then_some("new project: a name is required")
-            });
-        }
-    }
 }
 
 impl System for MailSystem {
@@ -821,8 +790,9 @@ impl System for MailSystem {
             return;
         };
         self.logs.remove(&endpoint);
+        self.settings.remove(&endpoint);
         self.creating_projects
-            .retain(|(creation, _)| creation.host() != endpoint);
+            .retain(|(creation, _)| creation.host != endpoint);
         self.cursors.reset(endpoint);
         self.cache.reset(endpoint);
         self.frame.close_all(
@@ -838,54 +808,7 @@ impl System for MailSystem {
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
         let mut rows = Vec::new();
-        let hosts = self.hosts();
-        // The agent's palette uses `c` to compact its context.
-        let on_agent = point
-            .subject
-            .as_ref()
-            .is_some_and(|subject| subject.kind() == AgentRef::KIND);
-        if !hosts.is_empty() && !on_agent {
-            let new_project = this.clone();
-            rows.push(Row::run("c", "new project", move |frame, window, cx| {
-                let hosts = new_project.read(cx).hosts();
-                match hosts.as_slice() {
-                    [(seed, _)] => {
-                        Self::prompt_new_project(new_project.clone(), *seed, frame, window, cx)
-                    }
-                    _ => {
-                        let this = new_project.clone();
-                        let choices = hosts.clone();
-                        frame.open_prompt(
-                            "on host:",
-                            Rc::new(move |_, needle, _| {
-                                choices
-                                    .iter()
-                                    .filter(|(_, name)| name.contains(needle))
-                                    .map(|(_, name)| Candidate {
-                                        value: name.clone(),
-                                        description: "host".to_owned(),
-                                    })
-                                    .collect()
-                            }),
-                            Rc::new(move |frame, input, window, cx| {
-                                let Some((seed, _)) = this
-                                    .read(cx)
-                                    .hosts()
-                                    .into_iter()
-                                    .find(|(_, name)| *name == input.trim())
-                                else {
-                                    frame.echo("no such host", StyleClass::SystemInfo, cx);
-                                    return;
-                                };
-                                Self::prompt_new_project(this.clone(), seed, frame, window, cx);
-                            }),
-                            window,
-                            cx,
-                        );
-                    }
-                }
-            }));
-        }
+        rows.extend(self.project_rows(point, cx));
         // A mail is not necessarily its thread's head. In a thread, the
         // name belongs to the open thread; in a project, to the selected
         // thread row. A desk row and a blank line are not rename contexts.
@@ -1074,24 +997,29 @@ impl System for MailSystem {
         created: ProjectCreated,
         cx: &mut Context<Self>,
     ) {
-        let name = project.name().to_owned();
-        self.create_project(
-            project.host,
-            name,
-            CreatedProject::AddressDraft(created),
-            cx,
-        );
+        let this = cx.entity();
+        let frame = self.frame.clone();
+        frame.with(cx, move |frame, window, cx| {
+            Self::prompt_project(
+                this,
+                project,
+                CreatedProject::AddressDraft(created),
+                frame,
+                window,
+                cx,
+            );
+        });
     }
 
     fn send_idea(&mut self, mail: IdeaMail, cx: &mut Context<Self>) {
         let Some(project) = self.thread_of(&mail.project) else {
             return;
         };
-        cx.emit(Event::Idea {
-            endpoint: project.host,
-            parent: project.message,
-            source: IdeaSource::Box(mail),
-        });
+        let Some(name) = self.project_address(project) else {
+            return;
+        };
+        self.queue_idea(project, mail.text.trim().to_owned(), cx);
+        (mail.sent)(name, cx);
     }
 
     fn find_text(

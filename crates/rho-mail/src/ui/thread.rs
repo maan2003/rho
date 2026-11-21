@@ -1110,8 +1110,7 @@ impl ThreadView {
         );
     }
 
-    /// In a project, the idea goes to the agents system, which sends it
-    /// and starts an agent from it; in a thread, the reply goes out.
+    /// In a project, send an idea and let the host start its work.
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_list(self.system.read(cx)) {
             return self.send_only(&SendOnly, window, cx);
@@ -1120,15 +1119,17 @@ impl ThreadView {
             self.echo_empty_draft(cx);
             return;
         }
-        thread::enter_normal_mode(&self.editor, window, cx);
         let thread = self.thread;
-        self.system.update(cx, |_, cx| {
-            cx.emit(Event::Idea {
-                endpoint: thread.host,
-                parent: thread.message,
-                source: super::IdeaSource::ProjectDraft,
-            });
+        let text = self.draft.read(cx).text();
+        let id = self.system.update(cx, |system, cx| {
+            let id = system.queue_idea(thread, text, cx);
+            system.set_draft(thread.host, Some(thread.message), String::new());
+            id
         });
+        thread::enter_normal_mode(&self.editor, window, cx);
+        self.clear_draft(cx);
+        self.follow = Some(Follow::Sending(id));
+        self.refresh(cx);
     }
 
     fn send_only(&mut self, _: &SendOnly, window: &mut Window, cx: &mut Context<Self>) {

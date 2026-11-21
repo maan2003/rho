@@ -346,6 +346,7 @@ pub trait MailRead {
     fn root_of(&self, message: MessageId) -> Option<MessageId>;
     /// The host's newest channel with this name.
     fn project_named(&self, name: &str) -> Option<MessageId>;
+    fn posted_by_client(&self, client_id: u64) -> Option<MessageId>;
     fn search_mail(
         &self,
         query: &str,
@@ -500,13 +501,20 @@ impl MailRead for ReadTxn {
             .rev()
             .find(|root| {
                 root.revision != Revision::Deleted
+                    && root.mentions.is_empty()
                     && names
                         .get(root.id.0.0)
                         .map(|name| name.value())
                         .unwrap_or_else(|| root.headline())
-                        == name
+                        .eq_ignore_ascii_case(&name)
             })
             .map(|root| root.id)
+    }
+
+    fn posted_by_client(&self, client_id: u64) -> Option<MessageId> {
+        self.open_table(CLIENT_IDS)
+            .get(client_id)
+            .map(|row| MessageId(ChatSeq(row.value())))
     }
 
     fn search_mail(
@@ -727,6 +735,9 @@ pub trait MailWrite {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId>;
+    /// The trial reply already exists when a retry creates its recipient.
+    /// Its words and position do not change when it reaches the new agent.
+    fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId);
     /// A direct conversation under a project. Its first mail is the
     /// anchor; later mail between the same pair goes under that anchor.
     fn post_peer(
@@ -1080,6 +1091,12 @@ impl MailWrite for WriteTxn {
             self.open_table(CLIENT_IDS).insert(client_id, seq.0);
         }
         Ok(MessageId(seq))
+    }
+
+    fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId) {
+        self.open_table(INBOX).insert((agent, message.0.0), ());
+        // The sequence did not move, but the workset can read new inbox mail.
+        tell(self, Appended::Mail(message.0));
     }
 
     fn post_peer(

@@ -140,6 +140,12 @@ A stop produces durable system mail in the agent's thread, not another
 kind of card. When a start from mail is refused before there is an agent,
 the host writes the stop in the idea's thread instead. Neither is agent input.
 
+A project's root owns its name; its host stores its place and mode beside
+the mail log and sends them to every device. The host alone chooses what
+an idea starts (see [SPEC-project-delivery](../../crates/rho-mail/specs/SPEC-project-delivery.md)).
+The settings and standing agent do not move when another agent starts in
+that project through explicit options.
+
 Direct mail between two agents on a host uses the same log and inbox.
 The first mail between a pair starts a thread under the writer's project;
 an answer stays in that conversation even if the agents work in different

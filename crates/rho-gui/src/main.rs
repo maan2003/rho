@@ -228,9 +228,8 @@ fn run() -> Result<()> {
                         (!text.is_empty()).then_some(text)
                     }));
                 });
-                let agents = cx.new(|cx| {
-                    rho_agents_view::AgentsSystem::new(db.clone(), mail.clone(), frame.clone(), cx)
-                });
+                let agents = cx
+                    .new(|cx| rho_agents_view::AgentsSystem::new(mail.clone(), frame.clone(), cx));
                 // The mail ranks a thread by the agents still in it and by
                 // the stops they are in, and names them with what they do;
                 // the agents system knows all of it, and a thread on screen
@@ -250,6 +249,13 @@ fn run() -> Result<()> {
                             },
                             |agents| agents.read(cx).participant(endpoint, agent),
                         )
+                    }));
+                    let known = agents.downgrade();
+                    mail.set_known_places(Rc::new(move |endpoint, cx| {
+                        known
+                            .upgrade()
+                            .map(|agents| agents.read(cx).known_project_places(endpoint))
+                            .unwrap_or_default()
                     }));
                     cx.observe(&agents, |_, _, cx| cx.notify()).detach();
                 });

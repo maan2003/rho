@@ -32,7 +32,6 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-status: the built product makes a project from a name alone and asks where its agents work in a menu at the first idea; nothing shows the place, there is no mode, and every idea joins the newest agent's workset.
 purpose: give each project one address to write to, and one answer, asked once, to where and how its agents work.
 principle: the user sends an idea to `tide@lab`; the project starts the work at its place, in its mode, and sends its asks and results from that address.
 sees: its name and host as an address, such as `tide@lab`; where it works and its mode, such as `on tide · one agent`, in the top line of the Desk narrowed to it; open, the Desk narrowed to that project.
@@ -203,7 +202,6 @@ rejected:
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## flow Start a project
-status: not built. The built product has `new project` on the Desk palette and under `to:`, which make a bare address; the first idea then opens a menu, `where this project's agents work`, with a prompt behind each row and an `on host:` prompt first when several hosts are attached.
 runs: 1 a week
 day: Turn ideas into work.
 when: the user has an idea for work that no project holds yet
@@ -217,7 +215,7 @@ steps:
    - from the Desk palette, `new project` asks the same three lines and opens the empty project
 system: the host keeps the project's name, place and mode, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
 user: the name, the place, and the mode.
-cases: the host is offline; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves mail`; a second project on the same repository; a project made from the Desk with no idea yet.
+cases: the host is offline; an older project with no known place says `no place set` until `works on…` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves mail`; a second project on the same repository; a project made from the Desk with no idea yet.
 mock:
 ```
 to: tide@lab                                        new project tide@lab

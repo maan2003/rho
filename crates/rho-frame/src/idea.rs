@@ -26,19 +26,15 @@ use crate::{Frame, FrameLink};
 pub struct IdeaProject {
     pub address: Address,
     pub name: String,
+    /// Host-owned project settings, presented under the narrowed Desk title.
+    pub details: Option<String>,
 }
 
 /// A validated project name on the host that will own it.
 #[derive(Clone)]
 pub struct NewIdeaProject {
     pub host: EndpointId,
-    name: String,
-}
-
-impl NewIdeaProject {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+    pub name: rho_agent_types::ProjectName,
 }
 
 pub(crate) const NEW_PROJECT: &str = "new project";
@@ -175,7 +171,7 @@ impl Frame {
             return;
         }
         if self.idea.overlay.is_some() {
-            self.choose_idea_project(window, cx);
+            self.choose_idea_project(false, window, cx);
             return;
         }
         // A saved addressee belongs to the draft; a default may only fill a
@@ -254,7 +250,7 @@ impl Frame {
         }
     }
 
-    fn choose_idea_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_idea_project(&mut self, sending: bool, window: &mut Window, cx: &mut Context<Self>) {
         let default = self.resolved_idea_project(cx).map(|(_, project)| project);
         let prefill = default.is_none().then(|| self.idea.recipient.clone());
         let label = "to:";
@@ -279,7 +275,10 @@ impl Frame {
 
                 match choice {
                     Some(ProjectChoice::Existing(project)) => {
-                        frame.edit_idea_to(project, window, cx)
+                        frame.edit_idea_to(project, window, cx);
+                        if sending {
+                            frame.send_idea(window, cx);
+                        }
                     }
                     Some(ProjectChoice::New(system, project)) => {
                         let link = FrameLink::new(
@@ -303,6 +302,9 @@ impl Frame {
                                         && frame.menu.is_none()
                                     {
                                         frame.edit_idea_to(project, window, cx);
+                                        if !frame.idea.text.read(cx).text().trim().is_empty() {
+                                            frame.send_idea(window, cx);
+                                        }
                                     }
                                 });
                             }),
@@ -368,9 +370,9 @@ impl Frame {
             .map_or((input.as_str(), None), |(name, host)| {
                 (name.trim_end(), Some(host))
             });
-        if name.is_empty() || name.contains('@') || name.contains('|') {
+        let Ok(name) = rho_agent_types::ProjectName::parse(name) else {
             return rows;
-        }
+        };
         let host_hint = requested_host.or_else(|| {
             default.and_then(|project| project.name.rsplit_once('@').map(|(_, host)| host))
         });
@@ -385,7 +387,7 @@ impl Frame {
             })
             .filter(|(_, (_, alias))| host_hint.is_none_or(|host| alias.eq_ignore_ascii_case(host)))
             .filter_map(|(system, (host, alias))| {
-                let value = format!("{name}@{alias}");
+                let value = format!("{}@{alias}", name.as_str());
                 (!rows
                     .iter()
                     .any(|(row, _)| row.value.eq_ignore_ascii_case(&value)))
@@ -399,7 +401,7 @@ impl Frame {
                             system.clone(),
                             NewIdeaProject {
                                 host,
-                                name: name.to_owned(),
+                                name: name.clone(),
                             },
                         ),
                     )
@@ -455,14 +457,14 @@ impl Frame {
             return;
         }
         let Some((system, project)) = self.resolved_idea_project(cx) else {
-            self.choose_idea_project(window, cx);
+            self.choose_idea_project(true, window, cx);
             return;
         };
         self.idea.project = Some(project.address.clone());
         self.idea.recipient = project.name;
         self.save_idea(cx);
-        // Keep the words until the project sends the mail, and restore the
-        // previous screen before asking any first-start questions.
+        // Keep the words until they are in the outbox. Sending returns to
+        // the previous screen.
         self.close_idea_overlay(window, cx);
         let sent_text = text.clone();
         let sent_to = project.address.clone();

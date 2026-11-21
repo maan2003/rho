@@ -6,14 +6,19 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ContentPart, Mention, MessageId, Role, Stop,
-    WorksetKind, Wpos,
+    Address, AgentId, ChatEvent, ChatRecord, ContentPart, Mention, MessageId, ProjectChange,
+    ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace, Role, Stop, WorksetKind,
+    Wpos,
 };
+use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
     AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
     StartFromMail, StopAgent,
 };
-use rho_mail::protocol::{ClientFrame, Leave, Open, Post, Project, ResolveProject, ServerFrame};
+use rho_mail::protocol::{
+    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Open, Post, PostIdea, Project,
+    ResolveProject, RetryIdea, ServerFrame,
+};
 use rho_mail::{HostMail, cards};
 use rho_rpc::protocol::client::{call, connect};
 use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
@@ -50,12 +55,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     tokio::runtime::Runtime::new()?.block_on(async {
-        with_host(rho_fake_model::Scenario::RealToolRounds).await?;
-        with_host(rho_fake_model::Scenario::MailChain).await
+        with_host(rho_fake_model::Scenario::RealToolRounds, false).await?;
+        with_host(rho_fake_model::Scenario::MailChain, false).await?;
+        with_host(rho_fake_model::Scenario::RealToolRounds, true).await
     })
 }
 
-async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
+async fn with_host(scenario: rho_fake_model::Scenario, projects: bool) -> anyhow::Result<()> {
     let rig = tempfile::tempdir()?;
     let root = rig.path();
     let paths = RuntimePaths::new(Some(root.join("run")))?;
@@ -78,6 +84,21 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
     config.distribution.overload_bps = 0;
     config.distribution.disconnect_bps = 0;
     let model = rho_fake_model::FakeModel::start(config).await?;
+    if projects {
+        let policy = root.join("config/rho");
+        std::fs::create_dir_all(&policy)?;
+        std::fs::write(
+            policy.join("init.py"),
+            r#"
+from rho.default import new_agent as default_new_agent
+
+def new_agent(*, runtime, **kwargs):
+    if runtime["kind"] == "claude":
+        runtime = {"kind": "native", "model": "sol", "effort": "medium"}
+    return default_new_agent(runtime=runtime, **kwargs)
+"#,
+        )?;
+    }
     let host_binary = Path::new(env!("CARGO_BIN_EXE_rho-agent-host"));
     let worker = root.join(WORKER);
     std::os::unix::fs::symlink(std::env::current_exe()?, &worker)?;
@@ -98,7 +119,10 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
             .spawn()?,
     );
     let result = tokio::time::timeout(Duration::from_secs(55), async {
-        if scenario == rho_fake_model::Scenario::MailChain {
+        if projects {
+            let _ready = connect_chat(&paths).await?;
+            run_projects(&paths, root).await.context("project routing")
+        } else if scenario == rho_fake_model::Scenario::MailChain {
             run_peer_chain(&paths, root).await
         } else {
             let refused = run_refused_start(&paths, root).await?;
@@ -120,6 +144,410 @@ async fn with_host(scenario: rho_fake_model::Scenario) -> anyhow::Result<()> {
     }
     let _ = host.0.wait();
     Ok(())
+}
+
+async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    let old = root.join("first-directory");
+    let new = root.join("different-directory");
+    let repo = root.join("checkouts-tide");
+    for path in [&old, &new, &repo] {
+        std::fs::create_dir(path)?;
+    }
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let ran = Command::new("git").current_dir(&repo).args(args).output()?;
+        anyhow::ensure!(
+            ran.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        Ok(())
+    };
+    git(&["init", "-b", "main"])?;
+    std::fs::write(repo.join("fixture-name"), "tide-checked-out")?;
+    git(&["add", "fixture-name"])?;
+    git(&[
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "user.name=Fixture",
+        "commit",
+        "-m",
+        "test checkout",
+    ])?;
+
+    let place = |path: &Path| ProjectPlace::parse(path.to_str().unwrap()).unwrap();
+    let one_config = ProjectConfig {
+        place: place(&old),
+        mode: ProjectMode::One,
+    };
+    let make = |name, config| async move {
+        call(
+            paths,
+            CreateProject {
+                name: ProjectName::parse(name).unwrap(),
+                config,
+            },
+        )
+        .await
+    };
+    let one = make("same", one_config.clone()).await?;
+    let remote = url::Url::from_file_path(repo).unwrap();
+    let each_config = ProjectConfig {
+        place: ProjectPlace::parse(remote.as_str()).unwrap(),
+        mode: ProjectMode::PerIdea,
+    };
+    let each = make("independent", each_config.clone()).await?;
+    let failed_config = ProjectConfig {
+        place: place(&root.join("missing-place")),
+        mode: ProjectMode::One,
+    };
+    let failed_project = make("asleep", failed_config.clone()).await?;
+    assert_eq!(make("SAME", one_config.clone()).await?, one);
+    assert!(make("same", failed_config.clone()).await.is_err());
+
+    let mut first_device = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut first_device).await? else {
+        anyhow::bail!("no mail hello");
+    };
+    write_frame(&mut first_device, &ClientFrame::Follow { since: head }).await?;
+    assert_eq!(
+        read_projects(&mut first_device).await?,
+        vec![
+            (one, one_config.clone()),
+            (each, each_config.clone()),
+            (failed_project, failed_config.clone())
+        ],
+    );
+
+    let send = |project: ProjectId, client_id, text: &'static str| async move {
+        call(
+            paths,
+            PostIdea {
+                client_id,
+                project,
+                content: vec![ContentPart::Text { text: text.into() }],
+                host_label: "lab".into(),
+            },
+        )
+        .await
+    };
+    // An idea starting on another connection cannot seed a second standing
+    // agent while the first one is being created.
+    let (a, b) = tokio::try_join!(
+        send(one, 801, "Test the channel's alpha clock."),
+        send(one, 802, "Test the channel's unequal beta clock."),
+    )?;
+    let standing = idea_agent(paths, a).await?;
+    assert_eq!(idea_agent(paths, b).await?, standing);
+    wait_for_delivery(paths, standing, a).await?;
+    wait_for_delivery(paths, standing, b).await?;
+    assert_eq!(
+        send(one, 802, "This duplicate must not start anything.").await?,
+        b
+    );
+
+    call(paths, StopAgent { agent: standing }).await?;
+    let after_stop = send(one, 803, "Test the stopped channel's stern clock.").await?;
+    assert_eq!(idea_agent(paths, after_stop).await?, standing);
+    wait_for_delivery(paths, standing, after_stop).await?;
+
+    let first = send(each, 810, "Check the first isolated checkout.").await?;
+    let first_agent = idea_agent(paths, first).await?;
+    let second = send(each, 811, "Check the second isolated checkout.").await?;
+    let second_agent = idea_agent(paths, second).await?;
+    assert_ne!(first_agent, second_agent);
+    wait_for_delivery(paths, first_agent, first).await?;
+    wait_for_delivery(paths, second_agent, second).await?;
+
+    let failed = send(
+        failed_project,
+        820,
+        "Retry this work without losing the brief.",
+    )
+    .await?;
+    let failure = wait_for_mail(&mut first_device, |row| {
+        matches!(row.event, ChatEvent::Posted {
+        from: Address::StartFailed, reply_to: Some(idea), ..
+    } if idea == failed)
+    })
+    .await?;
+    let stop = rho_agent_types::Message::from_record(&failure).unwrap();
+    assert_eq!(stop.parent, Some(failed));
+    assert!(
+        stop.text()
+            .contains(&format!("{} on lab", failed_config.place.as_str()))
+    );
+    assert!(
+        stop.text()
+            .contains("reply to retry, or change where it works from the project's palette.")
+    );
+    assert_eq!(
+        send(
+            failed_project,
+            820,
+            "A retry of this network request is not a new stop."
+        )
+        .await?,
+        failed
+    );
+
+    call(
+        paths,
+        ChangeProject {
+            project: one,
+            change: ProjectChange::Place(place(&new)),
+        },
+    )
+    .await?;
+    let changed = read_projects(&mut first_device).await?;
+    assert_eq!(
+        changed[0],
+        (
+            one,
+            ProjectConfig {
+                place: place(&new),
+                mode: ProjectMode::One
+            }
+        )
+    );
+    let next = send(one, 804, "Use the new directory only for this next idea.").await?;
+    let next_agent = idea_agent(paths, next).await?;
+    assert_ne!(standing, next_agent);
+    wait_for_delivery(paths, next_agent, next).await?;
+    assert_eq!(idea_agent(paths, a).await?, standing);
+
+    call(
+        paths,
+        ChangeProject {
+            project: failed_project,
+            change: ProjectChange::Place(place(&old)),
+        },
+    )
+    .await?;
+    let retry = call(
+        paths,
+        RetryIdea {
+            posted: Post {
+                client_id: 821,
+                parent: Some(failed),
+                reply_to: Some(stop.id),
+                mentions: Vec::new(),
+                content: vec![ContentPart::Text {
+                    text: "Use the corrected place now.".into(),
+                }],
+            },
+            host_label: "lab".into(),
+        },
+    )
+    .await?;
+    let retry_agent = idea_agent(paths, failed).await?;
+    wait_for_delivery(paths, retry_agent, failed).await?;
+    wait_for_delivery(paths, retry_agent, retry).await?;
+    let log = call(
+        paths,
+        AgentLog {
+            agent: retry_agent,
+            from: Wpos::ZERO,
+        },
+    )
+    .await?;
+    let deliveries: Vec<_> = log
+        .rows
+        .into_iter()
+        .filter_map(|(_, row)| match row {
+            LogEvent::Request { inputs, .. } => Some(inputs),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|input| input.message)
+        .collect();
+    assert_eq!(deliveries[..2], [failed, retry]);
+
+    call(
+        paths,
+        ChangeProject {
+            project: one,
+            change: ProjectChange::Mode(ProjectMode::PerIdea),
+        },
+    )
+    .await?;
+    let per_idea = send(one, 805, "Use a fresh agent after the mode changes.").await?;
+    let fresh = idea_agent(paths, per_idea).await?;
+    assert_ne!(fresh, next_agent);
+    assert_ne!(fresh, standing);
+    wait_for_delivery(paths, fresh, per_idea).await?;
+    call(
+        paths,
+        ImportProject {
+            project: one,
+            config: one_config,
+        },
+    )
+    .await?;
+
+    // A new session, with no previous settings, sees the host's existing
+    // choices rather than the old device-only preference it tried to import.
+    let mut second_device = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut second_device).await? else {
+        anyhow::bail!("no new device hello");
+    };
+    write_frame(&mut second_device, &ClientFrame::Follow { since: head }).await?;
+    assert_eq!(
+        read_projects(&mut second_device).await?,
+        vec![
+            (
+                one,
+                ProjectConfig {
+                    place: place(&new),
+                    mode: ProjectMode::PerIdea
+                }
+            ),
+            (each, each_config),
+            (
+                failed_project,
+                ProjectConfig {
+                    place: place(&old),
+                    mode: ProjectMode::One
+                }
+            ),
+        ],
+    );
+
+    let mut directory = connect(paths).await?;
+    write_open(&mut directory, &worksets::Open::Session).await?;
+    let (worksets, agents) = loop {
+        if let worksets::ServerFrame::Directory { worksets, agents } =
+            read_frame(&mut directory).await?
+        {
+            break (worksets, agents);
+        }
+    };
+    let by_agent = |id| {
+        agents
+            .iter()
+            .find(|agent| agent.agent == id)
+            .unwrap()
+            .workset
+    };
+    let kind = |id| {
+        &worksets
+            .iter()
+            .find(|entry| entry.workset == by_agent(id))
+            .unwrap()
+            .kind
+    };
+    let first_workset = by_agent(first_agent);
+    let second_workset = by_agent(second_agent);
+    assert_ne!(first_workset, second_workset);
+    for id in [first_agent, second_agent] {
+        assert_eq!(kind(id), &WorksetKind::Isolated);
+    }
+    for workset in [first_workset, second_workset] {
+        let checkout = call(paths, Eval {
+            workset,
+            code: "from pathlib import Path\nprint(Path('/src/checkouts-tide/fixture-name').read_text())".into(),
+        }).await?;
+        assert_eq!(checkout.error, None);
+        assert_eq!(checkout.output.trim(), "tide-checked-out");
+    }
+    let create_at = |agent| {
+        agents
+            .iter()
+            .find(|entry| entry.agent == agent)
+            .unwrap()
+            .spec
+            .props
+            .get("cwd")
+            .map(String::as_str)
+            .unwrap()
+    };
+    assert_eq!(create_at(standing), old.to_str().unwrap());
+    assert_eq!(create_at(next_agent), new.to_str().unwrap());
+    assert_ne!(
+        by_agent(next_agent),
+        by_agent(fresh),
+        "per idea creates a fresh directory workset too"
+    );
+    assert_eq!(
+        agents
+            .iter()
+            .filter(|entry| {
+                entry
+                    .spec
+                    .props
+                    .get("origin")
+                    .and_then(|s| s.strip_prefix("chat:"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|origin| {
+                        [
+                            a, b, after_stop, first, second, next, retry, per_idea, failed,
+                        ]
+                        .iter()
+                        .any(|mail| origin == mail.0.0)
+                    })
+            })
+            .count(),
+        6,
+        "reused and refused starts create no extra agents"
+    );
+
+    Ok(format!(
+        "project delivery: one {standing:?} reused after stop; isolated clones {first_workset}, {second_workset}; place/mode change and failure retry persisted across devices"
+    ))
+}
+
+async fn read_projects(
+    stream: &mut rho_rpc::Stream,
+) -> anyhow::Result<Vec<(ProjectId, ProjectConfig)>> {
+    loop {
+        if let ServerFrame::Projects { configured } = read_frame(stream).await? {
+            return Ok(configured);
+        }
+    }
+}
+
+async fn idea_agent(paths: &RuntimePaths, thread: MessageId) -> anyhow::Result<AgentId> {
+    // Each read is a different device cursor. Unlike a race with a single
+    // consumed frame, it can observe joins already delivered in a batch.
+    let mut stream = connect_chat(paths).await?;
+    let _: ServerFrame = read_frame(&mut stream).await?;
+    write_frame(
+        &mut stream,
+        &ClientFrame::Follow {
+            since: rho_agent_types::ChatSeq::ZERO,
+        },
+    )
+    .await?;
+    let joined = wait_for_mail(
+        &mut stream,
+        |row| matches!(row.event, ChatEvent::Joined { thread: joined, .. } if joined == thread),
+    )
+    .await?;
+    let ChatEvent::Joined { agent, .. } = joined.event else {
+        unreachable!()
+    };
+    Ok(agent)
+}
+
+async fn wait_for_delivery(
+    paths: &RuntimePaths,
+    agent: AgentId,
+    mail: MessageId,
+) -> anyhow::Result<()> {
+    loop {
+        let log = call(
+            paths,
+            AgentLog {
+                agent,
+                from: Wpos::ZERO,
+            },
+        )
+        .await?;
+        if log.rows.iter().any(|(_, row)| matches!(row, LogEvent::Request { inputs, .. } if inputs.iter().any(|input| input.message == Some(mail)))) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }
 
 async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
@@ -170,7 +598,7 @@ async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<
     assert_eq!(
         mail.text(),
         format!(
-            "failed · did not start · {reason}\n\nTo carry on, run start agent here and choose where reef's agents work."
+            "failed · did not start · {reason}\n\nreply to retry, or change where it works from the project's palette."
         )
     );
     let claims = cards::claims(
@@ -513,7 +941,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     let mut deleted = false;
     while !(edited && deleted) {
         match read_frame(&mut stream).await? {
-            ServerFrame::Work { .. } => {}
+            ServerFrame::Work { .. } | ServerFrame::Projects { .. } => {}
             ServerFrame::Mail { records } => {
                 for row in records {
                     match row.event {
@@ -548,7 +976,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                     })
                 });
             }
-            ServerFrame::Work { .. } => {}
+            ServerFrame::Work { .. } | ServerFrame::Projects { .. } => {}
             ServerFrame::Hello { .. } => {}
         }
         if let Some(mail) = stop_mail.take() {

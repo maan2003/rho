@@ -382,6 +382,8 @@ impl DeskView {
     ) {
         let changed_scope =
             self.project.as_ref().map(|p| &p.address) != project.as_ref().map(|p| &p.address);
+        let changed_title = self.project.as_ref().and_then(|p| p.details.as_ref())
+            != project.as_ref().and_then(|p| p.details.as_ref());
         self.project = project;
         if hold && !changed_scope && Layout::of(self.layout.viewport) == Layout::Phone {
             // Update displayed words in place. A newly ranked row can't
@@ -390,6 +392,9 @@ impl DeskView {
             DeskRows::keep_order(&mut rows.moving, &self.rows.moving);
         }
         if rows == self.rows && !changed_scope {
+            if changed_title {
+                cx.notify();
+            }
             return;
         }
         self.rows = rows;
@@ -560,9 +565,15 @@ impl DeskView {
 
 impl Surface for DeskView {
     fn title(&self, _cx: &App) -> String {
-        self.project
-            .as_ref()
-            .map_or_else(|| "desk".into(), |project| project.name.clone())
+        self.project.as_ref().map_or_else(
+            || "desk".into(),
+            |project| {
+                project.details.as_ref().map_or_else(
+                    || project.name.clone(),
+                    |details| format!("{} · {details}", project.name),
+                )
+            },
+        )
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -858,6 +869,7 @@ mod tests {
             Some(IdeaProject {
                 address: address.clone(),
                 name: "shoal@lab".into(),
+                details: None,
             })
         });
         assert_eq!(rows.wait_count, 9);
@@ -898,6 +910,7 @@ mod tests {
             Some(IdeaProject {
                 address: Address::new("project", id),
                 name: "reef@lab".into(),
+                details: None,
             })
         };
         let rows = desk_rows(&hand, vec![], project);
@@ -940,6 +953,7 @@ mod tests {
             Some(IdeaProject {
                 address: Address::new("project", 1),
                 name: "clock@lab".into(),
+                details: None,
             })
         };
         let rows = desk_rows(&hand, vec![], project);

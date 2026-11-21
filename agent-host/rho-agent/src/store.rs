@@ -565,9 +565,10 @@ pub fn role_of(from: Address) -> Role {
 pub(crate) mod agent_rows;
 pub mod gccp;
 pub mod mail;
-
+mod projects;
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
 pub(crate) use mail::migrate_mail;
 pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
+pub use projects::*;
 #[cfg(test)]
 mod tests;

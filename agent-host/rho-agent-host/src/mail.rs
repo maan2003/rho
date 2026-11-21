@@ -4,11 +4,14 @@
 
 use std::sync::Arc;
 
-use rho_agent::store::{Appended, MailRead as _};
+use anyhow::Context as _;
+use rho_agent::host::pool::ProjectIdea;
+use rho_agent::store::{Appended, MailRead as _, ProjectRead as _};
 use rho_agent_types::ChatSeq;
 use rho_db::RhoDb;
 use rho_mail::protocol::{
-    ClientFrame, Leave, Name, Open, Post, Project, Reparent, Request, ResolveProject, ServerFrame,
+    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Name, Open, Post, PostIdea,
+    Project, Reparent, Request, ResolveProject, RetryIdea, ServerFrame,
 };
 use rho_rpc::protocol::{Answer, Call, write_frame};
 use tokio::sync::{broadcast, mpsc};
@@ -102,6 +105,8 @@ async fn follow(
 ) {
     let mut sent: Option<ChatSeq> = None;
     let mut work_changed = services.pool.watch_thread_work();
+    let mut projects_changed = services.pool.watch_projects();
+    let mut send_projects = true;
     let mut send_work = true;
     let mut last_work = None;
     loop {
@@ -126,7 +131,22 @@ async fn follow(
             }
             send_work = false;
         }
+        if sent.is_some() && send_projects {
+            projects_changed.borrow_and_update();
+            let configured = services.db.read().configured_projects();
+            if outgoing_tx
+                .send(ServerFrame::Projects { configured })
+                .is_err()
+            {
+                return;
+            }
+            send_projects = false;
+        }
         tokio::select! {
+            changed = projects_changed.changed() => {
+                if changed.is_err() { return; }
+                send_projects = true;
+            }
             changed = work_changed.changed() => {
                 if changed.is_err() {
                     return;
@@ -195,12 +215,110 @@ where
             respond(writer, call, |ResolveProject { name }| async move {
                 let name = rho_agent_types::one_line(&name);
                 anyhow::ensure!(!name.is_empty(), "a project needs a name");
-                Ok(services
-                    .db
-                    .read()
-                    .project_named(&name)
-                    .map(|root| Project { root, name }))
+                let read = services.db.read();
+                Ok(read.project_named(&name).and_then(|root| {
+                    Some(Project {
+                        root,
+                        name: read.thread(root)?.name,
+                    })
+                }))
             })
+            .await
+        }
+        Request::CreateProject(call) => {
+            respond(writer, call, |CreateProject { name, config }| async move {
+                services.pool.create_project(name, config).await
+            })
+            .await
+        }
+        Request::ChangeProject(call) => {
+            respond(
+                writer,
+                call,
+                |ChangeProject { project, change }| async move {
+                    services.pool.change_project(project, change).await
+                },
+            )
+            .await
+        }
+        Request::ImportProject(call) => {
+            respond(
+                writer,
+                call,
+                |ImportProject { project, config }| async move {
+                    services.pool.import_project(project, config).await
+                },
+            )
+            .await
+        }
+        Request::PostIdea(call) => {
+            respond(
+                writer,
+                call,
+                |PostIdea {
+                     client_id,
+                     project,
+                     mut content,
+                     host_label,
+                 }| async move {
+                    prepare_image_content(&mut content).await?;
+                    let pool = services.pool.clone();
+                    // The connection does not own the start: after a drop the
+                    // outbox repeats the same client id and learns its receipt.
+                    tokio::spawn(async move {
+                        pool.post_project_idea(ProjectIdea {
+                            client_id,
+                            project,
+                            parent: project.0,
+                            reply_to: None,
+                            content,
+                            host_label,
+                        })
+                        .await
+                    })
+                    .await?
+                },
+            )
+            .await
+        }
+        Request::RetryIdea(call) => {
+            respond(
+                writer,
+                call,
+                |RetryIdea { posted, host_label }| async move {
+                    let Post {
+                        client_id,
+                        parent,
+                        reply_to,
+                        mentions,
+                        mut content,
+                    } = posted;
+                    anyhow::ensure!(mentions.is_empty(), "retry cannot change the recipients");
+                    let parent = parent.context("retry needs a thread")?;
+                    let reply_to = reply_to.context("retry needs a failed start")?;
+                    let project = rho_agent_types::ProjectId(
+                        services
+                            .db
+                            .read()
+                            .root_of(parent)
+                            .context("no such thread")?,
+                    );
+                    prepare_image_content(&mut content).await?;
+                    let pool = services.pool.clone();
+                    tokio::spawn(async move {
+                        pool.post_project_idea(ProjectIdea {
+                            client_id,
+                            project,
+                            parent,
+                            reply_to: Some(reply_to),
+                            content,
+                            host_label,
+                        })
+                        .await
+                    })
+                    .await?
+                },
+            )
             .await
         }
         Request::Post(call) => {

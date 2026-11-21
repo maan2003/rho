@@ -418,13 +418,6 @@ impl Minibuffer {
     }
 
     pub(crate) fn rejection(&self, cx: &App) -> Option<&'static str> {
-        if matches!(self.completion_input, CompletionInput::Address)
-            && let Some((candidate, _)) = self.selected_candidate()
-            && candidate.description == crate::idea::NEW_PROJECT
-            && !matches!(&self.completed_selection, Some(Completed::Text(completed, _)) if *completed == candidate)
-        {
-            return Some("choose new project with tab, then enter");
-        }
         self.validate.and_then(|validate| validate(&self.input(cx)))
     }
 

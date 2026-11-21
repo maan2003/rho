@@ -473,6 +473,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "unsent".into(),
             }],
+            delivery: crate::outbox::Delivery::Idea,
         };
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -522,6 +523,7 @@ mod tests {
             reply_to: Some(MessageId(ChatSeq(1))),
             mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
+            delivery: crate::outbox::Delivery::Retry,
         };
         cache.write_outbox(
             H1,

@@ -135,3 +135,6 @@ pub struct AuthState {
     pub disabled_namespaces: Vec<String>,
     pub active_namespace: Option<String>,
 }
+
+/// Source passed across the workset boundary by both the host and the GUI.
+pub mod snippets;
