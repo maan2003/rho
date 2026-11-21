@@ -70,7 +70,7 @@ cases: a result from days ago that has not been read; a stop reported as message
 reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a reply settles the card
-when the user replies to a `chat.Message` that waits, then its `Card` goes away, and the reply goes to whoever wrote the message.
+when the user replies to a `chat.Message` that waits, then its `Card` goes away. The reply is a message in the thread, read by every agent in it, and the card that goes is the one the user came from, which the deal remembers.
 
 ## rule opening is not reading
 when the user opens a `chat.Thread` and leaves it without a `Verdict` or a reply, then its `Card` stays as it was.
