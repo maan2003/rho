@@ -15,7 +15,7 @@ day: Know what wants them, and where they were.
 ## concept Desk
 purpose: show what wants the user, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting, and deals the first.
-sees: `N wait` and up to seven `deal.Card` rows, in the deal’s order, each a subject and a project, then `and N more` for the rest.
+sees: `N wait` and up to seven `deal.Card` rows, in the deal’s order, each a subject and a project, with the thread's latest `chat.Flash` while it is fresh, then `and N more` for the rest.
 does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
@@ -27,7 +27,7 @@ does:
 answers: what needs the user now?
 shows:
 - `Desk`: the count of everything that waits
-- `deal.Card`: up to seven waiting rows, in deal order, each its subject and project; nothing on a row says why or since when, the deal says that when it opens the card. Repeated stops in one project share a row at the first stop's place. The overflow names what it hides, such as `and 2 more · clock@lab`
+- `deal.Card`: up to seven waiting rows, in deal order, each its subject and project, plus the thread's latest flash as quiet context while it is fresh; nothing on a row says why or since when, the deal says that when it opens the card. Repeated stops in one project share a row at the first stop's place. The overflow names what it hides, such as `and 2 more · clock@lab`
 states:
 - empty: `0 wait`; no rows
 - loading: not agreed
@@ -44,7 +44,7 @@ keys:
 starts: `Glance at what waits`, `deal.Clear what waits`, `chat.Write an idea`, `window.Go to something by name`
 rejected:
 - `asks · 2h` and `result · 8m` words and ages on the rows · 2026-11-20 · the Desk is a glance; the deal says why and since when, one card at a time
-- a mark on what changed since the last glance · 2026-11-20 · the same reason
+- an unread mark on what changed since the last glance · 2026-11-20 · the same reason
 - a draft tail at the bottom · 2026-11-20 · the idea key opens the draft, see `chat.Write an idea`
 - `moving`, up to ten threads that are not waiting with the project's latest words · 2026-11-21 · the owner reads what waits and nothing else at a glance; what moves is one name away in `window.Palette`, where a thread row still shows the project's latest words
 

@@ -77,7 +77,11 @@ def new_agent(*, runtime, **kwargs):
     return default_new_agent(runtime=runtime, **kwargs)
 PY
 if [[ "${FORM_SEED_THREAD:-0}" == 1 ]]; then
-    "$bins/examples/thread_reading_fixture" seed "$rig/host-state/rho/rho.redb"
+    seed_args=()
+    if [[ -n "${FORM_FLASH_LEAD_SECONDS:-}" ]]; then
+        seed_args+=("$FORM_FLASH_LEAD_SECONDS")
+    fi
+    "$bins/examples/thread_reading_fixture" seed "$rig/host-state/rho/rho.redb" "${seed_args[@]}"
 fi
 read -r -a fake_args <<< "${FAKE_ARGS:-}"
 "$bins/rho-fake-model" --scenario "${FAKE_SCENARIO:-clarifying-question}" \

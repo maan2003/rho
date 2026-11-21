@@ -523,9 +523,15 @@ impl Frame {
         } else {
             hand
         };
-        let rows = desk_rows(hand, |address| {
-            self.project_for(address, cx).map(|(_, project)| project)
-        });
+        let rows = desk_rows(
+            hand,
+            |address| self.project_for(address, cx).map(|(_, project)| project),
+            |address| {
+                self.systems
+                    .iter()
+                    .find_map(|system| system.desk_context(address, cx))
+            },
+        );
         self.desk
             .update(cx, |desk, cx| desk.set_rows(rows, project, hold, cx));
     }

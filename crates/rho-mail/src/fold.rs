@@ -50,7 +50,6 @@ pub struct HostMail {
     /// The newest record told.
     pub head: ChatSeq,
     messages: BTreeMap<MessageId, Message>,
-    recaps: crate::reading::Recaps,
     #[cfg(feature = "ui")]
     pub(crate) text: rho_frame::TextIndex<MessageId>,
     /// Each message's children in log order; `None` holds the roots.
@@ -77,7 +76,6 @@ impl HostMail {
                 };
                 let id = message.id;
                 self.children.entry(*parent).or_default().push(id);
-                self.recaps.observe(&message, record);
                 self.messages.insert(id, message);
                 #[cfg(feature = "ui")]
                 self.refresh_text_tree(id, true);
@@ -96,7 +94,9 @@ impl HostMail {
                 if let Some(siblings) = self.children.get_mut(&from) {
                     siblings.retain(|sibling| sibling != message);
                 }
-                self.children.entry(*parent).or_default().push(*message);
+                let siblings = self.children.entry(*parent).or_default();
+                let slot = siblings.partition_point(|id| id < message);
+                siblings.insert(slot, *message);
                 self.messages.get_mut(message).expect("checked").parent = *parent;
                 #[cfg(feature = "ui")]
                 self.refresh_text_tree(*message, false);
@@ -126,7 +126,6 @@ impl HostMail {
                     return Told::Nothing;
                 };
                 mail.apply_revision(record);
-                self.recaps.observe(mail, record);
                 #[cfg(feature = "ui")]
                 if was_agent_only != self.agent_only(*message) && self.root_of(*message) == *message
                 {
@@ -186,6 +185,14 @@ impl HostMail {
         self.work = work.into_iter().collect();
     }
 
+    /// First post order chooses a flash, even if an earlier one was edited.
+    #[cfg(feature = "ui")]
+    pub(crate) fn latest_flash(&self, thread: MessageId) -> Option<&Message> {
+        self.reading_order(thread)
+            .filter(|mail| mail.to_user() && mail.flash_deadline().is_some())
+            .max_by_key(|mail| mail.id)
+    }
+
     /// The status words and the latest time the project wrote to this
     /// thread. A new user idea can change the status to `working` without
     /// changing when the project last wrote.
@@ -209,7 +216,10 @@ impl HostMail {
                 }
             }
         }
-        let words = if self.work.get(&thread) == Some(&ThreadWork::Working)
+        let flash = self.latest_flash(thread);
+        let words = if let Some(flash) = flash {
+            Some(flash.headline())
+        } else if self.work.get(&thread) == Some(&ThreadWork::Working)
             && latest_user
                 .is_some_and(|user| latest.is_none_or(|mail| mail.version().0 < user.id.0))
         {
@@ -228,14 +238,6 @@ impl HostMail {
         std::iter::once(thread)
             .chain(self.children(Some(thread)).iter().copied())
             .filter_map(|id| self.message(id))
-    }
-
-    pub(crate) fn recap(
-        &self,
-        thread: MessageId,
-        verdicts: impl Iterator<Item = UnixMs>,
-    ) -> Option<(MessageId, &str)> {
-        self.recaps.anchor(self.reading_order(thread), verdicts)
     }
 
     pub fn work(&self, thread: MessageId) -> Option<ThreadWork> {
@@ -479,6 +481,60 @@ mod tests {
     use rho_agent_types::{AgentIdDomain, ContentPart};
 
     use super::*;
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn thread_row_prefers_the_newest_flash_then_falls_back_after_its_tombstone() {
+        use rho_agent_types::{Mention, MessageKind};
+
+        let mut log = HostMail::default();
+        log.tell(&posted(1, None, Address::User, "project"));
+        log.tell(&posted(2, Some(1), Address::User, "idea"));
+        let project_words = |seq, words, kind| {
+            let mut item = posted(seq, Some(2), Address::Agent(agent(3)), words);
+            let ChatEvent::Posted {
+                kind: event_kind,
+                mentions,
+                ..
+            } = &mut item.event
+            else {
+                unreachable!()
+            };
+            *event_kind = kind;
+            mentions.push(Mention::User {
+                ping: kind == MessageKind::Kept,
+            });
+            item
+        };
+        log.tell(&project_words(3, "First update", MessageKind::Flash));
+        log.tell(&project_words(4, "Second update", MessageKind::Flash));
+        log.tell(&project_words(5, "A later kept result", MessageKind::Kept));
+        log.tell(&record(
+            6,
+            ChatEvent::Edited {
+                message: id(3),
+                content: vec![ContentPart::Text {
+                    text: "First update is edited".into(),
+                }],
+            },
+        ));
+        assert_eq!(log.latest_flash(id(2)).unwrap().id, id(4));
+        assert_eq!(
+            log.thread_activity(id(2)).0.as_deref(),
+            Some("Second update")
+        );
+        log.tell(&record(7, ChatEvent::Deleted { message: id(4) }));
+        assert_eq!(
+            log.thread_activity(id(2)).0.as_deref(),
+            Some("First update is edited")
+        );
+        log.tell(&record(8, ChatEvent::Deleted { message: id(3) }));
+        assert!(log.latest_flash(id(2)).is_none());
+        assert_eq!(
+            log.thread_activity(id(2)).0.as_deref(),
+            Some("A later kept result")
+        );
+    }
 
     #[cfg(feature = "ui")]
     #[test]

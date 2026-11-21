@@ -184,22 +184,8 @@ impl ThreadWork {
     }
 }
 
-pub const THREAD_COLD_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// The `## recap` section of a mail's text, heading included: the words
-/// that let the user answer a cold thread without its history. It runs to
-/// the next heading of the same or a higher level, or to the end.
-pub fn recap_section(text: &str) -> Option<std::ops::Range<usize>> {
-    mail_section(text, "recap")
-}
-
-/// Designated evidence in an outcome mail. Unlike a recap it stays
-/// visible even if the thread is warm.
+/// Designated evidence in an outcome message.
 pub fn proof_section(text: &str) -> Option<std::ops::Range<usize>> {
-    mail_section(text, "proof")
-}
-
-fn mail_section(text: &str, name: &str) -> Option<std::ops::Range<usize>> {
     let mut start = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -207,7 +193,7 @@ fn mail_section(text: &str, name: &str) -> Option<std::ops::Range<usize>> {
         let level = trimmed.chars().take_while(|c| *c == '#').count();
         let heading = (1..=2).contains(&level) && trimmed[level..].starts_with(' ');
         match start {
-            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case(name) => {
+            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case("proof") => {
                 start = Some(offset);
             }
             Some(start) if heading => return Some(start..offset),
@@ -530,32 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn a_recap_runs_from_its_heading_to_the_next_heading_or_the_end() {
+    fn proof_starts_at_its_heading_and_ends_before_the_next_section() {
         let text =
-            "Use clock B?\n\n## Recap\nThe clock is shared.\n### detail\nmore\n## next\nafter";
-        let range = recap_section(text).unwrap();
-        assert_eq!(
-            &text[range],
-            "## Recap\nThe clock is shared.\n### detail\nmore\n"
-        );
-        let last = "Ask\n## recap\nAll of it";
-        assert_eq!(&last[recap_section(last).unwrap()], "## recap\nAll of it");
-        assert_eq!(recap_section("## recaps\nno"), None);
-        assert_eq!(recap_section("#recap\nno"), None);
-        assert_eq!(recap_section("##recap\nno"), None);
-        assert_eq!(recap_section("plain words about a recap"), None);
-    }
-
-    #[test]
-    fn proof_starts_at_its_own_heading_and_does_not_consume_the_recap() {
-        let text =
-            "Proof in the prose\n## Proof\nTests passed\n### Output\nok\n## recap\nWhat to do";
+            "Proof in the prose\n## Proof\nTests passed\n### Output\nok\n## Next\nWhat to do";
         assert_eq!(
             &text[proof_section(text).unwrap()],
             "## Proof\nTests passed\n### Output\nok\n"
         );
-        assert_eq!(&text[recap_section(text).unwrap()], "## recap\nWhat to do");
-        assert!(proof_section("## proofreading\nno").is_none());
     }
 
     #[test]

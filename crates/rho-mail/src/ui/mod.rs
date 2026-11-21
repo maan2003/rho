@@ -1017,6 +1017,13 @@ impl System for MailSystem {
         cx.notify();
     }
 
+    fn desk_context(&self, address: &Address, _cx: &App) -> Option<String> {
+        let card = self.thread_of(address)?;
+        let chat = self.host_mail(card.host)?;
+        chat.latest_flash(chat.subthread_of(card.message))
+            .map(rho_agent_types::Message::headline)
+    }
+
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
         self.logs
             .iter()

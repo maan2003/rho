@@ -135,6 +135,11 @@ pub trait System: Sized + 'static {
         None
     }
 
+    /// A quiet, current line for one waiting row. The card itself is unchanged.
+    fn desk_context(&self, _address: &Address, _cx: &App) -> Option<String> {
+        None
+    }
+
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
         Vec::new()
     }
@@ -209,6 +214,8 @@ trait SystemHandle {
     fn open_link(&self, url: &Url, cx: &mut App) -> bool;
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
+
+    fn desk_context(&self, address: &Address, cx: &App) -> Option<String>;
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
 
@@ -286,6 +293,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
         self.read(cx).shown_in(address, cx)
+    }
+
+    fn desk_context(&self, address: &Address, cx: &App) -> Option<String> {
+        self.read(cx).desk_context(address, cx)
     }
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
@@ -399,6 +410,10 @@ impl AnySystem {
 
     pub fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
         self.0.shown_in(address, cx)
+    }
+
+    pub(crate) fn desk_context(&self, address: &Address, cx: &App) -> Option<String> {
+        self.0.desk_context(address, cx)
     }
 
     pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
