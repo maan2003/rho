@@ -76,6 +76,9 @@ def new_agent(*, runtime, **kwargs):
         runtime = {"kind": "native", "model": "sol", "effort": "medium"}
     return default_new_agent(runtime=runtime, **kwargs)
 PY
+if [[ "${FORM_SEED_THREAD:-0}" == 1 ]]; then
+    "$bins/examples/thread_reading_fixture" seed "$rig/host-state/rho/rho.redb"
+fi
 read -r -a fake_args <<< "${FAKE_ARGS:-}"
 "$bins/rho-fake-model" --scenario "${FAKE_SCENARIO:-clarifying-question}" \
     --no-faults "${fake_args[@]}" >"$rig/model.json" 2>"$rig/model.log" &
