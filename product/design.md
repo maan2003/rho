@@ -96,7 +96,7 @@ form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` 
 purpose: let the user read an exchange and know who said what, with nothing between the messages but a blank line.
 looks: the words in `editor text` on the `reading surface`; the user's own message in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's message in `reading text` with no bar; one blank line between messages; a `quiet` name line above a message from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`.
 states:
-- flash: a `chat.Flash` in `quiet`, its age in `quiet` at the end of its first line, `3m`; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
+- flash: a `chat.Flash` in `quiet`, its age in `quiet` at the end of its first line, `3m`, or `1h` while it is the thread's newest item; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
 - sending: the user's words in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `chat.Thread`.
