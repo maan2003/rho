@@ -75,6 +75,12 @@ enum ProjectChoice {
     New(AnySystem, NewIdeaProject),
 }
 
+#[derive(Clone, Copy)]
+enum ProjectIntent {
+    Address,
+    Send,
+}
+
 /// A durable idea submission. Repeating it after a lost receipt uses the
 /// same client id, so the host can answer without posting the idea twice.
 pub struct IdeaMail {
@@ -221,7 +227,7 @@ impl Frame {
             return;
         }
         if self.idea.overlay.is_some() {
-            self.choose_idea_project(false, window, cx);
+            self.choose_idea_project(ProjectIntent::Address, window, cx);
             return;
         }
         if self.idea.client_id.is_some_and(|id| {
@@ -408,7 +414,12 @@ impl Frame {
         }
     }
 
-    fn choose_idea_project(&mut self, sending: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_idea_project(
+        &mut self,
+        intent: ProjectIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let default = self.resolved_idea_project(cx).map(|(_, project)| project);
         let prefill = default.is_none().then(|| self.idea.recipient.clone());
         let label = "to:";
@@ -433,10 +444,7 @@ impl Frame {
 
                 match choice {
                     Some(ProjectChoice::Existing(project)) => {
-                        frame.edit_idea_to(project, window, cx);
-                        if sending {
-                            frame.send_idea(window, cx);
-                        }
+                        frame.choose_idea_to(project, intent, window, cx);
                     }
                     Some(ProjectChoice::New(system, project)) => {
                         let link = FrameLink::new(
@@ -459,10 +467,7 @@ impl Frame {
                                         && frame.minibuffer.is_none()
                                         && frame.menu.is_none()
                                     {
-                                        frame.edit_idea_to(project, window, cx);
-                                        if !frame.idea.text.read(cx).text().trim().is_empty() {
-                                            frame.send_idea(window, cx);
-                                        }
+                                        frame.choose_idea_to(project, intent, window, cx);
                                     }
                                 });
                             }),
@@ -571,7 +576,13 @@ impl Frame {
         rows
     }
 
-    fn edit_idea_to(&mut self, project: IdeaProject, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_idea_to(
+        &mut self,
+        project: IdeaProject,
+        intent: ProjectIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(overlay) = &self.idea.overlay else {
             return;
         };
@@ -587,6 +598,9 @@ impl Frame {
         self.refresh_idea_runtime(window, cx);
         window.focus(&overlay.editor.focus_handle(cx), cx);
         cx.notify();
+        if matches!(intent, ProjectIntent::Send) {
+            self.send_idea(window, cx);
+        }
     }
 
     pub(crate) fn close_idea_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -621,7 +635,7 @@ impl Frame {
             return;
         }
         let Some((system, project)) = self.resolved_idea_project(cx) else {
-            self.choose_idea_project(true, window, cx);
+            self.choose_idea_project(ProjectIntent::Send, window, cx);
             return;
         };
         let runtime = match self
@@ -752,6 +766,123 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ProjectHost {
+        projects: Vec<IdeaProject>,
+        sent: Vec<IdeaMail>,
+    }
+
+    impl crate::System for ProjectHost {
+        fn kinds(&self) -> &'static [&'static str] {
+            &["project"]
+        }
+
+        fn open(
+            &mut self,
+            _: &Address,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<crate::AnySurface> {
+            None
+        }
+
+        fn idea_project_hosts(&self, _: &App) -> Vec<(EndpointId, String)> {
+            vec![(EndpointId([1; 32]), "lab".into())]
+        }
+
+        fn idea_projects(&self, _: &App) -> Vec<IdeaProject> {
+            self.projects.clone()
+        }
+
+        fn create_idea_project(
+            &mut self,
+            new: NewIdeaProject,
+            created: ProjectCreated,
+            cx: &mut Context<Self>,
+        ) {
+            let name = new.name.as_str();
+            let project = IdeaProject {
+                address: Address::new("project", name),
+                name: format!("{name}@lab"),
+                details: None,
+                runtime: None,
+            };
+            self.projects.push(project.clone());
+            created(project, cx);
+        }
+
+        fn send_idea(&mut self, mail: IdeaMail, _: &mut Context<Self>) {
+            self.sent.push(mail);
+        }
+    }
+
+    #[gpui::test]
+    fn creating_a_project_keeps_the_intent_of_the_address_prompt(cx: &mut gpui::TestAppContext) {
+        let host = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            cx.new(|_| ProjectHost {
+                projects: Vec::new(),
+                sent: Vec::new(),
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            Frame::new(
+                rho_db::RhoDb::in_memory(),
+                vec![AnySystem::new(host.clone())],
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        let text = "Half a thought, not ready";
+        for (sending, name) in [(false, "skiff@lab"), (true, "stern@lab")] {
+            window
+                .update(cx, |frame, window, cx| {
+                    frame.prompt_idea(window, cx);
+                    frame.idea.text.update(cx, |draft, cx| {
+                        draft.edit([(0..draft.len(), text)], None, cx);
+                    });
+                    if sending {
+                        frame.send_idea(window, cx);
+                    } else {
+                        frame.prompt_idea(window, cx);
+                    }
+                    frame
+                        .minibuffer_mut()
+                        .unwrap()
+                        .set_input(name.into(), window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |frame, window, cx| frame.minibuffer_confirm(window, cx))
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |frame, window, cx| {
+                    assert_eq!(frame.idea.recipient, name);
+                    assert_eq!(frame.idea.text.read(cx).text(), text);
+                    assert_eq!(frame.idea_here(cx), !sending);
+                    assert_eq!(host.read(cx).sent.len(), sending as usize);
+                    if !sending {
+                        frame.cancel_idea(window, cx);
+                        frame.clear_idea(cx);
+                    }
+                })
+                .unwrap();
+        }
+        cx.update(|cx| {
+            let send = &host.read(cx).sent[0];
+            assert_eq!(send.text, text);
+            assert_eq!(send.project, Address::new("project", "stern"));
+        });
+    }
 
     #[test]
     fn runtime_choices_rank_the_project_without_losing_unfeatured_pairs() {
