@@ -4,10 +4,10 @@ The browser is inside the window. A page is a place like a terminal or a desktop
 
 ## concept Page
 purpose: let the user read and use a web page without leaving the window.
-principle: a mail holds a link to a pull request; the user puts the cursor on the link and presses `enter`; the page fills the window; they read it and use `Page.back` to go back to the thread, with the cursor where they left it.
+principle: a message holds a link to a pull request; the user puts the cursor on the link and presses `enter`; the page fills the window; they read it and use `Page.back` to go back to the thread, with the cursor where they left it.
 sees: the page, filling the window under the `window.Status line`, which reads `web ›` and the page's title; the lamp still at its right end.
 does:
-- open `enter` on a link in a `mail.Mail` or in a project's list of threads: open the link as a page; a link that is not a web address echoes that nothing opens it
+- open `enter` on a link in a `chat.Message` or in a project's list of threads: open the link as a page; a link that is not a web address echoes that nothing opens it
 - open page…, from the palette: ask `page:`, listing the open pages by title, most recently visited first; a title opens that page, anything else is read as a web address, `https://` assumed
 - type, click, and scroll: go to the site, except for the window's reserved chords
 - palette `ctrl-shift-;`: open `window.Palette` without the site taking the key
@@ -17,7 +17,7 @@ does:
 
 The palette shows `go back`, `go forward`, and `close page` with their keys. On the phone, the bar offers `back`, `desk`, and `menu`; `go forward` and `close page` are in `menu`.
 
-A link in a mail is drawn underlined, in the accent colour. Closing a page closes its tab. A tab no screen shows, such as one the browser restored on its own, is closed after ten minutes. A typed address with no scheme opens as `https://`, except a loopback address or a name with no dot, which open as `http://`. With no browser installed, the echo line reads `page: no browser found`.
+A link in a message is drawn underlined, in the accent colour. Closing a page closes its tab. A tab no screen shows, such as one the browser restored on its own, is closed after ten minutes. A typed address with no scheme opens as `https://`, except a loopback address or a name with no dot, which open as `http://`. With no browser installed, the echo line reads `page: no browser found`.
 
 ## flow Read and reply on a page
 runs: 10 a day (estimate)

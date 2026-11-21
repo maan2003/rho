@@ -19,18 +19,18 @@ done when: nothing waits and the user's place is on screen as they left it.
 day: Know what wants them, and where they were.
 
 ## concept Card
-purpose: put a mail that wants the user in reach, without making them look through the whole thread.
+purpose: put a message that wants the user in reach, without making them look through the whole thread.
 principle: a project asks whether a test can use a separate clock; the deal opens the thread at its reading position, with point in the draft, the user replies, and its card goes away.
-sees: the `mail.Project` address, the `mail.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `mail.Mail` that pings.
+sees: the `chat.Project` address, the `chat.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `chat.Message` that pings.
 has:
-- one `mail.Thread`
-- one `mail.Mail` that pings the user, or reports a stop
+- one `chat.Thread`
+- one `chat.Message` that pings the user, or reports a stop, or one `chat.Flash` that is a soft ask while it is fresh
 does:
 - deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last
 
-The longest-waiting card deals first; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a mail from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
+The longest-waiting card deals first; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread, except a soft ask, which says on its row that it fades, `fades · 14m`, and goes when its flash goes. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 rejected:
-- `asks` and `result` as two kinds of card · 2026-11-20 · both wait the same way; the mail either pings or it does not
+- `asks` and `result` as two kinds of card · 2026-11-20 · both wait the same way; the message either pings or it does not
 - a card that drops out of the count while it is skipped · 2026-11-20 · a skipped card is still something left
 
 ## rule a result already gone before results waited stays gone
@@ -42,10 +42,10 @@ purpose: let the user say once what a card means to them, so rho remembers their
 principle: the user replies if they have words; otherwise they say done. If they change their mind about a verdict, they can take it back.
 sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
 does:
-- reply: send the user's words and settle the card, as in `mail.Answer a mail`; the thread stays on screen, and the next card waits for `Card.deal`
-- done `space` then `d`, or `done` on the phone: the user has nothing more to say about this version of the mail; put away its card, leave other pings in the thread waiting, and if it was on screen, open the next card
+- reply: send the user's words and settle the card, as in `chat.Answer a message`; the thread stays on screen, and the next card waits for `Card.deal`
+- done `space` then `d`, or `done` on the phone: the user has nothing more to say about this version of the message; put away its card, leave other pings in the thread waiting, and if it was on screen, open the next card
 - mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user until it is unmuted; put the card away, and if it was on screen, open the next one
-- unmute: reopen the thread by name; its heading says `muted` and its verdict menu and palette offer `unmute`. Restore any mail that still waits without leaving the thread.
+- unmute: reopen the thread by name; its heading says `muted` and its verdict menu and palette offer `unmute`. Restore any message that still waits without leaving the thread.
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; each row names when that is, such as `1 hour · 17:26`, `tomorrow · 09:00`, or `next week · Mon 09:00`; a count typed first multiplies the row; the rows are the same on both devices, and there is no one-minute row
 - next `space` then `n`: open the next card; `nothing waits` comes only when the `desk.Desk` would read `0 wait`, and then the Desk opens
 - undo `space` then `u`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
@@ -60,17 +60,17 @@ want: open each thing that needs them and either answer it or say what to do wit
 so that: nothing waits on the user without their knowing
 steps:
 1. the user deals the next `Card` (`open` on the phone’s `desk.Desk`)
-2. the user reads the mail where the card opened
-3. the user replies, `mail.Answer a mail`
+2. the user reads the message where the card opened
+3. the user replies, `chat.Answer a message`
    - without a reply, they give `Verdict.done`, `Verdict.snooze` with a time, or `Verdict.mute`; on the phone, `done` takes one tap on the open card and deals the next
 4. the user continues until nothing waits and the `desk.Desk` is on screen
-system: orders cards from the mail that pings and from stops; snoozed cards can come back.
+system: orders cards from the message that pings and from stops; snoozed cards can come back.
 user: the reply or verdict, and the time for a snooze.
-cases: a result from days ago that has not been read; a stop reported as mail; a snoozed card returns.
+cases: a result from days ago that has not been read; a stop reported as message; a snoozed card returns.
 reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a reply settles the card
-when the user replies to a `mail.Mail` that waits, then its `Card` goes away, and the reply goes to whoever wrote the mail.
+when the user replies to a `chat.Message` that waits, then its `Card` goes away, and the reply goes to whoever wrote the message.
 
 ## rule opening is not reading
-when the user opens a `mail.Thread` and leaves it without a `Verdict` or a reply, then its `Card` stays as it was.
+when the user opens a `chat.Thread` and leaves it without a `Verdict` or a reply, then its `Card` stays as it was.

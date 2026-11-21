@@ -1,6 +1,6 @@
 # design
 
-The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, the project list, mail, and the agent transcript. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
+The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, the project list, message, and the agent transcript. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
 
 ## token color
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
@@ -10,8 +10,7 @@ The built window puts the work in one editor. The top line tells the user where 
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach.
 - failed · `oklch(76.0% 0.140 25)` · a step that did not finish successfully.
 - answer · `oklch(63.1% 0.195 244.8)` · a short explanation, including the answer to the last key.
-- marked · `oklch(72.0% 0.110 105)` · text picked out from the reading line: the user's own mail in a thread, a link, a search match, or the key for a choice.
-- recap · `oklch(73.0% 0.040 150)` · the part of a cold mail that lets the user answer without the history; a slight shift from reading text, not a second voice.
+- marked · `oklch(72.0% 0.110 105)` · text picked out from the reading line: the user's own message in a thread, a link, a search match, or the key for a choice.
 - keys in motion · `oklch(78.0% 0.120 185)` · a visible key or mode that tells the user how the keyboard will act, including `INS`.
 - choice value · `oklch(66.0% 0.120 135)` · the value attached to a choice, not its name or key.
 - point · `oklch(78.0% 0.012 95)` · where the user's attention is in the editor, and marks that guide the eye through text.
@@ -60,7 +59,7 @@ states:
 - host away: a named `lost connection` notice, or a count when more than one host is away.
 - unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
 - echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host warning keep their places.
-used on: `window.Screen`, including `desk.Desk`, `mail.Project`, `mail.Thread`, and `agents.Agent`.
+used on: `window.Screen`, including `desk.Desk`, `chat.Project`, `chat.Thread`, and `agents.Agent`.
 form: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [agent with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
@@ -69,7 +68,7 @@ looks: one line of `answer` in `editor text`, after the heading in the `Status l
 states:
 - quiet: absent; the normal heading is in view.
 - answer or refusal: the first line of the latest notice appears in the same place and color, then goes; an open prompt clears it.
-used on: `window.Screen`, including `mail.Thread` and `desk.Desk`.
+used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 form: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
@@ -80,37 +79,36 @@ states:
 - project list: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then mention, unread and reply counts, a status if present, and age.
 - prompt or palette: place rows use the Desk's columns with `row air` between them: subject, `attention` card words or the project's `quiet` latest words, and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. A command shows its name and its `quiet` key sequence, the name alone on a narrow window. Query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
-used on: `desk.Desk`, `mail.Project`, and `window.Palette`.
+used on: `desk.Desk`, `chat.Project`, and `window.Palette`.
 form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [narrow Desk](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
 
-## part Mail header
-purpose: identify who wrote the mail and when, before the user reads its words.
-looks: the name in `marked` with `emphasis`, then a centered dot and `quiet` time, on a line above the mail in `editor text`.
+## part Message header
+purpose: identify who wrote the message and when, before the user reads its words.
+looks: the name in `marked` with `emphasis`, then a centered dot and `quiet` time, on a line above the message in `editor text`.
 states:
-- delivered: `you` or the project's address, and the time; an edited mail adds `edited`.
-- sending: the header reads `you · sending…` in `quiet` until the host has the mail.
+- delivered: `you` or the project's address, and the time; an edited message adds `edited`.
+- sending: the header reads `you · sending…` in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
-used on: `agents.Agent`. In `mail.Thread` the voice is told by colour, see `Mail`.
-form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Mail` for the separate thread form.
+used on: `agents.Agent`. In `chat.Thread` the voice is told by colour, see `Message`.
+form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` for the separate thread form.
 
-## part Mail
-purpose: let the user read an exchange and know who said what, with nothing between the mails but a blank line.
-looks: the words in `editor text` on the `reading surface`; the user's own mail in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's mail in `reading text` with no bar; one blank line between mails; a `quiet` name line above a mail from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`; a `## recap` section in `recap`.
+## part Message
+purpose: let the user read an exchange and know who said what, with nothing between the messages but a blank line.
+looks: the words in `editor text` on the `reading surface`; the user's own message in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's message in `reading text` with no bar; one blank line between messages; a `quiet` name line above a message from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`.
 states:
-- recap anchor: the heading and recap are drawn in `recap`, before the body of the mail.
-- other mail: hide the recap unless it is the whole mail; then show the heading and words in regular mail colors.
-- sending: the user's words in `quiet` until the host has the mail.
+- flash: a `chat.Flash` in `quiet`, its age in `quiet` at the end of its first line, `3m`; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`; a soft ask adds `fades · 14m` instead of the age.
+- sending: the user's words in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
-used on: `mail.Thread`.
-form: [project and user mail on the laptop](design/laptop-card.png) and [the cold recap](design/laptop-reading.png).
+used on: `chat.Thread`.
+form: [project and user message on the laptop](design/laptop-card.png) and [the open thread](design/laptop-reading.png).
 
 ## part Quote
-purpose: let the user read the words another mail is answering without mistaking them for new words.
+purpose: let the user read the words another message is answering without mistaking them for new words.
 looks: quoted Markdown keeps its `>` marker in the reading line. The words use `editor text` on the `reading surface`, without a separate quote panel.
 states:
 - plain: the body has no quote marker.
 - quoted: `>` starts the quoted line; a block of several lines starts folded to its first line and `…`. The reply can follow in ordinary text.
-used on: built host thread (`mail.Thread`) and transcript (`agents.Agent`) when the writer includes quoted Markdown.
+used on: built host thread (`chat.Thread`) and transcript (`agents.Agent`) when the writer includes quoted Markdown.
 form:
 ```text
 > Fix the clock test that fails one run in five.
@@ -118,17 +116,17 @@ A separate clock per test should do it.
 ```
 
 ## part Draft
-purpose: let the user write the next mail without leaving the buffer.
-looks: the user's words in `marked`, like their sent mail, at the top of the thread, one blank line above the newest mail, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` mail.
+purpose: let the user write the next message without leaving the buffer.
+looks: the user's words in `marked`, like their sent message, at the top of the thread, one blank line above the newest message, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` message.
 states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
-- stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new mail` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
-- answering an older mail: one line in `quiet` right under the draft's last line, `answers eng-ka35 · 12:40 · Which clock needs fixing?`, the first words of that mail cut at the window; absent when the draft answers the newest mail.
+- stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
+- answering an older message: one line in `quiet` right under the draft's last line, `answers eng-ka35 · 12:40 · Which clock needs fixing?`, the first words of that message cut at the window; absent when the draft answers the newest message.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - addressing an idea: `on:` sits under `to:` above the words. The addressed project’s runtime appears in `quiet` until the user types or chooses a runtime. Changing `to:` updates the quiet value but keeps an explicit choice. Enter on `on:` opens the runtime choices.
-- after send: the words are the newest mail, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
-used on: `mail.Thread` and the draft of `mail.Write an idea`.
-form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new mail on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
+- after send: the words are the newest message, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
+used on: `chat.Thread` and the draft of `chat.Write an idea`.
+form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
 ## part Menu
 purpose: offer a few keyed choices without taking the user away from the thing they are on.
@@ -138,7 +136,7 @@ states:
 - open: title, actions, keys, and any values; on the phone the sheet has `close` at the top and a full-width `cancel` at the bottom edge.
 - sub-menu: it takes the same place; the phone sheet adds `‹ back`.
 - empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
-used on: `window.Screen` wherever `window.Menu` opens, including verdicts in `mail.Thread` and `agents.Agent`. Desk does not offer verdicts.
+used on: `window.Screen` wherever `window.Menu` opens, including verdicts in `chat.Thread` and `agents.Agent`. Desk does not offer verdicts.
 form: [laptop verdict grid](design/laptop-menu.png) and [phone verdict sheet](design/phone-menu.png).
 
 ## part Prompt
@@ -163,7 +161,7 @@ states:
 - writing an idea: cancel, undo, and send.
 - prompt: only cancel and enter.
 - menu sheet: the sheet takes taps in front of the work, and its cancel target covers the bar.
-used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `mail.Thread`, `agents.Agent`, and `window.Palette`.
+used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `chat.Thread`, `agents.Agent`, and `window.Palette`.
 form: [Desk](design/phone-desk.png), [card with send](design/phone-card.png), [transcript without send](design/phone-agent.png), and [palette](design/phone-prompt.png).
 
 ## part Card's words
@@ -174,7 +172,7 @@ states:
 - snoozed thread: it leaves the Desk waiting rows until it can be dealt again.
 - nothing waiting: no card words; ordinary row information remains.
 - echo: the words give way on the top line until the answer is gone.
-used on: `mail.Thread` when open as a card, and `window.Palette`; not on `desk.Desk`, which is a glance.
+used on: `chat.Thread` when open as a card, and `window.Palette`; not on `desk.Desk`, which is a glance.
 form: [ask on the phone's top line](design/phone-card.png).
 
 ## part Allowance row

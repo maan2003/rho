@@ -1,6 +1,6 @@
 # hosts
 
-A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their projects and mail together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
+A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their projects and message together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
 
 ## bet Agents live on hosts, and the window attaches to many
 instead of: one server, or everything on the laptop.
@@ -26,20 +26,20 @@ starts when: the user has a new laptop or a new host.
 steps:
 1. the user attaches the host, `Attach a host`
 2. the user pairs the device if it is new, `Pair this device`
-3. the user puts their first idea to work, `mail.Write an idea`
+3. the user puts their first idea to work, `chat.Write an idea`
 done when: the user's first idea is at work within minutes.
 day: Turn ideas into work.
 
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
 principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with addresses ending in `@rho`; when the connection drops, the top line says so in red until it is back.
-sees: its name, which the user chose, as the host part of its projects' addresses; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `mail.Project` address.
+sees: its name, which the user chose, as the host part of its projects' addresses; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `chat.Project` address.
 has:
-- many `mail.Project`
+- many `chat.Project`
 - many `agents.Agent`
 does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
-- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its mail comes back from the host when it is attached again; drafts and unsent mail stay
+- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its message comes back from the host when it is attached again; drafts and unsent message stay
 - status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
 
 A host is reached in one of three ways:
