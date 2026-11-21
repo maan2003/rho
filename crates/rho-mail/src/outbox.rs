@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{AgentId, ContentPart, EndpointId, MessageId, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, EndpointId, MessageId, RuntimeLabel, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 use crate::protocol::Post;
@@ -27,6 +27,7 @@ pub struct Outgoing {
     pub content: Vec<ContentPart>,
     #[senax(default)]
     pub delivery: Delivery,
+    pub runtime: Option<RuntimeLabel>,
 }
 
 impl Outgoing {
@@ -90,33 +91,56 @@ impl Outbox {
         content: Vec<ContentPart>,
         delivery: Delivery,
     ) -> (u64, Kept) {
-        let id = rand::random();
-        let outgoing = Outgoing {
-            at: UnixMs::now(),
-            parent,
-            reply_to,
-            mentions,
-            content,
-            delivery,
-        };
+        self.keep(
+            endpoint,
+            rand::random(),
+            Outgoing {
+                at: UnixMs::now(),
+                parent,
+                reply_to,
+                mentions,
+                content,
+                delivery,
+                runtime: None,
+            },
+        )
+    }
+
+    pub(crate) fn keep(
+        &mut self,
+        endpoint: EndpointId,
+        id: u64,
+        outgoing: Outgoing,
+    ) -> (u64, Kept) {
         self.waiting.push((endpoint, id, outgoing.clone()));
         (id, Kept::Put(id, outgoing))
     }
 
+    /// Whether the pending idea still belongs to the outbox.
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.waiting
+            .iter()
+            .any(|(_, client_id, _)| *client_id == id)
+    }
+
     /// The host's oldest unsent message, to post now, unless a post is
     /// already on its way.
-    pub fn next(&mut self, endpoint: EndpointId) -> Option<(Post, Delivery)> {
+    pub fn next(&mut self, endpoint: EndpointId) -> Option<(Post, Delivery, Option<RuntimeLabel>)> {
         if self.sending.contains_key(&endpoint) {
             return None;
         }
         let (_, id, outgoing) = self.waiting.iter().find(|(host, ..)| *host == endpoint)?;
         self.sending.insert(endpoint, *id);
-        Some((outgoing.call(*id), outgoing.delivery))
+        Some((
+            outgoing.call(*id),
+            outgoing.delivery,
+            outgoing.runtime.clone(),
+        ))
     }
 
-    /// The host logged what was on its way. Answers its client id, what it
-    /// was, and what the disk copy drops.
-    pub fn delivered(&mut self, endpoint: EndpointId) -> Option<(u64, Outgoing, Kept)> {
+    /// The host answered what was on its way, by either logging it or
+    /// refusing it definitively before posting. Drop the disk copy.
+    pub fn answered(&mut self, endpoint: EndpointId) -> Option<(u64, Outgoing, Kept)> {
         let sent = self.sending.remove(&endpoint)?;
         let at = self
             .waiting
@@ -210,11 +234,11 @@ mod tests {
         assert_eq!(
             outbox
                 .next(a)
-                .map(|(post, _)| (post.client_id, post.reply_to)),
+                .map(|(post, ..)| (post.client_id, post.reply_to)),
             Some((first, Some(MessageId(ChatSeq(7))))),
             "posted again under the same id"
         );
-        let (id, outgoing, kept) = outbox.delivered(a).unwrap();
+        let (id, outgoing, kept) = outbox.answered(a).unwrap();
         assert_eq!((id, kept), (first, Kept::Gone(first)));
         assert_eq!(
             rho_agent_types::transcript::text_content(&outgoing.content),
@@ -225,13 +249,16 @@ mod tests {
             outbox.waiting_under(b, thread).is_empty(),
             "the thread of a's host"
         );
-        assert_eq!(outbox.next(a).map(|(post, _)| post.client_id), Some(second));
-        outbox.delivered(a);
+        assert_eq!(
+            outbox.next(a).map(|(post, ..)| post.client_id),
+            Some(second)
+        );
+        outbox.answered(a);
         assert!(outbox.waiting_under(a, thread).is_empty());
         assert!(outbox.next(a).is_none());
         assert_eq!(outbox.hosts(), [b]);
-        assert!(outbox.delivered(b).is_some());
-        assert!(outbox.delivered(b).is_none(), "nothing more was on its way");
+        assert!(outbox.answered(b).is_some());
+        assert!(outbox.answered(b).is_none(), "nothing more was on its way");
     }
 
     #[test]
@@ -259,6 +286,42 @@ mod tests {
     }
 
     #[test]
+    fn an_idea_keeps_its_choice_when_resent_and_a_refusal_does_not_block_later_mail() {
+        let host = EndpointId([2; 32]);
+        let label = RuntimeLabel::parse("sol-high").unwrap();
+        let outgoing = Outgoing {
+            at: UnixMs(11),
+            parent: Some(MessageId(ChatSeq(75))),
+            reply_to: None,
+            mentions: Vec::new(),
+            content: text("explicit choice"),
+            delivery: Delivery::Idea,
+            runtime: Some(label.clone()),
+        };
+        let bytes = senax_encoder::encode(&outgoing).unwrap();
+        let saved = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
+        let mut outbox = Outbox::load(vec![(host, 31, saved)]);
+        let (next, _) = outbox.push(host, None, None, Vec::new(), text("later"), Delivery::Mail);
+        for _ in 0..2 {
+            assert_eq!(
+                outbox.next(host).map(|(post, delivery, runtime)| (
+                    post.client_id,
+                    delivery,
+                    runtime
+                )),
+                Some((31, Delivery::Idea, Some(label.clone()))),
+            );
+            outbox.failed(host); // No definite answer keeps the same request.
+        }
+        outbox.next(host).unwrap();
+        assert_eq!(outbox.answered(host).unwrap().2, Kept::Gone(31));
+        assert_eq!(
+            outbox.next(host).map(|(post, ..)| post.client_id),
+            Some(next)
+        );
+    }
+
+    #[test]
     fn what_was_left_unsent_goes_in_the_order_written() {
         let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let outgoing = |at: u64, text: &str| Outgoing {
@@ -268,6 +331,7 @@ mod tests {
             mentions: vec![agent],
             content: vec![ContentPart::Text { text: text.into() }],
             delivery: Delivery::Mail,
+            runtime: None,
         };
         let mut outbox = Outbox::load(vec![
             (EndpointId([1; 32]), 32, outgoing(2, "second")),
@@ -276,14 +340,14 @@ mod tests {
         assert_eq!(
             outbox
                 .next(EndpointId([1; 32]))
-                .map(|(post, _)| post.client_id),
+                .map(|(post, ..)| post.client_id),
             Some(31)
         );
-        outbox.delivered(EndpointId([1; 32]));
+        outbox.answered(EndpointId([1; 32]));
         assert_eq!(
             outbox
                 .next(EndpointId([1; 32]))
-                .map(|(post, _)| post.client_id),
+                .map(|(post, ..)| post.client_id),
             Some(32)
         );
     }

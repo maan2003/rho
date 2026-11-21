@@ -9,7 +9,7 @@ use anyhow::{Context as _, anyhow, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent_types::{
     Address, ContentPart, Mention, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
-    ProjectName, ProjectPlace, UnixMs, WorksetKind, one_line,
+    ProjectName, ProjectPlace, RuntimeLabel, UnixMs, WorksetKind, one_line,
 };
 use rho_agents_client::protocol::snippets::{self, Function, Runtime};
 use tokio::sync::{Mutex, watch};
@@ -39,6 +39,11 @@ impl Projects {
     }
 }
 
+pub enum ProjectIdeaResult {
+    Posted(MessageId),
+    RuntimeRefused(String),
+}
+
 pub struct ProjectIdea {
     pub client_id: u64,
     pub project: ProjectId,
@@ -46,6 +51,7 @@ pub struct ProjectIdea {
     pub reply_to: Option<MessageId>,
     pub content: Vec<ContentPart>,
     pub host_label: String,
+    pub runtime: Option<RuntimeLabel>,
 }
 
 impl AgentPool {
@@ -237,10 +243,9 @@ impl AgentPool {
     pub async fn post_project_idea(
         self: &Arc<Self>,
         idea: ProjectIdea,
-    ) -> anyhow::Result<MessageId> {
+    ) -> anyhow::Result<ProjectIdeaResult> {
         let _gate = self.projects.lock(idea.project).await;
-        let (message, standing, settings, resumed) = {
-            let mut write = self.db.write().await;
+        let (settings, posted, standing) = {
             let read = self.db.read();
             ensure!(
                 read.is_project(idea.project),
@@ -259,39 +264,64 @@ impl AgentPool {
                 );
             }
             let settings = read.project_settings(idea.project);
-            if let Some(message) = read.posted_by_client(idea.client_id) {
-                if read.project_start_complete(message) {
-                    return Ok(message);
-                }
-                // An earlier attempt posted this before it could start the
-                // agent. Do not post it again or send it to a different agent.
-                (message, None, settings, true)
-            } else {
-                let standing = match settings.as_ref().map(|s| &s.routing) {
-                    Some(Routing::One { agent: Some(agent) }) if read.agent(*agent).is_some() => {
-                        Some(*agent)
-                    }
-                    _ => None,
-                };
-                let message = write.post(
-                    UnixMs::now(),
-                    Some(idea.parent),
-                    NewMessage {
-                        from: Address::User,
-                        reply_to: idea.reply_to,
-                        // Also the membership signal for the normal inbox policy.
-                        // Do not fan a new idea out to inherited members.
-                        mentions: standing.into_iter().map(Mention::Direct).collect(),
-                        content: idea.content,
-                    },
-                    Some(idea.client_id),
-                )?;
-                if standing.is_some() {
-                    write.complete_project_start(message);
-                }
-                write.commit();
-                (message, standing, settings, false)
+            let posted = read.posted_by_client(idea.client_id);
+            if let Some(message) = posted
+                && read.project_start_complete(message)
+            {
+                return Ok(ProjectIdeaResult::Posted(message));
             }
+            let standing = match settings.as_ref().map(|s| &s.routing) {
+                Some(Routing::One { agent: Some(agent) }) if posted.is_none() => {
+                    read.agent(*agent).map(|head| (*agent, head))
+                }
+                _ => None,
+            };
+            (settings, posted, standing)
+        };
+        if let (Some((agent, head)), Some(runtime)) = (&standing, &idea.runtime)
+            && (
+                head.spec.runtime.model_name(),
+                head.spec.runtime.effort_name(),
+            ) != (runtime.model(), runtime.effort())
+        {
+            // Use the same SetSpec path as the palette; it owns the kind
+            // rule. The message isn't logged or delivered before it agrees.
+            let changed = self
+                .eval(head.workset, snippets::set_runtime(*agent, runtime))
+                .await;
+            let refusal = match changed {
+                Ok(result) => result.error.map(|error| last_error(&error).to_owned()),
+                Err(error) => Some(format!("{error:#}")),
+            };
+            if let Some(refusal) = refusal {
+                return Ok(ProjectIdeaResult::RuntimeRefused(refusal));
+            }
+        }
+        let resumed = posted.is_some();
+        let standing = standing.map(|(agent, _)| agent);
+        let message = if let Some(message) = posted {
+            // An earlier attempt posted this before it could start the
+            // agent. Don't post it again or send it to a different agent.
+            message
+        } else {
+            let mut write = self.db.write().await;
+            let message = write.post(
+                UnixMs::now(),
+                Some(idea.parent),
+                NewMessage {
+                    from: Address::User,
+                    reply_to: idea.reply_to,
+                    // Don't fan a new idea out to inherited members.
+                    mentions: standing.into_iter().map(Mention::Direct).collect(),
+                    content: idea.content,
+                },
+                Some(idea.client_id),
+            )?;
+            if standing.is_some() {
+                write.complete_project_start(message);
+            }
+            write.commit();
+            message
         };
         self.user_visited(message);
         self.consider_naming(message);
@@ -303,14 +333,14 @@ impl AgentPool {
             if let Err(error) = self.load(agent).await {
                 eprintln!("rho-agent: loading project agent {agent:?}: {error:#}");
             }
-            return Ok(message);
+            return Ok(ProjectIdeaResult::Posted(message));
         }
 
         // Retrying a refused start gives the new agent the original brief
         // first, then the words of the retry; neither is rewritten.
         let origin = idea.reply_to.map_or(message, |_| idea.parent);
         let result = self
-            .start_project_agent(origin, settings.as_ref(), resumed)
+            .start_project_agent(origin, settings.as_ref(), idea.runtime.as_ref(), resumed)
             .await;
         let mut write = self.db.write().await;
         match result {
@@ -337,13 +367,14 @@ impl AgentPool {
         }
         write.complete_project_start(message);
         write.commit();
-        Ok(message)
+        Ok(ProjectIdeaResult::Posted(message))
     }
 
     async fn start_project_agent(
         self: &Arc<Self>,
         message: MessageId,
         settings: Option<&ProjectSettings>,
+        runtime: Option<&RuntimeLabel>,
         resumed: bool,
     ) -> anyhow::Result<rho_agent_types::AgentId> {
         // A connection or host may go away after the worker created
@@ -361,8 +392,8 @@ impl AgentPool {
         }
         let place = &settings.context("the project does not have a place")?.place;
         let function = Function::default();
-        let runtime =
-            Runtime::parse(snippets::DEFAULT_RUNTIME).expect("the default runtime parses");
+        let default = Runtime::default();
+        let runtime = runtime.unwrap_or(&default);
         let (kind, code) = if place.is_repository() {
             (
                 WorksetKind::Isolated,
@@ -370,7 +401,7 @@ impl AgentPool {
                     &function,
                     Utf8Path::new(place.as_str()),
                     "",
-                    &runtime,
+                    runtime,
                     Some(message),
                 ),
             )
@@ -385,7 +416,7 @@ impl AgentPool {
                 }
                 Err(_) => path.to_owned(),
             };
-            let code = snippets::new_agent_in(&function, &cwd, &runtime, Some(message));
+            let code = snippets::new_agent_in(&function, &cwd, runtime, Some(message));
             (WorksetKind::Host { cwd }, code)
         };
         let (_, evaluated) = self.create_workset(kind, code).await?;
@@ -395,12 +426,17 @@ impl AgentPool {
                 evaluated
                     .error
                     .as_deref()
-                    .and_then(|traceback| traceback
-                        .lines()
-                        .rev()
-                        .find(|line| !line.trim().is_empty()))
+                    .map(last_error)
                     .unwrap_or("no agent was created")
             )
         })
     }
+}
+
+fn last_error(traceback: &str) -> &str {
+    traceback
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(traceback)
 }

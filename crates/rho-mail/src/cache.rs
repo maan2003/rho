@@ -474,6 +474,7 @@ mod tests {
                 text: "unsent".into(),
             }],
             delivery: crate::outbox::Delivery::Idea,
+            runtime: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -524,6 +525,7 @@ mod tests {
             mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
             delivery: crate::outbox::Delivery::Retry,
+            runtime: None,
         };
         cache.write_outbox(
             H1,

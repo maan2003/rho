@@ -27,6 +27,8 @@ const IDEA_DRAFT: TableDefinition<(), Sen<Option<IdeaDraft>>> =
 pub(crate) struct IdeaDraft {
     pub address: Option<String>,
     pub recipient: String,
+    pub runtime: Option<String>,
+    pub client_id: Option<u64>,
     pub text: String,
 }
 
@@ -64,6 +66,8 @@ pub(crate) fn idea_draft(db: &RhoDb) -> Option<IdeaDraft> {
     Some(IdeaDraft {
         address: Some(address.to_owned()),
         recipient: String::new(),
+        runtime: None,
+        client_id: None,
         text: text.to_owned(),
     })
 }
@@ -473,6 +477,8 @@ mod tests {
             Some(IdeaDraft {
                 address: Some("thread:tide".into()),
                 recipient: String::new(),
+                runtime: None,
+                client_id: None,
                 text: "Check the tide".into(),
             })
         );
@@ -499,6 +505,8 @@ mod tests {
         let draft = IdeaDraft {
             address: None,
             recipient: "tide@".into(),
+            runtime: Some("sol-high".into()),
+            client_id: Some(17),
             text: "Check the tide".into(),
         };
         writer.write(Write::IdeaDraft(Some(draft.clone())));

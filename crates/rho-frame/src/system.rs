@@ -168,6 +168,10 @@ pub trait System: Sized + 'static {
 
     fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
+    fn idea_pending(&self, _id: u64) -> bool {
+        false
+    }
+
     /// Every place of the system's that the palette lists by title. The
     /// frame joins them with the current hand and visit history.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
@@ -224,6 +228,7 @@ trait SystemHandle {
     fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App);
 
     fn send_idea(&self, mail: IdeaMail, cx: &mut App);
+    fn idea_pending(&self, id: u64, cx: &App) -> bool;
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
@@ -319,6 +324,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
         self.update(cx, |system, cx| system.send_idea(mail, cx))
+    }
+
+    fn idea_pending(&self, id: u64, cx: &App) -> bool {
+        self.read(cx).idea_pending(id)
     }
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -435,6 +444,10 @@ impl AnySystem {
 
     pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
         self.0.send_idea(mail, cx)
+    }
+
+    pub(crate) fn idea_pending(&self, id: u64, cx: &App) -> bool {
+        self.0.idea_pending(id, cx)
     }
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {

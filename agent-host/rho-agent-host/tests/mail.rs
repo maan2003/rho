@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use rho_agent_types::{
     Address, AgentId, ChatEvent, ChatRecord, ContentPart, Mention, MessageId, ProjectChange,
-    ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace, Role, Stop, WorksetKind,
-    Wpos,
+    ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace, Role, RuntimeLabel, Stop,
+    WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
@@ -16,8 +16,8 @@ use rho_agents_client::protocol::worksets::{
     StartFromMail, StopAgent,
 };
 use rho_mail::protocol::{
-    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Open, Post, PostIdea, Project,
-    ResolveProject, RetryIdea, ServerFrame,
+    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Open, Post, PostIdea,
+    PostIdeaReply, Project, ResolveProject, RetryIdea, ServerFrame,
 };
 use rho_mail::{HostMail, cards};
 use rho_rpc::protocol::client::{call, connect};
@@ -219,7 +219,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         ],
     );
 
-    let send = |project: ProjectId, client_id, text: &'static str| async move {
+    let post_as = |project: ProjectId, client_id, text: &'static str, runtime| async move {
         call(
             paths,
             PostIdea {
@@ -227,9 +227,16 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 project,
                 content: vec![ContentPart::Text { text: text.into() }],
                 host_label: "lab".into(),
+                runtime,
             },
         )
         .await
+    };
+    let send = |project, client_id, text| async move {
+        let PostIdeaReply::Posted(message) = post_as(project, client_id, text, None).await? else {
+            anyhow::bail!("an idea without an override was refused");
+        };
+        Ok(message)
     };
     // An idea starting on another connection cannot seed a second standing
     // agent while the first one is being created.
@@ -246,12 +253,53 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         b
     );
 
+    let PostIdeaReply::Posted(switched) = post_as(
+        one,
+        850,
+        "Use a higher effort on the same timer.",
+        Some(RuntimeLabel::parse("sol-high").unwrap()),
+    )
+    .await?
+    else {
+        anyhow::bail!("the standing agent could not take a same-kind change");
+    };
+    assert_eq!(idea_agent(paths, switched).await?, standing);
+    wait_for_delivery(paths, standing, switched).await?;
+    let refused = post_as(
+        one,
+        851,
+        "This must stay in the draft.",
+        Some(RuntimeLabel::parse("opus-high").unwrap()),
+    )
+    .await?;
+    assert!(matches!(refused, PostIdeaReply::RuntimeRefused(reason)
+        if reason.contains("only a stopped agent that has never sent a request")));
+    let after_refusal = send(one, 851, "Now continue with the same runtime.").await?;
+    let receipt = wait_for_mail(&mut first_device, |row| row.seq == after_refusal.0).await?;
+    assert_eq!(
+        rho_agent_types::Message::from_record(&receipt)
+            .unwrap()
+            .text(),
+        "Now continue with the same runtime.",
+        "a refused override never posts the idea"
+    );
+    assert_eq!(idea_agent(paths, after_refusal).await?, standing);
+
     call(paths, StopAgent { agent: standing }).await?;
     let after_stop = send(one, 803, "Test the stopped channel's stern clock.").await?;
     assert_eq!(idea_agent(paths, after_stop).await?, standing);
     wait_for_delivery(paths, standing, after_stop).await?;
 
-    let first = send(each, 810, "Check the first isolated checkout.").await?;
+    let PostIdeaReply::Posted(first) = post_as(
+        each,
+        810,
+        "Check the first isolated checkout.",
+        Some(RuntimeLabel::parse("sol-xhigh").unwrap()),
+    )
+    .await?
+    else {
+        anyhow::bail!("a fresh per-idea agent could not start on the chosen runtime");
+    };
     let first_agent = idea_agent(paths, first).await?;
     let second = send(each, 811, "Check the second isolated checkout.").await?;
     let second_agent = idea_agent(paths, second).await?;
@@ -422,6 +470,29 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             break (worksets, agents);
         }
     };
+    let runtime = |id| {
+        agents
+            .iter()
+            .find(|agent| agent.agent == id)
+            .unwrap()
+            .spec
+            .runtime_label()
+    };
+    assert_eq!(
+        runtime(standing),
+        "sol-high",
+        "unspecified ideas keep the standing runtime"
+    );
+    assert_eq!(
+        runtime(first_agent),
+        "sol-xhigh",
+        "a new agent uses the explicit runtime"
+    );
+    assert_eq!(
+        runtime(second_agent),
+        "sol-medium",
+        "the fixture maps the unedited default"
+    );
     let by_agent = |id| {
         agents
             .iter()

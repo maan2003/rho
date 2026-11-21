@@ -18,7 +18,7 @@ pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
 pub use mail::MailView;
-pub use projects::ProjectIdea;
+pub use projects::{ProjectIdea, ProjectIdeaResult};
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, UnixMs, WorksetKind,
 };

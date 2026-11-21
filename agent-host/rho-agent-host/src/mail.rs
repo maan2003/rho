@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent::host::pool::ProjectIdea;
+use rho_agent::host::pool::{ProjectIdea, ProjectIdeaResult};
 use rho_agent::store::{Appended, MailRead as _, ProjectRead as _};
 use rho_agent_types::ChatSeq;
 use rho_db::RhoDb;
 use rho_mail::protocol::{
     ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Name, Open, Post, PostIdea,
-    Project, Reparent, Request, ResolveProject, RetryIdea, ServerFrame,
+    PostIdeaReply, Project, Reparent, Request, ResolveProject, RetryIdea, ServerFrame,
 };
 use rho_rpc::protocol::{Answer, Call, write_frame};
 use tokio::sync::{broadcast, mpsc};
@@ -258,6 +258,7 @@ where
                 |PostIdea {
                      client_id,
                      project,
+                     runtime,
                      mut content,
                      host_label,
                  }| async move {
@@ -265,7 +266,7 @@ where
                     let pool = services.pool.clone();
                     // The connection does not own the start: after a drop the
                     // outbox repeats the same client id and learns its receipt.
-                    tokio::spawn(async move {
+                    let result = tokio::spawn(async move {
                         pool.post_project_idea(ProjectIdea {
                             client_id,
                             project,
@@ -273,10 +274,17 @@ where
                             reply_to: None,
                             content,
                             host_label,
+                            runtime,
                         })
                         .await
                     })
-                    .await?
+                    .await??;
+                    Ok(match result {
+                        ProjectIdeaResult::Posted(id) => PostIdeaReply::Posted(id),
+                        ProjectIdeaResult::RuntimeRefused(reason) => {
+                            PostIdeaReply::RuntimeRefused(reason)
+                        }
+                    })
                 },
             )
             .await
@@ -305,7 +313,7 @@ where
                     );
                     prepare_image_content(&mut content).await?;
                     let pool = services.pool.clone();
-                    tokio::spawn(async move {
+                    let result = tokio::spawn(async move {
                         pool.post_project_idea(ProjectIdea {
                             client_id,
                             project,
@@ -313,10 +321,15 @@ where
                             reply_to: Some(reply_to),
                             content,
                             host_label,
+                            runtime: None,
                         })
                         .await
                     })
-                    .await?
+                    .await??;
+                    match result {
+                        ProjectIdeaResult::Posted(id) => Ok(id),
+                        ProjectIdeaResult::RuntimeRefused(reason) => anyhow::bail!("{reason}"),
+                    }
                 },
             )
             .await
