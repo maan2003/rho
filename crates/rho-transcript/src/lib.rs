@@ -47,11 +47,25 @@ pub trait Style: Copy + Eq + Hash + 'static {
     }
 }
 
-/// Something drawn under a line of an item: an image, an unfurl.
+/// Where a block sits relative to an item's own text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockLine {
+    Above(u32),
+    Below(u32),
+}
+
+impl BlockLine {
+    fn row(self) -> u32 {
+        match self {
+            Self::Above(row) | Self::Below(row) => row,
+        }
+    }
+}
+
+/// Something drawn beside an item's lines, not part of its text.
 #[derive(Clone)]
 pub struct BlockSpec {
-    /// Which line of the item's own text the block sits under.
-    pub line: u32,
+    pub line: BlockLine,
     pub height: u32,
     pub render: RenderBlock,
     pub priority: usize,
@@ -785,7 +799,7 @@ where
         for item in self.items.get(inserted).into_iter().flatten() {
             let start = item.range.start.to_point(&snapshot).row;
             for block in &item.blocks {
-                let point = Point::new((start + block.line).min(snapshot.max_point().row), 0);
+                let point = Point::new((start + block.line.row()).min(snapshot.max_point().row), 0);
                 placements.push((
                     item.key.clone(),
                     block.clone(),
@@ -824,7 +838,10 @@ where
                     let anchor = snapshot.anchor_in_excerpt(*anchor)?;
                     owners.push(key.clone());
                     Some(BlockProperties {
-                        placement: BlockPlacement::Below(anchor),
+                        placement: match block.line {
+                            BlockLine::Above(_) => BlockPlacement::Above(anchor),
+                            BlockLine::Below(_) => BlockPlacement::Below(anchor),
+                        },
                         height: Some(block.height),
                         style: BlockStyle::Fixed,
                         render: block.render.clone(),
