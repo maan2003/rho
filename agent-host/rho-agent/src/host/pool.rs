@@ -8,6 +8,7 @@
 mod gccp;
 mod mail;
 mod naming;
+mod projects;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
 pub use mail::MailView;
+pub use projects::ProjectIdea;
 use rho_agent_types::{
     Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, UnixMs, WorksetKind,
 };
@@ -86,6 +88,7 @@ pub struct AgentPool {
     /// the one clock every device reads an agent's age by.
     doing: std::sync::Mutex<HashMap<AgentId, rho_agent_types::Doing>>,
     mail: mail::Mail,
+    projects: projects::Projects,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -255,11 +258,13 @@ impl AgentPool {
             statuses: std::sync::Mutex::new(Vec::new()),
             doing: std::sync::Mutex::new(HashMap::new()),
             mail: mail::Mail::default(),
+            projects: projects::Projects::default(),
             load_locks: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             first_agent: std::sync::Mutex::default(),
             handing: tokio::sync::watch::Sender::new(false),
         });
+        pool.init_projects().await;
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
             let mut interval =

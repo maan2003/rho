@@ -8,7 +8,8 @@
 //! only how it crosses the wire.
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ThreadWork,
+    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ProjectChange, ProjectConfig,
+    ProjectId, ProjectName, ThreadWork,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -33,6 +34,13 @@ rho_rpc::calls! {
     pub enum Request {
         /// A message from the user. Logged once per `client_id`.
         Post(Post) -> MessageId;
+        /// Post under a project and start the idea using the host's settings.
+        PostIdea(PostIdea) -> MessageId;
+        RetryIdea(RetryIdea) -> MessageId;
+        CreateProject(CreateProject) -> ProjectId;
+        ChangeProject(ChangeProject) -> ();
+        /// One-time import of an old device-only place, if the host still has none.
+        ImportProject(ImportProject) -> ();
         /// Puts a message and its thread under another message, or among
         /// the roots.
         Reparent(Reparent) -> ();
@@ -58,6 +66,39 @@ pub struct Post {
     /// does not make them members.
     pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct PostIdea {
+    pub client_id: u64,
+    pub project: ProjectId,
+    pub content: Vec<ContentPart>,
+    /// The name this device uses for the host, for a failed start's mail.
+    pub host_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RetryIdea {
+    pub posted: Post,
+    pub host_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CreateProject {
+    pub name: ProjectName,
+    pub config: ProjectConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ChangeProject {
+    pub project: ProjectId,
+    pub change: ProjectChange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ImportProject {
+    pub project: ProjectId,
+    pub config: ProjectConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -125,6 +166,11 @@ pub enum ServerFrame {
     Work {
         threads: Vec<(MessageId, ThreadWork)>,
     },
+    /// The host's project settings, replacing the previous snapshot. A
+    /// legacy project without a known place has no entry yet.
+    Projects {
+        configured: Vec<(ProjectId, ProjectConfig)>,
+    },
 }
 
 #[cfg(test)]
@@ -151,6 +197,32 @@ mod tests {
             thread: Some(MessageId(ChatSeq(4))),
         });
         round_trips(ClientFrame::View { thread: None });
+        let project = ProjectId(MessageId(ChatSeq(2)));
+        let config = ProjectConfig {
+            place: rho_agent_types::ProjectPlace::parse("git@github.com:owner/reef").unwrap(),
+            mode: rho_agent_types::ProjectMode::PerIdea,
+        };
+        round_trips(ServerFrame::Projects {
+            configured: vec![(project, config.clone())],
+        });
+        round_trips(Open::Request(
+            CreateProject {
+                name: ProjectName::parse("reef").unwrap(),
+                config,
+            }
+            .into(),
+        ));
+        round_trips(Open::Request(
+            PostIdea {
+                client_id: 17,
+                project,
+                content: vec![ContentPart::Text {
+                    text: "New idea".into(),
+                }],
+                host_label: "lab".into(),
+            }
+            .into(),
+        ));
         round_trips(ServerFrame::Work {
             threads: vec![
                 (MessageId(ChatSeq(14)), ThreadWork::Working),

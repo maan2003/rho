@@ -1,14 +1,7 @@
 //! Starting an agent from a mail.
 //!
-//! An agent can start from any mail: the one under the point, or
-//! the one the composer is about to send. An idea sent in a project asks
-//! nothing it need not: it works where the project's agents work, on the
-//! default runtime, and only a project no agent started from yet asks
-//! where, once. The rare `start agent` asks both:
-//! where (a new workset on a repository, a directory on the host as it is, or
-//! beside an agent already there) and the runtime. The GUI sends the code,
-//! which names the mail as `origin`, so policy joins the agent to its thread
-//! and hands it the mail first.
+//! The rare start with options asks for a place and runtime. An ordinary
+//! idea is routed entirely on its project's host, without this menu.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -16,12 +9,11 @@ use std::rc::Rc;
 use camino::Utf8PathBuf;
 use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
-use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start, project_start};
+use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start};
 use rho_agents_client::protocol::worksets::{MailLaunch, StartFromMail};
 use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
 use rho_frame::{Candidate, Frame, Row, Rows};
 use rho_mail::ThreadId;
-use rho_mail::ui::IdeaSource;
 use rho_window::style::StyleClass;
 
 use super::AgentsSystem;
@@ -31,105 +23,12 @@ pub(crate) struct Plan {
     pub host: HostId,
     pub start: Start,
     pub runtime: Runtime,
-    feedback: Feedback,
 }
 
-/// The idea box already acknowledges posting; successful creation must
-/// not replace that receipt. Failures remain visible in both flows.
-enum Feedback {
-    Started,
-    Sent,
-}
-
-/// Which mail the agent starts from.
-#[derive(Clone)]
-pub(crate) enum Origin {
-    /// The mail under the point: it exists, so the start goes
-    /// out at once.
-    Mail,
-    /// The composer's draft: sent first, started once the host logs it.
-    Draft(IdeaSource),
-}
-
-impl Origin {
-    fn feedback(&self) -> Feedback {
-        match self {
-            Self::Draft(IdeaSource::Box(_)) => Feedback::Sent,
-            _ => Feedback::Started,
-        }
-    }
-}
-
-/// What a start asks once it knows where.
 #[derive(Clone, Copy)]
-pub(crate) enum Runtimes {
-    /// `runtime (default):`, for the rare start that asks everything.
-    Ask,
-    /// Nothing: the default runtime, for an idea sent in a project.
-    Default,
-}
-
-/// Send an idea to the project rooted at `thread` and start an agent where
-/// its agents already work, on the default runtime. If none has started yet,
-/// ask where once; the project remembers where that agent works.
-pub(crate) fn idea(
-    system: &mut AgentsSystem,
-    thread: ThreadId,
-    source: IdeaSource,
-    cx: &mut Context<AgentsSystem>,
-) {
-    let Some(host) = system.host_of(thread.host) else {
-        system.frame.echo(
-            "the thread's host is not attached",
-            StyleClass::SystemInfo,
-            cx,
-        );
-        return;
-    };
-    let registry = system.registry();
-    let mail = system.mail.read(cx);
-    let start = mail.host_mail(thread.host).and_then(|log| {
-        let root = log.root_of(thread.message);
-        let agents = registry
-            .host_agents(host)
-            .into_iter()
-            .filter_map(|agent| registry.agent_identity(agent));
-        project_start(agents, |message| {
-            log.message(message).is_some() && log.root_of(message) == root
-        })
-    });
-    // Before the project has an agent, which is also after its first start
-    // failed, the answer the user gave is where.
-    let start = start.or_else(|| system.places.get(thread.host, thread.message));
-    match start {
-        Some(start) => {
-            let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
-            let origin = Origin::Draft(source);
-            send_and_start(
-                system,
-                thread,
-                &origin,
-                Plan {
-                    host,
-                    start,
-                    runtime,
-                    feedback: origin.feedback(),
-                },
-                cx,
-            );
-        }
-        None => {
-            let rows = rows(
-                system,
-                cx.entity(),
-                thread,
-                Origin::Draft(source),
-                Runtimes::Default,
-                cx,
-            );
-            system.frame.menu(rows, cx);
-        }
-    }
+pub(crate) enum Origin {
+    Mail,
+    Draft,
 }
 
 /// The `start agent` menu for `thread`: where the agent works. `read` is
@@ -140,17 +39,11 @@ pub(crate) fn rows(
     system: Entity<AgentsSystem>,
     thread: ThreadId,
     origin: Origin,
-    runtimes: Runtimes,
     cx: &App,
 ) -> Rows {
-    // The question an idea asks once: its answer is where the channel's
-    // agents work from then on.
-    let mut rows = Rows::new(match runtimes {
-        Runtimes::Ask => match origin {
-            Origin::Mail => "start agent",
-            Origin::Draft(_) => "send and start agent with options",
-        },
-        Runtimes::Default => "where this project's agents work",
+    let mut rows = Rows::new(match origin {
+        Origin::Mail => "start agent",
+        Origin::Draft => "send and start agent with options",
     });
     let host = read.host_of(thread.host);
     let known = host
@@ -159,13 +52,13 @@ pub(crate) fn rows(
     let repositories = Rc::new(known.repositories);
     let directories = Rc::new(known.directories);
     let on_repo = system.clone();
-    let repo_origin = origin.clone();
+    let repo_origin = origin;
     rows.push(Row::run(
         "n",
         "new workset on a repository",
         move |frame, window, cx| {
             let system = on_repo.clone();
-            let origin = repo_origin.clone();
+            let origin = repo_origin;
             frame.open_prompt(
                 "repository (url or host path):",
                 completions(repositories.clone()),
@@ -179,16 +72,7 @@ pub(crate) fn rows(
                         repo: Utf8PathBuf::from(repo),
                         rev: AUTO_BASE_REV.to_owned(),
                     };
-                    then(
-                        system.clone(),
-                        thread,
-                        origin.clone(),
-                        runtimes,
-                        start,
-                        frame,
-                        window,
-                        cx,
-                    );
+                    prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
                 }),
                 window,
                 cx,
@@ -196,13 +80,13 @@ pub(crate) fn rows(
         },
     ));
     let here = system.clone();
-    let here_origin = origin.clone();
+    let here_origin = origin;
     rows.push(Row::run(
         "h",
         "here, in a directory on the host",
         move |frame, window, cx| {
             let system = here.clone();
-            let origin = here_origin.clone();
+            let origin = here_origin;
             frame.open_prompt(
                 "directory on the host:",
                 completions(directories.clone()),
@@ -215,16 +99,7 @@ pub(crate) fn rows(
                     let start = Start::Here {
                         cwd: Utf8PathBuf::from(cwd),
                     };
-                    then(
-                        system.clone(),
-                        thread,
-                        origin.clone(),
-                        runtimes,
-                        start,
-                        frame,
-                        window,
-                        cx,
-                    );
+                    prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
                 }),
                 window,
                 cx,
@@ -263,7 +138,7 @@ pub(crate) fn rows(
         .filter(|(workset, cwd, _, _)| seen.insert((*workset, cwd.clone())));
     for (index, (workset, cwd, subject, address)) in destinations.take(9).enumerate() {
         let system = system.clone();
-        let origin = origin.clone();
+        let origin = origin;
         rows.push(Row::run(
             (index + 1).to_string(),
             format!("join {subject}  {address}"),
@@ -272,16 +147,7 @@ pub(crate) fn rows(
                     workset,
                     cwd: cwd.clone(),
                 };
-                then(
-                    system.clone(),
-                    thread,
-                    origin.clone(),
-                    runtimes,
-                    start,
-                    frame,
-                    window,
-                    cx,
-                );
+                prompt_runtime(system.clone(), thread, origin, start, frame, window, cx);
             },
         ));
     }
@@ -339,6 +205,10 @@ fn known_places(read: &AgentsSystem, host: HostId) -> KnownPlaces {
     known
 }
 
+pub(crate) fn known_project_places(read: &AgentsSystem, host: HostId) -> Vec<Candidate> {
+    known_places(read, host).repositories
+}
+
 /// A prompt's answers: the known ones that hold what is typed.
 fn completions(known: Rc<Vec<Candidate>>) -> rho_frame::CandidateSource {
     Rc::new(move |_, needle, _| {
@@ -349,32 +219,6 @@ fn completions(known: Rc<Vec<Candidate>>) -> rho_frame::CandidateSource {
             .cloned()
             .collect()
     })
-}
-
-/// Where is answered: ask the runtime, or start on the default.
-#[allow(clippy::too_many_arguments)]
-fn then(
-    system: Entity<AgentsSystem>,
-    thread: ThreadId,
-    origin: Origin,
-    runtimes: Runtimes,
-    start: Start,
-    frame: &mut Frame,
-    window: &mut gpui::Window,
-    cx: &mut Context<Frame>,
-) {
-    match runtimes {
-        Runtimes::Ask => prompt_runtime(system, thread, origin, start, frame, window, cx),
-        Runtimes::Default => {
-            // The channel's question, answered: kept, so the next idea asks
-            // nothing even if this start fails.
-            system.update(cx, |system, _| {
-                system.places.remember(thread.host, thread.message, &start)
-            });
-            let runtime = Runtime::parse(DEFAULT_RUNTIME).expect("the default runtime parses");
-            begin(system, thread, origin, start, runtime, cx);
-        }
-    }
 }
 
 fn prompt_runtime(
@@ -411,14 +255,7 @@ fn prompt_runtime(
                     return;
                 }
             };
-            begin(
-                system.clone(),
-                thread,
-                origin.clone(),
-                start.clone(),
-                runtime,
-                cx,
-            );
+            begin(system.clone(), thread, origin, start.clone(), runtime, cx);
         }),
         window,
         cx,
@@ -447,11 +284,10 @@ fn begin(
             host,
             start,
             runtime,
-            feedback: origin.feedback(),
         };
         match origin {
             Origin::Mail => create(system, plan, thread, cx),
-            Origin::Draft(_) => send_and_start(system, thread, &origin, plan, cx),
+            Origin::Draft => send_and_start(system, thread, plan, cx),
         }
     });
 }
@@ -460,15 +296,13 @@ fn begin(
 fn send_and_start(
     system: &mut AgentsSystem,
     thread: ThreadId,
-    origin: &Origin,
     plan: Plan,
     cx: &mut Context<AgentsSystem>,
 ) {
     let endpoint = thread.host;
-    let sent = system.mail.update(cx, |mail, cx| match origin {
-        Origin::Draft(source) => mail.send_idea(thread, source, cx),
-        Origin::Mail => unreachable!("the origin already exists"),
-    });
+    let sent = system
+        .mail
+        .update(cx, |mail, cx| mail.post_draft_with_options(thread, cx));
     match sent {
         Some(client_id) => {
             system.starting.insert((endpoint, client_id), plan);
@@ -531,16 +365,14 @@ pub(crate) fn create(
         cx.update(|cx| match reply {
             Ok(agent) => {
                 let _ = this.update(cx, |system, cx| {
-                    if matches!(plan.feedback, Feedback::Started) {
-                        let label = system
-                            .registry()
-                            .agent_id_label_on_host(agent, Some(plan.host));
-                        frame.echo(
-                            format!("started {label} · {on}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    }
+                    let label = system
+                        .registry()
+                        .agent_id_label_on_host(agent, Some(plan.host));
+                    frame.echo(
+                        format!("started {label} · {on}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                     // Its first turn may still fail, such as for want of a
                     // login on the host; the echo line says so when it does.
                     system.watch_first_turn(agent, cx);

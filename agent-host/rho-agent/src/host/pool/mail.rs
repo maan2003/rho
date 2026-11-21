@@ -163,21 +163,29 @@ impl AgentPool {
     /// A start refused before an agent existed. There is no agent or
     /// transcript to own this stop; the project speaks in its thread.
     pub async fn post_start_failure(&self, origin: MessageId, reason: &str) -> anyhow::Result<()> {
-        let (thread, project) = {
+        let text = format!(
+            "failed · did not start · {}\n\nreply to retry, or change where it works from the project's palette.",
+            rho_agent_types::one_line(reason)
+        );
+        let mut write = self.db.write().await;
+        self.write_start_failure(&mut write, origin, text)?;
+        write.commit();
+        Ok(())
+    }
+
+    pub(super) fn write_start_failure(
+        &self,
+        write: &mut rho_db::WriteTxn,
+        origin: MessageId,
+        text: String,
+    ) -> anyhow::Result<()> {
+        let thread = {
             let read = self.db.read();
             let mail = read
                 .message(origin)
                 .ok_or_else(|| anyhow::anyhow!("no mail #{}", origin.0.0))?;
-            let root = read.root_of(origin).expect("a message has a root");
-            let project = read.thread(root).expect("the root is a thread").name;
-            (read.mail_thread(&mail), project)
+            read.mail_thread(&mail)
         };
-        let reason = rho_agent_types::one_line(reason);
-        let project = rho_agent_types::one_line(&project);
-        let text = format!(
-            "failed · did not start · {reason}\n\nTo carry on, run start agent here and choose where {project}'s agents work."
-        );
-        let mut write = self.db.write().await;
         write.post(
             UnixMs::now(),
             Some(thread),
@@ -189,7 +197,6 @@ impl AgentPool {
             },
             None,
         )?;
-        write.commit();
         Ok(())
     }
 

@@ -33,7 +33,7 @@ pub mod remote;
 #[cfg(feature = "client")]
 pub mod session;
 #[cfg(feature = "client")]
-pub mod snippets;
+pub use protocol::snippets;
 #[cfg(feature = "client")]
 pub mod state;
 #[cfg(feature = "client")]

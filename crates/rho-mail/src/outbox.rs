@@ -25,6 +25,8 @@ pub struct Outgoing {
     /// Agents that receive it without being members of its thread.
     pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
+    #[senax(default)]
+    pub delivery: Delivery,
 }
 
 impl Outgoing {
@@ -37,6 +39,16 @@ impl Outgoing {
             content: self.content.clone(),
         }
     }
+}
+
+/// Whether the host starts a project agent for this message. Former
+/// outbox rows are ordinary posts; they keep exactly their former meaning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub enum Delivery {
+    #[default]
+    Mail,
+    Idea,
+    Retry,
 }
 
 /// What the outbox did, for the disk copy to follow.
@@ -76,6 +88,7 @@ impl Outbox {
         reply_to: Option<MessageId>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
+        delivery: Delivery,
     ) -> (u64, Kept) {
         let id = rand::random();
         let outgoing = Outgoing {
@@ -84,6 +97,7 @@ impl Outbox {
             reply_to,
             mentions,
             content,
+            delivery,
         };
         self.waiting.push((endpoint, id, outgoing.clone()));
         (id, Kept::Put(id, outgoing))
@@ -91,13 +105,13 @@ impl Outbox {
 
     /// The host's oldest unsent message, to post now, unless a post is
     /// already on its way.
-    pub fn next(&mut self, endpoint: EndpointId) -> Option<Post> {
+    pub fn next(&mut self, endpoint: EndpointId) -> Option<(Post, Delivery)> {
         if self.sending.contains_key(&endpoint) {
             return None;
         }
         let (_, id, outgoing) = self.waiting.iter().find(|(host, ..)| *host == endpoint)?;
         self.sending.insert(endpoint, *id);
-        Some(outgoing.call(*id))
+        Some((outgoing.call(*id), outgoing.delivery))
     }
 
     /// The host logged what was on its way. Answers its client id, what it
@@ -171,13 +185,14 @@ mod tests {
             Some(MessageId(ChatSeq(7))),
             vec![agent],
             text("a1"),
+            Delivery::Mail,
         );
         assert!(matches!(kept, Kept::Put(id, _) if id == first));
-        outbox.push(b, None, None, vec![agent], text("b1"));
-        let (second, _) = outbox.push(a, thread, None, Vec::new(), text("a2"));
+        outbox.push(b, None, None, vec![agent], text("b1"), Delivery::Mail);
+        let (second, _) = outbox.push(a, thread, None, Vec::new(), text("a2"), Delivery::Mail);
         assert_eq!(outbox.hosts(), [a, b]);
 
-        let to_a = outbox.next(a).expect("a post");
+        let to_a = outbox.next(a).expect("a post").0;
         assert_eq!(
             (
                 to_a.client_id,
@@ -188,12 +203,14 @@ mod tests {
             (first, vec![agent], thread, Some(MessageId(ChatSeq(7))))
         );
         assert!(outbox.next(a).is_none(), "one post at a time");
-        let to_b = outbox.next(b).expect("a post");
+        let to_b = outbox.next(b).expect("a post").0;
         assert_eq!((to_b.parent, to_b.mentions), (None, vec![agent]));
 
         outbox.failed(a);
         assert_eq!(
-            outbox.next(a).map(|post| (post.client_id, post.reply_to)),
+            outbox
+                .next(a)
+                .map(|(post, _)| (post.client_id, post.reply_to)),
             Some((first, Some(MessageId(ChatSeq(7))))),
             "posted again under the same id"
         );
@@ -208,7 +225,7 @@ mod tests {
             outbox.waiting_under(b, thread).is_empty(),
             "the thread of a's host"
         );
-        assert_eq!(outbox.next(a).map(|post| post.client_id), Some(second));
+        assert_eq!(outbox.next(a).map(|(post, _)| post.client_id), Some(second));
         outbox.delivered(a);
         assert!(outbox.waiting_under(a, thread).is_empty());
         assert!(outbox.next(a).is_none());
@@ -238,6 +255,7 @@ mod tests {
         assert_eq!(decoded.content, content);
         assert_eq!(decoded.parent, Some(MessageId(ChatSeq(4))));
         assert_eq!(decoded.reply_to, None);
+        assert_eq!(decoded.delivery, Delivery::Mail);
     }
 
     #[test]
@@ -249,18 +267,23 @@ mod tests {
             reply_to: None,
             mentions: vec![agent],
             content: vec![ContentPart::Text { text: text.into() }],
+            delivery: Delivery::Mail,
         };
         let mut outbox = Outbox::load(vec![
             (EndpointId([1; 32]), 32, outgoing(2, "second")),
             (EndpointId([1; 32]), 31, outgoing(1, "first")),
         ]);
         assert_eq!(
-            outbox.next(EndpointId([1; 32])).map(|post| post.client_id),
+            outbox
+                .next(EndpointId([1; 32]))
+                .map(|(post, _)| post.client_id),
             Some(31)
         );
         outbox.delivered(EndpointId([1; 32]));
         assert_eq!(
-            outbox.next(EndpointId([1; 32])).map(|post| post.client_id),
+            outbox
+                .next(EndpointId([1; 32]))
+                .map(|(post, _)| post.client_id),
             Some(32)
         );
     }

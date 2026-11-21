@@ -1,6 +1,6 @@
 # Built rho renders
 
-The thread captures were updated 2026-11-21, and the Desk and idea captures on 2026-11-20. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The thread, project and idea captures were updated 2026-11-21; the full Desk captures are from 2026-11-20. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -29,14 +29,34 @@ form_way laptop tree
 # Once the window and its first prompt are ready:
 form_way laptop input 'key:enter' 'wait:750' 'key:i' 'wait:600' \
     'text:Fix the clock test that fails one run in five.' 'wait:450' 'key:ctrl+enter' \
-    'wait:600' 'text:clock' 'wait:500' 'key:tab' 'wait:450' 'key:enter'
+    'wait:600' 'text:clock@lab' 'wait:500'
 form_shot laptop idea
-# The project is new: h chooses “here, in a directory on the host…”.
-form_way laptop input 'key:ctrl+enter' 'wait:800' 'key:h' 'wait:450' \
-    "text:$rig/repo" 'wait:400' 'key:enter'
+form_way laptop input 'key:enter' 'wait:450' "text:$rig/repo" 'wait:400' \
+    'key:enter' 'wait:450'
+form_shot laptop project-mode
+form_way laptop input 'key:enter' 'wait:800'
 ```
 
-The address chooser's entry is `new project clock@lab`; `tab` selects it explicitly before `enter` creates the project. On the default scenario, wait until the clock ask is visible on Desk (the work may briefly appear under `moving`).
+The [address chooser](laptop-idea.png) offers `new project clock@lab`; Enter
+takes that row. After `clock@lab works on:`, the [mode prompt](laptop-project-mode.png)
+starts on `one`. Accepting it sends the idea and returns to Desk without
+another prompt. The [same chooser at phone width](phone-idea.png) also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
+on Desk (the work may briefly appear under `moving`).
+
+### Start an empty project and change the next idea's mode
+
+Open the palette with `:`, choose `new project`, and enter `tide@lab`. Make an
+empty directory with `mkdir "$rig/tide"`; enter that path at `tide@lab works on:`.
+Known places, such as `$rig/repo` after the clock agent starts, appear as
+completions. Accept `one` at `tide@lab agents:`; Desk opens narrowed to
+`tide@lab · on tide · one agent`, with `0 wait`. At phone width (including a
+second local device), open `tide@lab` by name and `form_shot phone empty-project`.
+
+For the `per idea` project capture below, first open `clock@lab` by name
+on either window. In its palette choose `agents: one`, then select `per idea`
+(Down, Enter). The narrowed Desk updates its heading; the running agent and
+the existing waiting thread stay. `works on…` shows the present place and
+lets you replace it without moving that agent.
 
 ## Laptop: card, palette, verdict, and agent
 
@@ -160,7 +180,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 ## What the renders expose
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
-- Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk.
+- Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
 - In a thread, the draft is the next mail; `reply` appears while it is empty. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
 - The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.

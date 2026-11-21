@@ -15,7 +15,6 @@
 //! hosts it reaches and keeps their answers, and a chart observes it.
 
 mod address;
-mod places;
 mod start;
 mod surface;
 
@@ -80,9 +79,6 @@ pub struct AgentsSystem {
     /// Agents asked for with the user's message, by the id the chat gave
     /// the message: started once the host has logged it.
     starting: HashMap<(EndpointId, u64), start::Plan>,
-    /// Where each channel's agents work, as the user answered it, until an
-    /// agent of the channel says so itself.
-    places: places::ProjectPlaces,
     /// Agents this window started whose first turn has not ended, and
     /// whether it got to work: a failure before then is the start failing,
     /// and the echo line says so.
@@ -93,12 +89,7 @@ pub struct AgentsSystem {
 }
 
 impl AgentsSystem {
-    pub fn new(
-        db: rho_db::RhoDb,
-        mail: Entity<MailSystem>,
-        frame: FrameLink,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(mail: Entity<MailSystem>, frame: FrameLink, cx: &mut Context<Self>) -> Self {
         let (client, changes) = AgentsClient::spawn();
         let pump = cx.spawn(async move |this, cx| {
             let mut changes = changes;
@@ -139,19 +130,6 @@ impl AgentsSystem {
                 client_id,
                 message,
             } => this.delivered(*endpoint, *client_id, *message, cx),
-            MailEvent::Idea {
-                endpoint,
-                parent,
-                source,
-            } => start::idea(
-                this,
-                ThreadId {
-                    host: *endpoint,
-                    message: *parent,
-                },
-                source.clone(),
-                cx,
-            ),
             MailEvent::Inspect { agent, mail } => {
                 let agent = *agent;
                 let mail = mail.clone();
@@ -204,7 +182,6 @@ impl AgentsSystem {
             mail,
             frame,
             starting: HashMap::new(),
-            places: places::ProjectPlaces::open(db),
             first_turns: HashMap::new(),
             timer: None,
             _tasks: vec![pump, desktops_pump],
@@ -214,6 +191,12 @@ impl AgentsSystem {
 
     pub fn registry(&self) -> &AgentMap {
         &self.registry
+    }
+
+    pub fn known_project_places(&self, endpoint: EndpointId) -> Vec<Candidate> {
+        self.host_of(endpoint)
+            .map(|host| start::known_project_places(self, host))
+            .unwrap_or_default()
     }
 
     /// What the chat calls an agent of the host with this identity and
@@ -1274,17 +1257,22 @@ impl System for AgentsSystem {
                 rows.extend(surface::steer_rows(this.clone(), agent));
             }
         }
-        rows.extend(
-            start::rows(
-                self,
-                this,
-                thread,
-                start::Origin::Mail,
-                start::Runtimes::Ask,
-                cx,
-            )
-            .into_commands(),
-        );
+        let draft = self
+            .mail
+            .read(cx)
+            .thread_of(&point.surface)
+            .filter(|surface| {
+                !self
+                    .mail
+                    .read(cx)
+                    .draft(surface.host, Some(surface.message))
+                    .trim()
+                    .is_empty()
+            });
+        let (start_from, origin) = draft.map_or((thread, start::Origin::Mail), |draft| {
+            (draft, start::Origin::Draft)
+        });
+        rows.extend(start::rows(self, this, start_from, origin, cx).into_commands());
         rows
     }
 
