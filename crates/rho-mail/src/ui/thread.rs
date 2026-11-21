@@ -1663,7 +1663,7 @@ impl ThreadView {
         }
     }
 
-    fn tap_mail_header(
+    fn tap_mail(
         &mut self,
         event: &gpui::MouseDownEvent,
         window: &mut Window,
@@ -1676,15 +1676,20 @@ impl ThreadView {
         let Some(anchor) = rho_frame::phone_editor_tap(editor, event, window) else {
             return;
         };
-        let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
-        if let Some(Meta::Private { note, mail }) = self.line_meta(row, cx) {
+        let cursor = anchor.to_point(&editor.buffer().read(cx).snapshot(cx));
+        if let Some(Meta::Private { note, mail }) = self.line_meta(cursor.row, cx) {
             self.open_private(*mail, Some(*note), cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
         }
-        if let Some((agent, mail)) = self.agent_mail(row, cx)
-            && self.item_row(&Key::Message(mail.id), cx) == Some(row)
+        if self.open_inline(cursor, cx) {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some((agent, mail)) = self.agent_mail(cursor.row, cx)
+            && self.item_row(&Key::Message(mail.id), cx) == Some(cursor.row)
         {
             self.inspect(agent, mail, cx);
             window.prevent_default();
@@ -1709,6 +1714,15 @@ impl ThreadView {
             .or_else(|| quote.map(InlineOpen::Quote))
     }
 
+    fn open_inline(&mut self, cursor: Point, cx: &mut Context<Self>) -> bool {
+        match self.inline_open(cursor, cx) {
+            Some(InlineOpen::Quote(quote)) => self.toggle_quote(quote, cx),
+            Some(InlineOpen::Link(url)) => self.system.read(cx).frame.clone().open_link(url, cx),
+            None => return false,
+        }
+        true
+    }
+
     /// Enter opens the thing under the point: a quote, link, agent's mail,
     /// tangent or crumb.
     fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
@@ -1727,11 +1741,7 @@ impl ThreadView {
             self.open_private(*mail, Some(*note), cx);
             return;
         }
-        if let Some(target) = self.inline_open(cursor, cx) {
-            match target {
-                InlineOpen::Quote(quote) => self.toggle_quote(quote, cx),
-                InlineOpen::Link(url) => self.system.read(cx).frame.clone().open_link(url, cx),
-            }
+        if self.open_inline(cursor, cx) {
             return;
         }
         if let Some((agent, mail)) = self.agent_mail(cursor.row, cx) {
@@ -2168,6 +2178,7 @@ impl Surface for ThreadView {
                 .map(|chat| chat.members_under(Some(self.thread.message)))
                 .unwrap_or_default();
             let cursor = self.cursor(cx);
+            let opens_inline = self.inline_open(cursor, cx).is_some();
             let mail = (!self.on_draft(cx))
                 .then(|| self.agent_mail(cursor.row, cx))
                 .flatten();
@@ -2176,7 +2187,7 @@ impl Surface for ThreadView {
                 let look = Row::run("enter", "look into the work", move |_, _, cx| {
                     inspector.update(cx, |view, cx| view.inspect(agent, mail.clone(), cx));
                 });
-                rows.push(if self.inline_open(cursor, cx).is_none() {
+                rows.push(if !opens_inline {
                     look.bound_to(OpenRow)
                 } else {
                     look
@@ -2252,11 +2263,13 @@ impl Surface for ThreadView {
                     ));
                 }
             }
-            // The thumb's Open action mirrors Enter, including on a quote.
-            if matches!(
-                self.line_meta(self.cursor_row(cx), cx),
-                Some(Meta::Quote(..) | Meta::Thread(_) | Meta::Open(_))
-            ) {
+            // The thumb's Open action follows Enter at the point.
+            if opens_inline
+                || matches!(
+                    self.line_meta(cursor.row, cx),
+                    Some(Meta::Thread(_) | Meta::Open(_))
+                )
+            {
                 rows.push(
                     Row::run("enter", "open", move |_, window, cx| {
                         this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
@@ -2361,7 +2374,7 @@ impl Render for ThreadView {
             // selection is disabled. Capture the draft's pointer down
             // before it; GPUI also routes a completed tap this way.
             .capture_any_mouse_down(cx.listener(Self::tap_tail))
-            .capture_any_mouse_down(cx.listener(Self::tap_mail_header))
+            .capture_any_mouse_down(cx.listener(Self::tap_mail))
             .child(self.editor.clone())
             .children(gesture)
     }
@@ -2379,34 +2392,40 @@ mod tests {
     fn sending_an_inline_reply_keeps_point_at_the_top_and_shows_the_newest_mail(
         cx: &mut gpui::TestAppContext,
     ) {
-        check_reply(cx, SendFrom::Inline);
+        check_thread(cx, CheckThread::Inline);
     }
 
     #[gpui::test]
     fn sending_the_draft_with_options_keeps_point_at_the_top(cx: &mut gpui::TestAppContext) {
-        check_reply(cx, SendFrom::Options);
+        check_thread(cx, CheckThread::Options);
     }
 
     #[gpui::test]
     fn sending_a_stuck_draft_preserves_the_first_visible_history_row(
         cx: &mut gpui::TestAppContext,
     ) {
-        check_reply(cx, SendFrom::Stuck);
+        check_thread(cx, CheckThread::Stuck);
     }
 
     #[gpui::test]
     fn reading_an_older_mail_does_not_retarget_the_draft(cx: &mut gpui::TestAppContext) {
-        check_reply(cx, SendFrom::StableTarget);
+        check_thread(cx, CheckThread::StableTarget);
     }
 
-    enum SendFrom {
+    #[gpui::test]
+    fn a_bare_proof_url_in_mail_has_an_open_command(cx: &mut gpui::TestAppContext) {
+        check_thread(cx, CheckThread::ProofRow);
+    }
+
+    enum CheckThread {
         Inline,
         Options,
         Stuck,
         StableTarget,
+        ProofRow,
     }
 
-    fn check_reply(cx: &mut gpui::TestAppContext, from: SendFrom) {
+    fn check_thread(cx: &mut gpui::TestAppContext, check: CheckThread) {
         use gpui::{point, px, size};
         use rho_agent_types::{ChatEvent, ChatRecord};
         use rho_frame::{Frame, FrameLink};
@@ -2466,7 +2485,7 @@ mod tests {
                     "My preceding answer.\n\n> The earlier question.",
                 ));
                 let mut latest = post(4, Some(2), agent, "The latest question.");
-                if matches!(from, SendFrom::StableTarget)
+                if matches!(check, CheckThread::StableTarget)
                     && let ChatEvent::Posted { mentions, .. } = &mut latest.event
                 {
                     mentions.push(Mention::User { ping: true });
@@ -2513,7 +2532,32 @@ mod tests {
             })
             .unwrap();
 
-        if matches!(from, SendFrom::StableTarget) {
+        if matches!(check, CheckThread::ProofRow) {
+            cx.update(|cx| {
+                mail.update(cx, |system, cx| {
+                    system.logs.get_mut(&thread.host).unwrap().tell(&post(
+                        5,
+                        Some(2),
+                        agent,
+                        "https://proof.example.invalid/clock",
+                    ));
+                    cx.notify();
+                });
+            });
+            window.update(cx, |view, window, cx| {
+                let key = Key::Message(MessageId(ChatSeq(5)));
+                assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
+                assert_eq!(view.link_at(view.cursor(cx), cx).unwrap().as_str(), "https://proof.example.invalid/clock");
+                let rows = view.rows(window, cx);
+                assert!(
+                    rows.into_iter().any(|row| matches!(row.pick, rho_frame::menu::Pick::Run { label, .. } if label == "open")),
+                    "the palette must offer open for this ordinary mail line"
+                );
+            }).unwrap();
+            return;
+        }
+
+        if matches!(check, CheckThread::StableTarget) {
             cx.update(|cx| {
                 mail.update(cx, |system, cx| {
                     system.logs.get_mut(&thread.host).unwrap().tell(&post(
@@ -2592,7 +2636,7 @@ mod tests {
         let preceding = "My preceding answer.".to_owned();
         assert_eq!(mail_gutters(cx), [(4, 6, preceding.clone())]);
 
-        let stuck = matches!(from, SendFrom::Stuck);
+        let stuck = matches!(check, CheckThread::Stuck);
         if stuck {
             window
                 .update(cx, |view, window, cx| {
@@ -2646,7 +2690,7 @@ mod tests {
             assert_eq!(before.1.as_deref(), Some("The latest question."));
         }
 
-        if matches!(from, SendFrom::Options) {
+        if matches!(check, CheckThread::Options) {
             cx.update(|cx| {
                 mail.update(cx, |system, cx| system.post_draft_with_options(thread, cx))
                     .unwrap();
