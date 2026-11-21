@@ -407,6 +407,9 @@ impl MailSystem {
                     self.settings
                         .insert(endpoint, configured.into_iter().collect());
                     self.import_legacy_projects(endpoint, cx);
+                    self.frame.with(cx, |frame, window, cx| {
+                        frame.refresh_idea_runtime(window, cx)
+                    });
                     self.finish_project_creation(cx);
                     self.changed(endpoint, cx);
                 }
@@ -589,6 +592,9 @@ impl MailSystem {
             address: project.address(),
             name,
             details: self.project_details(project),
+            runtime: self
+                .project_config(project)
+                .map(|config| config.runtime.clone()),
         })
     }
 

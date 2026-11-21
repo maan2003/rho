@@ -39,10 +39,10 @@ has:
 - many `Thread`
 does:
 - open: narrow `desk.Desk` to the project through `window.Go to something by name`
-- receive an idea: start the work at the project's place in its mode, on the project's runtime unless the idea's `on:` line named another. `one agent`: the project's agent reads the idea in its new thread, and starts when none runs; an idea on another runtime switches it first, as `agents.Agent.set runtime` does. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
+- receive an idea: start the work at the project's place in its mode, on the project's runtime for a new agent unless the idea's `on:` line named another. `one agent`: the project's agent reads the idea in its new thread and keeps its runtime; it starts when none runs; an idea on another runtime switches it first, as `agents.Agent.set runtime` does. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
 - works on…, from the palette on the project: ask `tide@lab works on:` and change where the next idea starts; agents already running stay where they are
 - agents, from the palette on the project, as `agents: one` or `agents: per idea`: change the mode for the next idea; agents already running stay as they are
-- runtime…, from the palette on the project: ask `tide@lab runtime (sol-high):` with the host's runtimes as answers; the next idea starts on it; agents already running stay as they are
+- runtime…, from the palette on the project: ask `tide@lab runtime (sol-high):` with the host's runtimes as answers; the next new agent starts on it; agents already running stay as they are
 rejected:
 - the place read off the project's newest agent · 2026-11-21 · nothing could show it or change it
 - the kind of place deciding the mode, a repository per idea and a directory shared · 2026-11-21 · one standing agent on a repository is useful too

@@ -1,6 +1,6 @@
 # Built rho renders
 
-The thread and idea captures show the leading draft and newest-first mail; the full Desk captures show only what waits. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The thread and idea captures show the leading draft and newest-first mail; the full Desk captures show only what waits. The runtime captures show the project’s automatic choice on laptop and a draft override on phone. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -34,22 +34,23 @@ form_shot laptop idea
 form_way laptop input 'key:enter' 'wait:450' "text:$rig/repo" 'wait:400' \
     'key:enter' 'wait:450'
 form_shot laptop project-mode
+form_way laptop input 'key:enter' 'wait:550'
+form_shot laptop project-runtime
 form_way laptop input 'key:enter' 'wait:800'
 ```
 
 The [address chooser](laptop-idea.png) offers `new project clock@lab`; Enter
 takes that row. After `clock@lab works on:`, the [mode prompt](laptop-project-mode.png)
-starts on `one`. Accepting it sends the idea and returns to Desk without
-another prompt. For the [same chooser at phone width](phone-idea.png), start an idea on the unpaired phone, type its words, open the address chooser with `ctrl-t`, then type `foam@lab`. The chooser also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
-on Desk. Open `i` from Desk once again to capture the [empty idea](laptop-idea-empty.png) with `form_shot laptop idea-empty`.
+starts on `one`. After it, accept `opus-high` (marked `default`) at the [runtime prompt](laptop-project-runtime.png) to send the idea and return to Desk. For the [same chooser at phone width](phone-idea.png), start an idea on the unpaired phone, type its words, open the address chooser with `ctrl-t`, then type `foam@lab`. The chooser also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
+on Desk.
 
 ### Start an empty project and change the next idea's mode
 
 Open the palette with `:`, choose `new project`, and enter `tide@lab`. Make an
 empty directory with `mkdir "$rig/tide"`; enter that path at `tide@lab works on:`.
 Known places, such as `$rig/repo` after the clock agent starts, appear as
-completions. Accept `one` at `tide@lab agents:`; Desk opens narrowed to
-`tide@lab · on tide · one agent`, with `0 wait`. At phone width (including a
+completions. Accept `one` at `tide@lab agents:` and `opus-high` at `tide@lab runtime:`; Desk opens narrowed to
+`tide@lab · on tide · one agent · opus-high`, with `0 wait`. At phone width (including a
 second local device), open `tide@lab` by name and `form_shot phone empty-project`.
 
 For the `per idea` project capture below, first open `clock@lab` by name
@@ -57,6 +58,18 @@ on either window. In its palette choose `agents: one`, then select `per idea`
 (Down, Enter). The narrowed Desk updates its heading; the running agent and
 the existing waiting thread stay. `works on…` shows the present place and
 lets you replace it without moving that agent.
+
+### Show the project runtime and an idea override
+
+In the narrowed `clock@lab` Desk, choose `runtime…` in the palette and set
+`sol-high`. The Desk heading includes the new runtime. Open `i` for the
+[automatic choice on laptop](laptop-idea-empty.png); `on:` shows `sol-high`
+without adding it to the draft. Use `form_shot laptop idea-empty`. For the
+[explicit choice on phone](phone-idea-runtime.png), move from the words to
+`to:` and then `on:` with Shift-Tab twice. Press Enter and choose `sol-medium`,
+then return to the words with Shift-Tab and type `Write this on the chosen
+runtime.` Use `form_shot phone idea-runtime` before sending. Changing `to:`
+updates an automatic runtime but leaves an explicit choice alone.
 
 ## Laptop: card, palette, verdict, and agent
 

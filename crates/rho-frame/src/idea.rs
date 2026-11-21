@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
 use language::{Buffer, BufferEvent, Point};
 use multi_buffer::MultiBuffer;
-use rho_agent_types::{DEFAULT_RUNTIME, EndpointId, RuntimeLabel};
+use rho_agent_types::{EndpointId, RUNTIMES, RuntimeKind, RuntimeLabel};
 use rho_dealer::Address;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -28,6 +28,7 @@ pub struct IdeaProject {
     pub name: String,
     /// Host-owned project settings, presented under the narrowed Desk title.
     pub details: Option<String>,
+    pub runtime: Option<RuntimeLabel>,
 }
 
 /// A validated project name on the host that will own it.
@@ -35,6 +36,33 @@ pub struct IdeaProject {
 pub struct NewIdeaProject {
     pub host: EndpointId,
     pub name: rho_agent_types::ProjectName,
+}
+
+/// The common catalogue used by both the project and idea prompts.
+pub fn runtime_candidates(needle: &str, first: Option<(&RuntimeLabel, &str)>) -> Vec<Candidate> {
+    let needle = needle.trim().to_ascii_lowercase();
+    let mut candidates: Vec<_> = RUNTIMES
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            [RuntimeKind::Rho, RuntimeKind::Claude]
+                .into_iter()
+                .flat_map(RuntimeLabel::choices)
+                .filter(|label| !RUNTIMES.contains(&label.as_str())),
+        )
+        .filter(|label| label.contains(&needle))
+        .map(|value| {
+            let description = first
+                .filter(|(label, _)| label.as_str() == value)
+                .map_or("", |(_, description)| description)
+                .to_owned();
+            Candidate { value, description }
+        })
+        .collect();
+    if let Some((label, _)) = first {
+        candidates.sort_by_key(|candidate| candidate.value != label.as_str());
+    }
+    candidates
 }
 
 pub(crate) const NEW_PROJECT: &str = "new project";
@@ -244,15 +272,24 @@ impl Frame {
             address.set_text(self.idea.recipient.as_str(), window, cx);
             address
         });
+        let frame_link = FrameLink::new(
+            window
+                .window_handle()
+                .downcast::<Frame>()
+                .expect("the frame owns the window"),
+        );
         let address_edits = cx.subscribe(
             &address,
-            |frame, address, event: &editor::EditorEvent, cx| {
+            move |frame, address, event: &editor::EditorEvent, cx| {
                 if matches!(event, editor::EditorEvent::Edited { .. }) {
                     let recipient = address.read(cx).text(cx);
                     if frame.idea.recipient != recipient {
                         frame.idea.recipient = recipient;
                         frame.idea.client_id = None;
                         frame.save_idea(cx);
+                        frame_link.with(cx, |frame, window, cx| {
+                            frame.refresh_idea_runtime(window, cx);
+                        });
                     }
                 }
             },
@@ -261,20 +298,22 @@ impl Frame {
             let mut field = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut field, window, cx);
             field.set_use_modal_editing(false);
-            field.set_text(
-                self.idea.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
-                window,
-                cx,
-            );
+            if let Some(runtime) = &self.idea.runtime {
+                field.set_text(runtime.as_str(), window, cx);
+            }
             field
         });
         let runtime_edits = cx.subscribe(
             &runtime,
             |frame, runtime, event: &editor::EditorEvent, cx| {
                 if matches!(event, editor::EditorEvent::Edited { .. }) {
-                    frame.idea.runtime = Some(runtime.read(cx).text(cx));
-                    frame.idea.client_id = None;
-                    frame.save_idea(cx);
+                    let text = runtime.read(cx).text(cx);
+                    let override_text = (!text.is_empty()).then_some(text);
+                    if frame.idea.runtime != override_text {
+                        frame.idea.runtime = override_text;
+                        frame.idea.client_id = None;
+                        frame.save_idea(cx);
+                    }
                 }
             },
         );
@@ -285,6 +324,7 @@ impl Frame {
             return_focus,
             _edits: [address_edits, runtime_edits],
         });
+        self.refresh_idea_runtime(window, cx);
         window.focus(&editor.focus_handle(cx), cx);
         window.on_next_frame(move |window, cx| {
             if editor.focus_handle(cx).is_focused(window) {
@@ -293,6 +333,65 @@ impl Frame {
                 }
             }
         });
+        cx.notify();
+    }
+
+    /// The automatic answer is only a placeholder, not a copied setting
+    /// or an explicit override. Editing the field replaces it with words.
+    pub fn refresh_idea_runtime(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(overlay) = &self.idea.overlay else {
+            return;
+        };
+        let label = self
+            .resolved_idea_project(cx)
+            .and_then(|(_, project)| project.runtime);
+        let hint = label.as_ref().map_or("", RuntimeLabel::as_str);
+        overlay.runtime.update(cx, |field, cx| {
+            if field.placeholder_text(cx).as_deref() != Some(hint) {
+                field.set_placeholder_text(hint, window, cx);
+            }
+        });
+    }
+
+    pub(crate) fn prompt_idea_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.idea_here(cx) {
+            return;
+        }
+        let project = self
+            .resolved_idea_project(cx)
+            .and_then(|(_, project)| project.runtime);
+        self.open_prompt(
+            "on:",
+            Rc::new(move |_, needle, _| {
+                runtime_candidates(needle, project.as_ref().map(|label| (label, "project")))
+            }),
+            Rc::new(
+                |frame, input, window, cx| match RuntimeLabel::parse(&input) {
+                    Ok(runtime) => frame.edit_idea_runtime(runtime, window, cx),
+                    Err(reason) => frame.echo(&reason, StyleClass::SystemImportant, cx),
+                },
+            ),
+            window,
+            cx,
+        );
+    }
+
+    fn edit_idea_runtime(
+        &mut self,
+        runtime: RuntimeLabel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(overlay) = &self.idea.overlay else {
+            return;
+        };
+        self.idea.client_id = None;
+        self.idea.runtime = Some(runtime.label());
+        overlay
+            .runtime
+            .update(cx, |field, cx| field.set_text(runtime.as_str(), window, cx));
+        self.save_idea(cx);
+        window.focus(&overlay.runtime.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -485,6 +584,7 @@ impl Frame {
             address.set_text(self.idea.recipient.as_str(), window, cx)
         });
         self.save_idea(cx);
+        self.refresh_idea_runtime(window, cx);
         window.focus(&overlay.editor.focus_handle(cx), cx);
         cx.notify();
     }
@@ -628,6 +728,7 @@ impl Frame {
                 )
                 .child(
                     div()
+                        .key_context("RhoIdeaRuntime")
                         .flex()
                         .flex_none()
                         .items_center()
@@ -640,5 +741,29 @@ impl Frame {
                 .child(div().flex_1().min_h_0().child(overlay.editor.clone()))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_choices_rank_the_project_without_losing_unfeatured_pairs() {
+        let current = RuntimeLabel::parse("haiku-max").unwrap();
+        let rows = runtime_candidates("", Some((&current, "project")));
+        assert_eq!(
+            (&*rows[0].value, &*rows[0].description),
+            ("haiku-max", "project")
+        );
+        assert_eq!(rows[1].value, "opus-high");
+        assert_eq!(rows.iter().filter(|row| row.value == "sol-high").count(), 1);
+        assert!(
+            rows.iter()
+                .all(|row| RuntimeLabel::parse(&row.value).is_ok())
+        );
+        let filtered = runtime_candidates(" XHigH ", None);
+        assert!(filtered.iter().any(|row| row.value == "astra-xhigh"));
+        assert!(!filtered.iter().any(|row| row.value == "opus-high"));
     }
 }

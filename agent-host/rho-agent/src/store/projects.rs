@@ -2,7 +2,9 @@
 //! the mail forest; changing settings never rewrites a message or an agent.
 
 use redb::{TableDefinition, TableHandle as _};
-use rho_agent_types::{AgentId, MessageId, ProjectConfig, ProjectId, ProjectMode, ProjectPlace};
+use rho_agent_types::{
+    AgentId, MessageId, ProjectConfig, ProjectId, ProjectMode, ProjectPlace, RuntimeLabel,
+};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
@@ -17,6 +19,8 @@ const STARTED: TableDefinition<u64, ()> = TableDefinition::new("mail_project_sta
 pub struct ProjectSettings {
     pub place: ProjectPlace,
     pub routing: Routing,
+    #[senax(default)]
+    pub runtime: RuntimeLabel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -29,6 +33,7 @@ impl ProjectSettings {
     pub fn new(config: ProjectConfig) -> Self {
         Self {
             place: config.place,
+            runtime: config.runtime,
             routing: match config.mode {
                 ProjectMode::One => Routing::One { agent: None },
                 ProjectMode::PerIdea => Routing::PerIdea,
@@ -39,6 +44,7 @@ impl ProjectSettings {
     pub fn config(&self) -> ProjectConfig {
         ProjectConfig {
             place: self.place.clone(),
+            runtime: self.runtime.clone(),
             mode: match self.routing {
                 Routing::One { .. } => ProjectMode::One,
                 Routing::PerIdea => ProjectMode::PerIdea,
@@ -110,5 +116,37 @@ impl ProjectWrite for WriteTxn {
 
     fn complete_project_start(&mut self, idea: MessageId) {
         self.open_table(STARTED).insert(idea.0.0, ());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_settings_written_before_runtime_keep_the_place_mode_and_standing_agent() {
+        #[derive(Encode, Decode)]
+        struct Before {
+            place: ProjectPlace,
+            routing: Routing,
+        }
+        let agent = AgentId::from_counter(10, &rho_agent_types::AgentIdDomain(7)).unwrap();
+        let old = Before {
+            place: ProjectPlace::parse("/src/tide").unwrap(),
+            routing: Routing::One { agent: Some(agent) },
+        };
+        let bytes = senax_encoder::encode(&old).unwrap();
+        let mut saved = senax_encoder::decode::<ProjectSettings>(&mut bytes.as_ref()).unwrap();
+        assert_eq!(saved.runtime.as_str(), "opus-high");
+        assert_eq!(saved.place, old.place);
+        assert_eq!(saved.routing, old.routing);
+
+        saved.runtime = RuntimeLabel::parse("sol-high").unwrap();
+        let bytes = senax_encoder::encode(&saved).unwrap();
+        let decoded = senax_encoder::decode::<ProjectSettings>(&mut bytes.as_ref()).unwrap();
+        assert_eq!(decoded, saved);
+        let old_reader = senax_encoder::decode::<Before>(&mut bytes.as_ref()).unwrap();
+        assert_eq!(old_reader.place, old.place);
+        assert_eq!(old_reader.routing, old.routing);
     }
 }
