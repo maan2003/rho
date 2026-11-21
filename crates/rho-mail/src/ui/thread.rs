@@ -24,7 +24,8 @@ use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, EndpointId, Mention, Message, MessageId, MessageKind,
     Revision, UnixMs,
 };
-use rho_dealer::{Address, Addressed as _, Card, Marks};
+use rho_dealer::facts::Seen;
+use rho_dealer::{Address, Addressed as _, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage, SendOnly};
 use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
@@ -38,9 +39,8 @@ use crate::reading::body;
 use crate::{AgentRef, HostMail, ThreadId, cards};
 
 actions!(rho_private_reply, [ReplyPrivately, KeepPrivateReply]);
-actions!(rho_mail, [GoToDraft, GoToOldestMail, AnswerThisMail]);
+actions!(rho_mail, [GoToDraft, GoToOldestMail]);
 
-const ANSWERABLE: &str = "RhoAnswerableMail";
 const PRIVATE_SCREEN: &str = "RhoPrivateReply";
 const PRIVATE_KEY: &str = "alt-r";
 const PRIVATE_SEPARATOR: &str = "── private · only you see this · escape keeps it";
@@ -61,13 +61,6 @@ pub(super) fn bind(cx: &mut App) {
         bindings.push(KeyBinding::new("g g", GoToDraft, Some(&context)));
         bindings.push(KeyBinding::new("shift-g", GoToOldestMail, Some(&context)));
     }
-    bindings.extend(
-        rho_frame::normal_contexts(
-            ANSWERABLE,
-            " && vim_operator == none && !showing_completions",
-        )
-        .map(|context| KeyBinding::new("r", AnswerThisMail, Some(&context))),
-    );
     cx.bind_keys(bindings);
 }
 
@@ -241,20 +234,6 @@ enum Follow {
     Logged(MessageId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplyTarget {
-    Suggested(MessageId),
-    Chosen(MessageId),
-}
-
-impl ReplyTarget {
-    fn message(self) -> MessageId {
-        match self {
-            Self::Suggested(id) | Self::Chosen(id) => id,
-        }
-    }
-}
-
 struct UserMailGutter;
 
 pub struct ThreadView {
@@ -273,32 +252,10 @@ pub struct ThreadView {
     latest_project_activity: Option<ChatSeq>,
     /// Resolve against the new transcript before inferring motion direction.
     last_point: Anchor,
-    /// Set on open. Reading or quoting other mail does not retarget the draft.
-    reply_to: Option<ReplyTarget>,
     expanded: Expanded,
     _subscriptions: Vec<Subscription>,
     /// Reads a project's list again when a thread's age next changes.
     _ages: Option<Task<()>>,
-}
-
-fn suggested_reply_target(
-    system: &MailSystem,
-    thread: ThreadId,
-    list: bool,
-) -> Option<ReplyTarget> {
-    if list {
-        return None;
-    }
-    let chat = system.host_mail(thread.host)?;
-    let eligible = chat
-        .reading_order(thread.message)
-        .filter(|mail| incoming(Some(mail)));
-    eligible
-        .clone()
-        .filter(|mail| mail.pings_user())
-        .last()
-        .or_else(|| eligible.last())
-        .map(|mail| ReplyTarget::Suggested(mail.id))
 }
 
 #[derive(Default)]
@@ -496,7 +453,6 @@ impl ThreadView {
             follow: None,
             latest_project_activity: latest_project_activity(system, thread),
             last_point: Anchor::Min,
-            reply_to: suggested_reply_target(system, thread, list),
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
             _ages: None,
@@ -511,7 +467,6 @@ impl ThreadView {
             thread,
             view.is_list(),
             view.layout,
-            view.reply_to.map(ReplyTarget::message),
             &view.expanded,
             None,
             cx,
@@ -571,7 +526,6 @@ impl ThreadView {
             self.thread,
             list,
             self.layout,
-            self.reply_to.map(ReplyTarget::message),
             &self.expanded,
             self.private_edit.as_ref(),
             cx,
@@ -684,16 +638,6 @@ impl ThreadView {
         self.transcript.line_meta(self.history_row(row, cx)?, cx)
     }
 
-    fn selected_reply_target(&self, row: u32, cx: &App) -> Option<MessageId> {
-        self.reply_target_in_history(self.history_row(row, cx)?, cx)
-    }
-
-    fn reply_target_in_history(&self, row: u32, cx: &App) -> Option<MessageId> {
-        let chat = self.system.read(cx).host_mail(self.thread.host)?;
-        let id = self.transcript.line_meta(row, cx)?.mail()?;
-        incoming(chat.message(id)).then_some(id)
-    }
-
     /// The web link at a point in the transcript, if there is one.
     fn link_at(&self, cursor: Point, cx: &App) -> Option<url::Url> {
         let buffer = self.transcript.buffer().read(cx);
@@ -799,7 +743,6 @@ fn items(
     thread: ThreadId,
     list: bool,
     layout: Layout,
-    reply_to: Option<MessageId>,
     expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
@@ -809,7 +752,7 @@ fn items(
         items.push(separator_item(&system.project_of(thread), layout));
         items
     } else {
-        let mut items = vec![reply_separator(system, thread, reply_to, cx)];
+        let mut items = vec![gap(Key::Separator)];
         if system.work(thread) == Some(rho_agent_types::ThreadWork::StoppedByYou) {
             items.push(line(Key::Status, "stopped by you", Class::Crumb));
         }
@@ -823,64 +766,6 @@ fn items(
         ));
         items
     }
-}
-
-/// A one-line block above the separator: the editor's width, not a fixed
-/// character count, clips the hint without wrapping or adding a caret row.
-fn reply_separator(
-    system: &MailSystem,
-    thread: ThreadId,
-    target: Option<MessageId>,
-    cx: &App,
-) -> Item<Key, Class, Meta> {
-    let separator = gap(Key::Separator);
-    let Some((chat, target)) = system.host_mail(thread.host).zip(target) else {
-        return separator;
-    };
-    let newest = chat
-        .reading_order(thread.message)
-        .filter(|mail| incoming(Some(mail)))
-        .last();
-    if newest.is_some_and(|mail| mail.id == target) {
-        return separator;
-    }
-    let Some(mail) = chat.message(target) else {
-        return separator;
-    };
-    let writer = match mail.from {
-        Party::Agent(agent) => system
-            .agent_label(thread.host, agent, cx)
-            .unwrap_or_else(|| agent.encoded()),
-        _ => "system".to_owned(),
-    };
-    let first_words = if incoming(Some(mail)) {
-        mail.headline()
-    } else {
-        "mail taken back".to_owned()
-    };
-    let label = format!(
-        "answers {writer} · {} · {first_words}",
-        thread::when(mail.at.0 as i64)
-    );
-    separator.with_blocks(vec![BlockSpec {
-        line: BlockLine::Above(0),
-        height: 1,
-        priority: 0,
-        render: Arc::new(move |block| {
-            let style = &block.editor_style.text;
-            div()
-                .w(block.max_width)
-                .h(block.line_height)
-                .pl(block.anchor_x)
-                .font_family(style.font_family.clone())
-                .text_size(style.font_size)
-                .line_height(style.line_height)
-                .text_color(block.app.theme().colors().text_muted)
-                .truncate()
-                .child(label.clone())
-                .into_any_element()
-        }),
-    }])
 }
 
 fn separator_item(project: &str, layout: Layout) -> Item<Key, Class, Meta> {
@@ -1337,26 +1222,33 @@ impl ThreadView {
         }
         let thread = self.thread;
         let list = self.is_list();
-        let reply_to = self.reply_to.map(ReplyTarget::message);
+        thread::enter_normal_mode(&self.editor, window, cx);
+        if !list {
+            let system = self.system.clone();
+            self.system
+                .read(cx)
+                .frame
+                .clone()
+                .with_dealt(thread.address(), cx, move |seen, cx| {
+                    system.update(cx, |system, cx| {
+                        system.reply(thread, seen.and_then(cards::card_version), text, cx);
+                        system.set_draft(thread.host, Some(thread.message), String::new());
+                        cx.emit(Event::DraftSent(thread));
+                    });
+                });
+            return;
+        }
         let client_id = self.system.update(cx, |system, cx| {
-            let client_id = match reply_to {
-                Some(mail) => system.reply(thread, mail, text, cx),
-                None => system.post(thread.host, Some(thread.message), text, Vec::new(), cx),
-            };
+            let client_id = system.reply(thread, None, text, cx);
             system.set_draft(thread.host, Some(thread.message), String::new());
             client_id
         });
-        thread::enter_normal_mode(&self.editor, window, cx);
         self.finish_send(cx);
-        // In a project the message is a new thread: the cursor goes to it in
-        // the list, on its way and then where the list puts it, so `enter`
-        // opens it.
-        if list {
-            self.editor.update(cx, |editor, cx| {
-                editor.request_autoscroll(Autoscroll::fit(), cx)
-            });
-            self.follow = Some(Follow::Sending(client_id));
-        }
+        // In a project the message is a new thread: put the cursor there.
+        self.editor.update(cx, |editor, cx| {
+            editor.request_autoscroll(Autoscroll::fit(), cx)
+        });
+        self.follow = Some(Follow::Sending(client_id));
     }
 
     /// Place the point at the tapped column, including at the end of a
@@ -1435,22 +1327,6 @@ impl ThreadView {
             .clone()
             .all(|row| self.line_meta(row, cx).and_then(Meta::mail) == Some(mail))
             .then_some(lines)
-    }
-
-    fn answer_this_mail(
-        &mut self,
-        _: &AnswerThisMail,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.private_edit.is_some() || self.is_list() {
-            return;
-        }
-        if let Some(mail) = self.selected_reply_target(self.cursor_row(cx), cx) {
-            self.reply_to = Some(ReplyTarget::Chosen(mail));
-            self.refresh(cx);
-            self.go_to_draft(&GoToDraft, window, cx);
-        }
     }
 
     fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
@@ -1700,11 +1576,8 @@ impl ThreadView {
         Some((agent, mail))
     }
 
-    fn chosen_work<'a>(&self, cx: &'a App) -> Option<(AgentId, &'a Message)> {
-        let ReplyTarget::Chosen(target) = self.reply_to? else {
-            return None;
-        };
-        self.authored_mail(target, cx)
+    fn chosen_work<'a>(&self, dealt: Option<Seen>, cx: &'a App) -> Option<(AgentId, &'a Message)> {
+        self.authored_mail(cards::card_version(dealt?)?.message, cx)
     }
 
     fn work_participants<'a>(
@@ -1721,8 +1594,8 @@ impl ThreadView {
             .filter_map(move |agent| Some((agent, system.participant(thread.host, agent, cx)?)))
     }
 
-    fn draft_worker(&self, cx: &App) -> Option<AgentId> {
-        if let Some((agent, _)) = self.chosen_work(cx) {
+    fn draft_worker(&self, dealt: Option<Seen>, cx: &App) -> Option<AgentId> {
+        if let Some((agent, _)) = self.chosen_work(dealt, cx) {
             return Some(agent);
         }
         let mut participants = self.work_participants(cx);
@@ -1961,16 +1834,6 @@ fn links(text: &str) -> Vec<Range<usize>> {
     found
 }
 
-fn incoming(mail: Option<&Message>) -> bool {
-    mail.is_some_and(|mail| {
-        mail.from != Party::User
-            && !matches!(
-                mail.revision,
-                Revision::Deleted | Revision::TakenBack { .. }
-            )
-    })
-}
-
 fn message_item(
     message: &Message,
     third_voice: Option<&str>,
@@ -2102,18 +1965,6 @@ impl Surface for ThreadView {
         }
     }
 
-    fn opened(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reply_to = suggested_reply_target(self.system.read(cx), self.thread, self.is_list());
-        self.refresh(cx);
-    }
-
-    fn show_card(&mut self, card: &Card, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reply_to = cards::attention_mail(card.seen)
-            .map(ReplyTarget::Chosen)
-            .or_else(|| suggested_reply_target(self.system.read(cx), self.thread, self.is_list()));
-        self.refresh(cx);
-    }
-
     fn show_search_match(
         &mut self,
         point: &rho_frame::SearchPoint,
@@ -2160,11 +2011,11 @@ impl Surface for ThreadView {
 
     /// A mail under the point anchors a tangent; the draft belongs to the
     /// whole thread rather than to any particular row.
-    fn subject(&self, cx: &App) -> Subject {
+    fn subject(&self, dealt: Option<Seen>, cx: &App) -> Subject {
         if self.on_draft(cx) {
             return Subject::Draft {
                 worker: if self.private_edit.is_none() {
-                    self.draft_worker(cx)
+                    self.draft_worker(dealt, cx)
                 } else {
                     None
                 },
@@ -2180,7 +2031,7 @@ impl Surface for ThreadView {
         if !self.is_list() {
             return Subject::Own;
         }
-        self.subject(cx)
+        self.subject(None, cx)
     }
 
     fn edits_at_point(&self, cx: &App) -> bool {
@@ -2206,7 +2057,12 @@ impl Surface for ThreadView {
         }))
     }
 
-    fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(
+        &mut self,
+        dealt: Option<Seen>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Row> {
         if self.private_edit.is_some() {
             return Vec::new();
         }
@@ -2227,18 +2083,10 @@ impl Surface for ThreadView {
                 );
             }
             if self
-                .selected_reply_target(self.cursor_row(cx), cx)
+                .line_meta(self.cursor_row(cx), cx)
+                .and_then(Meta::mail)
                 .is_some()
             {
-                let answer = this.clone();
-                rows.push(
-                    Row::run("r", "answer this mail", move |_, window, cx| {
-                        answer.update(cx, |view, cx| {
-                            view.answer_this_mail(&AnswerThisMail, window, cx);
-                        });
-                    })
-                    .bound_to(AnswerThisMail),
-                );
                 let view = this.clone();
                 rows.push(Row::run("", "quote mail line", move |_, window, cx| {
                     view.update(cx, |view, cx| {
@@ -2262,7 +2110,7 @@ impl Surface for ThreadView {
             let on_draft = self.on_draft(cx);
             let opens_inline = self.inline_open(cursor, cx).is_some();
             let mail = if on_draft {
-                self.chosen_work(cx)
+                self.chosen_work(dealt, cx)
             } else {
                 self.agent_mail(cursor.row, cx)
             };
@@ -2434,17 +2282,10 @@ impl Render for ThreadView {
                 self.transcript.replace(&Key::Separator, label, cx);
             }
         }
-        let answerable = self.private_edit.is_none()
-            && !list
-            && self
-                .selected_reply_target(self.cursor_row(cx), cx)
-                .is_some();
         let context = if list {
-            thread::PROJECT_SCREEN.to_owned()
-        } else if answerable {
-            format!("{} {ANSWERABLE}", thread::SCREEN)
+            thread::PROJECT_SCREEN
         } else {
-            thread::SCREEN.to_owned()
+            thread::SCREEN
         };
         let view = cx.weak_entity();
         let gesture = (layout == Layout::Phone && !list).then(move || {
@@ -2471,7 +2312,7 @@ impl Render for ThreadView {
         div()
             .id("thread")
             .relative()
-            .key_context(context.as_str())
+            .key_context(context)
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::send))
@@ -2480,7 +2321,6 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::go_to_draft))
             .on_action(cx.listener(Self::go_to_oldest_mail))
             .on_action(cx.listener(Self::quote_selection))
-            .on_action(cx.listener(Self::answer_this_mail))
             .on_action(cx.listener(Self::reply_privately))
             .on_action(cx.listener(Self::keep_private))
             // The editor consumes text mouse-down even when its native
@@ -2521,8 +2361,127 @@ mod tests {
     }
 
     #[gpui::test]
-    fn reading_an_older_mail_does_not_retarget_the_draft(cx: &mut gpui::TestAppContext) {
-        check_thread(cx, CheckThread::StableTarget);
+    fn a_thread_reply_has_no_addressee_or_retarget_command(cx: &mut gpui::TestAppContext) {
+        check_thread(cx, CheckThread::ThreadReply);
+    }
+
+    #[gpui::test]
+    fn replying_from_the_deal_preserves_the_exact_observation(cx: &mut gpui::TestAppContext) {
+        use rho_agent_types::{ChatEvent, ChatRecord, MessageVersion};
+        use rho_dealer::Card;
+        use rho_dealer::facts::Seen;
+        use rho_dealer::rank::CardKind;
+
+        let domain = rho_agent_types::AgentIdDomain(0);
+        let a = AgentId::from_counter(1, &domain).unwrap();
+        let b = AgentId::from_counter(2, &domain).unwrap();
+        let root = MessageId(ChatSeq(1));
+        let thread = ThreadId {
+            host: EndpointId([3; 32]),
+            message: MessageId(ChatSeq(2)),
+        };
+        let ask = MessageId(ChatSeq(3));
+        let mut log = HostMail::default();
+        for (id, parent, from, words, mentions) in [
+            (1, None, Party::User, "Clock", Vec::new()),
+            (2, Some(root), Party::User, "Check the clocks.", Vec::new()),
+            (
+                3,
+                Some(thread.message),
+                Party::Agent(a),
+                "Use clock A?",
+                vec![Mention::User { ping: true }],
+            ),
+            (
+                4,
+                Some(thread.message),
+                Party::Agent(b),
+                "Widen the retry window?",
+                vec![Mention::User { ping: true }],
+            ),
+        ] {
+            log.tell(&ChatRecord {
+                seq: ChatSeq(id),
+                at: UnixMs(id),
+                event: ChatEvent::Posted {
+                    parent,
+                    from,
+                    mentions,
+                    reply_to: None,
+                    thread_reply: None,
+                    kind: MessageKind::Kept,
+                    content: vec![ContentPart::Text { text: words.into() }],
+                },
+            });
+        }
+        let (window, mail, _db) = super::super::search_bench::fixture(cx, log);
+        cx.update(|cx| {
+            mail.update(cx, |system, _| {
+                system.set_draft(thread.host, Some(thread.message), "Keep clock A.".into());
+            });
+        });
+        let card = Card {
+            address: thread.address(),
+            title: "Check the clocks.".into(),
+            kind: CardKind::Waits,
+            context: "clock@lab".into(),
+            label: "waits".into(),
+            priority: 1.,
+            cursor: String::new(),
+            seen: Seen::Mail {
+                message: 3,
+                version: 3,
+            },
+            skipped: false,
+        };
+        window
+            .update(cx, |frame, window, cx| frame.open_card(card, window, cx))
+            .unwrap();
+        // A later revision arrived while the dealt thread was open.
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system
+                    .logs
+                    .get_mut(&thread.host)
+                    .unwrap()
+                    .tell(&ChatRecord {
+                        seq: ChatSeq(5),
+                        at: UnixMs(5),
+                        event: ChatEvent::Revised {
+                            message: ask,
+                            author: a,
+                            ping: None,
+                            content: vec![ContentPart::Text {
+                                text: "Use clock B instead?".into(),
+                            }],
+                        },
+                    });
+                cx.emit(Event::Changed {
+                    endpoint: thread.host,
+                });
+            })
+        });
+        cx.draw_window(window.into());
+        cx.dispatch_action(window.into(), SendMessage);
+        cx.update(|cx| {
+            mail.update(cx, |system, _| {
+                let (_, outgoing) = system.outbox.next(thread.host).expect("the draft was sent");
+                assert_eq!(outgoing.parent, Some(thread.message));
+                assert_eq!(
+                    outgoing.settles,
+                    Some(MessageVersion {
+                        message: ask,
+                        version: ChatSeq(3)
+                    })
+                );
+                assert_eq!(outgoing.failed_start, None);
+                assert!(outgoing.mentions.is_empty());
+                assert_eq!(
+                    rho_agent_types::content_text(&outgoing.content),
+                    "Keep clock A."
+                );
+            })
+        });
     }
 
     #[gpui::test]
@@ -2531,9 +2490,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_draft_uses_the_dealt_writer_or_sole_participant_and_never_guesses(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn the_draft_uses_a_sole_participant_and_never_guesses(cx: &mut gpui::TestAppContext) {
         check_thread(cx, CheckThread::WorkTarget);
     }
 
@@ -2541,7 +2498,7 @@ mod tests {
         Inline,
         Options,
         Stuck,
-        StableTarget,
+        ThreadReply,
         ProofRow,
         WorkTarget,
     }
@@ -2559,6 +2516,7 @@ mod tests {
                     kind: rho_agent_types::MessageKind::Kept,
                     parent: parent.map(|id| MessageId(ChatSeq(id))),
                     reply_to: None,
+                    thread_reply: None,
                     from,
                     mentions: Vec::new(),
                     content: vec![ContentPart::Text { text: text.into() }],
@@ -2593,7 +2551,6 @@ mod tests {
         let worker = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let agent = Party::Agent(worker);
         let other = AgentId::from_counter(9, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let gone = AgentId::from_counter(12, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let reply = "Use each counter's own reference.";
         let mail = cx.update(|cx| {
             let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
@@ -2618,7 +2575,7 @@ mod tests {
                     "My preceding answer.\n\n> The earlier question.",
                 ));
                 let mut latest = post(4, Some(2), agent, "The latest question.");
-                if matches!(check, CheckThread::StableTarget)
+                if matches!(check, CheckThread::ThreadReply)
                     && let ChatEvent::Posted { mentions, .. } = &mut latest.event
                 {
                     mentions.push(Mention::User { ping: true });
@@ -2678,7 +2635,7 @@ mod tests {
         if matches!(check, CheckThread::WorkTarget) {
             let look =
                 |view: &mut ThreadView, window: &mut Window, cx: &mut Context<ThreadView>| {
-                    view.rows(window, cx)
+                    view.rows(None, window, cx)
                         .into_iter()
                         .find_map(|row| match row.pick {
                             rho_frame::menu::Pick::Run { label, run }
@@ -2693,7 +2650,7 @@ mod tests {
             let sole = window
                 .update(cx, |view, window, cx| {
                     assert_eq!(
-                        view.subject(cx),
+                        view.subject(None, cx),
                         Subject::Draft {
                             worker: Some(worker)
                         }
@@ -2724,66 +2681,18 @@ mod tests {
                         mentions.push(Mention::User { ping: true });
                     }
                     log.tell(&latest);
-                    log.tell(&post(8, Some(2), Party::Agent(gone), "I left the thread."));
                     cx.notify();
                 });
             });
 
             let ambiguous = window
                 .update(cx, |view, window, cx| {
-                    view.opened(window, cx);
                     assert_eq!(
-                        view.reply_to,
-                        Some(ReplyTarget::Suggested(MessageId(ChatSeq(7))))
-                    );
-                    assert_eq!(
-                        view.subject(cx),
+                        view.subject(None, cx),
                         Subject::Draft { worker: None },
-                        "the suggested reply must not steer either worker without a choice"
+                        "a draft with two participants must not guess a steering target"
                     );
                     let ambiguous = look(view, window, cx);
-                    let card = Card {
-                        address: thread.address(),
-                        title: "Earlier readings".into(),
-                        context: String::new(),
-                        label: String::new(),
-                        kind: rho_dealer::rank::CardKind::Waits,
-                        priority: 0.,
-                        cursor: String::new(),
-                        seen: rho_dealer::facts::Seen::Mail {
-                            message: 4,
-                            version: 4,
-                        },
-                        skipped: false,
-                    };
-                    view.show_card(&card, window, cx);
-                    assert_eq!(
-                        view.subject(cx),
-                        Subject::Draft {
-                            worker: Some(worker)
-                        }
-                    );
-                    assert_eq!(
-                        view.chosen_work(cx).map(|(agent, mail)| (agent, mail.id)),
-                        Some((worker, MessageId(ChatSeq(4))))
-                    );
-
-                    let newer = Key::Message(MessageId(ChatSeq(7)));
-                    assert!(view.cursor_to_item(&newer, Autoscroll::fit(), cx));
-                    view.answer_this_mail(&AnswerThisMail, window, cx);
-                    assert_eq!(
-                        view.subject(cx),
-                        Subject::Draft {
-                            worker: Some(other)
-                        }
-                    );
-                    let vanished = Key::Message(MessageId(ChatSeq(8)));
-                    assert!(view.cursor_to_item(&vanished, Autoscroll::fit(), cx));
-                    view.answer_this_mail(&AnswerThisMail, window, cx);
-                    assert_eq!(view.subject(cx), Subject::Draft { worker: Some(gone) });
-                    assert!(!view.rows(window, cx).iter().any(|row| matches!(
-                        &row.pick, rho_frame::menu::Pick::Run { label, .. } if label == "look into the work"
-                    )));
                     ambiguous
                 })
                 .unwrap();
@@ -2816,7 +2725,7 @@ mod tests {
                 let key = Key::Message(MessageId(ChatSeq(5)));
                 assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
                 assert_eq!(view.link_at(view.cursor(cx), cx).unwrap().as_str(), "https://proof.example.invalid/clock");
-                let rows = view.rows(window, cx);
+                let rows = view.rows(None, window, cx);
                 assert!(
                     rows.into_iter().any(|row| matches!(row.pick, rho_frame::menu::Pick::Run { label, .. } if label == "open")),
                     "the palette must offer open for this ordinary mail line"
@@ -2825,7 +2734,7 @@ mod tests {
             return;
         }
 
-        if matches!(check, CheckThread::StableTarget) {
+        if matches!(check, CheckThread::ThreadReply) {
             cx.update(|cx| {
                 mail.update(cx, |system, cx| {
                     system.logs.get_mut(&thread.host).unwrap().tell(&post(
@@ -2839,42 +2748,29 @@ mod tests {
             });
             window
                 .update(cx, |view, host_window, cx| {
-                    assert_eq!(
-                        view.reply_to.map(ReplyTarget::message),
-                        Some(MessageId(ChatSeq(4))),
-                        "new arrival does not retarget"
+                    assert!(
+                        !view
+                            .document(cx)
+                            .text()
+                            .lines()
+                            .any(|line| line.starts_with("answers "))
                     );
-                    view.opened(host_window, cx);
-                    assert_eq!(
-                        view.reply_to.map(ReplyTarget::message),
-                        Some(MessageId(ChatSeq(4))),
-                        "an open by name prefers the latest ping"
-                    );
-                    let older = MessageId(ChatSeq(2));
-                    let key = Key::Message(older);
+                    let key = Key::Message(MessageId(ChatSeq(2)));
                     assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
-                    assert_eq!(
-                        view.reply_to.map(ReplyTarget::message),
-                        Some(MessageId(ChatSeq(4)))
-                    );
+                    let rows = view.rows(None, host_window, cx);
+                    assert!(!rows.iter().any(|row| matches!(&row.pick,
+                        rho_frame::menu::Pick::Run { label, .. } if label.starts_with("answer this")
+                    )));
                     let row = view.cursor_row(cx);
                     view.quote(row..=row, host_window, cx);
-                    assert_eq!(
-                        view.reply_to.map(ReplyTarget::message),
-                        Some(MessageId(ChatSeq(4))),
-                        "quoting is not retargeting"
-                    );
-                    assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
-                    view.answer_this_mail(&AnswerThisMail, host_window, cx);
-                    assert_eq!(view.reply_to.map(ReplyTarget::message), Some(older));
                     assert!(view.on_draft(cx));
                     view.send_only(&SendOnly, host_window, cx);
                 })
                 .unwrap();
             let sent = cx.update(|cx| {
-                mail.update(cx, |system, _| system.outbox.next(thread.host).unwrap().0)
+                mail.update(cx, |system, _| system.outbox.next(thread.host).unwrap().1)
             });
-            assert_eq!(sent.reply_to, Some(MessageId(ChatSeq(2))));
+            assert_eq!((sent.settles, sent.failed_start), (None, None));
             return;
         }
 
@@ -3108,6 +3004,7 @@ mod tests {
             id: MessageId(rho_agent_types::ChatSeq(13)),
             parent: None,
             reply_to: None,
+            thread_reply: None,
             at: rho_agent_types::UnixMs(1_760_000_000_000),
             from,
             mentions: Vec::new(),
@@ -3233,25 +3130,6 @@ mod tests {
         assert_eq!(&item.text[item.styles[0].1.clone()], "Running the suite.");
         assert_eq!(item.styles[0].0, Class::Time);
         assert_eq!(item.lines[1].source_line(), Some(1));
-    }
-
-    #[test]
-    fn only_incoming_nondeleted_mail_can_receive_a_reply() {
-        let agent = AgentId::from_counter(19, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let incoming_mail = mail(
-            Party::Agent(agent),
-            Revision::Edited {
-                seq: ChatSeq(2),
-                at: UnixMs(2),
-            },
-            "Use the release branch.",
-        );
-        let sent = mail(Party::User, Revision::Original, "Not yet.");
-        let removed = mail(Party::Agent(agent), Revision::Deleted, "Removed.");
-        assert!(incoming(Some(&incoming_mail)));
-        assert!(!incoming(Some(&sent)));
-        assert!(!incoming(Some(&removed)));
-        assert!(!incoming(None));
     }
 
     #[test]

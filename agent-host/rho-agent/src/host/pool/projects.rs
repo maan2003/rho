@@ -48,7 +48,7 @@ pub struct ProjectIdea {
     pub client_id: u64,
     pub project: ProjectId,
     pub parent: MessageId,
-    pub reply_to: Option<MessageId>,
+    pub failed_start: Option<MessageId>,
     pub content: Vec<ContentPart>,
     pub host_label: String,
     pub runtime: Option<RuntimeLabel>,
@@ -273,7 +273,7 @@ impl AgentPool {
                 read.root_of(idea.parent) == Some(idea.project.0),
                 "idea is not under this project"
             );
-            if let Some(target) = idea.reply_to {
+            if let Some(target) = idea.failed_start {
                 ensure!(
                     read.message(target).is_some_and(|mail| {
                         mail.from == Address::StartFailed && read.mail_thread(&mail) == idea.parent
@@ -328,7 +328,7 @@ impl AgentPool {
                 Some(idea.parent),
                 NewMessage {
                     from: Address::User,
-                    reply_to: idea.reply_to,
+                    reply_to: idea.failed_start,
                     // Direct routing wakes only the standing agent. The idea
                     // is still human-authored project mail.
                     mentions: standing.into_iter().map(Mention::Direct).collect(),
@@ -356,7 +356,7 @@ impl AgentPool {
 
         // Retrying a refused start gives the new agent the original brief
         // first, then the words of the retry; neither is rewritten.
-        let origin = idea.reply_to.map_or(message, |_| idea.parent);
+        let origin = idea.failed_start.map_or(message, |_| idea.parent);
         let result = self
             .start_project_agent(origin, settings.as_ref(), idea.runtime.as_ref(), resumed)
             .await;

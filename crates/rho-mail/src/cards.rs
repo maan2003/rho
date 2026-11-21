@@ -4,10 +4,12 @@
 //! agent moves on, and no addressed result fades unread. Marks still belong
 //! to the user, and a reply settles the mail that preceded it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use jiff::Timestamp;
-use rho_agent_types::{Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId};
+use rho_agent_types::{
+    Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, MessageVersion,
+};
 use rho_dealer::curve::{self, Curve};
 use rho_dealer::facts::{Facts, Seen};
 use rho_dealer::rank::{CardKind, Trace};
@@ -58,14 +60,17 @@ pub fn claims(
     marks: &Marks,
     now: Timestamp,
     mut trace: Option<&mut Trace>,
-    local_answers: impl IntoIterator<Item = MessageId>,
+    local_answers: impl IntoIterator<Item = MessageVersion>,
 ) -> Vec<Claim> {
     let chat = host.chat;
     // One walk over the chat, not one per thread: every thread's mentions
     // of the user in log order, and the newest message the user wrote in
     // it. Ranking happens on every change, and a host's chat is long.
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
-    let mut answered: HashSet<_> = local_answers.into_iter().collect();
+    let mut answered = BTreeMap::new();
+    for seen in local_answers {
+        remember(&mut answered, seen);
+    }
     for message in chat.messages() {
         let mentioned = message.pings_user();
         let from_user = message.from == Party::User;
@@ -78,10 +83,10 @@ pub fn claims(
         }
         if from_user {
             thread.user_wrote = Some(message);
-            if let Some(mail) = message.reply_to {
-                answered.insert(mail);
-            } else {
-                thread.plain_user_mail = Some(message.id);
+            if let Some(seen) = settled_by(message) {
+                remember(&mut answered, seen);
+            } else if let Some(through) = legacy_read_through(message) {
+                thread.legacy_read_through = Some(through);
             }
         }
     }
@@ -94,13 +99,16 @@ pub fn claims(
         .address();
         let facts = marks.get(&address).facts();
         let user_wrote = messages.user_wrote;
-        let seen = SeenMail::new(facts, messages.plain_user_mail.map(|id| id.0));
+        let seen = SeenMail::new(facts, messages.legacy_read_through);
+        let through = |mail| seen.through(mail).max(answered.get(&mail).copied());
         let mut unseen = messages
             .mentions
             .into_iter()
-            .filter(|message| !answered.contains(&message.id) && seen.is_unread(message))
+            .filter(|message| {
+                through(message.id).is_none_or(|version| message.version().0 > version)
+            })
             .collect::<Vec<_>>();
-        let waiting_since = |message: &Message| message.ping_since(seen.through(message.id));
+        let waiting_since = |message: &Message| message.ping_since(through(message.id));
         unseen.sort_by_key(|message| waiting_since(message).0);
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
@@ -114,7 +122,7 @@ pub fn claims(
             trace.input(&address, "read", format!("{seen:?}"));
         }
 
-        // An addressed reply settles only its target. Older unanswered mail
+        // A reply from the deal settles only that card. Older unanswered mail
         // still waits, but the next mail in the conversation is where to land.
         let next = user_wrote
             .filter(|reply| reply.id != thread)
@@ -207,12 +215,40 @@ pub(crate) fn context_at_root(chat: &HostMail, root: MessageId, host_name: &str)
     )
 }
 
-/// The mail a project card opens on.
-pub fn attention_mail(seen: Seen) -> Option<MessageId> {
+/// A logged reply settles the specific observation it carries. Old,
+/// addressed replies are already historical and froze the target at send.
+pub(crate) fn settled_by(post: &Message) -> Option<MessageVersion> {
+    match post.thread_reply {
+        Some(reply) => reply.settles,
+        None => post.reply_to.map(|message| MessageVersion {
+            message,
+            version: post.id.0,
+        }),
+    }
+}
+
+pub(crate) fn legacy_read_through(post: &Message) -> Option<ChatSeq> {
+    (post.thread_reply.is_none() && post.reply_to.is_none()).then_some(post.id.0)
+}
+
+pub(crate) fn remember(exact: &mut BTreeMap<MessageId, ChatSeq>, seen: MessageVersion) {
+    let through = exact.entry(seen.message).or_insert(seen.version);
+    *through = (*through).max(seen.version);
+}
+
+pub(crate) fn card_version(seen: Seen) -> Option<MessageVersion> {
     match seen {
-        Seen::Mail { message, .. } => Some(MessageId(ChatSeq(message))),
+        Seen::Mail { message, version } => Some(MessageVersion {
+            message: MessageId(ChatSeq(message)),
+            version: ChatSeq(version),
+        }),
         _ => None,
     }
+}
+
+/// The mail a project card opens on.
+pub fn attention_mail(seen: Seen) -> Option<MessageId> {
+    card_version(seen).map(|seen| seen.message)
 }
 
 /// How much of a thread is read: whole-thread cutoffs (including from old
@@ -227,15 +263,22 @@ impl SeenMail {
     pub(crate) fn new(facts: Facts<'_>, wrote: Option<ChatSeq>) -> Self {
         let mut exact = BTreeMap::new();
         for (message, version) in facts.seen_mail() {
-            let latest = exact
-                .entry(MessageId(ChatSeq(message)))
-                .or_insert(ChatSeq(version));
-            *latest = (*latest).max(ChatSeq(version));
+            remember(
+                &mut exact,
+                MessageVersion {
+                    message: MessageId(ChatSeq(message)),
+                    version: ChatSeq(version),
+                },
+            );
         }
         Self {
             through: facts.seen_topic().map(ChatSeq).max(wrote),
             exact,
         }
+    }
+
+    pub(crate) fn note(&mut self, seen: MessageVersion) {
+        remember(&mut self.exact, seen);
     }
 
     fn through(&self, mail: MessageId) -> Option<ChatSeq> {
@@ -252,7 +295,7 @@ impl SeenMail {
 struct ThreadMessages<'a> {
     mentions: Vec<&'a Message>,
     user_wrote: Option<&'a Message>,
-    plain_user_mail: Option<MessageId>,
+    legacy_read_through: Option<ChatSeq>,
 }
 
 #[cfg(test)]
@@ -335,6 +378,7 @@ mod tests {
                 kind: rho_agent_types::MessageKind::Kept,
                 parent,
                 reply_to: None,
+                thread_reply: None,
                 from,
                 mentions,
                 content: vec![ContentPart::Text { text: text.into() }],
@@ -429,6 +473,7 @@ mod tests {
                 kind: rho_agent_types::MessageKind::Kept,
                 parent: Some(thread),
                 reply_to: Some(mail),
+                thread_reply: None,
                 from: Party::User,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text {
@@ -574,6 +619,55 @@ mod tests {
             w.hand(),
             "rho@lab › a · waits · now",
             "the reply settles the standalone ask without clearing an unrelated thread"
+        );
+    }
+
+    #[test]
+    fn a_thread_reply_does_not_settle_other_asks_or_an_edit_the_deal_did_not_show() {
+        let mut w = world();
+        let thread = w.agent("Clock");
+        let early = w.asks(thread);
+        let later = w.asks(thread);
+        let say = |w: &mut World, settles| {
+            w.record(ChatEvent::Posted {
+                parent: Some(thread),
+                reply_to: None,
+                thread_reply: Some(rho_agent_types::ThreadReply { settles }),
+                from: Party::User,
+                kind: rho_agent_types::MessageKind::Kept,
+                mentions: Vec::new(),
+                content: vec![ContentPart::Text {
+                    text: "Try the second clock.".into(),
+                }],
+            });
+        };
+        let card = |w: &mut World| attention_mail(w.deal().cards[0].seen);
+        say(&mut w, None);
+        assert_eq!(
+            card(&mut w),
+            Some(early),
+            "opening by name does not settle either ask"
+        );
+        say(
+            &mut w,
+            Some(MessageVersion {
+                message: early,
+                version: early.0,
+            }),
+        );
+        assert_eq!(card(&mut w), Some(later), "an unrelated wait stays");
+        w.record(ChatEvent::Revised {
+            message: early,
+            author: w.agents[&thread],
+            ping: None,
+            content: vec![ContentPart::Text {
+                text: "Use the monotonic clock instead?".into(),
+            }],
+        });
+        assert_eq!(
+            card(&mut w),
+            Some(early),
+            "a version the user never saw stays unread"
         );
     }
 

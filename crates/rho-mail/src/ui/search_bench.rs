@@ -37,6 +37,7 @@ fn corpus() -> HostMail {
                 kind: rho_agent_types::MessageKind::Kept,
                 parent: parent.map(|id| MessageId(ChatSeq(id))),
                 reply_to: None,
+                thread_reply: None,
                 from: if seq == 1 { Party::User } else { agent },
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text { text }],

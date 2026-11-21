@@ -134,6 +134,7 @@ mod prior_ping {
                     kind: super::MessageKind::Kept,
                     parent,
                     reply_to,
+                    thread_reply: None,
                     from,
                     content,
                     mentions: mentions
@@ -222,6 +223,7 @@ mod prior_ping {
                     event: ChatEvent::Posted {
                         parent: None,
                         reply_to: None,
+                        thread_reply: None,
                         from: Address::User,
                         content: vec![ContentPart::Text {
                             text: format!("mail {key}"),
@@ -746,6 +748,16 @@ pub trait MailWrite {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId>;
+    /// A user reply uses thread membership; its card mark is not routing.
+    fn post_user_reply(
+        &mut self,
+        at: UnixMs,
+        parent: Option<MessageId>,
+        reply: rho_agent_types::ThreadReply,
+        mentions: Vec<Mention>,
+        content: Vec<ContentPart>,
+        client_id: u64,
+    ) -> anyhow::Result<MessageId>;
     fn post_flash(
         &mut self,
         at: UnixMs,
@@ -768,8 +780,6 @@ pub trait MailWrite {
     ) -> anyhow::Result<MessageId>;
     /// The agent's live mail in this thread since the user's last mail.
     fn live_project_mail(&mut self, thread: MessageId, agent: AgentId) -> Option<MessageId>;
-    /// The current writer in the same transaction that records the answer.
-    fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId>;
     fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq>;
     /// Mark a still-current version taken back, without erasing its words.
     fn take_back_mail(
@@ -949,18 +959,29 @@ fn unscoped_peer_project(
     )
 }
 
-fn has_user_reply(write: &mut WriteTxn, id: MessageId) -> bool {
-    // A reply still answers the same mail if either one moves. Older
-    // clients could reply by posting directly under the mail.
+fn has_user_reply(write: &mut WriteTxn, mail: &Message) -> bool {
+    // A dealt card keeps its identity if either message moves. Older
+    // clients could answer a specific mail by posting directly under it.
     write
         .open_table(MAIL_LOG)
-        .range(id.0.0 + 1..)
+        .range(mail.id.0.0 + 1..)
         .any(|(_, row)| {
-            matches!(
-                row.value().into_owned().event,
-                ChatEvent::Posted { from: Address::User, parent, reply_to, .. }
-                    if reply_to.or(parent) == Some(id)
-            )
+            let ChatEvent::Posted {
+                from: Address::User,
+                parent,
+                reply_to,
+                thread_reply,
+                ..
+            } = row.value().into_owned().event
+            else {
+                return false;
+            };
+            match thread_reply {
+                Some(reply) => reply.settles.is_some_and(|seen| {
+                    seen.message == mail.id && seen.version >= mail.version().0
+                }),
+                None => reply_to.or(parent) == Some(mail.id),
+            }
         })
 }
 
@@ -1020,7 +1041,7 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         id.0.0
     );
     anyhow::ensure!(
-        mail.kind == MessageKind::Flash || !has_user_reply(write, id),
+        mail.kind == MessageKind::Flash || !has_user_reply(write, &mail),
         "you cannot change mail #{}: the user already answered it",
         id.0.0
     );
@@ -1060,6 +1081,7 @@ fn post_kind(
     message: NewMessage,
     kind: MessageKind,
     client_id: Option<u64>,
+    thread_reply: Option<rho_agent_types::ThreadReply>,
 ) -> anyhow::Result<MessageId> {
     if let Some(seq) = sent_before(write, client_id) {
         return Ok(MessageId(seq));
@@ -1089,6 +1111,7 @@ fn post_kind(
     let event = ChatEvent::Posted {
         parent,
         reply_to,
+        thread_reply,
         from,
         kind,
         mentions,
@@ -1166,7 +1189,40 @@ impl MailWrite for WriteTxn {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId> {
-        post_kind(self, at, parent, message, MessageKind::Kept, client_id)
+        post_kind(
+            self,
+            at,
+            parent,
+            message,
+            MessageKind::Kept,
+            client_id,
+            None,
+        )
+    }
+
+    fn post_user_reply(
+        &mut self,
+        at: UnixMs,
+        parent: Option<MessageId>,
+        reply: rho_agent_types::ThreadReply,
+        mentions: Vec<Mention>,
+        content: Vec<ContentPart>,
+        client_id: u64,
+    ) -> anyhow::Result<MessageId> {
+        post_kind(
+            self,
+            at,
+            parent,
+            NewMessage {
+                from: Address::User,
+                reply_to: None,
+                mentions,
+                content,
+            },
+            MessageKind::Kept,
+            Some(client_id),
+            Some(reply),
+        )
     }
 
     fn post_flash(
@@ -1190,7 +1246,15 @@ impl MailWrite for WriteTxn {
             mentions: vec![Mention::User { ping: false }],
             content,
         };
-        post_kind(self, at, Some(thread), message, MessageKind::Flash, None)
+        post_kind(
+            self,
+            at,
+            Some(thread),
+            message,
+            MessageKind::Flash,
+            None,
+            None,
+        )
     }
 
     fn expire_flash(&mut self, at: UnixMs, id: MessageId) -> bool {
@@ -1292,19 +1356,12 @@ impl MailWrite for WriteTxn {
                     .mentions
                     .iter()
                     .any(|m| matches!(m, Mention::Direct(_)))
-                && !has_user_reply(self, id)
+                && !has_user_reply(self, &mail)
             {
                 return Some(id);
             }
         }
         None
-    }
-
-    fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId> {
-        match current_message(self, mail)?.from {
-            Address::Agent(writer) => Some(writer),
-            _ => None,
-        }
     }
 
     fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq> {
@@ -1356,7 +1413,7 @@ impl MailWrite for WriteTxn {
         let Some(mail) = id.and_then(|id| current_message(self, id)) else {
             return;
         };
-        if !mail.pings_user() || has_user_reply(self, mail.id) {
+        if !mail.pings_user() || has_user_reply(self, &mail) {
             return;
         }
         let event = ChatEvent::Recovered {

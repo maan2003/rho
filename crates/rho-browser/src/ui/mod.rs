@@ -417,11 +417,16 @@ impl Surface for PageView {
         title(self.page_id())
     }
 
-    fn subject(&self, _cx: &App) -> Subject {
+    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
         Subject::Own
     }
 
-    fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(
+        &mut self,
+        _: Option<rho_frame::surface::Dealt>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Row> {
         vec![
             Row::run("", "go back", |frame, window, cx| frame.back(window, cx))
                 .bound_to(keys::Back),

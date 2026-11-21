@@ -269,7 +269,7 @@ where
                             client_id,
                             project,
                             parent: project.0,
-                            reply_to: None,
+                            failed_start: None,
                             content,
                             host_label,
                             runtime,
@@ -291,24 +291,24 @@ where
             respond(
                 writer,
                 call,
-                |RetryIdea { posted, host_label }| async move {
-                    let Post {
-                        client_id,
-                        parent,
-                        reply_to,
-                        mentions,
-                        mut content,
-                    } = posted;
-                    anyhow::ensure!(mentions.is_empty(), "retry cannot change the recipients");
-                    let parent = parent.context("retry needs a thread")?;
-                    let reply_to = reply_to.context("retry needs a failed start")?;
-                    let project = rho_agent_types::ProjectId(
-                        services
-                            .db
-                            .read()
-                            .root_of(parent)
-                            .context("no such thread")?,
-                    );
+                |RetryIdea {
+                     client_id,
+                     failed_start,
+                     mut content,
+                     host_label,
+                 }| async move {
+                    let (parent, project) = {
+                        let read = services.db.read();
+                        let stop = read
+                            .message(failed_start)
+                            .filter(|message| message.from == rho_agent_types::Address::StartFailed)
+                            .context("retry needs a failed start")?;
+                        let parent = read.mail_thread(&stop);
+                        let project = rho_agent_types::ProjectId(
+                            read.root_of(parent).context("no such thread")?,
+                        );
+                        (parent, project)
+                    };
                     prepare_image_content(&mut content).await?;
                     let pool = services.pool.clone();
                     let result = tokio::spawn(async move {
@@ -316,7 +316,7 @@ where
                             client_id,
                             project,
                             parent,
-                            reply_to: Some(reply_to),
+                            failed_start: Some(failed_start),
                             content,
                             host_label,
                             runtime: None,
@@ -339,14 +339,14 @@ where
                 |Post {
                      client_id,
                      parent,
-                     reply_to,
+                     settles,
                      mentions,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .post_user(client_id, parent, reply_to, mentions, content)
+                        .post_user(client_id, parent, settles, mentions, content)
                         .await
                 },
             )

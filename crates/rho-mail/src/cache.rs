@@ -419,6 +419,7 @@ mod tests {
                 kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
                 reply_to: None,
+                thread_reply: None,
                 from: Address::User,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text {
@@ -469,7 +470,8 @@ mod tests {
         let outgoing = Outgoing {
             at: UnixMs(3),
             parent: Some(MessageId(ChatSeq(2))),
-            reply_to: None,
+            failed_start: None,
+            settles: None,
             mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "unsent".into(),
@@ -523,7 +525,8 @@ mod tests {
         let outgoing = Outgoing {
             at: UnixMs(5),
             parent: Some(MessageId(ChatSeq(2))),
-            reply_to: Some(MessageId(ChatSeq(1))),
+            failed_start: Some(MessageId(ChatSeq(1))),
+            settles: None,
             mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
             delivery: crate::outbox::Delivery::Retry,

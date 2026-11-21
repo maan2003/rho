@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{AgentId, ContentPart, EndpointId, MessageId, RuntimeLabel, UnixMs};
+use rho_agent_types::{
+    AgentId, ContentPart, EndpointId, MessageId, MessageVersion, RuntimeLabel, UnixMs,
+};
 use senax_encoder::{Decode, Encode};
-
-use crate::protocol::Post;
 
 /// One message on disk until its host takes it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -21,7 +21,11 @@ pub struct Outgoing {
     pub at: UnixMs,
     /// The thread it goes in; none starts a root.
     pub parent: Option<MessageId>,
-    pub reply_to: Option<MessageId>,
+    /// Previously the address of an ordinary reply or the failed start.
+    /// On load, ordinary replies convert this to card settlement.
+    #[senax(rename = "reply_to")]
+    pub failed_start: Option<MessageId>,
+    pub settles: Option<MessageVersion>,
     /// Agents that receive it without being members of its thread.
     pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
@@ -42,13 +46,17 @@ pub enum OutgoingState {
 }
 
 impl Outgoing {
-    fn call(&self, client_id: u64) -> Post {
-        Post {
-            client_id,
-            parent: self.parent,
-            reply_to: self.reply_to,
-            mentions: self.mentions.clone(),
-            content: self.content.clone(),
+    pub(crate) fn import_addressed(
+        &mut self,
+        version: impl FnOnce(MessageId) -> rho_agent_types::ChatSeq,
+    ) {
+        if self.delivery != Delivery::Retry
+            && let Some(message) = self.failed_start.take()
+        {
+            self.settles = Some(MessageVersion {
+                message,
+                version: version(message),
+            });
         }
     }
 }
@@ -97,33 +105,6 @@ impl Outbox {
         }
     }
 
-    /// Keeps a message the user wrote to the host on `endpoint`.
-    /// Answers its client id and what the disk copy must keep.
-    pub fn push(
-        &mut self,
-        endpoint: EndpointId,
-        parent: Option<MessageId>,
-        reply_to: Option<MessageId>,
-        mentions: Vec<AgentId>,
-        content: Vec<ContentPart>,
-        delivery: Delivery,
-    ) -> (u64, Kept) {
-        self.keep(
-            endpoint,
-            rand::random(),
-            Outgoing {
-                at: UnixMs::now(),
-                parent,
-                reply_to,
-                mentions,
-                content,
-                delivery,
-                runtime: None,
-                state: OutgoingState::Queued,
-            },
-        )
-    }
-
     pub(crate) fn keep(
         &mut self,
         endpoint: EndpointId,
@@ -143,7 +124,7 @@ impl Outbox {
 
     /// The host's oldest unsent message, to post now, unless a post is
     /// already on its way.
-    pub fn next(&mut self, endpoint: EndpointId) -> Option<(Post, Delivery, Option<RuntimeLabel>)> {
+    pub(crate) fn next(&mut self, endpoint: EndpointId) -> Option<(u64, Outgoing)> {
         if self.sending.contains_key(&endpoint) {
             return None;
         }
@@ -151,11 +132,7 @@ impl Outbox {
             *host == endpoint && outgoing.state == OutgoingState::Queued
         })?;
         self.sending.insert(endpoint, Sending::Posting(*id));
-        Some((
-            outgoing.call(*id),
-            outgoing.delivery,
-            outgoing.runtime.clone(),
-        ))
+        Some((*id, outgoing.clone()))
     }
 
     pub(crate) fn posted(&mut self, endpoint: EndpointId, message: MessageId) {
@@ -202,12 +179,17 @@ impl Outbox {
         Kept::Put(id, outgoing.clone())
     }
 
-    pub(crate) fn reply_targets(&self, endpoint: EndpointId) -> impl Iterator<Item = MessageId> {
+    pub(crate) fn settlements(&self, endpoint: EndpointId) -> impl Iterator<Item = MessageVersion> {
         self.waiting.iter().filter_map(move |(host, _, outgoing)| {
             if *host != endpoint || outgoing.state != OutgoingState::Queued {
                 return None;
             }
-            outgoing.reply_to
+            outgoing.settles.or_else(|| {
+                outgoing.failed_start.map(|message| MessageVersion {
+                    message,
+                    version: message.0,
+                })
+            })
         })
     }
 
@@ -254,6 +236,20 @@ mod tests {
         vec![ContentPart::Text { text: text.into() }]
     }
 
+    fn queued(parent: Option<MessageId>, words: &str) -> Outgoing {
+        Outgoing {
+            at: UnixMs::now(),
+            parent,
+            failed_start: None,
+            settles: None,
+            mentions: Vec::new(),
+            content: text(words),
+            delivery: Delivery::Mail,
+            runtime: None,
+            state: OutgoingState::Queued,
+        }
+    }
+
     fn texts(outgoing: Vec<&Outgoing>) -> Vec<String> {
         outgoing
             .iter()
@@ -270,41 +266,39 @@ mod tests {
         let (a, b) = (EndpointId([1; 32]), EndpointId([2; 32]));
         let thread = Some(MessageId(ChatSeq(4)));
         let mut outbox = Outbox::default();
-        let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let (first, kept) = outbox.push(
+        let first = 77;
+        let second = 78;
+        let settlement = MessageVersion {
+            message: MessageId(ChatSeq(7)),
+            version: ChatSeq(14),
+        };
+        let (_, kept) = outbox.keep(
             a,
-            thread,
-            Some(MessageId(ChatSeq(7))),
-            vec![agent],
-            text("a1"),
-            Delivery::Mail,
+            first,
+            Outgoing {
+                settles: Some(settlement),
+                ..queued(thread, "a1")
+            },
         );
         assert!(matches!(kept, Kept::Put(id, _) if id == first));
-        outbox.push(b, None, None, vec![agent], text("b1"), Delivery::Mail);
-        let (second, _) = outbox.push(a, thread, None, Vec::new(), text("a2"), Delivery::Mail);
+        outbox.keep(b, 91, queued(None, "b1"));
+        outbox.keep(a, second, queued(thread, "a2"));
         assert_eq!(outbox.hosts(), [a, b]);
 
-        let to_a = outbox.next(a).expect("a post").0;
+        let (id, to_a) = outbox.next(a).expect("a post");
         assert_eq!(
-            (
-                to_a.client_id,
-                to_a.mentions.clone(),
-                to_a.parent,
-                to_a.reply_to
-            ),
-            (first, vec![agent], thread, Some(MessageId(ChatSeq(7))))
+            (id, to_a.parent, to_a.settles),
+            (first, thread, Some(settlement))
         );
         assert!(outbox.next(a).is_none(), "one post at a time");
-        let to_b = outbox.next(b).expect("a post").0;
-        assert_eq!((to_b.parent, to_b.mentions), (None, vec![agent]));
+        let (_, to_b) = outbox.next(b).expect("a post");
+        assert_eq!((to_b.parent, to_b.settles), (None, None));
 
         outbox.failed(a);
         assert_eq!(
-            outbox
-                .next(a)
-                .map(|(post, ..)| (post.client_id, post.reply_to)),
-            Some((first, Some(MessageId(ChatSeq(7))))),
-            "posted again under the same id"
+            outbox.next(a).map(|(id, post)| (id, post.settles)),
+            Some((first, Some(settlement))),
+            "posted again under the same id with the same card observation"
         );
         let (id, outgoing, kept) = outbox.answered(a).unwrap();
         assert_eq!((id, kept), (first, Kept::Gone(first)));
@@ -317,10 +311,7 @@ mod tests {
             outbox.local_under(b, thread).is_empty(),
             "the thread of a's host"
         );
-        assert_eq!(
-            outbox.next(a).map(|(post, ..)| post.client_id),
-            Some(second)
-        );
+        assert_eq!(outbox.next(a).map(|(id, _)| id), Some(second));
         outbox.answered(a);
         assert!(outbox.local_under(a, thread).is_empty());
         assert!(outbox.next(a).is_none());
@@ -349,8 +340,56 @@ mod tests {
         let decoded = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
         assert_eq!(decoded.content, content);
         assert_eq!(decoded.parent, Some(MessageId(ChatSeq(4))));
-        assert_eq!(decoded.reply_to, None);
+        assert_eq!(decoded.failed_start, None);
         assert_eq!(decoded.delivery, Delivery::Mail);
+    }
+
+    #[test]
+    fn an_old_addressed_post_becomes_a_thread_reply_but_a_retry_keeps_its_failed_start() {
+        #[derive(Encode)]
+        struct AddressedOutgoing {
+            at: UnixMs,
+            parent: Option<MessageId>,
+            reply_to: Option<MessageId>,
+            mentions: Vec<AgentId>,
+            content: Vec<ContentPart>,
+            delivery: Delivery,
+        }
+        let message = MessageId(ChatSeq(4));
+        for delivery in [Delivery::Mail, Delivery::Retry] {
+            let bytes = senax_encoder::encode(&AddressedOutgoing {
+                at: UnixMs(9),
+                parent: Some(MessageId(ChatSeq(2))),
+                reply_to: Some(message),
+                mentions: Vec::new(),
+                content: text("queued offline"),
+                delivery,
+            })
+            .unwrap();
+            let mut decoded = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
+            decoded.import_addressed(|id| {
+                assert_eq!(id, message);
+                ChatSeq(8)
+            });
+            assert_eq!(decoded.content, text("queued offline"));
+            if delivery == Delivery::Retry {
+                assert_eq!(
+                    (decoded.failed_start, decoded.settles),
+                    (Some(message), None)
+                );
+            } else {
+                assert_eq!(
+                    (decoded.failed_start, decoded.settles),
+                    (
+                        None,
+                        Some(MessageVersion {
+                            message,
+                            version: ChatSeq(8)
+                        })
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -360,7 +399,8 @@ mod tests {
         let outgoing = Outgoing {
             at: UnixMs(11),
             parent: Some(MessageId(ChatSeq(75))),
-            reply_to: None,
+            failed_start: None,
+            settles: None,
             mentions: Vec::new(),
             content: text("explicit choice"),
             delivery: Delivery::Idea,
@@ -370,24 +410,19 @@ mod tests {
         let bytes = senax_encoder::encode(&outgoing).unwrap();
         let saved = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
         let mut outbox = Outbox::load(vec![(host, 31, saved)]);
-        let (next, _) = outbox.push(host, None, None, Vec::new(), text("later"), Delivery::Mail);
+        let (next, _) = outbox.keep(host, 71, queued(None, "later"));
         for _ in 0..2 {
             assert_eq!(
-                outbox.next(host).map(|(post, delivery, runtime)| (
-                    post.client_id,
-                    delivery,
-                    runtime
-                )),
+                outbox
+                    .next(host)
+                    .map(|(id, outgoing)| (id, outgoing.delivery, outgoing.runtime)),
                 Some((31, Delivery::Idea, Some(label.clone()))),
             );
             outbox.failed(host); // No definite answer keeps the same request.
         }
         outbox.next(host).unwrap();
         assert_eq!(outbox.answered(host).unwrap().2, Kept::Gone(31));
-        assert_eq!(
-            outbox.next(host).map(|(post, ..)| post.client_id),
-            Some(next)
-        );
+        assert_eq!(outbox.next(host).map(|(id, _)| id), Some(next));
     }
 
     #[test]
@@ -396,7 +431,8 @@ mod tests {
         let outgoing = |at: u64, text: &str| Outgoing {
             at: UnixMs(at),
             parent: None,
-            reply_to: None,
+            failed_start: None,
+            settles: None,
             mentions: vec![agent],
             content: vec![ContentPart::Text { text: text.into() }],
             delivery: Delivery::Mail,
@@ -407,18 +443,8 @@ mod tests {
             (EndpointId([1; 32]), 32, outgoing(2, "second")),
             (EndpointId([1; 32]), 31, outgoing(1, "first")),
         ]);
-        assert_eq!(
-            outbox
-                .next(EndpointId([1; 32]))
-                .map(|(post, ..)| post.client_id),
-            Some(31)
-        );
+        assert_eq!(outbox.next(EndpointId([1; 32])).map(|(id, _)| id), Some(31));
         outbox.answered(EndpointId([1; 32]));
-        assert_eq!(
-            outbox
-                .next(EndpointId([1; 32]))
-                .map(|(post, ..)| post.client_id),
-            Some(32)
-        );
+        assert_eq!(outbox.next(EndpointId([1; 32])).map(|(id, _)| id), Some(32));
     }
 }
