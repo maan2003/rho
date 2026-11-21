@@ -6,6 +6,6 @@ The mail fold knows when new project text arrives; only the editor knows whether
 
 ## Contract
 
-An arriving project mail or a new version of the latest mail preserves the current viewport-relative position of an inline draft, subject to the editor's no-overscroll bounds. When the draft is stuck, the history viewport does not follow. The bottom-stuck excerpt shows a muted `↓ new mail` until it returns inline. The user's local posting acts on the draft and history as before, not as incoming mail.
+As new mail or a new version of the latest mail joins the history, an inline draft keeps its viewport-relative position, subject to the editor's no-overscroll bounds. When the draft is stuck, the history viewport stays where it was. The bottom-stuck excerpt shows a muted `↓ new mail` for project mail until it returns inline; it does not show the notice for the user's sending or logged mail. Sending a thread reply puts point in the empty draft without following any mail into the history.
 
 This implements [new mail follows the draft at the tail](../../../product/mail.md#rule-new-mail-follows-the-draft-at-the-tail).
