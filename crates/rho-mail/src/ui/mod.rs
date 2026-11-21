@@ -34,13 +34,14 @@ use rho_frame::{
     AnySurface, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint, System,
     TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
+use rho_rpc::protocol::Answer as RpcAnswer;
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;
 
 use crate::cache::Cache;
 pub use crate::cache::{MailAudience, WrittenMail};
 use crate::fold::HostMail;
-use crate::outbox::{Delivery, Kept, Outbox, Outgoing};
+use crate::outbox::{Delivery, Kept, Outbox, Outgoing, OutgoingState};
 use crate::protocol::{Name, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
 use crate::{ThreadId, cards};
@@ -93,6 +94,22 @@ pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participa
 enum CreatedProject {
     Open,
     AddressDraft(ProjectCreated),
+}
+
+enum PostAnswer {
+    Posted(MessageId),
+    IdeaRefused(String),
+    ReplyRefused(String),
+}
+
+impl PostAnswer {
+    fn mail(answer: RpcAnswer<MessageId>, addressed: bool) -> anyhow::Result<Self> {
+        match answer {
+            RpcAnswer::Done(message) => Ok(Self::Posted(message)),
+            RpcAnswer::Failed { reason } if addressed => Ok(Self::ReplyRefused(reason)),
+            RpcAnswer::Failed { reason } => Err(anyhow::anyhow!(reason)),
+        }
+    }
 }
 
 pub struct MailSystem {
@@ -353,13 +370,13 @@ impl MailSystem {
         }
     }
 
-    /// What the user wrote under `parent` that the host has not logged.
-    pub fn waiting_under(
+    /// What the user wrote under `parent` that is still local.
+    pub fn local_under(
         &self,
         endpoint: EndpointId,
         parent: Option<MessageId>,
     ) -> Vec<&crate::outbox::Outgoing> {
-        self.outbox.waiting_under(endpoint, parent)
+        self.outbox.local_under(endpoint, parent)
     }
 
     fn mail_event(&mut self, event: MailEvent, cx: &mut Context<Self>) {
@@ -534,8 +551,8 @@ impl MailSystem {
         });
         if let Some(project) = project {
             self.last_project = Some(project);
-            self.frame.changed(cx);
         }
+        self.frame.changed(cx);
         self.cache
             .write_outbox(endpoint, kept, project.map(|project| project.message));
         self.send_unsent(endpoint, cx);
@@ -649,6 +666,15 @@ impl MailSystem {
         self.send_unsent(endpoint, cx);
     }
 
+    fn refuse_reply(&mut self, endpoint: EndpointId, reason: String, cx: &mut Context<Self>) {
+        let echo = format!("reply not sent: {}", rho_agent_types::one_line(&reason));
+        let kept = self.outbox.refuse_reply(endpoint, reason);
+        self.cache.write_outbox(endpoint, kept, None);
+        self.changed(endpoint, cx);
+        self.frame.echo(echo, StyleClass::SystemImportant, cx);
+        self.send_unsent(endpoint, cx);
+    }
+
     /// Posts the host's oldest unsent message, unless one is on its way.
     /// The rest go one by one as each is answered; a retry carries the
     /// same client id, so the host keeps one copy.
@@ -660,11 +686,12 @@ impl MailSystem {
             return;
         };
         let host_label = self.host_name(endpoint);
+        let addressed = post.reply_to.is_some();
         let reply = link.run(move |dialer| async move {
             match delivery {
-                Delivery::Mail => crate::stream::call(&dialer, post)
-                    .await
-                    .map(PostIdeaReply::Posted),
+                Delivery::Mail => {
+                    PostAnswer::mail(crate::stream::query(&dialer, post).await?, addressed)
+                }
                 Delivery::Idea => {
                     let project = ProjectId(post.parent.expect("an idea is under a project"));
                     crate::stream::call(
@@ -678,26 +705,32 @@ impl MailSystem {
                         },
                     )
                     .await
+                    .map(|reply| match reply {
+                        PostIdeaReply::Posted(message) => PostAnswer::Posted(message),
+                        PostIdeaReply::RuntimeRefused(reason) => PostAnswer::IdeaRefused(reason),
+                    })
                 }
-                Delivery::Retry => crate::stream::call(
-                    &dialer,
-                    RetryIdea {
-                        posted: post,
-                        host_label,
-                    },
-                )
-                .await
-                .map(PostIdeaReply::Posted),
+                Delivery::Retry => PostAnswer::mail(
+                    crate::stream::query(
+                        &dialer,
+                        RetryIdea {
+                            posted: post,
+                            host_label,
+                        },
+                    )
+                    .await?,
+                    addressed,
+                ),
             }
         });
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
-                Ok(PostIdeaReply::Posted(message)) => {
+                Ok(PostAnswer::Posted(message)) => {
                     this.outbox.posted(endpoint, message);
                     this.finish_posted(endpoint, cx);
                 }
-                Ok(PostIdeaReply::RuntimeRefused(reason)) => {
+                Ok(PostAnswer::IdeaRefused(reason)) => {
                     if let Some((client_id, _, kept)) = this.outbox.answered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
                         let pending = PendingIdeaId(client_id).address();
@@ -709,11 +742,12 @@ impl MailSystem {
                     cx.notify();
                     this.send_unsent(endpoint, cx);
                 }
+                Ok(PostAnswer::ReplyRefused(reason)) => this.refuse_reply(endpoint, reason, cx),
                 Err(error) => {
                     this.outbox.failed(endpoint);
-                    // Transport errors did not refuse a durable idea. The
-                    // reconnect indicator and queued receipt tell the truth.
-                    if delivery != Delivery::Idea {
+                    // The connection did not refuse a durable idea or
+                    // answer; it will be retried under the same client id.
+                    if delivery != Delivery::Idea && !addressed {
                         this.frame.echo(
                             format!("mail: {error:#}"),
                             StyleClass::SystemImportant,
@@ -979,7 +1013,13 @@ impl System for MailSystem {
         for seed in seeds {
             claims.extend(
                 self.with_host(seed, cx, |host| {
-                    cards::claims(host, marks, now, trace.as_deref_mut())
+                    cards::claims(
+                        host,
+                        marks,
+                        now,
+                        trace.as_deref_mut(),
+                        self.outbox.reply_targets(seed),
+                    )
                 })
                 .unwrap_or_default(),
             );
@@ -1086,6 +1126,7 @@ impl System for MailSystem {
             }],
             delivery: Delivery::Idea,
             runtime: mail.runtime,
+            state: OutgoingState::Queued,
         };
         let (_, kept) = self.outbox.keep(project.host, mail.client_id, outgoing);
         self.keep_outgoing(project.host, Some(project.message), kept, cx);
@@ -1329,6 +1370,115 @@ mod tests {
                     .address()
                 );
                 assert!(!mail.outbox.contains(id));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn queuing_a_reply_settles_only_its_ask_on_this_device(cx: &mut gpui::TestAppContext) {
+        use rho_agent_types::{ChatEvent, ChatRecord, Mention};
+        let host = EndpointId([3; 32]);
+        let thread = ThreadId {
+            host,
+            message: MessageId(ChatSeq(2)),
+        };
+        let first = MessageId(ChatSeq(3));
+        let second = MessageId(ChatSeq(4));
+        let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let record = |id: MessageId, from: Party, parent, reply_to, mentions| ChatRecord {
+            seq: id.0,
+            at: UnixMs(id.0.0),
+            event: ChatEvent::Posted {
+                parent,
+                reply_to,
+                from,
+                mentions,
+                content: vec![ContentPart::Text {
+                    text: format!("Mail #{}", id.0.0),
+                }],
+            },
+        };
+        let mut log = HostMail::default();
+        log.tell(&record(
+            MessageId(ChatSeq(1)),
+            Party::User,
+            None,
+            None,
+            vec![],
+        ));
+        log.tell(&record(
+            thread.message,
+            Party::User,
+            Some(MessageId(ChatSeq(1))),
+            None,
+            vec![],
+        ));
+        for id in [first, second] {
+            log.tell(&record(
+                id,
+                Party::Agent(agent),
+                Some(thread.message),
+                None,
+                vec![Mention::User { ping: true }],
+            ));
+        }
+        let (_, mail, _db) = search_bench::fixture(cx, log);
+        cx.update(|cx| {
+            mail.update(cx, |mail, cx| {
+                let dealt = |mail: &MailSystem, cx: &App| {
+                    let claims = mail.claims(&Marks::default(), Timestamp::now(), None, cx);
+                    assert_eq!(claims.len(), 1);
+                    cards::attention_mail(claims[0].seen)
+                };
+                assert_eq!(dealt(mail, cx), Some(first));
+                let words = "Keep the reference clock.";
+                let id = mail.reply(thread, first, words.into(), cx);
+                assert_eq!(dealt(mail, cx), Some(second));
+                assert_eq!(mail.outbox.next(host).unwrap().0.client_id, id);
+                mail.outbox.failed(host);
+                assert_eq!(
+                    dealt(mail, cx),
+                    Some(second),
+                    "a lost connection is not a refusal"
+                );
+                assert_eq!(mail.outbox.next(host).unwrap().0.client_id, id);
+                let refusal = RpcAnswer::Failed {
+                    reason: "the thread moved".into(),
+                };
+                let PostAnswer::ReplyRefused(reason) = PostAnswer::mail(refusal, true).unwrap()
+                else {
+                    panic!("a host refusal must not be retried as a transport error");
+                };
+                mail.refuse_reply(host, reason, cx);
+                assert_eq!(dealt(mail, cx), Some(first));
+                let retained = mail.local_under(host, Some(thread.message));
+                assert_eq!(retained.len(), 1);
+                assert_eq!(rho_agent_types::content_text(&retained[0].content), words);
+                assert_eq!(
+                    retained[0].state,
+                    OutgoingState::Refused {
+                        reason: "the thread moved".into()
+                    }
+                );
+                assert!(mail.outbox.next(host).is_none());
+                // The successful path must not briefly redeal the same mail
+                // when the receipt arrives before the host's log.
+                let second_attempt = mail.reply(thread, first, words.into(), cx);
+                assert_eq!(mail.outbox.next(host).unwrap().0.client_id, second_attempt);
+                let logged = MessageId(ChatSeq(5));
+                mail.outbox.posted(host, logged);
+                mail.finish_posted(host, cx);
+                assert_eq!(dealt(mail, cx), Some(second));
+                mail.logs.get_mut(&host).unwrap().tell(&record(
+                    logged,
+                    Party::User,
+                    Some(thread.message),
+                    Some(first),
+                    vec![],
+                ));
+                mail.finish_posted(host, cx);
+                assert_eq!(dealt(mail, cx), Some(second));
+                assert_eq!(mail.local_under(host, Some(thread.message)).len(), 1);
             })
         });
     }

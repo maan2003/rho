@@ -177,7 +177,7 @@ steps:
 1. the user opens the thread by the deal or by name and reads what the project wrote since their last mail
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
 2. the user writes and edits an answer in the `Draft` at the top of the thread
-3. the user sends the answer with `Mail.reply`; the reply settles the card
+3. the user sends the answer with `Mail.reply`; the reply settles that card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread.
 system: opens at the top with the point in the `Draft` and mail below it, newest first. The user's last mail separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves, and sends the reply to whoever wrote the mail.
 user: the words of the answer, or done when there are none.
 cases: a cold mail with its recap, answered without the history; a result with proof; a colleague reached through `slack.Bot`.

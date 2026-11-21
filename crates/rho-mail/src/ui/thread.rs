@@ -1104,7 +1104,7 @@ fn pending_items(
     newest_first: bool,
 ) -> Vec<Item<Key, Class, Meta>> {
     let mut items = Vec::new();
-    let mut outgoing = system.waiting_under(host, Some(parent));
+    let mut outgoing = system.local_under(host, Some(parent));
     if newest_first {
         outgoing.reverse();
     }
@@ -1112,8 +1112,14 @@ fn pending_items(
         let id = outgoing.at.0;
         let mut text = body(&outgoing.content);
         let first = text.find('\n').unwrap_or(text.len());
-        text.insert_str(first, " · sending…");
-        let tag = first..first + " · sending…".len();
+        let suffix = match &outgoing.state {
+            crate::outbox::OutgoingState::Queued => " · sending…".to_owned(),
+            crate::outbox::OutgoingState::Refused { reason } => {
+                format!(" · not sent: {}", rho_agent_types::one_line(reason))
+            }
+        };
+        text.insert_str(first, &suffix);
+        let tag = first..first + suffix.len();
         let lines = text.lines().count().max(1);
         let len = text.len();
         items.push(

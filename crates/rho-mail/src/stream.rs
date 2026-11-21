@@ -14,7 +14,7 @@ use rho_agent_hosts::{Dialer, HostId, HostStream};
 use rho_agent_types::{
     ChatRecord, ChatSeq, EndpointId, MessageId, ProjectConfig, ProjectId, ThreadWork,
 };
-use rho_rpc::protocol::{Call, read_frame, write_frame, write_open};
+use rho_rpc::protocol::{Answer, Call, read_frame, write_frame, write_open};
 
 use crate::protocol::{ClientFrame, Open, ServerFrame};
 
@@ -190,6 +190,13 @@ impl HostStream for MailStream {
 
 /// One call to a host's mail, on a stream of its own.
 pub async fn call<C: Call>(dialer: &Dialer, call: C) -> anyhow::Result<C::Reply> {
+    query(dialer, call).await?.into_result()
+}
+
+/// A transport failure and a received refusal are different outcomes for
+/// a durable post: only the former may have reached the host.
+pub(crate) async fn query<C: Call>(dialer: &Dialer, call: C) -> anyhow::Result<Answer<C::Reply>> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    rho_rpc::protocol::call(&mut stream, call).await
+    write_open(&mut stream, &call.open()).await?;
+    read_frame(&mut stream).await
 }
