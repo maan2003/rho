@@ -27,25 +27,32 @@ def between(text, start, end):
 
 
 class Templates(unittest.TestCase):
-    def test_engineer_mail_contract(self):
-        for text in [gpt("engineer"), claude_t("engineer")]:
+    def test_engineer_chat_contract(self):
+        for family in [GPT, CLAUDE]:
+            text = render(template(family, "engineer"), "", "", "")
+            acting = between(text, "Acting and talking", "Before ending a turn")
             for rule in [
-                "In a warm thread, answer directly.",
-                "check the thread with `mail.read`",
-                "send with `ping=False` and edit that mail as the work moves",
-                "`mail.edit(id, text, ping=True)` makes it wait for the user",
-                "an answered mail is frozen",
-                "`replace_last=True` edits yours if it exists, or sends a new mail",
-                "a `## recap` section that lets the user answer without reading the history",
+                "chat.send(text, kind, *, thread) → int",
+                "chat.start(project, text, kind) → int",
+                "chat.fork(message, text, kind) → int",
+                "does the user need to read this?",
+                "It makes a card on their desk and stays in the record.",
+                "It never makes a card.",
+                "once something newer exists in the thread",
+                "edit it with new findings",
+                "read the thread with `chat.read`",
+                "Say what you answer in the first line",
+                "under `## proof`",
+                "last output lines verbatim in a code block",
+                "a screenshot if the change is visible",
+                "Another agent is reached with `agents.message`, never through chat.",
             ]:
-                self.assertIn(rule, text)
-            self.assertNotIn("mail.status", text)
-            self.assertIn("link to the PR or save and link the diff", text)
-            self.assertIn("paste its last output lines verbatim in a code block, including the final summary", text)
-            self.assertIn("include a screenshot if the change is visible", text)
-            self.assertIn("or an agent such as `eng-q9tz`.", text)
-            for obsolete in ["human.", "message_agent", "chat.direct", "Post passing progress"]:
-                self.assertNotIn(obsolete, text)
+                self.assertIn(rule, acting, family)
+            for obsolete in ["mail.", "human.", "message_agent", "chat.direct", "ping=", "replace_last", "reply_to", "## recap"]:
+                self.assertNotIn(obsolete, text, family)
+            communication = text.split("# Communication", 1)[1] if family == CLAUDE else text.split("## Working with the user", 1)[1]
+            self.assertIn("A result message must be fully self-contained", communication, family)
+            self.assertIn('for kind="message"; flashes are plain prose and the host does not check them', communication, family)
 
     def test_every_template_fills_its_slots(self):
         for family in [GPT, CLAUDE]:
@@ -81,11 +88,11 @@ class Templates(unittest.TestCase):
                        "loads applicable AGENTS.md guidance and the skill catalogue",
                        "Without an explicit request, do NOT consult the Advisor for:"]:
             self.assertIn(needle, collaboration)
-        self.assertIn('mail.send(to, text, *, thread=None, reply_to=None, ping=None, replace_last=False) → int', text)
+        self.assertIn('chat.send(text, kind, *, thread) → int', text)
         self.assertNotIn('mail.status', text)
         self.assertNotIn("Post passing progress", text)
-        self.assertIn("(ASD-STE100). The send refuses a sentence of more than 25 words", text)
-        self.assertIn("it reports back to you with mail.send.", text)
+        self.assertIn("A kept message cannot contain a sentence of more than 25 words", text)
+        self.assertIn("it reports back to you with `agents.message`.", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)
         self.assertIn("def papercut(", text)
         self.assertTrue(text.endswith("WORKSPACE_SENTINEL"))
@@ -215,7 +222,7 @@ class Instructions(unittest.TestCase):
             f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
             "\n\nYou were started directly and own the user\'s technical outcome."
             "\n\nAnother agent's message to you arrives in this format:\n```\n[message from <agent id>]\n<text>\n```"
-            '\n\nAnswer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a card from it.\n\n'
+            '\n\nReply with `agents.message(agent_id=sender, message=text)`, where `sender` is the agent ID from the header.\n\n'
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -269,9 +276,10 @@ class Instructions(unittest.TestCase):
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
             self.assertLess(text.index("# Engineers\n"), text.index(signature))
-            self.assertIn("mail.send(to, text, *, thread=None, reply_to=None, ping=None, replace_last=False)", text)
-        note = (f"Engineer eng-{direct.id} started you for the user; ask it with mail.send('eng-{direct.id}', text) if you "
-                "need more context. You own the user\'s technical outcome.")
+            self.assertIn("chat.send(text, kind, *, thread)", text)
+            self.assertNotIn("mail.send", text)
+        note = (f"Engineer eng-{direct.id} started you for the user; if you need more context, "
+                f"ask it with agents.message(agent_id='eng-{direct.id}', message=text). You own the user\'s technical outcome.")
         self.assertIn(note, prompt.instructions(owned))
         self.assertNotIn("started you for the user", prompt.instructions(direct))
         native_text = gpt("engineer", "", template(GPT, "user-owned-engineers"))
