@@ -33,7 +33,7 @@ def _local_address(sender, to):
 
 
 class SentMail(int):
-    """The new mail's id, awaitable without sending again."""
+    """The sent or revised mail's id, awaitable without sending again."""
 
     def __await__(self):
         return self
@@ -44,14 +44,18 @@ def _send(sender, parent, text, **kwargs) -> SentMail:
     return SentMail(_rho.send_mail(sender, parent, text, **kwargs))
 
 
-def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail:
+def send(sender, to, text, *, thread=None, reply_to=None, ping=None, replace_last: bool = False) -> SentMail:
     """Send to a local project, #thread, agent handle, or `user`.
     `reply_to=#id` identifies the exact mail answered. To address its
     writer use `to=None`. Mail to `user` needs a thread or reply; it pings
-    the user unless `ping=False`, which only mail to the user takes.
+    on a new mail unless `ping=False`. With `replace_last=True`, edit your
+    own live mail in that thread if one exists, preserving its ping unless
+    `ping` is set. Return the id of the mail sent or edited.
     """
-    if type(ping) is not bool:
-        raise ValueError(f"ping is True or False, not {ping!r}")
+    if ping is not None and type(ping) is not bool:
+        raise ValueError(f"ping is True, False or None, not {ping!r}")
+    if type(replace_last) is not bool:
+        raise ValueError(f"replace_last is True or False, not {replace_last!r}")
     text = str(text).strip()
     if not text:
         raise ValueError("mail needs text")
@@ -87,15 +91,15 @@ def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail
             if reply is None:
                 raise ValueError("mail to the user needs thread or reply_to")
             thread = thread_of(reply)
-        return _send(sender, ident(thread), text, to=USER, ping=ping, reply_to=reply_to)
+        return _send(sender, ident(thread), text, to=USER, ping=ping, reply_to=reply_to, replace_last=replace_last)
 
-    if thread is not None or not ping:
+    if thread is not None or ping is False:
         raise ValueError("only mail to the user takes thread or ping=False")
     if isinstance(to, str) and to.startswith(("eng-", "adv-")):
         target = agents.resolve(to)
         if sender == target:
             raise ValueError("cannot mail yourself")
-        return _send(sender, None, text, to=target, reply_to=reply_to)
+        return _send(sender, None, text, to=target, reply_to=reply_to, replace_last=replace_last)
     if isinstance(to, int) or isinstance(to, str) and to.startswith("#"):
         parent = ident(to)
     elif isinstance(to, str):
@@ -104,7 +108,7 @@ def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail
             raise ValueError(f"no project {to!r} on this host")
     else:
         raise ValueError(f"unknown mail address {to!r}")
-    return _send(sender, parent, text, reply_to=reply_to)
+    return _send(sender, parent, text, reply_to=reply_to, replace_last=replace_last)
 
 
 def make_project(sender: str, name: str) -> int:

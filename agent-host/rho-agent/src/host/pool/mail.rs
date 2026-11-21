@@ -110,7 +110,56 @@ impl Drop for MailView {
     }
 }
 
+/// Unlike a fresh send, replacing live mail keeps its existing recipients.
+pub(super) fn check_agent_text(
+    content: &[ContentPart],
+    mentions: &[Mention],
+) -> anyhow::Result<()> {
+    if mentions
+        .iter()
+        .any(|mention| matches!(mention, Mention::User { .. }))
+    {
+        for part in content {
+            if let ContentPart::Text { text } = part {
+                crate::worker::ste::check_mail(text)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl AgentPool {
+    pub(super) fn revise_agent_mail(
+        self: &Arc<Self>,
+        mut write: rho_db::WriteTxn,
+        workset: rho_agent_types::WorksetId,
+        at: UnixMs,
+        agent: AgentId,
+        message: MessageId,
+        content: Vec<ContentPart>,
+        ping: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let before = write.mail_version(message);
+        write.edit(at, agent, message, content, ping)?;
+        let version = write.mail_version(message);
+        if version != before {
+            write.append(
+                workset,
+                &Record {
+                    at,
+                    event: Event::MailWritten {
+                        agent,
+                        message,
+                        version,
+                    },
+                },
+            )?;
+            write.commit();
+            self.watch_recap(message);
+        }
+        Ok(())
+    }
+
     /// A start refused before an agent existed. There is no agent or
     /// transcript to own this stop; the project speaks in its thread.
     pub async fn post_start_failure(&self, origin: MessageId, reason: &str) -> anyhow::Result<()> {

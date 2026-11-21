@@ -66,13 +66,24 @@ pub(crate) enum PyRequest {
         control: crate::ipc::protocol::Control,
     },
     Delivered(rho_agent_types::AgentId),
-    /// A message from an agent, under `parent` or as a root.
+    // Legacy pair with `SentMail`; remove both at the next necessary epoch bump.
     SendMail {
         sender: rho_agent_types::AgentId,
         parent: Option<rho_agent_types::MessageId>,
         reply_to: Option<rho_agent_types::MessageId>,
         mentions: Vec<rho_agent_types::Mention>,
         content: Vec<rho_agent_types::ContentPart>,
+    },
+    /// A message from an agent, under `parent` or as a root, replied to with
+    /// `Seq`.
+    SendMail2 {
+        sender: rho_agent_types::AgentId,
+        parent: Option<rho_agent_types::MessageId>,
+        reply_to: Option<rho_agent_types::MessageId>,
+        mentions: Vec<rho_agent_types::Mention>,
+        content: Vec<rho_agent_types::ContentPart>,
+        replace_last: bool,
+        ping: Option<bool>,
     },
     Join {
         thread: rho_agent_types::MessageId,
@@ -172,6 +183,11 @@ pub(crate) enum PyReply {
     Search(Vec<crate::store::MailHit>),
     Project(Option<rho_agent_types::MessageId>),
     Handle(Option<String>),
+    // Legacy `SendMail` reply; `unanswered` is always `None`.
+    SentMail {
+        id: rho_agent_types::MessageId,
+        unanswered: Option<(rho_agent_types::MessageId, rho_agent_types::AgentId)>,
+    },
 }
 
 #[derive(Encode, Decode)]

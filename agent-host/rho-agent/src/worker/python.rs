@@ -746,14 +746,8 @@ fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPa
         .iter()
         .any(|mention| matches!(mention, Mention::User { .. }))
     {
-        let findings = crate::worker::ste::ste_findings(&text);
-        if !findings.is_empty() {
-            return Err(PyValueError::new_err(format!(
-                "not sent. Write the message in Simplified Technical English \
-                 (ASD-STE100): fix these problems, then send it again.\n\n{}",
-                findings.join("\n\n")
-            )));
-        }
+        crate::worker::ste::check_mail(&text)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
     }
     Ok(vec![ContentPart::Text { text }])
 }
@@ -761,7 +755,7 @@ fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPa
 /// Put mail in its project or thread. For a directed agent, the host
 /// determines the conversation; `parent` must be unset.
 #[pyfunction]
-#[pyo3(signature = (sender, parent, text, *, to = None, ping = None, reply_to = None))]
+#[pyo3(signature = (sender, parent, text, *, to = None, ping = None, reply_to = None, replace_last = false))]
 fn send_mail(
     py: Python<'_>,
     sender: &str,
@@ -770,16 +764,21 @@ fn send_mail(
     to: Option<&str>,
     ping: Option<bool>,
     reply_to: Option<u64>,
+    replace_last: bool,
 ) -> PyResult<u64> {
     let sender = agent_id(sender)?;
-    let mentions = recipient(to, ping)?;
-    let content = message_content(text, &mentions)?;
-    let request = PyRequest::SendMail {
+    let mentions = recipient(to, ping.or_else(|| (to == Some("user")).then_some(true)))?;
+    // For an opt-in replacement, the host checks text against the live
+    // mail's actual recipients under the same lock that selects the mail.
+    let content = message_content(text, if replace_last { &[] } else { &mentions })?;
+    let request = PyRequest::SendMail2 {
         sender,
         parent: parent.map(|seq| MessageId(ChatSeq(seq))),
         reply_to: reply_to.map(|seq| MessageId(ChatSeq(seq))),
         mentions,
         content,
+        replace_last,
+        ping,
     };
     match PyHost::block(py, request)? {
         PyReply::Seq(id) => Ok(id.0),

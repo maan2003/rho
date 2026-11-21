@@ -154,10 +154,12 @@ def send_mail(
     to: str | None = None,
     ping: bool | None = None,
     reply_to: int | None = None,
+    replace_last: bool = False,
 ) -> int:
     """Send durable mail as `sender` and return its id. With an agent in `to`, the host
-    chooses the conversation. Only mail to "user" takes `ping`, which it
-    needs, and must pass the STE check."""
+    chooses the conversation. `replace_last` edits the sender's live project
+    mail when present and returns that id. Only mail to "user" can ping or
+    must pass the STE check."""
 def agent_handle(agent: str) -> str | None: ...
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts

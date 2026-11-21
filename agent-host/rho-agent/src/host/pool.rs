@@ -1338,6 +1338,15 @@ impl AgentPool {
         workset: WorksetId,
         request: PyRequest,
     ) -> anyhow::Result<PyReply> {
+        let legacy_send = matches!(request, PyRequest::SendMail { .. });
+        let replacement = match &request {
+            PyRequest::SendMail2 {
+                replace_last: true,
+                ping,
+                ..
+            } => Some(*ping),
+            _ => None,
+        };
         Ok(match request {
             PyRequest::CreateAgent(spec) => {
                 let mut write = self.db.write().await;
@@ -1458,6 +1467,14 @@ impl AgentPool {
                 reply_to,
                 mentions,
                 content,
+            }
+            | PyRequest::SendMail2 {
+                sender,
+                parent,
+                reply_to,
+                mentions,
+                content,
+                ..
             } => {
                 self.own_agent(workset, sender)?;
                 self.known_mentions(&mentions)?;
@@ -1482,18 +1499,37 @@ impl AgentPool {
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
                 let pings = message.mentions.contains(&Mention::User { ping: true });
+                if !direct
+                    && let Some(thread) = parent
+                    && let Some(mail) = write.live_project_mail(thread, sender)
+                {
+                    if let Some(ping) = replacement {
+                        let current = self.db.read().message(mail).context("no live mail")?;
+                        mail::check_agent_text(&message.content, &current.mentions)?;
+                        self.revise_agent_mail(
+                            write,
+                            workset,
+                            at,
+                            sender,
+                            mail,
+                            message.content,
+                            ping,
+                        )?;
+                        return Ok(PyReply::Seq(mail.0));
+                    }
+                    anyhow::bail!(
+                        "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
+                        mail.0.0,
+                        mail.0.0,
+                    );
+                }
+
+                if replacement.is_some() {
+                    mail::check_agent_text(&message.content, &message.mentions)?;
+                }
                 let id = if direct {
                     write.post_peer(at, project, message)?
                 } else {
-                    if let Some(thread) = parent
-                        && let Some(mail) = write.live_project_mail(thread, sender)
-                    {
-                        anyhow::bail!(
-                            "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
-                            mail.0.0,
-                            mail.0.0,
-                        );
-                    }
                     write.post(at, parent, message, None)?
                 };
                 let version = write.mail_version(id);
@@ -1516,7 +1552,14 @@ impl AgentPool {
                 if !direct {
                     self.consider_naming(id);
                 }
-                PyReply::Seq(id.0)
+                if legacy_send {
+                    PyReply::SentMail {
+                        id,
+                        unanswered: None,
+                    }
+                } else {
+                    PyReply::Seq(id.0)
+                }
             }
             PyRequest::Edit {
                 agent,
@@ -1525,27 +1568,15 @@ impl AgentPool {
                 ping,
             } => {
                 self.own_agent(workset, agent)?;
-                let mut write = self.db.write().await;
-                let at = UnixMs::now();
-                let before = write.mail_version(message);
-                write.edit(at, agent, message, content, ping)?;
-                let version = write.mail_version(message);
-                if version == before {
-                    return Ok(PyReply::Done);
-                }
-                write.append(
+                self.revise_agent_mail(
+                    self.db.write().await,
                     workset,
-                    &Record {
-                        at,
-                        event: Event::MailWritten {
-                            agent,
-                            message,
-                            version,
-                        },
-                    },
+                    UnixMs::now(),
+                    agent,
+                    message,
+                    content,
+                    ping,
                 )?;
-                write.commit();
-                self.watch_recap(message);
                 PyReply::Done
             }
             PyRequest::Delete { agent, message } => {

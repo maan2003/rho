@@ -33,6 +33,17 @@ const CONTEXT: usize = 30;
 /// The widest excerpt of a line, in chars.
 const EXCERPT: usize = 100;
 
+pub(crate) fn check_mail(text: &str) -> anyhow::Result<()> {
+    let findings = ste_findings(text);
+    anyhow::ensure!(
+        findings.is_empty(),
+        "not sent. Write the message in Simplified Technical English \
+         (ASD-STE100): fix these problems, then send it again.\n\n{}",
+        findings.join("\n\n"),
+    );
+    Ok(())
+}
+
 /// One block per STE violation in the prose of `text`: where it is, the line
 /// with the violation underlined, and what to do. Code is exempt.
 pub(crate) fn ste_findings(text: &str) -> Vec<String> {

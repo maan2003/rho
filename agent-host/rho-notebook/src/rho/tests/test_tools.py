@@ -217,6 +217,20 @@ class Tools(WorksetCase):
         self.assertEqual(awaited, expected)
         self.assertIsInstance(awaited, int)
 
+    def test_replace_last_is_opt_in_and_keeps_ping_unspecified(self):
+        ns, _ = self.notebook(self.root)
+        mailbox = ns["mail"]
+        project = fake_rho.post_user(None, "rho")
+        thread = fake_rho.post_user(project, "Do it.")
+        with mock.patch.object(fake_rho, "send_mail", return_value=41) as host:
+            result = mailbox.send("user", "New words.", thread=thread, replace_last=True)
+        self.assertEqual(asyncio.run(_await(result)), 41)
+        host.assert_called_once_with(
+            self.root, thread, "New words.", to="user", ping=None, reply_to=None, replace_last=True,
+        )
+        with self.assertRaisesRegex(ValueError, "replace_last is True or False"):
+            mailbox.send("user", "New words.", thread=thread, replace_last=1)
+
     def test_send_propagates_the_hosts_edit_instruction_without_posting(self):
         ns, _ = self.notebook(self.root)
         mailbox = ns["mail"]

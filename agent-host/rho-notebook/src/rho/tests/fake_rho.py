@@ -201,12 +201,12 @@ def post(sender, parent, text, *, mentions=None):
         return _post(sender, parent, text, mentions or [])
 
 
-def send_mail(sender, parent, text, *, to=None, ping=True, reply_to=None):
+def send_mail(sender, parent, text, *, to=None, ping=None, reply_to=None, replace_last=False):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
         if to in (None, "user"):
-            mentions = [] if to is None else [(to, ping)]
+            mentions = [] if to is None else [(to, True if ping is None else ping)]
             if STATE.send_error:
                 raise RuntimeError(STATE.send_error)
             return _post(sender, parent, text, mentions, reply_to)

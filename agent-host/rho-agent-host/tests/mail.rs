@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ContentPart, MessageId, Role, Stop, WorksetKind, Wpos,
+    Address, AgentId, ChatEvent, ChatRecord, ContentPart, Mention, MessageId, Role, Stop,
+    WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::worksets::{
     AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
@@ -274,6 +275,40 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     )
     .await?;
     assert_eq!(first_before.output.trim(), "Use polling for this check.");
+    // With a live slot, replacing chooses the caller's own mail rather
+    // than the other agent's, and omission must not turn a quiet mail on.
+    let replace = |workset, agent: AgentId, words: &str, ping| {
+        let ping = match ping {
+            Some(true) => ", ping=True",
+            Some(false) => ", ping=False",
+            None => "",
+        };
+        eval(
+            workset,
+            format!(
+                "from rho.tools import Mail\nprint(int(Mail({:?}).send('user', {:?}, thread={}, replace_last=True{ping})))",
+                agent.encoded(),
+                words,
+                thread.0.0
+            ),
+        )
+    };
+    for (text, ping, expected_ping) in [
+        ("Use clock A for this check.", None, false),
+        ("Can I use clock A for both?", Some(true), true),
+        ("Use clock A for both.", Some(false), false),
+    ] {
+        let replaced = replace(aw, a, text, ping).await?;
+        assert_eq!(replaced.trim().parse::<u64>()?, first);
+        let row = wait_for_mail(&mut stream, |row| {
+            matches!(row.event, ChatEvent::Revised { message, author, .. } if message.0.0 == first && author == a)
+        }).await?;
+        let ChatEvent::Revised { content, ping, .. } = row.event else {
+            unreachable!()
+        };
+        assert_eq!(content, [ContentPart::Text { text: text.into() }]);
+        assert_eq!(ping, Some(expected_ping));
+    }
     eval(
         bw,
         format!(
@@ -339,8 +374,14 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             .collect::<Vec<_>>(),
         [b]
     );
-    let fresh = send(bw, b, "I will use clock B.").await?;
-    assert_ne!(id.0.0, fresh.trim().parse::<u64>()?);
+    let fresh = replace(bw, b, "I will use clock B.", None).await?;
+    let fresh = fresh.trim().parse::<u64>()?;
+    assert_ne!(id.0.0, fresh);
+    let row = wait_for_mail(&mut stream, |row| row.seq.0 == fresh).await?;
+    let ChatEvent::Posted { mentions, .. } = row.event else {
+        anyhow::bail!("with no live slot replace_last must post a new mail");
+    };
+    assert!(mentions.contains(&Mention::User { ping: true }));
     let frozen = eval(
         bw,
         format!(
@@ -367,7 +408,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         }
     }
     Ok(format!(
-        "two independent mails; repeat send refused, explicit edit and answer verified for mail #{}",
+        "two independent mails; repeat refused; replacement preserved/toggled ping in place; reply froze the old mail and replacement posted a new one (#{})",
         id.0.0
     ))
 }

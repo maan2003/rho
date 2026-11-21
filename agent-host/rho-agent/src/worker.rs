@@ -10,7 +10,7 @@ mod runtime;
 pub(crate) mod shared;
 pub mod shell;
 mod slack;
-mod ste;
+pub(crate) mod ste;
 pub mod terminal;
 mod workset;
 
