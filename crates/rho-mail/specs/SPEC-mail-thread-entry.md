@@ -6,6 +6,6 @@ The thread builds its displayed document from the mail fold, but the editor owns
 
 ## Contract
 
-A fresh thread starts at the top, whether opened by name or by deal. Point is in the draft, using any remembered position in its text; newest mail follows below. A deal names the target for a direct reply but does not select a mail. Returning to an existing view does not change either its point or viewport. A search result still selects its match.
+A fresh thread starts at the top, whether opened by name or by deal. Point is in the draft, using any remembered position in its text; newest mail follows below. A deal remembers its seen card version without selecting or addressing a message. A sent reply reaches the thread's agents and settles only that version, even in the local outbox. A host refusal restores the wait and retains the words; a reply sent by name does not settle a card. Returning to an existing view does not change either its point or viewport. A search result still selects its match.
 
-This implements `mail.Thread` in the [product model](../../../product/mail.md).
+This implements `chat.Thread` in the [product model](../../../product/chat.md).

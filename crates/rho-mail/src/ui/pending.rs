@@ -97,7 +97,7 @@ impl Surface for PendingIdea {
         Some(self.editor.clone())
     }
 
-    fn subject(&self, _: &App) -> Subject {
+    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _: &App) -> Subject {
         Subject::None
     }
 }

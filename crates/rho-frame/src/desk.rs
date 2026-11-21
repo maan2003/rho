@@ -540,7 +540,7 @@ impl Surface for DeskView {
         Some(self.editor.clone())
     }
 
-    fn subject(&self, cx: &App) -> Subject {
+    fn subject(&self, _: Option<rho_dealer::facts::Seen>, cx: &App) -> Subject {
         self.cursor_card(cx).map_or(Subject::None, Subject::Address)
     }
 }

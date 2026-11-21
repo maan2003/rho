@@ -88,7 +88,7 @@ principle: an agent writes `I plan to drop the cache layer, say no in 20 min` an
 sees: the words in `design.quiet` under the draft, newest first among the thread's messages, with the age at the end of the first line, `12m`; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the project's row, the newest flash's first line as the project's latest words
 does:
 - post, by an agent with `kind="flash"`: show it in the thread for twenty minutes from its first post, longer while it is the thread's newest item from either side; it goes when the clock has run and something newer exists, a message or a flash from anyone; then it is gone from every device, not kept as history
-- reply: the user's reply is an ordinary `Message` to the writer; it does not keep the flash
+- reply: the user's reply is an ordinary `Message` to the thread; it does not keep the flash
 - edit: the agent can change its words; the clock runs from the first post
 rejected:
 - one flash per agent, each replacing the last · 2026-11-21 · they vanish anyway; folding the earlier ones costs nothing and keeps a short plan readable
@@ -280,7 +280,7 @@ The historical review above was of Start a thread. Starting an agent from a mess
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule the last message stays live
-when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user, unless the agent explicitly opts in with `replace_last=True`. That option edits its live message, preserving its ping unless set, and returns the same id. If it has no live message in the thread, it sends and returns a new one. Other agents can each send one message. A `Flash` is never refused and never counts. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
+when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user. Other agents can each send one message. A `Flash` never occupies the live message slot. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`. An unchanged ask does not deal again after `done`; changed words do. A reply is read by the thread's agents. It freezes the dealt ask as the user saw it, not other pending asks. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
 why: a thread of ten messages that each supersede the last is a feed; each agent has one place for current words, and the flash is where the rest goes.
 rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing message; another send must not silently change it

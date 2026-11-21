@@ -317,11 +317,16 @@ impl Surface for AgentSurface {
         Some(self.editor.clone())
     }
 
-    fn subject(&self, _cx: &App) -> Subject {
+    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
         Subject::Own
     }
 
-    fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(
+        &mut self,
+        _: Option<rho_frame::surface::Dealt>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Row> {
         let agent = self.agent;
         let mut rows = steer_rows(self.system.clone(), agent);
         let origin = self.system.read(cx).agent_thread(agent, cx);

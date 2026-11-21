@@ -405,15 +405,11 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     let retry = call(
         paths,
         RetryIdea {
-            posted: Post {
-                client_id: 821,
-                parent: Some(failed),
-                reply_to: Some(stop.id),
-                mentions: Vec::new(),
-                content: vec![ContentPart::Text {
-                    text: "Use the corrected place now.".into(),
-                }],
-            },
+            client_id: 821,
+            failed_start: stop.id,
+            content: vec![ContentPart::Text {
+                text: "Use the corrected place now.".into(),
+            }],
             host_label: "lab".into(),
         },
     )
@@ -922,15 +918,18 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 .any(|(_, row)| matches!(row, LogEvent::Request { .. }))
         );
     }
-    // An answer goes to the exact mail's writer, even after leaving.
-    eval(bw, format!("mail.leave({}, {:?})", thread.0.0, b.encoded())).await?;
-    eval(aw, format!("mail.leave({}, {:?})", thread.0.0, a.encoded())).await?;
+    // The reply wakes both joined agents without naming a recipient. The
+    // dealt version is metadata only, for settling and freezing one ask.
+    let seen = rho_agent_types::MessageVersion {
+        message: id,
+        version: revision.seq,
+    };
     let answer = call(
         paths,
         Post {
             client_id: 112,
             parent: Some(thread),
-            reply_to: Some(id),
+            settles: Some(seen),
             mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "Use clock B.".into(),
@@ -938,17 +937,23 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         },
     )
     .await?;
-    let answer = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
-    let ChatEvent::Posted { mentions, .. } = answer.event else {
-        unreachable!()
-    };
-    assert_eq!(
-        mentions
-            .into_iter()
-            .filter_map(|m| m.agent())
-            .collect::<Vec<_>>(),
-        [b]
-    );
+    let answer_post = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
+    let reply = rho_agent_types::Message::from_record(&answer_post).context("not a post")?;
+    assert!(reply.mentions.is_empty());
+    assert_eq!(reply.reply_to, None);
+    assert_eq!(reply.thread_reply.unwrap().settles, Some(seen));
+    for agent in [a, b] {
+        wait_for_delivery(paths, agent, answer).await?;
+    }
+    // There is still no user answer tied to A's older words.
+    eval(
+        aw,
+        format!(
+            "from rho.tools import Mail\nMail({:?}).edit({first}, 'A was not settled.')",
+            a.encoded()
+        ),
+    )
+    .await?;
     let fresh = replace(bw, b, "I will use clock B.", None).await?;
     let fresh = fresh.trim().parse::<u64>()?;
     assert_ne!(id.0.0, fresh);
@@ -983,7 +988,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         }
     }
     Ok(format!(
-        "two flashes did not ping or consume the live slot; old and new APIs both sent; repeat refused; replacement preserved/toggled ping; reply froze the old mail; new mail #{}",
+        "two flashes did not ping or consume the live slot; old and new APIs both sent; repeat refused; replacement preserved/toggled ping; thread reply reached both workers, froze only the dealt version; new mail #{}",
         id.0.0
     ))
 }
@@ -1027,7 +1032,7 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         Post {
             client_id: 9,
             parent: Some(thread),
-            reply_to: None,
+            settles: None,
             mentions: vec![agent],
             content: vec![ContentPart::Text {
                 text: "Please run the check.".into(),
@@ -1138,16 +1143,19 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     assert!(text.starts_with("lost · "), "{text}");
     assert!(text.contains("Last transcript lines:"), "{text}");
 
-    // The user addresses the mail, not its agent. The host routes the
-    // answer to the original writer alone, even after the writer leaves.
+    // A former participant does not become a recipient because the card
+    // is theirs. The settlement still identifies the version the user saw.
     call(paths, Leave { thread, agent }).await?;
-    let reply_to = MessageId(origin_result.seq);
+    let seen = rho_agent_types::MessageVersion {
+        message: MessageId(origin_result.seq),
+        version: origin_result.seq,
+    };
     let answer = call(
         paths,
         Post {
             client_id: 10,
             parent: Some(thread),
-            reply_to: Some(reply_to),
+            settles: Some(seen),
             mentions: vec![],
             content: vec![ContentPart::Text {
                 text: "Thanks for checking.".into(),
@@ -1156,20 +1164,12 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     )
     .await?;
     let received = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
-    let ChatEvent::Posted {
-        kind: rho_agent_types::MessageKind::Kept,
-        parent,
-        reply_to: target,
-        mentions,
-        ..
-    } = received.event
-    else {
-        anyhow::bail!("the answer must be durable project mail")
-    };
-    assert_eq!((parent, target), (Some(thread), Some(reply_to)));
-    assert_eq!(mentions, [Mention::Direct(agent)]);
+    let reply = rho_agent_types::Message::from_record(&received).context("not a post")?;
+    assert_eq!((reply.parent, reply.reply_to), (Some(thread), None));
+    assert!(reply.mentions.is_empty());
+    assert_eq!(reply.thread_reply.unwrap().settles, Some(seen));
     Ok(format!(
-        "mail wire: project {}, fake model result #{}, edit/delete #{}, lost stop #{}, and addressed reply #{}",
+        "mail wire: project {}, fake model result #{}, edit/delete #{}, lost stop #{}, and thread-wide reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
     ))
 }
@@ -1224,8 +1224,15 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
     assert!(!text.contains(root.to_str().unwrap()), "{text}");
 
     let mut replies = Vec::new();
-    for (client_id, reply_to, text) in [
-        (72, Some(stop.id), "Use a separate clock per test."),
+    for (client_id, settles, text) in [
+        (
+            72,
+            Some(rho_agent_types::MessageVersion {
+                message: stop.id,
+                version: stop.version().0,
+            }),
+            "Use a separate clock per test.",
+        ),
         (73, None, "Keep the fix small."),
     ] {
         let reply = call(
@@ -1233,7 +1240,7 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
             Post {
                 client_id,
                 parent: Some(thread),
-                reply_to,
+                settles,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: text.into() }],
             },
@@ -1445,7 +1452,10 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
         Post {
             client_id: 3,
             parent: Some(work),
-            reply_to: Some(ask),
+            settles: Some(rho_agent_types::MessageVersion {
+                message: ask,
+                version: ask.0,
+            }),
             mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "MAIL-RIG-USER-ANSWER".into(),
@@ -1457,7 +1467,11 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
     let answer_msg = rho_agent_types::Message::from_record(&row).unwrap();
     assert_eq!(
         (answer_msg.parent, answer_msg.reply_to, answer_msg.from),
-        (Some(work), Some(ask), Address::User)
+        (Some(work), None, Address::User)
+    );
+    assert_eq!(
+        answer_msg.thread_reply.unwrap().settles.unwrap().message,
+        ask
     );
 
     let peer = peer.context("parent sent an ask before receiving the child mail")?;
@@ -1591,7 +1605,7 @@ async fn post(
         Post {
             client_id,
             parent,
-            reply_to: None,
+            settles: None,
             mentions: vec![],
             content: vec![ContentPart::Text { text: text.into() }],
         },

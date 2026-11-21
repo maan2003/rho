@@ -1019,25 +1019,19 @@ impl AgentPool {
         self: &Arc<Self>,
         client_id: u64,
         parent: Option<MessageId>,
-        reply_to: Option<MessageId>,
+        settles: Option<rho_agent_types::MessageVersion>,
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
         let mut write = self.db.write().await;
-        // An addressed answer stays in the shared thread, but only its
-        // writer receives it. Keep this route even if the writer is gone:
-        // falling back to thread membership would deliver to someone else.
-        let mentions = match reply_to.and_then(|target| write.mail_writer(target)) {
-            Some(writer) => vec![Mention::Direct(writer)],
-            None => self.user_mentions(mentions),
-        };
-        let message = NewMessage {
-            from: Address::User,
-            reply_to,
-            mentions,
+        let id = write.post_user_reply(
+            UnixMs::now(),
+            parent,
+            rho_agent_types::ThreadReply { settles },
+            self.user_mentions(mentions),
             content,
-        };
-        let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
+            client_id,
+        )?;
         write.commit();
         self.wake_receivers(id, None);
         self.consider_naming(id);
@@ -1073,9 +1067,8 @@ impl AgentPool {
         Ok(())
     }
 
-    /// Give the user's mail to a named writer if they still exist. A writer
-    /// can be removed after the mail was read or while the GUI was offline.
-    /// That cannot stop the user's reply from being saved in its thread.
+    /// Debug callers may add recipients outside the thread without
+    /// excluding any member that would otherwise receive the user's words.
     fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
         let read = self.db.read();
         let mut seen = HashSet::new();

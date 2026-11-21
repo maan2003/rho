@@ -279,7 +279,7 @@ async fn create_agent(
             rho_mail::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: None,
-                reply_to: None,
+                settles: None,
                 mentions: vec![agent],
                 content: vec![rho_agent_types::ContentPart::Text {
                     text: text.to_owned(),

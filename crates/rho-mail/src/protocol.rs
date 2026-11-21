@@ -60,8 +60,8 @@ pub struct Post {
     pub client_id: u64,
     /// The thread it goes in; none starts a root.
     pub parent: Option<MessageId>,
-    /// The mail this answers, if any; it need not be the parent.
-    pub reply_to: Option<MessageId>,
+    /// The card seen when the user opened the thread, not a recipient.
+    pub settles: Option<rho_agent_types::MessageVersion>,
     /// Agents the message reaches whether or not they are members. It
     /// does not make them members.
     pub mentions: Vec<AgentId>,
@@ -90,7 +90,9 @@ pub enum PostIdeaReply {
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct RetryIdea {
-    pub posted: Post,
+    pub client_id: u64,
+    pub failed_start: MessageId,
+    pub content: Vec<ContentPart>,
     pub host_label: String,
 }
 
@@ -268,6 +270,7 @@ mod tests {
                         kind: rho_agent_types::MessageKind::Kept,
                         parent: Some(MessageId(ChatSeq(2))),
                         reply_to: None,
+                        thread_reply: None,
                         from: Address::Agent(agent),
                         mentions: vec![Mention::User { ping: true }],
                         content: vec![ContentPart::Text { text: "hi".into() }],
@@ -321,6 +324,7 @@ mod tests {
                         kind: rho_agent_types::MessageKind::Kept,
                         parent: Some(MessageId(ChatSeq(7))),
                         reply_to: None,
+                        thread_reply: None,
                         from: Address::System {
                             agent,
                             stop: Stop::Stuck,
@@ -338,7 +342,10 @@ mod tests {
             Post {
                 client_id: 7,
                 parent: Some(MessageId(ChatSeq(2))),
-                reply_to: Some(MessageId(ChatSeq(4))),
+                settles: Some(rho_agent_types::MessageVersion {
+                    message: MessageId(ChatSeq(4)),
+                    version: ChatSeq(8),
+                }),
                 mentions: vec![agent],
                 content: vec![ContentPart::Text {
                     text: "root".into(),

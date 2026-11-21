@@ -648,6 +648,7 @@ mod tests {
                 kind: rho_agent_types::MessageKind::Kept,
                 parent: parent.map(id),
                 reply_to: None,
+                thread_reply: None,
                 from,
                 mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: text.into() }],

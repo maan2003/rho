@@ -161,6 +161,16 @@ Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
 
+### Send a reply from a dealt card
+
+With the long thread fixture, send a quiet newer message with the `send`
+command above, then open the kept ask from the Desk. The draft has no
+addressee even though a different message appears below it first. Tap the
+draft, type `Keep the monotonic timer.`, and tap **send**. The reply
+[appears in the shared thread](phone-thread-wide-reply.png) and the dealt ask
+no longer waits. Another window on the same host sees the reply and the
+settlement from the log.
+
 ## Fresh flashes in the thread and the Desk
 
 Start the same disposable host with `FORM_FLASH_LEAD_SECONDS=120` as well

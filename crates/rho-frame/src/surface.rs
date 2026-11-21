@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use editor::Editor;
 use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window};
+pub use rho_dealer::facts::Seen as Dealt;
 use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
@@ -98,7 +99,7 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
-    fn subject(&self, _cx: &App) -> Subject {
+    fn subject(&self, _dealt: Option<Dealt>, _cx: &App) -> Subject {
         Subject::Own
     }
 
@@ -112,7 +113,7 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// the subject as the dealer counts it. A thread is one card wherever
     /// the point is in it; a list's row is its own card.
     fn card(&self, cx: &App) -> Subject {
-        self.subject(cx)
+        self.subject(None, cx)
     }
 
     /// Whether the point is in the surface's writable text rather than on
@@ -163,7 +164,12 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     }
 
     /// The surface's own rows for the palette, for what is in view.
-    fn rows(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(
+        &mut self,
+        _dealt: Option<Dealt>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Row> {
         Vec::new()
     }
 }
@@ -177,7 +183,7 @@ trait SurfaceHandle {
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool>;
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
-    fn subject(&self, cx: &App) -> Subject;
+    fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject;
     fn mode(&self, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> Subject;
     fn edits_at_point(&self, cx: &App) -> bool;
@@ -185,7 +191,7 @@ trait SurfaceHandle {
     fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
-    fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
 }
 
@@ -222,8 +228,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).focus_handle(cx)
     }
 
-    fn subject(&self, cx: &App) -> Subject {
-        self.read(cx).subject(cx)
+    fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject {
+        self.read(cx).subject(dealt, cx)
     }
 
     fn mode(&self, cx: &App) -> Option<Mode> {
@@ -256,8 +262,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         })
     }
 
-    fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.update(cx, |surface, cx| surface.rows(window, cx))
+    fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row> {
+        self.update(cx, |surface, cx| surface.rows(dealt, window, cx))
     }
 
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
@@ -316,8 +322,8 @@ impl AnySurface {
         self.0.focus_handle(cx)
     }
 
-    pub fn subject(&self, cx: &App) -> Subject {
-        self.0.subject(cx)
+    pub fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject {
+        self.0.subject(dealt, cx)
     }
 
     pub fn mode(&self, cx: &App) -> Option<Mode> {
@@ -357,8 +363,8 @@ impl AnySurface {
         self.0.phone_send(cx)
     }
 
-    pub fn rows(&self, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.0.rows(window, cx)
+    pub fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row> {
+        self.0.rows(dealt, window, cx)
     }
 }
 

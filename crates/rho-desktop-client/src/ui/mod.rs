@@ -93,7 +93,12 @@ impl Surface for DesktopSurface {
         format!("{} · desktop {}", self.label, self.name)
     }
 
-    fn rows(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn rows(
+        &mut self,
+        _: Option<rho_frame::surface::Dealt>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Row> {
         let State::Open(view) = &self.state else {
             return Vec::new();
         };

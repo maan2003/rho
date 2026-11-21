@@ -393,7 +393,7 @@ impl Frame {
     pub fn point(&self, cx: &App) -> Point {
         let surface = self.current_address().clone();
         let current = self.current_surface();
-        let subject = current.subject(cx);
+        let subject = current.subject(self.dealt_seen(&surface), cx);
         let card = if current.inspects_card() {
             match self.history.current() {
                 ScreenEntry::Inspection(inspection) => Some(inspection.address.clone()),
@@ -1085,7 +1085,7 @@ impl Frame {
         rows.push(phrase.window_wide());
         rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
         let surface = self.current_surface().clone();
-        rows.extend(surface.rows(window, cx));
+        rows.extend(surface.rows(self.dealt_seen(self.current_address()), window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
         }

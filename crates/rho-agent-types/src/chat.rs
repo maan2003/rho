@@ -40,6 +40,19 @@ impl ChatSeq {
 )]
 pub struct MessageId(pub ChatSeq);
 
+/// What the user saw on one dealt card, independent of the route of a reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct MessageVersion {
+    pub message: MessageId,
+    pub version: ChatSeq,
+}
+
+/// A thread-wide reply may settle a dealt card; it never names a recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ThreadReply {
+    pub settles: Option<MessageVersion>,
+}
+
 /// A chat member: the user or one of the host's agents.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
@@ -102,9 +115,11 @@ pub enum ChatEvent {
     /// Neither posting nor a mention makes anyone a member.
     Posted {
         parent: Option<MessageId>,
-        /// The specific mail the user answered; independent of where the answer
-        /// is posted.
+        /// The original failed start on retry, or a historical addressee.
         reply_to: Option<MessageId>,
+        /// Absent on older posts. A present reply never implicitly settles
+        /// earlier cards in the thread.
+        thread_reply: Option<ThreadReply>,
         from: Address,
         #[senax(default)]
         kind: MessageKind,
@@ -221,6 +236,7 @@ pub struct Message {
     /// posted.
     pub parent: Option<MessageId>,
     pub reply_to: Option<MessageId>,
+    pub thread_reply: Option<ThreadReply>,
     pub from: Address,
     #[senax(default)]
     pub kind: MessageKind,
@@ -253,6 +269,7 @@ impl Message {
         let ChatEvent::Posted {
             parent,
             reply_to,
+            thread_reply,
             from,
             kind,
             mentions,
@@ -266,6 +283,7 @@ impl Message {
             at: record.at,
             parent: *parent,
             reply_to: *reply_to,
+            thread_reply: *thread_reply,
             from: *from,
             kind: *kind,
             mentions: mentions.clone(),
@@ -426,6 +444,7 @@ mod tests {
             at: UnixMs(1),
             parent: None,
             reply_to: None,
+            thread_reply: None,
             from: Address::User,
             kind: MessageKind::Kept,
             mentions: Vec::new(),
@@ -474,6 +493,7 @@ mod tests {
             ChatEvent::Posted {
                 parent,
                 reply_to: None,
+                thread_reply: None,
                 from: Address::User,
                 kind: MessageKind::Kept,
                 mentions: Vec::new(),
@@ -497,6 +517,7 @@ mod tests {
             event: ChatEvent::Posted {
                 parent: Some(MessageId(ChatSeq(11))),
                 reply_to: None,
+                thread_reply: None,
                 from: Address::Agent(agent),
                 kind: MessageKind::Flash,
                 mentions: vec![Mention::User { ping: false }],
@@ -535,6 +556,7 @@ mod tests {
                 kind: MessageKind::Kept,
                 parent: Some(MessageId(ChatSeq(2))),
                 reply_to: None,
+                thread_reply: None,
                 from: Address::Agent(agent),
                 mentions: vec![Mention::User { ping: false }],
                 content: Vec::new(),
@@ -568,6 +590,7 @@ mod tests {
             event: ChatEvent::Posted {
                 parent: Some(MessageId(ChatSeq(1))),
                 reply_to: None,
+                thread_reply: None,
                 from: Address::User,
                 kind: MessageKind::Kept,
                 mentions: Vec::new(),

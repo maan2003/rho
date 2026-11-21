@@ -441,7 +441,7 @@ impl Surface for NotesView {
         self.finding.then_some(Mode::Insert)
     }
 
-    fn subject(&self, _cx: &App) -> Subject {
+    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
         Subject::None
     }
 
