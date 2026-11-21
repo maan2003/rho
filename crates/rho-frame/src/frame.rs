@@ -1131,8 +1131,14 @@ impl Frame {
             card.heading()
         })
         .counted();
-        rows.extend(verdict_rows(target.clone()));
-        rows.push(Row::menu("s", snooze_rows(&target)));
+        if self.marks().get(&target).facts().muted() {
+            rows.push(Row::run("m", "unmute", move |frame, window, cx| {
+                frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
+            }));
+        } else {
+            rows.extend(verdict_rows(target.clone()));
+            rows.push(Row::menu("s", snooze_rows(&target)));
+        }
         push_deal_rows(&mut rows);
         rows
     }
@@ -1387,11 +1393,12 @@ impl Frame {
             ("idea".to_owned(), String::new(), colors.text_muted)
         } else if let Some(address) = own_card {
             let card = self.card_for(&address, cx);
-            (
-                surface.heading(cx).unwrap_or_else(|| card.heading()),
-                card.label,
-                status.warning,
-            )
+            let heading = surface.heading(cx).unwrap_or_else(|| card.heading());
+            if self.marks().get(&address).facts().muted() {
+                (heading, "muted".to_owned(), colors.text_muted)
+            } else {
+                (heading, card.label, status.warning)
+            }
         } else {
             let title = if let Some(titles) = phone_titles {
                 titles
@@ -1794,8 +1801,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    fn a_row_in_a_narrow_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
+    fn test_frame(cx: &mut gpui::TestAppContext, db: rho_db::RhoDb) -> gpui::WindowHandle<Frame> {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             let settings = settings::SettingsStore::test(cx);
@@ -1804,16 +1810,14 @@ mod tests {
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
         });
-        let frame = cx.add_window(|window, cx| {
-            Frame::new(
-                rho_db::RhoDb::in_memory(),
-                Vec::new(),
-                Vec::new(),
-                Rc::new(|| {}),
-                window,
-                cx,
-            )
-        });
+        cx.add_window(|window, cx| {
+            Frame::new(db, Vec::new(), Vec::new(), Rc::new(|| {}), window, cx)
+        })
+    }
+
+    #[gpui::test]
+    fn a_row_in_a_narrow_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
         frame
             .update(cx, |frame, _, cx| {
                 let project = crate::idea::IdeaProject {
@@ -1853,6 +1857,55 @@ mod tests {
                     frame.card_in_view(cx),
                     Some(subject),
                     "a pull from the actual card can skip it"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_persisted_mute_can_be_lifted_without_undoing_older_verdicts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let thread = Address::new("thread", "lab/2");
+        let other = Address::new("thread", "lab/12");
+        let db = rho_db::RhoDb::in_memory();
+        let (mut attention, _) = Attention::open(db.clone());
+        attention.say(vec![
+            crate::attention::Write::Fact(rho_dealer::facts::Fact::Mute {
+                node: thread.clone(),
+            }),
+            crate::attention::Write::Fact(rho_dealer::facts::Fact::Mute {
+                node: other.clone(),
+            }),
+        ]);
+        drop(attention);
+
+        let frame = test_frame(cx, db);
+        frame
+            .update(cx, |frame, window, cx| {
+                let card = cx.new(|cx| OpenCard(cx.focus_handle()));
+                frame.surfaces.insert(thread.clone(), AnySurface::new(card));
+                frame.history.show(thread.clone(), None);
+                assert!(!frame.attention.can_undo(), "the window just restarted");
+                assert!(frame.marks().get(&thread).facts().muted());
+                let mut rows = frame.verdict_rows(cx).rows;
+                let unmute = rows
+                    .iter()
+                    .position(|row| row.pick.label() == "unmute")
+                    .expect("the muted thread offers unmute");
+                let Pick::Run { run, .. } = rows.swap_remove(unmute).pick else {
+                    panic!("not an operation")
+                };
+                run(frame, None, window, cx);
+                assert!(!frame.marks().get(&thread).facts().muted());
+                assert!(
+                    frame.marks().get(&other).facts().muted(),
+                    "leave other verdicts alone"
+                );
+                assert_eq!(
+                    frame.current_address(),
+                    &thread,
+                    "stay in the reopened thread"
                 );
             })
             .unwrap();

@@ -182,6 +182,7 @@ pub enum DealerVerdict {
     Defer,
     Open,
     File,
+    Unmute,
 }
 
 #[derive(
