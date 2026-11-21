@@ -390,7 +390,7 @@ impl ThreadView {
                     );
                 }
             }),
-            cx.observe(&entity, |this, _, cx| this.refresh(cx)),
+            cx.observe(&entity, |this, _, cx| this.refresh_mail(cx)),
             cx.subscribe(&entity, |this, _, event: &Event, cx| match event {
                 Event::Delivered {
                     endpoint,
@@ -402,11 +402,7 @@ impl ThreadView {
                     this.follow = Some(Follow::Logged(*message));
                     this.refresh(cx);
                 }
-                Event::DraftSent(project) if *project == this.thread => {
-                    this.clear_draft(cx);
-                    this.refresh(cx);
-                    this.cursor_to_latest_mail(cx);
-                }
+                Event::DraftSent(thread) if *thread == this.thread => this.finish_send(cx),
                 _ => {}
             }),
         ];
@@ -476,9 +472,56 @@ impl ThreadView {
         view
     }
 
+    /// Preserve the inline draft across both optimistic and logged history.
+    /// A stuck draft leaves the history alone; only project mail gets a notice.
+    fn refresh_mail(&mut self, cx: &mut Context<Self>) {
+        let system = self.system.read(cx);
+        let list = self.is_list(system);
+        let newest = latest_mail(system, self.thread);
+        let arrived = self
+            .latest_mail
+            .zip(newest)
+            .is_some_and(|((_, old), (from, new))| from != Party::User && new > old);
+        self.latest_mail = newest;
+        let editor = self.editor.read(cx);
+        // An earlier change in the same frame can already be holding the
+        // draft on screen. Its anchor follows the draft through this edit too.
+        let screen_y = if !list && !editor.has_autoscroll_request() {
+            self.inline_draft_y(cx)
+        } else {
+            None
+        };
+        if !list && arrived && self.editor.read(cx).bottom_stuck_excerpt_is_visible() {
+            self.editor
+                .update(cx, |editor, cx| editor.mark_bottom_stuck_excerpt(cx));
+        }
+        self.refresh_at(screen_y, cx);
+    }
+
+    /// The first draft line's position in the history viewport. It can be
+    /// above the viewport when the inline draft is taller than the screen.
+    fn inline_draft_y(&self, cx: &mut App) -> Option<f64> {
+        let tail = draft::start(self.transcript.buffer(), cx);
+        self.editor.update(cx, |editor, cx| {
+            if editor.bottom_stuck_excerpt_is_visible() {
+                return None;
+            }
+            let viewport = editor.visible_line_count()?;
+            let scroll = editor.scroll_position(cx);
+            let display = editor.display_snapshot(cx);
+            let y = display.row_y(tail.to_display_point(&display).row().0 as f64)
+                - display.row_y(scroll.y);
+            (y < viewport).then_some(y)
+        })
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_at(None, cx);
+    }
+
     /// The rows as they stand, reconciled into the read-only excerpt.
     /// Never reset a point (or a selection) in the draft as mail arrives.
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    fn refresh_at(&mut self, screen_y: Option<f64>, cx: &mut Context<Self>) {
         let list = self.is_list(self.system.read(cx));
         let items = items(
             self.system.read(cx),
@@ -489,34 +532,6 @@ impl ThreadView {
             self.private_edit.as_ref(),
             cx,
         );
-        let newest = latest_mail(self.system.read(cx), self.thread);
-        let arrived = !list
-            && self
-                .latest_mail
-                .zip(newest)
-                .is_some_and(|((_, old), (from, new))| from != Party::User && new > old);
-        self.latest_mail = newest;
-        let (anchor, notice) = if arrived {
-            let editor = self.editor.read(cx);
-            if editor.bottom_stuck_excerpt_is_visible() {
-                (None, true)
-            } else {
-                let tail = draft::start(self.transcript.buffer(), cx);
-                let keep = self.editor.update(cx, |editor, cx| {
-                    let viewport = editor.visible_line_count()?;
-                    let scroll = editor.scroll_position(cx);
-                    let display = editor.display_snapshot(cx);
-                    let y = display.row_y(tail.to_display_point(&display).row().0 as f64)
-                        - display.row_y(scroll.y);
-                    // A known inline viewport, even if its first draft line
-                    // is now above the viewport in a tall draft.
-                    (y < viewport).then_some(y)
-                });
-                (keep, false)
-            }
-        } else {
-            (None, false)
-        };
         let writing = list
             .then(|| draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx))
             .flatten();
@@ -525,20 +540,14 @@ impl ThreadView {
             writing.restore(&self.editor, cx);
         }
         // SPEC-mail-follow-tail: the layout moves independently of point.
-        if notice || anchor.is_some() {
+        if let Some(screen_y) = screen_y
+            && self.inline_draft_y(cx) != Some(screen_y)
+        {
             let tail = draft::start(self.transcript.buffer(), cx);
             self.editor.update(cx, |editor, cx| {
-                if notice {
-                    editor.mark_bottom_stuck_excerpt(cx);
-                }
-                if let Some(screen_y) = anchor {
-                    let display = editor.display_snapshot(cx);
-                    let tail = display.buffer_snapshot().anchor_after(tail);
-                    editor.request_autoscroll(
-                        Autoscroll::top_relative(screen_y).for_anchor(tail),
-                        cx,
-                    );
-                }
+                let display = editor.display_snapshot(cx);
+                let tail = display.buffer_snapshot().anchor_after(tail);
+                editor.request_autoscroll(Autoscroll::top_relative(screen_y).for_anchor(tail), cx);
             });
         }
         if let Some(Follow::Logged(message)) = self.follow
@@ -688,9 +697,28 @@ impl ThreadView {
         });
     }
 
-    fn cursor_to_latest_mail(&mut self, cx: &mut Context<Self>) {
-        let row = self.transcript.buffer().read(cx).max_point().row;
-        self.cursor_to_row(row.saturating_sub(1), Autoscroll::fit(), cx);
+    fn finish_send(&mut self, cx: &mut Context<Self>) {
+        let screen_y = if self.is_list(self.system.read(cx)) {
+            None
+        } else {
+            self.inline_draft_y(cx)
+        };
+        self.clear_draft(cx);
+        self.dealt_mail = None;
+        self.refresh_at(screen_y, cx);
+
+        let tail = draft::start(self.transcript.buffer(), cx);
+        let point = self.editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            editor.selections.change_with(&display, |selections| {
+                selections.select_ranges([tail..tail]);
+            });
+            let point = editor.selections.newest_anchor().head();
+            cx.notify();
+            point
+        });
+        self.last_point = point;
+        self.draft_point = Some(point);
     }
 }
 
@@ -1153,15 +1181,14 @@ impl ThreadView {
             client_id
         });
         thread::enter_normal_mode(&self.editor, window, cx);
-        self.clear_draft(cx);
-        self.dealt_mail = None;
-        self.refresh(cx);
-        let tail = draft::start(self.transcript.buffer(), cx);
-        self.cursor_to_row(tail.row, Autoscroll::fit(), cx);
+        self.finish_send(cx);
         // In a project the message is a new thread: the cursor goes to it in
         // the list, on its way and then where the list puts it, so `enter`
         // opens it.
         if list {
+            self.editor.update(cx, |editor, cx| {
+                editor.request_autoscroll(Autoscroll::fit(), cx)
+            });
             self.follow = Some(Follow::Sending(client_id));
         }
     }
@@ -2241,6 +2268,171 @@ mod tests {
     use rho_agent_types::{AgentId, ChatSeq, ContentPart, UnixMs};
 
     use super::*;
+
+    #[gpui::test]
+    fn sending_an_inline_reply_keeps_the_point_and_the_draft_screen_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        check_inline_reply(cx, false);
+    }
+
+    #[gpui::test]
+    fn sending_the_draft_with_options_keeps_the_point_and_the_draft_screen_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        check_inline_reply(cx, true);
+    }
+
+    fn check_inline_reply(cx: &mut gpui::TestAppContext, with_options: bool) {
+        use gpui::{px, size};
+        use rho_agent_types::{ChatEvent, ChatRecord};
+        use rho_frame::{Frame, FrameLink};
+
+        fn post(seq: u64, parent: Option<u64>, from: Party, text: &str) -> ChatRecord {
+            ChatRecord {
+                seq: ChatSeq(seq),
+                at: UnixMs(1_760_000_000_000 + seq),
+                event: ChatEvent::Posted {
+                    parent: parent.map(|id| MessageId(ChatSeq(id))),
+                    reply_to: None,
+                    from,
+                    mentions: Vec::new(),
+                    content: vec![ContentPart::Text { text: text.into() }],
+                },
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+        let frame = FrameLink::new(cx.add_window(|window, cx| {
+            Frame::new(
+                db.clone(),
+                Vec::new(),
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        }));
+        let thread = ThreadId {
+            host: EndpointId([3; 32]),
+            message: MessageId(ChatSeq(2)),
+        };
+        let agent =
+            Party::Agent(AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap());
+        let reply = "Use each counter's own reference.";
+        let mail = cx.update(|cx| {
+            let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
+            cx.new(|cx| {
+                let mut system = MailSystem::new(db, frame, notes, cx);
+                let log = system.logs.entry(thread.host).or_default();
+                log.tell(&post(1, None, Party::User, "Clock"));
+                log.tell(&post(2, Some(1), agent, &"Earlier readings\n\n".repeat(25)));
+                system.set_draft(thread.host, Some(thread.message), reply.into());
+                system
+            })
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                mail.update(cx, |system, cx| {
+                    cx.new(|cx| ThreadView::new(system, mail.clone(), thread, window, cx))
+                })
+            })
+            .unwrap()
+        });
+        cx.simulate_window_resize(window.into(), size(px(640.), px(340.)));
+        cx.draw_window(window.into());
+        window
+            .update(cx, |view, _, cx| {
+                let tail = draft::start(view.transcript.buffer(), cx);
+                view.editor.update(cx, |editor, cx| {
+                    let display = editor.display_snapshot(cx);
+                    let tail = display.buffer_snapshot().anchor_after(tail);
+                    let viewport = editor.visible_line_count().unwrap();
+                    editor.request_autoscroll(
+                        Autoscroll::top_relative(viewport - 0.5).for_anchor(tail),
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        let screen_row = |cx: &mut gpui::TestAppContext, sent: bool| {
+            window
+                .update(cx, |view, _, cx| {
+                    assert!(!view.is_list(view.system.read(cx)));
+                    let tail = draft::start(view.transcript.buffer(), cx);
+                    if sent {
+                        assert!(view.draft.read(cx).is_empty());
+                        assert_eq!(view.cursor(cx), tail, "point must stay in the draft");
+                    }
+                    view.editor.update(cx, |editor, cx| {
+                        assert!(!editor.bottom_stuck_excerpt_is_visible());
+                        let scroll = editor.scroll_position(cx);
+                        let display = editor.display_snapshot(cx);
+                        display.row_y(tail.to_display_point(&display).row().0 as f64)
+                            - display.row_y(scroll.y)
+                    })
+                })
+                .unwrap()
+        };
+        let before = screen_row(cx, false);
+
+        if with_options {
+            cx.update(|cx| {
+                mail.update(cx, |system, cx| system.post_draft_with_options(thread, cx))
+                    .unwrap();
+            });
+        } else {
+            window
+                .update(cx, |view, window, cx| view.send_only(&SendOnly, window, cx))
+                .unwrap();
+        }
+        cx.draw_window(window.into());
+        assert_eq!(screen_row(cx, true), before, "while the mail is sending");
+
+        // The receipt can clear the optimistic row before the durable mail
+        // reaches the view. Test across both changes to the history.
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system.outbox.next(thread.host).unwrap();
+                system.outbox.delivered(thread.host).unwrap();
+                cx.notify();
+            });
+        });
+        cx.draw_window(window.into());
+        assert_eq!(screen_row(cx, true), before, "after the receipt");
+
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system.logs.get_mut(&thread.host).unwrap().tell(&post(
+                    3,
+                    Some(2),
+                    Party::User,
+                    reply,
+                ));
+                cx.notify();
+            });
+        });
+        cx.draw_window(window.into());
+        window
+            .update(cx, |view, _, cx| {
+                assert!(
+                    view.transcript
+                        .contains(&Key::Message(MessageId(ChatSeq(3))))
+                );
+            })
+            .unwrap();
+        assert_eq!(screen_row(cx, true), before, "when the sent mail lands");
+    }
 
     #[test]
     fn the_open_private_note_has_the_same_identity_but_no_body_in_mail_history() {
