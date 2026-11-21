@@ -202,8 +202,7 @@ The historical review above was of Start a thread. Starting an agent from a mail
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule the last mail stays live
-status: a second send from the same agent updates its live mail in place.
-when a project agent has already sent a `Mail` since the user's last mail in the `Thread`, then rho refuses another from that agent and tells them which mail to edit. Other agents can each send one mail. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
+when a project agent has already sent a `Mail` since the user's last mail in the `Thread`, then rho refuses another from that agent and tells them which mail to edit. Other agents can each send one mail. A mail that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
 why: a thread of ten mails that each supersede the last is a feed; each agent has one place for current words.
 rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing mail; another send must not silently change it

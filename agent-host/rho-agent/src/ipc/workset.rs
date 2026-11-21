@@ -172,10 +172,6 @@ pub(crate) enum PyReply {
     Search(Vec<crate::store::MailHit>),
     Project(Option<rho_agent_types::MessageId>),
     Handle(Option<String>),
-    SentMail {
-        id: rho_agent_types::MessageId,
-        unanswered: Option<(rho_agent_types::MessageId, rho_agent_types::AgentId)>,
-    },
 }
 
 #[derive(Encode, Decode)]

@@ -100,13 +100,12 @@ class Mail:
         """Send to a local project, #thread, agent handle, or "user".
         With reply_to=#id, you can pass None to address the writer.
         Mail to "user" needs a thread or reply_to; it pings the user unless
-        ping=False. The returned id may carry a `notice` suggesting an edit.
+        ping=False. Since the user's last mail in a thread, send once
+        and use mail.edit(id, text) for updates.
         """
         message = rho_mail.send(self._agent, to, text, thread=thread, reply_to=reply_to, ping=ping)
-        if to != rho_mail.USER or message.notice:
+        if to != rho_mail.USER:
             print(f"Sent mail #{message}.")
-        if message.notice:
-            print(message.notice)
         return message
 
     def edit(self, message, text, *, ping=None):
