@@ -26,7 +26,7 @@
 
 pub mod attention;
 pub mod deal;
-pub mod desk;
+mod desk;
 pub mod draft;
 pub mod frame;
 pub mod hosts;

@@ -72,14 +72,14 @@ form: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
 purpose: let the user pick a place, thread, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject, card words, and address. It shortens the subject only when it does not fit in the width left after the row's own words and address; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts its words below the subject; the project list can wrap its counts. The list uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address; the project list can wrap its counts. The list uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
 states:
-- desk: a subject and a project address in `quiet`; a moving row adds the project's latest words in `quiet`; a folded row of repeated stops uses the address instead of a subject.
+- desk: a subject and a project address in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
 - project list: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then mention, unread and reply counts, a status if present, and age.
 - prompt or palette: place rows use the Desk's columns with `row air` between them: subject, `attention` card words or the project's `quiet` latest words, and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. A command shows its name and its `quiet` key sequence, the name alone on a narrow window. Query matches use `marked`; the chosen row keeps its fill all the way across.
 - empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
 used on: `desk.Desk`, `mail.Project`, and `window.Palette`.
-form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [wrapped unread project row](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
+form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [narrow Desk](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
 
 ## part Mail header
 purpose: identify who wrote the mail and when, before the user reads its words.
@@ -210,9 +210,6 @@ lasts: `thumb settle`.
 
 ## rule the echo takes the card's words' place
 when the `Echo line` answers, then the `Status line` gives up its `Card's words` and pairing notice; its heading, lamp, connection warning, and mode stay.
-
-## rule a thread wears its waiting card's words
-when a `mail.Thread` has a waiting card, then its `Row` on `desk.Desk` is in the waiting section and does not also appear under `moving`.
 
 ## rule a prompt takes the phone bar
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.

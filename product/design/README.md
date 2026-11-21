@@ -1,6 +1,6 @@
 # Built rho renders
 
-The thread and idea captures show the leading draft and newest-first mail; the full Desk captures are from 2026-11-20. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The thread and idea captures show the leading draft and newest-first mail; the full Desk captures show only what waits. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -41,7 +41,7 @@ The [address chooser](laptop-idea.png) offers `new project clock@lab`; Enter
 takes that row. After `clock@lab works on:`, the [mode prompt](laptop-project-mode.png)
 starts on `one`. Accepting it sends the idea and returns to Desk without
 another prompt. For the [same chooser at phone width](phone-idea.png), start an idea on the unpaired phone, type its words, open the address chooser with `ctrl-t`, then type `foam@lab`. The chooser also accepts a tap on the row. On the default scenario, wait until the clock ask is visible
-on Desk (the work may briefly appear under `moving`). Open `i` from Desk once again to capture the [empty idea](laptop-idea-empty.png) with `form_shot laptop idea-empty`.
+on Desk. Open `i` from Desk once again to capture the [empty idea](laptop-idea-empty.png) with `form_shot laptop idea-empty`.
 
 ### Start an empty project and change the next idea's mode
 
@@ -78,7 +78,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 
 | Render | Capture |
 | --- | --- |
-| [Project with wrapped unread row](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
+| [Narrow Desk (per idea)](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
 | Verdict sheet over the unpaired card | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55`. |
 | [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
 
@@ -136,37 +136,50 @@ Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
 
-## Desk on laptop and phone: what moves
+## Desk on laptop and phone: what waits
 
-Start a separate fixture shell with the slow model:
+In a fresh fixture shell on the default `clarifying-question` scenario, follow
+**Put a clock idea to work**. Once its question waits, send eight more ideas
+to `clock@lab`. From Desk, `i` opens the idea editor with the last project
+already in its address field.
 
 ```sh
-FAKE_SCENARIO=slow-trickle FAKE_ARGS='--seed 51' \
-    bash product/design/capture.sh /tmp/rho-form-desk target/debug
+for idea in \
+    'Check cache eviction after the clock fix.' \
+    'Check retries without changing the clock.' \
+    'Check midnight rollover on a slow machine.' \
+    'Does the timer survive a sleep and wake cycle?' \
+    'Keep metrics timestamps in UTC.' \
+    'Measure skew after the network comes back.' \
+    'Reproduce the slow test on two cores.' \
+    'Write up the deadline tolerance.'
+do
+    form_way laptop input 'key:i' 'wait:450' "text:$idea" \
+        'wait:420' 'key:ctrl+enter' 'wait:1100'
+done
 ```
 
-Repeat **Put a clock idea to work**, then send a second idea to the same project from Desk. `i` opens the idea editor with the last project already in its address field.
+When the Desk reads `9 wait` and the sent notice has gone, select the first
+row with `gg` and capture. Stop the laptop before reusing its identity at
+phone width.
 
 ```sh
-form_way laptop input 'key:i' 'wait:450' \
-    'text:Check cache eviction after the clock fix.' 'wait:400' 'key:ctrl+enter'
-```
-
-Send the third idea and capture while it is still `working`. Stop the laptop before reusing its identity at phone width.
-
-```sh
-form_way laptop input 'key:i' 'wait:450' \
-    'text:Check retries without changing the clock.' 'wait:400' 'key:ctrl+enter' \
-    'wait:4700' 'key:g' 'key:g' 'wait:430'
+form_way laptop key 'g g'
 form_shot laptop desk
 form_way laptop stop
 form_gui phone laptop
 form_way phone tree
-# Wait for the Desk and its rows to load, before the third result arrives.
+# Wait for the nine cards to load, then select the first row.
+form_way phone key 'g g'
 form_shot phone desk
 ```
 
-The [laptop Desk](laptop-desk.png) and [phone Desk](phone-desk.png) show work under `moving`, with only subject, project, and latest words.
+Both captures show seven subjects with project addresses, then
+`and 2 more · clock@lab`. Enter or a tap on that overflow opens
+“Reproduce the slow test on two cores.” To check the empty case with work
+in flight, start a separate `FAKE_SCENARIO=slow-trickle` fixture and send
+only the first idea. Both Desk and `clock@lab` show `0 wait` until there
+is a card.
 
 ## Inspect an outcome mail and a transcript with full commands
 
@@ -180,7 +193,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 ## What the renders expose
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
-- Desk shows waiting subjects and their projects. Moving rows add the latest project words or `working`. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
+- Desk shows the wait count, waiting subjects with their projects, and any overflow. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
 - In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent mail, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
 - The palette can match mail body words absent from the subject. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.

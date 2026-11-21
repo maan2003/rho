@@ -23,7 +23,7 @@ use theme::ActiveTheme as _;
 
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
-use crate::desk::{DeskTarget, DeskView};
+use crate::desk::DeskView;
 use crate::idea::IdeaBox;
 use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
@@ -1268,21 +1268,16 @@ impl Frame {
 
     /// Enter on Desk: the row under the cursor.
     pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.desk.read(cx).cursor_target(cx) {
-            Some(DeskTarget::Card(address)) => {
-                if let Some(card) = self
-                    .hand()
-                    .cards
-                    .iter()
-                    .find(|card| card.address == address)
-                    .cloned()
-                {
-                    self.journal_deal(Some(&address), cx);
-                    self.open_card(card, window, cx);
-                }
-            }
-            Some(DeskTarget::Thread(address)) => self.open(address, window, cx),
-            None => {}
+        if let Some(address) = self.desk.read(cx).cursor_card(cx)
+            && let Some(card) = self
+                .hand()
+                .cards
+                .iter()
+                .find(|card| card.address == address)
+                .cloned()
+        {
+            self.journal_deal(Some(&address), cx);
+            self.open_card(card, window, cx);
         }
     }
 

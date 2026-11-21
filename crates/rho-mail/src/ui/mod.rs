@@ -26,7 +26,6 @@ use rho_agent_types::{
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
-use rho_frame::desk::MovingThread;
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{
     AnySurface, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint, System,
@@ -930,38 +929,6 @@ impl System for MailSystem {
         self.thread_of(address)
             .and_then(|thread| self.logs.get(&thread.host)?.newest_in(thread.message))
             .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0))
-    }
-
-    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
-        self.logs
-            .iter()
-            .flat_map(|(&host, chat)| {
-                chat.roots()
-                    .iter()
-                    .filter_map(move |&root| {
-                        let project = self.project_address(ThreadId {
-                            host,
-                            message: root,
-                        })?;
-                        Some((root, project))
-                    })
-                    .flat_map(move |(root, project)| {
-                        chat.children(Some(root))
-                            .iter()
-                            .filter_map(move |&message| {
-                                let (words, at) = chat.latest_words(message)?;
-                                Some(MovingThread {
-                                    thread: ThreadId { host, message }.address(),
-                                    subject: chat.name(message)?,
-                                    project: project.clone(),
-                                    words,
-                                    changed: Timestamp::from_millisecond(at.0.try_into().ok()?)
-                                        .ok()?,
-                                })
-                            })
-                    })
-            })
-            .collect()
     }
 
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {

@@ -19,7 +19,6 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
-use crate::desk::MovingThread;
 use crate::frame::Point;
 use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
@@ -183,10 +182,6 @@ pub trait System: Sized + 'static {
         Seen::Whole
     }
 
-    fn moving_threads(&self, _cx: &App) -> Vec<MovingThread> {
-        Vec::new()
-    }
-
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
         Vec::new()
     }
@@ -262,7 +257,6 @@ trait SystemHandle {
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
     fn seen(&self, address: &Address, cx: &App) -> Seen;
-    fn moving_threads(&self, cx: &App) -> Vec<MovingThread>;
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
 
@@ -348,10 +342,6 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.read(cx).seen(address, cx)
-    }
-
-    fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
-        self.read(cx).moving_threads(cx)
     }
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
@@ -467,10 +457,6 @@ impl AnySystem {
 
     pub fn seen(&self, address: &Address, cx: &App) -> Seen {
         self.0.seen(address, cx)
-    }
-
-    pub(crate) fn moving_threads(&self, cx: &App) -> Vec<MovingThread> {
-        self.0.moving_threads(cx)
     }
 
     pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {

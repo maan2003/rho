@@ -1,7 +1,6 @@
-//! The desk shows the dealer's hand and the latest words from work that moves.
+//! The Desk shows only what waits in the dealer's hand.
 
 use std::any::TypeId;
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -15,7 +14,6 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, Pixels, TextRun, Window,
     WindowTextSystem, div, px,
 };
-use jiff::Timestamp;
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, MultiBufferOffset, ToPoint as _};
 use rho_dealer::Address;
@@ -31,33 +29,12 @@ use crate::surface::{Subject, Surface};
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
-const MOVING_LIMIT: usize = 10;
-
-/// A thread's last Status change. The project and subject come from the
-/// same source as the thread itself.
-pub struct MovingThread {
-    pub thread: Address,
-    pub subject: String,
-    pub project: String,
-    pub words: String,
-    pub changed: Timestamp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DeskTarget {
-    Card(Address),
-    Thread(Address),
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DeskKey {
     Waiting(Address),
     Stops(Address),
     WaitingMore,
-    Gap,
-    MovingHeader,
-    Moving(Address),
-    More,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,23 +48,35 @@ enum DeskClass {
 struct DeskRow {
     key: DeskKey,
     subject: String,
-    words: String,
-    project: String,
-    target: DeskTarget,
+    detail: DeskDetail,
+    card: Address,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeskDetail {
+    Project(String),
+    Stops(String),
+}
+
+impl DeskDetail {
+    fn project(&self) -> Option<&str> {
+        match self {
+            Self::Project(project) => Some(project),
+            Self::Stops(_) => None,
+        }
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
 pub(crate) struct DeskRows {
     wait_count: usize,
     waiting: Vec<DeskRow>,
-    moving: Vec<DeskRow>,
     overflow: Option<WaitingOverflow>,
-    more: usize,
 }
 
 #[derive(PartialEq, Eq)]
 struct WaitingOverflow {
-    first: DeskTarget,
+    first: Address,
     words: String,
 }
 
@@ -104,7 +93,6 @@ impl DeskRows {
 
 pub(crate) fn desk_rows(
     hand: &Hand,
-    mut moving: Vec<MovingThread>,
     project_of: impl Fn(&Address) -> Option<IdeaProject>,
 ) -> DeskRows {
     // A project's stops occupy its first stop's place. Every pinging mail
@@ -131,9 +119,10 @@ pub(crate) fn desk_rows(
             DeskRow {
                 key,
                 subject: card.title.clone(),
-                words: String::new(),
-                project: project.map_or_else(|| card.context.clone(), |project| project.name),
-                target: DeskTarget::Card(card.address.clone()),
+                detail: DeskDetail::Project(
+                    project.map_or_else(|| card.context.clone(), |project| project.name),
+                ),
+                card: card.address.clone(),
             },
             card.kind,
             1,
@@ -146,13 +135,16 @@ pub(crate) fn desk_rows(
         let mut words = format!("and {total} more");
         let mut projects = HashSet::new();
         for (row, ..) in hidden {
-            if !row.project.is_empty() && projects.insert(&row.project) {
+            if let Some(project) = row.detail.project()
+                && !project.is_empty()
+                && projects.insert(project)
+            {
                 words.push_str(" · ");
-                words.push_str(&row.project);
+                words.push_str(project);
             }
         }
         Some(WaitingOverflow {
-            first: first.target.clone(),
+            first: first.card.clone(),
             words,
         })
     });
@@ -162,40 +154,19 @@ pub(crate) fn desk_rows(
         .map(|(mut row, kind, count, mixed)| {
             if let CardKind::Stop(reason) = kind
                 && count > 1
+                && let DeskDetail::Project(project) = row.detail
             {
-                row.subject = std::mem::take(&mut row.project);
+                row.subject = project;
                 let reason = if mixed { "stops" } else { reason };
-                row.words = format!("{count} {reason}");
+                row.detail = DeskDetail::Stops(format!("{count} {reason}"));
             }
             row
-        })
-        .collect();
-    // The hand, not just the visible seven cards, tells us what is waiting.
-    let waiting_threads = hand
-        .cards
-        .iter()
-        .map(|card| &card.address)
-        .collect::<HashSet<_>>();
-    moving.retain(|thread| !waiting_threads.contains(&thread.thread));
-    moving.sort_by(|a, b| (Reverse(a.changed), &a.thread).cmp(&(Reverse(b.changed), &b.thread)));
-    let more = moving.len().saturating_sub(MOVING_LIMIT);
-    let moving = moving
-        .into_iter()
-        .take(MOVING_LIMIT)
-        .map(|thread| DeskRow {
-            target: DeskTarget::Thread(thread.thread.clone()),
-            key: DeskKey::Moving(thread.thread),
-            subject: thread.subject,
-            words: thread.words,
-            project: thread.project,
         })
         .collect();
     DeskRows {
         wait_count: hand.cards.len(),
         waiting,
-        moving,
         overflow,
-        more,
     }
 }
 
@@ -230,10 +201,10 @@ impl rho_transcript::Style for DeskClass {
     }
 }
 
-/// The desk log uses a keyed transcript, so a status change updates a row
-/// rather than resetting the reader's selections and scroll.
+/// The Desk uses a keyed transcript so that changing the hand does not
+/// reset the reader's selection or scroll.
 pub(crate) struct DeskView {
-    transcript: Transcript<DeskKey, DeskClass, DeskTarget>,
+    transcript: Transcript<DeskKey, DeskClass, Address>,
     editor: Entity<Editor>,
     rows: DeskRows,
     project: Option<IdeaProject>,
@@ -304,8 +275,6 @@ impl DeskView {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
                     show_active_line_background: true,
-                    // An arrival can scroll the new row out of the way
-                    // while writing, even when the whole Desk fits.
                     sizing_behavior: SizingBehavior::FullOverscrollMargin,
                 },
                 multi_buffer.clone(),
@@ -331,7 +300,7 @@ impl DeskView {
         view
     }
 
-    pub(crate) fn cursor_target(&self, cx: &App) -> Option<DeskTarget> {
+    pub(crate) fn cursor_card(&self, cx: &App) -> Option<Address> {
         self.transcript.line_meta(self.cursor_row(cx), cx).cloned()
     }
 
@@ -389,7 +358,6 @@ impl DeskView {
             // Update displayed words in place. A newly ranked row can't
             // take the place of one the user is about to tap.
             DeskRows::keep_order(&mut rows.waiting, &self.rows.waiting);
-            DeskRows::keep_order(&mut rows.moving, &self.rows.moving);
         }
         if rows == self.rows && !changed_scope {
             if changed_title {
@@ -399,7 +367,7 @@ impl DeskView {
         }
         self.rows = rows;
         self.reconcile(cx);
-        if self.cursor_target(cx).is_none() {
+        if self.cursor_card(cx).is_none() {
             self.focus_first_row(cx);
         }
         cx.notify();
@@ -472,7 +440,6 @@ impl DeskView {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let rows = || self.rows.waiting.iter().chain(&self.rows.moving);
         let measure = |text: &str| self.layout.measure(&self.text_system, text);
         let phone = Layout::of(self.layout.viewport) == Layout::Phone;
         // The editor and count extend to the frame edge; keep the existing
@@ -483,8 +450,12 @@ impl DeskView {
             self.layout.content
         };
         let wide = RowLayout::new(measure);
-        let project_width = rows()
-            .map(|row| measure(first_line(&row.project)))
+        let project_width = self
+            .rows
+            .waiting
+            .iter()
+            .filter_map(|row| row.detail.project())
+            .map(|project| measure(first_line(project)))
             .max()
             .unwrap_or_default()
             .min(room * 0.45);
@@ -507,27 +478,12 @@ impl DeskView {
             .iter()
             .map(&mut row_item)
             .collect::<Vec<_>>();
-        let moving = self
-            .rows
-            .moving
-            .iter()
-            .map(&mut row_item)
-            .collect::<Vec<_>>();
         if let Some(overflow) = &self.rows.overflow {
             waiting.push(
-                line(DeskKey::WaitingMore, overflow.words.clone())
+                Item::new(DeskKey::WaitingMore, overflow.words.clone())
+                    .with_styles(vec![(DeskClass::Muted, 0..overflow.words.len())])
                     .with_lines(vec![overflow.first.clone()]),
             );
-        }
-        if !moving.is_empty() {
-            if !waiting.is_empty() {
-                waiting.push(line(DeskKey::Gap, String::new()));
-            }
-            waiting.push(line(DeskKey::MovingHeader, "moving".into()));
-            waiting.extend(moving);
-            if self.rows.more > 0 {
-                waiting.push(line(DeskKey::More, format!("and {} more", self.rows.more)));
-            }
         }
         self.transcript.reconcile(waiting, cx);
         let snapshot = self.transcript.buffer().read(cx).snapshot();
@@ -581,34 +537,13 @@ impl Surface for DeskView {
     }
 
     fn subject(&self, cx: &App) -> Subject {
-        match self.cursor_target(cx) {
-            Some(DeskTarget::Card(address) | DeskTarget::Thread(address)) => {
-                Subject::Address(address)
-            }
-            None => Subject::None,
-        }
-    }
-
-    fn card(&self, cx: &App) -> Subject {
-        match self.cursor_target(cx) {
-            Some(DeskTarget::Card(address)) => Subject::Address(address),
-            _ => Subject::None,
-        }
+        self.cursor_card(cx).map_or(Subject::None, Subject::Address)
     }
 }
 
 impl Focusable for DeskView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
-    }
-}
-
-impl DeskRow {
-    fn words_class(&self) -> DeskClass {
-        match self.target {
-            DeskTarget::Card(_) => DeskClass::Label,
-            DeskTarget::Thread(_) => DeskClass::Muted,
-        }
     }
 }
 
@@ -630,19 +565,18 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
 
     fn item(&self, row: &DeskRow, room: Pixels) -> LaidOutRow {
         let gap = self.space * 2.;
-        let project = self.cut(&row.project, room - gap, "");
-        let project_cell = if project.is_empty() {
-            px(0.)
-        } else {
-            (self.measure)(&project) + gap
+        let (detail, class) = match &row.detail {
+            DeskDetail::Project(project) => (project, DeskClass::Muted),
+            DeskDetail::Stops(stops) => (stops, DeskClass::Label),
         };
-        let words = self.words(row, room - project_cell - gap);
-        let words_cell = if words.is_empty() {
-            px(0.)
+        let detail = self.cut(detail, room - gap);
+        let has_detail = !detail.is_empty();
+        let subject_room = if has_detail {
+            room - (self.measure)(&detail) - gap
         } else {
-            (self.measure)(&words) + gap
+            room
         };
-        let subject = self.cut(&row.subject, room - project_cell - words_cell, "");
+        let subject = self.cut(&row.subject, subject_room);
         let mut text = String::new();
         let mut styles = Vec::new();
         let mut gaps = Vec::new();
@@ -652,34 +586,22 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             &mut gaps,
             &subject,
             DeskClass::Title,
-            (!words.is_empty() || !project.is_empty()).then(|| (self.measure)(&subject) + gap),
+            has_detail.then(|| (self.measure)(&subject) + gap),
         );
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &project,
-            DeskClass::Muted,
-            (!project.is_empty() && !words.is_empty()).then_some(project_cell),
-        );
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &words,
-            row.words_class(),
-            None,
-        );
+        self.cell(&mut text, &mut styles, &mut gaps, &detail, class, None);
         (
             Item::new(row.key.clone(), text)
                 .with_styles(styles)
-                .with_lines(vec![row.target.clone()]),
+                .with_lines(vec![row.card.clone()]),
             gaps,
         )
     }
 
     fn compact(&self, row: &DeskRow, room: Pixels, project_width: Pixels) -> LaidOutRow {
-        let project = self.cut(&row.project, project_width, "");
+        let project = row
+            .detail
+            .project()
+            .map_or_else(String::new, |project| self.cut(project, project_width));
         let has_project = !project.is_empty();
         let column = room - project_width;
         let subject_room = if has_project {
@@ -687,7 +609,7 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
         } else {
             room
         };
-        let subject = self.cut(&row.subject, subject_room, "");
+        let subject = self.cut(&row.subject, subject_room);
         let mut text = String::new();
         let mut styles = Vec::new();
         let mut gaps = Vec::new();
@@ -707,21 +629,21 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             DeskClass::Muted,
             None,
         );
-        let mut lines = vec![row.target.clone()];
-        let words = self.words(row, room - 2. * self.space);
-        if !words.is_empty() {
-            text.push_str("\n  ");
-            self.cell(
-                &mut text,
-                &mut styles,
-                &mut gaps,
-                &words,
-                row.words_class(),
-                None,
-            );
-            lines.push(row.target.clone());
-        } else {
-            text.push('\n');
+        let mut lines = vec![row.card.clone()];
+        if let DeskDetail::Stops(stops) = &row.detail {
+            let stops = self.cut(stops, room - 2. * self.space);
+            if !stops.is_empty() {
+                text.push_str("\n  ");
+                self.cell(
+                    &mut text,
+                    &mut styles,
+                    &mut gaps,
+                    &stops,
+                    DeskClass::Label,
+                    None,
+                );
+                lines.push(row.card.clone());
+            }
         }
         (
             Item::new(row.key.clone(), text)
@@ -729,10 +651,6 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
                 .with_lines(lines),
             gaps,
         )
-    }
-
-    fn words(&self, row: &DeskRow, room: Pixels) -> String {
-        self.cut(&row.words, room, "")
     }
 
     fn cell(
@@ -755,19 +673,19 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
         }
     }
 
-    fn cut(&self, text: &str, room: Pixels, suffix: &str) -> String {
+    fn cut(&self, text: &str, room: Pixels) -> String {
         let text = first_line(text);
-        let mut shown = format!("{text}{suffix}");
+        let mut shown = text.to_owned();
         if (self.measure)(&shown) <= room {
             return shown;
         }
-        shown = format!("…{suffix}");
+        shown = "…".into();
         if (self.measure)(&shown) > room {
             return String::new();
         }
         for end in text.char_indices().skip(1).map(|(end, _)| end) {
             let prefix = text[..end].trim_end();
-            let candidate = format!("{prefix}…{suffix}");
+            let candidate = format!("{prefix}…");
             if (self.measure)(&candidate) > room {
                 break;
             }
@@ -777,12 +695,7 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
     }
 }
 
-type LaidOutRow = (Item<DeskKey, DeskClass, DeskTarget>, Vec<(usize, Pixels)>);
-
-fn line(key: DeskKey, text: String) -> Item<DeskKey, DeskClass, DeskTarget> {
-    let end = text.len();
-    Item::new(key, text).with_styles(vec![(DeskClass::Muted, 0..end)])
-}
+type LaidOutRow = (Item<DeskKey, DeskClass, Address>, Vec<(usize, Pixels)>);
 
 impl Render for DeskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -835,7 +748,6 @@ impl Render for DeskView {
 
 #[cfg(test)]
 mod tests {
-    use jiff::SignedDuration;
     use rho_dealer::Card;
 
     use super::*;
@@ -865,7 +777,7 @@ mod tests {
             cards: [7, 94, 2, 71, 28, 16, 48, 44, 12].map(card).to_vec(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, Vec::new(), |address| {
+        let rows = desk_rows(&hand, |address| {
             Some(IdeaProject {
                 address: address.clone(),
                 name: "shoal@lab".into(),
@@ -882,14 +794,14 @@ mod tests {
                 "idea 7", "idea 94", "idea 2", "idea 71", "idea 28", "idea 16", "idea 48"
             ]
         );
-        assert_eq!(rows.waiting[1].project, "shoal@lab");
-        assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(94)));
+        assert_eq!(rows.waiting[1].detail.project(), Some("shoal@lab"));
+        assert_eq!(rows.waiting[1].card, address(94));
     }
 
     #[test]
     fn folding_preserves_the_first_card_and_reports_hidden_cards_not_groups() {
-        let mut cards = [7, 85, 2, 71, 28, 25, 48, 44, 12, 16, 9, 1].map(card);
-        for index in [0, 2, 7, 9, 10] {
+        let mut cards = [7, 85, 2, 71, 28, 25, 48, 44, 12, 16, 9, 1, 3, 11].map(card);
+        for index in [0, 2, 7, 9, 10, 12, 13] {
             cards[index].label = format!("failed · {index}m");
             cards[index].kind = CardKind::Stop("failed");
         }
@@ -905,26 +817,30 @@ mod tests {
             let id = match address.rest() {
                 "t7" | "t2" | "t85" => 1,
                 "t44" | "t16" | "t9" => 2,
+                "t3" | "t11" => 3,
                 _ => return None,
             };
             Some(IdeaProject {
                 address: Address::new("project", id),
-                name: "reef@lab".into(),
+                name: if id == 3 { "clock@lab" } else { "reef@lab" }.into(),
                 details: None,
             })
         };
-        let rows = desk_rows(&hand, vec![], project);
-        assert_eq!(rows.wait_count, 12);
+        let rows = desk_rows(&hand, project);
+        assert_eq!(rows.wait_count, 14);
         assert_eq!(rows.waiting[0].subject, "reef@lab");
-        assert_eq!(rows.waiting[0].words, "2 failed");
-        assert_eq!(rows.waiting[0].target, DeskTarget::Card(address(7)));
-        assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(85)));
-        assert_eq!(rows.waiting[1].project, "reef@lab");
-        assert_eq!(rows.waiting[6].target, DeskTarget::Card(address(44)));
-        assert_eq!(rows.waiting[6].words, "3 stops");
+        assert_eq!(rows.waiting[0].detail, DeskDetail::Stops("2 failed".into()));
+        assert_eq!(rows.waiting[0].card, address(7));
+        assert_eq!(rows.waiting[1].card, address(85));
+        assert_eq!(rows.waiting[1].detail.project(), Some("reef@lab"));
+        assert_eq!(rows.waiting[6].card, address(44));
+        assert_eq!(rows.waiting[6].detail, DeskDetail::Stops("3 stops".into()));
         let overflow = rows.overflow.unwrap();
-        assert_eq!(overflow.first, DeskTarget::Card(address(12)));
-        assert_eq!(overflow.words, "and 2 more · unformatted channel");
+        assert_eq!(overflow.first, address(12));
+        assert_eq!(
+            overflow.words,
+            "and 4 more · unformatted channel · clock@lab"
+        );
         let afterwards = Hand {
             cards: hand
                 .cards
@@ -933,8 +849,8 @@ mod tests {
                 .collect(),
             next_change: None,
         };
-        let rows = desk_rows(&afterwards, vec![], project);
-        assert_eq!(rows.waiting[1].target, DeskTarget::Card(address(2)));
+        let rows = desk_rows(&afterwards, project);
+        assert_eq!(rows.waiting[1].card, address(2));
         assert_eq!(rows.waiting[1].subject, "idea 2");
     }
 
@@ -956,18 +872,18 @@ mod tests {
                 details: None,
             })
         };
-        let rows = desk_rows(&hand, vec![], project);
+        let rows = desk_rows(&hand, project);
         assert_eq!(rows.waiting[0].subject, "idea 7");
         assert_eq!(rows.waiting[1].subject, "idea 85");
         let overflow = rows.overflow.unwrap();
-        assert_eq!(overflow.first, DeskTarget::Card(address(44)));
+        assert_eq!(overflow.first, address(44));
         assert_eq!(overflow.words, "and 3 more · clock@lab");
 
         let hand = Hand {
             cards: hand.cards[8..].into(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, vec![], project);
+        let rows = desk_rows(&hand, project);
         assert_eq!(
             rows.waiting
                 .iter()
@@ -979,91 +895,26 @@ mod tests {
     }
 
     #[test]
-    fn desktop_subject_uses_the_width_left_by_its_own_details() {
+    fn a_narrow_stop_group_opens_from_either_line() {
         let row = DeskRow {
-            key: DeskKey::Waiting(address(7)),
-            subject: "abcdefghijklmno".into(),
-            words: "asks · 2m".into(),
-            project: "a@b".into(),
-            target: DeskTarget::Card(address(7)),
+            key: DeskKey::Stops(Address::new("project", 1)),
+            subject: "tide@lab".into(),
+            detail: DeskDetail::Stops("12 failed".into()),
+            card: address(7),
         };
         let layout = RowLayout::new(|text: &str| px(text.chars().count() as f32 * 5.));
-        let (fits, gaps) = layout.item(&row, px(155.));
-        assert_eq!(fits.text, "abcdefghijklmno a@b asks · 2m\n");
-        assert_eq!(gaps, [(15, px(10.)), (19, px(10.))]);
+        let (item, gaps) = layout.compact(&row, px(64.), px(29.));
+        assert_eq!(item.text, "tide@lab\n  12 failed\n");
         assert_eq!(
-            layout.item(&row, px(150.)).0.text,
-            "abcdefghijklm… a@b asks · 2m\n"
+            item.styles,
+            [(DeskClass::Title, 0..8), (DeskClass::Label, 11..20)]
         );
-    }
-
-    #[test]
-    fn a_narrow_moving_row_keeps_the_project_and_opens_from_either_line() {
-        let thread = address(7);
-        let row = DeskRow {
-            key: DeskKey::Moving(thread.clone()),
-            subject: "Clock correction edge cases".into(),
-            words: "Replaying the slower timezone tests".into(),
-            project: "tide@lab".into(),
-            target: DeskTarget::Thread(thread),
-        };
-        let wide = RowLayout::new(|text: &str| px(text.chars().count() as f32 * 5.));
-        let (item, gaps) = wide.compact(&row, px(150.), px(40.));
-        assert_eq!(
-            item.text,
-            "Clock correction ed… tide@lab\n  Replaying the slower timezo…\n"
-        );
-        assert_eq!(gaps, [(22, px(10.))]);
-        assert_eq!(item.lines, [row.target.clone(), row.target]);
-    }
-
-    #[test]
-    fn moving_excludes_the_whole_hand_before_taking_and_counting_rows() {
-        let now: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
-        let moving = [28, 7, 32, 3, 14, 26, 4, 12, 6, 18, 11, 5, 9, 35]
-            .into_iter()
-            .map(|n| MovingThread {
-                thread: address(n),
-                subject: format!("thread {n}"),
-                project: "tide@mini".into(),
-                words: format!("running {n} tests"),
-                changed: now - SignedDuration::from_mins(i64::from(n)),
-            })
-            .collect();
-        let hand = Hand {
-            cards: [3, 42, 45, 61, 80, 19, 99, 6].map(card).to_vec(),
-            next_change: None,
-        };
-        let rows = desk_rows(&hand, moving, |_| None);
-        assert_eq!(rows.wait_count, 8);
-        assert_eq!(rows.waiting[0].target, DeskTarget::Card(address(3)));
-        assert_eq!(rows.moving[0].words, "running 4 tests");
-        assert_eq!(rows.moving[0].target, DeskTarget::Thread(address(4)));
-        assert_eq!(rows.more, 2);
-        assert_eq!(
-            rows.moving
-                .iter()
-                .map(|row| row.subject.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "thread 4",
-                "thread 5",
-                "thread 7",
-                "thread 9",
-                "thread 11",
-                "thread 12",
-                "thread 14",
-                "thread 18",
-                "thread 26",
-                "thread 28"
-            ]
-        );
+        assert!(gaps.is_empty());
+        assert_eq!(item.lines, [address(7), address(7)]);
     }
 
     #[test]
     fn laptop_rows_clip_in_shaped_pixels_without_padding_to_other_rows() {
-        // Equal character counts have quite different advances; one title
-        // fits as-is, while the other has to keep a visible ellipsis.
         let measure = |text: &str| {
             px(text
                 .chars()
@@ -1079,31 +930,34 @@ mod tests {
         let waiting = DeskRow {
             key: DeskKey::Waiting(address(3)),
             subject: "WiWi".into(),
-            words: "asks".into(),
-            project: "mini".into(),
-            target: DeskTarget::Card(address(3)),
+            detail: DeskDetail::Project("mini".into()),
+            card: address(3),
         };
-        let moving = DeskRow {
-            key: DeskKey::Moving(address(4)),
+        let stops = DeskRow {
+            key: DeskKey::Stops(Address::new("project", 1)),
             subject: "WWWW".into(),
-            words: "fixing".into(),
-            project: "mini".into(),
-            target: DeskTarget::Thread(address(4)),
+            detail: DeskDetail::Stops("2 failed".into()),
+            card: address(4),
         };
-        let row_layout = RowLayout::new(measure);
-        for (room, moving_title) in [(72., "W…"), (84., "WW…"), (90., "WWWW")] {
-            for (row, title) in [(&waiting, "WiWi"), (&moving, moving_title)] {
-                let (item, gaps) = row_layout.item(row, px(room));
-                let (class, range) = &item.styles[2];
-                assert_eq!(*class, row.words_class());
-                assert_eq!(&item.text[range.clone()], row.words);
-                assert_eq!(&item.text[item.styles[0].1.clone()], title);
+        let layout = RowLayout::new(measure);
+        // Waiting needs 22 + 8 + 14 = 44 px; the stop row needs the full
+        // 36 + 8 + 36 = 80 px. One pixel less must clip only the latter.
+        for (room, stops_title) in [(68., "WW…"), (79., "WWW…"), (80., "WWWW")] {
+            for (row, title, detail, class) in [
+                (&waiting, "WiWi", "mini", DeskClass::Muted),
+                (&stops, stops_title, "2 failed", DeskClass::Label),
+            ] {
+                let (item, gaps) = layout.item(row, px(room));
+                assert_eq!(item.text, format!("{title} {detail}\n"));
                 assert_eq!(
-                    gaps.iter().map(|(_, width)| *width).collect::<Vec<_>>(),
-                    [px(8.), px(8.)],
+                    item.styles,
+                    [
+                        (DeskClass::Title, 0..title.len()),
+                        (class, title.len() + 1..item.text.len() - 1)
+                    ]
                 );
-                assert_eq!(item.lines, std::slice::from_ref(&row.target));
-                assert_eq!(item.text.lines().count(), 1);
+                assert_eq!(gaps, [(title.len(), px(8.))]);
+                assert_eq!(item.lines, std::slice::from_ref(&row.card));
             }
         }
     }
@@ -1113,9 +967,8 @@ mod tests {
         let row = |n| DeskRow {
             key: DeskKey::Waiting(address(n)),
             subject: format!("row {n}"),
-            words: String::new(),
-            project: "lab".into(),
-            target: DeskTarget::Card(address(n)),
+            detail: DeskDetail::Project("lab".into()),
+            card: address(n),
         };
         let before = [row(5), row(9)];
         let mut fresh = [row(3), row(9), row(5), row(2)];
