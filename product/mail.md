@@ -50,14 +50,14 @@ has:
 - many `Thread`, each a tangent under a mail
 - one `Draft` at the end of the thread
 does:
-- open: from a `deal.Card`, land on the mail that pings; otherwise open the thread by subject
+- open: from a `deal.Card` or by subject, open at the same place in `Thread`; a return restores the view and point as left
 - reply: write in the `Draft` and send with `Mail.reply`
 - fork: take a tangent into a thread under its mail; the prompt line says when to fork
 
 ## concept Mail
 purpose: carry a brief, an ask, a result, or a word on the work's progress in the voice of the project, and let the user answer whoever wrote.
 principle: after the user has been away, a project quotes just enough of the brief to ask a question that stands on its own; the user replies without needing to know the writer's name.
-sees: the words, with the voice told by colour alone: the user's own mail in `design.marked`, the project's in reading text; a quiet name line above a mail from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the mail quotes; proof on a result; a `## recap` section while the thread is cold
+sees: the words, with the voice told by colour alone: the user's own mail in `design.marked`, the project's in reading text; a quiet name line above a mail from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the mail quotes; proof on a result; a `## recap` section before the body when this mail carries the thread's recap
 does:
 - show proof: a result mail designates evidence under `## proof`. The heading and evidence stay visible on warm and cold threads.
 - ping: a mail either pings the user or it does not. A mail that pings is dealt as a `deal.Card` and reads `waits · 2h` on its row. A mail that does not ping stays in the thread with no card; it is how the project says what it is doing while it works, edited in place as the work moves
@@ -73,13 +73,14 @@ rejected:
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
 
 ## concept Draft
+status: the draft scrolls away with history.
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the end of the thread, even after a restart.
-sees: the unsent text as the next mail at the end of the thread, after one blank line; when empty, a quiet `reply` where the words will go.
+sees: the unsent text as the next mail at the end of the thread, after one blank line; when empty, a quiet `reply` where the words will go. When the first line is below the window, the draft becomes a `window.Bottom-stuck excerpt`; on the phone it sits above the keyboard.
 does:
 - edit `i`, `A`, `o` at the end, or a tap anywhere below the last mail: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `enter` on a selection in one mail: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
-- send `ctrl-enter`, or `send` on the phone bar while writing: the words become the last mail; the point rests in the empty draft and moves to the project's next pinging mail when it arrives
+- send `ctrl-enter`, or `send` on the phone bar while writing: the words become the last mail; the point rests in the empty draft even when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
 rejected:
 - a separator line, `── reply to tide@lab · ctrl-enter sends`, between the history and the draft · 2026-11-20 · the draft is the next mail; a line of chrome on every thread costs more than it says
@@ -88,21 +89,23 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
+status: a dealt thread opens on its pinging mail; the draft is not stuck and new mail does not follow the draft or show a notice.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
-- the `Mail` in order, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable; the mail that pings is under the point when a `deal.Card` opens
-- a `## recap` section of a mail only while the thread is cold, in `design.recap`; warm, it is not on screen at all
-- the `Draft` as the next mail at the end
+- the `Mail` in order, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable
+- one `## recap`, in `design.recap`, before the body of the newest stretch opener that has one
+- the `Draft` as the next mail at the end or stuck to the bottom while the user reads earlier history
 - a `notes.Private reply` below its mail, editable there; tangents open as their own `Thread`, not folded into the main history
 states:
 - empty: the opening mail, then the empty draft; a thread begins with a mail
 - loading: the thread's mail is not yet available; wording not agreed
 - partial: only the available mail; wording not agreed
 - error: the thread is unavailable; wording not agreed
-- full: the whole thread from the top when it fits the window; otherwise the mail that pings at the top of the window, with history above it and the draft below, all in the same buffer
+- full: whether opened by the deal or by name, the point goes into the `Draft`, where it was left if it has text; the first project mail since the user's last mail starts at the top, or the latest mail if none followed theirs. If the tail is shorter than the window, history fills the space above it. It never scrolls to empty space below the draft. Returning to a place restores it as left.
 keys:
 - `enter` with no selection on a project's mail: `Mail.look into the work`
+- `ctrl-u`, `ctrl-d`: scroll history by half a window without moving the point out of the `Draft`
 - `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
 - `enter` on a selection in one mail: `Draft.quote`
 - `alt-r` on a mail: `notes.Private reply.reply privately`
@@ -112,6 +115,7 @@ keys:
 - `ctrl-k`, `tab`, `q`: `window.Screen`
 starts: `Answer a mail`, `agents.Look into the work`, `notes.Reply privately`
 rejected:
+- the mail that pings at the top of the window · 2026-11-21 · open on what the project has said since the user's last word, with the next reply ready in either way of opening
 - newest mail first · 2026-11-20 · the exchange reads in its own order
 - the agent's transcript beside the mail in a second column · 2026-11-20 · one place in focus; the transcript is one level down
 - the card alone, with the history folded · 2026-11-20 · a short history costs nothing and a long one is one scroll away
@@ -133,12 +137,13 @@ It started after the DST change last week.
 
 ## recap
 The mock clock is shared between tests. One run in five lands on a DST boundary.
+
 Is a separate clock per test enough, or do you want the suite isolated too?
 
 reply
 ```
 
-The first two lines are the user's, in `design.marked`; the project's mail follows in reading text. The recap is on screen because the thread is cold, in `design.recap`. `reply` is the empty draft's placeholder, in `design.quiet`.
+The first two lines are the user's, in `design.marked`; the project's mail follows in reading text. The recap leads the project's mail because that mail opened the latest stretch with a recap, in `design.recap`. The recap and body are separated by one blank line. `reply` is the empty draft's placeholder, in `design.quiet`.
 
 mock, phone:
 ```text
@@ -160,11 +165,11 @@ when: a project or the Slack bot has something that asks for the user, or the us
 want: read what arrived, including proof on a result, and answer in place if needed
 so that: the person or project that needs the user's words gets them, and the mail no longer waits
 steps:
-1. the user reads the mail the deal opened
+1. the user opens the thread by the deal or by name and reads what the project wrote since their last mail
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
 2. the user writes and edits an answer in the `Draft` at the end of the thread
 3. the user sends the answer with `Mail.reply`; the reply settles the card
-system: opens the asking mail, keeps the `Draft` if the user leaves, and sends the reply to whoever wrote the mail.
+system: opens with the point in the `Draft` and the first project mail after the user's last mail at the top, or the latest mail if none followed theirs; fills any spare space with earlier history, keeps the draft if the user leaves, and sends the reply to whoever wrote the mail.
 user: the words of the answer, or done when there are none.
 cases: a cold mail with its recap, answered without the history; a result with proof; a colleague reached through `slack.Bot`.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
@@ -197,9 +202,21 @@ The historical review above was of Start a thread. Starting an agent from a mail
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule the last mail stays live
-when the project's current ask in a `Thread` has no user reply, then an update replaces its words in place, even if another agent writes them. It reads `edited` and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
-why: a thread of ten mails that each supersede the last is a feed; one live mail is a state the user can read in one look.
+status: a second send from the same agent updates its live mail in place.
+when a project agent has already sent a `Mail` since the user's last mail in the `Thread`, then rho refuses another from that agent and tells them which mail to edit. Other agents can each send one mail. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
+why: a thread of ten mails that each supersede the last is a feed; each agent has one place for current words.
+rejected:
+- a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing mail; another send must not silently change it
 
 ## rule a cold mail carries a recap
-when more than ten minutes have passed since the user had a `Thread` open, then it is cold. rho tells the `Project` once. The project's next pinging `Mail`, new or edited, carries a `## recap` section: enough that the user can answer without reading the history. When ten minutes pass with a pinging mail that has no recap, rho reminds the project once. Warm, the recap is not on screen; cold, it shows in `design.recap`. Warm mail is short.
-why: the user comes back to a thread with no memory of it; the recap is for them, and the history stays whole for the times they want it.
+status: rho decides cold from when the user last had the thread open, then hides or shows the recaps together.
+when project `Mail` arrives or is edited in a `Thread` more than ten minutes after the user's last mail or verdict there (or with neither), then it opens a cold stretch. The newest stretch opener with a `## recap` shows that section in `design.recap` before its body. All other recap sections are hidden. An answer within ten minutes does not move or hide the chosen recap.
+why: after a long gap the user can answer without reading the history, and the same context stays visible while they work.
+rejected:
+- cold from when the user last had the thread open · 2026-11-21 · reading on either device must not change the recap; the user's actual words and decisions mark the return
+
+rho tells the project once when the thread goes cold. The project's next pinging mail, new or edited, carries a recap that lets the user answer without the history. When ten minutes pass with a pinging mail that has no recap, rho reminds the project once.
+
+## rule new mail follows the draft at the tail
+status: new or edited mail does not keep the draft in place or show a notice while the user reads.
+when new project `Mail` arrives or the latest mail is edited, then history moves as needed to keep the `Draft` in place if it is inline, without moving the point. If it is stuck, history stays where it was and the draft shows a quiet `↓ new mail` at its right end until the user scrolls down to the tail.

@@ -23,6 +23,15 @@ The way back keeps the user's earlier screens, as they were left. A screen that 
 
 Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end. A search selects the whole match, so `c` changes it and `d` deletes it.
 
+## concept Bottom-stuck excerpt
+status: an excerpt scrolls away with the rest of the screen's text.
+purpose: let the user keep working in one part of the text while reading what came before it.
+principle: the user scrolls back to read an old `mail.Mail` while typing a `mail.Draft`; the draft remains editable at the bottom, with history above it.
+sees: a designated excerpt as ordinary text when its first line is in the window; when that line is below the window, the excerpt sits over the bottom edge. It can take up to half the window; if taller, its text scrolls inside that space. On the phone it stays above the keyboard.
+does:
+- scroll history `ctrl-u`, `ctrl-d`, or by thumb above the excerpt: move the view, not the point
+- move and search: use the same motions as one buffer; `k` from the first line can move into history, `G` goes to the end
+
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
 principle: the user opens a thread that asks for them; the line at the top names it and says `waits · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.

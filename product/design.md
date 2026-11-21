@@ -95,8 +95,8 @@ form: [you and clock@lab above their respective mails](design/laptop-card.png).
 purpose: let the user read an exchange and know who said what, with nothing between the mails but a blank line.
 looks: the words in `editor text` on the `reading surface`; the user's own mail in `marked`, the project's in `reading text`; one blank line between mails; a `quiet` name line above a mail from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`; a `## recap` section in `recap`.
 states:
-- warm: the recap section is not drawn.
-- cold: the recap is drawn in `recap`, where the writer put it.
+- recap anchor: the heading and recap are drawn in `recap`, before the body of the mail.
+- other mail: the recap section is not drawn.
 - sending: the user's words in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `mail.Thread`.
@@ -120,6 +120,7 @@ purpose: let the user write the next mail without leaving the buffer.
 looks: ordinary `editor text` after the last mail and one blank line, on the same `reading surface`; nothing marks where the history ends.
 states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft.
+- stuck in a thread: the same excerpt at the bottom, up to half the window; `↓ new mail` appears right-aligned in `quiet` when history changes above it.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - after send: the words are the last mail, marked while on their way; the draft is empty with the point in it. For an idea the echo says where it went.
 used on: `mail.Thread` and the draft of `mail.Write an idea`.
