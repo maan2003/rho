@@ -237,7 +237,8 @@ pub struct ThreadView {
     initial_scroll: bool,
     latest_mail: Option<(Party, ChatSeq)>,
     hint_anchor: Option<Anchor>,
-    last_point_row: u32,
+    /// Resolve against the new transcript before inferring motion direction.
+    last_point: Anchor,
     /// The mail dealt to this view, also the target when the cursor is
     /// between mails rather than on a different writer's mail.
     dealt_mail: Option<MessageId>,
@@ -351,7 +352,9 @@ impl ThreadView {
                     let selection = editor.selections.newest_anchor();
                     let head = selection.head();
                     let row = head.to_point(&snapshot).row;
-                    let previous = std::mem::replace(&mut this.last_point_row, row);
+                    let previous = std::mem::replace(&mut this.last_point, head)
+                        .to_point(&snapshot)
+                        .row;
                     let tail = draft::start(this.transcript.buffer(), cx).row;
                     if selection.start == selection.end
                         && row < tail
@@ -368,7 +371,6 @@ impl ThreadView {
                                 .find(|&row| this.transcript.buffer().read(cx).line_len(row) > 0)
                                 .unwrap_or(tail)
                         };
-                        this.last_point_row = target;
                         this.cursor_to_row(target, Autoscroll::fit(), cx);
                         return;
                     }
@@ -423,7 +425,7 @@ impl ThreadView {
             initial_scroll: !list,
             latest_mail: latest_mail(system, thread),
             hint_anchor: None,
-            last_point_row: 0,
+            last_point: Anchor::Min,
             dealt_mail: None,
             reply_to: None,
             expanded_quotes: HashSet::new(),
@@ -445,13 +447,16 @@ impl ThreadView {
             // The list reads from the top.
             view.cursor_to_first_thread(cx);
         } else {
-            view.editor.update(cx, |editor, cx| {
+            let end = view.editor.update(cx, |editor, cx| {
                 let display = editor.display_snapshot(cx);
                 let end = display.buffer_snapshot().max_point();
                 editor.selections.change_with(&display, |selections| {
                     selections.select_ranges([end..end]);
                 });
+                editor.selections.newest_anchor().head()
             });
+            view.last_point = end;
+            view.draft_point = Some(end);
         }
         // What is unread and the user's private replies come from the
         // ledger, which is the frame's and is leased while it opens this:

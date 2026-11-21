@@ -124,7 +124,7 @@ rejected:
 
 The point never rests on the blank line between two mails. A reply from a dealt card settles the card and stays on the thread; the next card waits for `deal.Card.deal`. On the phone, the whole space below the last mail is the draft's tap target.
 
-Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), and [an outcome with its proof](design/laptop-proof.png).
+Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), [an outcome with its proof](design/laptop-proof.png), [a cold recap above its mail](design/laptop-reading.png), and [the notice in a stuck phone draft](design/phone-reading-notice.png).
 
 mock:
 ```text

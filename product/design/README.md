@@ -46,7 +46,7 @@ Starting from the waiting clock ask, run the rows in order. `space` deals on Des
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
 | [Mail body search](laptop-prompt.png) | `form_way laptop input 'text::' 'wait:400' 'text:mail: behavior' 'wait:600'; form_shot laptop prompt` |
-| [Verdict menu over the card](laptop-menu.png) | `form_way laptop input 'key:escape' 'wait:600' 'key:space' 'wait:700'; form_shot laptop menu` |
+| [Verdict menu below the card](laptop-menu.png) | `form_way laptop input 'key:escape' 'wait:600' 'key:space' 'wait:700'; form_shot laptop menu` |
 | [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:k' 'key:k' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |
 
@@ -99,11 +99,11 @@ form_way laptop stop
 form_gui phone laptop
 # After the thread restores, scroll back and tap inside its projected draft:
 form_way phone input 'key:ctrl+u' 'key:ctrl+u' 'wait:550'
-form_way phone click 130 1550
+form_way phone click 153 1550
 form_way phone input 'text:only ' 'wait:550'
 fixture="$bins/examples/thread_reading_fixture"
 read -r ws worker mid < <("$fixture" send "$rig/runtime" "$rig/repo" 2 \
-    $'Both checks pass.\\n\\nThe retry policy did not change.')
+    $'Both checks pass.\n\nThe retry policy did not change.')
 sleep .6
 form_shot phone reading-notice
 ```
@@ -113,7 +113,7 @@ body, and no March or warm recap. The short tail sits at the window edge.
 The [phone notice](phone-reading-notice.png) leaves the reading position and
 the full draft in place, even when the notice doesn't fit beside the draft.
 Scroll back down with `ctrl-d`; the notice clears when the draft comes inline.
-While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\\n\\nNo retries were changed.\\n\\nBoth clocks use the same input.'`:
+While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history moves up, but the draft and caret stay put.
 
 ## Desk on laptop and phone: what moves
