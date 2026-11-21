@@ -129,14 +129,14 @@ impl Editor {
         snapshot: &DisplaySnapshot,
         scroll_y: f64,
         viewport: f64,
-        label_rows: f64,
+        chrome_rows: f64,
     ) -> Option<StuckExcerptRows> {
         let rows = self.stuck_excerpt_range(snapshot)?;
         let start_y = snapshot.row_y(rows.start.as_f64());
         let end_y = snapshot.row_y(rows.end.as_f64());
         let state = self.stuck_excerpt.as_mut()?;
         let Some((height, max_offset)) =
-            panel_size(state.edge, start_y, end_y, scroll_y, viewport, label_rows)
+            panel_size(state.edge, start_y, end_y, scroll_y, viewport, chrome_rows)
         else {
             state.pending = false;
             state.followed_head = None;
@@ -175,9 +175,9 @@ fn panel_size(
     end: f64,
     scroll: f64,
     viewport: f64,
-    label_rows: f64,
+    chrome_rows: f64,
 ) -> Option<(f64, f64)> {
-    let height = (end - start).min((viewport / 2.0).floor() - label_rows);
+    let height = (end - start).min((viewport / 2.0).floor() - chrome_rows);
     (edge.is_outside(start, end, scroll, viewport) && height > 0.0)
         .then_some((height, end - start - height))
 }
@@ -199,6 +199,14 @@ mod tests {
         assert_eq!(
             panel_size(StuckEdge::Bottom, 45.0, 71.0, 14.0, 31.0, 0.0),
             Some((15.0, 11.0))
+        );
+    }
+
+    #[test]
+    fn the_band_counts_toward_the_half_viewport_cap() {
+        assert_eq!(
+            panel_size(StuckEdge::Top, 1.0, 13.0, 15.0, 13.5, 0.625),
+            Some((5.375, 6.625))
         );
     }
 

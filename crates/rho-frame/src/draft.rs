@@ -520,6 +520,99 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_short_top_draft_does_not_shift_when_stuck_or_notified(cx: &mut gpui::TestAppContext) {
+        use editor::{EditorMode, SizingBehavior};
+        use gpui::{point, px, size};
+
+        let (document, caret) = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+
+            let draft = cx.new(|cx| Buffer::local("reference clock\nsecond line", cx));
+            let history = cx.new(|cx| Buffer::local(&"history\n".repeat(70), cx));
+            let document = Placement::Top.document(&history, &draft, cx);
+            let caret = document
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(Point::new(1, 5));
+            (document, caret)
+        });
+        let window = cx.add_window(|window, cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                document,
+                None,
+                window,
+                cx,
+            );
+            Placement::Top.stick(&mut editor, "↑ new mail".into(), cx);
+            editor
+        });
+        cx.simulate_window_resize(window.into(), size(px(610.), px(342.)));
+        cx.draw_window(window.into());
+        let draft_xy =
+            |editor: &mut Editor, window: &mut gpui::Window, cx: &mut Context<Editor>| {
+                let display = editor.snapshot(window, cx);
+                editor
+                    .window_position_for_display_point(
+                        caret.to_display_point(&display),
+                        &display,
+                        window,
+                        cx,
+                    )
+                    .unwrap()
+            };
+        let inline = window.update(cx, draft_xy).unwrap();
+        window
+            .update(cx, |editor, window, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([caret..caret]);
+                });
+                editor.set_scroll_position(point(0., 12.25), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        let history_xy = |editor: &Editor| {
+            editor
+                .buffer_location_for_window_position(
+                    point(inline.x, inline.y + px(65.)),
+                    Bias::Left,
+                )
+                .unwrap()
+        };
+        let before_notice = window
+            .update(cx, |editor, window, cx| {
+                assert!(
+                    editor.stuck_excerpt_is_visible(),
+                    "scroll {:?}, visible lines {:?}, max point {:?}",
+                    editor.scroll_position(cx),
+                    editor.visible_line_count(),
+                    editor.snapshot(window, cx).max_point()
+                );
+                assert_eq!(draft_xy(editor, window, cx), inline);
+                let history = history_xy(editor);
+                editor.mark_stuck_excerpt(cx);
+                history
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        window
+            .update(cx, |editor, window, cx| {
+                assert_eq!(draft_xy(editor, window, cx), inline);
+                assert_eq!(history_xy(editor), before_notice);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn the_top_projection_keeps_a_tall_drafts_real_caret_and_leaves_room_for_history(
         cx: &mut gpui::TestAppContext,
     ) {

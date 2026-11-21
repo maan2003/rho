@@ -34,6 +34,8 @@ The built window puts the work in one editor. The top line tells the user where 
 - reading inset · `8 px` · keep the edge of window controls off the frame.
 - seam width · `1 px` · divide the top line and phone controls without adding a panel.
 - command strip breath · `2 px` above and below · keep prompt and menu close to the text rhythm.
+- stuck draft shadow · `4 px` down, `12 px` blur, black at `35%` · separate the draft from the history below its seam without dimming the draft.
+- draft gutter stroke · `1 px` beside each inline line of a thread draft, `2 px` continuous when stuck · keep the left edge fixed while marking the whole stuck draft.
 - thumb target · `56 px` high · an action the thumb can hit at the bottom edge or in a menu sheet.
 - narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop menu grid.
 - row air · two text spaces · leave space between a row name and its words.
@@ -117,14 +119,14 @@ A separate clock per test should do it.
 
 ## part Draft
 purpose: let the user write the next mail without leaving the buffer.
-looks: the user's words in `marked`, like their sent mail, at the top of the thread, one blank line above the newest mail, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line, as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` mail.
+looks: the user's words in `marked`, like their sent mail, at the top of the thread, one blank line above the newest mail, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` mail.
 states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
-- stuck in a thread: the same excerpt at the top edge, up to half the window, on the `command strip` surface so it reads as a layer over the history; `↑ new mail` appears right-aligned in `quiet` when project mail lands below it while the user reads history.
+- stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new mail` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - after send: the words are the newest mail, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
 used on: `mail.Thread` and the draft of `mail.Write an idea`.
-form: [empty reply](design/laptop-card.png), [empty idea](design/laptop-idea-empty.png), and [stuck reply with new mail](design/phone-reading-notice.png).
+form: [empty reply](design/laptop-card.png), [empty idea](design/laptop-idea-empty.png), and a stuck reply with new mail on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
 ## part Menu
 purpose: offer a few keyed choices without taking the user away from the thing they are on.
