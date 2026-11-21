@@ -216,30 +216,17 @@ class Tools(WorksetCase):
         awaited = asyncio.run(_await(posted))
         self.assertEqual(awaited, expected)
         self.assertIsInstance(awaited, int)
-        self.assertIsNone(awaited.notice)
 
-        self.state.send_unanswered = expected, self.root
-        printed, result = run(lambda: mailbox.send("user", "Done.", thread=thread))
-        self.assertEqual(asyncio.run(_await(result)), expected + 1)
-        self.assertEqual(
-            result.notice,
-            f"Mail #{expected} has no user reply. If it is still live, use `mail.edit({expected}, ...)` for updates.",
-        )
-        self.assertIn(result.notice, printed)
-        self.assertEqual(asyncio.run(_await(result)).notice, result.notice)
-        self.assertEqual([mail["text"] for mail in self.state.messages[2:]], ["Use the mock clock.", "Done."])
-
-    def test_send_recommends_the_writer_edit_their_own_mail(self):
-        other = add_agent(self.state, native(), preset="engineer", cwd=self.tmp)
+    def test_send_propagates_the_hosts_edit_instruction_without_posting(self):
+        ns, _ = self.notebook(self.root)
+        mailbox = ns["mail"]
         project = fake_rho.post_user(None, "rho")
         thread = fake_rho.post_user(project, "Do it.")
-        _, earlier = run(lambda: tools.Mail(other).send(thread, "My first finding."))
-        self.state.send_unanswered = earlier, other
-
-        printed, posted = run(lambda: tools.Mail(self.root).send(thread, "Also this."))
-        self.assertEqual(fake_rho.message(posted)["text"], "Also this.")
-        self.assertIn(f"Mail #{earlier} has no user reply.", printed)
-        self.assertIn("ask its writer to use `mail.edit`", posted.notice)
+        _, earlier = run(lambda: mailbox.send("user", "My first finding.", thread=thread))
+        self.state.send_error = f"mail.send refused. Use mail.edit({earlier}, text) instead."
+        with self.assertRaisesRegex(RuntimeError, rf"mail\.edit\({earlier}, text\)"):
+            mailbox.send("user", "Also this.", thread=thread)
+        self.assertEqual([m["text"] for m in self.state.messages[2:]], ["My first finding."])
 
     def test_other_mail_tools_start_immediately_and_can_be_awaited(self):
         ns, _ = self.notebook(self.root)

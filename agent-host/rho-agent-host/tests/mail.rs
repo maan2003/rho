@@ -246,12 +246,43 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             ),
         )
     };
-    let first = send(aw, a, "Can I use clock A?").await?;
-    let repeat = send(bw, b, "Can I use clock A?").await?;
-    let changed = send(bw, b, "Can I use clock B?").await?;
-    assert_eq!(first, repeat);
-    assert_eq!(first, changed);
-    let id = MessageId(rho_agent_types::ChatSeq(first.trim().parse()?));
+    let first = eval(
+        aw,
+        format!(
+            "from rho import mail\nprint(int(mail.send({:?}, 'user', 'Use polling for this check.', thread={}, ping=False)))",
+            a.encoded(), thread.0.0
+        ),
+    )
+    .await?;
+    let first: u64 = first.trim().parse()?;
+    let independent = send(bw, b, "Can I use clock B?").await?;
+    let id = MessageId(rho_agent_types::ChatSeq(independent.trim().parse()?));
+    assert_ne!(first, id.0.0, "each agent owns its own mail");
+    let refused = send(aw, a, "Can I use clock A?").await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("mail.edit({first}, text)")),
+        "{refused:#}"
+    );
+    let first_before = call(
+        paths,
+        Eval {
+            workset: aw,
+            code: format!("print(mail.message({first})['text'])"),
+        },
+    )
+    .await?;
+    assert_eq!(first_before.output.trim(), "Use polling for this check.");
+    eval(
+        bw,
+        format!(
+            "from rho.tools import Mail\nMail({:?}).edit({}, 'Can I use a monotonic clock?')",
+            b.encoded(),
+            id.0.0
+        ),
+    )
+    .await?;
     let revision = wait_for_mail(&mut stream, |row|
         matches!(row.event, ChatEvent::Revised { message, author, .. } if message == id && author == b)
     ).await?;
@@ -261,7 +292,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     assert_eq!(
         content,
         [ContentPart::Text {
-            text: "Can I use clock B?".into()
+            text: "Can I use a monotonic clock?".into()
         }]
     );
     // The second agent was a member of the same thread at the time of the
@@ -281,7 +312,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 .any(|(_, row)| matches!(row, LogEvent::Request { .. }))
         );
     }
-    // The new writer's address is resolved by the host, even after leaving.
+    // An answer goes to the exact mail's writer, even after leaving.
     eval(bw, format!("mail.leave({}, {:?})", thread.0.0, b.encoded())).await?;
     eval(aw, format!("mail.leave({}, {:?})", thread.0.0, a.encoded())).await?;
     let answer = call(
@@ -308,6 +339,22 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             .collect::<Vec<_>>(),
         [b]
     );
+    let fresh = send(bw, b, "I will use clock B.").await?;
+    assert_ne!(id.0.0, fresh.trim().parse::<u64>()?);
+    let frozen = eval(
+        bw,
+        format!(
+            "from rho.tools import Mail\nMail({:?}).edit({}, 'I will use clock B.')",
+            b.encoded(),
+            id.0.0
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        frozen.to_string().contains("already answered"),
+        "{frozen:#}"
+    );
     // An explicit stop leaves a status, not another mail.
     call(paths, StopAgent { agent: b }).await?;
     loop {
@@ -320,7 +367,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         }
     }
     Ok(format!(
-        "two agents, one live ask #{}; the answer named the new writer",
+        "two independent mails; repeat send refused, explicit edit and answer verified for mail #{}",
         id.0.0
     ))
 }
@@ -383,6 +430,7 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         ChatEvent::Posted { parent: Some(parent), from: Address::Agent(from), mentions, .. }
         if *parent == thread && *from == agent && mentions.iter().any(|m| matches!(m, rho_agent_types::Mention::User { ping: true }))
     )).await?;
+    let tool_thread = post(paths, 90, Some(project), "Check the interface.").await?;
     let EvalResult { output, error, .. } = call(
         paths,
         Eval {
@@ -394,8 +442,6 @@ from rho.tools import Mail
 mail = Mail("{}")
 note = await mail.send("user", "Use polling for this check.", thread={}, ping=False)
 assert isinstance(note, int)
-assert "Mail #{prior} has no user reply" in note.notice, note.notice
-assert "mail.edit({prior}, ...)" in note.notice, note.notice
 mail.edit(note, "Use sockets for this check.", ping=True)
 hits = await mail.search("sockets", project={})
 assert [row["message"] for row in hits] == [note]
@@ -404,10 +450,9 @@ assert not mail.search("sockets", project={})
 print(f"worker:{{os.getpid()}} note:{{note}}")
 "#,
                 agent.encoded(),
-                thread.0.0,
+                tool_thread.0.0,
                 project.0.0,
                 project.0.0,
-                prior = origin_result.seq.0,
             ),
         },
     )

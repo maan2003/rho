@@ -117,7 +117,7 @@ def on_notebook(agent, ns):
             if thread:
                 _rho.send_mail(agent.id, thread[0], text, **address)
             else:
-                message, _unanswered = _rho.send_mail(agent.id, None, text, **address)
+                message = _rho.send_mail(agent.id, None, text, **address)
                 thread.append(message)
     ns["human"] = Human()
 
@@ -191,10 +191,7 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                         match write.post(rho_agent_types::UnixMs::now(), parent, message, None) {
                             Ok(id) => {
                                 write.commit();
-                                PyReply::SentMail {
-                                    id,
-                                    unanswered: None,
-                                }
+                                PyReply::Seq(id.0)
                             }
                             Err(error) => PyReply::Error(format!("{error:#}")),
                         }

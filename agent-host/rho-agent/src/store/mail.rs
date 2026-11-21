@@ -735,16 +735,8 @@ pub trait MailWrite {
         project: Option<MessageId>,
         message: NewMessage,
     ) -> anyhow::Result<MessageId>;
-    /// The latest project mail in this thread, if it has no user reply.
-    fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)>;
-    /// Reuses the current unanswered pinging mail, if the thread has one,
-    /// and whether its words changed.
-    fn restate_ping(
-        &mut self,
-        at: UnixMs,
-        thread: MessageId,
-        message: &NewMessage,
-    ) -> anyhow::Result<Option<(MessageId, bool)>>;
+    /// The agent's live mail in this thread since the user's last mail.
+    fn live_project_mail(&mut self, thread: MessageId, agent: AgentId) -> Option<MessageId>;
     /// The current writer in the same transaction that records the answer.
     fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId>;
     fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq>;
@@ -981,40 +973,6 @@ fn current_message(write: &mut WriteTxn, id: MessageId) -> Option<Message> {
     Some(message)
 }
 
-fn last_project_mail(
-    write: &mut WriteTxn,
-    thread: MessageId,
-    matches: impl Fn(&Message) -> bool,
-) -> Option<Message> {
-    let anchor = current_message(write, thread)?;
-    // A project root is a collection of threads, not a single conversation.
-    if anchor.parent.is_none() && !anchor.to_user() {
-        return None;
-    }
-    let mut candidates: Vec<_> = write
-        .open_table(CHILDREN)
-        .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
-        .rev()
-        .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
-        .collect();
-    // A deeper branch's anchor is mail in its enclosing conversation.
-    if anchor
-        .parent
-        .is_none_or(|parent| parent_now(write, parent).is_none())
-    {
-        candidates.insert(candidates.partition_point(|id| *id > thread), thread);
-    }
-    candidates
-        .into_iter()
-        .filter_map(|id| current_message(write, id))
-        .find(|mail| {
-            !matches!(
-                mail.revision,
-                Revision::Deleted | Revision::TakenBack { .. }
-            ) && matches(mail)
-        })
-}
-
 fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow::Result<Message> {
     let mail =
         current_message(write, id).ok_or_else(|| anyhow::anyhow!("no message #{}", id.0.0))?;
@@ -1044,25 +1002,24 @@ fn revise(
     write: &mut WriteTxn,
     at: UnixMs,
     mail: &Message,
-    writer: AgentId,
+    author: AgentId,
     content: Vec<ContentPart>,
     ping: Option<bool>,
-) -> bool {
+) {
     let ping = mail
         .to_user()
         .then(|| ping.unwrap_or_else(|| mail.pings_user()));
     if mail.content == content && ping.is_none_or(|ping| ping == mail.pings_user()) {
-        return false;
+        return;
     }
     let event = ChatEvent::Revised {
         message: mail.id,
-        author: writer,
+        author,
         content,
         ping,
     };
     let seq = append(write, at, event.clone());
     write.index_mail_event(seq, &event);
-    true
 }
 
 impl MailWrite for WriteTxn {
@@ -1173,47 +1130,46 @@ impl MailWrite for WriteTxn {
         Ok(id)
     }
 
-    fn unanswered_project_mail(&mut self, thread: MessageId) -> Option<(MessageId, AgentId)> {
-        let latest = last_project_mail(self, thread, |mail| {
-            matches!(mail.from, Address::Agent(_))
+    fn live_project_mail(&mut self, thread: MessageId, agent: AgentId) -> Option<MessageId> {
+        // SPEC-live-project-mail: the same transaction checks the writer's
+        // slot and appends the new mail. Thread membership is the current
+        // parent, but a top-level thread starts with its opening mail.
+        let anchor = current_message(self, thread)?;
+        if anchor.parent.is_none() && !anchor.to_user() {
+            return None; // a project directory, not an exchange
+        }
+        let mut candidates: Vec<_> = self
+            .open_table(CHILDREN)
+            .range((thread.0.0, 0)..=(thread.0.0, u64::MAX))
+            .rev()
+            .map(|(key, _)| MessageId(ChatSeq(key.value().1)))
+            .collect();
+        if anchor
+            .parent
+            .is_none_or(|parent| parent_now(self, parent).is_none())
+        {
+            candidates.insert(candidates.partition_point(|id| *id > thread), thread);
+        }
+        for id in candidates {
+            let mail = current_message(self, id).expect("a child is a message");
+            if mail.from == Address::User {
+                break;
+            }
+            if mail.from == Address::Agent(agent)
+                && !matches!(
+                    mail.revision,
+                    Revision::Deleted | Revision::TakenBack { .. }
+                )
                 && !mail
                     .mentions
                     .iter()
                     .any(|m| matches!(m, Mention::Direct(_)))
-        })?;
-        let Address::Agent(writer) = latest.from else {
-            unreachable!()
-        };
-        (!has_user_reply(self, latest.id)).then_some((latest.id, writer))
-    }
-
-    fn restate_ping(
-        &mut self,
-        at: UnixMs,
-        thread: MessageId,
-        message: &NewMessage,
-    ) -> anyhow::Result<Option<(MessageId, bool)>> {
-        let Address::Agent(writer) = message.from else {
-            return Ok(None);
-        };
-        let ping = Mention::User { ping: true };
-        if message.mentions != [ping] {
-            return Ok(None);
+                && !has_user_reply(self, id)
+            {
+                return Some(id);
+            }
         }
-        let Some(mail) = last_project_mail(self, thread, |mail| {
-            matches!(mail.from, Address::Agent(_)) && mail.pings_user()
-        }) else {
-            return Ok(None);
-        };
-        if mail.mentions != [ping] || has_user_reply(self, mail.id) {
-            return Ok(None);
-        }
-        if let Some(reply_to) = message.reply_to {
-            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
-        }
-        anyhow::ensure!(has_content(&message.content), "a message needs content");
-        let changed = revise(self, at, &mail, writer, message.content.clone(), None);
-        Ok(Some((mail.id, changed)))
+        None
     }
 
     fn mail_writer(&mut self, mail: MessageId) -> Option<AgentId> {

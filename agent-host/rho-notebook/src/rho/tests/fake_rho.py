@@ -17,8 +17,7 @@ class State:
         self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
         self.messages = []  # MessageRecord, in order, with `_to`: who receives it
-        self.send_unanswered = None  # host-supplied prior mail and author in a send receipt
-        self.send_unanswered = None  # host-supplied prior mail and author in a send receipt
+        self.send_error = None
         self.members = {}  # (thread, agent) -> joined (True) or left
         self.names = {}  # thread -> name
         self.inputs = []  # (agent, text, role, message)
@@ -208,7 +207,9 @@ def send_mail(sender, parent, text, *, to=None, ping=True, reply_to=None):
             raise ValueError(f"{sender} is not an agent of this workset")
         if to in (None, "user"):
             mentions = [] if to is None else [(to, ping)]
-            return _post(sender, parent, text, mentions, reply_to), STATE.send_unanswered
+            if STATE.send_error:
+                raise RuntimeError(STATE.send_error)
+            return _post(sender, parent, text, mentions, reply_to)
         if to not in STATE.agents and to not in STATE.elsewhere:
             raise ValueError("agent was deleted or does not exist")
         if sender == to:
@@ -245,7 +246,7 @@ def send_mail(sender, parent, text, *, to=None, ping=True, reply_to=None):
         id = _post(sender, thread or project, text, [(to, "direct")], reply_to)
         if thread is None:
             STATE.names[id] = " ↔ ".join(sorted(pair))
-        return id, None
+        return id
 
 
 def agent_handle(agent):

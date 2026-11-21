@@ -1482,47 +1482,41 @@ impl AgentPool {
                 let mut write = self.db.write().await;
                 let at = UnixMs::now();
                 let pings = message.mentions.contains(&Mention::User { ping: true });
-                let (id, changed, unanswered) = if direct {
-                    (write.post_peer(at, project, message)?, true, None)
+                let id = if direct {
+                    write.post_peer(at, project, message)?
                 } else {
-                    let revised = match parent {
-                        Some(thread) if pings => write.restate_ping(at, thread, &message)?,
-                        _ => None,
-                    };
-                    let unanswered = if pings {
-                        None
-                    } else {
-                        parent.and_then(|thread| write.unanswered_project_mail(thread))
-                    };
-                    let (id, changed) = match revised {
-                        Some(revised) => revised,
-                        None => (write.post(at, parent, message, None)?, true),
-                    };
-                    (id, changed, unanswered)
+                    if let Some(thread) = parent
+                        && let Some(mail) = write.live_project_mail(thread, sender)
+                    {
+                        anyhow::bail!(
+                            "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
+                            mail.0.0,
+                            mail.0.0,
+                        );
+                    }
+                    write.post(at, parent, message, None)?
                 };
-                if changed {
-                    let version = write.mail_version(id);
-                    write.append(
-                        workset,
-                        &Record {
-                            at,
-                            event: Event::MailWritten {
-                                agent: sender,
-                                message: id,
-                                version,
-                            },
+                let version = write.mail_version(id);
+                write.append(
+                    workset,
+                    &Record {
+                        at,
+                        event: Event::MailWritten {
+                            agent: sender,
+                            message: id,
+                            version,
                         },
-                    )?;
-                    write.commit();
-                    self.wake_receivers(id, Some(workset));
-                    if pings {
-                        self.watch_recap(id);
-                    }
-                    if !direct {
-                        self.consider_naming(id);
-                    }
+                    },
+                )?;
+                write.commit();
+                self.wake_receivers(id, Some(workset));
+                if pings {
+                    self.watch_recap(id);
                 }
-                PyReply::SentMail { id, unanswered }
+                if !direct {
+                    self.consider_naming(id);
+                }
+                PyReply::Seq(id.0)
             }
             PyRequest::Edit {
                 agent,

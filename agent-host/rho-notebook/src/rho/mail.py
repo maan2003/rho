@@ -33,12 +33,7 @@ def _local_address(sender, to):
 
 
 class SentMail(int):
-    """The new mail's id, with any follow-up suggestion in `notice`."""
-
-    def __new__(cls, id: int, notice: str | None = None):
-        self = super().__new__(cls, id)
-        self.notice = notice
-        return self
+    """The new mail's id, awaitable without sending again."""
 
     def __await__(self):
         return self
@@ -46,12 +41,7 @@ class SentMail(int):
 
 
 def _send(sender, parent, text, **kwargs) -> SentMail:
-    id, unanswered = _rho.send_mail(sender, parent, text, **kwargs)
-    if unanswered is None:
-        return SentMail(id)
-    prior, author = unanswered
-    edit = f"use `mail.edit({prior}, ...)`" if author == sender else "ask its writer to use `mail.edit`"
-    return SentMail(id, f"Mail #{prior} has no user reply. If it is still live, {edit} for updates.")
+    return SentMail(_rho.send_mail(sender, parent, text, **kwargs))
 
 
 def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail:
@@ -118,7 +108,7 @@ def send(sender, to, text, *, thread=None, reply_to=None, ping=True) -> SentMail
 
 
 def make_project(sender: str, name: str) -> int:
-    return _rho.send_mail(sender, None, name)[0]
+    return _rho.send_mail(sender, None, name)
 
 
 def join(thread: int, agent: str) -> None:

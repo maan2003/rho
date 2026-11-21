@@ -863,7 +863,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
 }
 
 #[tokio::test]
-async fn last_project_mail_waits_for_a_user_reply_not_a_new_post() {
+async fn live_project_mail_tracks_each_writer_until_the_next_user_post() {
     let (_dir, db) = db().await;
     let mut write = db.write().await;
     let (a, b) = (agent(1), agent(2));
@@ -879,208 +879,50 @@ async fn last_project_mail_waits_for_a_user_reply_not_a_new_post() {
             None,
         )
         .unwrap();
-    assert_eq!(write.unanswered_project_mail(root), None);
-    assert_eq!(write.unanswered_project_mail(thread), Some((thread, a)));
-
-    let result = write
-        .post(
-            at,
-            Some(thread),
-            NewMessage {
-                mentions: vec![Mention::User { ping: true }],
-                ..said(Address::Agent(b), "Gateway passed")
-            },
-            None,
-        )
-        .unwrap();
-    let unrelated = write
-        .post(
-            at,
-            Some(thread),
-            said(Address::User, "Separate question"),
-            None,
-        )
-        .unwrap();
-    assert_eq!(write.unanswered_project_mail(unrelated), None);
+    assert_eq!(write.live_project_mail(root, a), None, "not a conversation");
     assert_eq!(
-        write.unanswered_project_mail(result),
-        None,
-        "a tangent's anchor belongs to the main thread"
+        write.live_project_mail(thread, a),
+        Some(thread),
+        "top-level anchor"
     );
 
-    let coworker = write
-        .post(
-            at,
-            Some(thread),
-            NewMessage {
-                reply_to: Some(result),
-                ..said(Address::Agent(a), "The queue is clear")
-            },
-            None,
-        )
-        .unwrap();
-    assert_eq!(write.unanswered_project_mail(thread), Some((coworker, a)));
-    write.delete(at, a, coworker).unwrap();
-    assert_eq!(write.unanswered_project_mail(thread), Some((result, b)));
-
-    let answer = write
-        .post(
-            at,
-            Some(thread),
-            NewMessage {
-                reply_to: Some(result),
-                ..said(Address::User, "Thanks")
-            },
-            None,
-        )
-        .unwrap();
-    write.reparent(at, answer, Some(unrelated)).unwrap();
-    assert_eq!(
-        write.unanswered_project_mail(thread),
-        None,
-        "do not fall back to the older unacknowledged anchor"
-    );
-    assert!(
-        write
-            .edit(
-                at,
-                b,
-                result,
-                said(Address::Agent(b), "Actually failed").content,
-                None
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("already answered")
-    );
-    assert!(
-        write
-            .delete(at, b, result)
-            .unwrap_err()
-            .to_string()
-            .contains("already answered")
-    );
-
-    let followup = write
-        .post(at, Some(thread), said(Address::Agent(b), "All done"), None)
-        .unwrap();
-    assert_eq!(write.unanswered_project_mail(thread), Some((followup, b)));
-    let legacy = write
-        .post(at, Some(followup), said(Address::User, "That's all"), None)
-        .unwrap();
-    write.reparent(at, legacy, Some(unrelated)).unwrap();
-    assert_eq!(
-        write.unanswered_project_mail(thread),
-        None,
-        "a legacy answer survives moves too"
-    );
-    assert!(
-        write
-            .delete(at, b, followup)
-            .unwrap_err()
-            .to_string()
-            .contains("already answered")
-    );
-}
-
-#[tokio::test]
-async fn a_live_ask_is_one_mail_across_writers_and_is_never_delivered_to_peers() {
-    let (_dir, db) = db().await;
-    let mut write = db.write().await;
-    let (a, b) = (agent(1), agent(2));
-    let at = UnixMs(20);
-    let root = write
-        .post(at, None, said(Address::User, "Atlas"), None)
-        .unwrap();
-    let thread = write
-        .post(at, Some(root), said(Address::User, "Fix the clock"), None)
-        .unwrap();
-    write.join(at, thread, a).unwrap();
-    write.join(at, thread, b).unwrap();
-    let addressed = |agent, ping, text| NewMessage {
+    let words = |agent, ping, text| NewMessage {
         mentions: vec![Mention::User { ping }],
         ..said(Address::Agent(agent), text)
     };
-    let first = addressed(a, true, "Can I use clock A?");
-    assert_eq!(write.restate_ping(at, thread, &first).unwrap(), None);
-    let ask = write.post(at, Some(thread), first.clone(), None).unwrap();
+    let quiet = write
+        .post(at, Some(thread), words(b, false, "Checking offsets"), None)
+        .unwrap();
+    assert_eq!(write.live_project_mail(thread, a), Some(thread));
+    assert_eq!(write.live_project_mail(thread, b), Some(quiet));
+    assert_eq!(
+        write.live_project_mail(quiet, b),
+        None,
+        "a tangent owns its own slot"
+    );
 
-    let control = write
+    let user = write
         .post(
             at,
             Some(thread),
-            said(Address::Agent(a), "Checking the offsets"),
+            said(Address::User, "Start with Monday"),
             None,
         )
         .unwrap();
-    let repeat = addressed(b, true, "Can I use clock A?");
-    assert_eq!(
-        write.restate_ping(UnixMs(21), thread, &repeat).unwrap(),
-        Some((ask, false))
-    );
-    assert_eq!(write.mail_writer(ask), Some(a));
-    let changed = addressed(b, true, "Can I use clock B?");
-    assert_eq!(
-        write.restate_ping(UnixMs(22), thread, &changed).unwrap(),
-        Some((ask, true))
-    );
-    assert_eq!(write.mail_writer(ask), Some(b));
-    assert!(write.edit(at, a, ask, first.content.clone(), None).is_err());
-    write
-        .edit(
-            UnixMs(23),
-            b,
-            ask,
-            addressed(b, true, "Can I use a monotonic clock?").content,
-            None,
-        )
+    assert_eq!(write.live_project_mail(thread, a), None);
+    assert_eq!(write.live_project_mail(thread, b), None);
+    let current = write
+        .post(at, Some(thread), words(b, true, "Which timezone?"), None)
         .unwrap();
-    let user_answer = NewMessage {
-        reply_to: Some(ask),
-        ..said(Address::User, "Yes")
-    };
-    write.post(at, Some(thread), user_answer, None).unwrap();
-    assert_eq!(write.restate_ping(at, thread, &changed).unwrap(), None);
-    assert!(write.edit(at, b, ask, first.content.clone(), None).is_err());
-    let fresh = write.post(at, Some(thread), changed.clone(), None).unwrap();
-    let result = write
-        .post(at, Some(thread), addressed(a, true, "Clock B works"), None)
-        .unwrap();
+    assert_eq!(write.live_project_mail(thread, b), Some(current));
+    write.delete(at, b, current).unwrap();
     assert_eq!(
-        write.restate_ping(at, thread, &first).unwrap(),
-        Some((result, true)),
-        "unanswered pinging mail stays live"
+        write.live_project_mail(thread, b),
+        None,
+        "past the last user post"
     );
-    write.commit();
-
-    let read = db.read();
-    let mail = read.message(ask).unwrap();
-    assert_eq!(mail.from, Address::Agent(b));
-    assert_eq!(mail.text(), "Can I use a monotonic clock?");
-    assert_eq!(mail.version().1, UnixMs(23));
-    assert_eq!(
-        read.thread_messages(Some(thread), usize::MAX)
-            .into_iter()
-            .filter(|m| m.to_user())
-            .map(|m| m.id)
-            .collect::<Vec<_>>(),
-        [ask, fresh, result]
-    );
-    for agent in [a, b] {
-        assert!(
-            read.inbox(agent, ChatSeq::ZERO)
-                .iter()
-                .all(|m| ![ask, fresh, result].contains(&m.id)),
-            "agent {} received mail to the user",
-            agent.encoded(),
-        );
-    }
-    assert!(
-        read.recipients_of(&mail).is_empty(),
-        "peer was woken for project mail"
-    );
-    assert_eq!(read.recipients_of(&read.message(control).unwrap()), [b]);
-    assert!(read.inbox(b, ChatSeq::ZERO).iter().any(|m| m.id == control));
+    write.reparent(at, user, Some(quiet)).unwrap();
+    assert_eq!(write.live_project_mail(thread, b), Some(quiet));
 }
 
 #[tokio::test]
@@ -1134,12 +976,9 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
         .unwrap();
     log_mail(&mut write, older);
     let cross = write
-        .post(at, Some(thread), send(a, "Which clock?"), None)
+        .post(at, Some(thread), send(b, "Which monotonic clock?"), None)
         .unwrap();
     let to = log_mail(&mut write, cross);
-    write
-        .restate_ping(at, thread, &send(b, "Which monotonic clock?"))
-        .unwrap();
     let later = write
         .post(at, Some(thread), send(a, "Which timezone?"), None)
         .unwrap();

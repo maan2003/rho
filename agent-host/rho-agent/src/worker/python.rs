@@ -758,8 +758,6 @@ fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPa
     Ok(vec![ContentPart::Text { text }])
 }
 
-type SentMail = (u64, Option<(u64, String)>);
-
 /// Put mail in its project or thread. For a directed agent, the host
 /// determines the conversation; `parent` must be unset.
 #[pyfunction]
@@ -772,7 +770,7 @@ fn send_mail(
     to: Option<&str>,
     ping: Option<bool>,
     reply_to: Option<u64>,
-) -> PyResult<SentMail> {
+) -> PyResult<u64> {
     let sender = agent_id(sender)?;
     let mentions = recipient(to, ping)?;
     let content = message_content(text, &mentions)?;
@@ -784,10 +782,7 @@ fn send_mail(
         content,
     };
     match PyHost::block(py, request)? {
-        PyReply::SentMail { id, unanswered } => Ok((
-            id.0.0,
-            unanswered.map(|(message, author)| (message.0.0, author.encoded().to_string())),
-        )),
+        PyReply::Seq(id) => Ok(id.0),
         _ => Err(unexpected()),
     }
 }
