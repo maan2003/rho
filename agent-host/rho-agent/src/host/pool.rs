@@ -1022,20 +1022,14 @@ impl AgentPool {
         mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
-        let mut mentions = self.user_mentions(mentions);
         let mut write = self.db.write().await;
-        // Resolve the writer on the host, even if they are no longer a
-        // thread member. A deleted agent cannot receive mail, but the answer
-        // still belongs in the thread.
-        if let Some(target) = reply_to
-            && let Some(agent) = write.mail_writer(target)
-            && self.workset_of(agent).is_ok()
-            && mentions
-                .iter()
-                .all(|mention| mention.agent() != Some(agent))
-        {
-            mentions.push(Mention::Agent(agent));
-        }
+        // An addressed answer stays in the shared thread, but only its
+        // writer receives it. Keep this route even if the writer is gone:
+        // falling back to thread membership would deliver to someone else.
+        let mentions = match reply_to.and_then(|target| write.mail_writer(target)) {
+            Some(writer) => vec![Mention::Direct(writer)],
+            None => self.user_mentions(mentions),
+        };
         let message = NewMessage {
             from: Address::User,
             reply_to,
