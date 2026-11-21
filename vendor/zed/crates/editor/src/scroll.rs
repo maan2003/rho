@@ -985,6 +985,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.scroll_screen(amount, window, cx);
+        if self.point_in_bottom_stuck_excerpt(cx) {
+            return;
+        }
 
         let Some(visible_line_count) = self.visible_line_count() else {
             return;

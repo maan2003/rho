@@ -380,8 +380,11 @@ impl EditorElement {
                 }
 
                 if event.button == MouseButton::Left && hitbox.is_hovered(window) {
-                    let point_for_position =
-                        position_map.point_for_position_on_line(event.position, row, &line_layout);
+                    let point_for_position = position_map.point_for_position_on_row(
+                        event.position.x,
+                        row,
+                        Some(&line_layout),
+                    );
 
                     editor.update(cx, |editor, cx| {
                         let snapshot = editor.snapshot(window, cx);

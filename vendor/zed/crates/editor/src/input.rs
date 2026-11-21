@@ -3176,7 +3176,16 @@ impl EntityInputHandler for Editor {
                     + self.gutter_dimensions.full_width(),
             ) - scroll_left,
         );
-        let y = line_height * (start.row().as_f64() - scroll_position.y) as f32;
+        let y = self
+            .last_position_map
+            .as_ref()
+            .and_then(|map| map.bottom_excerpt_y(start.row()))
+            .map(|y| y - element_bounds.top())
+            .unwrap_or_else(|| {
+                line_height
+                    * (snapshot.row_y(start.row().as_f64()) - snapshot.row_y(scroll_position.y))
+                        as f32
+            });
 
         Some(Bounds {
             origin: element_bounds.origin + point(x, y),

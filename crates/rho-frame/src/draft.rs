@@ -28,12 +28,21 @@ pub fn document(
 
 fn set_excerpt(doc: &mut MultiBuffer, draft: &Entity<Buffer>, cx: &mut Context<MultiBuffer>) {
     doc.set_excerpts_for_path(
-        PathKey::sorted(1),
+        path(),
         draft.clone(),
         [Point::zero()..draft.read(cx).max_point()],
         0,
         cx,
     );
+}
+
+fn path() -> PathKey {
+    PathKey::sorted(1)
+}
+
+/// Keep this document's designated draft excerpt on screen while reading.
+pub fn stick(editor: &mut Editor, notice: gpui::SharedString, cx: &mut Context<Editor>) {
+    editor.set_bottom_stuck_excerpt(path(), notice, cx);
 }
 
 /// A sent draft isn't the next draft's undo history.
@@ -46,7 +55,7 @@ pub fn replace(editor: &Entity<Editor>, draft: &Entity<Buffer>, cx: &mut App) {
 }
 
 fn replace_excerpt(doc: &mut MultiBuffer, draft: &Entity<Buffer>, cx: &mut Context<MultiBuffer>) {
-    doc.remove_excerpts(PathKey::sorted(1), cx);
+    doc.remove_excerpts(path(), cx);
     set_excerpt(doc, draft, cx);
 }
 
@@ -192,6 +201,252 @@ pub fn focus_writing_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_short_tail_clamps_and_the_stuck_draft_resolves_to_its_real_buffer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use editor::scroll::{Autoscroll, ScrollAmount};
+        use editor::{EditorMode, SizingBehavior};
+        use gpui::{point, px, size};
+
+        let (history, draft, doc) = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+
+            let long_history = (0..84)
+                .map(|i| format!("mail line {i}\n"))
+                .collect::<String>();
+            let history = cx.new(|cx| {
+                let mut buffer = Buffer::local(&long_history, cx);
+                buffer.set_capability(Capability::Read, cx);
+                buffer
+            });
+            let draft = cx.new(|cx| Buffer::local("one line\nlonger second row", cx));
+            let doc = document(&history, &draft, cx);
+            (history, draft, doc)
+        });
+        let window = cx.add_window(|window, cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                doc.clone(),
+                None,
+                window,
+                cx,
+            );
+            stick(&mut editor, "↓ new mail".into(), cx);
+            editor
+        });
+        cx.simulate_window_resize(window.into(), size(px(600.), px(338.)));
+        cx.draw_window(window.into());
+        let draft_start = cx.update(|cx| start(&history, cx));
+        let open_target = Point::new(draft_start.row - 4, 0);
+        window
+            .update(cx, |editor, window, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let caret = snapshot.anchor_after(draft_start);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([caret..caret]);
+                });
+                editor.request_autoscroll(
+                    Autoscroll::top().for_anchor(snapshot.anchor_after(open_target)),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        let original_top = window.update(cx, |editor, window, cx| {
+            let viewport = editor.visible_line_count().unwrap();
+            assert!(viewport > 8.0, "the viewport is taller than the short tail");
+            let display = editor.snapshot(window, cx);
+            let bottom = display.row_y(display.max_point().row().next_row().as_f64());
+            let top = display.row_y(editor.scroll_position(cx).y);
+            assert!((top + viewport - bottom).abs() < 0.1,
+                "the viewport must end at the draft, not the requested top: {top} + {viewport} != {bottom}");
+            assert!(!editor.bottom_stuck_excerpt_is_visible());
+            top
+        }).unwrap();
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.scroll_screen_with_cursor_margin(&ScrollAmount::Page(-0.5), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+
+        window
+            .update(cx, |editor, window, cx| {
+                let display = editor.snapshot(window, cx);
+                assert!(
+                    editor.bottom_stuck_excerpt_is_visible(),
+                    "half-page up sticks the draft"
+                );
+                let top = display.row_y(editor.scroll_position(cx).y);
+                assert!(
+                    (original_top - top - (editor.visible_line_count().unwrap() / 2.0).trunc())
+                        .abs()
+                        < 0.2
+                );
+                assert_eq!(
+                    editor
+                        .selections
+                        .newest_anchor()
+                        .head()
+                        .to_point(display.buffer_snapshot()),
+                    draft_start
+                );
+
+                let draft_end = display.max_point();
+                let xy = editor
+                    .window_position_for_display_point(draft_end, &display, window, cx)
+                    .unwrap();
+                let (_, buffer, offset) = editor
+                    .buffer_location_for_window_position(xy + point(px(2.), px(3.)), Bias::Left)
+                    .expect("the final projected row is visible and hit-testable");
+                assert_eq!(buffer, draft.read(cx).remote_id());
+                assert_eq!(offset, "one line\nlonger second row".len());
+            })
+            .unwrap();
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.scroll_screen_with_cursor_margin(&ScrollAmount::Page(0.5), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        window
+            .update(cx, |editor, _, cx| {
+                assert!(!editor.bottom_stuck_excerpt_is_visible());
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                assert_eq!(
+                    editor.selections.newest_anchor().head().to_point(&snapshot),
+                    draft_start
+                );
+            })
+            .unwrap();
+
+        // A draft longer than the entire viewport projects less than half
+        // of it, tracks the caret, and has its own pointer-scroll offset.
+        let long = (0..36)
+            .map(|i| format!("draft line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tall = cx.update(|cx| cx.new(|cx| Buffer::local(&long, cx)));
+        let editor = window.root(cx).unwrap();
+        cx.update(|cx| replace(&editor, &tall, cx));
+        window
+            .update(cx, |editor, window, cx| {
+                let caret = Anchor::Max;
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([caret..caret]);
+                });
+                editor.set_scroll_position(point(0., 5.), window, cx);
+            })
+            .unwrap();
+        cx.draw_window(window.into());
+        let (over_draft, history_top) = window
+            .update(cx, |editor, window, cx| {
+                let display = editor.snapshot(window, cx);
+                assert!(editor.bottom_stuck_excerpt_is_visible());
+                let end = editor
+                    .window_position_for_display_point(display.max_point(), &display, window, cx)
+                    .unwrap();
+                let position = point(end.x + px(1.), end.y + px(4.));
+                let (_, buffer, offset) = editor
+                    .buffer_location_for_window_position(position, Bias::Left)
+                    .unwrap();
+                assert_eq!(
+                    (buffer, offset),
+                    (tall.read(cx).remote_id(), long.len()),
+                    "the capped projection follows the caret"
+                );
+                let half_height = window.viewport_size().height / 2.0;
+                let (_, buffer_above_half, _) = editor
+                    .buffer_location_for_window_position(
+                        point(position.x, half_height - px(2.)),
+                        Bias::Left,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    buffer_above_half,
+                    history.read(cx).remote_id(),
+                    "the draft cannot cover more than half the viewport"
+                );
+                (position, editor.scroll_position(cx))
+            })
+            .unwrap();
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_event(gpui::ScrollEvent {
+            position: over_draft,
+            delta: gpui::ScrollDelta::Lines(point(0., 4.)),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
+        });
+        cx.draw_window(window.into());
+        window
+            .update(cx, |editor, _, cx| {
+                let (_, buffer, offset) = editor
+                    .buffer_location_for_window_position(over_draft, Bias::Left)
+                    .unwrap();
+                assert_eq!(buffer, tall.read(cx).remote_id());
+                assert!(
+                    offset < long.len(),
+                    "scrolling the panel reveals earlier draft lines"
+                );
+                assert_eq!(
+                    editor.scroll_position(cx),
+                    history_top,
+                    "scrolling the panel leaves history fixed"
+                );
+            })
+            .unwrap();
+
+        // Even when there is no older history to fill the screen, the
+        // last row ends at the viewport edge, not a few rows below its top.
+        cx.update(|cx| {
+            history.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(Point::zero()..buffer.max_point(), "just one mail\n")],
+                    None,
+                    cx,
+                );
+            });
+            tall.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(Point::zero()..buffer.max_point(), "short answer")],
+                    None,
+                    cx,
+                );
+            });
+        });
+        cx.draw_window(window.into());
+        window
+            .update(cx, |editor, window, cx| {
+                let display = editor.snapshot(window, cx);
+                let xy = editor
+                    .window_position_for_display_point(display.max_point(), &display, window, cx)
+                    .unwrap();
+                let height = f64::from(window.viewport_size().height);
+                let line = height / editor.visible_line_count().unwrap();
+                assert!(
+                    (height - f64::from(xy.y) - line).abs() < 1.0,
+                    "the short document is bottom-aligned"
+                );
+                assert!(!editor.bottom_stuck_excerpt_is_visible());
+                assert_eq!(editor.scroll_position(cx).y, 0.0);
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn only_an_attempt_to_change_mail_emits_the_read_only_event(cx: &mut gpui::TestAppContext) {

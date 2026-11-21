@@ -221,6 +221,16 @@ impl Editor {
             target_bottom = display_map.row_y(target_point.row().next_row().as_f64());
         }
 
+        if matches!(
+            autoscroll,
+            Autoscroll::Strategy(AutoscrollStrategy::Fit | AutoscrollStrategy::Newest, None)
+        ) && let Some(rows) = self.bottom_excerpt_range(&display_map)
+            && rows.contains(&target_point.row())
+            && display_map.row_y(rows.start.as_f64()) >= scroll_top_y + visible_lines
+        {
+            return (NeedsHorizontalAutoscroll(false), editor_was_scrolled);
+        }
+
         let visible_sticky_headers =
             self.visible_sticky_header_count_for_point(&display_map, target_point, cx);
 

@@ -571,6 +571,16 @@ impl EditorElement {
                                 }
                             };
 
+                            if let Some(panel) = &position_map.bottom_excerpt
+                                && panel.max_offset > 0.0
+                                && panel.bounds.contains(&event.position)
+                                && delta.y != Pixels::ZERO
+                            {
+                                let dy = -f64::from(delta.y * scroll_sensitivity / line_height);
+                                editor.scroll_bottom_excerpt(dy, panel.max_offset, cx);
+                                cx.stop_propagation();
+                                return;
+                            }
                             let current_scroll_position = position_map.snapshot.scroll_position();
                             let x = (current_scroll_position.x
                                 * ScrollPixelOffset::from(glyph_width)

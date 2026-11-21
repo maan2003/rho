@@ -1,6 +1,8 @@
+mod bottom_excerpt;
 #[cfg(feature = "native")]
 mod header;
 mod mouse;
+use self::bottom_excerpt::{BottomExcerptLayout, BottomExcerptText};
 
 #[cfg(all(test, feature = "native"))]
 pub(crate) use header::StickyHeader;
@@ -1235,6 +1237,7 @@ impl EditorElement {
         em_advance: Pixels,
         autoscroll_containing_element: bool,
         redacted_ranges: &[Range<DisplayPoint>],
+        animate: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<CursorLayout> {
@@ -1246,7 +1249,7 @@ impl EditorElement {
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
             let animation_settings = EditorSettings::get_global(cx).cursor_animation;
-            let animation_enabled = animation_settings.enabled && !cx.reduce_motion();
+            let animation_enabled = animate && animation_settings.enabled && !cx.reduce_motion();
             let animation_context = animation_enabled.then(|| {
                 (
                     CursorViewport::new(
@@ -1283,7 +1286,7 @@ impl EditorElement {
                 editor
                     .cursor_animations
                     .reconcile_newest_selection(newest_animation_selection_id);
-            } else {
+            } else if animate {
                 editor.cursor_animations.clear();
             }
 
@@ -7125,8 +7128,42 @@ impl EditorElement {
         layout: &EditorLayout,
         window: &mut Window,
     ) {
-        let start_row = layout.visible_display_row_range.start;
-        let end_row = layout.visible_display_row_range.end;
+        self.paint_highlighted_range_in(
+            range,
+            fill,
+            color,
+            corner_radius,
+            line_end_overshoot,
+            PaintedTextRows {
+                range: &layout.visible_display_row_range,
+                lines: &layout.position_map.line_layouts,
+                snapshot: &layout.position_map.snapshot,
+                origin: layout.content_origin,
+                bounds: layout.position_map.text_hitbox.bounds,
+                line_height: layout.position_map.line_height,
+                scroll_x: layout.position_map.scroll_pixel_position.x,
+                top_y: layout
+                    .position_map
+                    .snapshot
+                    .row_y(layout.position_map.scroll_position.y),
+                align: layout.text_align,
+            },
+            window,
+        );
+    }
+
+    fn paint_highlighted_range_in(
+        &self,
+        range: Range<DisplayPoint>,
+        fill: bool,
+        color: Hsla,
+        corner_radius: Pixels,
+        line_end_overshoot: Pixels,
+        rows: PaintedTextRows<'_>,
+        window: &mut Window,
+    ) {
+        let start_row = rows.range.start;
+        let end_row = rows.range.end;
         if range.start != range.end {
             let row_range = if range.end.column() == 0 {
                 cmp::max(range.start.row(), start_row)..cmp::min(range.end.row(), end_row)
@@ -7137,53 +7174,47 @@ impl EditorElement {
 
             let highlighted_range = HighlightedRange {
                 color,
-                line_height: layout.position_map.line_height,
+                line_height: rows.line_height,
                 corner_radius,
-                start_y: layout.content_origin.y
+                start_y: rows.origin.y
                     + Pixels::from(
-                        (layout.position_map.snapshot.row_y(row_range.start.as_f64())
-                            - layout
-                                .position_map
-                                .snapshot
-                                .row_y(layout.position_map.scroll_position.y))
-                            * ScrollOffset::from(layout.position_map.line_height),
+                        (rows.snapshot.row_y(row_range.start.as_f64()) - rows.top_y)
+                            * ScrollOffset::from(rows.line_height),
                     ),
                 lines: row_range
                     .iter_rows()
                     .map(|row| {
-                        let line_layout =
-                            &layout.position_map.line_layouts[row.minus(start_row) as usize];
+                        let line_layout = &rows.lines[row.minus(start_row) as usize];
                         let alignment_offset =
-                            line_layout.alignment_offset(layout.text_align, layout.content_width);
+                            line_layout.alignment_offset(rows.align, rows.bounds.size.width);
                         HighlightedRangeLine {
                             start_x: if row == range.start.row() {
-                                layout.content_origin.x
+                                rows.origin.x
                                     + Pixels::from(
                                         ScrollPixelOffset::from(
                                             line_layout.x_for_index(range.start.column() as usize)
                                                 + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
+                                        ) - rows.scroll_x,
                                     )
                             } else {
-                                layout.content_origin.x + alignment_offset
-                                    - Pixels::from(layout.position_map.scroll_pixel_position.x)
+                                rows.origin.x + alignment_offset - Pixels::from(rows.scroll_x)
                             },
                             end_x: if row == range.end.row() {
-                                layout.content_origin.x
+                                rows.origin.x
                                     + Pixels::from(
                                         ScrollPixelOffset::from(
                                             line_layout.x_for_index(range.end.column() as usize)
                                                 + alignment_offset,
-                                        ) - layout.position_map.scroll_pixel_position.x,
+                                        ) - rows.scroll_x,
                                     )
                             } else {
                                 Pixels::from(
                                     ScrollPixelOffset::from(
-                                        layout.content_origin.x
+                                        rows.origin.x
                                             + line_layout.width
                                             + alignment_offset
                                             + line_end_overshoot,
-                                    ) - layout.position_map.scroll_pixel_position.x,
+                                    ) - rows.scroll_x,
                                 )
                             },
                         }
@@ -7191,29 +7222,23 @@ impl EditorElement {
                     .collect(),
             };
 
-            let snapshot = &layout.position_map.snapshot;
+            let snapshot = &rows.snapshot;
             let first = row_range.start.as_f64();
             let last = row_range.end.as_f64();
             if snapshot.row_y(last) - snapshot.row_y(first) != last - first {
                 // Selection contains source text, not the decorative gaps.
                 for (ix, line) in highlighted_range.lines.into_iter().enumerate() {
                     HighlightedRange {
-                        start_y: layout.content_origin.y
-                            + layout.position_map.line_height
-                                * (snapshot.row_y(first + ix as f64)
-                                    - snapshot.row_y(layout.position_map.scroll_position.y))
-                                    as f32,
+                        start_y: rows.origin.y
+                            + rows.line_height
+                                * (snapshot.row_y(first + ix as f64) - rows.top_y) as f32,
                         lines: vec![line],
                         ..highlighted_range
                     }
-                    .paint(
-                        fill,
-                        layout.position_map.text_hitbox.bounds,
-                        window,
-                    );
+                    .paint(fill, rows.bounds, window);
                 }
             } else {
-                highlighted_range.paint(fill, layout.position_map.text_hitbox.bounds, window);
+                highlighted_range.paint(fill, rows.bounds, window);
             }
         }
     }
@@ -9535,6 +9560,21 @@ impl Element for EditorElement {
                         });
                     snapshot = new_snapshot;
 
+                    // A tail-anchored document shorter than the viewport
+                    // has no history left to fill it. Leave the spare space
+                    // above the document, never below the designated excerpt.
+                    let bounds = if self.editor.read(cx).keeps_bottom_visible() {
+                        let document_height = line_height
+                            * snapshot.row_y(snapshot.max_point().row().next_row().as_f64()) as f32;
+                        let height = document_height.min(bounds.size.height);
+                        Bounds::new(
+                            point(bounds.left(), bounds.bottom() - height),
+                            size(bounds.size.width, height),
+                        )
+                    } else {
+                        bounds
+                    };
+
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                     let gutter_hitbox = window.insert_hitbox(
                         gutter_bounds(bounds, gutter_dimensions),
@@ -10608,9 +10648,27 @@ impl Element for EditorElement {
                         em_advance,
                         autoscroll_containing_element,
                         &redacted_ranges,
+                        true,
                         window,
                         cx,
                     );
+                    let bottom_excerpt = if !is_minimap {
+                        self.layout_bottom_excerpt(
+                            &snapshot,
+                            &text_hitbox,
+                            content_origin,
+                            editor_width,
+                            scroll_position,
+                            scroll_pixel_position,
+                            line_height,
+                            em_width,
+                            em_advance,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        None
+                    };
                     passes.mark("prepaint/cursors");
                     let navigation_overlay_paint_commands = self.layout_navigation_overlays(
                         &snapshot,
@@ -11024,6 +11082,7 @@ impl Element for EditorElement {
                         scroll_pixel_position,
                         scroll_max,
                         line_layouts,
+                        bottom_excerpt: bottom_excerpt.as_ref().map(|p| p.text.clone()),
                         line_height,
                         em_advance,
                         em_layout_width,
@@ -11074,6 +11133,7 @@ impl Element for EditorElement {
                         mode,
                         defer_paint_until_rewrapped,
                         position_map,
+                        bottom_excerpt,
                         visible_display_row_range: start_row..end_row,
                         wrap_guides,
                         indent_guides,
@@ -11161,7 +11221,7 @@ impl Element for EditorElement {
             window.set_key_context(key_context);
             window.handle_input(
                 &focus_handle,
-                ElementInputHandler::new(bounds, self.editor.clone()),
+                ElementInputHandler::new(layout.hitbox.bounds, self.editor.clone()),
                 cx,
             );
             self.register_actions(window, cx);
@@ -11178,6 +11238,13 @@ impl Element for EditorElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     self.paint_mouse_listeners(layout, window, cx);
+                    if bounds.top() < layout.hitbox.top() {
+                        let spare = Bounds::new(
+                            bounds.origin,
+                            size(bounds.size.width, layout.hitbox.top() - bounds.top()),
+                        );
+                        window.paint_quad(fill(spare, self.style.background));
+                    }
 
                     // A newly laid-out editor can still have a wrap snapshot for its old width
                     // after the bounded synchronous wait in WrapMap. Painting that snapshot makes
@@ -11214,36 +11281,45 @@ impl Element for EditorElement {
                     #[cfg(not(feature = "native"))]
                     let below_sticky_headers_mask = None;
 
-                    window.with_content_mask(below_sticky_headers_mask, |window| {
-                        self.paint_background(layout, window, cx);
-
-                        self.paint_indent_guides(layout, window, cx);
-
-                        if layout.gutter_hitbox.size.width > Pixels::ZERO {
-                            #[cfg(feature = "native")]
-                            self.paint_blamed_display_rows(layout, window, cx);
-                            self.paint_line_numbers(layout, window, cx);
-                        }
-
-                        self.paint_text(layout, window, cx);
-
-                        if !layout.spacer_blocks.is_empty() {
-                            window.with_element_namespace("blocks", |window| {
-                                self.paint_spacer_blocks(layout, window, cx);
-                            });
-                        }
-
-                        if layout.gutter_hitbox.size.width > Pixels::ZERO {
-                            self.paint_gutter_highlights(layout, window, cx);
-                            self.paint_gutter_indicators(layout, window, cx);
-                        }
-
-                        if !layout.blocks.is_empty() {
-                            window.with_element_namespace("blocks", |window| {
-                                self.paint_non_spacer_blocks(layout, window, cx);
-                            });
-                        }
+                    let history_mask = layout.bottom_excerpt.as_ref().map(|panel| {
+                        let mut visible = bounds;
+                        visible.size.height = (panel.text.chrome_top - bounds.top()).max(px(0.));
+                        ContentMask { bounds: visible }
                     });
+                    window.with_content_mask(below_sticky_headers_mask, |window| {
+                        window.with_content_mask(history_mask, |window| {
+                            self.paint_background(layout, window, cx);
+
+                            self.paint_indent_guides(layout, window, cx);
+
+                            if layout.gutter_hitbox.size.width > Pixels::ZERO {
+                                #[cfg(feature = "native")]
+                                self.paint_blamed_display_rows(layout, window, cx);
+                                self.paint_line_numbers(layout, window, cx);
+                            }
+
+                            self.paint_text(layout, window, cx);
+
+                            if !layout.spacer_blocks.is_empty() {
+                                window.with_element_namespace("blocks", |window| {
+                                    self.paint_spacer_blocks(layout, window, cx);
+                                });
+                            }
+
+                            if layout.gutter_hitbox.size.width > Pixels::ZERO {
+                                self.paint_gutter_highlights(layout, window, cx);
+                                self.paint_gutter_indicators(layout, window, cx);
+                            }
+
+                            if !layout.blocks.is_empty() {
+                                window.with_element_namespace("blocks", |window| {
+                                    self.paint_non_spacer_blocks(layout, window, cx);
+                                });
+                            }
+                        });
+                    });
+
+                    self.paint_bottom_excerpt(layout, window, cx);
 
                     #[cfg(feature = "native")]
                     window.with_element_namespace("blocks", |window| {
@@ -11322,6 +11398,7 @@ impl ScrollbarLayoutInformation {
 
 pub struct EditorLayout {
     position_map: Rc<PositionMap>,
+    bottom_excerpt: Option<BottomExcerptLayout>,
     defer_paint_until_rewrapped: bool,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
@@ -11386,6 +11463,18 @@ pub struct EditorLayout {
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
     text_align: TextAlign,
     content_width: Pixels,
+}
+
+struct PaintedTextRows<'a> {
+    range: &'a Range<DisplayRow>,
+    lines: &'a [LineWithInvisibles],
+    snapshot: &'a EditorSnapshot,
+    origin: gpui::Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    scroll_x: ScrollPixelOffset,
+    top_y: f64,
+    align: TextAlign,
 }
 
 impl EditorLayout {
@@ -11857,6 +11946,7 @@ pub(crate) struct PositionMap {
     pub em_layout_width: Pixels,
     pub visible_row_range: Range<DisplayRow>,
     pub line_layouts: Vec<LineWithInvisibles>,
+    pub(super) bottom_excerpt: Option<Rc<BottomExcerptText>>,
     pub snapshot: EditorSnapshot,
     pub text_align: TextAlign,
     pub content_width: Pixels,
@@ -11938,22 +12028,59 @@ impl PositionMap {
     }
 
     pub(crate) fn point_for_position(&self, position: gpui::Point<Pixels>) -> PointForPosition {
-        let text_bounds = self.text_hitbox.bounds;
-        let scroll_position = self.scroll_position;
-        let position = position - text_bounds.origin;
-        let y = position.y.max(px(0.)).min(self.size.height);
-        let x = position.x + (scroll_position.x as f32 * self.em_layout_width);
-        let row = self
-            .snapshot
-            .row_at_y((y / self.line_height) as f64 + self.snapshot.row_y(scroll_position.y))
-            .floor() as u32;
-
-        let (column, x_overshoot_after_line_end) = if let Some(line_index) =
-            row.checked_sub(self.visible_row_range.start.0)
-            && let Some(line) = self.line_layouts.get(line_index as usize)
+        if let Some(panel) = &self.bottom_excerpt
+            && panel.bounds.contains(&position)
         {
-            let alignment_offset = line.alignment_offset(self.text_align, self.content_width);
-            let x_relative_to_text = x - alignment_offset;
+            let row = DisplayRow(
+                self.snapshot
+                    .row_at_y(
+                        panel.top_y
+                            + f64::from((position.y - panel.bounds.top()) / self.line_height),
+                    )
+                    .floor() as u32,
+            )
+            .clamp(panel.rows.start, DisplayRow(panel.rows.end.0 - 1));
+            return self.point_for_position_on_row(
+                position.x,
+                row,
+                panel.lines.get(row.minus(panel.rows.start) as usize),
+            );
+        }
+        let y = (position.y - self.text_hitbox.top())
+            .max(px(0.))
+            .min(self.size.height);
+        let row = DisplayRow(
+            self.snapshot
+                .row_at_y(
+                    (y / self.line_height) as f64 + self.snapshot.row_y(self.scroll_position.y),
+                )
+                .floor() as u32,
+        );
+        let line = row
+            .0
+            .checked_sub(self.visible_row_range.start.0)
+            .and_then(|ix| self.line_layouts.get(ix as usize));
+        self.point_for_position_on_row(position.x, row, line)
+    }
+
+    pub(crate) fn bottom_excerpt_y(&self, row: DisplayRow) -> Option<Pixels> {
+        let panel = self.bottom_excerpt.as_ref()?;
+        panel.rows.contains(&row).then(|| {
+            panel.bounds.top()
+                + self.line_height * (self.snapshot.row_y(row.as_f64()) - panel.top_y) as f32
+        })
+    }
+
+    fn point_for_position_on_row(
+        &self,
+        window_x: Pixels,
+        row: DisplayRow,
+        line: Option<&LineWithInvisibles>,
+    ) -> PointForPosition {
+        let x = window_x - self.text_hitbox.left()
+            + self.scroll_position.x as f32 * self.em_layout_width;
+        let (column, x_overshoot_after_line_end) = if let Some(line) = line {
+            let x_relative_to_text = x - line.alignment_offset(self.text_align, self.content_width);
             if let Some(ix) = line.index_for_x(x_relative_to_text) {
                 (ix as u32, px(0.))
             } else {
@@ -11962,51 +12089,6 @@ impl PositionMap {
         } else {
             (0, x)
         };
-
-        let mut exact_unclipped = DisplayPoint::new(DisplayRow(row), column);
-        let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);
-        let next_valid = self.snapshot.clip_point(exact_unclipped, Bias::Right);
-
-        let nearest_valid = if previous_valid == next_valid {
-            previous_valid
-        } else {
-            match self.snapshot.inlay_bias_at(exact_unclipped) {
-                Some(Bias::Left) => next_valid,
-                Some(Bias::Right) => previous_valid,
-                None => previous_valid,
-            }
-        };
-
-        let column_overshoot_after_line_end =
-            (x_overshoot_after_line_end / self.em_layout_width) as u32;
-        *exact_unclipped.column_mut() += column_overshoot_after_line_end;
-        PointForPosition {
-            previous_valid,
-            next_valid,
-            nearest_valid,
-            exact_unclipped,
-        }
-    }
-
-    fn point_for_position_on_line(
-        &self,
-        position: gpui::Point<Pixels>,
-        row: DisplayRow,
-        line: &LineWithInvisibles,
-    ) -> PointForPosition {
-        let text_bounds = self.text_hitbox.bounds;
-        let scroll_position = self.scroll_position;
-        let position = position - text_bounds.origin;
-        let x = position.x + (scroll_position.x as f32 * self.em_layout_width);
-
-        let alignment_offset = line.alignment_offset(self.text_align, self.content_width);
-        let x_relative_to_text = x - alignment_offset;
-        let (column, x_overshoot_after_line_end) =
-            if let Some(ix) = line.index_for_x(x_relative_to_text) {
-                (ix as u32, px(0.))
-            } else {
-                (line.len as u32, px(0.).max(x_relative_to_text - line.width))
-            };
 
         let mut exact_unclipped = DisplayPoint::new(row, column);
         let previous_valid = self.snapshot.clip_point(exact_unclipped, Bias::Left);

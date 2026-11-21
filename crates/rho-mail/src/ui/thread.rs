@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use editor::display_map::ToDisplayPoint as _;
 use editor::scroll::Autoscroll;
 use editor::{
     Anchor, Editor, EditorEvent, EditorMode, HighlightKey, SelectionEffects, SizingBehavior,
@@ -21,7 +22,7 @@ use jiff::{SignedDuration, Timestamp};
 use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
-    Address as Party, EndpointId, Mention, Message, MessageId, Revision, UnixMs,
+    Address as Party, ChatSeq, EndpointId, Mention, Message, MessageId, Revision, UnixMs,
 };
 use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
@@ -234,6 +235,7 @@ pub struct ThreadView {
     draft_subscription: Subscription,
     follow: Option<Follow>,
     initial_scroll: bool,
+    latest_mail: Option<(Party, ChatSeq)>,
     hint_anchor: Option<Anchor>,
     last_point_row: u32,
     /// The mail dealt to this view, also the target when the cursor is
@@ -244,6 +246,21 @@ pub struct ThreadView {
     _subscriptions: Vec<Subscription>,
     /// Reads a project's list again when a thread's age next changes.
     _ages: Option<Task<()>>,
+}
+
+/// The latest posted mail by position, and the version now shown there.
+fn latest_mail(system: &MailSystem, thread: ThreadId) -> Option<(Party, ChatSeq)> {
+    let chat = system.host_mail(thread.host)?;
+    let message = chat
+        .reading_order(thread.message)
+        .filter(|mail| {
+            !matches!(
+                mail.revision,
+                Revision::Deleted | Revision::TakenBack { .. }
+            )
+        })
+        .last()?;
+    Some((message.from, message.version().0))
 }
 
 /// How often the ages in a project's list move: their unit is the minute.
@@ -292,6 +309,9 @@ impl ThreadView {
                 cx,
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
+            if !list {
+                draft::stick(&mut editor, "↓ new mail".into(), cx);
+            }
             editor.disable_headers_for_buffers(
                 [buffer.read(cx).remote_id(), draft.read(cx).remote_id()],
                 cx,
@@ -401,6 +421,7 @@ impl ThreadView {
             draft_subscription,
             follow: None,
             initial_scroll: !list,
+            latest_mail: latest_mail(system, thread),
             hint_anchor: None,
             last_point_row: 0,
             dealt_mail: None,
@@ -463,10 +484,57 @@ impl ThreadView {
             self.private_edit.as_ref(),
             cx,
         );
-        let writing = draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx);
+        let newest = latest_mail(self.system.read(cx), self.thread);
+        let arrived = !list
+            && self
+                .latest_mail
+                .zip(newest)
+                .is_some_and(|((_, old), (from, new))| from != Party::User && new > old);
+        self.latest_mail = newest;
+        let (anchor, notice) = if arrived {
+            let editor = self.editor.read(cx);
+            if editor.bottom_stuck_excerpt_is_visible() {
+                (None, true)
+            } else {
+                let tail = draft::start(self.transcript.buffer(), cx);
+                let keep = self.editor.update(cx, |editor, cx| {
+                    let viewport = editor.visible_line_count()?;
+                    let scroll = editor.scroll_position(cx);
+                    let display = editor.display_snapshot(cx);
+                    let y = display.row_y(tail.to_display_point(&display).row().0 as f64)
+                        - display.row_y(scroll.y);
+                    // A known inline viewport, even if its first draft line
+                    // is now above the viewport in a tall draft.
+                    (y < viewport).then_some(y)
+                });
+                (keep, false)
+            }
+        } else {
+            (None, false)
+        };
+        let writing = list
+            .then(|| draft::WritingCaret::capture(&self.editor, self.transcript.buffer(), cx))
+            .flatten();
         self.transcript.reconcile(items, cx);
         if let Some(writing) = writing {
             writing.restore(&self.editor, cx);
+        }
+        // SPEC-mail-follow-tail: the layout moves independently of point.
+        if notice || anchor.is_some() {
+            let tail = draft::start(self.transcript.buffer(), cx);
+            self.editor.update(cx, |editor, cx| {
+                if notice {
+                    editor.mark_bottom_stuck_excerpt(cx);
+                }
+                if let Some(screen_y) = anchor {
+                    let display = editor.display_snapshot(cx);
+                    let tail = display.buffer_snapshot().anchor_after(tail);
+                    editor.request_autoscroll(
+                        Autoscroll::top_relative(screen_y).for_anchor(tail),
+                        cx,
+                    );
+                }
+            });
         }
         if let Some(Follow::Logged(message)) = self.follow
             && self.cursor_to_item(&Key::Thread(message), Autoscroll::fit(), cx)
@@ -2058,7 +2126,7 @@ impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let system = self.system.read(cx);
         let list = self.is_list(system);
-        if std::mem::take(&mut self.initial_scroll)
+        if self.initial_scroll
             && let Some(chat) = system.host_mail(self.thread.host)
         {
             // SPEC-mail-thread-entry: point and viewport have different
@@ -2069,6 +2137,7 @@ impl Render for ThreadView {
             if let Some(mail) = open_anchor(visible)
                 && let Some(row) = self.item_row(&Key::Message(mail), cx)
             {
+                self.initial_scroll = false;
                 self.editor.update(cx, |editor, cx| {
                     let display = editor.display_snapshot(cx);
                     let from = display.buffer_snapshot().anchor_after(Point::new(row, 0));
