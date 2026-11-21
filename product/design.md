@@ -123,6 +123,7 @@ looks: the user's words in `marked`, like their sent mail, at the top of the thr
 states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
 - stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new mail` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
+- answering an older mail: one line in `quiet` right under the draft's last line, `answers eng-ka35 · 12:40 · Which clock needs fixing?`, the first words of that mail cut at the window; absent when the draft answers the newest mail.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - after send: the words are the newest mail, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
 used on: `mail.Thread` and the draft of `mail.Write an idea`.
