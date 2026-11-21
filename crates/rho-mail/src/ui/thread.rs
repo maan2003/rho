@@ -2533,7 +2533,7 @@ mod tests {
         cx.update(|cx| {
             mail.update(cx, |system, cx| {
                 system.outbox.next(thread.host).unwrap();
-                system.outbox.delivered(thread.host).unwrap();
+                system.outbox.answered(thread.host).unwrap();
                 cx.notify();
             });
         });

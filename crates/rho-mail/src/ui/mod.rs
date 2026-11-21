@@ -23,7 +23,7 @@ use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
-    ProjectConfig, ProjectId, ThreadWork,
+    ProjectConfig, ProjectId, ThreadWork, UnixMs,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -39,8 +39,8 @@ pub use thread::ThreadView;
 use crate::cache::Cache;
 pub use crate::cache::{MailAudience, WrittenMail};
 use crate::fold::HostMail;
-use crate::outbox::{Delivery, Outbox};
-use crate::protocol::{Name, PostIdea, RetryIdea};
+use crate::outbox::{Delivery, Kept, Outbox, Outgoing};
+use crate::protocol::{Name, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
 use crate::{ThreadId, cards};
 
@@ -502,6 +502,25 @@ impl MailSystem {
         delivery: Delivery,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let (id, kept) = self.outbox.push(
+            endpoint,
+            parent,
+            reply_to,
+            mentions,
+            vec![ContentPart::Text { text }],
+            delivery,
+        );
+        self.keep_outgoing(endpoint, parent, kept, cx);
+        id
+    }
+
+    fn keep_outgoing(
+        &mut self,
+        endpoint: EndpointId,
+        parent: Option<MessageId>,
+        kept: Kept,
+        cx: &mut Context<Self>,
+    ) {
         let project = parent.and_then(|message| {
             self.project_root(ThreadId {
                 host: endpoint,
@@ -512,15 +531,10 @@ impl MailSystem {
             self.last_project = Some(project);
             self.frame.changed(cx);
         }
-        let content = vec![ContentPart::Text { text }];
-        let (id, kept) = self
-            .outbox
-            .push(endpoint, parent, reply_to, mentions, content, delivery);
         self.cache
             .write_outbox(endpoint, kept, project.map(|project| project.message));
         self.send_unsent(endpoint, cx);
         cx.notify();
-        id
     }
 
     /// The project starts work on the host after this durable local post.
@@ -593,13 +607,15 @@ impl MailSystem {
         let Some(link) = self.link_for(endpoint) else {
             return;
         };
-        let Some((post, delivery)) = self.outbox.next(endpoint) else {
+        let Some((post, delivery, runtime)) = self.outbox.next(endpoint) else {
             return;
         };
         let host_label = self.host_name(endpoint);
         let reply = link.run(move |dialer| async move {
             match delivery {
-                Delivery::Mail => crate::stream::call(&dialer, post).await,
+                Delivery::Mail => crate::stream::call(&dialer, post)
+                    .await
+                    .map(PostIdeaReply::Posted),
                 Delivery::Idea => {
                     let project = ProjectId(post.parent.expect("an idea is under a project"));
                     crate::stream::call(
@@ -607,35 +623,46 @@ impl MailSystem {
                         PostIdea {
                             client_id: post.client_id,
                             project,
+                            runtime,
                             content: post.content,
                             host_label,
                         },
                     )
                     .await
                 }
-                Delivery::Retry => {
-                    crate::stream::call(
-                        &dialer,
-                        RetryIdea {
-                            posted: post,
-                            host_label,
-                        },
-                    )
-                    .await
-                }
+                Delivery::Retry => crate::stream::call(
+                    &dialer,
+                    RetryIdea {
+                        posted: post,
+                        host_label,
+                    },
+                )
+                .await
+                .map(PostIdeaReply::Posted),
             }
         });
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             let _ = this.update(cx, |this, cx| match reply {
-                Ok(message) => {
-                    if let Some((client_id, _, kept)) = this.outbox.delivered(endpoint) {
+                Ok(reply) => {
+                    if let Some((client_id, outgoing, kept)) = this.outbox.answered(endpoint) {
                         this.cache.write_outbox(endpoint, kept, None);
-                        cx.emit(Event::Delivered {
-                            endpoint,
-                            client_id,
-                            message,
-                        });
+                        let result = match reply {
+                            PostIdeaReply::Posted(message) => {
+                                cx.emit(Event::Delivered {
+                                    endpoint,
+                                    client_id,
+                                    message,
+                                });
+                                Ok(())
+                            }
+                            PostIdeaReply::RuntimeRefused(reason) => Err(reason),
+                        };
+                        if outgoing.delivery == Delivery::Idea {
+                            this.frame.with(cx, move |frame, _, cx| {
+                                frame.finish_idea(client_id, result, cx);
+                            });
+                        }
                     }
                     cx.notify();
                     this.send_unsent(endpoint, cx);
@@ -989,11 +1016,26 @@ impl System for MailSystem {
         let Some(project) = self.thread_of(&mail.project) else {
             return;
         };
-        let Some(name) = self.project_address(project) else {
+        if self.outbox.contains(mail.client_id) {
             return;
+        }
+        let outgoing = Outgoing {
+            at: UnixMs::now(),
+            parent: Some(project.message),
+            reply_to: None,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: mail.text.trim().to_owned(),
+            }],
+            delivery: Delivery::Idea,
+            runtime: mail.runtime,
         };
-        self.queue_idea(project, mail.text.trim().to_owned(), cx);
-        (mail.sent)(name, cx);
+        let (_, kept) = self.outbox.keep(project.host, mail.client_id, outgoing);
+        self.keep_outgoing(project.host, Some(project.message), kept, cx);
+    }
+
+    fn idea_pending(&self, id: u64) -> bool {
+        self.outbox.contains(id)
     }
 
     fn text_sources(&self, search: &mut TextSearch, current: &Address, _cx: &App) {

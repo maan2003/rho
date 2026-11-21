@@ -9,42 +9,8 @@
 //! takes the same arguments.
 
 use camino::Utf8Path;
-use rho_agent_types::{AgentId, MessageId};
-
-use crate::protocol::transcript::RuntimeKind;
-
-/// What an agent runs on, as the policy's `runtime=` takes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Runtime {
-    pub kind: RuntimeKind,
-    pub model: String,
-    pub effort: String,
-}
-
-/// The models each runtime kind offers, and the efforts each takes, as
-/// `_rho.pyi` lists them.
-const NATIVE_MODELS: [&str; 4] = ["sol", "terra", "astra", "hydrogen"];
-const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
-const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-/// What the model picker cycles through, first the default. Any other
-/// pair the policy takes can be typed.
-///
-/// The default is the runtime the user picks for agents they start from a
-/// message: `opus-high`, decided once here rather than learned, so a start
-/// that asks nothing still runs where the user would have put it.
-pub const RUNTIMES: [&str; 7] = [
-    "opus-high",
-    "sol-medium",
-    "sol-high",
-    "terra-medium",
-    "astra-high",
-    "hydrogen-high",
-    "fable-high",
-];
-
-pub const DEFAULT_RUNTIME: &str = RUNTIMES[0];
+use rho_agent_types::{AgentId, MessageId, RuntimeKind};
+pub use rho_agent_types::{DEFAULT_RUNTIME, RUNTIMES, RuntimeLabel as Runtime};
 
 /// The policy function a new agent's code calls when the draft names none.
 pub const DEFAULT_FUNCTION: &str = "new_agent";
@@ -88,74 +54,34 @@ impl Default for Function {
     }
 }
 
-impl Runtime {
-    /// Reads `<model>-<effort>`; empty is the default.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let text = text.trim().to_ascii_lowercase();
-        let text = if text.is_empty() {
-            DEFAULT_RUNTIME.to_owned()
-        } else {
-            text
-        };
-        let refusal = || {
-            format!(
-                "unknown model `{text}`; write <model>-<effort>, like {}",
-                RUNTIMES.join(", ")
-            )
-        };
-        let (model, effort) = text.split_once('-').ok_or_else(refusal)?;
-        let kind = if NATIVE_MODELS.contains(&model) && NATIVE_EFFORTS.contains(&effort) {
-            RuntimeKind::Rho
-        } else if CLAUDE_MODELS.contains(&model) && CLAUDE_EFFORTS.contains(&effort) {
-            RuntimeKind::Claude
-        } else {
-            return Err(refusal());
-        };
-        Ok(Self {
-            kind,
-            model: model.to_owned(),
-            effort: effort.to_owned(),
-        })
+/// Existing agent start fields use the default when no answer was written.
+pub fn parse_runtime(text: &str) -> Result<Runtime, String> {
+    if text.trim().is_empty() {
+        Ok(Runtime::default())
+    } else {
+        Runtime::parse(text)
     }
+}
 
-    /// All model/effort pairs the host supports, in catalogue order.
-    pub fn choices(kind: RuntimeKind) -> impl Iterator<Item = String> {
-        let (models, efforts) = match kind {
-            RuntimeKind::Rho => (NATIVE_MODELS.as_slice(), NATIVE_EFFORTS.as_slice()),
-            RuntimeKind::Claude => (CLAUDE_MODELS.as_slice(), CLAUDE_EFFORTS.as_slice()),
-        };
-        models.iter().flat_map(move |model| {
-            efforts
-                .iter()
-                .map(move |effort| format!("{model}-{effort}"))
-        })
-    }
-
-    /// How the picker and the field write it.
-    pub fn label(&self) -> String {
-        format!("{}-{}", self.model, self.effort)
-    }
-
-    /// The `runtime=` dict.
-    fn python(&self) -> String {
-        match self.kind {
-            RuntimeKind::Rho => format!(
-                "{{\"kind\": \"native\", \"model\": {}, \"effort\": {}, \"fast\": False}}",
-                py_str(&self.model),
-                py_str(&self.effort)
-            ),
-            RuntimeKind::Claude => format!(
-                "{{\"kind\": \"claude\", \"model\": {}, \"effort\": {}}}",
-                py_str(&self.model),
-                py_str(&self.effort)
-            ),
-        }
+/// The policy's `runtime=` dict.
+fn python_runtime(runtime: &Runtime) -> String {
+    match runtime.kind() {
+        RuntimeKind::Rho => format!(
+            "{{\"kind\": \"native\", \"model\": {}, \"effort\": {}, \"fast\": False}}",
+            py_str(runtime.model()),
+            py_str(runtime.effort())
+        ),
+        RuntimeKind::Claude => format!(
+            "{{\"kind\": \"claude\", \"model\": {}, \"effort\": {}}}",
+            py_str(runtime.model()),
+            py_str(runtime.effort())
+        ),
     }
 }
 
 /// The picker's next choice after `current`.
 pub fn cycle_runtime(current: &str) -> &'static str {
-    let current = Runtime::parse(current).map(|runtime| runtime.label());
+    let current = parse_runtime(current).map(|runtime| runtime.label());
     let at = RUNTIMES
         .iter()
         .position(|runtime| Ok(*runtime) == current.as_deref());
@@ -176,7 +102,7 @@ pub fn new_agent_on(
         function.as_str(),
         py_str(repo.as_str()),
         py_str(rev),
-        runtime.python(),
+        python_runtime(runtime),
         origin_arg(origin)
     )
 }
@@ -193,7 +119,7 @@ pub fn new_agent_in(
         "{}(cwd={}, runtime={}{})\n",
         function.as_str(),
         py_str(cwd.as_str()),
-        runtime.python(),
+        python_runtime(runtime),
         origin_arg(origin)
     )
 }
@@ -220,7 +146,7 @@ pub fn compact(id: AgentId) -> String {
 
 /// Moves the agent to another runtime, keeping its props.
 pub fn set_runtime(id: AgentId, runtime: &Runtime) -> String {
-    agent(id, &format!("set_runtime({})", runtime.python()))
+    agent(id, &format!("set_runtime({})", python_runtime(runtime)))
 }
 
 /// Branches the agent's history before its `turns`-th last input from the
@@ -278,40 +204,27 @@ mod tests {
 
     #[test]
     fn runtimes_parse_and_cycle() {
+        assert_eq!(parse_runtime("").unwrap().as_str(), "opus-high");
         assert_eq!(
-            Runtime::parse("").unwrap(),
-            Runtime {
-                kind: RuntimeKind::Claude,
-                model: "opus".into(),
-                effort: "high".into()
-            }
-        );
-        assert_eq!(
-            Runtime::parse(" Opus-High ").unwrap().kind,
+            Runtime::parse(" Opus-High ").unwrap().kind(),
             RuntimeKind::Claude
         );
         assert_eq!(
-            Runtime::parse("opus-low").unwrap().kind,
+            Runtime::parse("opus-low").unwrap().kind(),
             RuntimeKind::Claude
         );
-        assert_eq!(Runtime::parse("fable-max").unwrap().effort, "max");
+        assert_eq!(Runtime::parse("fable-max").unwrap().effort(), "max");
         assert!(Runtime::parse("sol-max").is_err(), "max is Claude-only");
-        assert_eq!(
-            Runtime::parse("haiku-medium").unwrap(),
-            Runtime {
-                kind: RuntimeKind::Claude,
-                model: "haiku".into(),
-                effort: "medium".into()
-            }
-        );
+        let haiku = Runtime::parse("haiku-medium").unwrap();
+        assert_eq!((haiku.model(), haiku.effort()), ("haiku", "medium"));
         assert!(Runtime::parse("med-eng").is_err());
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");
         assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
         assert_eq!(DEFAULT_RUNTIME, "opus-high");
-        assert_eq!(Runtime::parse("").unwrap().label(), "opus-high");
+        assert_eq!(parse_runtime("").unwrap().label(), "opus-high");
         assert_eq!(
-            Runtime::parse("hydrogen-high").unwrap().kind,
+            Runtime::parse("hydrogen-high").unwrap().kind(),
             RuntimeKind::Rho
         );
         assert_eq!(cycle_runtime(RUNTIMES[RUNTIMES.len() - 1]), RUNTIMES[0]);

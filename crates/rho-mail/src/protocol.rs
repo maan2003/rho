@@ -9,7 +9,7 @@
 
 use rho_agent_types::{
     AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ProjectChange, ProjectConfig,
-    ProjectId, ProjectName, ThreadWork,
+    ProjectId, ProjectName, RuntimeLabel, ThreadWork,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -35,7 +35,7 @@ rho_rpc::calls! {
         /// A message from the user. Logged once per `client_id`.
         Post(Post) -> MessageId;
         /// Post under a project and start the idea using the host's settings.
-        PostIdea(PostIdea) -> MessageId;
+        PostIdea(PostIdea) -> PostIdeaReply;
         RetryIdea(RetryIdea) -> MessageId;
         CreateProject(CreateProject) -> ProjectId;
         ChangeProject(ChangeProject) -> ();
@@ -72,9 +72,20 @@ pub struct Post {
 pub struct PostIdea {
     pub client_id: u64,
     pub project: ProjectId,
+    /// An explicit answer; without one the host keeps a standing agent's
+    /// runtime or uses the project's default for a new agent.
+    pub runtime: Option<RuntimeLabel>,
     pub content: Vec<ContentPart>,
     /// The name this device uses for the host, for a failed start's mail.
     pub host_label: String,
+}
+
+/// A runtime refusal happens before posting. The client can drop that
+/// attempt without discarding the draft; lost transport still means retry.
+#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
+pub enum PostIdeaReply {
+    Posted(MessageId),
+    RuntimeRefused(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -216,6 +227,7 @@ mod tests {
             PostIdea {
                 client_id: 17,
                 project,
+                runtime: Some(RuntimeLabel::parse("sol-high").unwrap()),
                 content: vec![ContentPart::Text {
                     text: "New idea".into(),
                 }],

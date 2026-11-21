@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
 use language::{Buffer, BufferEvent, Point};
 use multi_buffer::MultiBuffer;
-use rho_agent_types::EndpointId;
+use rho_agent_types::{DEFAULT_RUNTIME, EndpointId, RuntimeLabel};
 use rho_dealer::Address;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
@@ -47,21 +47,21 @@ enum ProjectChoice {
     New(AnySystem, NewIdeaProject),
 }
 
-pub type IdeaSent = Rc<dyn Fn(String, &mut App)>;
-
-/// A request to send the user's words. The project calls `sent` only
-/// when the mail has gone to its outbox (a first start may ask where).
-#[derive(Clone)]
+/// A durable idea submission. Repeating it after a lost receipt uses the
+/// same client id, so the host can answer without posting the idea twice.
 pub struct IdeaMail {
+    pub client_id: u64,
     pub project: Address,
     pub text: String,
-    pub sent: IdeaSent,
+    pub runtime: Option<RuntimeLabel>,
 }
 
 pub(crate) struct IdeaBox {
     pub(crate) text: Entity<Buffer>,
     project: Option<Address>,
     recipient: String,
+    runtime: Option<String>,
+    client_id: Option<u64>,
     overlay: Option<Overlay>,
     _edits: gpui::Subscription,
 }
@@ -69,17 +69,20 @@ pub(crate) struct IdeaBox {
 struct Overlay {
     editor: Entity<Editor>,
     address: Entity<Editor>,
+    runtime: Entity<Editor>,
     return_focus: FocusHandle,
-    _edits: gpui::Subscription,
+    _edits: [gpui::Subscription; 2],
 }
 
 impl IdeaBox {
     pub(crate) fn new(cx: &mut Context<Frame>, db: &rho_db::RhoDb) -> Self {
-        let (project, recipient, words) = place::idea_draft(db)
+        let (project, recipient, runtime, client_id, words) = place::idea_draft(db)
             .map(|saved| {
                 (
                     saved.address.and_then(|a| Address::parse(&a)),
                     saved.recipient,
+                    saved.runtime,
+                    saved.client_id,
                     saved.text,
                 )
             })
@@ -90,6 +93,8 @@ impl IdeaBox {
             text,
             project,
             recipient,
+            runtime,
+            client_id,
             overlay: None,
         }
     }
@@ -100,6 +105,7 @@ impl IdeaBox {
                 if let Some(overlay) = &frame.idea.overlay {
                     overlay.editor.update(cx, Self::style_draft);
                 }
+                frame.idea.client_id = None;
                 frame.save_idea(cx);
             }
         })
@@ -175,6 +181,8 @@ impl Frame {
             (!text.is_empty() || !self.idea.recipient.is_empty()).then(|| place::IdeaDraft {
                 address: self.idea.project.as_ref().map(ToString::to_string),
                 recipient: self.idea.recipient.clone(),
+                runtime: self.idea.runtime.clone(),
+                client_id: self.idea.client_id,
                 text,
             });
         self.place.write(Write::IdeaDraft(draft));
@@ -186,6 +194,14 @@ impl Frame {
         }
         if self.idea.overlay.is_some() {
             self.choose_idea_project(false, window, cx);
+            return;
+        }
+        if self.idea.client_id.is_some_and(|id| {
+            self.systems
+                .iter()
+                .any(|system| system.idea_pending(id, cx))
+        }) {
+            self.echo("idea: waiting for the host", StyleClass::SystemInfo, cx);
             return;
         }
         // A saved addressee belongs to the draft; a default may only fill a
@@ -232,7 +248,32 @@ impl Frame {
             &address,
             |frame, address, event: &editor::EditorEvent, cx| {
                 if matches!(event, editor::EditorEvent::Edited { .. }) {
-                    frame.idea.recipient = address.read(cx).text(cx);
+                    let recipient = address.read(cx).text(cx);
+                    if frame.idea.recipient != recipient {
+                        frame.idea.recipient = recipient;
+                        frame.idea.client_id = None;
+                        frame.save_idea(cx);
+                    }
+                }
+            },
+        );
+        let runtime = cx.new(|cx| {
+            let mut field = Editor::single_line(window, cx);
+            rho_window::editor_config::configure(&mut field, window, cx);
+            field.set_use_modal_editing(false);
+            field.set_text(
+                self.idea.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
+                window,
+                cx,
+            );
+            field
+        });
+        let runtime_edits = cx.subscribe(
+            &runtime,
+            |frame, runtime, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::Edited { .. }) {
+                    frame.idea.runtime = Some(runtime.read(cx).text(cx));
+                    frame.idea.client_id = None;
                     frame.save_idea(cx);
                 }
             },
@@ -240,8 +281,9 @@ impl Frame {
         self.idea.overlay = Some(Overlay {
             editor: editor.clone(),
             address,
+            runtime,
             return_focus,
-            _edits: address_edits,
+            _edits: [address_edits, runtime_edits],
         });
         window.focus(&editor.focus_handle(cx), cx);
         window.on_next_frame(move |window, cx| {
@@ -257,6 +299,8 @@ impl Frame {
     pub(crate) fn focus_idea_address(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(overlay) = &self.idea.overlay {
             let handle = if overlay.address.focus_handle(cx).is_focused(window) {
+                overlay.runtime.focus_handle(cx)
+            } else if overlay.runtime.focus_handle(cx).is_focused(window) {
                 overlay.editor.focus_handle(cx)
             } else {
                 overlay.address.focus_handle(cx)
@@ -432,6 +476,9 @@ impl Frame {
         let Some(overlay) = &self.idea.overlay else {
             return;
         };
+        if self.idea.project.as_ref() != Some(&project.address) {
+            self.idea.client_id = None;
+        }
         self.idea.project = Some(project.address);
         self.idea.recipient = project.name;
         overlay.address.update(cx, |address, cx| {
@@ -459,6 +506,8 @@ impl Frame {
         self.idea.text = text;
         self.idea.project = None;
         self.idea.recipient.clear();
+        self.idea.runtime = None;
+        self.idea.client_id = None;
         self.save_idea(cx);
     }
 
@@ -475,51 +524,75 @@ impl Frame {
             self.choose_idea_project(true, window, cx);
             return;
         };
+        let runtime = match self
+            .idea
+            .runtime
+            .as_deref()
+            .map(RuntimeLabel::parse)
+            .transpose()
+        {
+            Ok(runtime) => runtime,
+            Err(reason) => {
+                self.echo(&reason, StyleClass::SystemImportant, cx);
+                return;
+            }
+        };
+        if self.idea.project.as_ref() != Some(&project.address) {
+            self.idea.client_id = None;
+        }
         self.idea.project = Some(project.address.clone());
         self.idea.recipient = project.name;
+        let client_id = *self.idea.client_id.get_or_insert_with(|| {
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
+            u64::from_le_bytes(bytes[8..].try_into().expect("UUID halves are 8 bytes"))
+        });
         self.save_idea(cx);
-        // Keep the words until they are in the outbox. Sending returns to
-        // the previous screen.
         self.close_idea_overlay(window, cx);
-        let sent_text = text.clone();
-        let sent_to = project.address.clone();
-        let short = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        let idea: String = short.chars().take(60).collect();
-        let frame = FrameLink::new(
-            window
-                .window_handle()
-                .downcast::<Frame>()
-                .expect("the frame owns the window"),
-        );
         system.send_idea(
             IdeaMail {
+                client_id,
                 project: project.address,
                 text,
-                sent: Rc::new(move |name, cx| {
-                    let sent_to = sent_to.clone();
-                    let sent_text = sent_text.clone();
-                    let idea = idea.clone();
-                    frame.with(cx, move |frame, _, cx| {
-                        if frame.idea.overlay.is_none()
-                            && frame.idea.project.as_ref() == Some(&sent_to)
-                            && frame.idea.text.read(cx).text() == sent_text
-                        {
-                            frame.clear_idea(cx);
-                        }
-                        frame.echo(
-                            &format!("sent to {name}: {idea}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    });
-                }),
+                runtime,
             },
             cx,
         );
+    }
+
+    /// Keep the submitted draft until the host answers. A refusal removes
+    /// only its outbox attempt, so the words remain available to edit.
+    pub fn finish_idea(&mut self, id: u64, result: Result<(), String>, cx: &mut Context<Self>) {
+        if self.idea.client_id != Some(id) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                let name = self.idea.recipient.clone();
+                let idea: String = self
+                    .idea
+                    .text
+                    .read(cx)
+                    .text()
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(60)
+                    .collect();
+                self.clear_idea(cx);
+                self.echo(
+                    &format!("sent to {name}: {idea}"),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+            Err(reason) => self.echo(
+                &format!("idea: {reason} · draft kept"),
+                StyleClass::SystemImportant,
+                cx,
+            ),
+        }
     }
 
     pub(crate) fn idea_editor(&self) -> Option<Entity<Editor>> {
@@ -552,6 +625,17 @@ impl Frame {
                         .text_color(colors.text_muted)
                         .child("to:")
                         .child(div().flex_1().child(overlay.address.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .text_color(colors.text_muted)
+                        .child("on:")
+                        .child(div().flex_1().child(overlay.runtime.clone())),
                 )
                 .child(div().flex_1().min_h_0().child(overlay.editor.clone()))
                 .into_any_element(),

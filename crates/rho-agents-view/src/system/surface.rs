@@ -447,7 +447,7 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
                         frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
                         return;
                     }
-                    match Runtime::parse(&input) {
+                    match snippets::parse_runtime(&input) {
                         Ok(runtime) => system.update(cx, |system, cx| {
                             system.eval(
                                 agent,
@@ -525,7 +525,7 @@ fn switchable(
     // Keep the usual start choices visible without scrolling, then include
     // every other supported model and effort.
     let usual = RUNTIMES.into_iter().filter(move |choice| {
-        Runtime::parse(choice).is_ok_and(|runtime| runtime.kind == kind || can_change_kind)
+        Runtime::parse(choice).is_ok_and(|runtime| runtime.kind() == kind || can_change_kind)
     });
     let all = Runtime::choices(kind)
         .chain(

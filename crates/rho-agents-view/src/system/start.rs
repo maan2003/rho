@@ -11,7 +11,9 @@ use gpui::{App, Context, Entity};
 use rho_agent_hosts::HostId;
 use rho_agents_client::create::{AUTO_BASE_REV, Creation, Start};
 use rho_agents_client::protocol::worksets::{MailLaunch, StartFromMail};
-use rho_agents_client::snippets::{DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime};
+use rho_agents_client::snippets::{
+    self, DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime,
+};
 use rho_frame::{Candidate, Frame, Row, Rows};
 use rho_mail::ThreadId;
 use rho_window::style::StyleClass;
@@ -248,7 +250,7 @@ fn prompt_runtime(
                 .collect()
         }),
         Rc::new(move |frame, input, _, cx| {
-            let runtime = match Runtime::parse(&input) {
+            let runtime = match snippets::parse_runtime(&input) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     frame.echo(&error, StyleClass::SystemInfo, cx);
