@@ -229,7 +229,7 @@ steps:
 2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; a URL or a `git@` address is a repository, a path is a directory on `lab`
 3. `tide@lab agents:` asks for the mode, `one` under the point and `per idea` below it
 4. `tide@lab runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
-5. the idea sends and the work starts, as in `Write an idea`
+5. if the user started from Send, the idea sends and the work starts; if they were editing `to:` with `ctrl-t`, the new project fills that line and the draft stays open until they Send
    - from the Desk palette, `new project` asks the same four lines and opens the empty project
 system: the host keeps the project's name, place, mode and runtime, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
 user: the name, the place, the mode, and the runtime.
