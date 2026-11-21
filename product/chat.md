@@ -86,12 +86,13 @@ purpose: let an agent say what it is doing or about to do, for the user who happ
 principle: an agent writes `I plan to drop the cache layer, say no in 20 min` and starts; the user who is in the thread replies `no`, and the agent changes course; the user who is away never sees it, and the thread does not grow.
 sees: the words in `design.quiet` under the draft, newest first among the thread's messages, with the age at the end of the first line, `12m`; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the project's row, the newest flash's first line as the project's latest words
 does:
-- post, by an agent with `ephemeral=True`: show it in the thread for twenty minutes from its first post, or until the same agent sends a `Message`, whichever is first; then it is gone from every device, not kept as history
+- post, by an agent with `ephemeral=True`: show it in the thread for twenty minutes from its first post, longer while it is the thread's newest item from either side; it goes when the clock has run and something newer exists, a message or a flash from anyone; then it is gone from every device, not kept as history
 - reply: the user's reply is an ordinary `Message` to the writer; it does not keep the flash
 - edit: the agent can change its words; the clock runs from the first post
 rejected:
 - one flash per agent, each replacing the last · 2026-11-21 · they vanish anyway; folding the earlier ones costs nothing and keeps a short plan readable
 - an `expires_in` parameter · 2026-11-21 · one clock is easier to trust than a number each agent tunes
+- a flash that fades on its clock even while it is the newest thing in the thread · 2026-11-21 · the user who opens the thread an hour later still wants the last state of the work; the next message or flash replaces it
 - a soft ask, a flash that pings and takes its card with it when it fades · 2026-11-21 · a card that vanishes breaks `nothing addressed to the user disappears unread`; what needs the user is a `Message`, so one bit, `ephemeral`, is the whole choice
 - a kept message that does not ping, for progress · 2026-11-21 · see `Message`
 
