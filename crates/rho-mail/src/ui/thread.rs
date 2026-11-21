@@ -233,10 +233,12 @@ enum Follow {
     Logged(MessageId),
 }
 
+struct UserMailGutter;
+
 pub struct ThreadView {
     system: Entity<MailSystem>,
     thread: ThreadId,
-    transcript: Transcript<Key, Class, Meta>,
+    transcript: Transcript<Key, Class, Meta, UserMailGutter>,
     layout: Layout,
     editor: Entity<Editor>,
     placement: draft::Placement,
@@ -455,6 +457,10 @@ impl ThreadView {
             _subscriptions: subscriptions,
             _ages: None,
         };
+        if !list {
+            view.transcript
+                .set_gutter(rho_window::style::user_prompt_gutter_color);
+        }
         view.transcript.attach(&view.editor, cx);
         let items = items(
             system,
@@ -1061,7 +1067,8 @@ fn pending_items(
                     (Class::Pending, tag.clone()),
                     (Class::User, tag.end..len),
                 ])
-                .with_lines(vec![Meta::None; lines]),
+                .with_lines(vec![Meta::None; lines])
+                .with_gutter(0..len),
         );
         items.push(gap(Key::PendingGap(id)));
     }
@@ -1901,11 +1908,15 @@ fn message_item(
         return None;
     }
     styles.extend(links(&text).into_iter().map(|link| (Class::Link, link)));
-    Some(
-        Item::new(Key::Message(message.id), text)
-            .with_styles(styles)
-            .with_lines(lines),
-    )
+    let len = text.len();
+    let item = Item::new(Key::Message(message.id), text)
+        .with_styles(styles)
+        .with_lines(lines);
+    Some(if message.from == Party::User {
+        item.with_gutter(0..len)
+    } else {
+        item
+    })
 }
 
 impl Surface for ThreadView {
@@ -2344,7 +2355,12 @@ mod tests {
                 let log = system.logs.entry(thread.host).or_default();
                 log.tell(&post(1, None, Party::User, "Clock"));
                 log.tell(&post(2, Some(1), agent, &"Earlier readings\n\n".repeat(25)));
-                log.tell(&post(3, Some(2), Party::User, "My preceding answer."));
+                log.tell(&post(
+                    3,
+                    Some(2),
+                    Party::User,
+                    "My preceding answer.\n\n> The earlier question.",
+                ));
                 log.tell(&post(4, Some(2), agent, "The latest question."));
                 system.set_draft(thread.host, Some(thread.message), reply.into());
                 system
@@ -2363,15 +2379,17 @@ mod tests {
         window
             .update(cx, |view, _, cx| {
                 let doc = view.document(cx).text();
-                let first = doc.lines().take(8).collect::<Vec<_>>();
+                let first = doc.lines().take(9).collect::<Vec<_>>();
                 assert_eq!(
-                    &first[..7],
+                    first.as_slice(),
                     &[
                         reply,
                         "",
                         "The latest question.",
                         "",
                         "My preceding answer.",
+                        "",
+                        "> The earlier question.",
                         "",
                         "Earlier readings"
                     ],
@@ -2384,6 +2402,35 @@ mod tests {
                 );
             })
             .unwrap();
+
+        let mail_gutters = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |view, window, cx| {
+                    view.editor.update(cx, |editor, cx| {
+                        let display = editor.display_snapshot(cx);
+                        let text = display.buffer_snapshot().text();
+                        let lines = text.lines().collect::<Vec<_>>();
+                        let mut spans = editor
+                            .all_gutter_highlights(window, cx)
+                            .into_iter()
+                            .filter_map(|(range, colour)| {
+                                let start = display.display_point_to_point(range.start, Bias::Left);
+                                if start.row == 0 {
+                                    return None; // the draft's own bar
+                                }
+                                assert_eq!(colour, rho_window::style::user_prompt_gutter_color(cx));
+                                let end = display.display_point_to_point(range.end, Bias::Left);
+                                Some((start.row, end.row, lines[start.row as usize].to_owned()))
+                            })
+                            .collect::<Vec<_>>();
+                        spans.sort_unstable();
+                        spans
+                    })
+                })
+                .unwrap()
+        };
+        let preceding = "My preceding answer.".to_owned();
+        assert_eq!(mail_gutters(cx), [(4, 6, preceding.clone())]);
 
         let stuck = matches!(from, SendFrom::Stuck);
         if stuck {
@@ -2465,6 +2512,14 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(
+            mail_gutters(cx),
+            [
+                (2, 2, format!("{reply} · sending…")),
+                (6, 8, preceding.clone()),
+            ],
+        );
+
         // The receipt can clear the optimistic row before the durable mail
         // reaches the view. Test across both changes to the history.
         cx.update(|cx| {
@@ -2476,6 +2531,7 @@ mod tests {
         });
         cx.draw_window(window.into());
         assert_eq!(draft_and_history(cx, true), before, "after the receipt");
+        assert_eq!(mail_gutters(cx), [(4, 6, preceding.clone())]);
 
         cx.update(|cx| {
             mail.update(cx, |system, cx| {
@@ -2506,6 +2562,11 @@ mod tests {
             draft_and_history(cx, true),
             before,
             "when the sent mail lands"
+        );
+
+        assert_eq!(
+            mail_gutters(cx),
+            [(2, 2, reply.to_owned()), (6, 8, preceding)],
         );
 
         window
