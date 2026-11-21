@@ -81,12 +81,7 @@ def send(sender, to, text, *, thread=None, reply_to=None, ping=None, replace_las
     if isinstance(to, str):
         to = _local_address(sender, to.strip())
     if to == USER:
-        props = agents.Agent(sender).props
-        if props.get("preset") != "engineer":
-            if (parent := props.get("parent")) is None:
-                raise ValueError("only an Engineer can mail the user")
-            from .prompt import label
-            raise ValueError(f"mail your parent agent {label(parent)} instead")
+        _may_address_user(sender)
         if thread is None:
             if reply is None:
                 raise ValueError("mail to the user needs thread or reply_to")
@@ -109,6 +104,22 @@ def send(sender, to, text, *, thread=None, reply_to=None, ping=None, replace_las
     else:
         raise ValueError(f"unknown mail address {to!r}")
     return _send(sender, parent, text, reply_to=reply_to, replace_last=replace_last)
+
+
+def send_chat(sender, text, kind, *, thread) -> SentMail:
+    _may_address_user(sender)
+    if kind not in ("message", "flash"):
+        raise ValueError("kind is 'message' or 'flash'")
+    return SentMail(_rho.send_chat(sender, ident(thread), str(text).strip(), kind))
+
+
+def _may_address_user(sender):
+    props = agents.Agent(sender).props
+    if props.get("preset") != "engineer":
+        if (parent := props.get("parent")) is None:
+            raise ValueError("only an Engineer can mail the user")
+        from .prompt import label
+        raise ValueError(f"mail your parent agent {label(parent)} instead")
 
 
 def make_project(sender: str, name: str) -> int:

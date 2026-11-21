@@ -369,6 +369,7 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(send_chat, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(edit_message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(delete_message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(search_mail, &module)?)?;
@@ -786,6 +787,30 @@ fn send_mail(
     }
 }
 
+/// Both kinds speak to the user. The wire carries no recipient or ping.
+#[pyfunction]
+#[pyo3(signature = (sender, thread, text, kind))]
+fn send_chat(py: Python<'_>, sender: &str, thread: u64, text: String, kind: &str) -> PyResult<u64> {
+    use rho_agent_types::MessageKind;
+    let (kind, mentions) = match kind {
+        "message" => (MessageKind::Kept, &[Mention::User { ping: true }][..]),
+        "flash" => (MessageKind::Flash, &[][..]),
+        _ => return Err(PyValueError::new_err("kind is 'message' or 'flash'")),
+    };
+    match PyHost::block(
+        py,
+        PyRequest::SendChat {
+            sender: agent_id(sender)?,
+            thread: MessageId(ChatSeq(thread)),
+            content: message_content(text, mentions)?,
+            kind,
+        },
+    )? {
+        PyReply::Seq(id) => Ok(id.0),
+        _ => Err(unexpected()),
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (agent, id, text, *, ping = None))]
 fn edit_message(
@@ -806,7 +831,12 @@ fn edit_message(
     if existing.from != Address::Agent(agent) {
         return Err(PyValueError::new_err("you can only change your own mail"));
     }
-    let content = message_content(text, &existing.mentions)?;
+    let mentions = if existing.kind == rho_agent_types::MessageKind::Flash {
+        &[][..]
+    } else {
+        &existing.mentions
+    };
+    let content = message_content(text, mentions)?;
     match PyHost::block(
         py,
         PyRequest::Edit {

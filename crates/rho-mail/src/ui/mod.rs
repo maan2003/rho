@@ -70,7 +70,6 @@ struct Slot {
     name: String,
     link: Link,
     endpoint: Option<EndpointId>,
-    view: tokio::sync::watch::Sender<Option<MessageId>>,
 }
 
 /// An agent of a thread as the agents system describes it to mail: what to
@@ -125,7 +124,6 @@ pub struct MailSystem {
     legacy_places: HashMap<(EndpointId, ProjectId), ProjectConfig>,
     known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
-    view: Option<ThreadId>,
     drafts: TextIndex<(EndpointId, Option<MessageId>)>,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
@@ -182,7 +180,6 @@ impl MailSystem {
             last_project: loaded.last_project,
             drafts,
             cache,
-            view: None,
             hosts: HashMap::new(),
             logs,
             events,
@@ -220,31 +217,6 @@ impl MailSystem {
     pub fn agent_label(&self, endpoint: EndpointId, agent: AgentId, cx: &App) -> Option<String> {
         self.participant(endpoint, agent, cx)
             .map(|participant| participant.label)
-    }
-
-    /// Reports which mail thread is open in the focused place, if any.
-    /// A focus change to a non-mail screen sends `None`; neither opens
-    /// nor closes change a verdict or read mark.
-    fn set_view(&mut self, thread: Option<ThreadId>, cx: &mut Context<Self>) {
-        if self.view == thread {
-            return;
-        }
-        self.view = thread;
-        for slot in self.hosts.values() {
-            Self::sync_view(slot, thread);
-        }
-        cx.notify();
-    }
-
-    fn sync_view(slot: &Slot, view: Option<ThreadId>) {
-        let next = view
-            .filter(|view| Some(view.host) == slot.endpoint)
-            .map(|view| view.message);
-        slot.view.send_if_modified(|current| {
-            let changed = *current != next;
-            *current = next;
-            changed
-        });
     }
 
     pub fn work(&self, thread: ThreadId) -> Option<ThreadWork> {
@@ -389,7 +361,6 @@ impl MailSystem {
             } => {
                 if let Some(slot) = self.hosts.get_mut(&host) {
                     slot.endpoint = Some(endpoint);
-                    Self::sync_view(slot, self.view);
                 }
                 if fresh {
                     self.settings.remove(&endpoint);
@@ -877,16 +848,6 @@ impl System for MailSystem {
         Some(AnySurface::new(view))
     }
 
-    fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
-        let thread = address
-            .and_then(|address| self.thread_of(address))
-            .filter(|thread| {
-                self.host_mail(thread.host)
-                    .is_some_and(|chat| !chat.is_project(thread.message))
-            });
-        self.set_view(thread, cx);
-    }
-
     fn streams(
         &mut self,
         host: HostId,
@@ -895,20 +856,16 @@ impl System for MailSystem {
         link: &Link,
         _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
-        let (view, incoming_view) = tokio::sync::watch::channel(None);
         let slot = Slot {
             name: name.to_owned(),
             link: link.clone(),
             endpoint,
-            view,
         };
-        Self::sync_view(&slot, self.view);
         self.hosts.insert(host, slot);
         vec![Arc::new(MailStream::new(
             host,
             self.cursors.clone(),
             self.events.clone(),
-            incoming_view,
         ))]
     }
 
@@ -1300,6 +1257,7 @@ mod tests {
             seq: project.0,
             at: UnixMs(1),
             event: rho_agent_types::ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
                 reply_to: None,
                 from: Party::User,
@@ -1351,6 +1309,7 @@ mod tests {
                         seq: posted.0,
                         at: UnixMs(12),
                         event: rho_agent_types::ChatEvent::Posted {
+                            kind: rho_agent_types::MessageKind::Kept,
                             parent: Some(project),
                             reply_to: None,
                             from: Party::User,
@@ -1389,6 +1348,7 @@ mod tests {
             seq: id.0,
             at: UnixMs(id.0.0),
             event: ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent,
                 reply_to,
                 from,

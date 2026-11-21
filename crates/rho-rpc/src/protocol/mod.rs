@@ -73,7 +73,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/62";
+pub const IROH_ALPN: &[u8] = b"rho/ui/63";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP44";
 
@@ -189,9 +189,9 @@ pub enum Protocol {
     /// Worksets and the agent directory (`rho-agents-client`,
     /// `protocol::worksets`). Replaces `Agents`.
     Worksets,
-    /// The host's mail log and what the user writes to it (`rho-mail`).
+    /// The host's chat log and what the user writes to it.
     #[senax(rename = "Chat")]
-    Mail,
+    Chat,
 }
 
 /// The first frame on every stream: which protocol it speaks, and that

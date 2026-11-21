@@ -227,6 +227,7 @@ mod tests {
 
     fn message(from: Address, mentions: Vec<Mention>, text: &str) -> Message {
         Message {
+            kind: rho_agent_types::MessageKind::Kept,
             id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
             parent: Some(MessageId(ChatSeq(2))),

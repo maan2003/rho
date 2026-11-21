@@ -90,7 +90,6 @@ pub struct MailStream {
     host: HostId,
     cursors: Cursors,
     events: futures_mpsc::UnboundedSender<MailEvent>,
-    view: tokio::sync::watch::Receiver<Option<MessageId>>,
 }
 
 impl MailStream {
@@ -98,13 +97,11 @@ impl MailStream {
         host: HostId,
         cursors: Cursors,
         events: futures_mpsc::UnboundedSender<MailEvent>,
-        view: tokio::sync::watch::Receiver<Option<MessageId>>,
     ) -> Self {
         Self {
             host,
             cursors,
             events,
-            view,
         }
     }
 }
@@ -120,7 +117,6 @@ impl HostStream for MailStream {
         let host = self.host;
         let cursors = self.cursors.clone();
         let events = self.events.clone();
-        let mut view = self.view.clone();
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
@@ -153,33 +149,20 @@ impl HostStream for MailStream {
                     return Ok(());
                 }
                 write_frame(&mut socket, &ClientFrame::Follow { since }).await?;
-                let (mut reader, mut writer) = tokio::io::split(socket);
-                let receive = async {
-                    loop {
-                        let frame = read_frame::<_, ServerFrame>(&mut reader).await?;
-                        let event = match frame {
-                            ServerFrame::Mail { records } => MailEvent::Records { host, records },
-                            ServerFrame::Work { threads } => MailEvent::Work { host, threads },
-                            ServerFrame::Projects { configured } => {
-                                MailEvent::Projects { host, configured }
-                            }
-                            ServerFrame::Hello { .. } => continue,
-                        };
-                        if events.unbounded_send(event).is_err() {
-                            return Ok(());
+                loop {
+                    let frame = read_frame::<_, ServerFrame>(&mut socket).await?;
+                    let event = match frame {
+                        ServerFrame::Messages { records } => MailEvent::Records { host, records },
+                        ServerFrame::Work { threads } => MailEvent::Work { host, threads },
+                        ServerFrame::Projects { configured } => {
+                            MailEvent::Projects { host, configured }
                         }
+                        ServerFrame::Hello { .. } => continue,
+                    };
+                    if events.unbounded_send(event).is_err() {
+                        return Ok(());
                     }
-                };
-                let send = async {
-                    loop {
-                        let thread = *view.borrow_and_update();
-                        write_frame(&mut writer, &ClientFrame::View { thread }).await?;
-                        if view.changed().await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                };
-                tokio::select! { result = receive => result, result = send => result }
+                }
             }
             .await;
             let _ = events.unbounded_send(MailEvent::Closed { host });

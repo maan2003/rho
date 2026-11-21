@@ -201,6 +201,10 @@ def post(sender, parent, text, *, mentions=None):
         return _post(sender, parent, text, mentions or [])
 
 
+def send_chat(sender, thread, text, kind):
+    return send_mail(sender, thread, text, to="user", ping=(kind == "message"))
+
+
 def send_mail(sender, parent, text, *, to=None, ping=None, reply_to=None, replace_last=False):
     with STATE.lock:
         if sender not in STATE.agents:

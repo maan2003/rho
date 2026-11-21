@@ -396,11 +396,8 @@ impl Services {
                 })
             }
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
-            Request::ColdNotice { incoming } => Reply::ColdNotice(
-                self.pool
-                    .upgrade()
-                    .and_then(|pool| pool.cold_notice(self.agent, incoming)),
-            ),
+            // An adopted worker on epoch 35 can still ask this.
+            Request::ColdNotice { .. } => Reply::ColdNotice(None),
         };
         Ok(reply)
     }

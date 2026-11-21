@@ -166,6 +166,14 @@ pub(crate) enum PyRequest {
         limit: u64,
     },
     ProjectNamed(String),
+    /// New chat API. Leave the SendMail/SendMail2 request and reply shapes
+    /// alone so a running workset can still be adopted without restarting.
+    SendChat {
+        sender: rho_agent_types::AgentId,
+        thread: rho_agent_types::MessageId,
+        content: Vec<rho_agent_types::ContentPart>,
+        kind: rho_agent_types::MessageKind,
+    },
 }
 
 #[derive(Encode, Decode)]

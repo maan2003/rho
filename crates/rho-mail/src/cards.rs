@@ -332,6 +332,7 @@ mod tests {
             text: &str,
         ) -> MessageId {
             self.record(ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent,
                 reply_to: None,
                 from,
@@ -425,6 +426,7 @@ mod tests {
 
         fn answers(&mut self, thread: MessageId, mail: MessageId) {
             self.record(ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
                 parent: Some(thread),
                 reply_to: Some(mail),
                 from: Party::User,

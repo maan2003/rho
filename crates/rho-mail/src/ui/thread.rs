@@ -2537,6 +2537,7 @@ mod tests {
                 seq: ChatSeq(seq),
                 at: UnixMs(1_760_000_000_000 + seq),
                 event: ChatEvent::Posted {
+                    kind: rho_agent_types::MessageKind::Kept,
                     parent: parent.map(|id| MessageId(ChatSeq(id))),
                     reply_to: None,
                     from,
@@ -3084,6 +3085,7 @@ mod tests {
 
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
+            kind: rho_agent_types::MessageKind::Kept,
             id: MessageId(rho_agent_types::ChatSeq(13)),
             parent: None,
             reply_to: None,

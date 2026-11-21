@@ -17,10 +17,10 @@ use anyhow::Context as _;
 pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
-pub use mail::MailView;
 pub use projects::{ProjectIdea, ProjectIdeaResult};
 use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, UnixMs, WorksetKind,
+    Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, MessageKind, UnixMs,
+    WorksetKind,
 };
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
@@ -265,6 +265,7 @@ impl AgentPool {
             handing: tokio::sync::watch::Sender::new(false),
         });
         pool.init_projects().await;
+        pool.restore_flash_expiry().await;
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
             let mut interval =
@@ -1038,7 +1039,6 @@ impl AgentPool {
         };
         let id = write.post(UnixMs::now(), parent, message, Some(client_id))?;
         write.commit();
-        self.user_visited(id);
         self.wake_receivers(id, None);
         self.consider_naming(id);
         Ok(id)
@@ -1475,82 +1475,20 @@ impl AgentPool {
                 content,
                 ..
             } => {
-                self.own_agent(workset, sender)?;
-                self.known_mentions(&mentions)?;
-                let direct = mentions
-                    .iter()
-                    .any(|mention| matches!(mention, Mention::Direct(_)));
-                let project = if direct {
-                    anyhow::ensure!(
-                        parent.is_none(),
-                        "direct mail chooses its own thread; address the agent"
-                    );
-                    self.mail_project(sender)
-                } else {
-                    None
-                };
-                let message = NewMessage {
-                    from: Address::Agent(sender),
-                    reply_to,
-                    mentions,
-                    content,
-                };
-                let mut write = self.db.write().await;
-                let at = UnixMs::now();
-                let pings = message.mentions.contains(&Mention::User { ping: true });
-                if !direct
-                    && let Some(thread) = parent
-                    && let Some(mail) = write.live_project_mail(thread, sender)
-                {
-                    if let Some(ping) = replacement {
-                        let current = self.db.read().message(mail).context("no live mail")?;
-                        mail::check_agent_text(&message.content, &current.mentions)?;
-                        self.revise_agent_mail(
-                            write,
-                            workset,
-                            at,
-                            sender,
-                            mail,
-                            message.content,
-                            ping,
-                        )?;
-                        return Ok(PyReply::Seq(mail.0));
-                    }
-                    anyhow::bail!(
-                        "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
-                        mail.0.0,
-                        mail.0.0,
-                    );
-                }
-
-                if replacement.is_some() {
-                    mail::check_agent_text(&message.content, &message.mentions)?;
-                }
-                let id = if direct {
-                    write.post_peer(at, project, message)?
-                } else {
-                    write.post(at, parent, message, None)?
-                };
-                let version = write.mail_version(id);
-                write.append(
-                    workset,
-                    &Record {
-                        at,
-                        event: Event::MailWritten {
-                            agent: sender,
-                            message: id,
-                            version,
+                let id = self
+                    .send_agent_message(
+                        workset,
+                        parent,
+                        NewMessage {
+                            from: Address::Agent(sender),
+                            reply_to,
+                            mentions,
+                            content,
                         },
-                    },
-                )?;
-                write.commit();
-                self.wake_receivers(id, Some(workset));
-                if pings {
-                    self.watch_recap(id);
-                }
-                if !direct {
-                    self.consider_naming(id);
-                }
+                        replacement,
+                        "mail",
+                    )
+                    .await?;
                 if legacy_send {
                     PyReply::SentMail {
                         id,
@@ -1559,6 +1497,32 @@ impl AgentPool {
                 } else {
                     PyReply::Seq(id.0)
                 }
+            }
+            PyRequest::SendChat {
+                sender,
+                thread,
+                content,
+                kind,
+            } => {
+                let id = match kind {
+                    MessageKind::Kept => {
+                        self.send_agent_message(
+                            workset,
+                            Some(thread),
+                            NewMessage {
+                                from: Address::Agent(sender),
+                                reply_to: None,
+                                mentions: vec![Mention::User { ping: true }],
+                                content,
+                            },
+                            None,
+                            "chat",
+                        )
+                        .await?
+                    }
+                    MessageKind::Flash => self.send_flash(workset, sender, thread, content).await?,
+                };
+                PyReply::Seq(id.0)
             }
             PyRequest::Edit {
                 agent,

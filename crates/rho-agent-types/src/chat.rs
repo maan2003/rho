@@ -83,6 +83,16 @@ impl Mention {
     }
 }
 
+/// Whether a post is part of the record or only a flash for the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MessageKind {
+    #[default]
+    Kept,
+    Flash,
+}
+
+pub const FLASH_LIFETIME: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 /// One change to a host's chat.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ChatEvent {
@@ -96,6 +106,8 @@ pub enum ChatEvent {
         /// is posted.
         reply_to: Option<MessageId>,
         from: Address,
+        #[senax(default)]
+        kind: MessageKind,
         mentions: Vec<Mention>,
         content: Vec<ContentPart>,
     },
@@ -224,6 +236,8 @@ pub struct Message {
     pub parent: Option<MessageId>,
     pub reply_to: Option<MessageId>,
     pub from: Address,
+    #[senax(default)]
+    pub kind: MessageKind,
     pub mentions: Vec<Mention>,
     pub content: Vec<ContentPart>,
     /// A revision that started the current ping, rather than the original mail.
@@ -254,6 +268,7 @@ impl Message {
             parent,
             reply_to,
             from,
+            kind,
             mentions,
             content,
         } = &record.event
@@ -266,6 +281,7 @@ impl Message {
             parent: *parent,
             reply_to: *reply_to,
             from: *from,
+            kind: *kind,
             mentions: mentions.clone(),
             content: content.clone(),
             ping_started: None,
@@ -350,7 +366,7 @@ impl Message {
 
     /// Whether the mail waits for the user as a card.
     pub fn pings_user(&self) -> bool {
-        self.mentions.contains(&Mention::User { ping: true })
+        self.kind == MessageKind::Kept && self.mentions.contains(&Mention::User { ping: true })
     }
 
     /// Mail to the user pings or stops pinging; other mail stays as it is.
@@ -360,6 +376,12 @@ impl Message {
                 *was = ping;
             }
         }
+    }
+
+    /// The first post starts the clock; `version()` may change independently.
+    pub fn flash_deadline(&self) -> Option<UnixMs> {
+        (self.kind == MessageKind::Flash && self.revision != Revision::Deleted)
+            .then(|| self.at + FLASH_LIFETIME)
     }
 
     /// The message's text, images left out.
@@ -419,6 +441,7 @@ mod tests {
             parent: None,
             reply_to: None,
             from: Address::User,
+            kind: MessageKind::Kept,
             mentions: Vec::new(),
             content: vec![
                 ContentPart::Text {
@@ -440,7 +463,7 @@ mod tests {
 
     #[test]
     fn a_post_written_before_reply_addresses_still_decodes() {
-        #[derive(Encode)]
+        #[derive(Debug, PartialEq, Eq, Encode, Decode)]
         enum OldChatEvent {
             Posted {
                 parent: Option<MessageId>,
@@ -466,10 +489,44 @@ mod tests {
                 parent,
                 reply_to: None,
                 from: Address::User,
+                kind: MessageKind::Kept,
                 mentions: Vec::new(),
                 content
             }
         );
+    }
+
+    #[test]
+    fn a_flash_does_not_break_an_old_workers_message_decoder() {
+        #[derive(Decode)]
+        struct OldMessage {
+            id: MessageId,
+            from: Address,
+            mentions: Vec<Mention>,
+        }
+        let agent = AgentId::from_counter(81, &crate::AgentIdDomain(7)).unwrap();
+        let record = ChatRecord {
+            seq: ChatSeq(15),
+            at: UnixMs(742),
+            event: ChatEvent::Posted {
+                parent: Some(MessageId(ChatSeq(11))),
+                reply_to: None,
+                from: Address::Agent(agent),
+                kind: MessageKind::Flash,
+                mentions: vec![Mention::User { ping: false }],
+                content: vec![ContentPart::Text {
+                    text: "Checking now".into(),
+                }],
+            },
+        };
+        let flash = Message::from_record(&record).unwrap();
+        let bytes = senax_encoder::encode(&flash).unwrap();
+        let old = senax_encoder::decode::<OldMessage>(&mut bytes.as_ref()).unwrap();
+        assert_eq!(
+            (old.id, old.from),
+            (MessageId(ChatSeq(15)), Address::Agent(agent))
+        );
+        assert_eq!(old.mentions, [Mention::User { ping: false }]);
     }
 
     #[test]
@@ -508,6 +565,7 @@ mod tests {
             seq: ChatSeq(5),
             at: UnixMs(1),
             event: ChatEvent::Posted {
+                kind: MessageKind::Kept,
                 parent: Some(MessageId(ChatSeq(2))),
                 reply_to: None,
                 from: Address::Agent(agent),
@@ -544,6 +602,7 @@ mod tests {
                 parent: Some(MessageId(ChatSeq(1))),
                 reply_to: None,
                 from: Address::User,
+                kind: MessageKind::Kept,
                 mentions: Vec::new(),
                 content: vec![
                     ContentPart::Image {
