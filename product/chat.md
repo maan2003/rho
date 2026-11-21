@@ -62,20 +62,21 @@ does:
 - fork: take a tangent into a thread under its message; the prompt line says when to fork
 
 ## concept Message
-purpose: carry an idea, an ask, or a result in the voice of the project, keep it as the record of the work, and let the user answer whoever wrote.
+purpose: carry an idea, an ask, or a result in the voice of the project, keep it as the record of the work, and let the user answer in the thread.
 principle: the project asks a question; the user reads it on top of the thread with the project's earlier words one glance below, and replies without needing to know the writer's name.
 sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes; proof on a result
 does:
 - show proof: a result message designates evidence under `## proof`
 - ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on the message: open the `agents.Agent` that wrote the message at the step that produced its current words; a failed stop opens its error
-- reply: deliver the user's words only to the writer, keeping the answer in the shared thread
+- reply: the user's words go into the thread, and every agent in it reads them; there is no addressee. With two asks open, the user names the agent in words or deals the next card
 - edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and keeps the card as it is
 - reply privately `alt-r`: write a remark directly beneath this message, as in `notes.Reply privately`
 rejected:
 - kinds of message, `ask`, `result`, and `fyi` · 2026-11-20 · one yes or no, whether the message pings, does the job; a result waits like an ask
 - a message that is kept but does not ping · 2026-11-21 · anything worth the record is worth a card, and agents used it to be polite; progress is a `Flash`
 - a `## recap` section on a cold message, so it reads without the history · 2026-11-21 · with the newest message on top, the context is one glance below; the recap fold hid whole messages, and agents wrote it badly
+- a reply with an addressee: the draft answers one message, says so with an `answers …` line, `r` retargets, and the host delivers the words to that writer only · 2026-11-21 · a chat message has no target; every agent in the thread reads it and the user names one in words when it matters. The deal still settles the card the user came from
 - a header with the writer and the time above each message · 2026-11-20 · colour tells the voice, and the top line says how long the thread has waited
 - a status line kept apart from the messages, replaced rather than kept · 2026-11-20 · a `Flash`, replaced as the work moves, does the same job without a second surface
 
@@ -100,13 +101,12 @@ rejected:
 ## concept Draft
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the top of the thread, even after a restart.
-sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest message; when empty, a quiet `reply` right at the cursor where the words will go. When the draft answers a message that is not the newest, a quiet line right under the draft names it, `answers eng-ka35 · 12:40 · Which clock needs fixing?`, cut at the window; when it answers the newest message, nothing is said. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
+sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest message; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `enter` on a selection in one message: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
 - send `ctrl-enter`, or `send` on the phone bar while writing: the words become the newest message, right below the empty draft; the point rests in the draft and nothing scrolls, then or when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
-- answer this message, from the palette on a message, or `r` on it in Normal mode: make the draft answer that message; the quiet line changes or goes away
 rejected:
 - move the point to the project's next pinging message after sending · 2026-11-21 · the user stays in the draft; the history moves as needed
 - a separator line, `── reply to tide@lab · ctrl-enter sends`, between the history and the draft · 2026-11-20 · the draft is the next message; a line of chrome on every thread costs more than it says
@@ -203,7 +203,7 @@ steps:
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
 2. the user writes and edits an answer in the `Draft` at the top of the thread
 3. the user sends the answer with `Message.reply`; the reply settles that card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread.
-system: opens at the top with the point in the `Draft` and message below it, newest first. The user's last message separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves, and sends the reply to whoever wrote the message.
+system: opens at the top with the point in the `Draft` and message below it, newest first. The user's last message separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves. The reply is a message in the thread that every agent in it reads.
 user: the words of the answer, or done when there are none.
 cases: a question answered after a day away, with the project's earlier words one glance below; a result with proof; a colleague reached through `slack.Bot`.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
@@ -278,13 +278,6 @@ rejected:
 
 The historical review above was of Start a thread. Starting an agent from a message was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
-
-## rule the draft answers what the user came for
-when the user opens a `Thread` from a `deal.Card`, then the `Draft` answers the dealt message, even when newer messages sit between it and the draft; when the user opens the thread by name, the draft answers the newest message that pings, or the newest message when none does. The thread says which message that is whenever it is not the newest, and the user can change it with `Draft.answer this message`.
-cases: two agents ask in one thread and the deal opens the older ask; the user opens by name while two asks wait; the user quotes a line of an older message, which does not change the target.
-rejected:
-- the draft always answers the newest message · 2026-11-21 · the deal brought the user to an older ask, and the reply would go to the wrong writer
-- the draft silently answers the dealt message · 2026-11-21 · the words under the draft were another agent's, and the reply went to the one above without a sign
 
 ## rule the last message stays live
 when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user, unless the agent explicitly opts in with `replace_last=True`. That option edits its live message, preserving its ping unless set, and returns the same id. If it has no live message in the thread, it sends and returns a new one. Other agents can each send one message. A `Flash` is never refused and never counts. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
