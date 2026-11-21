@@ -42,29 +42,34 @@ def label(agent_id: str) -> str:
 
 def started_by_note(by: str) -> str:
     return (
-        f"Engineer {by} started you for the user; ask it with mail.send({by!r}, text) if you "
-        "need more context."
+        f"Engineer {by} started you for the user; if you need more context, "
+        f"ask it with agents.message(agent_id={by!r}, message=text)."
     )
 
 
 def team(agent_id: str, props: dict) -> str:
     """Who the agent is among the others, and how they talk."""
     me = label(agent_id)
+    preset = props["preset"]
     parent = props.get("parent")
     parent_address = label(parent) if parent is not None else None
     if parent_address is not None:
+        report = (
+            f"agents.message(agent_id={parent_address!r}, message=text)"
+            if preset == "engineer"
+            else f"mail.send({parent_address!r}, text)"
+        )
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
             f"agent id is {me}; your parent agent is {parent_address}.\n\nMessages from your "
             "parent define your task. Report to your parent with "
-            f"mail.send({parent_address!r}, text)."
+            f"{report}."
         )
     else:
         identity = (
             "You are the primary agent in a team of agents collaborating to fulfill the "
             f"user's goals. Your agent id is {me}."
         )
-    preset = props["preset"]
     started_by = props.get("started_by")
     if preset == "advisor":
         if parent_address is None:
@@ -86,6 +91,17 @@ def team(agent_id: str, props: dict) -> str:
         ownership = f"{started_by_note(label(started_by))} You own the user's technical outcome."
     else:
         ownership = "You were started directly and own the user's technical outcome."
+    if preset == "engineer":
+        reply = (
+            "Reply with `agents.message(agent_id=sender, message=text)`, "
+            "where `sender` is the agent ID from the header."
+        )
+    else:
+        reply = (
+            "Answer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. "
+            "An agent writes to another agent by mail in a thread under the project; "
+            "the user can read it one level down and never gets a card from it."
+        )
     return f"""{identity}
 
 {ownership}
@@ -96,7 +112,7 @@ Another agent's message to you arrives in this format:
 <text>
 ```
 
-Answer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. An agent writes to another agent by mail in a thread under the project; the user can read it one level down and never gets a card from it.
+{reply}
 
 """
 
