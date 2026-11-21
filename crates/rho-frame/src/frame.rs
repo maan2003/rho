@@ -1923,7 +1923,7 @@ mod tests {
                     cards: vec![card],
                     next_change: None,
                 };
-                let rows = desk_rows(&hand, |_| Some(project.clone()));
+                let rows = desk_rows(&hand, |_| Some(project.clone()), |_| None);
                 frame.desk.update(cx, |desk, cx| {
                     desk.set_rows(rows, Some(project.clone()), false, cx)
                 });

@@ -49,6 +49,7 @@ struct DeskRow {
     key: DeskKey,
     subject: String,
     detail: DeskDetail,
+    flash: Option<String>,
     card: Address,
 }
 
@@ -94,6 +95,7 @@ impl DeskRows {
 pub(crate) fn desk_rows(
     hand: &Hand,
     project_of: impl Fn(&Address) -> Option<IdeaProject>,
+    flash_at: impl Fn(&Address) -> Option<String>,
 ) -> DeskRows {
     // A project's stops occupy its first stop's place. Every pinging mail
     // remains a row, even when another came from the same project.
@@ -122,6 +124,7 @@ pub(crate) fn desk_rows(
                 detail: DeskDetail::Project(
                     project.map_or_else(|| card.context.clone(), |project| project.name),
                 ),
+                flash: flash_at(&card.address),
                 card: card.address.clone(),
             },
             card.kind,
@@ -159,6 +162,7 @@ pub(crate) fn desk_rows(
                 row.subject = project;
                 let reason = if mixed { "stops" } else { reason };
                 row.detail = DeskDetail::Stops(format!("{count} {reason}"));
+                row.flash = None;
             }
             row
         })
@@ -588,7 +592,35 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             DeskClass::Title,
             has_detail.then(|| (self.measure)(&subject) + gap),
         );
-        self.cell(&mut text, &mut styles, &mut gaps, &detail, class, None);
+        let used = (self.measure)(&subject)
+            + if has_detail {
+                gap + (self.measure)(&detail)
+            } else {
+                px(0.)
+            };
+        let flash = row
+            .flash
+            .as_ref()
+            .map(|words| self.cut(words, room - used - gap))
+            .filter(|words| !words.is_empty());
+        self.cell(
+            &mut text,
+            &mut styles,
+            &mut gaps,
+            &detail,
+            class,
+            flash.as_ref().map(|_| (self.measure)(&detail) + gap),
+        );
+        if let Some(flash) = flash {
+            self.cell(
+                &mut text,
+                &mut styles,
+                &mut gaps,
+                &flash,
+                DeskClass::Muted,
+                None,
+            );
+        }
         (
             Item::new(row.key.clone(), text)
                 .with_styles(styles)
@@ -630,18 +662,15 @@ impl<M: Fn(&str) -> Pixels> RowLayout<M> {
             None,
         );
         let mut lines = vec![row.card.clone()];
-        if let DeskDetail::Stops(stops) = &row.detail {
-            let stops = self.cut(stops, room - 2. * self.space);
-            if !stops.is_empty() {
+        let extra = match &row.detail {
+            DeskDetail::Stops(stops) => Some((stops, DeskClass::Label)),
+            DeskDetail::Project(_) => row.flash.as_ref().map(|words| (words, DeskClass::Muted)),
+        };
+        if let Some((extra, class)) = extra {
+            let extra = self.cut(extra, room - 2. * self.space);
+            if !extra.is_empty() {
                 text.push_str("\n  ");
-                self.cell(
-                    &mut text,
-                    &mut styles,
-                    &mut gaps,
-                    &stops,
-                    DeskClass::Label,
-                    None,
-                );
+                self.cell(&mut text, &mut styles, &mut gaps, &extra, class, None);
                 lines.push(row.card.clone());
             }
         }
@@ -771,6 +800,44 @@ mod tests {
     }
 
     #[test]
+    fn current_words_are_quiet_context_on_the_existing_card_only() {
+        let hand = Hand {
+            cards: [7, 2].map(card).to_vec(),
+            next_change: None,
+        };
+        let with_flash = desk_rows(
+            &hand,
+            |_| None,
+            |id| (*id == address(7)).then(|| "Running clock checks".into()),
+        );
+        let without_flash = desk_rows(&hand, |_| None, |_| None);
+        assert_eq!(with_flash.wait_count, without_flash.wait_count);
+        assert_eq!(with_flash.waiting[1], without_flash.waiting[1]);
+        let row = &with_flash.waiting[0];
+        assert_eq!(row.subject, without_flash.waiting[0].subject);
+        assert_eq!(row.card, without_flash.waiting[0].card);
+        let layout = RowLayout::new(|s: &str| px(s.chars().count() as f32));
+        let (wide, _) = layout.item(row, px(55.));
+        assert_eq!(
+            wide.text,
+            "idea 7 unformatted channel Running clock checks\n"
+        );
+        let (phone, _) = layout.compact(row, px(40.), px(19.));
+        assert_eq!(phone.lines, vec![address(7), address(7)]);
+        assert_eq!(
+            phone.text,
+            "idea 7 unformatted channel\n  Running clock checks\n"
+        );
+        assert!(
+            phone
+                .styles
+                .iter()
+                .any(|(class, bytes)| *class == DeskClass::Muted
+                    && &phone.text[bytes.clone()] == "Running clock checks")
+        );
+    }
+
+    #[test]
     fn waiting_comes_straight_from_the_hand_with_the_full_count() {
         // Ranking a second time by priority, subject, or project yields
         // different orders. Counting the displayed rows would say seven.
@@ -778,14 +845,18 @@ mod tests {
             cards: [7, 94, 2, 71, 28, 16, 48, 44, 12].map(card).to_vec(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, |address| {
-            Some(IdeaProject {
-                address: address.clone(),
-                name: "shoal@lab".into(),
-                details: None,
-                runtime: None,
-            })
-        });
+        let rows = desk_rows(
+            &hand,
+            |address| {
+                Some(IdeaProject {
+                    address: address.clone(),
+                    name: "shoal@lab".into(),
+                    details: None,
+                    runtime: None,
+                })
+            },
+            |_| None,
+        );
         assert_eq!(rows.wait_count, 9);
         assert_eq!(
             rows.waiting
@@ -829,7 +900,7 @@ mod tests {
                 runtime: None,
             })
         };
-        let rows = desk_rows(&hand, project);
+        let rows = desk_rows(&hand, project, |_| None);
         assert_eq!(rows.wait_count, 14);
         assert_eq!(rows.waiting[0].subject, "reef@lab");
         assert_eq!(rows.waiting[0].detail, DeskDetail::Stops("2 failed".into()));
@@ -852,7 +923,7 @@ mod tests {
                 .collect(),
             next_change: None,
         };
-        let rows = desk_rows(&afterwards, project);
+        let rows = desk_rows(&afterwards, project, |_| None);
         assert_eq!(rows.waiting[1].card, address(2));
         assert_eq!(rows.waiting[1].subject, "idea 2");
     }
@@ -876,7 +947,7 @@ mod tests {
                 runtime: None,
             })
         };
-        let rows = desk_rows(&hand, project);
+        let rows = desk_rows(&hand, project, |_| None);
         assert_eq!(rows.waiting[0].subject, "idea 7");
         assert_eq!(rows.waiting[1].subject, "idea 85");
         let overflow = rows.overflow.unwrap();
@@ -887,7 +958,7 @@ mod tests {
             cards: hand.cards[8..].into(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, project);
+        let rows = desk_rows(&hand, project, |_| None);
         assert_eq!(
             rows.waiting
                 .iter()
@@ -904,6 +975,7 @@ mod tests {
             key: DeskKey::Stops(Address::new("project", 1)),
             subject: "tide@lab".into(),
             detail: DeskDetail::Stops("12 failed".into()),
+            flash: None,
             card: address(7),
         };
         let layout = RowLayout::new(|text: &str| px(text.chars().count() as f32 * 5.));
@@ -935,12 +1007,14 @@ mod tests {
             key: DeskKey::Waiting(address(3)),
             subject: "WiWi".into(),
             detail: DeskDetail::Project("mini".into()),
+            flash: None,
             card: address(3),
         };
         let stops = DeskRow {
             key: DeskKey::Stops(Address::new("project", 1)),
             subject: "WWWW".into(),
             detail: DeskDetail::Stops("2 failed".into()),
+            flash: None,
             card: address(4),
         };
         let layout = RowLayout::new(measure);
@@ -972,6 +1046,7 @@ mod tests {
             key: DeskKey::Waiting(address(n)),
             subject: format!("row {n}"),
             detail: DeskDetail::Project("lab".into()),
+            flash: None,
             card: address(n),
         };
         let before = [row(5), row(9)];

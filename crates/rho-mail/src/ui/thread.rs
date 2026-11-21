@@ -3,7 +3,7 @@
 //! A project is the same surface over a root: it lists its threads, each
 //! with its replies folded under it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,13 +17,13 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, MouseButton,
     MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, EndpointId, Mention, Message, MessageId, Revision, UnixMs,
+    Address as Party, AgentId, ChatSeq, EndpointId, Mention, Message, MessageId, MessageKind,
+    Revision, UnixMs,
 };
-use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage, SendOnly};
@@ -95,6 +95,7 @@ enum Key {
     Message(MessageId),
     /// The replies under a message, folded.
     Fold(MessageId),
+    EarlierFlashes(AgentId),
     /// A thread under a root, on one line.
     Thread(MessageId),
     /// The user's private reply under a message: a note about it, which
@@ -112,7 +113,6 @@ enum Key {
 enum Class {
     Crumb,
     User,
-    Recap,
     Proof,
     Time,
     Fold,
@@ -131,14 +131,13 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 13;
+    const COUNT: usize = 12;
 
     fn slot(self) -> usize {
         match self {
             Self::Crumb => 0,
             Self::User => 1,
-            Self::Recap => 11,
-            Self::Proof => 12,
+            Self::Proof => 11,
             Self::Time => 2,
             Self::Fold => 3,
             Self::Pending => 4,
@@ -162,7 +161,6 @@ impl rho_transcript::Style for Class {
         let (color, weight) = match self {
             Self::Crumb | Self::Time | Self::Pending => (colors.text_muted, None),
             Self::User => (colors.text_accent, None),
-            Self::Recap => (gpui::rgb(0x97af9b).into(), None),
             Self::Fold => (cx.theme().status().info, None),
             Self::Quote => (colors.text_muted, None),
             Self::Name => (colors.text, None),
@@ -194,6 +192,7 @@ enum Meta {
     Mail(MessageId, Option<usize>),
     /// One quoted block, by first line in its mail's body.
     Quote(QuoteId, usize),
+    EarlierFlashes(AgentId),
     /// A project row or a tangent below a mail.
     Thread(MessageId),
     Private {
@@ -210,6 +209,7 @@ struct QuoteId {
 }
 
 enum InlineOpen {
+    Flashes(AgentId),
     Quote(QuoteId),
     Link(url::Url),
 }
@@ -275,7 +275,7 @@ pub struct ThreadView {
     last_point: Anchor,
     /// Set on open. Reading or quoting other mail does not retarget the draft.
     reply_to: Option<ReplyTarget>,
-    expanded_quotes: HashSet<QuoteId>,
+    expanded: Expanded,
     _subscriptions: Vec<Subscription>,
     /// Reads a project's list again when a thread's age next changes.
     _ages: Option<Task<()>>,
@@ -301,13 +301,22 @@ fn suggested_reply_target(
         .map(|mail| ReplyTarget::Suggested(mail.id))
 }
 
+#[derive(Default)]
+struct Expanded {
+    quotes: HashSet<QuoteId>,
+    flashes: HashSet<AgentId>,
+}
+
 /// New project posts count even when a sync batch ends with the user's
 /// mail. A revision counts only if it is on the newest visible mail.
 fn latest_project_activity(system: &MailSystem, thread: ThreadId) -> Option<ChatSeq> {
     let chat = system.host_mail(thread.host)?;
     let mut newest = None;
     let mut project_post = None;
-    for mail in chat.reading_order(thread.message) {
+    for mail in chat
+        .reading_order(thread.message)
+        .filter(|mail| mail.kind == MessageKind::Kept)
+    {
         if matches!(
             mail.revision,
             Revision::Deleted | Revision::TakenBack { .. }
@@ -325,8 +334,7 @@ fn latest_project_activity(system: &MailSystem, thread: ThreadId) -> Option<Chat
         .or(project_post)
 }
 
-/// How often the ages in a project's list move: their unit is the minute.
-const LIST_AGES_EVERY: SignedDuration = SignedDuration::from_secs(60);
+const MINUTE_MS: u64 = 60_000;
 
 impl ThreadView {
     /// The view over `thread` on `system`, which is `entity` as the frame
@@ -376,7 +384,7 @@ impl ThreadView {
             );
             rho_window::editor_config::configure(&mut editor, window, cx);
             if !list {
-                placement.stick(&mut editor, "↑ new mail".into(), cx);
+                placement.stick(&mut editor, "↑ new".into(), cx);
                 let doc = editor.buffer().read(cx).snapshot(cx);
                 draft::style(&mut editor, placement.range(&doc), "reply", cx);
             }
@@ -489,7 +497,7 @@ impl ThreadView {
             latest_project_activity: latest_project_activity(system, thread),
             last_point: Anchor::Min,
             reply_to: suggested_reply_target(system, thread, list),
-            expanded_quotes: HashSet::new(),
+            expanded: Expanded::default(),
             _subscriptions: subscriptions,
             _ages: None,
         };
@@ -504,7 +512,7 @@ impl ThreadView {
             view.is_list(),
             view.layout,
             view.reply_to.map(ReplyTarget::message),
-            &view.expanded_quotes,
+            &view.expanded,
             None,
             cx,
         );
@@ -564,7 +572,7 @@ impl ThreadView {
             list,
             self.layout,
             self.reply_to.map(ReplyTarget::message),
-            &self.expanded_quotes,
+            &self.expanded,
             self.private_edit.as_ref(),
             cx,
         );
@@ -587,12 +595,19 @@ impl ThreadView {
     /// Reads the thread again when an age it shows next says another.
     fn schedule_ages(&mut self, cx: &mut Context<Self>) {
         let system = self.system.read(cx);
-        let list = self.is_list()
-            && system
-                .host_mail(self.thread.host)
-                .is_some_and(|chat| !chat.children(Some(self.thread.message)).is_empty());
-        self._ages = list.then(|| {
-            let wait = std::time::Duration::try_from(LIST_AGES_EVERY).expect("positive interval");
+        let thread = self.thread.message;
+        let now = UnixMs::now().0;
+        let wait = system.host_mail(self.thread.host).and_then(|chat| {
+            if self.is_list() {
+                return (!chat.children(Some(thread)).is_empty()).then_some(MINUTE_MS);
+            }
+            chat.reading_order(thread)
+                .filter(|message| message.flash_deadline().is_some())
+                .map(|message| MINUTE_MS - now.saturating_sub(message.at.0) % MINUTE_MS)
+                .min()
+        });
+        self._ages = wait.map(|wait| {
+            let wait = std::time::Duration::from_millis(wait);
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
                 let _ = this.update(cx, |view, cx| view.refresh(cx));
@@ -785,12 +800,12 @@ fn items(
     list: bool,
     layout: Layout,
     reply_to: Option<MessageId>,
-    expanded_quotes: &HashSet<QuoteId>,
+    expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
     if list {
-        let mut items = history_items(system, thread, true, expanded_quotes, private_edit, cx);
+        let mut items = history_items(system, thread, true, expanded, private_edit, cx);
         items.push(separator_item(&system.project_of(thread), layout));
         items
     } else {
@@ -802,7 +817,7 @@ fn items(
             system,
             thread,
             false,
-            expanded_quotes,
+            expanded,
             private_edit,
             cx,
         ));
@@ -886,7 +901,7 @@ fn history_items(
     system: &MailSystem,
     thread: ThreadId,
     list: bool,
-    expanded_quotes: &HashSet<QuoteId>,
+    expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
 ) -> Vec<Item<Key, Class, Meta>> {
@@ -918,39 +933,15 @@ fn history_items(
         };
         line(Key::Crumb, &text, Class::Crumb).with_lines(vec![Meta::Open(parent.address())])
     });
-    // The user's private replies and verdicts both come from the ledger.
-    // The frame is leased while it opens this surface; the first refresh
-    // after the lease reads both before drawing.
-    let (mut private, chosen_recap) = system
+    // The frame is leased when it opens the surface. The first refresh
+    // after the lease reads its ledger before drawing.
+    let mut private = system
         .frame
         .read(cx, |frame, _| {
-            let marks = frame.marks();
-            let verdicts = marks
-                .get(&thread.address())
-                .facts()
-                .0
-                .iter()
-                .filter_map(|entry| {
-                    matches!(
-                        entry.fact,
-                        Fact::Settled { .. } | Fact::Snooze { .. } | Fact::Mute { .. }
-                    )
-                    .then(|| {
-                        u64::try_from(entry.at.timestamp().as_millisecond())
-                            .ok()
-                            .map(UnixMs)
-                    })
-                    .flatten()
-                });
-            let chosen = (!list)
-                .then(|| chat.recap(thread.message, verdicts))
-                .flatten();
-            (
-                private_items(marks, chat, host, thread.message, private_edit),
-                chosen,
-            )
+            private_items(frame.marks(), chat, host, thread.message, private_edit)
         })
         .unwrap_or_default();
+    let now = Timestamp::now();
     let mail_item = |message: &Message| {
         let voice = match message.from {
             Party::Agent(agent)
@@ -965,10 +956,7 @@ fn history_items(
             }
             _ => None,
         };
-        let recap = chosen_recap
-            .filter(|(id, _)| *id == message.id)
-            .map(|(_, text)| text);
-        message_item(message, voice.as_deref(), recap, expanded_quotes)
+        message_item(message, voice.as_deref(), &expanded.quotes, now)
     };
     if list {
         if let Some(crumb) = crumb {
@@ -988,18 +976,33 @@ fn history_items(
     }
 
     items.extend(pending_items(system, host, thread.message, true));
-    for id in chat
-        .children(Some(thread.message))
-        .iter()
-        .rev()
-        .copied()
-        .chain(std::iter::once(thread.message))
-    {
-        let Some(message) = chat.message(id) else {
-            continue;
-        };
+    let flashes = flash_groups(chat.reading_order(thread.message));
+    let mut history: Vec<_> = chat.reading_order(thread.message).collect();
+    history.reverse();
+    for message in history {
+        let id = message.id;
         let start = items.len();
-        items.extend(mail_item(message));
+        if let Some(agent) = flash_author(message) {
+            let group = &flashes[&agent];
+            let newest = group.latest == id;
+            let open = expanded.flashes.contains(&agent);
+            if newest || open {
+                items.extend(mail_item(message));
+            }
+            if newest && group.earlier > 0 {
+                let prefix = if open { "−" } else { "+" };
+                items.push(
+                    line(
+                        Key::EarlierFlashes(agent),
+                        &format!("{prefix}{} earlier", group.earlier),
+                        Class::Time,
+                    )
+                    .with_lines(vec![Meta::EarlierFlashes(agent)]),
+                );
+            }
+        } else {
+            items.extend(mail_item(message));
+        }
         items.extend(private.remove(&id).unwrap_or_default());
         // The opening mail's children are this history, not a tangent.
         let replies = chat.children(Some(id));
@@ -1024,6 +1027,38 @@ fn history_items(
     }
     items.extend(crumb);
     without_trailing_gap(items)
+}
+
+/// One group per author, independent of edit versions and display state.
+struct FlashGroup {
+    latest: MessageId,
+    earlier: usize,
+}
+
+fn flash_author(message: &Message) -> Option<AgentId> {
+    match message.from {
+        Party::Agent(agent) if message.flash_deadline().is_some() => Some(agent),
+        _ => None,
+    }
+}
+
+fn flash_groups<'a>(messages: impl Iterator<Item = &'a Message>) -> HashMap<AgentId, FlashGroup> {
+    let mut groups = HashMap::<AgentId, FlashGroup>::new();
+    for message in messages {
+        if let Some(agent) = flash_author(message) {
+            groups
+                .entry(agent)
+                .and_modify(|group| {
+                    group.latest = group.latest.max(message.id);
+                    group.earlier += 1;
+                })
+                .or_insert(FlashGroup {
+                    latest: message.id,
+                    earlier: 0,
+                });
+        }
+    }
+    groups
 }
 
 fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key, Class, Meta>> {
@@ -1762,10 +1797,11 @@ impl ThreadView {
     fn inline_open(&self, cursor: Point, cx: &App) -> Option<InlineOpen> {
         let quote = match self.line_meta(cursor.row, cx) {
             Some(Meta::Quote(quote, _)) => Some(*quote),
+            Some(Meta::EarlierFlashes(agent)) => return Some(InlineOpen::Flashes(*agent)),
             _ => None,
         };
         if let Some(quote) = quote
-            && !self.expanded_quotes.contains(&quote)
+            && !self.expanded.quotes.contains(&quote)
         {
             return Some(InlineOpen::Quote(quote));
         }
@@ -1776,6 +1812,13 @@ impl ThreadView {
 
     fn open_inline(&mut self, cursor: Point, cx: &mut Context<Self>) -> bool {
         match self.inline_open(cursor, cx) {
+            Some(InlineOpen::Flashes(agent)) => {
+                if !self.expanded.flashes.remove(&agent) {
+                    self.expanded.flashes.insert(agent);
+                }
+                self.refresh(cx);
+                self.cursor_to_item(&Key::EarlierFlashes(agent), Autoscroll::fit(), cx);
+            }
             Some(InlineOpen::Quote(quote)) => self.toggle_quote(quote, cx),
             Some(InlineOpen::Link(url)) => self.system.read(cx).frame.clone().open_link(url, cx),
             None => return false,
@@ -1821,8 +1864,8 @@ impl ThreadView {
     }
 
     fn toggle_quote(&mut self, quote: QuoteId, cx: &mut Context<Self>) {
-        if !self.expanded_quotes.remove(&quote) {
-            self.expanded_quotes.insert(quote);
+        if !self.expanded.quotes.remove(&quote) {
+            self.expanded.quotes.insert(quote);
         }
         self.refresh(cx);
         if let Some(start) = self.item_row(&Key::Message(quote.mail), cx)
@@ -1931,8 +1974,8 @@ fn incoming(mail: Option<&Message>) -> bool {
 fn message_item(
     message: &Message,
     third_voice: Option<&str>,
-    shown_recap: Option<&str>,
     expanded_quotes: &HashSet<QuoteId>,
+    now: Timestamp,
 ) -> Option<Item<Key, Class, Meta>> {
     let edited = match message.revision {
         Revision::Original => "",
@@ -1940,8 +1983,13 @@ fn message_item(
         Revision::TakenBack { .. } => " · taken back",
         Revision::Deleted => return None,
     };
+    let flash = message.kind == MessageKind::Flash;
+    let tag = if flash {
+        format!("{edited} · {}", ago(message.at.0, now))
+    } else {
+        edited.to_owned()
+    };
     let body = body(&message.content);
-    let recap = rho_agent_types::recap_section(&body);
     let proof_heading = message
         .pings_user()
         .then(|| rho_agent_types::proof_section(&body))
@@ -1950,20 +1998,6 @@ fn message_item(
     let mut text = String::new();
     let mut styles = Vec::new();
     let mut lines = Vec::new();
-    if let Some(shown_recap) = shown_recap {
-        text.push_str(shown_recap);
-        styles.push((Class::Recap, 0..text.len()));
-        let source = recap
-            .as_ref()
-            .filter(|range| body[range.start..range.end].trim_end() == shown_recap)
-            .map(|range| body[..range.start].lines().count());
-        lines.extend(
-            shown_recap
-                .lines()
-                .enumerate()
-                .map(|(offset, _)| Meta::Mail(message.id, source.map(|start| start + offset))),
-        );
-    }
     if let Some(voice) = third_voice {
         if !lines.is_empty() {
             text.push('\n');
@@ -1975,32 +2009,17 @@ fn message_item(
     }
     let voice = if message.from == Party::User {
         Class::User
+    } else if flash {
+        Class::Time
     } else {
         Class::Name
     };
-    // A non-anchor recap is folded only if the mail still has words.
-    let folded_recap = recap.filter(|range| {
-        shown_recap.is_some()
-            || !body[..range.start].trim().is_empty()
-            || !body[range.end..].trim().is_empty()
-    });
     let mut offset = 0;
     let mut body_lines = body.lines().enumerate().peekable();
     let mut first_body = true;
     while let Some((first_line, line)) = body_lines.next() {
-        let in_recap = folded_recap
-            .as_ref()
-            .is_some_and(|range| range.contains(&offset));
         let starts_proof = proof_heading == Some(offset);
         offset += line.len() + 1;
-        if in_recap {
-            // The preceding separator belongs to the hidden section.
-            if !first_body && text.ends_with('\n') {
-                text.pop();
-                lines.pop();
-            }
-            continue;
-        }
         if !lines.is_empty() {
             text.push('\n');
         }
@@ -2040,14 +2059,14 @@ fn message_item(
         }
         if first_body {
             let first_end = text[start..].find('\n').map_or(text.len(), |n| start + n);
-            text.insert_str(first_end, edited);
+            text.insert_str(first_end, &tag);
             // An expanded quote is still quiet after its tag.
             if let Some((_, range)) = styles.last_mut() {
                 if first_end != range.end {
-                    range.end += edited.len();
+                    range.end += tag.len();
                 }
             }
-            styles.push((Class::Crumb, first_end..first_end + edited.len()));
+            styles.push((Class::Crumb, first_end..first_end + tag.len()));
             first_body = false;
         }
     }
@@ -3122,104 +3141,98 @@ mod tests {
             (&bot, "cargo exited 101 · edited"),
             (&user, "Go ahead."),
         ] {
-            let item = message_item(mail, None, None, &HashSet::new()).unwrap();
+            let item = message_item(mail, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
             assert_eq!(item.text, format!("{first}\n"));
         }
-        let third_voice = message_item(&original, Some("eng-ab12"), None, &HashSet::new()).unwrap();
+        let third_voice = message_item(
+            &original,
+            Some("eng-ab12"),
+            &HashSet::new(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .unwrap();
         assert_eq!(third_voice.text, "eng-ab12\nReady?\n");
         let deleted = Message {
             revision: Revision::Deleted,
             ..original
         };
-        assert!(message_item(&deleted, None, None, &HashSet::new()).is_none());
+        assert!(message_item(&deleted, None, &HashSet::new(), Timestamp::UNIX_EPOCH).is_none());
     }
 
     #[test]
-    fn folding_a_recap_leaves_words_from_that_mail_visible() {
-        let writer = AgentId::from_counter(11, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let recap = "## recap\nWhat we changed.\n\nThe timer is steady.";
-        let revision = Revision::Edited {
-            seq: ChatSeq(19),
-            at: UnixMs(21),
-        };
-        let recap_only = mail(Party::Agent(writer), revision, recap);
-        let warm = message_item(&recap_only, None, None, &HashSet::new()).unwrap();
-        assert_eq!(
-            warm.text,
-            "## recap · edited\nWhat we changed.\n\nThe timer is steady.\n"
-        );
-        assert!(warm.styles.iter().all(|(class, _)| *class != Class::Recap));
-        assert_eq!(warm.lines[3].source_line(), Some(3));
-
-        // A name and whitespace are not a body. With the same selected
-        // cold recap, render it once in its special colour as before.
-        let space_before = mail(Party::Agent(writer), revision, &format!("  \n{recap}\n"));
-        let warm = message_item(&space_before, Some("eng-ab12"), None, &HashSet::new()).unwrap();
-        assert!(warm.text.contains("## recap\nWhat we changed."));
-        let cold = message_item(&recap_only, None, Some(recap), &HashSet::new()).unwrap();
-        assert_eq!(cold.text, format!("{recap}\n"));
-        assert_eq!(cold.styles, [(Class::Recap, 0..recap.len())]);
-
-        let followed = mail(
-            Party::Agent(writer),
-            revision,
-            &format!("{recap}\n\n## Result\nActual work."),
-        );
-        let warm = message_item(&followed, None, None, &HashSet::new()).unwrap();
-        assert_eq!(warm.text, "## Result · edited\nActual work.\n");
-        assert_eq!(warm.lines[0].source_line(), Some(5));
-    }
-
-    #[test]
-    fn a_ping_keeps_proof_visible_when_its_recap_is_hidden() {
+    fn an_old_markdown_summary_is_ordinary_text_and_proof_is_still_designated() {
         let writer = AgentId::from_counter(11, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let mut result = mail(
             Party::Agent(writer),
-            Revision::Original,
-            "Done.\n\n## recap\nEarlier plan.\n\n## proof\n42 tests passed.",
+            Revision::Edited {
+                seq: ChatSeq(2),
+                at: UnixMs(2),
+            },
+            "## recap\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.",
         );
-        result.mentions = vec![rho_agent_types::Mention::User { ping: true }];
+        result.mentions = vec![Mention::User { ping: true }];
         result.ping_started = Some((result.id.0, result.at));
-        let warm = message_item(&result, None, None, &HashSet::new()).unwrap();
-        assert_eq!(warm.text, "Done.\nProof\n42 tests passed.\n");
+        let item = message_item(&result, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
+        assert_eq!(
+            item.text,
+            "## recap · edited\nEarlier plan.\n\n## Result\nDone.\n\nProof\n42 tests passed.\n"
+        );
         assert!(
-            warm.styles.iter().any(
-                |(class, bytes)| *class == Class::Proof && &warm.text[bytes.clone()] == "Proof"
+            item.styles.iter().any(
+                |(class, bytes)| *class == Class::Proof && &item.text[bytes.clone()] == "Proof"
             )
         );
-        let recap = "## recap\nEarlier version's plan.";
-        let cold = message_item(&result, None, Some(recap), &HashSet::new()).unwrap();
+        assert_eq!(item.lines[1].source_line(), Some(1));
+    }
+
+    #[test]
+    fn flash_groups_use_original_order_and_ignore_deleted_messages() {
+        let domain = rho_agent_types::AgentIdDomain(0);
+        let a = AgentId::from_counter(1, &domain).unwrap();
+        let b = AgentId::from_counter(2, &domain).unwrap();
+        let flash = |id, agent, revision| Message {
+            id: MessageId(ChatSeq(id)),
+            kind: MessageKind::Flash,
+            at: UnixMs(100_000),
+            ..mail(
+                Party::Agent(agent),
+                revision,
+                "Running the suite.\nNo retries.",
+            )
+        };
+        let edited = flash(
+            3,
+            a,
+            Revision::Edited {
+                seq: ChatSeq(29),
+                at: UnixMs(800_000),
+            },
+        );
+        let newest = flash(12, a, Revision::Original);
+        let groups = flash_groups(
+            [
+                &flash(2, a, Revision::Original),
+                &edited,
+                &flash(5, b, Revision::Original),
+                &newest,
+                &flash(41, a, Revision::Deleted),
+            ]
+            .into_iter(),
+        );
+        assert_eq!((groups[&a].latest, groups[&a].earlier), (newest.id, 2));
         assert_eq!(
-            cold.text,
-            format!("{recap}\nDone.\nProof\n42 tests passed.\n")
+            (groups[&b].latest, groups[&b].earlier),
+            (MessageId(ChatSeq(5)), 0)
         );
-        assert!(
-            cold.styles
-                .iter()
-                .any(|(class, bytes)| *class == Class::Recap && &cold.text[bytes.clone()] == recap)
-        );
+        let now = Timestamp::from_millisecond(840_000).unwrap();
+        let item = message_item(&edited, None, &HashSet::new(), now).unwrap();
         assert_eq!(
-            cold.lines[0].source_line(),
-            None,
-            "previous version's recap"
+            item.text,
+            "Running the suite. · edited · 12m\nNo retries.\n"
         );
-        assert_eq!(
-            cold.lines[2].source_line(),
-            Some(0),
-            "the body remains indexed"
-        );
-        let current = message_item(
-            &result,
-            None,
-            Some("## recap\nEarlier plan."),
-            &HashSet::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            current.lines[0].source_line(),
-            Some(2),
-            "current recap is searchable in its new place"
-        );
+        assert_eq!(&item.text[item.styles[0].1.clone()], "Running the suite.");
+        assert_eq!(item.styles[0].0, Class::Time);
+        assert_eq!(item.lines[1].source_line(), Some(1));
     }
 
     #[test]
@@ -3265,7 +3278,7 @@ mod tests {
             mail: message.id,
             first_line: 4,
         };
-        let folded = message_item(&message, None, None, &HashSet::new()).unwrap();
+        let folded = message_item(&message, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
         assert_eq!(
             folded.text,
             "preface\n> façade first …\nCan this ship?\n> another quote …\n",
@@ -3281,7 +3294,13 @@ mod tests {
             quote_text(&folded),
             ["> façade first …", "> another quote …"]
         );
-        let expanded = message_item(&message, None, None, &HashSet::from([first])).unwrap();
+        let expanded = message_item(
+            &message,
+            None,
+            &HashSet::from([first]),
+            Timestamp::UNIX_EPOCH,
+        )
+        .unwrap();
         assert_eq!(
             expanded.text,
             "preface\n> façade first\n> second\nCan this ship?\n> another quote …\n",

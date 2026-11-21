@@ -118,8 +118,8 @@ This makes the phone card and the [phone transcript](phone-agent.png). The trans
 
 ## Read long history while drafting
 
-Seed a disposable thread with March history, today's cold arrival, a user reply,
-and a subsequent warm ask. The seed prints the thread ID (2 on a new fixture).
+Seed a disposable thread with March history, today's report, a user reply,
+and a subsequent ask. The seed prints the thread ID (2 on a new fixture).
 
 ```sh
 /src/cargo-one build --locked --offline -p rho-agent-host --example thread_reading_fixture
@@ -136,7 +136,7 @@ done
 sleep .7
 form_way "$device" input key:enter wait:950 key:space wait:700
 form_shot "$device" reading
-form_way "$device" input key:i 'text:Keep the reference clock.' \
+form_way "$device" input key:i 'text:Keep this clock.' \
     key:enter 'text:Both counters can use it.' key:enter 'text:Leave the retry alone.' \
     key:enter 'text:Log the chosen clock.' key:enter 'text:Run both tests twice.' \
     key:enter 'text:Compare the timestamps.' key:enter 'text:Keep the earlier result.' \
@@ -151,8 +151,8 @@ sleep .6
 form_shot "$device" reading-notice
 ```
 
-The [open thread](laptop-reading.png) puts the draft above the warm message. Today's
-cold message has a recap before its body; March and warm message don't.
+The [open thread](laptop-reading.png) puts the draft above the newest message.
+The earlier messages read in place.
 On [laptop](laptop-reading-notice.png) and [phone](phone-reading-notice.png), the
 stuck draft starts at the same place as it did inline. The gutter runs to the
 seam beneath the last line; the notice uses that reserved space without moving
@@ -161,14 +161,29 @@ Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
 
-### A warm message whose whole body is a recap
+## Fresh flashes in the thread and the Desk
 
-In the same fixture, send a user reply from the open thread. Then send project
-message with `"$fixture" send` and edit it to `## recap`, a short paragraph,
-a blank line, and another paragraph with no intervening heading. Use `gg` to
-read the newest message. [Before](laptop-recap-only-before.png), the edited message
-vanished. [After](laptop-recap-only-after.png), it stays visible as ordinary
-message with its `edited` tag; the cold recap below remains accented.
+Start the same disposable host with `FORM_FLASH_LEAD_SECONDS=120` as well
+as `FORM_SEED_THREAD=1`. Four flashes are logged before a newer kept ask;
+the host expires them at the deadline printed by the fixture. The short
+lead is set only by seeding earlier original post times, not by switching
+the clock or bypassing the running host.
+
+- Open `laptop` with `form_gui`; dismiss the synthetic phrase, then
+  [`form_shot laptop flash-desk-before`](laptop-flash-desk-before.png). The kept ask is the only card; its
+  row includes the newest flash's first line.
+- Open the card with Space; [`form_shot laptop flash-thread-before`](laptop-flash-thread-before.png). Both
+  writers have a quiet flash in the history, with their original ages.
+  Move to `+2 earlier` and press Enter (or tap the line on `phone`) to show
+  those two [earlier flashes](phone-flash-expanded.png) in their original positions; repeat to fold them again.
+- After the printed deadline, [`form_shot laptop flash-thread-after`](laptop-flash-thread-after.png),
+  then Tab to Desk and [`form_shot laptop flash-desk-after`](laptop-flash-desk-after.png). The flashes
+  and quiet Desk words are gone without re-opening the thread; the same
+  kept ask still waits.
+- To send a flash from a live fixture workset, run
+  `"$bins/examples/thread_reading_fixture" flash "$rig/runtime" "$rig/repo" 2 'I am checking the second clock.'`.
+  It appears without a card. It is now the latest item, so time
+  alone will not remove it; something newer must also arrive.
 
 ## Desk on laptop and phone: what waits
 
