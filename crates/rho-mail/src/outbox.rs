@@ -28,6 +28,17 @@ pub struct Outgoing {
     #[senax(default)]
     pub delivery: Delivery,
     pub runtime: Option<RuntimeLabel>,
+    #[senax(default)]
+    pub state: OutgoingState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub enum OutgoingState {
+    #[default]
+    Queued,
+    /// An answer from the host, not a failure to reach it. The words
+    /// remain readable in the thread but do not get retried or settle it.
+    Refused { reason: String },
 }
 
 impl Outgoing {
@@ -108,6 +119,7 @@ impl Outbox {
                 content,
                 delivery,
                 runtime: None,
+                state: OutgoingState::Queued,
             },
         )
     }
@@ -135,7 +147,9 @@ impl Outbox {
         if self.sending.contains_key(&endpoint) {
             return None;
         }
-        let (_, id, outgoing) = self.waiting.iter().find(|(host, ..)| *host == endpoint)?;
+        let (_, id, outgoing) = self.waiting.iter().find(|(host, _, outgoing)| {
+            *host == endpoint && outgoing.state == OutgoingState::Queued
+        })?;
         self.sending.insert(endpoint, Sending::Posting(*id));
         Some((
             outgoing.call(*id),
@@ -175,13 +189,35 @@ impl Outbox {
         Some((id, outgoing, Kept::Gone(id)))
     }
 
+    pub(crate) fn refuse_reply(&mut self, endpoint: EndpointId, reason: String) -> Kept {
+        let Some(Sending::Posting(id)) = self.sending.remove(&endpoint) else {
+            unreachable!("a refused reply was in flight")
+        };
+        let (_, _, outgoing) = self
+            .waiting
+            .iter_mut()
+            .find(|(host, client_id, _)| *host == endpoint && *client_id == id)
+            .expect("the in-flight reply is still in the outbox");
+        outgoing.state = OutgoingState::Refused { reason };
+        Kept::Put(id, outgoing.clone())
+    }
+
+    pub(crate) fn reply_targets(&self, endpoint: EndpointId) -> impl Iterator<Item = MessageId> {
+        self.waiting.iter().filter_map(move |(host, _, outgoing)| {
+            if *host != endpoint || outgoing.state != OutgoingState::Queued {
+                return None;
+            }
+            outgoing.reply_to
+        })
+    }
+
     /// The post failed; the message waits for the next try.
     pub fn failed(&mut self, endpoint: EndpointId) {
         self.sending.remove(&endpoint);
     }
 
-    /// The unsent messages under one parent on one host, oldest first.
-    pub fn waiting_under(&self, endpoint: EndpointId, parent: Option<MessageId>) -> Vec<&Outgoing> {
+    /// The still-local mail under one parent on one host, oldest first.
+    pub fn local_under(&self, endpoint: EndpointId, parent: Option<MessageId>) -> Vec<&Outgoing> {
         self.waiting
             .iter()
             .filter(|(host, _, outgoing)| *host == endpoint && outgoing.parent == parent)
@@ -199,8 +235,8 @@ impl Outbox {
     /// Every host with something unsent.
     pub fn hosts(&self) -> Vec<EndpointId> {
         let mut hosts = Vec::new();
-        for (host, ..) in &self.waiting {
-            if !hosts.contains(host) {
+        for (host, _, outgoing) in &self.waiting {
+            if outgoing.state == OutgoingState::Queued && !hosts.contains(host) {
                 hosts.push(*host);
             }
         }
@@ -276,9 +312,9 @@ mod tests {
             rho_agent_types::transcript::text_content(&outgoing.content),
             "a1"
         );
-        assert_eq!(texts(outbox.waiting_under(a, thread)), ["a2"]);
+        assert_eq!(texts(outbox.local_under(a, thread)), ["a2"]);
         assert!(
-            outbox.waiting_under(b, thread).is_empty(),
+            outbox.local_under(b, thread).is_empty(),
             "the thread of a's host"
         );
         assert_eq!(
@@ -286,7 +322,7 @@ mod tests {
             Some(second)
         );
         outbox.answered(a);
-        assert!(outbox.waiting_under(a, thread).is_empty());
+        assert!(outbox.local_under(a, thread).is_empty());
         assert!(outbox.next(a).is_none());
         assert_eq!(outbox.hosts(), [b]);
         assert!(outbox.answered(b).is_some());
@@ -329,6 +365,7 @@ mod tests {
             content: text("explicit choice"),
             delivery: Delivery::Idea,
             runtime: Some(label.clone()),
+            state: OutgoingState::Queued,
         };
         let bytes = senax_encoder::encode(&outgoing).unwrap();
         let saved = senax_encoder::decode::<Outgoing>(&mut bytes.as_ref()).unwrap();
@@ -364,6 +401,7 @@ mod tests {
             content: vec![ContentPart::Text { text: text.into() }],
             delivery: Delivery::Mail,
             runtime: None,
+            state: OutgoingState::Queued,
         };
         let mut outbox = Outbox::load(vec![
             (EndpointId([1; 32]), 32, outgoing(2, "second")),

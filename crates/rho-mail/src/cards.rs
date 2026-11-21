@@ -58,13 +58,14 @@ pub fn claims(
     marks: &Marks,
     now: Timestamp,
     mut trace: Option<&mut Trace>,
+    local_answers: impl IntoIterator<Item = MessageId>,
 ) -> Vec<Claim> {
     let chat = host.chat;
     // One walk over the chat, not one per thread: every thread's mentions
     // of the user in log order, and the newest message the user wrote in
     // it. Ranking happens on every change, and a host's chat is long.
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
-    let mut answered = HashSet::new();
+    let mut answered: HashSet<_> = local_answers.into_iter().collect();
     for message in chat.messages() {
         let mentioned = message.pings_user();
         let from_user = message.from == Party::User;
@@ -506,7 +507,7 @@ mod tests {
                 chat: &self.chat,
                 name: "lab",
             };
-            let claims = claims(&host, &self.marks, self.now.timestamp(), None);
+            let claims = claims(&host, &self.marks, self.now.timestamp(), None, []);
             let names = |address: &Address| {
                 let id = ThreadId::from_address(address)?;
                 name(&host, id.message)

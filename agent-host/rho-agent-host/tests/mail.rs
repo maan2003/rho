@@ -718,6 +718,7 @@ async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<
         &rho_dealer::Marks::default(),
         jiff::Timestamp::now(),
         None,
+        [],
     );
     let [claim] = claims.as_slice() else {
         anyhow::bail!("refused start did not deal one card")
@@ -1387,6 +1388,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                             &rho_dealer::Marks::default(),
                             jiff::Timestamp::now(),
                             None,
+                            [],
                         );
                         assert!(claims.is_empty(), "peer mail made a card");
                         peer = Some(mail.id);

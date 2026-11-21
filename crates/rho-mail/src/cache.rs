@@ -475,6 +475,7 @@ mod tests {
             }],
             delivery: crate::outbox::Delivery::Idea,
             runtime: None,
+            state: crate::outbox::OutgoingState::Queued,
         };
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -526,6 +527,9 @@ mod tests {
             content: vec![ContentPart::Text { text: "hi".into() }],
             delivery: crate::outbox::Delivery::Retry,
             runtime: None,
+            state: crate::outbox::OutgoingState::Refused {
+                reason: "target was removed".into(),
+            },
         };
         cache.write_outbox(
             H1,
@@ -544,6 +548,12 @@ mod tests {
         cursors.sort();
         assert_eq!(cursors, [(H1, ChatSeq(3)), (H2, ChatSeq(1))]);
         assert_eq!(loaded.outbox, [(H1, 7, outgoing.clone())]);
+        assert!(
+            crate::outbox::Outbox::load(loaded.outbox)
+                .next(H1)
+                .is_none(),
+            "restarting must not retry a refusal",
+        );
         assert_eq!(
             loaded.last_project,
             Some(ThreadId {
