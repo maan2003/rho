@@ -117,12 +117,12 @@ A separate clock per test should do it.
 
 ## part Draft
 purpose: let the user write the next mail without leaving the buffer.
-looks: ordinary `editor text` after the last mail and one blank line, on the same `reading surface`; nothing marks where the history ends.
+looks: the user's words in `marked`, like their sent mail, at the top of the thread, one blank line above the newest mail, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line, as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` mail.
 states:
-- empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft.
-- stuck in a thread: the same excerpt at the bottom, up to half the window; `↓ new mail` appears right-aligned in `quiet` when history changes above it.
+- empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
+- stuck in a thread: the same excerpt at the top edge, up to half the window, on the `command strip` surface so it reads as a layer over the history; `↑ new mail` appears right-aligned in `quiet` when project mail lands below it while the user reads history.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
-- after send: the words are the last mail, marked while on their way; the draft is empty with the point in it. For an idea the echo says where it went.
+- after send: the words are the newest mail, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
 used on: `mail.Thread` and the draft of `mail.Write an idea`.
 form: to be captured from the built screen; until then the mock under `mail.Thread`.
 

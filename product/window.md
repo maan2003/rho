@@ -23,13 +23,14 @@ The way back keeps the user's earlier screens, as they were left. A screen that 
 
 Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end. A search selects the whole match, so `c` changes it and `d` deletes it.
 
-## concept Bottom-stuck excerpt
-purpose: let the user keep working in one part of the text while reading what came before it.
-principle: the user scrolls back to read an old `mail.Mail` while typing a `mail.Draft`; the draft remains editable at the bottom, with history above it.
-sees: a designated excerpt as ordinary text when its first line is in the window; when that line is below the window, the excerpt sits over the bottom edge. It can take up to half the window; if taller, its text scrolls inside that space. On the phone it stays above the keyboard.
+## concept Edge-stuck excerpt
+status: built for the bottom edge only, as the thread's draft at the end of the thread.
+purpose: let the user keep working in one part of the text while reading the rest of it.
+principle: the user scrolls down to read an old `mail.Mail` while typing a `mail.Draft`; the draft remains editable at the top edge, with history below it.
+sees: a designated excerpt as ordinary text while any of it is in the window; when it has left the window past one edge, the excerpt sits over that edge, the top for a `mail.Draft`. It can take up to half the window; if taller, its text scrolls inside that space.
 does:
-- scroll history `ctrl-u`, `ctrl-d`, or by thumb above the excerpt: move the view, not the point
-- move and search: use the same motions as one buffer; `k` from the first line can move into history, `G` goes to the end
+- scroll the rest `ctrl-u`, `ctrl-d`, or by thumb outside the excerpt: move the view, not the point
+- move and search: use the same motions as one buffer; `j` from the last line of a top excerpt moves into the text below it, `G` goes to the end
 
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.

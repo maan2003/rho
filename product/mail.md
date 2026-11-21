@@ -49,11 +49,11 @@ rejected:
 ## concept Thread
 purpose: keep one piece of work and the whole exchange about it together.
 principle: the user writes to `tide@lab` about a flaky test; the project asks about the test and later sends the result in the same thread, whatever agents did the work.
-sees: its subject and project; on a row, what waits, or the project's latest words when nothing waits; open, its mails in order, oldest first, and the `Draft` as the next mail at the end
+sees: its subject and project; on a row, what waits, or the project's latest words when nothing waits; open, the `Draft` first, then its mails newest first, oldest last
 has:
 - many `Mail`
 - many `Thread`, each a tangent under a mail
-- one `Draft` at the end of the thread
+- one `Draft` at the top of the thread
 does:
 - open: from a `deal.Card` or by subject, open at the same place in `Thread`; a return restores the view and point as left
 - reply: write in the `Draft` and send with `Mail.reply`
@@ -80,11 +80,12 @@ Agents can search mail. Mail written while the host is away waits on the device 
 ## concept Draft
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the end of the thread, even after a restart.
-sees: the unsent text as the next mail at the end of the thread, after one blank line; when empty, a quiet `reply` where the words will go. When the first line is below the window, the draft becomes a `window.Bottom-stuck excerpt`; on the phone it sits above the keyboard.
+status: the built draft is the last mail at the end of the thread and sticks to the bottom edge.
+sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
-- edit `i`, `A`, `o` at the end, or a tap anywhere below the last mail: write in place; `escape` returns to Normal with the cursor still in the draft
+- edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `enter` on a selection in one mail: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
-- send `ctrl-enter`, or `send` on the phone bar while writing: the words become the last mail; the point rests in the empty draft even when the project answers
+- send `ctrl-enter`, or `send` on the phone bar while writing: the words become the newest mail, right below the empty draft; the point rests in the draft and nothing scrolls, then or when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
 rejected:
 - move the point to the project's next pinging mail after sending · 2026-11-21 · the user stays in the draft; the history moves as needed
@@ -93,24 +94,28 @@ rejected:
 
 A thread has one draft on each device, not shared with other devices.
 
+rejected:
+- the draft as the last mail at the end of the thread, stuck to the bottom while reading · 2026-11-21 · with the newest mail first the draft leads, and no open or fill rule is needed
+
 ## screen Thread
+status: the built screen reads oldest first with the draft at the end, opens on the first project mail since the user's last mail, fills a short tail with history, and sticks the draft to the bottom.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
-- the `Mail` in order, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable
+- the `Draft` first, at the top of the document, or stuck to the top edge while the user reads history below
+- the `Mail` newest first, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable; the user's own last mail, in `design.marked`, is the line between what is new since they wrote and the history below
 - one `## recap`, in `design.recap`, before the body of the newest stretch opener that has one
-- the `Draft` as the next mail at the end or stuck to the bottom while the user reads earlier history
 - a `notes.Private reply` below its mail, editable there; tangents open as their own `Thread`, not folded into the main history
 states:
-- empty: the opening mail, then the empty draft; a thread begins with a mail
+- empty: the empty draft, then the opening mail; a thread begins with a mail
 - loading: the thread's mail is not yet available; wording not agreed
 - partial: only the available mail; wording not agreed
 - error: the thread is unavailable; wording not agreed
-- full: whether opened by the deal or by name, the point goes into the `Draft`, where it was left if it has text; the first project mail since the user's last mail starts at the top, or the latest mail if none followed theirs. If the tail is shorter than the window, history fills the space above it. If the whole thread fits, the spare space goes above the opening mail. It never scrolls to empty space below the draft. Returning to a place restores it as left.
+- full: whether opened by the deal or by name, the window starts at the top of the document: the `Draft`, with the point in it where it was left, then the newest mail. Older mail is one scroll down. Returning to a place restores it as left.
 keys:
 - `enter` with no selection on a project's mail: `Mail.look into the work`
 - `ctrl-u`, `ctrl-d`: scroll history by half a window without moving the point out of the `Draft`
-- `G`: go to the draft; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
+- `gg`: go to the draft; `G`: go to the oldest mail; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
 - `enter` on a selection in one mail: `Draft.quote`
 - `alt-r` on a mail: `notes.Private reply.reply privately`
 - `u`, `shift-u` in the draft: undo and redo the last edit
@@ -120,7 +125,7 @@ keys:
 starts: `Answer a mail`, `agents.Look into the work`, `notes.Reply privately`
 rejected:
 - the mail that pings at the top of the window · 2026-11-21 · open on what the project has said since the user's last word, with the next reply ready in either way of opening
-- newest mail first · 2026-11-20 · the exchange reads in its own order
+- oldest mail first, the draft at the end · 2026-11-21 · the first project mail since the user's last word could not be at the top and the window full at once; with the newest first and the draft leading, open is always the top and the user's own last mail separates new from history. `newest mail first` was itself rejected on 2026-11-20 as `the exchange reads in its own order`; a first reading now runs bottom up, and the recap covers the cold return
 - the agent's transcript beside the mail in a second column · 2026-11-20 · one place in focus; the transcript is one level down
 - the card alone, with the history folded · 2026-11-20 · a short history costs nothing and a long one is one scroll away
 - the agent's work folded under each mail · 2026-11-20 · the transcript is `agents.Look into the work`
@@ -128,35 +133,34 @@ rejected:
 - marking the mail under the point by brightness or a bar · 2026-11-20 · the cursor is enough
 - a background tint behind the recap · 2026-11-20 · a slight text colour reads better
 
-The point never rests on the blank line between two mails. A reply from a dealt card settles the card and stays on the thread; the next card waits for `deal.Card.deal`. On the phone, the whole space below the last mail is the draft's tap target.
+The point never rests on the blank line between two mails. A reply from a dealt card settles the card and stays on the thread; the next card waits for `deal.Card.deal`. On the phone, the draft is the tap target to write.
 
 Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), [an outcome with its proof](design/laptop-proof.png), [a cold recap above its mail](design/laptop-reading.png), and [the notice in a stuck phone draft](design/phone-reading-notice.png).
 
 mock:
 ```text
 clock@lab › Flaky clock test                                   waits · 2h   NOR
-
-Fix the clock test that fails one run in five.
-It started after the DST change last week.
+reply
 
 ## recap
 The mock clock is shared between tests. One run in five lands on a DST boundary.
 
 Is a separate clock per test enough, or do you want the suite isolated too?
 
-reply
+Fix the clock test that fails one run in five.
+It started after the DST change last week.
 ```
 
-The first two lines are the user's, in `design.marked`; the project's mail follows in reading text. The recap leads the project's mail because that mail opened the latest stretch with a recap, in `design.recap`. The recap and body are separated by one blank line. `reply` is the empty draft's placeholder, in `design.quiet`.
+`reply` is the empty draft's placeholder, in `design.quiet`, with the point on it. The project's newest mail follows in reading text, led by its recap in `design.recap` because that mail opened the latest stretch with a recap. The last two lines are the user's own mail, in `design.marked`: everything above it is new since they wrote, everything below it is history.
 
 mock, phone:
 ```text
 clock@lab › Flaky clock test…  waits · 3m  NOR
-Fix the clock test that fails one run in five.
+reply
 
 Could you clarify which behaviour you want?
 
-reply
+Fix the clock test that fails one run in five.
 
     back     menu     done     snooze     more
 ```
@@ -247,5 +251,7 @@ rejected:
 
 rho tells the project once when the thread goes cold. The project's next pinging mail, new or edited, carries a recap that lets the user answer without the history. When ten minutes pass with a pinging mail that has no recap, rho reminds the project once.
 
-## rule new mail follows the draft at the tail
-when new `Mail` arrives or the latest mail is edited, then history moves as needed to keep the `Draft` in place if it is inline, without pulling the point into history. If the draft is stuck, history stays where it was. The draft shows a quiet `↓ new mail` for project mail, not the user's own mail, until the user scrolls down to the tail.
+## rule new mail lands below the draft
+when new `Mail` arrives, the user's own or the project's, or the newest mail is edited, then it takes its place right below the `Draft` and the point does not move. With the window at the top, the user sees it at once and older mail moves down. With the draft stuck to the top edge, the view stays where it is, and for project mail the stuck draft shows a quiet `↑ new mail` at its right end until the user scrolls back to the top.
+rejected:
+- history pushes up to keep the draft in place at the tail, `↓ new mail` for project mail when stuck at the bottom · 2026-11-21 · the mirror of this rule for the oldest-first order
