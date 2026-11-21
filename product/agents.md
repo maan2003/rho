@@ -1,6 +1,6 @@
 # agents
 
-The agents do the work behind the project's mail. The user goes one level down from the work to see an agent's transcript, terminals, shell, or desktops.
+The agents do the work behind the project's message. The user goes one level down from the work to see an agent's transcript, terminals, shell, or desktops.
 
 ## bet An agent is labour, not a colleague
 instead of: reaching an individually named agent from each thread.
@@ -11,43 +11,43 @@ costs: the user goes one level down to see what a particular agent did.
 ## bet Trust by inspection
 instead of: agents that report what they did, which the user believes.
 serves: Keep the work moving.
-because: the user does not edit code by hand and must still know whether a result is right; the result mail carries proof, the transcript shows how the work was done, and the terminal, shell, and desktop let the user stand beside the agent.
+because: the user does not edit code by hand and must still know whether a result is right; the result message carries proof, the transcript shows how the work was done, and the terminal, shell, and desktop let the user stand beside the agent.
 costs: a transcript is long, and the user reads it to find what went wrong.
 
 ## journey An agent in trouble gets back on track
 goal: the user gets the work going again so the result comes.
 starts when: an agent stops or goes quiet.
 steps:
-1. the user opens the project's mail about the stop, `deal.Clear what waits`
-2. the user reads the reason, `mail.Answer a mail`
+1. the user opens the project's message about the stop, `deal.Clear what waits`
+2. the user reads the reason, `chat.Answer a message`
    - when they need more, the user goes into the transcript, `Look into the work`
-3. the user replies with what the project should do next, `mail.Answer a mail`; a new reply retries an agent that could not launch
+3. the user replies with what the project should do next, `chat.Answer a message`; a new reply retries an agent that could not launch
 4. the user gets the result after the work carries on, `deal.Clear what waits`
 done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Agent
 purpose: do a piece of the user's work on a host, and let the user inspect what was done if needed.
-principle: an agent works from the user's mail about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
+principle: an agent works from the user's message about a flaky test. When the result arrives from the project, the user goes from the thread to the transcript to see what the agent ran.
 sees: its name, which is its workset's name with its short code, such as `manifold-release-and-bridge (eng-kjhi)`, or the short code alone, such as `eng-q9tz`; its host; its folder on the host, such as `/src/rho`; what it is doing: `working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`.
 has:
 - many `Terminal`
 - one `Shell`
 - many `Desktop`
-- many `mail.Thread`, the one it started from first
+- many `chat.Thread`, the one it started from first
 does:
-- open `enter` or a tap on a mail header: from the `mail.Thread` one level down, at the step that wrote the mail as it now reads; when opened by name, a retrying or failed agent opens on its last error, otherwise on its newest step
+- open `enter` or a tap on a message header: from the `chat.Thread` one level down, at the step that wrote the message as it now reads; when opened by name, a retrying or failed agent opens on its last error, otherwise on its newest step
 - open its thread, from the palette as `open its thread`: open the thread it started from
 - rewind turns, from the palette: take back its last turn and wait for the user; the palette has no way to give a count, so it is always one; the echo line reads `rewound one turn: eng-rb89 · waiting for you`
 - compact context, from the palette: shorten what it holds in mind; the echo reads `compacted: eng-rb89`
 - new cache key, from the palette: make it start its model's cache afresh; the echo reads `new cache key: eng-rb89`
-- stop agent, from the palette: end its work and keep the transcript; the thread says `stopped by you`, with no new mail.
+- stop agent, from the palette: end its work and keep the transcript; the thread says `stopped by you`, with no new message.
 - set runtime, from the palette: ask `runtime (current):`, offering the host's other models and efforts of its kind, one word each; a stopped agent that has never sent a request can also change to another kind. To change kinds after the agent has sent a request, start another agent. The echo reads `runtime: eng-ka35 · sol-low (was sol-medium)`.
 - cancel the request, from the palette: stop what it is asking its model now; the echo reads `cancelled: eng-rb89` or `not cancelled: eng-rb89 · it was not asking its model` when there was no request
 
 While the agent's host is away, each of these echoes `the agent's host is not attached`.
 
-The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. Each command line ends with `ok` or `error` and how long it ran; the same error again counts on one line, `×7`; a cancel reads `you cancelled the request`. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user writes to the project in `mail.Thread`; the transcript is for looking, not for replying.
+The agent's screen is its transcript: everything it did, so the user can check its work or see why it is stuck. Each command line ends with `ok` or `error` and how long it ran; the same error again counts on one line, `×7`; a cancel reads `you cancelled the request`. An agent has been quiet for an hour; the user opens it and sees the same error repeat; they cancel the request and set another runtime. The screen has a line on top with the agent's name, host, folder, and what it is doing; then every message it was given, every command it ran and what came back, every error, and every message it posted, newest at the bottom. A command still running shows how long it has run, counting up; a finished one shows `ok`, `error`, `cancelled`, or `ended`, and how long it took. There is no box to write in. The user writes to the project in `chat.Thread`; the transcript is for looking, not for replying.
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
@@ -107,7 +107,7 @@ A desktop of a known agent on an attached host is also a place in `window.Palett
 answers: what went wrong, on what brief?
 shows:
 - in the `window.Status line`, the agent, its host, folder and runtime, what it is doing, and the errors since its last successful step. On a phone the folder and host give way before the agent's name.
-- the brief once, then the transcript in order: mail uses `design.Mail header` (`you · 12:22`) in reading text, commands show their whole line, wrapped rather than cut, and output stays open; nothing the agent was given is shortened, since this screen is for finding out what happened
+- the brief once, then the transcript in order: message uses `design.Message header` (`you · 12:22`) in reading text, commands show their whole line, wrapped rather than cut, and output stays open; nothing the agent was given is shortened, since this screen is for finding out what happened
 keys:
 - `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
 - `space` then `u`: undo the last verdict without leaving the transcript
@@ -115,7 +115,7 @@ keys:
 - `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`
 
-Built renders: [mail's writing step on the laptop](design/laptop-agent.png) and [on the phone](design/phone-agent.png).
+Built renders: [message's writing step on the laptop](design/laptop-agent.png) and [on the phone](design/phone-agent.png).
 
 mock:
 ```text
@@ -153,9 +153,9 @@ when: the user has a result or a report of trouble and wants to see how the work
 want: see what actually happened without making agent activity part of the thread
 so that: the user can trust the result or understand where the work is stuck
 steps:
-1. the user opens the work's `mail.Thread`
-2. the user presses `enter` on the mail or taps its header to go one level down to the `Agent` transcript
-   - away from an agent's mail, `look into the work` opens the sole participant or asks which agent if more than one is available, newest first and with its runtime. From the draft it takes the dealt mail's writer or an explicitly chosen reply target first.
+1. the user opens the work's `chat.Thread`
+2. the user presses `enter` on the message or taps its header to go one level down to the `Agent` transcript
+   - away from an agent's message, `look into the work` opens the sole participant or asks which agent if more than one is available, newest first and with its runtime. From the draft it takes the dealt message's writer or an explicitly chosen reply target first.
 3. the user reads what the agent ran and what came back
 4. the user goes back to the thread with `window.Screen.back`
 system: keeps the transcript with the work it explains.
@@ -173,9 +173,9 @@ want: change its course without starting over
 so that: its work goes on from a good point
 steps:
 1. the user opens the agent's screen, `Agent`
-2. the user opens the palette, here or on the mail's `mail.Thread`, and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`; on the `desk.Desk` the palette offers `look into the work` for the row's agent
-   - from the thread draft, steering addresses the writer of the dealt mail or explicitly chosen reply; without one, it addresses the sole participant. If the thread has several possible workers, first select a mail or open the agent's transcript.
-3. if the work needs new instructions, the user returns to the thread and writes to the project, `mail.Answer a mail`
+2. the user opens the palette, here or on the message's `chat.Thread`, and chooses `cancel the request`, `rewind turns`, `compact context`, `new cache key`, or `set runtime…`; on the `desk.Desk` the palette offers `look into the work` for the row's agent
+   - from the thread draft, steering addresses the writer of the dealt message or explicitly chosen reply; without one, it addresses the sole participant. If the thread has several possible workers, first select a message or open the agent's transcript.
+3. if the work needs new instructions, the user returns to the thread and writes to the project, `chat.Answer a message`
 system: carries the change to the agent's host.
 user: which change, and what to tell it.
 reviewed: 2026-11-20 · laptop · reviewer · 3 findings
@@ -196,7 +196,7 @@ cases: the agent's host is a host on this machine, where its desktop does not op
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule an idea starts the work in its thread
-when the user sends a `mail.Mail` as a new idea to a `mail.Project`, then the work starts in the `mail.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `mail.Project.receive an idea`.
+when the user sends a `chat.Message` as a new idea to a `chat.Project`, then the work starts in the `chat.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `chat.Project.receive an idea`.
 
 ## flow Approve a push or a fetch
 runs: 3 a day
@@ -216,13 +216,13 @@ cases: two agents push at once, where the second question waits for the first; a
 ## rule a push waits for the user
 when an `Agent` pushes to or fetches from a repository through the user's ssh login, then the window asks the user first, and without a `y` the push or fetch does not happen.
 
-## rule a refused start leaves mail
-when a start cannot use the `mail.Project`'s place before it creates an `Agent`, then the `mail.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works from the project's palette`. A later start shows its own progress without erasing the stop from history.
+## rule a refused start leaves a message
+when a start cannot use the `chat.Project`'s place before it creates an `Agent`, then the `chat.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works from the project's palette`. A later start shows its own progress without erasing the stop from history.
 rejected:
 - telling the user to run `start agent here` · 2026-11-21 · no command has that name, and the place belongs to the project
 
 ## rule a stuck agent asks
-when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop mail. When the model answers again, the project edits that stop and it no longer deals.
+when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop message. When the model answers again, the project edits that stop and it no longer deals.
 
-## rule rewinding takes back its mail
-when `rewind turns` takes back a turn that wrote mail, then the withdrawn mail is still readable as `taken back` but no longer deals. Mail since changed by another turn is not withdrawn.
+## rule rewinding takes back its messages
+when `rewind turns` takes back a turn that wrote message, then the withdrawn message is still readable as `taken back` but no longer deals. Message since changed by another turn is not withdrawn.

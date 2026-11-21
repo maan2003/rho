@@ -8,7 +8,7 @@ starts when: the user decides to work on a different project now.
 steps:
 1. the user sees what waits on the desk, `Glance at what waits`
 2. the user opens the thread by project name and subject in the same query, `window.Go to something by name`
-3. the user picks up the thread, with their draft still there, `mail.Answer a mail`, `mail.Draft`
+3. the user picks up the thread, with their draft still there, `chat.Answer a message`, `chat.Draft`
 done when: the user knows what waits and can carry on where they left off, drafts and all.
 day: Know what wants them, and where they were.
 
@@ -20,8 +20,8 @@ does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
 - open a row `enter` or one tap: open the selected card; the waiting overflow opens the first hidden card
-- write an idea `i` on any row: open the idea draft, as `mail.Write an idea`
-- narrow: show only one `mail.Project`'s waiting rows, chosen by name, with where the project works, its mode and its runtime in the top line, such as `tide@lab · on tide · one agent · sol-high`; a project has no screen of its own
+- write an idea `i` on any row: open the idea draft, as `chat.Write an idea`
+- narrow: show only one `chat.Project`'s waiting rows, chosen by name, with where the project works, its mode and its runtime in the top line, such as `tide@lab · on tide · one agent · sol-high`; a project has no screen of its own
 
 ## screen Desk
 answers: what needs the user now?
@@ -38,14 +38,14 @@ keys:
 - `space`: deal the first card, `Desk.deal`; with no card waiting and a verdict to take back, open `deal.Verdict`
 - `enter`: open the selected row, `Desk.open a row`
 - `j` and `k`: move between waiting and overflow rows, skipping labels and blank lines; `gg`: first row; `G`: last row
-- `i`: `mail.Write an idea`
+- `i`: `chat.Write an idea`
 - `tab`: `window.Screen`
 - `:`: `window.Palette`, which leaves out what waits here, since it is already in view
-starts: `Glance at what waits`, `deal.Clear what waits`, `mail.Write an idea`, `window.Go to something by name`
+starts: `Glance at what waits`, `deal.Clear what waits`, `chat.Write an idea`, `window.Go to something by name`
 rejected:
 - `asks · 2h` and `result · 8m` words and ages on the rows · 2026-11-20 · the Desk is a glance; the deal says why and since when, one card at a time
 - a mark on what changed since the last glance · 2026-11-20 · the same reason
-- a draft tail at the bottom · 2026-11-20 · the idea key opens the draft, see `mail.Write an idea`
+- a draft tail at the bottom · 2026-11-20 · the idea key opens the draft, see `chat.Write an idea`
 - `moving`, up to ten threads that are not waiting with the project's latest words · 2026-11-21 · the owner reads what waits and nothing else at a glance; what moves is one name away in `window.Palette`, where a thread row still shows the project's latest words
 
 On the phone, rows keep their place while the Desk is on screen, so a row does not move under the thumb; a new order shows when the Desk opens again.
@@ -60,7 +60,7 @@ desk                                                                        NOR
 Flaky clock test  tide@lab
 Release window  slack@harness
 reef@lab  6 failed
-Switch the mail runtime  dune@lab
+Switch the model runtime  dune@lab
 Limit the retry window  mire@lab
 Rename the fixture  sand@lab
 Shoreline import  shoal@lab
@@ -74,7 +74,7 @@ desk                               NOR
 Flaky clock test               tide@lab
 Release window            slack@harness
 reef@lab                       6 failed
-Switch the mail runtime        dune@lab
+Switch the model runtime        dune@lab
 Limit the retry window         mire@lab
 Rename the fixture             sand@lab
 Shoreline import              shoal@lab
@@ -103,4 +103,4 @@ The historical review was of Glance at what waits on Home.
 when the user returns within ten minutes away, then their `window.Screen` is where they left it; after more than ten minutes away, the `Desk` is on screen. Away begins when the window loses the keyboard or the device goes idle.
 
 ## rule work has words before the agent writes any
-when an agent works in a `mail.Thread` and the project has not written since the user did, then the thread's row in `window.Palette` reads `working`; the word goes away when the agent stops or the thread waits.
+when an agent works in a `chat.Thread` and the project has not written since the user did, then the thread's row in `window.Palette` reads `working`, or the first line of the agent's newest fresh `chat.Flash` when it has one; the word goes away when the agent stops or the thread waits.

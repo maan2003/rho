@@ -1,6 +1,6 @@
 # Built rho renders
 
-The thread and idea captures show the leading draft and newest-first mail; the full Desk captures show only what waits. The runtime captures show the project’s automatic choice on laptop and a draft override on phone. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
+The thread and idea captures show the leading draft and newest-first message; the full Desk captures show only what waits. The runtime captures show the project’s automatic choice on laptop and a draft override on phone. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
 ## Run the fixture
 
@@ -78,9 +78,9 @@ Starting from the waiting clock ask, capture the card, verdict, and agent in ord
 | Render | Capture |
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
-| [Mail body search](laptop-prompt.png) | From Desk, `form_way laptop input 'text::' 'wait:400' 'text:mail: behavior' 'wait:600'; form_shot laptop prompt`. |
+| [Message body search](laptop-prompt.png) | From Desk, `form_way laptop input 'text::' 'wait:400' 'text:chat: behavior' 'wait:600'; form_shot laptop prompt`. |
 | [Verdict menu below the card](laptop-menu.png) | `form_way laptop input 'key:space' 'wait:700'; form_shot laptop menu` |
-| [Agent transcript at the mail's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:g' 'key:g' 'key:j' 'key:enter' 'wait:850'; form_shot laptop agent` |
+| [Agent transcript at the message's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:g' 'key:g' 'key:j' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |
 
 The echo says `nothing waits` when the last card is cleared. Use `space` then `u` to undo the verdict, then `form_way laptop stop`.
@@ -95,7 +95,7 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 | Verdict sheet over the unpaired card | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55`. |
 | [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
 | [Command-only palette](phone-palette-commands.png) | From the blank palette, `form_way phone input 'text:> note' 'wait:550'; form_shot phone palette-commands`. Only commands appear, without shortcut hints. |
-| [Text-only palette](phone-palette-text.png) | From the command-only palette, `form_way phone input 'key:escape' 'wait:320' 'text::' 'wait:280' 'text:/ behavior' 'wait:550'; form_shot phone palette-text`. Tap the mail row to open its matching line. |
+| [Text-only palette](phone-palette-text.png) | From the command-only palette, `form_way phone input 'key:escape' 'wait:320' 'text::' 'wait:280' 'text:/ behavior' 'wait:550'; form_shot phone palette-text`. Tap the message row to open its matching line. |
 
 For the card without the `unpaired` notice, reuse the laptop identity:
 
@@ -151,8 +151,8 @@ sleep .6
 form_shot "$device" reading-notice
 ```
 
-The [open thread](laptop-reading.png) puts the draft above the warm mail. Today's
-cold mail has a recap before its body; March and warm mail don't.
+The [open thread](laptop-reading.png) puts the draft above the warm message. Today's
+cold message has a recap before its body; March and warm message don't.
 On [laptop](laptop-reading-notice.png) and [phone](phone-reading-notice.png), the
 stuck draft starts at the same place as it did inline. The gutter runs to the
 seam beneath the last line; the notice uses that reserved space without moving
@@ -161,14 +161,14 @@ Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
 
-### A warm mail whose whole body is a recap
+### A warm message whose whole body is a recap
 
 In the same fixture, send a user reply from the open thread. Then send project
-mail with `"$fixture" send` and edit it to `## recap`, a short paragraph,
+message with `"$fixture" send` and edit it to `## recap`, a short paragraph,
 a blank line, and another paragraph with no intervening heading. Use `gg` to
-read the newest mail. [Before](laptop-recap-only-before.png), the edited mail
+read the newest message. [Before](laptop-recap-only-before.png), the edited message
 vanished. [After](laptop-recap-only-after.png), it stays visible as ordinary
-mail with its `edited` tag; the cold recap below remains accented.
+message with its `edited` tag; the cold recap below remains accented.
 
 ## Desk on laptop and phone: what waits
 
@@ -215,7 +215,7 @@ in flight, start a separate `FAKE_SCENARIO=slow-trickle` fixture and send
 only the first idea. Both Desk and `clock@lab` show `0 wait` until there
 is a card.
 
-## Inspect an outcome mail and a transcript with full commands
+## Inspect an outcome message and a transcript with full commands
 
 Run `FAKE_SCENARIO=real-tool-rounds FAKE_ARGS='--seed 899421 --rounds 2' bash product/design/capture.sh /tmp/rho-form-proof target/debug`.
 Use **Put a clock idea to work** with `Run the clock acceptance checks.` for the idea. When the result waits, deal it with `space` and capture [proof](laptop-proof.png). Move `j` from the draft to the project's words, then press `enter` for the [transcript](laptop-agent.png). The command source, including each last shell argument, and the successful output are visible without opening a fold.
@@ -228,8 +228,8 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
 - Desk shows the wait count, waiting subjects with their projects, and any overflow. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
-- In a thread, the draft leads the newest-first mail; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent mail, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
-- The palette can match mail body words absent from the subject. `>` limits rows to commands, `/` to mail and note text; `mail:` and `note:` retain their narrower scopes. Up and Down wrap the selection without changing the query. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
-- Both transcripts start with the brief and land on the mail's writing step. The phone shows the directory basename and wraps the step in the same reading area.
+- In a thread, the draft leads the newest-first message; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent message, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
+- The palette can match message body words absent from the subject. `>` limits rows to commands, `/` to message and note text; `chat:` and `note:` retain their narrower scopes. Up and Down wrap the selection without changing the query. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
+- Both transcripts start with the brief and land on the message's writing step. The phone shows the directory basename and wraps the step in the same reading area.
 
 These renders cover the states named above, not pending or private delivery, host disconnection, a failed agent, alternate appearances, or motion timings.

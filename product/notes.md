@@ -1,6 +1,6 @@
 # notes
 
-Notes are the user's memory: text only they write and only their devices hold. They live apart from the work and can be found from the user's palette. A note is about nothing and listed in `Notes`, or about a `mail.Mail` and also a private reply beside it.
+Notes are the user's memory: text only they write and only their devices hold. They live apart from the work and can be found from the user's palette. A note is about nothing and listed in `Notes`, or about a `chat.Message` and also a private reply beside it.
 
 ## concept Note
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
@@ -17,11 +17,11 @@ No agent sees a note. A note's text passes between the user's devices through th
 While the user types a new note, the top line follows its first line as it is typed. A note is saved the moment the user leaves it.
 
 ## concept Private reply
-purpose: let the user keep a remark on a `mail.Mail` in its thread, where only they see it.
-principle: a project mails a result the user doubts; they press `alt-r` on the mail, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
-sees: directly under the mail, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
+purpose: let the user keep a remark on a `chat.Message` in its thread, where only they see it.
+principle: a project messages a result the user doubts; they press `alt-r` on the message, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
+sees: directly under the message, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
 does:
-- reply privately `alt-r` on the mail, or `reply privately` from the palette or phone menu: start writing beneath it; if the mail already has a private reply, edit the latest one there
+- reply privately `alt-r` on the message, or `reply privately` from the palette or phone menu: start writing beneath it; if the message already has a private reply, edit the latest one there
 - edit `enter` or a tap on an existing private reply: write in place; `escape`, or `keep` on the phone, returns to reading
 
 ## concept Find or start
@@ -35,7 +35,7 @@ does:
 
 ## screen Notes
 answers: What did the user write down, and can they find it or start another note?
-shows: `Find or start` at the top; then `Note` rows, last written first, with their first line, a few quieter words from the rest, and age; a `Private reply` adds its mail's first words after `↳`, and the thread's subject when different.
+shows: `Find or start` at the top; then `Note` rows, last written first, with their first line, a few quieter words from the rest, and age; a `Private reply` adds its message's first words after `↳`, and the thread's subject when different.
 states:
 - empty: `no notes yet · i or o to start` (on the phone, `no notes yet · tap new to start`)
 - loading: no separate loading state; the device lists the notes it holds
@@ -118,19 +118,19 @@ reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 ## flow Reply privately
 runs: 2 a week
 day: Keep their own memory.
-when: a `mail.Mail` needs a remark that is for the user only
-want: write it beside the mail
+when: a `chat.Message` needs a remark that is for the user only
+want: write it beside the message
 so that: the user sees it the next time they read the thread, and no agent does
 steps:
-1. the user puts the cursor on the mail
-2. the user presses `alt-r`; a private tail opens directly under the mail
-3. the user types the remark and presses `escape`; the remark stays under the mail
-system: keeps the remark with the mail on every device.
+1. the user puts the cursor on the message
+2. the user presses `alt-r`; a private tail opens directly under the message
+3. the user types the remark and presses `escape`; the remark stays under the message
+system: keeps the remark with the message on every device.
 user: the remark.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a note about nothing stays off the desk
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is not on the `desk.Desk`.
 
-## rule a note about a mail shows in its thread
-when a `Note` is about a `mail.Mail`, then the `mail.Thread` that shows the mail shows the note beside it as a `Private reply`.
+## rule a note about a message shows in its thread
+when a `Note` is about a `chat.Message`, then the `chat.Thread` that shows the message shows the note beside it as a `Private reply`.

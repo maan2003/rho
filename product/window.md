@@ -10,7 +10,7 @@ costs: what has no place yet is reached through a terminal, the browser, or an a
 
 ## concept Screen
 purpose: show one thing at a time, so the user is never looking at two things that compete for them.
-principle: the user opens a `mail.Thread` from the desk; `Screen.back` returns to the desk exactly as they left it, narrowed or not.
+principle: the user opens a `chat.Thread` from the desk; `Screen.back` returns to the desk exactly as they left it, narrowed or not.
 sees: the screen's text, filling the window under the `Status line`; nothing around it.
 does:
 - back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
@@ -25,8 +25,8 @@ Every screen is text in an editor. Helix's selections, motions, search, and mode
 
 ## concept Edge-stuck excerpt
 purpose: let the user keep working in one part of the text while reading the rest of it.
-principle: the user scrolls down to read an old `mail.Mail` while typing a `mail.Draft`; the draft remains editable at the top edge, with history below it.
-sees: a designated excerpt as ordinary text while any of it is in the window; when it has left the window past one edge, the excerpt sits over that edge, the top for a `mail.Draft`. It can take up to half the window; if taller, its text scrolls inside that space.
+principle: the user scrolls down to read an old `chat.Message` while typing a `chat.Draft`; the draft remains editable at the top edge, with history below it.
+sees: a designated excerpt as ordinary text while any of it is in the window; when it has left the window past one edge, the excerpt sits over that edge, the top for a `chat.Draft`. It can take up to half the window; if taller, its text scrolls inside that space.
 does:
 - scroll the rest `ctrl-u`, `ctrl-d`, or by thumb outside the excerpt: move the view, not the point
 - move and search: use the same motions as one buffer; `j` from the last line of a top excerpt moves into the text below it, `G` goes to the end
@@ -34,7 +34,7 @@ does:
 ## concept Status line
 purpose: tell the user, at a glance, where they are, what just happened, and whether something important waits elsewhere, without a screen of its own.
 principle: the user opens a thread that asks for them; the line at the top names it and says `waits · 2h`; they say done, and for a few seconds the line reads `done: debug`; later, deep in an agent's screen, a yellow dot lights at its right end; they finish and deal.
-sees: where the user is: the place, such as a `mail.Project` and `mail.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `waits · 2h`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Helix mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
+sees: where the user is: the place, such as a `chat.Project` and `chat.Thread`, and the thing under the cursor, and when the screen is that card, its words beside it, such as `waits · 2h`; the lamp, a yellow dot `●` at the right end, while something important waits and the user looks at something else; a host that is not connected, in red; the Helix mode, such as `NOR` or `INS`; and, for about four seconds after a key, the echo line in its place: one line of words that answers the key, or says that something failed, such as that a host refused to start an agent.
 
 The lamp stays off on `desk.Desk`. Elsewhere, the card already in view does not light the lamp or ring the chime; another waiting card can. When that card rises past a higher line, the window chimes once.
 
@@ -44,18 +44,18 @@ On the phone, a long name is cut at a word so that the card's words stay whole.
 
 ## concept Palette
 purpose: reach any place, command, or remembered words in one prompt.
-principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a mail that mentions a clock are both in reach. The user chooses the one they meant.
-sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits (left out on `desk.Desk`, where it is already in view), then the screen's commands. Places include `mail.Thread` by subject, `mail.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or the project's latest words otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently active: a thread the user visited or the project wrote to today comes before one from last week, and recency can lift a thread one step of match strength, never over a whole-name match or a command. The current place ranks last among matching places. A place whose name starts with the typed word comes before a recent place that only contains it, and a match on words in order beats one out of order. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one; on a narrow window it shows its name only. The draft of the current thread is searched before the mail history.
+principle: the user opens `:` and types `clock`; the matching subject, `Flaky clock test`, and a message that mentions a clock are both in reach. The user chooses the one they meant.
+sees: best matches first as the user types; with nothing typed, recent places newest first (leaving out the current place), then what waits (left out on `desk.Desk`, where it is already in view), then the screen's commands. Places include `chat.Thread` by subject, `chat.Project`, people and channels reachable through `slack.Bot`, `browser.Page`, `browser.Bookmark`, `notes.Note`, and `usage.Chart`. A thread row shows its subject, its `deal.Card` words when it waits or the project's latest words otherwise, then its project address. Among equal matches, the waiting thread comes first, then the most recently active: a thread the user visited or the project wrote to today comes before one from last week, and recency can lift a thread one step of match strength, never over a whole-name match or a command. The current place ranks last among matching places. A place whose name starts with the typed word comes before a recent place that only contains it, and a match on words in order beats one out of order. A command whose whole name matches comes first. When each typed word starts a word in a command's name, that command also comes before partial place matches, including matches inside words. A place with a matching full name still comes before a command that merely contains it. Other commands follow the places. Each command appears once, by its own name, not the name of the thing under the cursor. A command shows the entire key sequence that works from this screen, if it has one; on a narrow window it shows its name only. The draft of the current thread is searched before the message history.
 does:
 - open `:`, or `ctrl-shift-;` from a terminal, a desktop, a page, or a draft the user is typing: open the same prompt; the place under it does not see the keys
-- search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of mail and notes. A query that starts with `>` lists commands only; one that starts with `/` searches the text of mail and notes only; `mail:` and `note:` narrow the text search to one kind. The rows follow every keystroke without a pause the user can feel, on a history of ten thousand mails
+- search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of message and notes. A query that starts with `>` lists commands only; one that starts with `/` searches the text of message and notes only; `chat:` and `note:` narrow the text search to one kind. The rows follow every keystroke without a pause the user can feel, on a history of ten thousand messages
 - choose `up`, `down`: move through the rows, wrapping at both ends without changing the typed words
 - run `enter`: open the chosen place or run the chosen command; a command that needs an answer opens a `Prompt`. With nothing typed, `enter` opens the last place when there is one
 rejected:
 - menus for hosts, usage, and starting an agent · 2026-11-20 · each row is a palette row by its full name, such as `hosts › attach`; the palette is enough
 - a second key for threads, apart from `:` for commands · 2026-11-21 · one prompt with a `>` prefix keeps one habit; commands already rank first when the typed words start their name
 
-When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `mail.Write an idea`, not to the palette.
+When nothing matches, the prompt offers no fallback rows. Nothing acts on a row before it is chosen; the idea key belongs to `chat.Write an idea`, not to the palette.
 
 ## screen Palette
 answers: where can the user go, or what can they run, with these words?
@@ -74,7 +74,7 @@ keys:
 - `escape`: `Prompt`
 starts: `Go to something by name`, `Run a command I rarely use`
 
-Built renders: [mail search on laptop](design/laptop-prompt.png), [blank phone palette](design/phone-prompt.png), and the phone with [commands only](design/phone-palette-commands.png) or [text only](design/phone-palette-text.png).
+Built renders: [message search on laptop](design/laptop-prompt.png), [blank phone palette](design/phone-prompt.png), and the phone with [commands only](design/phone-palette-commands.png) or [text only](design/phone-palette-text.png).
 
 mock:
 ```text
@@ -82,7 +82,7 @@ mock:
 
 Flaky clock test         waits · 2.0h                 tide@lab
 Cache eviction tests     running the clock tests    tide@lab
-Mail · Flaky clock test  The mock clock is shared between tests.
+Message · Flaky clock test  The mock clock is shared between tests.
 ```
 
 ## concept Menu
@@ -118,7 +118,7 @@ A question from a host, such as whether an agent may push, opens a prompt by its
 
 ## concept Phone bar
 purpose: give the thumb what the keys give on the laptop.
-principle: on the phone, the user reads the waiting mail and taps `done` on the bar along the bottom edge; the echo line says it is done.
+principle: on the phone, the user reads the waiting message and taps `done` on the bar along the bottom edge; the echo line says it is done.
 sees: one row of buttons along the bottom edge, each an icon and a word; which buttons show depends on the screen:
 - on `desk.Desk`: the bar reaches the desk's actions by thumb; the exact buttons are not agreed
 - with a card open in a thread: `back`, `menu`, `done`, `snooze`, and `more`; while writing, `undo` and `send` take their place
@@ -130,14 +130,14 @@ does:
 - flick down from the top of a screen: back, as `Screen.back` does
 - `menu`: open the `Palette`
 - `more`: open the menu of `deal.Verdict`, as `space` does
-- long press on a mail: quote the pressed lines into the draft, as `mail.Draft.quote`
+- long press on a message: quote the pressed lines into the draft, as `chat.Draft.quote`
 
 The snooze button opens the snooze times as a sheet, the same rows as on the laptop, each with its time.
 
 ## flow Go to something by name
 runs: 20 a day
 day: Reach anything.
-when: the user knows the place they want or remembers words from a mail or note
+when: the user knows the place they want or remembers words from a message or note
 want: reach it by typing what they remember
 so that: they never hunt through lists for it
 steps:
@@ -145,9 +145,9 @@ steps:
 2. the user types part of the name or remembered words
    - if they choose to narrow the search, the user adds a prefix
 3. the user opens the match with `Palette.run`
-system: ranks matches by what the user typed and searches mail and notes in the same prompt as places and commands.
+system: ranks matches by what the user typed and searches message and notes in the same prompt as places and commands.
 user: the name or the words they remember.
-cases: two threads with the same subject in different projects; the user remembers a line of a mail but not its subject.
+cases: two threads with the same subject in different projects; the user remembers a line of a message but not its subject.
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## flow Run a command I rarely use
