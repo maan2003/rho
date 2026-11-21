@@ -1811,14 +1811,15 @@ fn message_item(
     let mut text = String::new();
     let mut styles = Vec::new();
     let mut lines = Vec::new();
-    if let Some(recap) = shown_recap {
-        text.push_str(recap);
+    if let Some(shown_recap) = shown_recap {
+        text.push_str(shown_recap);
         styles.push((Class::Recap, 0..text.len()));
-        let source = rho_agent_types::recap_section(&body)
-            .filter(|range| body[range.clone()].trim_end() == recap)
+        let source = recap
+            .as_ref()
+            .filter(|range| body[range.start..range.end].trim_end() == shown_recap)
             .map(|range| body[..range.start].lines().count());
         lines.extend(
-            recap
+            shown_recap
                 .lines()
                 .enumerate()
                 .map(|(offset, _)| Meta::Mail(message.id, source.map(|start| start + offset))),
@@ -1838,11 +1839,19 @@ fn message_item(
     } else {
         Class::Name
     };
+    // A non-anchor recap is folded only if the mail still has words.
+    let folded_recap = recap.filter(|range| {
+        shown_recap.is_some()
+            || !body[..range.start].trim().is_empty()
+            || !body[range.end..].trim().is_empty()
+    });
     let mut offset = 0;
     let mut body_lines = body.lines().enumerate().peekable();
     let mut first_body = true;
     while let Some((first_line, line)) = body_lines.next() {
-        let in_recap = recap.as_ref().is_some_and(|range| range.contains(&offset));
+        let in_recap = folded_recap
+            .as_ref()
+            .is_some_and(|range| range.contains(&offset));
         let starts_proof = proof_heading == Some(offset);
         offset += line.len() + 1;
         if in_recap {
@@ -1903,7 +1912,6 @@ fn message_item(
             first_body = false;
         }
     }
-    // A mail containing only a hidden recap has no visible rows.
     if lines.is_empty() {
         return None;
     }
@@ -2675,6 +2683,42 @@ mod tests {
             ..original
         };
         assert!(message_item(&deleted, None, None, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn folding_a_recap_leaves_words_from_that_mail_visible() {
+        let writer = AgentId::from_counter(11, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let recap = "## recap\nWhat we changed.\n\nThe timer is steady.";
+        let revision = Revision::Edited {
+            seq: ChatSeq(19),
+            at: UnixMs(21),
+        };
+        let recap_only = mail(Party::Agent(writer), revision, recap);
+        let warm = message_item(&recap_only, None, None, &HashSet::new()).unwrap();
+        assert_eq!(
+            warm.text,
+            "## recap · edited\nWhat we changed.\n\nThe timer is steady.\n"
+        );
+        assert!(warm.styles.iter().all(|(class, _)| *class != Class::Recap));
+        assert_eq!(warm.lines[3].source_line(), Some(3));
+
+        // A name and whitespace are not a body. With the same selected
+        // cold recap, render it once in its special colour as before.
+        let space_before = mail(Party::Agent(writer), revision, &format!("  \n{recap}\n"));
+        let warm = message_item(&space_before, Some("eng-ab12"), None, &HashSet::new()).unwrap();
+        assert!(warm.text.contains("## recap\nWhat we changed."));
+        let cold = message_item(&recap_only, None, Some(recap), &HashSet::new()).unwrap();
+        assert_eq!(cold.text, format!("{recap}\n"));
+        assert_eq!(cold.styles, [(Class::Recap, 0..recap.len())]);
+
+        let followed = mail(
+            Party::Agent(writer),
+            revision,
+            &format!("{recap}\n\n## Result\nActual work."),
+        );
+        let warm = message_item(&followed, None, None, &HashSet::new()).unwrap();
+        assert_eq!(warm.text, "## Result · edited\nActual work.\n");
+        assert_eq!(warm.lines[0].source_line(), Some(5));
     }
 
     #[test]

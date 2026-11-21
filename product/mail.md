@@ -268,7 +268,7 @@ rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing mail; another send must not silently change it
 
 ## rule a cold mail carries a recap
-when project `Mail` arrives or is edited in a `Thread` more than ten minutes after the user's last mail or verdict there (or with neither), then it opens a cold stretch. The newest stretch opener with a `## recap` shows that section in `design.recap` before its body. All other recap sections are hidden. An answer within ten minutes does not move or hide the chosen recap.
+when project `Mail` arrives or is edited in a `Thread` more than ten minutes after the user's last mail or verdict there (or with neither), then it opens a cold stretch. The newest stretch opener with a `## recap` shows that section in `design.recap` before its body. Other recap sections are hidden when there are words outside the recap. A mail consisting only of a recap stays visible as ordinary mail, with its heading. An answer within ten minutes does not move or hide the chosen recap.
 why: after a long gap the user can answer without reading the history, and the same context stays visible while they work.
 rejected:
 - cold from when the user last had the thread open · 2026-11-21 · reading on either device must not change the recap; the user's actual words and decisions mark the return
