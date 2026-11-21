@@ -69,7 +69,7 @@ does:
 - show proof: a result mail designates evidence under `## proof`. The heading and evidence stay visible on warm and cold threads.
 - ping: a mail either pings the user or it does not. A mail that pings is dealt as a `deal.Card` and reads `waits · 2h` on its row. A mail that does not ping stays in the thread with no card; it is how the project says what it is doing while it works, edited in place as the work moves
 - look into the work `enter` on the mail: open the `agents.Agent` that wrote the mail at the step that produced its current words; a failed stop opens its error
-- reply: send the user's words to whoever wrote the mail
+- reply: deliver the user's words only to the writer, keeping the answer in the shared thread
 - edit or delete: agents may change or take back their own mails, except that mail the user has answered stays as it was. An edit that turns the ping on deals the mail; an edit of a mail that already pings keeps its card as it is
 - reply privately `alt-r`: write a remark directly beneath this mail, as in `notes.Reply privately`
 rejected:

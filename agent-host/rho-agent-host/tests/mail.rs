@@ -1106,8 +1106,8 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     assert!(text.starts_with("lost · "), "{text}");
     assert!(text.contains("Last transcript lines:"), "{text}");
 
-    // The user doesn't address an agent. The host delivers to the original
-    // writer, even after the writer leaves.
+    // The user addresses the mail, not its agent. The host routes the
+    // answer to the original writer alone, even after the writer leaves.
     call(paths, Leave { thread, agent }).await?;
     let reply_to = MessageId(origin_result.seq);
     let answer = call(
@@ -1134,7 +1134,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
         anyhow::bail!("the answer must be durable project mail")
     };
     assert_eq!((parent, target), (Some(thread), Some(reply_to)));
-    assert_eq!(mentions, [rho_agent_types::Mention::Agent(agent)]);
+    assert_eq!(mentions, [Mention::Direct(agent)]);
     Ok(format!(
         "mail wire: project {}, fake model result #{}, edit/delete #{}, lost stop #{}, and addressed reply #{}",
         project.0.0, origin_result.seq.0, note.0.0, stopped.seq.0, answer.0.0
