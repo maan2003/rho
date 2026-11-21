@@ -67,7 +67,7 @@ states:
 - loading: `searching…` if the text search is still running and no named rows match yet
 - partial: named matches appear while the text search is still running
 - error: not agreed
-- full: the rows that match the query
+- full: the rows that match the query; on a phone, tap \`previous\` or \`next\` below a long list to page through the matches, then tap a row to run it
 keys:
 - `enter`: `Palette.run`
 - `up`, `down`, `ctrl-p`, `ctrl-n`: `Palette.choose`
