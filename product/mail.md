@@ -82,12 +82,13 @@ Agents can search mail. Mail written while the host is away waits on the device 
 ## concept Draft
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the top of the thread, even after a restart.
-sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
+sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` right at the cursor where the words will go. When the draft answers a mail that is not the newest, a quiet line right under the draft names it, `answers eng-ka35 · 12:40 · Which clock needs fixing?`, cut at the window; when it answers the newest mail, nothing is said. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `enter` on a selection in one mail: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
 - send `ctrl-enter`, or `send` on the phone bar while writing: the words become the newest mail, right below the empty draft; the point rests in the draft and nothing scrolls, then or when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
+- answer this mail, from the palette on a mail, or `r` on it in Normal mode: make the draft answer that mail; the quiet line changes or goes away
 rejected:
 - move the point to the project's next pinging mail after sending · 2026-11-21 · the user stays in the draft; the history moves as needed
 - a separator line, `── reply to tide@lab · ctrl-enter sends`, between the history and the draft · 2026-11-20 · the draft is the next mail; a line of chrome on every thread costs more than it says
@@ -252,6 +253,13 @@ rejected:
 
 The historical review above was of Start a thread. Starting an agent from a mail was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
+
+## rule the draft answers what the user came for
+when the user opens a `Thread` from a `deal.Card`, then the `Draft` answers the dealt mail, even when newer mail sits between it and the draft; when the user opens the thread by name, the draft answers the newest mail that pings, or the newest mail when none does. The thread says which mail that is whenever it is not the newest, and the user can change it with `Draft.answer this mail`.
+cases: two agents ask in one thread and the deal opens the older ask; the user opens by name while two asks wait; the user quotes a line of an older mail, which does not change the target.
+rejected:
+- the draft always answers the newest mail · 2026-11-21 · the deal brought the user to an older ask, and the reply would go to the wrong writer
+- the draft silently answers the dealt mail · 2026-11-21 · the words under the draft were another agent's, and the reply went to the one above without a sign
 
 ## rule the last mail stays live
 when a project agent has already sent a `Mail` since the user's last mail in the `Thread`, then rho refuses another from that agent and tells them which mail to edit, unless the agent explicitly opts in with `replace_last=True`. That option edits its live mail, preserving its ping unless set, and returns the same id. If it has no live mail in the thread, it sends and returns a new one. Other agents can each send one mail. A mail that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the mail that raised it. Mail to the user stays in the thread but does not wake its agents.
