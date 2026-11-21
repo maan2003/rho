@@ -544,9 +544,11 @@ impl MailSystem {
         if text.is_empty() {
             return None;
         }
+        // Effects run after this update. Let the view clear its old draft
+        // and reconcile the queued mail together, before the post's notify.
+        cx.emit(Event::DraftSent(thread));
         let id = self.post(thread.host, parent, text, Vec::new(), cx);
         self.set_draft(thread.host, parent, String::new());
-        cx.emit(Event::DraftSent(thread));
         Some(id)
     }
 

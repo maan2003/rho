@@ -88,6 +88,7 @@ does:
 - send `ctrl-enter`, or `send` on the phone bar while writing: the words become the newest mail, right below the empty draft; the point rests in the draft and nothing scrolls, then or when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
 rejected:
+- move the point to the project's next pinging mail after sending · 2026-11-21 · the user stays in the draft; the history moves as needed
 - a separator line, `── reply to tide@lab · ctrl-enter sends`, between the history and the draft · 2026-11-20 · the draft is the next mail; a line of chrome on every thread costs more than it says
 - a `to:` prompt or a one-line strip for a new idea · 2026-11-20 · see `Write an idea`
 
@@ -253,4 +254,4 @@ rho tells the project once when the thread goes cold. The project's next pinging
 ## rule new mail lands below the draft
 when new `Mail` arrives, the user's own or the project's, or the newest mail is edited, then it takes its place right below the `Draft` and the point does not move. With the window at the top, the user sees it at once and older mail moves down. With the draft stuck to the top edge, the view stays where it is, and for project mail the stuck draft shows a quiet `↑ new mail` at its right end until the user scrolls back to the top.
 rejected:
-- history pushes up to keep the draft in place at the tail, `↓ new mail` when stuck at the bottom · 2026-11-21 · the mirror of this rule for the oldest-first order
+- history pushes up to keep the draft in place at the tail, `↓ new mail` for project mail when stuck at the bottom · 2026-11-21 · the mirror of this rule for the oldest-first order

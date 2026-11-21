@@ -14406,6 +14406,7 @@ name = "rho-mail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "bytes",
  "editor",
  "futures",
@@ -14415,6 +14416,7 @@ dependencies = [
  "multi_buffer",
  "rand 0.10.3",
  "redb",
+ "release_channel",
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-db",
@@ -14425,9 +14427,12 @@ dependencies = [
  "rho-rpc",
  "rho-transcript",
  "rho-window",
+ "semver",
  "senax-encoder",
+ "settings",
  "tempfile",
  "theme",
+ "theme_settings",
  "tokio",
  "tracing",
  "url",

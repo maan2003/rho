@@ -77,5 +77,13 @@ theme = { path = "../../vendor/zed/crates/theme", optional = true }
 url = { workspace = true, optional = true }
 
 [dev-dependencies]
+assets = { path = "../../vendor/zed/crates/assets" }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }
+release_channel = { path = "../../vendor/zed/crates/release_channel" }
+semver = "1"
+settings = { path = "../../vendor/zed/crates/settings", features = ["test-support"] }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 rho-mail = { path = ".", features = ["client"] }
 tempfile = { workspace = true }
