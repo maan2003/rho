@@ -52,10 +52,12 @@ impl Takeback {
 /// The verdicts a card can take.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Dealt with: everything the source has said so far is handled.
+    /// Dealt with: what the user has seen of the card is handled.
     Done,
     /// Nothing from this address reaches the user again.
     Mute,
+    /// Let this address ask again.
+    Unmute,
     /// Out of the way until then.
     Snooze(Until),
 }
@@ -65,6 +67,7 @@ impl Verdict {
         match self {
             Self::Done => rho_journal::DealerVerdict::Done,
             Self::Mute => rho_journal::DealerVerdict::Mute,
+            Self::Unmute => rho_journal::DealerVerdict::Unmute,
             Self::Snooze(_) => rho_journal::DealerVerdict::Defer,
         }
     }
@@ -228,6 +231,7 @@ impl Attention {
         match verdict.clone() {
             Verdict::Done => Fact::Settled { node, seen },
             Verdict::Mute => Fact::Mute { node },
+            Verdict::Unmute => Fact::Unmute { node },
             Verdict::Snooze(until) => Fact::Snooze { node, until },
         }
     }

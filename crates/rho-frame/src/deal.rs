@@ -252,7 +252,9 @@ impl Frame {
             skip_until: None,
         });
         let said = format!("{verb}: {called}");
-        if self.current_surface().inspects_card() || self.card_in_view(cx).as_ref() != Some(address)
+        if matches!(verdict, Verdict::Unmute)
+            || self.current_surface().inspects_card()
+            || self.card_in_view(cx).as_ref() != Some(address)
         {
             self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
