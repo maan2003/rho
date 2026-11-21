@@ -195,7 +195,7 @@ cases: the agent's host is a host on this machine, where its desktop does not op
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule an idea starts the work in its thread
-when the user sends a `mail.Mail` as a new idea to a `mail.Project`, then the agent starts in the `mail.Thread` for that work and reads the idea first.
+when the user sends a `mail.Mail` as a new idea to a `mail.Project`, then the work starts in the `mail.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `mail.Project.receive an idea`.
 
 ## flow Approve a push or a fetch
 runs: 3 a day
@@ -216,7 +216,9 @@ cases: two agents push at once, where the second question waits for the first; a
 when an `Agent` pushes to or fetches from a repository through the user's ssh login, then the window asks the user first, and without a `y` the push or fetch does not happen.
 
 ## rule a refused start leaves mail
-when `start agent here` cannot use the chosen host directory before it creates an `Agent`, then the `mail.Thread` keeps a `failed` stop with the directory and host and tells the user how to choose again. A later start shows its own progress without erasing the stop from history.
+when a start cannot use the `mail.Project`'s place before it creates an `Agent`, then the `mail.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works from the project's palette`. A later start shows its own progress without erasing the stop from history.
+rejected:
+- telling the user to run `start agent here` · 2026-11-21 · no command has that name, and the place belongs to the project
 
 ## rule a stuck agent asks
 when an `Agent` has been retrying its model for three minutes, then its thread says `stuck · can't reach its model` and the age of the retry, and the project sends one stop mail. When the model answers again, the project edits that stop and it no longer deals.
