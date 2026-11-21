@@ -20,7 +20,7 @@ day: Know what wants them, and where they were.
 
 ## concept Card
 purpose: put a mail that wants the user in reach, without making them look through the whole thread.
-principle: a project asks whether a test can use a separate clock; the deal opens the thread on that mail, the user replies, and its card goes away.
+principle: a project asks whether a test can use a separate clock; the deal opens the thread at its reading position, with point in the draft, the user replies, and its card goes away.
 sees: the `mail.Project` address, the `mail.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `mail.Mail` that pings.
 has:
 - one `mail.Thread`

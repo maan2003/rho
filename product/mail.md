@@ -89,7 +89,7 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
-status: a dealt thread opens on its pinging mail; the draft is not stuck and new mail does not follow the draft or show a notice.
+status: the draft is not stuck and new mail does not follow the draft or show a notice.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
@@ -208,7 +208,6 @@ rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing mail; another send must not silently change it
 
 ## rule a cold mail carries a recap
-status: rho decides cold from when the user last had the thread open, then hides or shows the recaps together.
 when project `Mail` arrives or is edited in a `Thread` more than ten minutes after the user's last mail or verdict there (or with neither), then it opens a cold stretch. The newest stretch opener with a `## recap` shows that section in `design.recap` before its body. All other recap sections are hidden. An answer within ten minutes does not move or hide the chosen recap.
 why: after a long gap the user can answer without reading the history, and the same context stays visible while they work.
 rejected:

@@ -19,8 +19,8 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message,
-    MessageId, ThreadWork,
+    Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
+    ThreadWork,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
@@ -132,8 +132,6 @@ pub struct MailSystem {
     creating_projects: Vec<(CreatingProject, CreatedProject)>,
     last_project: Option<ThreadId>,
     view: Option<ThreadId>,
-    last_open: HashMap<ThreadId, Timestamp>,
-    view_cold: bool,
     drafts: HashMap<(EndpointId, Option<MessageId>), String>,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
@@ -187,8 +185,6 @@ impl MailSystem {
                 .collect(),
             cache,
             view: None,
-            last_open: HashMap::new(),
-            view_cold: false,
             hosts: HashMap::new(),
             logs,
             events,
@@ -235,31 +231,11 @@ impl MailSystem {
         if self.view == thread {
             return;
         }
-        let now = Timestamp::now();
-        if let Some(previous) = self.view.take() {
-            self.last_open.insert(previous, now);
-        }
-        self.view_cold = thread.is_some_and(|thread| self.thread_is_cold(thread, now));
         self.view = thread;
         for slot in self.hosts.values() {
             Self::sync_view(slot, thread);
         }
         cx.notify();
-    }
-
-    fn thread_is_cold(&self, thread: ThreadId, now: Timestamp) -> bool {
-        if self.view == Some(thread) {
-            return self.view_cold;
-        }
-        let last_open = self.last_open.get(&thread).copied();
-        let last_written = self
-            .host_mail(thread.host)
-            .and_then(|chat| chat.last_user_mail(thread.message))
-            .and_then(|at| Timestamp::from_millisecond(at.0.try_into().ok()?).ok());
-        last_open.max(last_written).is_some_and(|last| {
-            now.duration_since(last)
-                > jiff::SignedDuration::try_from(rho_agent_types::THREAD_COLD_AFTER).unwrap()
-        })
     }
 
     fn sync_view(slot: &Slot, view: Option<ThreadId>) {
@@ -1153,7 +1129,7 @@ impl System for MailSystem {
                 {
                     continue;
                 }
-                let words = mail.text();
+                let words = crate::reading::body(&mail.content);
                 let Some((row, line)) = query.matching_line(&words) else {
                     continue;
                 };

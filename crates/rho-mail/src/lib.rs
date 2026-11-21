@@ -19,6 +19,8 @@ pub mod fold;
 #[cfg(feature = "client")]
 pub mod outbox;
 #[cfg(feature = "client")]
+mod reading;
+#[cfg(feature = "client")]
 pub mod stream;
 #[cfg(feature = "ui")]
 pub mod ui;
