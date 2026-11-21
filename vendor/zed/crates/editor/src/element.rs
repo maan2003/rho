@@ -6174,6 +6174,28 @@ impl EditorElement {
         );
     }
 
+    fn gutter_highlight_geometry(&self, layout: &EditorLayout, cx: &App) -> (Pixels, Pixels) {
+        let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
+        let image_gutter = layout.position_map.snapshot.has_gutter_images;
+        let highlight_width = if compact_gutter || image_gutter {
+            (layout.position_map.em_advance * 0.125).max(px(1.))
+        } else {
+            0.275 * layout.position_map.line_height
+        };
+        let text_inset = self.editor.read(cx).gutter_highlight_text_inset;
+        let highlight_left = if let Some(inset) = text_inset {
+            layout.content_origin.x + layout.position_map.em_advance * inset
+                - Pixels::from(layout.position_map.scroll_pixel_position.x)
+        } else if image_gutter {
+            layout.gutter_hitbox.right()
+                - layout.position_map.em_advance * 0.5
+                - highlight_width
+        } else {
+            layout.gutter_hitbox.left()
+        };
+        (highlight_left, highlight_width)
+    }
+
     fn paint_gutter_highlight_ranges(
         &self,
         highlights: &[(Range<DisplayPoint>, Hsla)],
@@ -6184,15 +6206,14 @@ impl EditorElement {
         window: &mut Window,
         cx: &App,
     ) {
-        let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
-        let image_gutter = layout.position_map.snapshot.has_gutter_images;
-        let highlight_width = if compact_gutter || image_gutter {
-            (layout.position_map.em_advance * 0.125).max(px(1.))
-        } else {
-            0.275 * layout.position_map.line_height
-        };
+        let (highlight_left, highlight_width) = self.gutter_highlight_geometry(layout, cx);
         let highlight_corner_radii = Corners::all(0.05 * layout.position_map.line_height);
-        let text_inset = self.editor.read(cx).gutter_highlight_text_inset;
+        let editor = self.editor.read(cx);
+        let top_excerpt = editor
+            .stuck_excerpt
+            .as_ref()
+            .filter(|state| state.edge == StuckEdge::Top)
+            .and_then(|_| editor.stuck_excerpt_range(&layout.position_map.snapshot.display_snapshot));
         window.paint_layer(|window| {
             for (range, color) in highlights {
                 let start_row = if range.start.row() < visible_rows.start {
@@ -6218,16 +6239,12 @@ impl EditorElement {
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - scroll_y_pixels,
                     );
-                let highlight_left = if let Some(inset) = text_inset {
-                    layout.content_origin.x + layout.position_map.em_advance * inset
-                        - Pixels::from(layout.position_map.scroll_pixel_position.x)
-                } else if image_gutter {
-                    layout.gutter_hitbox.right()
-                        - layout.position_map.em_advance * 0.5
-                        - highlight_width
-                } else {
-                    layout.gutter_hitbox.left()
-                };
+                let (highlight_left, highlight_width) =
+                    if top_excerpt.as_ref().is_some_and(|rows| rows.contains(&range.start.row())) {
+                        (highlight_left.round(), px(1.))
+                    } else {
+                        (highlight_left, highlight_width)
+                    };
                 let bounds = Bounds::from_corners(
                     point(highlight_left, start_y),
                     point(highlight_left + highlight_width, end_y),

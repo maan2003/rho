@@ -111,29 +111,39 @@ and a subsequent warm ask. The seed prints the thread ID (2 on a new fixture).
 ```sh
 /src/cargo-one build --locked --offline -p rho-agent-host --example thread_reading_fixture
 FORM_SEED_THREAD=1 bash product/design/capture.sh /tmp/rho-form-thread target/debug
-form_gui laptop
-# Once the first prompt is ready, pair and deal:
-form_way laptop input 'key:enter' 'wait:1000' 'key:space' 'wait:650'
-form_shot laptop reading
-form_way laptop input 'key:g' 'key:g' 'key:i' \
-    'text:Use the reference clock for both.' 'wait:550'
-form_way laptop stop
-form_gui phone laptop
-# After the thread restores, scroll back and tap inside its projected draft:
-form_way phone input 'key:ctrl+d' 'key:ctrl+d' 'wait:550'
-form_way phone click 155 77
-form_way phone input 'text:only ' 'wait:550' 'key:escape'
+# Run once per device, in a fresh fixture shell each time.
+device=laptop                         # or phone
+form_gui "$device"
+# Wait for the fresh clock fixture window to receive keys.
+for _ in {1..20}; do
+    form_way "$device" tree | jq -e \
+        '[.Windows[] | select(.app_id == "rho-gui" and .is_focused)] | length == 1' >/dev/null && break
+    sleep .2
+done
+sleep .7
+form_way "$device" input key:enter wait:950 key:space wait:700
+form_shot "$device" reading
+form_way "$device" input key:i 'text:Keep the reference clock.' \
+    key:enter 'text:Both counters can use it.' key:enter 'text:Leave the retry alone.' \
+    key:enter 'text:Log the chosen clock.' key:enter 'text:Run both tests twice.' \
+    key:enter 'text:Compare the timestamps.' key:enter 'text:Keep the earlier result.' \
+    key:enter 'text:Send the exact output.' wait:550
+sleep 1
+form_way "$device" input key:escape key:g key:g wait:650
+form_way "$device" input 'key:ctrl+d' 'wait:550'
 fixture="$bins/examples/thread_reading_fixture"
 read -r ws worker mid < <("$fixture" send "$rig/runtime" "$rig/repo" 2 \
     $'Both checks pass.\n\nThe retry policy did not change.')
 sleep .6
-form_shot phone reading-notice
+form_shot "$device" reading-notice
 ```
 
 The [open thread](laptop-reading.png) puts the draft above the warm mail. Today's
 cold mail has a recap before its body; March and warm mail don't.
-The [phone notice](phone-reading-notice.png) leaves the reading position and
-the full draft in place, even when the notice needs its own line.
+On [laptop](laptop-reading-notice.png) and [phone](phone-reading-notice.png), the
+stuck draft starts at the same place as it did inline. The gutter runs to the
+seam beneath the last line; the notice uses that reserved space without moving
+the draft or the history.
 Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
