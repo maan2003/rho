@@ -1945,7 +1945,7 @@ impl Surface for ThreadView {
     }
 
     fn show_card(&mut self, card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some(mail) = cards::attention_mail(&card.cursor) else {
+        let Some(mail) = cards::attention_mail(card.seen) else {
             return;
         };
         self.dealt_mail = Some(mail);

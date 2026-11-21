@@ -17,7 +17,7 @@ use jiff::{Timestamp, Zoned};
 
 use crate::address::Address;
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
-use crate::facts::Snooze;
+use crate::facts::{Seen, Snooze};
 use crate::marks::Marks;
 
 /// What is waiting, independent of the words in which it appears.
@@ -50,6 +50,8 @@ pub struct Claim {
     /// Where the source stands: a skip holds on to it, and the source
     /// moving past it voids the skip.
     pub cursor: String,
+    /// What the user would have seen when dealing this claim.
+    pub seen: Seen,
     /// What the user having just written to it adds.
     pub bonus: f64,
     /// A reply this soon after the user's own words comes through a
@@ -69,6 +71,7 @@ impl Claim {
             curve,
             kind,
             cursor: cursor.into(),
+            seen: Seen::Whole,
             bonus: 0.0,
             breaks_snooze_set_by: None,
             under: None,
@@ -88,6 +91,8 @@ pub struct Card {
     /// Where the source stood: a skip holds on to it, and the source
     /// moving past it voids the skip.
     pub cursor: String,
+    /// What was visible at this ranking, captured when the card opens.
+    pub seen: Seen,
     /// Passed over this sitting: behind every card that was not, until its
     /// source moves or the skip runs out.
     pub skipped: bool,
@@ -212,6 +217,7 @@ struct Part {
     curve: Curve,
     kind: CardKind,
     cursor: String,
+    seen: Seen,
     bonus: f64,
     breaks_snooze_set_by: Option<Timestamp>,
     /// From a source, which a snooze's end moves; the user's own dates
@@ -225,6 +231,7 @@ impl Part {
             curve: claim.curve,
             kind: claim.kind,
             cursor: claim.cursor.clone(),
+            seen: claim.seen,
             bonus: claim.bonus,
             breaks_snooze_set_by: claim.breaks_snooze_set_by,
             from_source: true,
@@ -236,6 +243,7 @@ impl Part {
             curve,
             kind: CardKind::Other,
             cursor,
+            seen: Seen::Whole,
             bonus: 0.0,
             breaks_snooze_set_by: None,
             from_source: false,
@@ -443,6 +451,7 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 kind: part.kind,
                 priority,
                 cursor: part.cursor.clone(),
+                seen: part.seen,
                 skipped: skip.is_some(),
                 address,
             },

@@ -170,6 +170,7 @@ impl Frame {
             kind: CardKind::Other,
             priority: f64::NEG_INFINITY,
             cursor: String::new(),
+            seen: Seen::Whole,
             skipped: false,
         }
     }
@@ -187,12 +188,16 @@ impl Frame {
         }
     }
 
-    /// How far the user has seen `address`: everything its system has.
-    fn seen(&self, address: &Address, cx: &gpui::App) -> Seen {
-        self.systems
-            .iter()
-            .find(|system| system.opens(address, cx))
-            .map_or(Seen::Whole, |system| system.seen(address, cx))
+    /// The dealt snapshot takes precedence; a verdict on a list row instead
+    /// sees the card currently listed there.
+    fn seen(&self, address: &Address) -> Seen {
+        self.dealt_seen(address).unwrap_or_else(|| {
+            self.hand()
+                .cards
+                .iter()
+                .find(|card| &card.address == address)
+                .map_or(Seen::Whole, |card| card.seen)
+        })
     }
 
     /// Says `writes`, and returns what takes them back.
@@ -228,7 +233,7 @@ impl Frame {
     ) {
         tracing::debug!(address = %address, ?verdict, "verdict");
         let called = self.called(address, cx);
-        let seen = self.seen(address, cx);
+        let seen = self.seen(address);
         let fact = crate::attention::Attention::fact(address, &verdict, seen);
         let takeback = self.write_marks(vec![Write::Fact(fact)], cx);
         let journal = verdict.journal();
@@ -256,7 +261,7 @@ impl Frame {
         self.close_current(window, cx);
         // The verdict and what comes of it, on one line: the last card put
         // away says the deal is empty too.
-        match self.deal_next(window, cx) {
+        match self.deal_next(None, window, cx) {
             true => self.echo(&said, StyleClass::SystemInfo, cx),
             false => {
                 let words = if matches!(verdict, Verdict::Done)
@@ -306,7 +311,7 @@ impl Frame {
     /// in a row see the same world and the skip is what moves them on.
     /// With nothing to deal, Desk opens and the echo line says so.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.deal_next(window, cx) {
+        if !self.deal_next(self.card_in_view(cx), window, cx) {
             self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
         }
     }
@@ -314,7 +319,7 @@ impl Frame {
     /// On Desk, Space deals immediately if there is a card. If the deal
     /// is empty, it still gives the last verdict a route to Undo.
     pub(crate) fn desk_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.deal_next(window, cx) {
+        if !self.deal_next(self.card_in_view(cx), window, cx) {
             if self.attention.can_undo() {
                 self.verdict_menu(window, cx);
             } else {
@@ -323,11 +328,16 @@ impl Frame {
         }
     }
 
-    /// The pull itself: whether a card opened. Empty lands on Desk, since
-    /// there is nothing to deal and the glance is the answer.
-    fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Whether a card opened. An explicit pull passes over its open card;
+    /// a verdict already put that card away and passes over nothing else.
+    /// Empty lands on Desk, since there is nothing to deal.
+    fn deal_next(
+        &mut self,
+        in_view: Option<Address>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let now = Timestamp::now();
-        let in_view = self.card_in_view(cx);
         // Reading a card and pulling again is what a skip is: the card is
         // still owed, it is just not what to look at next.
         if let Some(address) = &in_view

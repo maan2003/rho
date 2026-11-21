@@ -32,7 +32,8 @@ A card is titled by the thread's subject and the project's address.
 | A5 | Several unseen pings | one card, counting from the selected ping |
 | A6 | Seen | nothing until newer pinging mail |
 | A7 | The user wrote in the thread within the hour before the mention | a signal pressure bonus, fading over the hour |
-| A8 | Done through a message before the mention | the mention still deals |
+| A8 | An older device said done through a message before the mention | the mention still deals |
+| A15 | Done on a dealt mail | only that version is put away; another ping in the same thread or a newer revision still deals |
 | A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
 | A11 | An agent made by another agent | deals only by mentioning the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not mail |

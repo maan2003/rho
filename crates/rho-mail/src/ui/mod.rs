@@ -25,7 +25,6 @@ use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
     ProjectConfig, ProjectId, ThreadWork, UnixMs,
 };
-use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
@@ -711,7 +710,7 @@ impl MailSystem {
     }
 
     /// The messages of others in a thread the user has not read, newest
-    /// first: those past what they settled through or wrote after.
+    /// first: those newer than their verdicts or the user's own last mail.
     pub(crate) fn unread_ids_in(
         &self,
         chat: &HostMail,
@@ -722,7 +721,6 @@ impl MailSystem {
         if facts.muted() {
             return Vec::new();
         }
-        let seen = facts.seen_topic().map(rho_agent_types::ChatSeq);
         let mut wrote = None;
         for id in chat.children(Some(thread.message)) {
             if let Some(message) = chat.message(*id)
@@ -731,15 +729,10 @@ impl MailSystem {
                 wrote = Some(id.0);
             }
         }
-        let seen = seen.max(wrote);
+        let seen = cards::SeenMail::new(facts, wrote);
         chat.others_in(thread.message)
             .into_iter()
-            .filter(|id| {
-                seen.is_none_or(|seen| {
-                    chat.message(*id)
-                        .is_some_and(|mail| mail.version().0 > seen)
-                })
-            })
+            .filter(|id| chat.message(*id).is_some_and(|mail| seen.is_unread(mail)))
             .collect()
     }
 
@@ -953,14 +946,6 @@ impl System for MailSystem {
     /// draw, which this asks for.
     fn marks_moved(&mut self, _touched: &BTreeSet<Address>, cx: &mut Context<Self>) {
         cx.notify();
-    }
-
-    /// Through its newest message, and through the stops its agents are
-    /// in when any is: a done on a stop's card sees the stop.
-    fn seen(&self, address: &Address, _cx: &App) -> Seen {
-        self.thread_of(address)
-            .and_then(|thread| self.logs.get(&thread.host)?.newest_in(thread.message))
-            .map_or(Seen::Whole, |(newest, _)| Seen::Topic(newest.0))
     }
 
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {

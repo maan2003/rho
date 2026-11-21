@@ -221,21 +221,24 @@ impl Fact {
 }
 
 /// How far the user had seen, in the source's own terms.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum Seen {
     /// An agent's story, through this position: what agent cards read
     /// before topics replaced them. Only the migration to topics reads
     /// it; it stays so `main`'s entries still decode.
     Agent(u64),
-    /// A note: there is nothing more to see.
+    /// A note or a user-assigned date: there is nothing more to see.
+    #[default]
     Whole,
-    /// A mail thread, through this position in its host's log.
+    /// A legacy mail verdict, through this position in its host's log.
     Topic(u64),
     /// A chat thread, through this message, and through every stop its
     /// agents were in that began by `stopped`, in unix milliseconds on
     /// the host's clock: a stop is no message, so the instant its host
     /// gave it is where it stands.
     Thread { message: u64, stopped: u64 },
+    /// One dealt mail and the version read, both positions in its host's log.
+    Mail { message: u64, version: u64 },
 }
 
 /// A snooze in force or past: when it was said and when it ends.
@@ -285,8 +288,7 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// The newest mail version the user had seen when done with the thread:
-    /// where its unread starts, and what its card has handled.
+    /// The latest legacy thread-wide read. New mail verdicts name one mail.
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
@@ -294,6 +296,14 @@ impl<'a> Facts<'a> {
                 _ => None,
             })
             .max()
+    }
+
+    /// Individual mail and version pairs a verdict took out of the deal.
+    pub fn seen_mail(self) -> impl Iterator<Item = (u64, u64)> + 'a {
+        self.seen().filter_map(|seen| match *seen {
+            Seen::Mail { message, version } => Some((message, version)),
+            _ => None,
+        })
     }
 
     /// When the newest stop of a thread's agents the user had seen began:
@@ -409,6 +419,34 @@ mod tests {
         };
         let entries = [settled(0, 812), settled(1, 800)];
         assert_eq!(Facts(&entries).seen_topic(), Some(812));
+    }
+
+    #[test]
+    fn exact_mail_verdicts_round_trip_without_moving_the_legacy_cutoff() {
+        let said = entry(
+            2,
+            Fact::Settled {
+                node: Address::new("thread", "clock"),
+                seen: Seen::Mail {
+                    message: 17,
+                    version: 38,
+                },
+            },
+        );
+        let back = Entry::decode(&said.encode()).unwrap();
+        assert_eq!(back, said);
+        let entries = [
+            entry(
+                1,
+                Fact::Settled {
+                    node: Address::new("thread", "clock"),
+                    seen: Seen::Topic(13),
+                },
+            ),
+            back,
+        ];
+        assert_eq!(Facts(&entries).seen_topic(), Some(13));
+        assert_eq!(Facts(&entries).seen_mail().collect::<Vec<_>>(), [(17, 38)]);
     }
 
     fn snooze(minute: i64) -> Entry {
