@@ -24,7 +24,6 @@ The way back keeps the user's earlier screens, as they were left. A screen that 
 Every screen is text in an editor. Helix's selections, motions, search, and modes work on every screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end. A search selects the whole match, so `c` changes it and `d` deletes it.
 
 ## concept Edge-stuck excerpt
-status: built for the bottom edge only, as the thread's draft at the end of the thread.
 purpose: let the user keep working in one part of the text while reading the rest of it.
 principle: the user scrolls down to read an old `mail.Mail` while typing a `mail.Draft`; the draft remains editable at the top edge, with history below it.
 sees: a designated excerpt as ordinary text while any of it is in the window; when it has left the window past one edge, the excerpt sits over that edge, the top for a `mail.Draft`. It can take up to half the window; if taller, its text scrolls inside that space.

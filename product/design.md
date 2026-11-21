@@ -59,7 +59,7 @@ states:
 - unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
 - echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host warning keep their places.
 used on: `window.Screen`, including `desk.Desk`, `mail.Project`, `mail.Thread`, and `agents.Agent`.
-form: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on an unpaired phone](design/phone-menu.png); [agent with its host, folder and activity](design/laptop-agent.png).
+form: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [agent with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
 purpose: answer the action the user just took without opening anything.
@@ -89,7 +89,7 @@ states:
 - sending: the header reads `you · sending…` in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `agents.Agent`. In `mail.Thread` the voice is told by colour, see `Mail`.
-form: [you and clock@lab above their respective mails](design/laptop-card.png).
+form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Mail` for the separate thread form.
 
 ## part Mail
 purpose: let the user read an exchange and know who said what, with nothing between the mails but a blank line.
@@ -100,7 +100,7 @@ states:
 - sending: the user's words in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `mail.Thread`.
-form: to be captured from the built screen; until then the mock under `mail.Thread`.
+form: [project and user mail on the laptop](design/laptop-card.png) and [the cold recap](design/laptop-reading.png).
 
 ## part Quote
 purpose: let the user read the words another mail is answering without mistaking them for new words.
@@ -124,7 +124,7 @@ states:
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - after send: the words are the newest mail, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
 used on: `mail.Thread` and the draft of `mail.Write an idea`.
-form: to be captured from the built screen; until then the mock under `mail.Thread`.
+form: [empty reply](design/laptop-card.png), [empty idea](design/laptop-idea-empty.png), and [stuck reply with new mail](design/phone-reading-notice.png).
 
 ## part Menu
 purpose: offer a few keyed choices without taking the user away from the thing they are on.

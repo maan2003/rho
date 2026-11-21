@@ -338,6 +338,7 @@ impl ScrollManager {
         scroll_position: gpui::Point<ScrollOffset>,
         map: &DisplaySnapshot,
         scroll_beyond_last_line: ScrollBeyondLastLine,
+        anchor_bias: Bias,
         local: bool,
         autoscroll: bool,
         workspace_id: Option<WorkspaceId>,
@@ -374,7 +375,14 @@ impl ScrollManager {
                 Bias::Left,
             )
             .to_point(map);
-        let top_anchor = map.buffer_snapshot().anchor_before(scroll_top_buffer_point);
+        // A top projection leaves the viewport anchored to the history
+        // behind it. Right bias keeps the visible row when mail is inserted
+        // exactly at its start. At scroll zero, stay at the document start.
+        let top_anchor = if scroll_top_y > 0. && anchor_bias == Bias::Right {
+            map.buffer_snapshot().anchor_after(scroll_top_buffer_point)
+        } else {
+            map.buffer_snapshot().anchor_before(scroll_top_buffer_point)
+        };
 
         self.set_anchor(
             ScrollAnchor {
@@ -818,10 +826,15 @@ impl Editor {
             scroll_position
         };
         let scroll_beyond_last_line = self.scroll_beyond_last_line(cx);
+        let anchor_bias = match self.stuck_excerpt.as_ref().map(|excerpt| excerpt.edge) {
+            Some(crate::StuckEdge::Top) => Bias::Right,
+            _ => Bias::Left,
+        };
         self.scroll_manager.set_scroll_position(
             adjusted_position,
             &display_map,
             scroll_beyond_last_line,
+            anchor_bias,
             local,
             autoscroll,
             workspace_id,
@@ -985,7 +998,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.scroll_screen(amount, window, cx);
-        if self.point_in_bottom_stuck_excerpt(cx) {
+        if self.point_in_stuck_excerpt(cx) {
             return;
         }
 

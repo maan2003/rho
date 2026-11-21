@@ -6,6 +6,6 @@ The thread builds its displayed document from the mail fold, but the editor owns
 
 ## Contract
 
-A fresh thread, opened by name or by deal, puts point in the draft and requests the first displayed project mail after the latest user mail as the top line. With no later project mail it requests the latest displayed mail. If that top would leave blank space beneath the draft, the editor clamps to its last full viewport. If the whole thread fits, its unused space is above the opening mail, not below the draft. A deal names the target for a direct reply but does not select a row. Returning to an existing view does not change either its point or viewport. A search result still selects its match.
+A fresh thread starts at the top, whether opened by name or by deal. Point is in the draft, using any remembered position in its text; newest mail follows below. A deal names the target for a direct reply but does not select a mail. Returning to an existing view does not change either its point or viewport. A search result still selects its match.
 
 This implements `mail.Thread` in the [product model](../../../product/mail.md).

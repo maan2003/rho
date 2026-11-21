@@ -79,8 +79,7 @@ Agents can search mail. Mail written while the host is away waits on the device 
 
 ## concept Draft
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
-principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the end of the thread, even after a restart.
-status: the built draft is the last mail at the end of the thread and sticks to the bottom edge.
+principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the top of the thread, even after a restart.
 sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
@@ -98,7 +97,6 @@ rejected:
 - the draft as the last mail at the end of the thread, stuck to the bottom while reading · 2026-11-21 · with the newest mail first the draft leads, and no open or fill rule is needed
 
 ## screen Thread
-status: the built screen reads oldest first with the draft at the end, opens on the first project mail since the user's last mail, fills a short tail with history, and sticks the draft to the bottom.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
@@ -175,9 +173,9 @@ so that: the person or project that needs the user's words gets them, and the ma
 steps:
 1. the user opens the thread by the deal or by name and reads what the project wrote since their last mail
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
-2. the user writes and edits an answer in the `Draft` at the end of the thread
+2. the user writes and edits an answer in the `Draft` at the top of the thread
 3. the user sends the answer with `Mail.reply`; the reply settles the card
-system: opens with the point in the `Draft` and the first project mail after the user's last mail at the top, or the latest mail if none followed theirs; fills any spare space with earlier history, keeps the draft if the user leaves, and sends the reply to whoever wrote the mail.
+system: opens at the top with the point in the `Draft` and mail below it, newest first. The user's last mail separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves, and sends the reply to whoever wrote the mail.
 user: the words of the answer, or done when there are none.
 cases: a cold mail with its recap, answered without the history; a result with proof; a colleague reached through `slack.Bot`.
 reviewed: 2026-11-20 · laptop · reviewer · 2 findings

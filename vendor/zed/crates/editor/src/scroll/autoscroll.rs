@@ -224,9 +224,15 @@ impl Editor {
         if matches!(
             autoscroll,
             Autoscroll::Strategy(AutoscrollStrategy::Fit | AutoscrollStrategy::Newest, None)
-        ) && let Some(rows) = self.bottom_excerpt_range(&display_map)
+        ) && let Some(rows) = self.stuck_excerpt_range(&display_map)
+            && let Some(state) = &self.stuck_excerpt
             && rows.contains(&target_point.row())
-            && display_map.row_y(rows.start.as_f64()) >= scroll_top_y + visible_lines
+            && state.edge.is_outside(
+                display_map.row_y(rows.start.as_f64()),
+                display_map.row_y(rows.end.as_f64()),
+                scroll_top_y,
+                visible_lines,
+            )
         {
             return (NeedsHorizontalAutoscroll(false), editor_was_scrolled);
         }
