@@ -21,7 +21,7 @@ goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:
 1. the user writes to the project from where they are, `Write an idea`
-2. the user sees the work start, `desk.Glance at what moves`
+2. the user sees the work start, in the thread row's `working` word in `window.Palette`, or by the project's next mail
 3. the user opens the project's ask when it needs something, `deal.Clear what waits`
 4. the user answers the ask in its thread, `Answer a mail`
 5. the user opens the result, `deal.Clear what waits`
