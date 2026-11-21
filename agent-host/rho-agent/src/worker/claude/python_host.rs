@@ -338,6 +338,65 @@ mod tests {
         host.shutdown().await.unwrap();
     }
 
+    /// The latest exec raising wakes the model at once even when its code
+    /// awaits; only a failure nobody awaited waits out its claim window.
+    #[tokio::test]
+    async fn a_raising_exec_returns_at_once_and_a_background_failure_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut host = host(temp.path()).await;
+        let started = std::time::Instant::now();
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(1),
+                "call".try_into().unwrap(),
+                "import asyncio\nawait asyncio.sleep(0)\nraise RuntimeError('x')".into(),
+                UnixMs::now(),
+            )
+            .is_none()
+        );
+        assert_eq!(settle(&mut host).await, Wake::Returned);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(host.latest_failed());
+        let text = host.report().unwrap().render().text;
+        assert!(text.contains("RuntimeError: x"), "{text}");
+        host.take_pending();
+
+        let started = UnixMs::now();
+        assert!(
+            host.exec(
+                "request".into(),
+                serde_json::json!(2),
+                "background".try_into().unwrap(),
+                "async def broken():\n    raise RuntimeError('y')\nt = asyncio.create_task(broken())"
+                    .into(),
+                started,
+            )
+            .is_none()
+        );
+        assert_eq!(settle(&mut host).await, Wake::Returned);
+        assert!(!host.latest_failed());
+        let _ = host.report();
+        host.take_pending();
+        // Unclaimed for its 20 seconds, it wakes nobody until they pass.
+        let deadline = std::time::Duration::from_secs(25);
+        let why = loop {
+            if let Boundary::Now { why } = host.decide(true, None, None, false, UnixMs::now()) {
+                break why;
+            }
+            assert!(
+                UnixMs::now().0 - started.0 < deadline.as_millis() as u64,
+                "never woke"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(why, Wake::Failure);
+        assert!(UnixMs::now().0 - started.0 >= 20_000);
+        let text = host.report().unwrap().render().text;
+        assert!(text.contains("RuntimeError: y"), "{text}");
+        host.shutdown().await.unwrap();
+    }
+
     /// With no call open too, taking the report is what tells the model:
     /// the notebook wakes nobody a second time for what it said.
     #[tokio::test]

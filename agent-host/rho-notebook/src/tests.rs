@@ -143,6 +143,39 @@ async fn a_raise_is_the_cells_output() {
     );
 }
 
+/// Awaiting makes the code a coroutine; its raise still ends the cell at
+/// once, not as an unclaimed task failure 20 seconds later.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_awaiting_raise_is_the_cells_output_at_once() {
+    let (notebook, wake) = notebook().await;
+    let started = std::time::Instant::now();
+    let cell =
+        notebook.run("import asyncio\nawait asyncio.sleep(0)\nraise ValueError('nope')".into());
+    finished(&wake, &cell).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(cell.facts().finished.unwrap().failed);
+    let text = notebook.report().unwrap().render().text;
+    assert!(text.contains("ValueError: nope"), "{text}");
+    assert!(text.contains(":3 in <module>"), "{text}");
+
+    // A streamed unit that awaits and raises ends its stream the same way.
+    let started = std::time::Instant::now();
+    let cell = notebook.stream();
+    cell.feed(
+        "await asyncio.sleep(0)\nraise ValueError('streamed')\nprint('not run')\n".into(),
+        true,
+    )
+    .unwrap();
+    finished(&wake, &cell).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(cell.facts().finished.unwrap().failed);
+    let text = notebook.report().unwrap().render().text;
+    assert!(
+        text.contains("ValueError: streamed") && !text.contains("not run"),
+        "{text}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_statements_run_as_they_arrive() {
     let (notebook, wake) = notebook().await;
