@@ -381,7 +381,7 @@ impl Frame {
     /// Desk is a list, so a pull from it opens the top card rather than
     /// passing over the row.
     pub fn card_in_view(&self, cx: &App) -> Option<Address> {
-        match self.current_address().kind() == FRAME_KIND {
+        match self.desk_in_view() {
             true => None,
             false => self.card_target(cx),
         }
@@ -1766,5 +1766,95 @@ impl Render for Frame {
                 )
             }))
             .children(minibuffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desk::desk_rows;
+
+    struct OpenCard(gpui::FocusHandle);
+
+    impl gpui::Focusable for OpenCard {
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.0.clone()
+        }
+    }
+
+    impl gpui::Render for OpenCard {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl crate::Surface for OpenCard {
+        fn title(&self, _: &App) -> String {
+            "The meter".into()
+        }
+    }
+
+    #[gpui::test]
+    fn a_row_in_a_narrow_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+        let frame = cx.add_window(|window, cx| {
+            Frame::new(
+                rho_db::RhoDb::in_memory(),
+                Vec::new(),
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        frame
+            .update(cx, |frame, _, cx| {
+                let project = crate::idea::IdeaProject {
+                    address: Address::new("thread", "lab/1"),
+                    name: "tide@lab".into(),
+                    details: None,
+                    runtime: None,
+                };
+                let subject = Address::new("thread", "lab/2");
+                let mut card = frame.card_for(&subject, cx);
+                card.kind = rho_dealer::rank::CardKind::Waits;
+                let hand = rho_dealer::rank::Hand {
+                    cards: vec![card],
+                    next_change: None,
+                };
+                let rows = desk_rows(&hand, |_| Some(project.clone()));
+                frame.desk.update(cx, |desk, cx| {
+                    desk.set_rows(rows, Some(project.clone()), false, cx)
+                });
+                frame
+                    .surfaces
+                    .insert(project.address.clone(), AnySurface::new(frame.desk.clone()));
+                frame.history.show(project.address, None);
+                assert_eq!(
+                    frame.card_target(cx),
+                    Some(subject.clone()),
+                    "a verdict can target the row"
+                );
+                assert_eq!(frame.card_in_view(cx), None, "a pull must not skip the row");
+
+                let card = cx.new(|cx| OpenCard(cx.focus_handle()));
+                frame
+                    .surfaces
+                    .insert(subject.clone(), AnySurface::new(card));
+                frame.history.show(subject.clone(), None);
+                assert_eq!(
+                    frame.card_in_view(cx),
+                    Some(subject),
+                    "a pull from the actual card can skip it"
+                );
+            })
+            .unwrap();
     }
 }
