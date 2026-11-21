@@ -1,6 +1,6 @@
 //! Mail as the frame shows it.
 //!
-//! [`MailSystem`] owns each host's forest, disk copy, outbox, and session.
+//! [`ChatSystem`] owns each host's forest, disk copy, outbox, and session.
 //! It plugs into the frame as a [`System`] under the `thread` kind: a
 //! root anchors a project, and each reply directly below it starts a
 //! thread. Both open as a [`ThreadView`]. [`crate::cards`] says which
@@ -40,7 +40,7 @@ pub use thread::ThreadView;
 
 use crate::cache::Cache;
 pub use crate::cache::{MailAudience, WrittenMail};
-use crate::fold::HostMail;
+use crate::fold::HostChat;
 use crate::outbox::{Delivery, Kept, Outbox, Outgoing, OutgoingState};
 use crate::protocol::{Name, Post, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
@@ -110,12 +110,12 @@ impl PostAnswer {
     }
 }
 
-pub struct MailSystem {
+pub struct ChatSystem {
     notes: Entity<rho_notes::NoteSystem>,
     cache: Cache,
     hosts: HashMap<HostId, Slot>,
     /// Each log's forest, by the identity of the host that keeps it.
-    logs: HashMap<EndpointId, HostMail>,
+    logs: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
     creating_projects: Vec<(ThreadId, CreatedProject)>,
@@ -132,9 +132,9 @@ pub struct MailSystem {
     _pump: Task<()>,
 }
 
-impl EventEmitter<Event> for MailSystem {}
+impl EventEmitter<Event> for ChatSystem {}
 
-impl MailSystem {
+impl ChatSystem {
     pub fn new(
         db: rho_db::RhoDb,
         frame: FrameLink,
@@ -143,11 +143,11 @@ impl MailSystem {
     ) -> Self {
         thread::bind(cx);
         let legacy_places = projects::legacy_places(&db);
-        let cache = Cache::open_on(db).expect("the mail copy opens");
+        let cache = Cache::open_on(db).expect("the chat copy opens");
         let loaded = cache.load();
         let mut logs = HashMap::new();
         for (seed, _) in &loaded.cursors {
-            let mut chat = HostMail::default();
+            let mut chat = HostChat::default();
             for record in cache.read_log(*seed) {
                 chat.tell(&record);
             }
@@ -233,7 +233,7 @@ impl MailSystem {
     }
 
     pub fn work(&self, thread: ThreadId) -> Option<ThreadWork> {
-        self.host_mail(thread.host)?.work(thread.message)
+        self.host_chat(thread.host)?.work(thread.message)
     }
 
     /// A mail thread's subject and project address for a row elsewhere.
@@ -247,7 +247,7 @@ impl MailSystem {
             .values()
             .find(|slot| slot.endpoint == Some(channel.host))?
             .name;
-        self.host_mail(channel.host)?
+        self.host_chat(channel.host)?
             .project(channel.message)
             .map(|project| project.address(alias))
     }
@@ -261,14 +261,14 @@ impl MailSystem {
             .values()
             .find(|slot| slot.name == host_alias)?
             .endpoint?;
-        let message = self.host_mail(endpoint)?.root_named(project)?;
+        let message = self.host_chat(endpoint)?.root_named(project)?;
         Some(ThreadId {
             host: endpoint,
             message,
         })
     }
 
-    pub fn host_mail(&self, endpoint: EndpointId) -> Option<&HostMail> {
+    pub fn host_chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
         self.logs.get(&endpoint)
     }
 
@@ -278,7 +278,7 @@ impl MailSystem {
         writes: &HashSet<(MessageId, Option<ChatSeq>)>,
     ) -> HashMap<(MessageId, Option<ChatSeq>), WrittenMail> {
         use rho_agent_types::Revision;
-        let Some(log) = self.host_mail(endpoint) else {
+        let Some(log) = self.host_chat(endpoint) else {
             return HashMap::new();
         };
         let mut result = HashMap::new();
@@ -336,7 +336,7 @@ impl MailSystem {
 
     fn project_of(&self, thread: ThreadId) -> String {
         let host = self.host_name(thread.host);
-        self.host_mail(thread.host).map_or_else(
+        self.host_chat(thread.host).map_or_else(
             || host.clone(),
             |chat| cards::context(chat, thread.message, &host),
         )
@@ -378,7 +378,7 @@ impl MailSystem {
                 if fresh {
                     self.settings.remove(&endpoint);
                     self.cache.reset(endpoint);
-                    self.logs.insert(endpoint, HostMail::default());
+                    self.logs.insert(endpoint, HostChat::default());
                 }
                 self.logs.entry(endpoint).or_default();
                 self.send_unsent(endpoint, cx);
@@ -468,7 +468,7 @@ impl MailSystem {
     ) -> u64 {
         // Retry is the one exceptional route. A failure can be replied to
         // by name too; use it only when it is still the last kept item.
-        let failed_start = self.host_mail(thread.host).and_then(|chat| {
+        let failed_start = self.host_chat(thread.host).and_then(|chat| {
             let last = match settles {
                 Some(dealt) => chat.message(dealt.message),
                 None => chat
@@ -574,7 +574,7 @@ impl MailSystem {
     }
 
     fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
-        let chat = self.host_mail(thread.host)?;
+        let chat = self.host_chat(thread.host)?;
         chat.message(thread.message)?;
         let root = chat.root_of(thread.message);
         chat.project(root)?;
@@ -613,7 +613,7 @@ impl MailSystem {
             return;
         };
         if !self
-            .host_mail(endpoint)
+            .host_chat(endpoint)
             .is_some_and(|chat| chat.message(message).is_some())
         {
             return;
@@ -783,7 +783,7 @@ impl MailSystem {
     /// first: those newer than their verdicts or the user's own last mail.
     pub(crate) fn unread_ids_in(
         &self,
-        chat: &HostMail,
+        chat: &HostChat,
         thread: ThreadId,
         marks: &Marks,
     ) -> Vec<MessageId> {
@@ -828,11 +828,11 @@ impl MailSystem {
     }
 }
 
-impl MailSystem {
+impl ChatSystem {
     fn pending_ideas(&self) -> impl Iterator<Item = (PendingIdeaId, String, &Outgoing)> {
         self.outbox.ideas().filter_map(|(host, id, outgoing)| {
             let project = outgoing.parent?;
-            let chat = self.host_mail(host)?;
+            let chat = self.host_chat(host)?;
             let alias = self.host_name(host);
             Some((
                 PendingIdeaId(id),
@@ -843,7 +843,7 @@ impl MailSystem {
     }
 }
 
-impl System for MailSystem {
+impl System for ChatSystem {
     fn kinds(&self) -> &'static [&'static str] {
         &[ThreadId::KIND, PendingIdeaId::KIND]
     }
@@ -1039,7 +1039,7 @@ impl System for MailSystem {
 
     fn desk_context(&self, address: &Address, _cx: &App) -> Option<String> {
         let card = self.thread_of(address)?;
-        let chat = self.host_mail(card.host)?;
+        let chat = self.host_chat(card.host)?;
         chat.latest_flash(chat.subthread_of(card.message))
             .map(rho_agent_types::Message::headline)
     }
@@ -1122,7 +1122,7 @@ impl System for MailSystem {
     }
 
     fn text_sources(&self, search: &mut TextSearch, current: &Address, _cx: &App) {
-        if !search.includes(TextKind::Mail) {
+        if !search.includes(TextKind::Chat) {
             return;
         }
         if let Some(thread) = self.thread_of(current) {
@@ -1134,7 +1134,7 @@ impl System for MailSystem {
         }
         for (host, _) in self.hosts() {
             search.add(self.logs[&host].text.clone(), move |message| {
-                TextTarget::Mail { host, message }
+                TextTarget::Message { host, message }
             });
         }
     }
@@ -1156,7 +1156,7 @@ impl System for MailSystem {
                             point: SearchPoint::Draft(hit.row),
                         });
                 }
-                &TextTarget::Mail { host, message } => ThreadId { host, message },
+                &TextTarget::Message { host, message } => ThreadId { host, message },
                 TextTarget::Note(_) => return None,
             };
             let chat = self.logs.get(&id.host)?;
@@ -1186,9 +1186,9 @@ impl System for MailSystem {
                         })
                         .or_insert_with(|| cards::context_at_root(chat, root, host_alias));
                     let title = if project.is_empty() {
-                        format!("Mail · {subject}")
+                        format!("Message · {subject}")
                     } else {
-                        format!("Mail · {subject} · {project}")
+                        format!("Message · {subject} · {project}")
                     };
                     entry.insert((address(thread), title))
                 }
@@ -1197,7 +1197,7 @@ impl System for MailSystem {
                 address: owner.clone(),
                 title: title.clone(),
                 line: hit.line().to_owned(),
-                point: SearchPoint::Mail {
+                point: SearchPoint::Message {
                     message: address(id.message),
                     line: hit.row,
                 },
@@ -1280,7 +1280,7 @@ mod tests {
     fn a_queued_idea_is_findable_until_its_post_is_in_the_log(cx: &mut gpui::TestAppContext) {
         let endpoint = EndpointId([3; 32]);
         let project = MessageId(ChatSeq(1));
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         log.tell(&rho_agent_types::ChatRecord {
             seq: project.0,
             at: UnixMs(1),
@@ -1309,13 +1309,13 @@ mod tests {
                     cx,
                 );
                 let pending = PendingIdeaId(id).address();
-                let queued = |mail: &MailSystem, cx: &App| {
+                let queued = |mail: &ChatSystem, cx: &App| {
                     mail.find(&Marks::default(), cx)
                         .into_iter()
                         .filter(|row| row.title == title)
                         .collect::<Vec<_>>()
                 };
-                let check_queued = |mail: &MailSystem, cx: &App| {
+                let check_queued = |mail: &ChatSystem, cx: &App| {
                     let matches = queued(mail, cx);
                     assert_eq!(matches.len(), 1);
                     assert_eq!(&matches[0].address, &pending);
@@ -1393,7 +1393,7 @@ mod tests {
                 }],
             },
         };
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         log.tell(&record(
             MessageId(ChatSeq(1)),
             Party::User,
@@ -1420,7 +1420,7 @@ mod tests {
         let (_, mail, _db) = search_bench::fixture(cx, log);
         cx.update(|cx| {
             mail.update(cx, |mail, cx| {
-                let dealt = |mail: &MailSystem, cx: &App| {
+                let dealt = |mail: &ChatSystem, cx: &App| {
                     let claims = mail.claims(&Marks::default(), Timestamp::now(), None, cx);
                     assert_eq!(claims.len(), 1);
                     cards::attention_mail(claims[0].seen)

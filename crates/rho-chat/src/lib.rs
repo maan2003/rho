@@ -26,7 +26,7 @@ pub mod stream;
 pub mod ui;
 
 #[cfg(feature = "client")]
-pub use fold::{HostMail, Thread, Told};
+pub use fold::{HostChat, Thread, Told};
 
 /// An agent as an address, `agent:<encoded id>`: what a thread's
 /// participants are named by, and what the agents system opens. The id

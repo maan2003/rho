@@ -770,19 +770,19 @@ mod tests {
         for point in [SearchPoint::Draft(2), SearchPoint::Line(19)] {
             results.push(FoundText {
                 address: Address::new("thread", "reef@lab"),
-                title: "Mail · Failing lever · reef@lab".into(),
+                title: "Message · Failing lever · reef@lab".into(),
                 line: "a brass pin sticks".into(),
                 point,
             });
         }
-        let query = TextQuery::parse("mail: pin brass");
+        let query = TextQuery::parse("chat: pin brass");
         let mut rows = listing.rank_query(&query);
         listing.append_text(
             &mut rows,
             results.into_iter().map(|hit| (hit, Vec::new())).collect(),
         );
         assert_eq!(rows.iter().map(|row| row.index).collect::<Vec<_>>(), [1, 2]);
-        assert!(ids(&listing, "mail:").is_empty());
+        assert!(ids(&listing, "chat:").is_empty());
         assert_eq!(ids(&listing, "brass pin"), [0]);
     }
 
@@ -909,7 +909,7 @@ mod tests {
     fn an_exact_command_beats_a_more_specific_command_offered_first() {
         let rows = commands(
             &[
-                Row::run("", "done with this mail", |_, _, _| {}),
+                Row::run("", "done with this message", |_, _, _| {}),
                 Row::run("d", "done", |_, _, _| {}),
             ],
             |_| None,

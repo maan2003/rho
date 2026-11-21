@@ -14,7 +14,7 @@ use crate::palette::{best_hit, text_marks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextKind {
-    Mail,
+    Chat,
     Note,
 }
 
@@ -39,8 +39,8 @@ impl<'a> TextQuery<'a> {
         } else {
             let body = input.strip_prefix('/');
             let text = body.unwrap_or(input).trim_start();
-            if let Some(words) = text.strip_prefix("mail:") {
-                (TextScope::Text(Some(TextKind::Mail)), words)
+            if let Some(words) = text.strip_prefix("chat:") {
+                (TextScope::Text(Some(TextKind::Chat)), words)
             } else if let Some(words) = text.strip_prefix("note:") {
                 (TextScope::Text(Some(TextKind::Note)), words)
             } else if body.is_some() {
@@ -74,7 +74,7 @@ impl<'a> TextQuery<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextTarget {
     Draft(Address),
-    Mail {
+    Message {
         host: EndpointId,
         message: MessageId,
     },
@@ -489,7 +489,9 @@ mod tests {
             ("clock", [true, true]),
             ("> clock", [false, false]),
             ("/ clock", [true, true]),
-            ("mail: clock", [true, false]),
+            ("chat: clock", [true, false]),
+            ("/ chat: clock", [true, false]),
+            ("mail: clock", [true, true]),
             ("note: clock", [false, true]),
             ("/ note: clock", [false, true]),
             ("/", [false, false]),
@@ -498,7 +500,7 @@ mod tests {
             let query = TextQuery::parse(input);
             assert_eq!(
                 [
-                    query.includes(TextKind::Mail),
+                    query.includes(TextKind::Chat),
                     query.includes(TextKind::Note)
                 ],
                 expected,
@@ -588,7 +590,7 @@ mod tests {
         draft.update(1, "a clockwork".into(), 0);
         let mut search = TextSearch::new("clock".into(), 3);
         search.add_draft(&draft, &1, Address::new("thread", "open"));
-        search.add(mail, |id| TextTarget::Mail {
+        search.add(mail, |id| TextTarget::Message {
             host: EndpointId([1; 32]),
             message: MessageId(rho_agent_types::ChatSeq(id)),
         });

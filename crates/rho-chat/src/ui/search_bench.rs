@@ -3,9 +3,9 @@ use rho_frame::Frame;
 
 use super::*;
 
-fn corpus() -> HostMail {
+fn corpus() -> HostChat {
     let agent = Party::Agent(AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap());
-    let mut log = HostMail::default();
+    let mut log = HostChat::default();
     for seq in 1..=10_001 {
         let parent = if seq == 1 {
             None
@@ -49,10 +49,10 @@ fn corpus() -> HostMail {
 
 pub(super) fn fixture(
     cx: &mut gpui::TestAppContext,
-    log: HostMail,
+    log: HostChat,
 ) -> (
     gpui::WindowHandle<Frame>,
-    Entity<MailSystem>,
+    Entity<ChatSystem>,
     tempfile::TempDir,
 ) {
     let temp = tempfile::tempdir().unwrap();
@@ -75,7 +75,7 @@ pub(super) fn fixture(
         let frame = FrameLink::new(window.window_handle().downcast::<Frame>().unwrap());
         let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
         let system = cx.new(|cx| {
-            let mut system = MailSystem::new(db.clone(), frame, notes, cx);
+            let mut system = ChatSystem::new(db.clone(), frame, notes, cx);
             system.logs.insert(EndpointId([3; 32]), log);
             system
         });
@@ -149,7 +149,7 @@ fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
     for _ in 0..20 {
         cx.dispatch_action(window, rho_frame::keys::Palette);
         cx.draw_window(window);
-        cx.simulate_input(window, "mail: ");
+        cx.simulate_input(window, "chat: ");
         cx.draw_window(window);
         for key in ["c", "l", "o", "c", "k", "space", "b", "e", "h", "backspace"] {
             let key = gpui::Keystroke::parse(key).unwrap();
@@ -163,7 +163,7 @@ fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
         }
         frame
             .update(cx, |frame, _, cx| {
-                assert_eq!(frame.minibuffer_mut().unwrap().input(cx), "mail: clock be");
+                assert_eq!(frame.minibuffer_mut().unwrap().input(cx), "chat: clock be");
             })
             .unwrap();
         cx.dispatch_action(window, rho_frame::keys::MinibufferCancel);

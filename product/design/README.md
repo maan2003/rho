@@ -78,7 +78,7 @@ Starting from the waiting clock ask, capture the card, verdict, and agent in ord
 | Render | Capture |
 | --- | --- |
 | [Dealt clock thread](laptop-card.png) | `form_way laptop input 'key:g' 'key:g' 'wait:400' 'key:space' 'wait:800'; form_shot laptop card` |
-| [Message body search](laptop-prompt.png) | From Desk, `form_way laptop input 'text::' 'wait:400' 'text:chat: behavior' 'wait:600'; form_shot laptop prompt`. |
+| [Message body search](laptop-prompt.png) | With the seeded clock history (`FORM_SEED_THREAD=1`), from Desk, `form_way laptop input 'text::' 'wait:400' 'text:chat: steady' 'wait:600'; form_shot laptop prompt`. |
 | [Verdict menu below the card](laptop-menu.png) | `form_way laptop input 'key:space' 'wait:700'; form_shot laptop menu` |
 | [Agent transcript at the message's writing step](laptop-agent.png) | `form_way laptop input 'key:escape' 'wait:550' 'key:g' 'key:g' 'key:j' 'key:enter' 'wait:850'; form_shot laptop agent` |
 | [Done echo back on Desk](laptop-echo.png) | `form_way laptop input 'key:ctrl+k' 'wait:600' 'key:space' 'wait:350' 'key:d' 'wait:320'; form_shot laptop echo` |

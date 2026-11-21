@@ -14,8 +14,8 @@ use rho_agents_client::protocol::worksets::{MailLaunch, StartFromMail};
 use rho_agents_client::snippets::{
     self, DEFAULT_FUNCTION, DEFAULT_RUNTIME, Function, RUNTIMES, Runtime,
 };
+use rho_chat::ThreadId;
 use rho_frame::{Candidate, Frame, Row, Rows};
-use rho_mail::ThreadId;
 use rho_window::style::StyleClass;
 
 use super::AgentsSystem;
@@ -115,7 +115,7 @@ pub(crate) fn rows(
         return rows;
     };
     let mail = read.mail.read(cx);
-    let Some(log) = mail.host_mail(thread.host) else {
+    let Some(log) = mail.host_chat(thread.host) else {
         return rows;
     };
     let members = if log.is_project(thread.message) {
@@ -328,7 +328,7 @@ pub(crate) fn create(
     let origin = system
         .mail
         .read(cx)
-        .host_mail(thread.host)
+        .host_chat(thread.host)
         .and_then(|chat| chat.message(thread.message))
         .filter(|mail| mail.from == rho_agent_types::Address::StartFailed)
         .and_then(|mail| mail.reply_to)

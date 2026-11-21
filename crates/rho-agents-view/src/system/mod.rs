@@ -36,6 +36,8 @@ use rho_agents_client::quota::Quotas;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, Heard, now_ms};
+use rho_chat::ui::{ChatSystem, Event as MailEvent, MailAudience, Participant};
+use rho_chat::{AgentRef, ThreadId};
 use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
@@ -43,8 +45,6 @@ use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks, Point,
     Row, Subject, System,
 };
-use rho_mail::ui::{Event as MailEvent, MailAudience, MailSystem, Participant};
-use rho_mail::{AgentRef, ThreadId};
 use rho_rpc::protocol::Call;
 use rho_shell_view::ui::ShellSurface;
 use rho_terminal::ui::TerminalSurface;
@@ -75,7 +75,7 @@ pub struct AgentsSystem {
     quotas: Quotas,
     /// What the hosts answered for the spend charts.
     usage: Usage,
-    mail: Entity<MailSystem>,
+    mail: Entity<ChatSystem>,
     frame: FrameLink,
     /// Agents asked for with the user's message, by the id the chat gave
     /// the message: started once the host has logged it.
@@ -90,7 +90,7 @@ pub struct AgentsSystem {
 }
 
 impl AgentsSystem {
-    pub fn new(mail: Entity<MailSystem>, frame: FrameLink, cx: &mut Context<Self>) -> Self {
+    pub fn new(mail: Entity<ChatSystem>, frame: FrameLink, cx: &mut Context<Self>) -> Self {
         let (client, changes) = AgentsClient::spawn();
         let pump = cx.spawn(async move |this, cx| {
             let mut changes = changes;
@@ -382,7 +382,7 @@ impl AgentsSystem {
             .host_of_agent(agent)
             .and_then(|host| self.registry.host_endpoint(host));
         let mail = self.mail.read(cx);
-        let log = endpoint.and_then(|endpoint| mail.host_mail(endpoint));
+        let log = endpoint.and_then(|endpoint| mail.host_chat(endpoint));
         for name in needed {
             match name {
                 Label::Agent(id) => {
@@ -772,7 +772,7 @@ impl AgentsSystem {
     fn agent_thread(&self, agent: AgentId, cx: &App) -> Option<ThreadId> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;
-        let chat = self.mail.read(cx).host_mail(host)?;
+        let chat = self.mail.read(cx).host_chat(host)?;
         let message = chat.agent_thread(agent).or_else(|| {
             mirrored
                 .identity
@@ -785,7 +785,7 @@ impl AgentsSystem {
     fn brief(&self, agent: AgentId, cx: &App) -> Option<String> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;
-        let chat = self.mail.read(cx).host_mail(host)?;
+        let chat = self.mail.read(cx).host_chat(host)?;
         let origin = mirrored.identity.origin()?;
         let brief = chat.message(origin)?.text();
         (!brief.trim().is_empty()).then_some(brief)
@@ -1245,7 +1245,7 @@ impl System for AgentsSystem {
         let (desk, mail) = {
             let system = self.mail.read(cx);
             let here = system.thread_of(&point.surface);
-            let chat = system.host_mail(thread.host);
+            let chat = system.host_chat(thread.host);
             let desk = here.is_none()
                 || here
                     .is_some_and(|place| chat.is_some_and(|chat| chat.is_project(place.message)));

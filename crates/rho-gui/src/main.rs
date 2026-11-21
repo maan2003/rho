@@ -213,33 +213,33 @@ fn run() -> Result<()> {
                     .expect("the frame is the window's root");
                 let frame = FrameLink::new(handle);
                 let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
-                let mail = cx.new(|cx| {
-                    rho_mail::ui::MailSystem::new(db.clone(), frame.clone(), notes.clone(), cx)
+                let chat = cx.new(|cx| {
+                    rho_chat::ui::ChatSystem::new(db.clone(), frame.clone(), notes.clone(), cx)
                 });
-                // The mail owns its words; Notes holds only a weak reader of
+                // Chat owns its words; Notes holds only a weak reader of
                 // it.
-                let mail_for_notes = mail.downgrade();
+                let chat_for_notes = chat.downgrade();
                 notes.update(cx, |notes, _| {
                     notes.set_mail_excerpt(Rc::new(move |address, cx| {
-                        let mail = mail_for_notes.upgrade()?;
-                        let mail = mail.read(cx);
-                        let id = mail.thread_of(address)?;
-                        let text = mail.host_mail(id.host)?.message(id.message)?.headline();
+                        let chat = chat_for_notes.upgrade()?;
+                        let chat = chat.read(cx);
+                        let id = chat.thread_of(address)?;
+                        let text = chat.host_chat(id.host)?.message(id.message)?.headline();
                         (!text.is_empty()).then_some(text)
                     }));
                 });
                 let agents = cx
-                    .new(|cx| rho_agents_view::AgentsSystem::new(mail.clone(), frame.clone(), cx));
-                // The mail ranks a thread by the agents still in it and by
+                    .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
+                // Chat ranks a thread by the agents still in it and by
                 // the stops they are in, and names them with what they do;
                 // the agents system knows all of it, and a thread on screen
                 // reads again when it moves.
                 let participants = agents.downgrade();
-                mail.update(cx, |mail, cx| {
-                    mail.set_participants(Rc::new(move |endpoint, agent, cx| {
+                chat.update(cx, |chat, cx| {
+                    chat.set_participants(Rc::new(move |endpoint, agent, cx| {
                         participants.upgrade().map_or_else(
                             || {
-                                Some(rho_mail::ui::Participant {
+                                Some(rho_chat::ui::Participant {
                                     label: agent.encoded(),
                                     runtime: None,
                                     created_at: None,
@@ -251,7 +251,7 @@ fn run() -> Result<()> {
                         )
                     }));
                     let known = agents.downgrade();
-                    mail.set_known_places(Rc::new(move |endpoint, cx| {
+                    chat.set_known_places(Rc::new(move |endpoint, cx| {
                         known
                             .upgrade()
                             .map(|agents| agents.read(cx).known_project_places(endpoint))
@@ -268,7 +268,7 @@ fn run() -> Result<()> {
                 });
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
-                    AnySystem::new(mail),
+                    AnySystem::new(chat),
                     AnySystem::new(agents),
                     AnySystem::new(browser),
                     AnySystem::new(notes),

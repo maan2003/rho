@@ -417,7 +417,7 @@ fn render_labelled(
         UiBlock::MailWritten { message, version } => {
             let words = label(Label::Write(*message, *version));
             let line = if words.is_empty() {
-                "wrote mail"
+                "wrote a message"
             } else {
                 &words
             };
@@ -679,10 +679,13 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     timer
 }
 
-fn mail_preview(source: &str) -> Option<String> {
-    // This is a preview of a literal, not an interpretation of Python.
-    // Do not speculate about dynamic recipients or bodies.
-    let args = source.trim_start().strip_prefix("mail.send(")?.trim_start();
+fn chat_preview(source: &str) -> Option<String> {
+    // Preview a literal, not an interpretation of Python.
+    let source = source.trim_start();
+    if let Some(args) = source.strip_prefix("chat.send(") {
+        return literal_argument(args.trim_start());
+    }
+    let args = source.strip_prefix("mail.send(")?.trim_start();
     let body = args
         .strip_prefix("\"user\"")
         .or_else(|| args.strip_prefix("'user'"))?
@@ -741,36 +744,42 @@ fn status_preview(source: &str) -> Option<String> {
     literal_argument(text.trim_start())
 }
 
-// When the recipient, status or body is computed, the transcript can
-// still say which mail action ran without exposing its machine arguments.
-fn mail_operation(source: &str) -> Option<&'static str> {
+// The two APIs share transcript vocabulary, including in old recordings.
+fn chat_call(source: &str) -> Option<&str> {
     let source = source.trim_start();
-    [
-        ("mail.status(", "set thread status"),
-        ("mail.send(", "send mail"),
-        ("mail.edit(", "edit mail"),
-        ("mail.delete(", "delete mail"),
-        ("mail.read(", "read mail"),
-        ("mail.roots(", "list projects"),
-        ("mail.search(", "search mail"),
-        ("mail.fork(", "start a tangent"),
-        ("mail.start(", "start a thread"),
-        ("mail.join(", "follow a thread"),
-        ("mail.leave(", "leave a thread"),
-        ("mail.name(", "name a thread"),
-        ("mail.move(", "move mail"),
-    ]
-    .into_iter()
-    .find_map(|(prefix, words)| source.starts_with(prefix).then_some(words))
+    source
+        .strip_prefix("chat.")
+        .or_else(|| source.strip_prefix("mail."))
+        .and_then(|call| call.split_once('('))
+        .map(|(name, _)| name)
+}
+
+fn chat_operation(source: &str) -> Option<&'static str> {
+    Some(match chat_call(source)? {
+        "status" => "set thread status",
+        "send" => "send a message",
+        "edit" => "edit a message",
+        "delete" => "delete a message",
+        "read" => "read messages",
+        "roots" => "list projects",
+        "search" => "search messages",
+        "fork" => "start a tangent",
+        "start" => "start a thread",
+        "join" => "follow a thread",
+        "leave" => "leave a thread",
+        "name" => "name a thread",
+        "move" => "move a message",
+        _ => return None,
+    })
 }
 
 fn tool_heading(tool: &UiTool, source: &str) -> String {
     let native = matches!(tool.name.as_str(), "exec" | "mcp__py__exec");
-    if native && let Some(mail) = mail_preview(source) {
+    if native && let Some(mail) = chat_preview(source) {
         let verb = match tool.status {
             UiToolStatus::Error | UiToolStatus::Cancelled => Some("tried to write to you"),
             UiToolStatus::Running => Some("writing to you"),
-            _ => None, // Only the mail log says what was actually written.
+            _ => None, // Only the chat log says what was actually written.
         };
         if let Some(verb) = verb {
             return format!("{verb}: {}", preview(&mail));
@@ -783,7 +792,7 @@ fn tool_heading(tool: &UiTool, source: &str) -> String {
             format!("set status \"{}\"", preview(&status))
         };
     }
-    if native && let Some(action) = mail_operation(source) {
+    if native && let Some(action) = chat_operation(source) {
         return action.to_owned();
     }
     if native && let Some(shell) = python_shell_command(source) {
@@ -811,17 +820,17 @@ pub(crate) fn preview(text: &str) -> String {
 fn tool_detail(tool: &UiTool, source: &str) -> Option<String> {
     let mut detail = Vec::new();
     if matches!(tool.name.as_str(), "exec" | "mcp__py__exec")
-        && let Some(mail) = mail_preview(source)
+        && let Some(mail) = chat_preview(source)
         && preview(&mail) != mail
     {
         detail.push(mail);
     }
     if let Some(output) = tool.output.as_deref().or(tool.error.as_deref()) {
         let output = output.trim_end();
-        detail.push(if mail_operation(source).is_some() {
+        detail.push(if chat_operation(source).is_some() {
             output
                 .lines()
-                .map(|line| mail_output_line(source, line))
+                .map(|line| chat_output_line(source, line))
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
@@ -851,9 +860,9 @@ fn unnumber(text: &str) -> Option<&str> {
 
 /// A few mail tools print a listing by putting numbers in front of each
 /// result. Keep the subject, writer, and excerpt instead of that notation.
-fn mail_output_line(source: &str, line: &str) -> String {
-    let source = source.trim_start();
-    if source.starts_with("mail.search(")
+fn chat_output_line(source: &str, line: &str) -> String {
+    let call = chat_call(source);
+    if call == Some("search")
         && let Some((subject, result)) =
             unnumber(line).and_then(|line| line.split_once(" · mail #"))
         && let Some((id, excerpt)) = result.split_once(" · ")
@@ -861,10 +870,10 @@ fn mail_output_line(source: &str, line: &str) -> String {
     {
         return format!("{subject} · {excerpt}");
     }
-    if source.starts_with("mail.roots(") {
+    if call == Some("roots") {
         return unnumber(line).unwrap_or(line).to_owned();
     }
-    if source.starts_with("mail.read(") {
+    if call == Some("read") {
         if let Some(subject) = line
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
@@ -896,14 +905,14 @@ fn mail_output_line(source: &str, line: &str) -> String {
             }
         }
     }
-    mail_receipt(line).to_owned()
+    chat_receipt(line).to_owned()
 }
 
 // These fixed receipts are useful to the model with their machine ids,
 // but in the transcript the writing step already points to the actual mail.
-fn mail_receipt(line: &str) -> &str {
+fn chat_receipt(line: &str) -> &str {
     for (prefix, words) in [
-        ("Sent mail #", "Sent mail."),
+        ("Sent mail #", "Sent a message."),
         ("Started #", "Started the thread."),
         ("Joined #", "Followed the thread."),
         ("Left #", "Left the thread."),
@@ -924,7 +933,7 @@ fn mail_receipt(line: &str) -> &str {
         && number(message)
         && number(thread)
     {
-        return "Moved the mail.";
+        return "Moved the message.";
     }
     if let Some((number, advice)) = line
         .strip_prefix("Mail #")
@@ -932,14 +941,14 @@ fn mail_receipt(line: &str) -> &str {
         && self::number(number)
     {
         if advice == "ask its writer to use `mail.edit` for updates." {
-            return "Earlier mail is unanswered. If it is still live, ask its writer to update it.";
+            return "The earlier message is unanswered. If it is still live, ask its writer to update it.";
         }
         if advice
             .strip_prefix("use `mail.edit(")
             .and_then(|rest| rest.strip_suffix(", ...)` for updates."))
             == Some(number)
         {
-            return "Earlier mail is unanswered. If it is still live, update it instead.";
+            return "The earlier message is unanswered. If it is still live, update it instead.";
         }
     }
     line
@@ -1355,6 +1364,22 @@ mod tests {
         assert_eq!(drafted.spans[1].class, StyleClass::Default);
         let sourced = render(&source, None, 0, &label);
         assert_eq!(text_of(&sourced.spans), "writing to you: Hello · …\n");
+
+        let mut exec = tool(UiToolStatus::Running);
+        exec.name = "exec".into();
+        let source = r#"chat.send("Checking the clock.", "flash", thread=2)"#;
+        assert_eq!(
+            tool_heading(&exec, source),
+            "writing to you: Checking the clock."
+        );
+        assert_eq!(
+            tool_heading(&exec, "chat.send(result, kind, thread=2)"),
+            "send a message"
+        );
+        assert_eq!(
+            tool_heading(&exec, "mail.send(agent, text, thread=2)"),
+            "send a message"
+        );
     }
 
     #[test]
@@ -1409,7 +1434,7 @@ mod tests {
         );
         assert_eq!(
             text_of(&render(&block, None, 0, &|_| String::new()).spans),
-            "wrote mail\n"
+            "wrote a message\n"
         );
     }
 
@@ -1446,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_receipts_leave_out_machine_keys_and_keep_other_output() {
+    fn chat_receipts_leave_out_machine_keys_and_keep_other_output() {
         let mut exec = tool(UiToolStatus::Success);
         exec.name = "exec".into();
         exec.format = ArgumentsFormat::Text;
@@ -1460,41 +1485,43 @@ mod tests {
         assert_eq!(
             tool_detail(&exec, source).as_deref(),
             Some(concat!(
-                "  Sent mail.\n",
-                "  Earlier mail is unanswered. If it is still live, update it instead.\n",
+                "  Sent a message.\n",
+                "  The earlier message is unanswered. If it is still live, update it instead.\n",
                 "  Check #273 in my tests."
             ))
         );
         assert_eq!(
-            mail_receipt(
+            chat_receipt(
                 "Mail #16 has no user reply. If it is still live, ask its writer to use `mail.edit` for updates."
             ),
-            "Earlier mail is unanswered. If it is still live, ask its writer to update it."
+            "The earlier message is unanswered. If it is still live, ask its writer to update it."
         );
-        assert_eq!(mail_receipt("Moved #976 to #2."), "Moved the mail.");
-        assert_eq!(mail_receipt("Sent mail #unknown."), "Sent mail #unknown.");
+        assert_eq!(chat_receipt("Moved #976 to #2."), "Moved the message.");
+        assert_eq!(chat_receipt("Sent mail #unknown."), "Sent mail #unknown.");
     }
 
     #[test]
-    fn structured_mail_search_keeps_subjects_and_excerpts_not_tool_keys() {
-        assert_eq!(
-            mail_output_line(
-                "mail.search('race')",
-                "#14 Race on clock · mail #77 · Check #31 in the fixture"
-            ),
-            "Race on clock · Check #31 in the fixture"
-        );
-        assert_eq!(
-            mail_output_line(
-                "mail.read(14)",
-                "→ #77 user (reply to #97): Keep #31 in the test"
-            ),
-            "→ you: Keep #31 in the test"
-        );
-        assert_eq!(
-            mail_output_line("mail.read(14)", "#31 in the human continuation"),
-            "#31 in the human continuation"
-        );
+    fn structured_chat_search_keeps_subjects_and_excerpts_not_tool_keys() {
+        for api in ["chat", "mail"] {
+            assert_eq!(
+                chat_output_line(
+                    &format!("{api}.search('race')"),
+                    "#14 Race on clock · mail #77 · Check #31 in the fixture"
+                ),
+                "Race on clock · Check #31 in the fixture"
+            );
+            assert_eq!(
+                chat_output_line(
+                    &format!("{api}.read(14)"),
+                    "→ #77 user (reply to #97): Keep #31 in the test"
+                ),
+                "→ you: Keep #31 in the test"
+            );
+            assert_eq!(
+                chat_output_line(&format!("{api}.read(14)"), "#31 in the human continuation"),
+                "#31 in the human continuation"
+            );
+        }
     }
 
     #[test]

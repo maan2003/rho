@@ -15,11 +15,11 @@ use rho_agents_client::protocol::worksets::{
     AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
     StartFromMail, StopAgent,
 };
-use rho_mail::protocol::{
+use rho_chat::protocol::{
     ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Open, Post, PostIdea,
     PostIdeaReply, Project, ResolveProject, RetryIdea, ServerFrame,
 };
-use rho_mail::{HostMail, cards};
+use rho_chat::{HostChat, cards};
 use rho_rpc::protocol::client::{call, connect};
 use rho_rpc::protocol::{RuntimePaths, read_frame, write_frame, write_open};
 
@@ -70,9 +70,9 @@ async fn with_host(scenario: rho_fake_model::Scenario, projects: bool) -> anyhow
     std::fs::write(
         auth.join("default.json"),
         serde_json::to_vec(&serde_json::json!({
-            "access_token": "rho-mail-test",
+            "access_token": "rho-chat-test",
             "expires_at_ms": u64::MAX,
-            "account_id": "rho-mail-test",
+            "account_id": "rho-chat-test",
             "client_secret": vec![0u8; 32],
         }))?,
     )?;
@@ -680,7 +680,7 @@ async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<
     .expect_err("the requested directory is missing");
     let reason = format!("{} does not exist on lab", missing.display());
     assert_eq!(error.to_string(), reason);
-    let mut history = HostMail::default();
+    let mut history = HostChat::default();
     let mail = loop {
         let ServerFrame::Messages { records } = read_frame(&mut stream).await? else {
             continue;
@@ -1389,7 +1389,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
     .agent
     .context("no parent agent")?;
 
-    let mut history = HostMail::default();
+    let mut history = HostChat::default();
     let mut brief = None;
     let mut peer = None;
     let ask = loop {

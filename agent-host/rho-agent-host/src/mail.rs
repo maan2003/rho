@@ -1,4 +1,4 @@
-//! The mail part of the agent host ([`rho_mail::protocol`]): a session
+//! The mail part of the agent host ([`rho_chat::protocol`]): a session
 //! carries the host's log from where a client holds it; what the user does
 //! in the chat is a call on a stream of its own.
 
@@ -8,11 +8,11 @@ use anyhow::Context as _;
 use rho_agent::host::pool::{ProjectIdea, ProjectIdeaResult};
 use rho_agent::store::{Appended, MailRead as _, ProjectRead as _};
 use rho_agent_types::ChatSeq;
-use rho_db::RhoDb;
-use rho_mail::protocol::{
+use rho_chat::protocol::{
     ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Name, Open, Post, PostIdea,
     PostIdeaReply, Project, Reparent, Request, ResolveProject, RetryIdea, ServerFrame,
 };
+use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, write_frame};
 use tokio::sync::{broadcast, mpsc};
 

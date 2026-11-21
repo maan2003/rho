@@ -2,7 +2,7 @@
 
 ## Record justification
 
-The plain form is written by `rho_mail::AgentRef` for a thread's
+The plain form is written by `rho_chat::AgentRef` for a thread's
 participants and an agent's posts, the parts under it by
 `rho_agents_view::system::AgentAddress`, and every form is kept in the
 user's ledger and history and read back by every GUI device and build that

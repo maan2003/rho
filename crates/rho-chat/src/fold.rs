@@ -46,7 +46,7 @@ pub struct Thread {
 
 /// One host's forest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HostMail {
+pub struct HostChat {
     /// The newest record told.
     pub head: ChatSeq,
     messages: BTreeMap<MessageId, Message>,
@@ -63,7 +63,7 @@ pub struct HostMail {
     first_joined: BTreeMap<AgentId, MessageId>,
 }
 
-impl HostMail {
+impl HostChat {
     pub fn tell(&mut self, record: &ChatRecord) -> Told {
         if record.seq <= self.head {
             return Told::Nothing;
@@ -487,7 +487,7 @@ mod tests {
     fn thread_row_prefers_the_newest_flash_then_falls_back_after_its_tombstone() {
         use rho_agent_types::{Mention, MessageKind};
 
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "project"));
         log.tell(&posted(2, Some(1), Address::User, "idea"));
         let project_words = |seq, words, kind| {
@@ -541,7 +541,7 @@ mod tests {
     fn text_projection_follows_edits_deletion_and_moves_into_or_out_of_private_roots() {
         use rho_agent_types::Mention;
 
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "visible project"));
         log.tell(&posted(
             2,
@@ -597,7 +597,7 @@ mod tests {
     fn a_human_idea_routed_to_one_worker_is_catalogued_but_private_agent_mail_is_not() {
         use rho_agent_types::Mention;
 
-        let mut log = HostMail::default();
+        let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "tide"));
         log.tell(&posted(2, Some(1), Address::User, "Measure clock jitter."));
         let directed = |seq, parent, from, text| {
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn an_addressed_maintenance_root_is_not_a_project() {
-        let mut mail = HostMail::default();
+        let mut mail = HostChat::default();
         let mut maintenance = posted(1, None, Address::User, "Restart fixture");
         let ChatEvent::Posted { mentions, .. } = &mut maintenance.event else {
             unreachable!()
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn project_members_include_threads_but_not_another_project_or_left_members() {
-        let mut mail = HostMail::default();
+        let mut mail = HostChat::default();
         for (seq, parent) in [
             (1, None),
             (2, None),
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn the_fold_keeps_the_forest() {
         let (a, b) = (agent(1), agent(2));
-        let mut mail = HostMail::default();
+        let mut mail = HostChat::default();
         assert_eq!(
             mail.tell(&posted(1, None, Address::User, "rho")),
             Told::Posted {

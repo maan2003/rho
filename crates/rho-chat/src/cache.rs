@@ -148,7 +148,7 @@ impl Cache {
         let (sender, receiver) = mpsc::channel();
         let writer_db = db.clone();
         let handle = std::thread::Builder::new()
-            .name("rho-mail-cache".into())
+            .name("rho-chat-cache".into())
             .spawn(move || writer(writer_db, receiver))?;
         Ok(Self {
             db,
