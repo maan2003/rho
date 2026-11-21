@@ -93,7 +93,7 @@ principle: an agent runs the window it is testing on a desktop of its own; the u
 sees: the app, live, scaled to fit the window; at the top, the agent's name, `desktop`, and the desktop's name; `connecting to desktop … of …` while it opens; while drawing, a line along the bottom with `DRAW`, `u undo`, `y copy`, and `esc live`.
 does:
 - desktop…, from the palette on any of the agent's screens: open the agent's desktop, or, with more than one, ask `desktop:` and open the one chosen; the row shows only when the agent runs one
-- verdict `space`: open `deal.Verdict` on the agent's thread without leaving the desktop
+- verdict `space`: open `deal.Verdict` on the card being inspected without leaving the desktop
 - other keys, clicks, and wheel: go to the app on the desktop
 - palette `ctrl-shift-;`: open the palette without the app seeing the keys; see `window.Palette`
 - draw on this frame, from the palette: hold the picture still; dragging draws red lines on it
@@ -111,7 +111,7 @@ shows:
 keys:
 - `]e`, `[e`: the next or previous error; on the phone, `error` takes the `desk` slot when there are errors
 - `space` then `u`: undo the last verdict without leaving the transcript
-- `space`: `deal.Verdict` on the agent's thread; the transcript stays open
+- `space`: `deal.Verdict` on the card the user came from; the transcript stays open. Opening the agent by name does not choose a card.
 - `ctrl-k`: `window.Screen.back`
 starts: `Steer an agent`, `Work beside an agent`
 

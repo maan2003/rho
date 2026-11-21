@@ -40,7 +40,8 @@ use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
-    Address, Addressed as _, AnySurface, Candidate, Found, FrameLink, Marks, Point, Row, System,
+    Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks, Point,
+    Row, System,
 };
 use rho_mail::ui::{Event as MailEvent, MailAudience, MailSystem, Participant};
 use rho_mail::{AgentRef, ThreadId};
@@ -146,7 +147,8 @@ impl AgentsSystem {
                         );
                         return;
                     }
-                    frame.open(AgentRef(agent).address(), window, cx);
+                    let card = frame.card_to_inspect(cx);
+                    frame.open_inspection(AgentRef(agent).address(), card, window, cx);
                     if let Some(surface) = system
                         .read(cx)
                         .surfaces
@@ -838,12 +840,14 @@ impl AgentsSystem {
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
-            rows.push(Row::run(key, description, move |_, _, cx| {
-                this.update(cx, |this, cx| this.open_terminal(agent, new, cx));
+            rows.push(Row::run(key, description, move |frame, _, cx| {
+                let card = frame.card_to_inspect(cx);
+                this.update(cx, |this, cx| this.open_terminal(agent, new, card, cx));
             }));
         }
         rows.push(Row::run("x", "shell", move |frame, window, cx| {
-            frame.open(AgentAddress::shell(agent).address(), window, cx);
+            let card = frame.card_to_inspect(cx);
+            frame.open_inspection(AgentAddress::shell(agent).address(), card, window, cx);
         }));
         if here.part == Part::Shell {
             let this = this.clone();
@@ -852,8 +856,9 @@ impl AgentsSystem {
             }));
         }
         if !self.desktops_of(agent).is_empty() {
-            rows.push(Row::run("d", "desktop…", move |_, _, cx| {
-                this.update(cx, |this, cx| this.open_desktop(agent, cx));
+            rows.push(Row::run("d", "desktop…", move |frame, _, cx| {
+                let card = frame.card_to_inspect(cx);
+                this.update(cx, |this, cx| this.open_desktop(agent, card, cx));
             }));
         }
         rows
@@ -861,7 +866,13 @@ impl AgentsSystem {
 
     /// Opens a terminal of the agent: with `new` a fresh one, else the
     /// first that runs, spawning one when none does.
-    fn open_terminal(&mut self, agent: AgentId, new: bool, cx: &mut Context<Self>) {
+    fn open_terminal(
+        &mut self,
+        agent: AgentId,
+        new: bool,
+        card: Option<CardInspection>,
+        cx: &mut Context<Self>,
+    ) {
         let Some((link, id, _)) = self.workset_of(agent) else {
             return;
         };
@@ -871,8 +882,10 @@ impl AgentsSystem {
             let _ = this.update(cx, |this, cx| match running {
                 Ok(running) => {
                     let terminal = rho_terminal::ui::pick_terminal(&running, new);
-                    this.frame
-                        .open(AgentAddress::terminal(agent, terminal).address(), cx);
+                    let address = AgentAddress::terminal(agent, terminal).address();
+                    this.frame.with(cx, move |frame, window, cx| {
+                        frame.open_inspection(address, card, window, cx);
+                    });
                 }
                 Err(error) => {
                     this.frame
@@ -908,7 +921,12 @@ impl AgentsSystem {
     }
 
     /// Opens the agent's one desktop, or asks which of its desktops.
-    fn open_desktop(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+    fn open_desktop(
+        &mut self,
+        agent: AgentId,
+        card: Option<CardInspection>,
+        cx: &mut Context<Self>,
+    ) {
         let names = self.desktops_of(agent);
         let addresses: Vec<(String, Address)> = names
             .into_iter()
@@ -921,7 +939,12 @@ impl AgentsSystem {
             [] => self
                 .frame
                 .echo("the agent runs no desktop", StyleClass::SystemInfo, cx),
-            [(_, address)] => self.frame.open(address.clone(), cx),
+            [(_, address)] => {
+                let address = address.clone();
+                self.frame.with(cx, move |frame, window, cx| {
+                    frame.open_inspection(address, card, window, cx);
+                });
+            }
             _ => {
                 let candidates: Vec<Candidate> = addresses
                     .iter()
@@ -946,7 +969,14 @@ impl AgentsSystem {
                         Rc::new(move |frame, input, window, cx| {
                             let input = input.trim();
                             match addresses.iter().find(|(name, _)| name == input) {
-                                Some((_, address)) => frame.open(address.clone(), window, cx),
+                                Some((_, address)) => {
+                                    frame.open_inspection(
+                                        address.clone(),
+                                        card.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
                                 None => frame.echo(
                                     &format!("desktop: none called {input:?}"),
                                     StyleClass::SystemInfo,
@@ -1110,14 +1140,6 @@ impl System for AgentsSystem {
             return Some(AnySurface::new(surface));
         }
         let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
-        let system = cx.weak_entity();
-        let related = move |cx: &App| {
-            system
-                .upgrade()?
-                .read(cx)
-                .agent_thread(agent, cx)
-                .map(|thread| thread.address())
-        };
         if !matches!(part, Part::Desktop(_)) {
             self.registry.mirrored(agent)?;
         }
@@ -1143,7 +1165,7 @@ impl System for AgentsSystem {
                             cx,
                         )
                     });
-                    return Some(AnySurface::new(surface).with_related_card(related));
+                    return Some(AnySurface::new(surface).for_inspection());
                 };
                 if !self.desktops_of(agent).contains(&name) {
                     let surface = cx.new(|cx| {
@@ -1154,12 +1176,12 @@ impl System for AgentsSystem {
                             cx,
                         )
                     });
-                    return Some(AnySurface::new(surface).with_related_card(related));
+                    return Some(AnySurface::new(surface).for_inspection());
                 }
                 AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
             }
         };
-        Some(surface.with_related_card(related))
+        Some(surface.for_inspection())
     }
 
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {

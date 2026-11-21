@@ -393,7 +393,7 @@ impl Frame {
     }
 
     pub fn open_card(&mut self, card: Card, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_with(card.address.clone(), Some(&card), window, cx);
+        self.show_dealt_card(&card, window, cx);
         self.systems_changed(cx);
     }
 

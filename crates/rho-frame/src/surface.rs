@@ -262,26 +262,22 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 }
 
 /// A surface of any type, as the frame holds it.
-type RelatedCard = Rc<dyn Fn(&App) -> Option<Address>>;
-
 #[derive(Clone)]
-pub struct AnySurface(Rc<dyn SurfaceHandle>, Option<RelatedCard>);
+pub struct AnySurface(Rc<dyn SurfaceHandle>, bool);
 
 impl AnySurface {
     pub fn new<S: Surface>(entity: Entity<S>) -> Self {
-        Self(Rc::new(entity), None)
+        Self(Rc::new(entity), false)
     }
 
-    /// The screen is for inspecting another place's card, not for leaving
-    /// the screen when that card is settled. `None` means there is no such
-    /// place.
-    pub fn with_related_card(mut self, find: impl Fn(&App) -> Option<Address> + 'static) -> Self {
-        self.1 = Some(Rc::new(find));
+    /// A screen for inspecting work, not a card in its own right.
+    pub fn for_inspection(mut self) -> Self {
+        self.1 = true;
         self
     }
 
     pub fn inspects_card(&self) -> bool {
-        self.1.is_some()
+        self.1
     }
 
     pub fn view(&self) -> AnyView {
@@ -325,10 +321,7 @@ impl AnySurface {
     }
 
     pub fn card(&self, cx: &App) -> Subject {
-        self.1.as_ref().map_or_else(
-            || self.0.card(cx),
-            |find| find(cx).map_or(Subject::None, Subject::Address),
-        )
+        self.0.card(cx)
     }
 
     pub(crate) fn edits_at_point(&self, cx: &App) -> bool {

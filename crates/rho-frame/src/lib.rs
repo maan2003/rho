@@ -46,7 +46,7 @@ pub mod thread;
 pub mod when;
 
 pub use deal::dealer_policy_snapshot;
-pub use frame::{Frame, Point};
+pub use frame::{CardInspection, Frame, Point};
 pub use keys::normal_contexts;
 pub use link::FrameLink;
 pub use menu::{Row, Rows};
