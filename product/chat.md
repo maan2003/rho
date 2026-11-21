@@ -67,7 +67,7 @@ principle: the project asks a question; the user reads it on top of the thread w
 sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes; proof on a result
 does:
 - show proof: a result message designates evidence under `## proof`
-- ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. A message that does not need the user is a `Flash`, not a message
+- ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on the message: open the `agents.Agent` that wrote the message at the step that produced its current words; a failed stop opens its error
 - reply: deliver the user's words only to the writer, keeping the answer in the shared thread
 - edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and keeps the card as it is
@@ -86,14 +86,15 @@ purpose: let an agent say what it is doing or about to do, for the user who happ
 principle: an agent writes `I plan to drop the cache layer, say no in 20 min` and starts; the user who is in the thread replies `no`, and the agent changes course; the user who is away never sees it, and the thread does not grow.
 sees: the words in `design.quiet` under the draft, newest first among the thread's messages, with the age at the end of the first line, `12m`; one open flash per agent, with its earlier fresh flashes folded under it as `+2 earlier`; on the project's row, the newest flash's first line as the project's latest words
 does:
-- post, by an agent with `ephemeral=True`: show it in the thread for twenty minutes from its first post, longer while it is the thread's newest item from either side; it goes when the clock has run and something newer exists, a message or a flash from anyone; then it is gone from every device, not kept as history
+- post, by an agent with `kind="flash"`: show it in the thread for twenty minutes from its first post, longer while it is the thread's newest item from either side; it goes when the clock has run and something newer exists, a message or a flash from anyone; then it is gone from every device, not kept as history
 - reply: the user's reply is an ordinary `Message` to the writer; it does not keep the flash
 - edit: the agent can change its words; the clock runs from the first post
 rejected:
 - one flash per agent, each replacing the last · 2026-11-21 · they vanish anyway; folding the earlier ones costs nothing and keeps a short plan readable
+- an `ephemeral=True` flag with `False` as the default · 2026-11-21 · a default lets the model skip the choice; a required `kind` makes it pick one every time
 - an `expires_in` parameter · 2026-11-21 · one clock is easier to trust than a number each agent tunes
 - a flash that fades on its clock even while it is the newest thing in the thread · 2026-11-21 · the user who opens the thread an hour later still wants the last state of the work; the next message or flash replaces it
-- a soft ask, a flash that pings and takes its card with it when it fades · 2026-11-21 · a card that vanishes breaks `nothing addressed to the user disappears unread`; what needs the user is a `Message`, so one bit, `ephemeral`, is the whole choice
+- a soft ask, a flash that pings and takes its card with it when it fades · 2026-11-21 · a card that vanishes breaks `nothing addressed to the user disappears unread`; what needs the user is a `Message`, so the agent names one of two kinds and nothing else
 - a kept message that does not ping, for progress · 2026-11-21 · see `Message`
 
 ## concept Draft
@@ -286,7 +287,7 @@ rejected:
 - the draft silently answers the dealt message · 2026-11-21 · the words under the draft were another agent's, and the reply went to the one above without a sign
 
 ## rule the last message stays live
-when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `ephemeral=True` for anything that does not need the user, unless the agent explicitly opts in with `replace_last=True`. That option edits its live message, preserving its ping unless set, and returns the same id. If it has no live message in the thread, it sends and returns a new one. Other agents can each send one message. A `Flash` is never refused and never counts. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
+when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user, unless the agent explicitly opts in with `replace_last=True`. That option edits its live message, preserving its ping unless set, and returns the same id. If it has no live message in the thread, it sends and returns a new one. Other agents can each send one message. A `Flash` is never refused and never counts. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`, and the user's reply goes to the writer of the words shown. An unchanged ask does not deal again after `done`; changed words do. Once the user replies, the ask is frozen. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
 why: a thread of ten messages that each supersede the last is a feed; each agent has one place for current words, and the flash is where the rest goes.
 rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing message; another send must not silently change it
