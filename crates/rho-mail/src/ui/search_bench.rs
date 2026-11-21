@@ -45,8 +45,9 @@ fn corpus() -> HostMail {
     log
 }
 
-fn fixture(
+pub(super) fn fixture(
     cx: &mut gpui::TestAppContext,
+    log: HostMail,
 ) -> (
     gpui::WindowHandle<Frame>,
     Entity<MailSystem>,
@@ -73,7 +74,7 @@ fn fixture(
         let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
         let system = cx.new(|cx| {
             let mut system = MailSystem::new(db.clone(), frame, notes, cx);
-            system.logs.insert(EndpointId([3; 32]), corpus());
+            system.logs.insert(EndpointId([3; 32]), log);
             system
         });
         let systems = vec![rho_frame::AnySystem::new(system.clone())];
@@ -86,7 +87,7 @@ fn fixture(
 #[gpui::test]
 #[ignore = "performance benchmark"]
 fn bench_palette_find_text(cx: &mut gpui::TestAppContext) {
-    let (_window, mail, _db) = fixture(cx);
+    let (_window, mail, _db) = fixture(cx, corpus());
     cx.update(|cx| {
         let mail = mail.read(cx);
         let current = Address::new("frame", "desk");
@@ -137,7 +138,7 @@ fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
         tracing::subscriber::set_default(reporter)
     });
 
-    let (frame, _mail, _db) = fixture(cx);
+    let (frame, _mail, _db) = fixture(cx, corpus());
     let window = *frame;
     cx.run_until_parked();
     cx.draw_window(window);

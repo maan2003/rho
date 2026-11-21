@@ -1,8 +1,8 @@
 //! What the user wrote that no host has taken yet.
 //!
 //! A message goes in here the moment it is written, under a random id the
-//! client picks, and onto disk with it. It leaves when its host answers
-//! that the message is logged. Until then it is posted again whenever the
+//! client picks, and onto disk with it. It leaves when the host has answered
+//! and its log contains the message. Until then it is posted again whenever the
 //! host comes back: a host logs a `client_id` once, so posting twice is
 //! harmless, and words written while the network was down are not lost.
 //! A host's messages go one at a time, oldest first, so its mail log holds
@@ -61,13 +61,19 @@ pub enum Kept {
     Gone(u64),
 }
 
+/// A host's current delivery, first in flight, then awaiting its log.
+enum Sending {
+    Posting(u64),
+    Logged { client_id: u64, message: MessageId },
+}
+
 #[derive(Default)]
 pub struct Outbox {
     /// By the host each goes to; oldest first.
     waiting: Vec<(EndpointId, u64, Outgoing)>,
-    /// The id on its way to each host; what is written meanwhile waits
-    /// for its answer.
-    sending: HashMap<EndpointId, u64>,
+    /// One delivery per host. Keep the local row until the arrival of the
+    /// matching log entry, even if the request itself has already answered.
+    sending: HashMap<EndpointId, Sending>,
 }
 
 impl Outbox {
@@ -130,7 +136,7 @@ impl Outbox {
             return None;
         }
         let (_, id, outgoing) = self.waiting.iter().find(|(host, ..)| *host == endpoint)?;
-        self.sending.insert(endpoint, *id);
+        self.sending.insert(endpoint, Sending::Posting(*id));
         Some((
             outgoing.call(*id),
             outgoing.delivery,
@@ -138,10 +144,29 @@ impl Outbox {
         ))
     }
 
-    /// The host answered what was on its way, by either logging it or
-    /// refusing it definitively before posting. Drop the disk copy.
+    pub(crate) fn posted(&mut self, endpoint: EndpointId, message: MessageId) {
+        let sending = self
+            .sending
+            .get_mut(&endpoint)
+            .expect("a post was in flight");
+        let Sending::Posting(client_id) = *sending else {
+            unreachable!("one receipt per request")
+        };
+        *sending = Sending::Logged { client_id, message };
+    }
+
+    pub(crate) fn receipt(&self, endpoint: EndpointId) -> Option<MessageId> {
+        match self.sending.get(&endpoint)? {
+            Sending::Logged { message, .. } => Some(*message),
+            Sending::Posting(_) => None,
+        }
+    }
+
+    /// A posted mail is in the local log, or the host refused definitively.
     pub fn answered(&mut self, endpoint: EndpointId) -> Option<(u64, Outgoing, Kept)> {
-        let sent = self.sending.remove(&endpoint)?;
+        let sent = match self.sending.remove(&endpoint)? {
+            Sending::Posting(id) | Sending::Logged { client_id: id, .. } => id,
+        };
         let at = self
             .waiting
             .iter()
@@ -162,6 +187,13 @@ impl Outbox {
             .filter(|(host, _, outgoing)| *host == endpoint && outgoing.parent == parent)
             .map(|(_, _, outgoing)| outgoing)
             .collect()
+    }
+
+    pub(crate) fn ideas(&self) -> impl Iterator<Item = (EndpointId, u64, &Outgoing)> {
+        self.waiting
+            .iter()
+            .filter(|(_, _, outgoing)| outgoing.delivery == Delivery::Idea)
+            .map(|(host, id, outgoing)| (*host, *id, outgoing))
     }
 
     /// Every host with something unsent.

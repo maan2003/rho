@@ -77,7 +77,7 @@ rejected:
 - a header with the writer and the time above each mail · 2026-11-20 · colour tells the voice, and the top line says how long the thread has waited
 - a status line kept apart from the mails, replaced rather than kept · 2026-11-20 · a mail without a ping, edited in place, does the same job and stays as history
 
-Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
+Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back. A submitted idea says `queued for` its project and can be found by name in `window.Palette` until the host's thread takes its place.
 
 ## concept Draft
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.

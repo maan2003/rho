@@ -657,6 +657,11 @@ impl Frame {
             },
             cx,
         );
+        self.echo(
+            &format!("queued for {}", self.idea.recipient),
+            StyleClass::SystemInfo,
+            cx,
+        );
     }
 
     /// Keep the submitted draft until the host answers. A refusal removes
