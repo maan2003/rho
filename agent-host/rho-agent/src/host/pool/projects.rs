@@ -311,7 +311,8 @@ impl AgentPool {
                 NewMessage {
                     from: Address::User,
                     reply_to: idea.reply_to,
-                    // Don't fan a new idea out to inherited members.
+                    // Direct routing wakes only the standing agent. The idea
+                    // is still human-authored project mail.
                     mentions: standing.into_iter().map(Mention::Direct).collect(),
                     content: idea.content,
                 },
