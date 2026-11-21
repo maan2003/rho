@@ -246,6 +246,12 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     )?;
     let standing = idea_agent(paths, a).await?;
     assert_eq!(idea_agent(paths, b).await?, standing);
+    let continuing = wait_for_mail(&mut first_device, |row| row.seq == a.max(b).0).await?;
+    let continuing = rho_agent_types::Message::from_record(&continuing)
+        .context("the second idea must be logged as mail")?;
+    assert_eq!(continuing.from, Address::User);
+    assert_eq!(continuing.parent, Some(one.0));
+    assert_eq!(continuing.mentions, [Mention::Direct(standing)]);
     wait_for_delivery(paths, standing, a).await?;
     wait_for_delivery(paths, standing, b).await?;
     assert_eq!(
@@ -685,7 +691,7 @@ async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<
     let [claim] = claims.as_slice() else {
         anyhow::bail!("refused start did not deal one card")
     };
-    assert_eq!(cards::attention_mail(&claim.cursor), Some(mail.id));
+    assert_eq!(cards::attention_mail(claim.seen), Some(mail.id));
     assert_eq!(claim.title, "Check the tide clock.");
     Ok(format!(
         "a missing directory refused the start and dealt stop mail #{}",

@@ -260,18 +260,19 @@ impl HostMail {
         })
     }
 
-    /// Standalone messages addressed to agents (including maintenance
-    /// requests) and direct agent threads are visible from an agent's
-    /// history, not projects or results in the human's catalogue.
+    /// Agent maintenance roots and peer mail aren't in the user's
+    /// catalogue. Direct delivery of a user's idea does not make it peer
+    /// mail: it tells the host to wake only the project's standing worker.
     pub fn agent_only(&self, id: MessageId) -> bool {
         let Some(mail) = self.message(id) else {
             return false;
         };
         (mail.parent.is_none() && !mail.mentions.is_empty() && !mail.to_user())
-            || mail
-                .mentions
-                .iter()
-                .any(|mention| matches!(mention, rho_agent_types::Mention::Direct(_)))
+            || matches!(mail.from, Address::Agent(_))
+                && mail
+                    .mentions
+                    .iter()
+                    .any(|mention| matches!(mention, rho_agent_types::Mention::Direct(_)))
     }
 
     pub fn message(&self, id: MessageId) -> Option<&Message> {
@@ -533,6 +534,39 @@ mod tests {
         assert_eq!(log.text.body(&id(3)), Some("wind restored"));
         log.tell(&record(8, ChatEvent::Deleted { message: id(3) }));
         assert!(!log.text.contains(&id(3)));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_human_idea_routed_to_one_worker_is_catalogued_but_private_agent_mail_is_not() {
+        use rho_agent_types::Mention;
+
+        let mut log = HostMail::default();
+        log.tell(&posted(1, None, Address::User, "tide"));
+        log.tell(&posted(2, Some(1), Address::User, "Measure clock jitter."));
+        let directed = |seq, parent, from, text| {
+            let mut event = posted(seq, Some(parent), from, text);
+            let ChatEvent::Posted { mentions, .. } = &mut event.event else {
+                unreachable!()
+            };
+            mentions.push(Mention::Direct(agent(7)));
+            event
+        };
+        log.tell(&directed(3, 1, Address::User, "Inspect tide B for drift."));
+        log.tell(&directed(
+            4,
+            1,
+            Address::Agent(agent(3)),
+            "Private clock comparison.",
+        ));
+        assert_eq!(log.text.body(&id(2)), Some("Measure clock jitter."));
+        assert!(
+            !log.agent_only(id(3)),
+            "the subject must be findable by name"
+        );
+        assert_eq!(log.text.body(&id(3)), Some("Inspect tide B for drift."));
+        assert!(log.agent_only(id(4)));
+        assert_eq!(log.text.body(&id(4)), None);
     }
 
     fn agent(n: u64) -> AgentId {
