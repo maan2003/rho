@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use jiff::Timestamp;
 use rho_agent_types::{Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId};
 use rho_dealer::curve::{self, Curve};
+use rho_dealer::facts::{Facts, Seen};
 use rho_dealer::rank::{CardKind, Trace};
 use rho_dealer::{Addressed, Claim, Marks};
 
@@ -92,19 +93,14 @@ pub fn claims(
         .address();
         let facts = marks.get(&address).facts();
         let user_wrote = messages.user_wrote;
-        let seen = facts
-            .seen_topic()
-            .map(ChatSeq)
-            .max(messages.plain_user_mail.map(|id| id.0));
+        let seen = SeenMail::new(facts, messages.plain_user_mail.map(|id| id.0));
         let mut unseen = messages
             .mentions
             .into_iter()
-            .filter(|message| {
-                !answered.contains(&message.id)
-                    && seen.is_none_or(|seen| message.version().0 > seen)
-            })
+            .filter(|message| !answered.contains(&message.id) && seen.is_unread(message))
             .collect::<Vec<_>>();
-        unseen.sort_by_key(|message| message.ping_since(seen).0);
+        let waiting_since = |message: &Message| message.ping_since(seen.through(message.id));
+        unseen.sort_by_key(|message| waiting_since(message).0);
         if let Some(trace) = trace.as_deref_mut() {
             trace.input(
                 &address,
@@ -114,7 +110,7 @@ pub fn claims(
                     unseen.iter().map(|mail| mail.id).collect::<Vec<_>>()
                 ),
             );
-            trace.input(&address, "seen through", format!("{seen:?}"));
+            trace.input(&address, "read", format!("{seen:?}"));
         }
 
         // An addressed reply settles only its target. Older unanswered mail
@@ -145,7 +141,7 @@ pub fn claims(
                     since,
                     ..
                 } => since,
-                _ => mail.ping_since(seen).1,
+                _ => waiting_since(mail).1,
             }
             .0,
         );
@@ -157,11 +153,15 @@ pub fn claims(
         // of a ping the user hasn't settled yet.
         let newest = unseen
             .iter()
-            .map(|mail| mail.ping_since(seen).0)
+            .map(|mail| waiting_since(mail).0)
             .max()
             .expect("the trigger is unseen");
         let cursor = format!("{}/{}", mail.id.0.0, newest.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
+        claim.seen = Seen::Mail {
+            message: mail.id.0.0,
+            version: mail.version().0.0,
+        };
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
         // A snooze or mute on the project holds its threads too.
@@ -206,10 +206,45 @@ pub(crate) fn context_at_root(chat: &HostMail, root: MessageId, host_name: &str)
     )
 }
 
-/// The mail a project card opens on, decoded from its source cursor.
-pub fn attention_mail(cursor: &str) -> Option<MessageId> {
-    let (trigger, _) = cursor.split_once('/')?;
-    Some(MessageId(ChatSeq(trigger.parse().ok()?)))
+/// The mail a project card opens on.
+pub fn attention_mail(seen: Seen) -> Option<MessageId> {
+    match seen {
+        Seen::Mail { message, .. } => Some(MessageId(ChatSeq(message))),
+        _ => None,
+    }
+}
+
+/// How much of a thread is read: whole-thread cutoffs (including from old
+/// devices) and the latest verdict on each specific mail.
+#[derive(Debug)]
+pub(crate) struct SeenMail {
+    through: Option<ChatSeq>,
+    exact: BTreeMap<MessageId, ChatSeq>,
+}
+
+impl SeenMail {
+    pub(crate) fn new(facts: Facts<'_>, wrote: Option<ChatSeq>) -> Self {
+        let mut exact = BTreeMap::new();
+        for (message, version) in facts.seen_mail() {
+            let latest = exact
+                .entry(MessageId(ChatSeq(message)))
+                .or_insert(ChatSeq(version));
+            *latest = (*latest).max(ChatSeq(version));
+        }
+        Self {
+            through: facts.seen_topic().map(ChatSeq).max(wrote),
+            exact,
+        }
+    }
+
+    fn through(&self, mail: MessageId) -> Option<ChatSeq> {
+        self.through.max(self.exact.get(&mail).copied())
+    }
+
+    pub(crate) fn is_unread(&self, message: &Message) -> bool {
+        self.through(message.id)
+            .is_none_or(|seen| message.version().0 > seen)
+    }
 }
 
 #[derive(Default)]
@@ -228,7 +263,7 @@ mod tests {
         AgentIdDomain, ChatEvent, ChatRecord, ContentPart, Mention, Stop, UnixMs,
     };
     use rho_dealer::curve::*;
-    use rho_dealer::facts::{Device, Entry, Fact, Seen};
+    use rho_dealer::facts::{Device, Entry, Fact};
     use rho_dealer::rank::{Hand, Sources};
     use rho_dealer::{Address, Skips, Until, rank};
 
@@ -414,7 +449,13 @@ mod tests {
         }
 
         fn done(&mut self, thread: MessageId) {
-            self.done_through(thread, self.newest(thread));
+            let seen = self
+                .deal()
+                .cards
+                .iter()
+                .find(|card| card.address == self.address(thread))
+                .map_or(Seen::Whole, |card| card.seen);
+            self.done_through(thread, seen);
         }
 
         fn done_through(&mut self, thread: MessageId, seen: Seen) {
@@ -517,14 +558,14 @@ mod tests {
         let a = w.agent("a");
         let ask = w.asks(a);
         let cards = w.deal().cards;
-        let cursor = |thread: MessageId| {
+        let trigger = |thread: MessageId| {
             cards
                 .iter()
                 .find(|card| card.address == w.address(thread))
-                .map(|card| card.cursor.clone())
+                .and_then(|card| attention_mail(card.seen))
         };
-        assert_eq!(cursor(root).as_deref().and_then(attention_mail), Some(root));
-        assert_eq!(cursor(a).as_deref().and_then(attention_mail), Some(ask));
+        assert_eq!(trigger(root), Some(root));
+        assert_eq!(trigger(a), Some(ask));
         w.writes_to(root);
         assert_eq!(
             w.hand(),
@@ -544,7 +585,7 @@ mod tests {
             w.deal()
                 .cards
                 .first()
-                .and_then(|card| attention_mail(&card.cursor))
+                .and_then(|card| attention_mail(card.seen))
         };
         assert_eq!(trigger(&w), Some(first));
         w.answers(a, second);
@@ -584,7 +625,7 @@ mod tests {
             .find(|card| card.address == w.address(a))
             .unwrap();
         assert_eq!(card.label, "waits · 6.0d");
-        assert_eq!(attention_mail(&card.cursor), Some(result));
+        assert_eq!(attention_mail(card.seen), Some(result));
         w.writes_to(a);
         assert_eq!(w.hand(), "rho@lab › b · waits · 6.0d");
     }
@@ -717,7 +758,7 @@ mod tests {
                 Some(true) => {
                     assert_ne!(hand.cards[0].cursor, original);
                     assert_eq!(hand.cards[0].label, "waits · now");
-                    assert_eq!(attention_mail(&hand.cards[0].cursor), Some(ask));
+                    assert_eq!(attention_mail(hand.cards[0].seen), Some(ask));
                 }
             }
         }
@@ -728,6 +769,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         let older = w.finishes(a);
+        w.done(a);
         let ask = w.asks(a);
         w.done(a);
         w.pass(mins(7));
@@ -744,8 +786,8 @@ mod tests {
         let [card] = hand.cards.as_slice() else {
             panic!("{:?}", hand.cards)
         };
-        assert_eq!(attention_mail(&card.cursor), Some(ask));
-        assert_ne!(attention_mail(&card.cursor), Some(older));
+        assert_eq!(attention_mail(card.seen), Some(ask));
+        assert_ne!(attention_mail(card.seen), Some(older));
         assert_eq!(card.label, "waits · now", "age is the revision's");
         w.done(a);
         assert_eq!(w.hand(), "");
@@ -794,7 +836,7 @@ mod tests {
         };
         assert_eq!(card.kind, CardKind::Stop("failed"));
         assert_eq!(card.label, "failed · now");
-        assert_eq!(attention_mail(&card.cursor), Some(failure));
+        assert_eq!(attention_mail(card.seen), Some(failure));
     }
 
     #[test]
@@ -864,7 +906,7 @@ mod tests {
         let trigger = w.sends_under(a, Some(reply), true);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(reply));
-        assert_eq!(attention_mail(&hand.cards[0].cursor), Some(trigger));
+        assert_eq!(attention_mail(hand.cards[0].seen), Some(trigger));
         w.done(a);
         assert_eq!(w.deal().cards.len(), 1);
         w.done(reply);
@@ -915,7 +957,7 @@ mod tests {
             "rho@lab › a · failed · 2m\nrho@lab › b · lost · now"
         );
         let card = &w.deal().cards[0];
-        assert_eq!(attention_mail(&card.cursor), Some(first));
+        assert_eq!(attention_mail(card.seen), Some(first));
         w.done(a);
         w.writes_to(b);
         assert_eq!(w.hand(), "");
@@ -923,7 +965,56 @@ mod tests {
         let second = w.stop(a, Stop::Stuck);
         w.done_through(a, Seen::Topic(first.0.0));
         assert_eq!(w.hand(), "rho@lab › a · stuck · now");
-        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(second));
+        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(second));
+    }
+
+    #[test]
+    fn done_on_one_ping_leaves_the_next_ping_in_the_same_thread() {
+        let mut w = world();
+        let thread = w.agent("two asks");
+        let first = w.asks(thread);
+        w.pass(mins(3));
+        let second = w.stop(thread, Stop::Failed);
+        let dealt = w.deal();
+        assert_eq!(attention_mail(dealt.cards[0].seen), Some(first));
+
+        w.done(thread);
+        let remaining = w.deal();
+        assert_eq!(remaining.cards.len(), 1, "the second ping still waits");
+        assert_eq!(attention_mail(remaining.cards[0].seen), Some(second));
+        assert_eq!(remaining.cards[0].kind, CardKind::Stop("failed"));
+    }
+
+    #[test]
+    fn done_on_a_dealt_version_does_not_acknowledge_an_edit_made_while_it_was_open() {
+        let mut w = world();
+        let thread = w.agent("the clock");
+        let first = w.asks(thread);
+        let dealt = w.deal().cards.remove(0);
+        w.pass(mins(4));
+        let second = w.asks(thread);
+        w.pass(mins(7));
+        w.record(ChatEvent::Revised {
+            message: first,
+            author: w.agents[&thread],
+            ping: None,
+            content: vec![ContentPart::Text {
+                text: "A different question about the same clock.".into(),
+            }],
+        });
+        let edited = w.deal().cards.remove(0);
+        assert_eq!(attention_mail(edited.seen), Some(first));
+        assert_ne!(edited.seen, dealt.seen);
+        assert_eq!(edited.cursor, format!("{}/{}", first.0.0, second.0.0));
+
+        w.done_through(thread, dealt.seen);
+        let next = w.deal().cards.remove(0);
+        assert_eq!(attention_mail(next.seen), Some(second));
+        assert_eq!(next.label, "waits · 7m");
+        w.done_through(thread, next.seen);
+        let revised = w.deal().cards.remove(0);
+        assert_eq!(revised.seen, edited.seen);
+        assert_eq!(revised.label, "waits · now");
     }
 
     #[test]
@@ -939,14 +1030,14 @@ mod tests {
         let newest = w.asks(a);
 
         let card = &w.deal().cards[0];
-        assert_eq!(attention_mail(&card.cursor), Some(next));
+        assert_eq!(attention_mail(card.seen), Some(next));
         assert_eq!(card.label, "waits · 3m");
         w.answers(a, next);
         // This reply is after the latest ask; it did not answer that ask or
         // the older stop, and both still wait.
-        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(older));
+        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(older));
         w.answers(a, older);
-        assert_eq!(attention_mail(&w.deal().cards[0].cursor), Some(newest));
+        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(newest));
     }
 
     #[test]
@@ -959,7 +1050,7 @@ mod tests {
         let deal = w.deal();
         let card = &deal.cards[0];
         assert_eq!(card.label, "waits · 2m");
-        assert_eq!(attention_mail(&card.cursor), Some(ask));
+        assert_eq!(attention_mail(card.seen), Some(ask));
         w.mute(a);
         assert_eq!(w.hand(), "");
     }

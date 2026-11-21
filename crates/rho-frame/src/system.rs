@@ -14,7 +14,6 @@ use gpui::{App, Context, Entity, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::EndpointId;
-use rho_dealer::facts::Seen;
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
@@ -136,12 +135,6 @@ pub trait System: Sized + 'static {
         None
     }
 
-    /// How far the user has seen one of this system's addresses once they
-    /// have read it: everything the system has of it, in its own terms.
-    fn seen(&self, _address: &Address, _cx: &App) -> Seen {
-        Seen::Whole
-    }
-
     fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
         Vec::new()
     }
@@ -212,7 +205,6 @@ trait SystemHandle {
     fn open_link(&self, url: &Url, cx: &mut App) -> bool;
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
-    fn seen(&self, address: &Address, cx: &App) -> Seen;
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
 
@@ -289,10 +281,6 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
         self.read(cx).shown_in(address, cx)
-    }
-
-    fn seen(&self, address: &Address, cx: &App) -> Seen {
-        self.read(cx).seen(address, cx)
     }
 
     fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
@@ -402,10 +390,6 @@ impl AnySystem {
 
     pub fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
         self.0.shown_in(address, cx)
-    }
-
-    pub fn seen(&self, address: &Address, cx: &App) -> Seen {
-        self.0.seen(address, cx)
     }
 
     pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {

@@ -665,6 +665,7 @@ mod tests {
                 kind: rho_dealer::rank::CardKind::Other,
                 priority: 1.,
                 cursor: "".into(),
+                seen: Default::default(),
                 skipped: false,
             }),
             visit,

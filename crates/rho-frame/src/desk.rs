@@ -765,6 +765,7 @@ mod tests {
             kind: CardKind::Waits,
             priority: f64::from(n),
             cursor: format!("{n}/100"),
+            seen: Default::default(),
             skipped: false,
         }
     }

@@ -43,7 +43,7 @@ principle: the user replies if they have words; otherwise they say done. If they
 sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
 does:
 - reply: send the user's words and settle the card, as in `mail.Answer a mail`; the thread stays on screen, and the next card waits for `Card.deal`
-- done `space` then `d`, or `done` on the phone: the user has nothing more to say; put away the card, and if it was on screen, open the next one
+- done `space` then `d`, or `done` on the phone: the user has nothing more to say about this version of the mail; put away its card, leave other pings in the thread waiting, and if it was on screen, open the next card
 - mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user again; put the card away, and if it was on screen, open the next one
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then; each row names when that is, such as `1 hour · 17:26`, `tomorrow · 09:00`, or `next week · Mon 09:00`; a count typed first multiplies the row; the rows are the same on both devices, and there is no one-minute row
 - next `space` then `n`: open the next card; `nothing waits` comes only when the `desk.Desk` would read `0 wait`, and then the Desk opens

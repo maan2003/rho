@@ -15,6 +15,7 @@ use gpui::{
 use jiff::Timestamp;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostEvent, HostSpec};
+use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 use rho_ledger::Pairing;
 use rho_window::history::History;
@@ -62,7 +63,7 @@ pub struct Frame {
     pub(crate) attention: Attention,
     /// The surfaces the reader has been on, by address. The newest entry
     /// is where down deals; Desk is the oldest and never closes.
-    history: History<Address, ()>,
+    history: History<Address, Option<Seen>>,
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
     pub(crate) idea: IdeaBox,
@@ -171,7 +172,7 @@ impl Frame {
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
-            history: History::new(desk_address, ()),
+            history: History::new(desk_address, None),
             surfaces,
             desk,
             idea,
@@ -260,7 +261,7 @@ impl Frame {
             None => {
                 self.history.forget(&address);
                 self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-                self.history.show(Self::desk_address(), ());
+                self.history.show(Self::desk_address(), None);
             }
         }
     }
@@ -305,7 +306,7 @@ impl Frame {
                 false => self.history.back().is_some() || self.history.forward().is_some(),
             };
             if !stepped {
-                self.history.show(Self::desk_address(), ());
+                self.history.show(Self::desk_address(), None);
             }
         }
     }
@@ -386,6 +387,15 @@ impl Frame {
         }
     }
 
+    /// What was on the card when the reader opened it, not the hand as it
+    /// stands now. New mail can have arrived while this surface was open.
+    pub(crate) fn dealt_seen(&self, address: &Address) -> Option<Seen> {
+        if self.current_address() != address {
+            return None;
+        }
+        *self.history.current()
+    }
+
     pub fn desk_in_view(&self) -> bool {
         self.current_surface().entity_id() == self.desk.entity_id()
     }
@@ -438,7 +448,7 @@ impl Frame {
                 rho_journal::SurfaceShowMethod::Open
             },
         });
-        self.history.show(address, ());
+        self.history.show(address, card.map(|card| card.seen));
         if self.desk_in_view() {
             self.refresh_desk(&self.hand().clone(), false, cx);
             self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
@@ -480,12 +490,12 @@ impl Frame {
         }
         if current {
             if self.history.back().is_none() && self.history.forward().is_none() {
-                self.history.show(Self::desk_address(), ());
+                self.history.show(Self::desk_address(), None);
             }
             // A forgotten entry under the cursor is left on the first step
             // either way; a frame surface closes by stepping off it.
             if address.kind() == FRAME_KIND && self.current_address() == address {
-                self.history.show(Self::desk_address(), ());
+                self.history.show(Self::desk_address(), None);
             }
             self.settle(false, window, cx);
             self.close_overlays(window, cx);
