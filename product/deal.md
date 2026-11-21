@@ -24,11 +24,11 @@ principle: a project asks whether a test can use a separate clock; the deal open
 sees: the `chat.Project` address, the `chat.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `chat.Message` that pings.
 has:
 - one `chat.Thread`
-- one `chat.Message` that pings the user, or reports a stop, or one `chat.Flash` that is a soft ask while it is fresh
+- one `chat.Message` that pings the user, or reports a stop
 does:
 - deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last
 
-The longest-waiting card deals first; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread, except a soft ask, which says on its row that it fades, `fades · 14m`, and goes when its flash goes. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
+The longest-waiting card deals first; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 rejected:
 - `asks` and `result` as two kinds of card · 2026-11-20 · both wait the same way; the message either pings or it does not
 - a card that drops out of the count while it is skipped · 2026-11-20 · a skipped card is still something left
