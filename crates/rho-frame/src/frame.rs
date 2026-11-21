@@ -49,8 +49,24 @@ pub(crate) const FRAME_PADDING: Pixels = px(2.);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Point {
     pub surface: Address,
-    pub subject: Option<Address>,
+    pub subject: Subject,
     pub card: Option<Address>,
+}
+
+impl Point {
+    /// The thing under point for commands that operate on an address.
+    pub fn subject(&self) -> Option<&Address> {
+        subject_address(&self.surface, &self.subject)
+    }
+}
+
+fn subject_address<'a>(surface: &'a Address, subject: &'a Subject) -> Option<&'a Address> {
+    match subject {
+        Subject::Own if surface.kind() == FRAME_KIND => None,
+        Subject::Own | Subject::Draft { .. } => Some(surface),
+        Subject::Address(address) => Some(address),
+        Subject::None => None,
+    }
 }
 
 /// The card as it stood when the reader stepped down into the work.
@@ -376,21 +392,15 @@ impl Frame {
     /// Where the reader is.
     pub fn point(&self, cx: &App) -> Point {
         let surface = self.current_address().clone();
-        let resolve = |subject: Subject| match subject {
-            Subject::Own if surface.kind() == FRAME_KIND => None,
-            Subject::Own => Some(surface.clone()),
-            Subject::Address(address) => Some(address),
-            Subject::None => None,
-        };
         let current = self.current_surface();
-        let subject = resolve(current.subject(cx));
+        let subject = current.subject(cx);
         let card = if current.inspects_card() {
             match self.history.current() {
                 ScreenEntry::Inspection(inspection) => Some(inspection.address.clone()),
                 _ => None,
             }
         } else {
-            resolve(current.card(cx))
+            subject_address(&surface, &current.card(cx)).cloned()
         };
         Point {
             surface,

@@ -17,6 +17,10 @@ pub type PhoneSend = Rc<dyn Fn(&mut Window, &mut App)>;
 pub enum Subject {
     /// The thing the surface is of: its own address.
     Own,
+    /// A thread draft still belongs to its thread, but may steer this worker.
+    Draft {
+        worker: Option<rho_agent_types::AgentId>,
+    },
     /// Something the surface lists: the row under the point.
     Address(Address),
     /// Nothing: a log, a picker, a page about nothing in particular.

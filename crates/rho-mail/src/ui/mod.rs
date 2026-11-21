@@ -945,7 +945,7 @@ impl System for MailSystem {
         // name belongs to the open thread; in a project, to the selected
         // thread row. A desk row and a blank line are not rename contexts.
         let rename = self.thread_of(&point.surface).and_then(|surface| {
-            let at = self.thread_of(point.subject.as_ref()?)?;
+            let at = self.thread_of(point.subject()?)?;
             let chat = self.logs.get(&surface.host)?;
             let thread = if chat.is_project(surface.message) {
                 at

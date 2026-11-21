@@ -41,7 +41,7 @@ use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks, Point,
-    Row, System,
+    Row, Subject, System,
 };
 use rho_mail::ui::{Event as MailEvent, MailAudience, MailSystem, Participant};
 use rho_mail::{AgentRef, ThreadId};
@@ -1114,8 +1114,7 @@ impl AgentsSystem {
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
         let chat = self.mail.read(cx);
         point
-            .subject
-            .as_ref()
+            .subject()
             .and_then(|address| chat.thread_of(address))
             .or_else(|| chat.thread_of(&point.surface))
     }
@@ -1221,14 +1220,20 @@ impl System for AgentsSystem {
             return self.agent_rows(here, cx);
         }
         let mut rows = Vec::new();
-        // On an agent in a thread's `with` line: the agent is steered from
-        // there as from its transcript.
-        if let Some(AgentAddress {
-            agent,
-            part: Part::Transcript,
-        }) = point.subject.as_ref().and_then(AgentAddress::from_address)
-            && self.registry.mirrored(agent).is_some()
-        {
+        // A thread draft can identify its worker without changing what
+        // mail, notes, and verdicts see as the subject. The `with` line
+        // already names an agent directly.
+        let steering = match &point.subject {
+            Subject::Draft { worker } => *worker,
+            _ => point
+                .subject()
+                .and_then(AgentAddress::from_address)
+                .and_then(|AgentAddress { agent, part }| {
+                    (part == Part::Transcript).then_some(agent)
+                }),
+        }
+        .filter(|agent| self.registry.mirrored(*agent).is_some());
+        if let Some(agent) = steering {
             rows.extend(surface::steer_rows(this.clone(), agent));
         }
         let Some(thread) = self.thread_at(point, cx) else {
@@ -1275,7 +1280,7 @@ impl System for AgentsSystem {
                         })
                     });
                 }));
-            } else {
+            } else if steering.is_none() && !matches!(point.subject, Subject::Draft { .. }) {
                 rows.extend(surface::steer_rows(this.clone(), agent));
             }
         }
