@@ -223,6 +223,8 @@ enum CompletionInput {
     Whole,
     /// A whole-input project address, with tappable rows.
     Address,
+    /// Enter takes the literal input until the reader chooses a row.
+    Explicit,
 }
 
 pub struct Minibuffer {
@@ -417,7 +419,14 @@ impl Minibuffer {
     pub fn select_by_delta(&mut self, delta: isize) {
         let count = self.answer.len() as isize;
         if count != 0 {
-            self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
+            let selected = if self.takes_candidate() {
+                self.selected as isize
+            } else if delta > 0 {
+                -1
+            } else {
+                0
+            };
+            self.selected = (selected + delta).rem_euclid(count) as usize;
             self.moved_selection = true;
         }
     }
@@ -495,6 +504,16 @@ impl Minibuffer {
         self.completion_input = CompletionInput::Address;
     }
 
+    pub fn complete_only_when_chosen(&mut self) {
+        self.completion_input = CompletionInput::Explicit;
+    }
+
+    fn takes_candidate(&self) -> bool {
+        !matches!(self.completion_input, CompletionInput::Explicit)
+            || self.moved_selection
+            || self.completed_selection.is_some()
+    }
+
     pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
         let Answer::Text { rows, .. } = &self.answer else {
             return None;
@@ -545,10 +564,10 @@ impl Minibuffer {
     pub(crate) fn into_submission(self, cx: &App) -> (String, Submission) {
         let typed = self.input(cx);
         let input = match &self.answer {
-            Answer::Text { rows, .. } => rows
+            Answer::Text { rows, .. } if self.takes_candidate() => rows
                 .get(self.selected)
                 .map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row)),
-            Answer::Palette { .. } => typed,
+            _ => typed,
         };
         let submission: Submission = match self.answer {
             Answer::Text { submit, .. } => {
@@ -593,7 +612,9 @@ impl Minibuffer {
             .selected
             .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
         let address = matches!(self.completion_input, CompletionInput::Address);
-        let clickable = address || layout == crate::Layout::Phone;
+        let clickable = address
+            || matches!(self.completion_input, CompletionInput::Explicit)
+            || layout == crate::Layout::Phone;
         let measure = measure(text_style, window);
         let inset = rems(0.5);
         let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
@@ -614,7 +635,7 @@ impl Minibuffer {
         let rows = (window_start..self.answer.len())
             .take(VISIBLE_CANDIDATES)
             .map(|index| {
-                let selected = index == self.selected;
+                let selected = index == self.selected && self.takes_candidate();
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
                 let mut row = div().flex().flex_row().gap(inset).w_full().px(inset);

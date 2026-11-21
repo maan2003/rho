@@ -339,10 +339,11 @@ impl MailSystem {
             window,
             cx,
         );
-        if let Some(current) = current
-            && let Some(prompt) = frame.minibuffer_mut()
-        {
-            prompt.set_input(current.as_str().to_owned(), window, cx);
+        if let Some(prompt) = frame.minibuffer_mut() {
+            prompt.complete_only_when_chosen();
+            if let Some(current) = current {
+                prompt.set_input(current.as_str().to_owned(), window, cx);
+            }
         }
     }
 
@@ -527,6 +528,61 @@ mod tests {
     use rho_db::SenValue;
 
     use super::*;
+
+    #[gpui::test]
+    fn project_place_uses_the_typed_directory_unless_a_completion_is_chosen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, mail, _db) =
+            super::super::search_bench::fixture(cx, crate::HostMail::default());
+        let endpoint = EndpointId([3; 32]);
+        cx.update(|cx| {
+            mail.update(cx, |mail, _| {
+                mail.set_known_places(Rc::new(move |host, _| {
+                    assert_eq!(host, endpoint);
+                    ["/srv/bench work/repo", "/srv/bench work/tools"]
+                        .into_iter()
+                        .map(|value| Candidate {
+                            value: value.to_owned(),
+                            description: "directory on the host".to_owned(),
+                        })
+                        .collect()
+                }))
+            });
+        });
+        let picked = Rc::new(std::cell::RefCell::new(None));
+        for (choose, expected) in [(false, "/srv/bench work"), (true, "/srv/bench work/repo")] {
+            let result = picked.clone();
+            window
+                .update(cx, |frame, window, cx| {
+                    MailSystem::prompt_place(
+                        &mail,
+                        endpoint,
+                        "reef@lab",
+                        None,
+                        Rc::new(move |_, place, _, _| *result.borrow_mut() = Some(place)),
+                        frame,
+                        window,
+                        cx,
+                    );
+                    frame
+                        .minibuffer_mut()
+                        .unwrap()
+                        .set_input("/srv/bench work".into(), window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            if choose {
+                window
+                    .update(cx, |frame, _, _| {
+                        frame.minibuffer_mut().unwrap().select_by_delta(1)
+                    })
+                    .unwrap();
+            }
+            cx.dispatch_action(*window, rho_frame::keys::MinibufferConfirm);
+            assert_eq!(picked.borrow_mut().take().unwrap().as_str(), expected);
+        }
+    }
 
     #[test]
     fn a_pre_project_device_can_still_read_its_old_place_to_import() {

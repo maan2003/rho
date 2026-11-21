@@ -226,7 +226,7 @@ want: name the project and say once where, how, and on what model its agents wor
 so that: the idea starts now, and every later idea to that address starts with no question
 steps:
 1. in an idea, the user writes `to: tide@lab`; a name with no match offers `new project tide@lab`, and `enter` takes it
-2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; a URL or a `git@` address is a repository, a path is a directory on `lab`
+2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; Enter takes the place as typed unless the user chooses a completion. A URL or a `git@` address is a repository, a path is a directory on `lab`
 3. `tide@lab agents:` asks for the mode, `one` under the point and `per idea` below it
 4. `tide@lab runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
 5. if the user started from Send, the idea sends and the work starts; if they were editing `to:` with `ctrl-t`, the new project fills that line and the draft stays open until they Send
