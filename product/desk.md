@@ -13,14 +13,13 @@ done when: the user knows what waits and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
-status: the built Desk still shows `moving` rows under the waiting rows.
 purpose: show what wants the user, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting, and deals the first.
 sees: `N wait` and up to seven `deal.Card` rows, in the deal’s order, each a subject and a project, then `and N more` for the rest.
 does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
-- open a row `enter` or one tap: open the selected card or thread; the waiting overflow opens the first hidden card
+- open a row `enter` or one tap: open the selected card; the waiting overflow opens the first hidden card
 - write an idea `i` on any row: open the idea draft, as `mail.Write an idea`
 - narrow: show only one `mail.Project`'s waiting rows, chosen by name, with where the project works and its mode in the top line, such as `tide@lab · on tide · one agent`; a project has no screen of its own
 
@@ -51,7 +50,7 @@ rejected:
 
 On the phone, rows keep their place while the Desk is on screen, so a row does not move under the thumb; a new order shows when the Desk opens again.
 
-Built renders: [the desk on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png), both from before `moving` went.
+Built renders: [the desk on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
 
 mock:
 ```text

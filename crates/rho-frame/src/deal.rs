@@ -496,12 +496,6 @@ impl Frame {
                     .is_some_and(|(_, owner)| owner.address == project.address)
             })
         };
-        let moving = self
-            .systems
-            .iter()
-            .flat_map(|system| system.moving_threads(cx))
-            .filter(|thread| belongs(&thread.thread))
-            .collect();
         let scoped;
         let hand = if project.is_some() {
             scoped = Hand {
@@ -517,7 +511,7 @@ impl Frame {
         } else {
             hand
         };
-        let rows = desk_rows(hand, moving, |address| {
+        let rows = desk_rows(hand, |address| {
             self.project_for(address, cx).map(|(_, project)| project)
         });
         self.desk
