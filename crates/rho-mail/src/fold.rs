@@ -50,6 +50,7 @@ pub struct HostMail {
     /// The newest record told.
     pub head: ChatSeq,
     messages: BTreeMap<MessageId, Message>,
+    recaps: crate::reading::Recaps,
     /// Each message's children in log order; `None` holds the roots.
     children: BTreeMap<Option<MessageId>, Vec<MessageId>>,
     names: HashMap<MessageId, String>,
@@ -74,6 +75,7 @@ impl HostMail {
                 };
                 let id = message.id;
                 self.children.entry(*parent).or_default().push(id);
+                self.recaps.observe(&message, record);
                 self.messages.insert(id, message);
                 Told::Posted {
                     message: id,
@@ -116,6 +118,7 @@ impl HostMail {
                     return Told::Nothing;
                 };
                 mail.apply_revision(record);
+                self.recaps.observe(mail, record);
                 Told::Thread(self.subthread_of(*message))
             }
             ChatEvent::Named { thread, name } => {
@@ -170,16 +173,22 @@ impl HostMail {
         latest.map(|mail| (mail.headline(), mail.version().1))
     }
 
-    pub fn last_user_mail(&self, thread: MessageId) -> Option<UnixMs> {
-        self.children(Some(thread))
-            .iter()
-            .rev()
-            .copied()
-            .chain(std::iter::once(thread))
+    /// The opening mail and its immediate replies are shown in a thread.
+    pub(crate) fn reading_order(
+        &self,
+        thread: MessageId,
+    ) -> impl Iterator<Item = &Message> + Clone {
+        std::iter::once(thread)
+            .chain(self.children(Some(thread)).iter().copied())
             .filter_map(|id| self.message(id))
-            .find(|mail| mail.from == Address::User)
-            .or_else(|| self.message(thread))
-            .map(|mail| mail.at)
+    }
+
+    pub(crate) fn recap(
+        &self,
+        thread: MessageId,
+        verdicts: impl Iterator<Item = UnixMs>,
+    ) -> Option<(MessageId, &str)> {
+        self.recaps.anchor(self.reading_order(thread), verdicts)
     }
 
     pub fn work(&self, thread: MessageId) -> Option<ThreadWork> {

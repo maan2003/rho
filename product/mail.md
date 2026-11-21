@@ -73,7 +73,6 @@ rejected:
 Agents can search mail. Mail written while the host is away waits on the device and goes out when the host is back.
 
 ## concept Draft
-status: the draft scrolls away with history.
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the end of the thread, even after a restart.
 sees: the unsent text as the next mail at the end of the thread, after one blank line; when empty, a quiet `reply` where the words will go. When the first line is below the window, the draft becomes a `window.Bottom-stuck excerpt`; on the phone it sits above the keyboard.
@@ -89,7 +88,6 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
-status: a dealt thread opens on its pinging mail; the draft is not stuck and new mail does not follow the draft or show a notice.
 answers: what is this piece of work waiting for from the user?
 shows:
 - the `Thread` subject and `Project` address in the `window.Status line`, with the card's words, `waits · 2h`, while it waits
@@ -102,7 +100,7 @@ states:
 - loading: the thread's mail is not yet available; wording not agreed
 - partial: only the available mail; wording not agreed
 - error: the thread is unavailable; wording not agreed
-- full: whether opened by the deal or by name, the point goes into the `Draft`, where it was left if it has text; the first project mail since the user's last mail starts at the top, or the latest mail if none followed theirs. If the tail is shorter than the window, history fills the space above it. It never scrolls to empty space below the draft. Returning to a place restores it as left.
+- full: whether opened by the deal or by name, the point goes into the `Draft`, where it was left if it has text; the first project mail since the user's last mail starts at the top, or the latest mail if none followed theirs. If the tail is shorter than the window, history fills the space above it. If the whole thread fits, the spare space goes above the opening mail. It never scrolls to empty space below the draft. Returning to a place restores it as left.
 keys:
 - `enter` with no selection on a project's mail: `Mail.look into the work`
 - `ctrl-u`, `ctrl-d`: scroll history by half a window without moving the point out of the `Draft`
@@ -126,7 +124,7 @@ rejected:
 
 The point never rests on the blank line between two mails. A reply from a dealt card settles the card and stays on the thread; the next card waits for `deal.Card.deal`. On the phone, the whole space below the last mail is the draft's tap target.
 
-Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), and [an outcome with its proof](design/laptop-proof.png).
+Built renders: [asking mail on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), [an outcome with its proof](design/laptop-proof.png), [a cold recap above its mail](design/laptop-reading.png), and [the notice in a stuck phone draft](design/phone-reading-notice.png).
 
 mock:
 ```text
@@ -208,7 +206,6 @@ rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing mail; another send must not silently change it
 
 ## rule a cold mail carries a recap
-status: rho decides cold from when the user last had the thread open, then hides or shows the recaps together.
 when project `Mail` arrives or is edited in a `Thread` more than ten minutes after the user's last mail or verdict there (or with neither), then it opens a cold stretch. The newest stretch opener with a `## recap` shows that section in `design.recap` before its body. All other recap sections are hidden. An answer within ten minutes does not move or hide the chosen recap.
 why: after a long gap the user can answer without reading the history, and the same context stays visible while they work.
 rejected:
@@ -217,5 +214,4 @@ rejected:
 rho tells the project once when the thread goes cold. The project's next pinging mail, new or edited, carries a recap that lets the user answer without the history. When ten minutes pass with a pinging mail that has no recap, rho reminds the project once.
 
 ## rule new mail follows the draft at the tail
-status: new or edited mail does not keep the draft in place or show a notice while the user reads.
 when new project `Mail` arrives or the latest mail is edited, then history moves as needed to keep the `Draft` in place if it is inline, without moving the point. If it is stuck, history stays where it was and the draft shows a quiet `↓ new mail` at its right end until the user scrolls down to the tail.

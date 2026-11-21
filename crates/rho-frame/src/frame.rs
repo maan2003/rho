@@ -1714,6 +1714,10 @@ impl Render for Frame {
                 .child(bar)
                 .children(sheet);
         }
+        let keep_bottom = idea.is_none()
+            && surface
+                .editor(cx)
+                .is_some_and(|editor| editor.read(cx).keeps_bottom_visible());
         frame
             .child(idea.unwrap_or_else(|| {
                 div()
@@ -1723,31 +1727,30 @@ impl Render for Frame {
                     .child(surface.view())
                     .into_any_element()
             }))
-            // The menu, pinned to the bottom edge and drawn over the buffer
-            // rather than in it: nothing reflows, and the point stays where
-            // the reader left it.
             .children(self.menu.as_ref().map(|open| {
-                div()
-                    .track_focus(&self.menu_focus)
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .child(
-                        bottom_strip(&text_style, cx).child(open.transient.render_rows(
-                            &text_style,
-                            cx,
-                            |index, row| {
-                                row.id(("rho-menu-row", index))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.click_menu_row(index, window, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .into_any_element()
-                            },
-                        )),
-                    )
+                let menu = div().track_focus(&self.menu_focus);
+                // A bottom-aligned document and a stuck excerpt need space
+                // above the choices. Other buffers keep their usual overlay.
+                let menu = if keep_bottom {
+                    menu.flex_none()
+                } else {
+                    menu.absolute().bottom_0().left_0().right_0()
+                };
+                menu.child(
+                    bottom_strip(&text_style, cx).child(open.transient.render_rows(
+                        &text_style,
+                        cx,
+                        |index, row| {
+                            row.id(("rho-menu-row", index))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.click_menu_row(index, window, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .into_any_element()
+                        },
+                    )),
+                )
             }))
             .children(minibuffer)
     }

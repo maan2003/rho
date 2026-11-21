@@ -84,6 +84,7 @@ mod signature_help;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
+mod bottom_excerpt;
 mod clipboard;
 #[cfg(feature = "native")]
 mod code_actions;
@@ -1302,6 +1303,7 @@ pub struct Editor {
     last_bounds: Option<Bounds<Pixels>>,
     defer_paint_until_initial_wrap: bool,
     last_position_map: Option<Rc<PositionMap>>,
+    bottom_excerpt: Option<bottom_excerpt::BottomExcerpt>,
     /// The right margin (vertical scrollbar + minimap width) the editor was
     /// last laid out with, updated on every prepaint.
     /// Used later in the frame by `SplitBufferHeadersElement` to shrink the
@@ -2805,6 +2807,7 @@ impl Editor {
             last_bounds: None,
             defer_paint_until_initial_wrap: false,
             last_position_map: None,
+            bottom_excerpt: None,
             last_right_margin: Pixels::ZERO,
             last_horizontal_scrollbar_visible: false,
             expect_bounds_change: None,
@@ -12343,9 +12346,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<gpui::Point<Pixels>> {
-        let origin = self.last_position_map.as_ref()?.text_hitbox.bounds.origin;
+        let map = self.last_position_map.as_ref()?;
+        let origin = map.text_hitbox.bounds.origin;
+        let projected_y = map.bottom_excerpt_y(source.row());
         self.display_to_pixel_point(source, editor_snapshot, window, cx)
-            .map(|position| origin + position)
+            .map(|position| {
+                let mut position = origin + position;
+                if let Some(y) = projected_y {
+                    position.y = y;
+                }
+                position
+            })
     }
 
     pub fn register_addon<T: Addon>(&mut self, instance: T) {

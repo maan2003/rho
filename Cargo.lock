@@ -14166,6 +14166,7 @@ name = "rho-frame"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "bytes",
  "collections",
  "editor",
@@ -14176,6 +14177,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "redb",
+ "release_channel",
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-db",
@@ -14184,10 +14186,12 @@ dependencies = [
  "rho-ledger",
  "rho-transcript",
  "rho-window",
+ "semver",
  "senax-encoder",
  "settings",
  "text",
  "theme",
+ "theme_settings",
  "tokio",
  "tracing",
  "url",

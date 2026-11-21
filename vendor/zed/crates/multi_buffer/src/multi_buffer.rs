@@ -6839,6 +6839,19 @@ impl MultiBufferSnapshot {
         first_excerpt
     }
 
+    /// The anchor range of a path containing exactly one excerpt.
+    pub fn single_excerpt_range(&self, path: &PathKey) -> Option<Range<Anchor>> {
+        let mut cursor = self.excerpts.cursor::<ExcerptSummary>(());
+        cursor.seek(path, Bias::Left);
+        let excerpt = cursor.item().filter(|excerpt| &excerpt.path_key == path)?;
+        let range = Anchor::range_in_buffer(excerpt.path_key_index, excerpt.range.context.clone());
+        cursor.next();
+        (!cursor
+            .item()
+            .is_some_and(|excerpt| &excerpt.path_key == path))
+        .then_some(range)
+    }
+
     pub fn buffer_for_id(&self, id: BufferId) -> Option<&BufferSnapshot> {
         self.buffers.get(&id).map(|state| &state.buffer_snapshot)
     }
