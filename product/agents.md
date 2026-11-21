@@ -51,7 +51,7 @@ The agent's screen is its transcript: everything it did, so the user can check i
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
-principle: an agent starts on `opus-high`, the default; the user wants a cheaper one for a small piece of work, so they choose `set runtime…` and give it `sol-medium`.
+principle: an agent starts on its project's runtime, `opus-high` until the project says otherwise, or on the one the idea's `on:` line named; the user wants a cheaper one for a small piece of work already running, so they choose `set runtime…` and give it `sol-medium`.
 sees: a name such as `sol-medium`, `opus-high`, or `fable-high`.
 
 ## concept Terminal

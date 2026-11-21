@@ -32,19 +32,21 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-purpose: give each project one address to write to, and one answer, asked once, to where and how its agents work.
-principle: the user sends an idea to `tide@lab`; the project starts the work at its place, in its mode, and sends its asks and results from that address.
-sees: its name and host as an address, such as `tide@lab`; where it works and its mode, such as `on tide · one agent`, in the top line of the Desk narrowed to it; open, the Desk narrowed to that project.
+purpose: give each project one address to write to, and one answer, asked once, to where, how, and on what model its agents work.
+principle: the user sends an idea to `tide@lab`; the project starts the work at its place, in its mode, on its runtime, and sends its asks and results from that address.
+sees: its name and host as an address, such as `tide@lab`; where it works, its mode and its runtime, such as `on tide · one agent · sol-high`, in the top line of the Desk narrowed to it; open, the Desk narrowed to that project.
 has:
 - many `Thread`
 does:
 - open: narrow `desk.Desk` to the project through `window.Go to something by name`
-- receive an idea: start the work at the project's place in its mode. `one agent`: the project's agent reads the idea in its new thread, and starts when none runs. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
+- receive an idea: start the work at the project's place in its mode, on the project's runtime unless the idea's `on:` line named another. `one agent`: the project's agent reads the idea in its new thread, and starts when none runs; an idea on another runtime switches it first, as `agents.Agent.set runtime` does. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
 - works on…, from the palette on the project: ask `tide@lab works on:` and change where the next idea starts; agents already running stay where they are
 - agents, from the palette on the project, as `agents: one` or `agents: per idea`: change the mode for the next idea; agents already running stay as they are
+- runtime…, from the palette on the project: ask `tide@lab runtime (sol-high):` with the host's runtimes as answers; the next idea starts on it; agents already running stay as they are
 rejected:
 - the place read off the project's newest agent · 2026-11-21 · nothing could show it or change it
 - the kind of place deciding the mode, a repository per idea and a directory shared · 2026-11-21 · one standing agent on a repository is useful too
+- every project agent on `opus-high`, with the model chosen only through `start agent` · 2026-11-21 · that path asks the place again and never makes a project thread, so no project thread could start on another model
 
 ## concept Thread
 purpose: keep one piece of work and the whole exchange about it together.
@@ -190,47 +192,63 @@ when: the user has an idea, wherever they are in the window
 want: send it to the right project without losing their place
 so that: work starts and the user can carry on where they were
 steps:
-1. the user presses the idea key, `i` on a `desk.Desk` row or the idea key elsewhere; a `Draft` fills the window, with a `to:` line already addressed to the project picked from context
+1. the user presses the idea key, `i` on a `desk.Desk` row or the idea key elsewhere; a `Draft` fills the window, with a `to:` line already addressed to the project picked from context, and an `on:` line with that project's runtime
 2. the user writes, in the usual modes
    - if it is for a different project, the user edits the `to:` line with project completion, or `ctrl-t` asks for the project; a name with no match offers a `new project …` row, which is `Start a project`
+   - if this one idea should think on another model, the user edits the `on:` line, with the host's runtimes as completions; `shift-tab` moves between the lines and the words; a runtime the host does not know is refused in the echo and the idea stays
 3. the user sends with `ctrl-enter` or `send`; the echo names the idea and the project, and the screen before is back
-system: picks the thread's project, or the last project the user wrote to; starts the work at that project's place, in its mode, as `Project.receive an idea`.
-user: the words and, if different from the automatic choice, the project.
-cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; the idea comes while reading a page; the current thread belongs to a different project.
+system: picks the thread's project, or the last project the user wrote to; fills `on:` with that project's runtime, again when `to:` changes and the user has not touched `on:`; starts the work at that project's place, in its mode, on the `on:` runtime, as `Project.receive an idea`.
+user: the words and, if different from the automatic choice, the project and the runtime.
+cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; the idea comes while reading a page; the current thread belongs to a different project; an idea on another runtime to a `one agent` project whose agent cannot change kind, refused as `set runtime` refuses it, with the idea kept.
+mock:
+```text
+to: tide@lab
+on: sol-high                                        sol-high
+                                                    sol-medium
+                                                    opus-high  project
+
+idea
+```
 rejected:
 - a one-line idea strip across every screen · 2026-11-20 · never agreed; a full window with the usual modes costs nothing when the window shows one place at a time
 - a `to:` prompt before the draft opens · 2026-11-20 · the address is a line of the draft
 - a draft tail at the bottom of the Desk · 2026-11-20 · the same draft is one key away, without a line of chrome on the Desk
 - two send keys, one that starts an agent and one that only sends · 2026-11-20 · one wording and one key everywhere; the project decides what the mail starts
+- a palette command `send on…` that asks the runtime · 2026-11-21 · it hides the default and adds a step; a line shows what the idea will run on before it goes
 reviewed: 2026-11-20 · laptop · reviewer · 1 finding
 
 ## flow Start a project
 runs: 1 a week
 day: Turn ideas into work.
 when: the user has an idea for work that no project holds yet
-want: name the project and say once where and how its agents work
+want: name the project and say once where, how, and on what model its agents work
 so that: the idea starts now, and every later idea to that address starts with no question
 steps:
 1. in an idea, the user writes `to: tide@lab`; a name with no match offers `new project tide@lab`, and `enter` takes it
 2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; a URL or a `git@` address is a repository, a path is a directory on `lab`
 3. `tide@lab agents:` asks for the mode, `one` under the point and `per idea` below it
-4. the idea sends and the work starts, as in `Write an idea`
-   - from the Desk palette, `new project` asks the same three lines and opens the empty project
-system: the host keeps the project's name, place and mode, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
-user: the name, the place, and the mode.
-cases: the host is offline; an older project with no known place says `no place set` until `works on…` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves mail`; a second project on the same repository; a project made from the Desk with no idea yet.
+4. `tide@lab runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
+5. the idea sends and the work starts, as in `Write an idea`
+   - from the Desk palette, `new project` asks the same four lines and opens the empty project
+system: the host keeps the project's name, place, mode and runtime, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
+user: the name, the place, the mode, and the runtime.
+cases: the host is offline; an older project with no known place says `no place set` until `works on…` is answered; an older project with a place but no runtime reads and runs `opus-high` until `runtime…` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves mail`; a second project on the same repository; a project made from the Desk with no idea yet.
 mock:
 ```
 to: tide@lab                                        new project tide@lab
 tide@lab works on: git@github.com:maan2003/tide     repository
 tide@lab agents: one                                every idea goes to the same agent
                  per idea                           each idea gets a fresh agent in its own workset
+tide@lab runtime: opus-high                         default
+                  sol-high
+                  sol-medium
 ```
 rejected:
 - a menu `where this project's agents work` with two rows and a prompt behind each · 2026-11-21 · three kinds of UI for one answer, and the place stayed invisible
 - an `on host:` prompt · 2026-11-21 · the address names the host
 - the mode asked only for a repository · 2026-11-21 · several agents in one directory are fine too
 - a second question at the second idea · 2026-11-21 · a surprise later costs more than one more line now
+- no runtime question, every project on `opus-high` · 2026-11-21 · a project thread could not start on another model at all
 
 The historical review above was of Start a thread. Starting an agent from a mail was walked separately:
 > reviewed: 2026-11-20 · laptop · reviewer · 4 findings
