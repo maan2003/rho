@@ -98,7 +98,7 @@ purpose: let the user read an exchange and know who said what, with nothing betw
 looks: the words in `editor text` on the `reading surface`; the user's own mail in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's mail in `reading text` with no bar; one blank line between mails; a `quiet` name line above a mail from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`; a `## recap` section in `recap`.
 states:
 - recap anchor: the heading and recap are drawn in `recap`, before the body of the mail.
-- other mail: the recap section is not drawn.
+- other mail: hide the recap unless it is the whole mail; then show the heading and words in regular mail colors.
 - sending: the user's words in `quiet` until the host has the mail.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `mail.Thread`.

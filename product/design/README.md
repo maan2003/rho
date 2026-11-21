@@ -148,6 +148,15 @@ Use `gg` to return to the draft inline and clear the notice.
 While there, run `"$fixture" edit "$rig/runtime" "$ws" "$worker" "$mid" $'Both checks pass.\n\nNo retries were changed.\n\nBoth clocks use the same input.'`:
 history grows below the draft, but the draft and caret stay put.
 
+### A warm mail whose whole body is a recap
+
+In the same fixture, send a user reply from the open thread. Then send project
+mail with `"$fixture" send` and edit it to `## recap`, a short paragraph,
+a blank line, and another paragraph with no intervening heading. Use `gg` to
+read the newest mail. [Before](laptop-recap-only-before.png), the edited mail
+vanished. [After](laptop-recap-only-after.png), it stays visible as ordinary
+mail with its `edited` tag; the cold recap below remains accented.
+
 ## Desk on laptop and phone: what waits
 
 In a fresh fixture shell on the default `clarifying-question` scenario, follow
