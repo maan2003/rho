@@ -1639,6 +1639,11 @@ impl Render for Frame {
             .on_action(
                 cx.listener(|this, _: &keys::PromptIdea, window, cx| this.prompt_idea(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &keys::PromptIdeaRuntime, window, cx| {
+                    this.prompt_idea_runtime(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &keys::FocusIdeaAddress, window, cx| {
                 this.focus_idea_address(window, cx);
             }))

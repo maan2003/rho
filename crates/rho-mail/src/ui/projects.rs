@@ -9,11 +9,11 @@ use gpui::{App, Context, Entity, Window};
 use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{
     ChatSeq, EndpointId, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
-    ProjectName, ProjectPlace,
+    ProjectName, ProjectPlace, RuntimeLabel,
 };
 use rho_db::{RhoDb, Sen};
 use rho_dealer::Addressed as _;
-use rho_frame::idea::NewIdeaProject;
+use rho_frame::idea::{NewIdeaProject, runtime_candidates};
 use rho_frame::{Candidate, Frame, Point, Row};
 use rho_window::style::StyleClass;
 use senax_encoder::{Decode, Encode};
@@ -41,7 +41,11 @@ impl MailSystem {
                 ProjectMode::One => "one agent",
                 ProjectMode::PerIdea => "per idea",
             };
-            Some(format!("on {} · {mode}", config.place.label()))
+            Some(format!(
+                "on {} · {mode} · {}",
+                config.place.label(),
+                config.runtime
+            ))
         } else if self.settings.contains_key(&project.host) {
             Some("no place set".into())
         } else {
@@ -138,13 +142,15 @@ impl MailSystem {
         }));
         if let Some(config) = config {
             let mode = config.mode;
+            let mode_address = address.clone();
+            let change = this.clone();
             rows.push(Row::run(
                 "",
                 format!("agents: {}", mode.label()),
                 move |frame, window, cx| {
-                    let change = this.clone();
+                    let change = change.clone();
                     prompt_mode(
-                        &address,
+                        &mode_address,
                         mode,
                         Rc::new(move |_, mode, _, cx| {
                             change.update(cx, |mail, cx| {
@@ -157,6 +163,23 @@ impl MailSystem {
                     );
                 },
             ));
+            let current = config.runtime.clone();
+            rows.push(Row::run("", "runtime…", move |frame, window, cx| {
+                let change = this.clone();
+                prompt_runtime(
+                    format!("{address} runtime ({current}):"),
+                    current.clone(),
+                    "current",
+                    Rc::new(move |_, runtime, _, cx| {
+                        change.update(cx, |mail, cx| {
+                            mail.change_project(project, ProjectChange::Runtime(runtime), cx)
+                        });
+                    }),
+                    frame,
+                    window,
+                    cx,
+                );
+            }));
         }
         rows
     }
@@ -243,21 +266,37 @@ impl MailSystem {
                 let this = this.clone();
                 let project = project.clone();
                 let created = created.clone();
+                let prompt = format!("{address} runtime:");
                 prompt_mode(
                     &address,
                     ProjectMode::One,
-                    Rc::new(move |_, mode, _, cx| {
-                        this.update(cx, |mail, cx| {
-                            mail.create_project(
-                                project.clone(),
-                                ProjectConfig {
-                                    place: place.clone(),
-                                    mode,
-                                },
-                                created.as_ref().clone(),
-                                cx,
-                            )
-                        });
+                    Rc::new(move |frame, mode, window, cx| {
+                        let this = this.clone();
+                        let project = project.clone();
+                        let created = created.clone();
+                        let place = place.clone();
+                        prompt_runtime(
+                            prompt.clone(),
+                            RuntimeLabel::default(),
+                            "default",
+                            Rc::new(move |_, runtime, _, cx| {
+                                this.update(cx, |mail, cx| {
+                                    mail.create_project(
+                                        project.clone(),
+                                        ProjectConfig {
+                                            place: place.clone(),
+                                            mode,
+                                            runtime,
+                                        },
+                                        created.as_ref().clone(),
+                                        cx,
+                                    )
+                                });
+                            }),
+                            frame,
+                            window,
+                            cx,
+                        );
                     }),
                     frame,
                     window,
@@ -409,6 +448,31 @@ fn prompt_mode(
     }
 }
 
+type RuntimeAnswer = Rc<dyn Fn(&mut Frame, RuntimeLabel, &mut Window, &mut Context<Frame>)>;
+
+fn prompt_runtime(
+    title: String,
+    first: RuntimeLabel,
+    description: &'static str,
+    accept: RuntimeAnswer,
+    frame: &mut Frame,
+    window: &mut Window,
+    cx: &mut Context<Frame>,
+) {
+    frame.open_prompt(
+        title,
+        Rc::new(move |_, needle, _| runtime_candidates(needle, Some((&first, description)))),
+        Rc::new(
+            move |frame, input, window, cx| match RuntimeLabel::parse(&input) {
+                Ok(runtime) => accept(frame, runtime, window, cx),
+                Err(reason) => frame.echo(&reason, StyleClass::SystemInfo, cx),
+            },
+        ),
+        window,
+        cx,
+    );
+}
+
 // The former on-device answers remain on disk as a downgrade copy. Import
 // only to an unconfigured host, never use them as live launch settings.
 #[derive(Clone, Debug, Decode, Encode)]
@@ -451,6 +515,7 @@ pub(super) fn legacy_places(db: &RhoDb) -> HashMap<(EndpointId, ProjectId), Proj
                 ProjectConfig {
                     place,
                     mode: ProjectMode::One,
+                    runtime: RuntimeLabel::default(),
                 },
             ))
         })
@@ -498,6 +563,7 @@ mod tests {
         let config = |id| &answers[&(EndpointId([7; 32]), ProjectId(MessageId(ChatSeq(id))))];
         assert_eq!(config(39).place.as_str(), "file:///tmp/old%20work/tree");
         assert_eq!(config(39).mode, ProjectMode::One);
+        assert_eq!(config(39).runtime.as_str(), "opus-high");
         assert_eq!(config(48).place.as_str(), "/tmp/not-a-clone");
         assert!(!config(48).place.is_repository());
     }

@@ -783,6 +783,7 @@ mod tests {
                 address: address.clone(),
                 name: "shoal@lab".into(),
                 details: None,
+                runtime: None,
             })
         });
         assert_eq!(rows.wait_count, 9);
@@ -825,6 +826,7 @@ mod tests {
                 address: Address::new("project", id),
                 name: if id == 3 { "clock@lab" } else { "reef@lab" }.into(),
                 details: None,
+                runtime: None,
             })
         };
         let rows = desk_rows(&hand, project);
@@ -871,6 +873,7 @@ mod tests {
                 address: Address::new("project", 1),
                 name: "clock@lab".into(),
                 details: None,
+                runtime: None,
             })
         };
         let rows = desk_rows(&hand, project);

@@ -212,6 +212,7 @@ mod tests {
         let config = ProjectConfig {
             place: rho_agent_types::ProjectPlace::parse("git@github.com:owner/reef").unwrap(),
             mode: rho_agent_types::ProjectMode::PerIdea,
+            runtime: RuntimeLabel::parse("haiku-xhigh").unwrap(),
         };
         round_trips(ServerFrame::Projects {
             configured: vec![(project, config.clone())],
@@ -220,6 +221,13 @@ mod tests {
             CreateProject {
                 name: ProjectName::parse("reef").unwrap(),
                 config,
+            }
+            .into(),
+        ));
+        round_trips(Open::Request(
+            ChangeProject {
+                project,
+                change: ProjectChange::Runtime(RuntimeLabel::parse("sol-medium").unwrap()),
             }
             .into(),
         ));

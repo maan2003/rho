@@ -11,7 +11,7 @@ use rho_agent_types::{
     Address, ContentPart, Mention, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
     ProjectName, ProjectPlace, RuntimeLabel, UnixMs, WorksetKind, one_line,
 };
-use rho_agents_client::protocol::snippets::{self, Function, Runtime};
+use rho_agents_client::protocol::snippets::{self, Function};
 use tokio::sync::{Mutex, watch};
 
 use super::AgentPool;
@@ -149,6 +149,7 @@ impl AgentPool {
                 &ProjectSettings {
                     place,
                     routing: Routing::One { agent: Some(agent) },
+                    runtime: RuntimeLabel::default(),
                 },
             );
         }
@@ -213,28 +214,45 @@ impl AgentPool {
         let mut write = self.db.write().await;
         let read = self.db.read();
         ensure!(read.is_project(id), "no such project on this host");
-        let held = read.project_settings(id).map(|settings| settings.config());
-        let config = match (change, &held) {
-            (ProjectChange::Place(place), Some(held)) => ProjectConfig {
-                place,
-                mode: held.mode,
-            },
+        let held = read.project_settings(id);
+        let settings = match (change, held.as_ref()) {
+            (ProjectChange::Place(place), Some(held)) => {
+                if held.place == place {
+                    return Ok(());
+                }
+                ProjectSettings::new(ProjectConfig {
+                    place,
+                    ..held.config()
+                })
+            }
             // The legacy workflow had one shared destination. Setting its
             // previously unknown place is the only missing answer.
-            (ProjectChange::Place(place), None) => ProjectConfig {
+            (ProjectChange::Place(place), None) => ProjectSettings::new(ProjectConfig {
                 place,
                 mode: ProjectMode::One,
-            },
-            (ProjectChange::Mode(mode), Some(held)) => ProjectConfig {
-                place: held.place.clone(),
-                mode,
-            },
-            (ProjectChange::Mode(_), None) => anyhow::bail!("set where this project works first"),
+                runtime: RuntimeLabel::default(),
+            }),
+            (ProjectChange::Mode(mode), Some(held)) => {
+                let config = held.config();
+                if config.mode == mode {
+                    return Ok(());
+                }
+                ProjectSettings::new(ProjectConfig { mode, ..config })
+            }
+            (ProjectChange::Runtime(runtime), Some(held)) => {
+                if held.runtime == runtime {
+                    return Ok(());
+                }
+                // This is a default for new agents, not a change to the
+                // running agent or the project's standing identity.
+                ProjectSettings {
+                    runtime,
+                    ..held.clone()
+                }
+            }
+            (_, None) => anyhow::bail!("set where this project works first"),
         };
-        if held.as_ref() == Some(&config) {
-            return Ok(());
-        }
-        write.set_project_settings(id, &ProjectSettings::new(config));
+        write.set_project_settings(id, &settings);
         write.commit();
         self.projects.changed.send_replace(());
         Ok(())
@@ -391,10 +409,10 @@ impl AgentPool {
         {
             return Ok(agent);
         }
-        let place = &settings.context("the project does not have a place")?.place;
+        let settings = settings.context("the project does not have a place")?;
+        let place = &settings.place;
         let function = Function::default();
-        let default = Runtime::default();
-        let runtime = runtime.unwrap_or(&default);
+        let runtime = runtime.unwrap_or(&settings.runtime);
         let (kind, code) = if place.is_repository() {
             (
                 WorksetKind::Isolated,

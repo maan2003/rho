@@ -31,6 +31,7 @@ actions!(
         DeskFirst,
         DeskDraft,
         PromptIdea,
+        PromptIdeaRuntime,
         RedoEdit,
         SendIdea,
         FocusIdeaAddress,
@@ -152,6 +153,7 @@ fn bindings() -> Vec<KeyBinding> {
     bindings.extend([
         KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", PromptIdea, Some("RhoIdeaAddress > Editor")),
+        KeyBinding::new("enter", PromptIdeaRuntime, Some("RhoIdeaRuntime > Editor")),
         KeyBinding::new("shift-tab", FocusIdeaAddress, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),

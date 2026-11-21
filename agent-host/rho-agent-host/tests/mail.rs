@@ -179,6 +179,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     let one_config = ProjectConfig {
         place: place(&old),
         mode: ProjectMode::One,
+        runtime: RuntimeLabel::default(),
     };
     let make = |name, config| async move {
         call(
@@ -195,11 +196,13 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     let each_config = ProjectConfig {
         place: ProjectPlace::parse(remote.as_str()).unwrap(),
         mode: ProjectMode::PerIdea,
+        runtime: RuntimeLabel::parse("sol-low").unwrap(),
     };
     let each = make("independent", each_config.clone()).await?;
     let failed_config = ProjectConfig {
         place: place(&root.join("missing-place")),
         mode: ProjectMode::One,
+        runtime: RuntimeLabel::default(),
     };
     let failed_project = make("asleep", failed_config.clone()).await?;
     assert_eq!(make("SAME", one_config.clone()).await?, one);
@@ -291,6 +294,26 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     );
     assert_eq!(idea_agent(paths, after_refusal).await?, standing);
 
+    let next_default = RuntimeLabel::parse("sol-xhigh").unwrap();
+    call(
+        paths,
+        ChangeProject {
+            project: one,
+            change: ProjectChange::Runtime(next_default.clone()),
+        },
+    )
+    .await?;
+    assert_eq!(
+        read_projects(&mut first_device).await?[0],
+        (
+            one,
+            ProjectConfig {
+                runtime: next_default.clone(),
+                ..one_config.clone()
+            }
+        )
+    );
+
     call(paths, StopAgent { agent: standing }).await?;
     let after_stop = send(one, 803, "Test the stopped channel's stern clock.").await?;
     assert_eq!(idea_agent(paths, after_stop).await?, standing);
@@ -360,7 +383,8 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             one,
             ProjectConfig {
                 place: place(&new),
-                mode: ProjectMode::One
+                mode: ProjectMode::One,
+                runtime: next_default.clone(),
             }
         )
     );
@@ -453,7 +477,8 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 one,
                 ProjectConfig {
                     place: place(&new),
-                    mode: ProjectMode::PerIdea
+                    mode: ProjectMode::PerIdea,
+                    runtime: next_default.clone(),
                 }
             ),
             (each, each_config),
@@ -461,7 +486,8 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 failed_project,
                 ProjectConfig {
                     place: place(&old),
-                    mode: ProjectMode::One
+                    mode: ProjectMode::One,
+                    runtime: RuntimeLabel::default(),
                 }
             ),
         ],
@@ -496,8 +522,13 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     );
     assert_eq!(
         runtime(second_agent),
-        "sol-medium",
-        "the fixture maps the unedited default"
+        "sol-low",
+        "an unspecified new agent uses the project setting"
+    );
+    assert_eq!(
+        runtime(next_agent),
+        "sol-xhigh",
+        "a new agent uses the changed project default"
     );
     let by_agent = |id| {
         agents

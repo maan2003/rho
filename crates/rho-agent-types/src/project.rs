@@ -218,12 +218,14 @@ impl Unpacker for RuntimeLabel {
 pub struct ProjectConfig {
     pub place: ProjectPlace,
     pub mode: ProjectMode,
+    pub runtime: RuntimeLabel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ProjectChange {
     Place(ProjectPlace),
     Mode(ProjectMode),
+    Runtime(RuntimeLabel),
 }
 
 /// A validated name without the client-owned host alias.
