@@ -81,7 +81,7 @@ Agents can search mail. Mail written while the host is away waits on the device 
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the end of the thread, even after a restart.
 status: the built draft is the last mail at the end of the thread and sticks to the bottom edge.
-sees: the unsent text as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge; on the phone it is in the half above the keyboard.
+sees: the unsent text in `design.marked`, the user's own colour, as the first lines of the thread, one blank line above the newest mail; when empty, a quiet `reply` where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `enter` on a selection in one mail: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
