@@ -4,7 +4,7 @@
 //! that means something in normal mode is bound for `vim_mode == normal`
 //! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
 
-use gpui::{App, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, actions};
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, actions};
 
 actions!(
     rho_frame,
@@ -82,15 +82,8 @@ fn end_of_document(cx: &App) -> KeyBinding {
         "RhoFrame > Editor && vim_mode == helix_normal && vim_operator == none",
     )
     .expect("the context parses");
-    KeyBinding::load(
-        "shift-g",
-        action,
-        Some(context.into()),
-        false,
-        None,
-        &DummyKeyboardMapper,
-    )
-    .expect("the keystroke parses")
+    KeyBinding::load("shift-g", action, Some(context.into()), false, None, cx)
+        .expect("the keystroke parses")
 }
 
 fn bindings() -> Vec<KeyBinding> {
@@ -241,7 +234,7 @@ mod tests {
 
     #[test]
     fn a_page_reserves_its_window_chords_and_leaves_site_chords_unbound() {
-        let action_at = |surface, key| {
+        let action_at = |surface, key: &'static str| {
             bindings_for(surface, Keystroke::parse(key).unwrap())
                 .first()
                 .map(|binding| binding.action().name())

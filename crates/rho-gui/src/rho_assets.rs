@@ -14,62 +14,47 @@ use rust_embed::RustEmbed;
 #[include = "themes/**/*.json"]
 struct RhoEmbedded;
 
-/// Vendored from zed's `assets/settings/default.json` (at the pinned fork
-/// rev) with rho's chrome opinions applied: no line numbers, no gutter
-/// buttons, no scrollbars, no indent guides. Editors are bare buffers; the
-/// surface viewport is the chrome.
-pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
-
-/// [`RHO_DEFAULT_SETTINGS`] with `RHO_GUI_FONT_FAMILY`, when set, as the
-/// buffer and UI font, their sizes multiplied by `RHO_GUI_FONT_SCALE` and
-/// their weight set to `RHO_GUI_FONT_WEIGHT`: the deployment that supplies a
-/// font through `RHO_GUI_FONTS` makes it the default, sized and weighted to
-/// read like Rho Font, and user settings still win.
-pub fn default_settings() -> Cow<'static, str> {
+/// Rho's default choices over the current editor's defaults. User settings
+/// still override both; they are loaded by the settings store separately.
+pub fn default_settings() -> String {
     let family = std::env::var("RHO_GUI_FONT_FAMILY").ok();
     let number = |name| {
         std::env::var(name)
             .ok()
             .and_then(|value| value.parse().ok())
     };
-    let scale = number("RHO_GUI_FONT_SCALE");
-    let weight = number("RHO_GUI_FONT_WEIGHT");
-    if family.is_none() && scale.is_none() && weight.is_none() {
-        return Cow::Borrowed(RHO_DEFAULT_SETTINGS);
-    }
-    Cow::Owned(settings_with_font(family.as_deref(), scale, weight))
+    settings_with_font(
+        family.as_deref(),
+        number("RHO_GUI_FONT_SCALE"),
+        number("RHO_GUI_FONT_WEIGHT"),
+    )
+    .to_string()
 }
 
-fn settings_with_font(family: Option<&str>, scale: Option<f32>, weight: Option<f32>) -> String {
-    let mut settings = RHO_DEFAULT_SETTINGS.to_string();
-    let mut set_number = |key: String, f: &dyn Fn(f32) -> f32| {
-        let prefix = format!(r#""{key}": "#);
-        let start = settings.find(&prefix).expect("defaults set the key") + prefix.len();
-        let end = start
-            + settings[start..]
-                .find(',')
-                .expect("the number ends at a comma");
-        let value: f32 = settings[start..end].parse().expect("the value is a number");
-        settings.replace_range(start..end, &f(value).to_string());
-    };
-    for key in ["buffer_font", "ui_font"] {
+fn settings_with_font(
+    family: Option<&str>,
+    scale: Option<f32>,
+    weight: Option<f32>,
+) -> serde_json::Value {
+    let mut base = settings::parse_json_with_comments(&settings::default_settings())
+        .expect("bundled editor defaults are valid JSONC");
+    let overrides = serde_json::from_str(include_str!("../assets/settings/rho-defaults.json"))
+        .expect("bundled rho overrides are valid JSON");
+    util::merge_json_value_into(overrides, &mut base);
+    for prefix in ["buffer_font", "ui_font"] {
+        if let Some(family) = family {
+            base[&format!("{prefix}_family")] = family.into();
+        }
         if let Some(scale) = scale {
-            set_number(format!("{key}_size"), &|size| size * scale);
+            let size = &mut base[&format!("{prefix}_size")];
+            *size =
+                (size.as_f64().expect("default font size is numeric") * f64::from(scale)).into();
         }
         if let Some(weight) = weight {
-            set_number(format!("{key}_weight"), &|_| weight);
+            base[&format!("{prefix}_weight")] = weight.into();
         }
     }
-    if let Some(family) = family {
-        let family = serde_json::to_string(family).expect("a string serializes");
-        for key in ["buffer_font_family", "ui_font_family"] {
-            settings = settings.replace(
-                &format!(r#""{key}": "Rho Font""#),
-                &format!(r#""{key}": {family}"#),
-            );
-        }
-    }
-    settings
+    base
 }
 
 pub struct RhoAssets;
@@ -149,26 +134,22 @@ mod tests {
     fn font_override_replaces_both_defaults() {
         let settings = settings_with_font(Some("ABC \"Quoted\" Sans"), Some(1.5), Some(300.0));
         for key in ["buffer_font_family", "ui_font_family"] {
-            assert!(
-                settings.contains(&format!(r#""{key}": "ABC \"Quoted\" Sans""#)),
-                "{key} must name the override"
-            );
-            assert!(!settings.contains(&format!(r#""{key}": "Rho Font""#)));
+            assert_eq!(settings[key], "ABC \"Quoted\" Sans");
         }
-        assert!(settings.contains(r#""buffer_font_size": 22.5,"#));
-        assert!(settings.contains(r#""ui_font_size": 21,"#));
-        assert!(
-            settings.contains(r#""agent_buffer_font_size": 12,"#),
-            "only the two defaults scale"
+        assert_eq!(settings["buffer_font_size"].as_f64(), Some(22.5));
+        assert_eq!(settings["ui_font_size"].as_f64(), Some(21.0));
+        assert_eq!(
+            settings["agent_buffer_font_size"], 12,
+            "only two default sizes scale"
         );
-        assert!(settings.contains(r#""buffer_font_weight": 300,"#));
-        assert!(settings.contains(r#""ui_font_weight": 300,"#));
+        assert_eq!(settings["buffer_font_weight"].as_f64(), Some(300.0));
+        assert_eq!(settings["ui_font_weight"].as_f64(), Some(300.0));
 
         let unscaled = settings_with_font(Some("ABC Sans"), None, None);
-        assert!(unscaled.contains(r#""buffer_font_size": 15,"#));
-        assert!(unscaled.contains(r#""ui_font_weight": 400,"#));
+        assert_eq!(unscaled["buffer_font_size"], 15);
+        assert_eq!(unscaled["ui_font_weight"], 400);
         let unrenamed = settings_with_font(None, Some(1.5), None);
-        assert!(unrenamed.contains(r#""ui_font_family": "Rho Font""#));
+        assert_eq!(unrenamed["ui_font_family"], "Rho Font");
     }
 
     #[test]

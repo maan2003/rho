@@ -1,0 +1,21 @@
+{
+  "theme": { "dark": "Rho OKSolar P3" },
+  "base_keymap": "VSCode",
+  "buffer_font_family": "Rho Font",
+  "buffer_font_fallbacks": ["Noto Color Emoji"],
+  "buffer_font_size": 15,
+  "ui_font_family": "Rho Font",
+  "ui_font_fallbacks": ["Noto Color Emoji"],
+  "text_rendering_mode": "grayscale",
+  "scrollbar": { "show": "never" },
+  "gutter": {
+    "line_numbers": false,
+    "runnables": false,
+    "bookmarks": false,
+    "breakpoints": false,
+    "folds": false,
+    "min_line_number_digits": 2
+  },
+  "indent_guides": { "enabled": false },
+  "vim": { "default_mode": "normal" }
+}
