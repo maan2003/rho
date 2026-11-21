@@ -2231,6 +2231,7 @@ impl Surface for ThreadView {
                         move |frame, window, cx| {
                             let suggestions = choices.clone();
                             let choices = choices.clone();
+                            let card = frame.card_to_inspect(cx);
                             frame.open_prompt(
                                 "look into the work:",
                                 Rc::new(move |_, query, _| {
@@ -2251,7 +2252,12 @@ impl Surface for ThreadView {
                                     if let Some((_, _, address)) =
                                         choices.iter().find(|(name, _, _)| name == input.trim())
                                     {
-                                        frame.open(address.clone(), window, cx);
+                                        frame.open_inspection(
+                                            address.clone(),
+                                            card.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     } else {
                                         frame.echo("no such agent", StyleClass::SystemInfo, cx);
                                     }

@@ -13,9 +13,10 @@ use jiff::{SignedDuration, Timestamp};
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_dealer::Address;
-use rho_dealer::facts::Seen;
 use rho_window::history::{History, Visit};
 use senax_encoder::{Decode, Encode};
+
+use crate::frame::ScreenEntry;
 
 const PLACE: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_place_v1");
 const LAST_INPUT: TableDefinition<(), i64> = TableDefinition::new("gui_frame_last_input_v1");
@@ -91,7 +92,7 @@ struct SavedVisit {
 }
 
 impl Saved {
-    pub(crate) fn of(history: &History<Address, Option<Seen>>) -> Self {
+    pub(crate) fn of(history: &History<Address, ScreenEntry>) -> Self {
         let mut keys: Vec<_> = history.keys_back().collect();
         keys.reverse();
         let at = keys.len() as u32;
@@ -120,7 +121,7 @@ impl Saved {
     /// The history it describes, by address alone, with the desk in it
     /// whatever was written: the desk is the screen nothing closes. An address
     /// this build cannot read is left out.
-    pub(crate) fn history(&self, desk: &Address) -> History<Address, Option<Seen>> {
+    pub(crate) fn history(&self, desk: &Address) -> History<Address, ScreenEntry> {
         // Reuse the same stack record; the oldest releases called the desk
         // Home. Translate that one surface instead of losing its position.
         let address = |key: &str| {
@@ -139,9 +140,9 @@ impl Saved {
         if !screens.contains(desk) {
             screens.insert(0, desk.clone());
         }
-        let mut history = History::new(screens[0].clone(), None);
+        let mut history = History::new(screens[0].clone(), ScreenEntry::Opened);
         for address in &screens[1..] {
-            history.show(address.clone(), None);
+            history.show(address.clone(), ScreenEntry::Opened);
         }
         let at = at.unwrap_or_else(|| desk.clone());
         while history.current_key() != &at && history.back().is_some() {}
@@ -190,10 +191,10 @@ pub(crate) fn return_history(
     desk: &Address,
     last: Option<Timestamp>,
     now: Timestamp,
-) -> History<Address, Option<Seen>> {
+) -> History<Address, ScreenEntry> {
     let mut history = saved.history(desk);
     if is_cold(last, now) {
-        history.show(desk.clone(), None);
+        history.show(desk.clone(), ScreenEntry::Opened);
     }
     history
 }
@@ -285,10 +286,10 @@ mod tests {
     #[test]
     fn the_history_comes_back_with_the_screen_in_view() {
         let desk = address("frame:desk");
-        let mut history = History::new(desk.clone(), None);
-        history.show(address("thread:a/1"), None);
-        history.show(address("agent:x"), None);
-        history.show(address("thread:a/2"), None);
+        let mut history = History::new(desk.clone(), ScreenEntry::Opened);
+        history.show(address("thread:a/1"), ScreenEntry::Opened);
+        history.show(address("agent:x"), ScreenEntry::Opened);
+        history.show(address("thread:a/2"), ScreenEntry::Opened);
         history.back();
         assert_eq!(history.current_key(), &address("agent:x"));
 
@@ -402,9 +403,9 @@ mod tests {
             [address("thread:a/1"), desk.clone()]
         );
 
-        let mut walked = History::new(desk.clone(), None);
-        walked.show(address("thread:a/1"), None);
-        walked.show(desk.clone(), None);
+        let mut walked = History::new(desk.clone(), ScreenEntry::Opened);
+        walked.show(address("thread:a/1"), ScreenEntry::Opened);
+        walked.show(desk.clone(), ScreenEntry::Opened);
         let history = Saved::of(&walked).history(&desk);
         assert_eq!(history.current_key(), &desk);
         assert_eq!(

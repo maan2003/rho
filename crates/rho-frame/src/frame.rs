@@ -53,6 +53,27 @@ pub struct Point {
     pub card: Option<Address>,
 }
 
+/// The card as it stood when the reader stepped down into the work.
+#[derive(Clone)]
+pub struct CardInspection {
+    address: Address,
+    seen: Seen,
+}
+
+#[derive(Default)]
+pub(crate) enum ScreenEntry {
+    #[default]
+    Opened,
+    Dealt(Seen),
+    Inspection(CardInspection),
+}
+
+enum Open<'a> {
+    Explicit,
+    Deal(&'a Card),
+    Inspect(CardInspection),
+}
+
 /// How long an echo stays on the line.
 const ECHO_FOR: Duration = Duration::from_secs(4);
 
@@ -63,7 +84,7 @@ pub struct Frame {
     pub(crate) attention: Attention,
     /// The surfaces the reader has been on, by address. The newest entry
     /// is where down deals; Desk is the oldest and never closes.
-    history: History<Address, Option<Seen>>,
+    history: History<Address, ScreenEntry>,
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
     pub(crate) idea: IdeaBox,
@@ -172,7 +193,7 @@ impl Frame {
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
-            history: History::new(desk_address, None),
+            history: History::new(desk_address, ScreenEntry::Opened),
             surfaces,
             desk,
             idea,
@@ -261,7 +282,7 @@ impl Frame {
             None => {
                 self.history.forget(&address);
                 self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-                self.history.show(Self::desk_address(), None);
+                self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
         }
     }
@@ -306,7 +327,7 @@ impl Frame {
                 false => self.history.back().is_some() || self.history.forward().is_some(),
             };
             if !stepped {
-                self.history.show(Self::desk_address(), None);
+                self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
         }
     }
@@ -363,7 +384,14 @@ impl Frame {
         };
         let current = self.current_surface();
         let subject = resolve(current.subject(cx));
-        let card = resolve(current.card(cx));
+        let card = if current.inspects_card() {
+            match self.history.current() {
+                ScreenEntry::Inspection(inspection) => Some(inspection.address.clone()),
+                _ => None,
+            }
+        } else {
+            resolve(current.card(cx))
+        };
         Point {
             surface,
             subject,
@@ -390,10 +418,29 @@ impl Frame {
     /// What was on the card when the reader opened it, not the hand as it
     /// stands now. New mail can have arrived while this surface was open.
     pub(crate) fn dealt_seen(&self, address: &Address) -> Option<Seen> {
-        if self.current_address() != address {
-            return None;
+        match self.history.current() {
+            ScreenEntry::Dealt(seen) if self.current_address() == address => Some(*seen),
+            ScreenEntry::Inspection(inspection) if &inspection.address == address => {
+                Some(inspection.seen)
+            }
+            _ => None,
         }
-        *self.history.current()
+    }
+
+    /// Capture the card under the reader, keeping its observation while
+    /// moving between the transcript, desktop, shell and terminal.
+    pub fn card_to_inspect(&self, cx: &App) -> Option<CardInspection> {
+        if let ScreenEntry::Inspection(inspection) = self.history.current() {
+            return Some(inspection.clone());
+        }
+        let address = self.card_target(cx)?;
+        let card = self
+            .hand()
+            .cards
+            .iter()
+            .find(|card| card.address == address)?;
+        let seen = self.dealt_seen(&address).unwrap_or(card.seen);
+        Some(CardInspection { address, seen })
     }
 
     pub fn desk_in_view(&self) -> bool {
@@ -413,13 +460,35 @@ impl Frame {
         {
             return;
         }
-        self.open_with(address, None, window, cx);
+        self.open_with(address, Open::Explicit, window, cx);
     }
 
-    pub(crate) fn open_with(
+    pub fn open_inspection(
         &mut self,
         address: Address,
-        card: Option<&Card>,
+        inspection: Option<CardInspection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match inspection {
+            Some(inspection) => self.open_with(address, Open::Inspect(inspection), window, cx),
+            None => self.open(address, window, cx),
+        }
+    }
+
+    pub(crate) fn show_dealt_card(
+        &mut self,
+        card: &Card,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_with(card.address.clone(), Open::Deal(card), window, cx);
+    }
+
+    fn open_with(
+        &mut self,
+        address: Address,
+        open: Open<'_>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -435,20 +504,31 @@ impl Frame {
             self.surfaces.insert(address.clone(), surface);
         }
         let surface = self.surfaces[&address].clone();
-        if let Some(card) = card {
-            surface.show_card(card, window, cx);
-        } else {
-            surface.opened(window, cx);
-        }
+        let (entry, method) = match open {
+            Open::Deal(card) => {
+                surface.show_card(card, window, cx);
+                (
+                    ScreenEntry::Dealt(card.seen),
+                    rho_journal::SurfaceShowMethod::Deal,
+                )
+            }
+            Open::Inspect(inspection) => {
+                surface.opened(window, cx);
+                (
+                    ScreenEntry::Inspection(inspection),
+                    rho_journal::SurfaceShowMethod::Open,
+                )
+            }
+            Open::Explicit => {
+                surface.opened(window, cx);
+                (ScreenEntry::Opened, rho_journal::SurfaceShowMethod::Open)
+            }
+        };
         rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: journal_surface(&address),
-            method: if card.is_some() {
-                rho_journal::SurfaceShowMethod::Deal
-            } else {
-                rho_journal::SurfaceShowMethod::Open
-            },
+            method,
         });
-        self.history.show(address, card.map(|card| card.seen));
+        self.history.show(address, entry);
         if self.desk_in_view() {
             self.refresh_desk(&self.hand().clone(), false, cx);
             self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
@@ -490,12 +570,12 @@ impl Frame {
         }
         if current {
             if self.history.back().is_none() && self.history.forward().is_none() {
-                self.history.show(Self::desk_address(), None);
+                self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
             // A forgotten entry under the cursor is left on the first step
             // either way; a frame surface closes by stepping off it.
             if address.kind() == FRAME_KIND && self.current_address() == address {
-                self.history.show(Self::desk_address(), None);
+                self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
             self.settle(false, window, cx);
             self.close_overlays(window, cx);
@@ -1840,7 +1920,7 @@ mod tests {
                 frame
                     .surfaces
                     .insert(project.address.clone(), AnySurface::new(frame.desk.clone()));
-                frame.history.show(project.address, None);
+                frame.history.show(project.address, ScreenEntry::Opened);
                 assert_eq!(
                     frame.card_target(cx),
                     Some(subject.clone()),
@@ -1852,11 +1932,87 @@ mod tests {
                 frame
                     .surfaces
                     .insert(subject.clone(), AnySurface::new(card));
-                frame.history.show(subject.clone(), None);
+                frame.history.show(subject.clone(), ScreenEntry::Opened);
                 assert_eq!(
                     frame.card_in_view(cx),
                     Some(subject),
                     "a pull from the actual card can skip it"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn opening_an_agent_by_name_has_no_verdict_target(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let agent = Address::new("agent", "standing");
+                let transcript = cx.new(|cx| OpenCard(cx.focus_handle()));
+                frame
+                    .surfaces
+                    .insert(agent.clone(), AnySurface::new(transcript).for_inspection());
+                frame.open(agent, window, cx);
+                assert_eq!(frame.card_target(cx), None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_transcript_settles_the_card_as_it_was_when_dealt(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let earlier = Address::new("thread", "lab/2");
+                let inspected = Address::new("thread", "lab/7");
+                let agent = Address::new("agent", "standing");
+                for (address, inspecting) in [(&inspected, false), (&agent, true)] {
+                    let view = cx.new(|cx| OpenCard(cx.focus_handle()));
+                    let surface = AnySurface::new(view);
+                    frame.surfaces.insert(
+                        address.clone(),
+                        if inspecting {
+                            surface.for_inspection()
+                        } else {
+                            surface
+                        },
+                    );
+                }
+                let mut card = frame.card_for(&inspected, cx);
+                card.seen = Seen::Mail {
+                    message: 10,
+                    version: 11,
+                };
+                frame.open_card(card.clone(), window, cx);
+                // This is no longer the observation in the hand. Neither a
+                // later mail nor the same agent's earlier thread is the one
+                // the reader chose to inspect.
+                card.seen = Seen::Mail {
+                    message: 13,
+                    version: 13,
+                };
+                let first = frame.card_for(&earlier, cx);
+                frame.signals.hand.cards = vec![first, card];
+                let origin = frame.card_to_inspect(cx).expect("the open card waits");
+                frame.open_inspection(agent.clone(), Some(origin), window, cx);
+                assert_eq!(frame.card_target(cx), Some(inspected.clone()));
+                frame.verdict(&inspected, Verdict::Done, "done".to_owned(), window, cx);
+                assert_eq!(
+                    frame
+                        .marks()
+                        .get(&inspected)
+                        .facts()
+                        .seen_mail()
+                        .collect::<Vec<_>>(),
+                    [(10, 11)]
+                );
+                assert_eq!(frame.marks().get(&earlier).facts().seen_mail().next(), None);
+                assert_eq!(frame.current_address(), &agent, "stay on the transcript");
+                frame.open(agent, window, cx);
+                assert_eq!(
+                    frame.card_target(cx),
+                    None,
+                    "a new visit has no stale origin"
                 );
             })
             .unwrap();
@@ -1885,7 +2041,7 @@ mod tests {
             .update(cx, |frame, window, cx| {
                 let card = cx.new(|cx| OpenCard(cx.focus_handle()));
                 frame.surfaces.insert(thread.clone(), AnySurface::new(card));
-                frame.history.show(thread.clone(), None);
+                frame.history.show(thread.clone(), ScreenEntry::Opened);
                 assert!(!frame.attention.can_undo(), "the window just restarted");
                 assert!(frame.marks().get(&thread).facts().muted());
                 let mut rows = frame.verdict_rows(cx).rows;
