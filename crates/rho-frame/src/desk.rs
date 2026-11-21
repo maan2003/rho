@@ -4,6 +4,7 @@ use std::any::TypeId;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use editor::display_map::Crease;
@@ -237,7 +238,7 @@ pub(crate) struct DeskView {
     rows: DeskRows,
     project: Option<IdeaProject>,
     layout: DeskLayout,
-    text_system: Arc<WindowTextSystem>,
+    text_system: Rc<WindowTextSystem>,
 }
 
 #[derive(PartialEq, Eq)]

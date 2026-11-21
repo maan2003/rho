@@ -23,22 +23,20 @@ struct VectorSpriteVarying {
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(2) @interpolate(flat) glyph: u32,
     @location(3) @interpolate(flat) pixels_per_em: f32,
-    @location(4) clip_distances: vec4<f32>,
 }
 
 @vertex
 fn vs_vector_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> VectorSpriteVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let sprite = b_vector_sprites[instance_id];
-    let position = unit_vertex * sprite.bounds.size + sprite.bounds.origin;
+    let position = clip_to_mask(unit_vertex, sprite.bounds, sprite.content_mask).position;
 
     var out = VectorSpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position = to_device_position_impl(position);
     out.em_position = vec2<f32>(position.x - sprite.origin.x, sprite.origin.y - position.y) / sprite.font_size;
     out.color = gpui_color_to_framebuffer(sprite.color);
     out.glyph = sprite.glyph;
     out.pixels_per_em = sprite.font_size;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
     return out;
 }
 
@@ -115,9 +113,6 @@ fn vector_cast(glyph: u32, header: u32, pixel: vec2<f32>, pixels_per_em: f32, ve
 
 @fragment
 fn fs_vector_sprite(input: VectorSpriteVarying) -> @location(0) vec4<f32> {
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
     let glyph = input.glyph;
     let pixel = input.em_position;
     let bounds_min = vec2<f32>(glyph_float(glyph), glyph_float(glyph + 1u));

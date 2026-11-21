@@ -15,8 +15,7 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_runnables(false, cx);
     editor.set_show_breakpoints(false, cx);
     editor.set_show_bookmarks(false, cx);
-    editor.set_show_vertical_scrollbar(false, cx);
-    editor.set_show_horizontal_scrollbar(false, cx);
+    editor.set_show_scrollbars(false, cx);
     editor.set_offset_content(false, cx);
     editor.set_mouse_click_selection_enabled(false, cx);
     editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
@@ -53,8 +52,7 @@ pub fn configure_file(editor: &mut Editor, window: &mut Window, cx: &mut Context
     editor.set_show_runnables(false, cx);
     editor.set_show_breakpoints(false, cx);
     editor.set_show_bookmarks(false, cx);
-    editor.set_show_vertical_scrollbar(false, cx);
-    editor.set_show_horizontal_scrollbar(false, cx);
+    editor.set_show_scrollbars(false, cx);
     editor.set_offset_content(false, cx);
     editor.set_show_wrap_guides(false, cx);
     editor.set_show_indent_guides(false, cx);

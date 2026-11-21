@@ -414,7 +414,7 @@ mod tests {
         Room,
     }
 
-    fn key(notation: &str) -> Keystroke {
+    fn key(notation: &'static str) -> Keystroke {
         Keystroke::parse(notation).expect("a keystroke")
     }
 

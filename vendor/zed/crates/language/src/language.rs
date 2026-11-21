@@ -41,7 +41,7 @@ use collections::{HashMap, HashSet};
 use futures::Future;
 use futures::future::LocalBoxFuture;
 use futures::lock::OwnedMutexGuard;
-use gpui::{App, AsyncApp, Entity, EntityId, SharedString};
+use gpui::{App, AsyncApp, BackgroundExecutor, Entity, EntityId, SharedString};
 use http_client::HttpClient;
 
 pub use language_core::{
@@ -65,7 +65,8 @@ pub use language_core::{
     serialize_regex,
 };
 pub use language_registry::{
-    LanguageLoader, LanguageName, LanguageServerStatusUpdate, LoadedLanguage, ServerHealth,
+    ExtensionLanguagesUpdateOutcome, LanguageLoader, LanguageName, LanguageRegistration,
+    LanguageRegistrationStatus, LanguageServerStatusUpdate, LoadedLanguage, ServerHealth,
 };
 use lsp::{
     CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions, Uri,
@@ -105,6 +106,7 @@ pub use toolchain::{
 use tree_sitter::{self, QueryCursor};
 #[cfg(not(target_family = "wasm"))]
 use tree_sitter::{WasmStore, wasmtime};
+use util::paths::PathStyle;
 use util::rel_path::RelPath;
 
 pub use available_languages::AvailableLanguage;
@@ -600,6 +602,7 @@ impl CachedLspAdapter {
 pub trait LspAdapterDelegate: Send + Sync {
     fn show_notification(&self, message: &str, cx: &mut App);
     fn http_client(&self) -> Arc<dyn HttpClient>;
+    fn background_executor(&self) -> &BackgroundExecutor;
     fn worktree_id(&self) -> WorktreeId;
     fn worktree_root_path(&self) -> &Path;
     fn resolve_relative_path(&self, path: PathBuf) -> PathBuf;
@@ -789,6 +792,7 @@ pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
         &self,
         _command_name: &str,
         _arguments: &[serde_json::Value],
+        _path_style: PathStyle,
     ) -> Option<ClientCommand> {
         None
     }
@@ -1039,7 +1043,6 @@ pub struct FakeLspAdapter {
     pub initialization_options: Option<Value>,
     pub additional_initialization_options: HashMap<LanguageServerName, Value>,
     pub additional_workspace_configuration: HashMap<LanguageServerName, Value>,
-    pub prettier_plugins: Vec<&'static str>,
     pub disk_based_diagnostics_progress_token: Option<String>,
     pub disk_based_diagnostics_sources: Vec<String>,
     pub language_server_binary: LanguageServerBinary,
@@ -1055,6 +1058,8 @@ pub struct FakeLspAdapter {
                 + Fn(&lsp::CompletionItem, &Arc<Language>) -> Option<CodeLabel>,
         >,
     >,
+    pub label_for_symbol:
+        Option<Box<dyn 'static + Send + Sync + Fn(&Symbol, &Arc<Language>) -> Option<CodeLabel>>>,
 }
 
 pub struct Language {
@@ -1256,7 +1261,7 @@ impl Language {
         };
         let text_len = text.source_len();
         let highlights = if text_len > MAX_TEXT_HIGHLIGHT_ENTRY_BYTES {
-            Self::compute_resolved_highlights(grammar, &highlights_config.query, text)
+            self.compute_resolved_highlights(grammar, &highlights_config.query, text)
         } else {
             let key = TextHighlightKey::new(text.source_chunks(), text_len);
             match highlights_config
@@ -1270,7 +1275,7 @@ impl Language {
                     highlights_config.text_highlight_cache.insert(
                         key,
                         cached_text,
-                        Self::compute_resolved_highlights(grammar, &highlights_config.query, text),
+                        self.compute_resolved_highlights(grammar, &highlights_config.query, text),
                     )
                 }
             }
@@ -1285,13 +1290,23 @@ impl Language {
     }
 
     fn compute_resolved_highlights(
+        &self,
         grammar: &Arc<Grammar>,
         query: &tree_sitter::Query,
         text: &(impl HighlightSource + ?Sized),
     ) -> ResolvedHighlights {
         let highlight_map = grammar.highlight_map();
         let text_len = text.source_len();
-        let tree = text.parse(grammar);
+        let tree = match text.parse(grammar) {
+            Ok(tree) => tree,
+            Err(error) => {
+                log::warn!(
+                    "highlighting {} text of {text_len} bytes: {error:#}",
+                    self.name()
+                );
+                return ResolvedHighlights::default();
+            }
+        };
         let regions = with_query_cursor(|cursor| {
             cursor.set_byte_range(0..text_len);
             let mut captures = cursor.captures(query, tree.root_node(), text.text_provider());
@@ -1572,7 +1587,7 @@ impl Debug for Language {
 pub trait HighlightSource {
     fn source_len(&self) -> usize;
     fn source_chunks(&self) -> impl Iterator<Item = &str>;
-    fn parse(&self, grammar: &Grammar) -> Tree;
+    fn parse(&self, grammar: &Grammar) -> Result<Tree>;
     fn text_provider<'a>(&'a self) -> impl tree_sitter::TextProvider<&'a [u8]> + 'a;
 }
 
@@ -1585,12 +1600,12 @@ impl HighlightSource for str {
         iter::once(self)
     }
 
-    fn parse(&self, grammar: &Grammar) -> Tree {
+    fn parse(&self, grammar: &Grammar) -> Result<Tree> {
         with_parser(|parser| {
+            parser.set_language(&grammar.ts_language)?;
             parser
-                .set_language(&grammar.ts_language)
-                .expect("incompatible grammar");
-            parser.parse(self, None).unwrap()
+                .parse(self, None)
+                .context("tree-sitter returned no tree")
         })
     }
 
@@ -1608,7 +1623,7 @@ impl HighlightSource for Rope {
         self.chunks()
     }
 
-    fn parse(&self, grammar: &Grammar) -> Tree {
+    fn parse(&self, grammar: &Grammar) -> Result<Tree> {
         parse_text(grammar, self, None)
     }
 
@@ -1617,11 +1632,9 @@ impl HighlightSource for Rope {
     }
 }
 
-pub(crate) fn parse_text(grammar: &Grammar, text: &Rope, old_tree: Option<Tree>) -> Tree {
+pub(crate) fn parse_text(grammar: &Grammar, text: &Rope, old_tree: Option<Tree>) -> Result<Tree> {
     with_parser(|parser| {
-        parser
-            .set_language(&grammar.ts_language)
-            .expect("incompatible grammar");
+        parser.set_language(&grammar.ts_language)?;
         let mut chunks = text.chunks_in_range(0..text.len());
         parser
             .parse_with_options(
@@ -1632,7 +1645,7 @@ pub(crate) fn parse_text(grammar: &Grammar, text: &Rope, old_tree: Option<Tree>)
                 old_tree.as_ref(),
                 None,
             )
-            .unwrap()
+            .context("tree-sitter returned no tree")
     })
 }
 
@@ -1718,7 +1731,6 @@ impl Default for FakeLspAdapter {
             additional_initialization_options: HashMap::default(),
             additional_workspace_configuration: HashMap::default(),
             disk_based_diagnostics_sources: Vec::new(),
-            prettier_plugins: Vec::new(),
             language_server_binary: LanguageServerBinary {
                 path: "/the/fake/lsp/path".into(),
                 arguments: vec![],
@@ -1726,6 +1738,7 @@ impl Default for FakeLspAdapter {
             },
             opt_in_languages: HashSet::default(),
             label_for_completion: None,
+            label_for_symbol: None,
         }
     }
 }
@@ -1825,6 +1838,15 @@ impl LspAdapter for FakeLspAdapter {
     ) -> Option<CodeLabel> {
         let label_for_completion = self.label_for_completion.as_ref()?;
         label_for_completion(item, language)
+    }
+
+    async fn label_for_symbol(
+        &self,
+        symbol: &Symbol,
+        language: &Arc<Language>,
+    ) -> Option<CodeLabel> {
+        let label_for_symbol = self.label_for_symbol.as_ref()?;
+        label_for_symbol(symbol, language)
     }
 
     fn is_opt_in_for(&self, language: &LanguageName) -> bool {

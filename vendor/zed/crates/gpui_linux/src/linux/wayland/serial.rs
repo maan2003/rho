@@ -1,4 +1,5 @@
 use collections::HashMap;
+use wayland_client::{Proxy, protocol::wl_surface};
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum SerialKind {
@@ -27,32 +28,59 @@ impl SelectionSerial {
     }
 }
 
+/// The user interaction an `xdg_activation_v1` token request must reference.
+#[derive(Clone, Debug)]
+pub(crate) struct ActivationContext {
+    pub(crate) serial: Serial,
+    pub(crate) requesting_surface: wl_surface::WlSurface,
+}
+
+#[derive(Clone, Debug)]
+struct Press {
+    serial: Serial,
+    focused_surface: Option<wl_surface::WlSurface>,
+}
+
 #[derive(Debug)]
 /// Helper for tracking of different serial kinds.
 pub(crate) struct SerialTracker {
     serials: HashMap<SerialKind, Serial>,
-    selection_serial: Option<SelectionSerial>,
+    latest_press: Option<Press>,
 }
 
 pub(crate) struct SerialSnapshot {
     kind: SerialKind,
     serial: Option<Serial>,
-    selection_serial: Option<SelectionSerial>,
+    latest_press: Option<Press>,
 }
 
 impl SerialTracker {
     pub fn new() -> Self {
         Self {
             serials: HashMap::default(),
-            selection_serial: None,
+            latest_press: None,
         }
     }
 
     pub fn update(&mut self, kind: SerialKind, value: u32) {
+        self.update_with_focused_surface(kind, value, None);
+    }
+
+    /// Like [`Self::update`], but for key and pointer presses also records the surface
+    /// that had focus, which activation token requests must name alongside the serial.
+    pub fn update_with_focused_surface(
+        &mut self,
+        kind: SerialKind,
+        value: u32,
+        focused_surface: Option<wl_surface::WlSurface>,
+    ) {
         let serial = Serial(value);
 
         if matches!(&kind, SerialKind::KeyPress | SerialKind::MousePress) {
-            self.selection_serial = Some(SelectionSerial(serial));
+            self.latest_press = Some(Press {
+                serial,
+                focused_surface,
+            });
         }
 
         self.serials.insert(kind, serial);
@@ -60,12 +88,12 @@ impl SerialTracker {
 
     pub fn update_scoped(&mut self, kind: SerialKind, value: u32) -> SerialSnapshot {
         let serial = self.serials.get(&kind).copied();
-        let selection_serial = self.selection_serial;
+        let latest_press = self.latest_press.clone();
         self.update(kind, value);
         SerialSnapshot {
             kind,
             serial,
-            selection_serial,
+            latest_press,
         }
     }
 
@@ -75,7 +103,7 @@ impl SerialTracker {
         } else {
             self.serials.remove(&snapshot.kind);
         }
-        self.selection_serial = snapshot.selection_serial;
+        self.latest_press = snapshot.latest_press;
     }
 
     /// Returns the latest tracked serial of the provided [`SerialKind`].
@@ -86,7 +114,22 @@ impl SerialTracker {
     }
 
     pub fn selection_serial(&self) -> Option<SelectionSerial> {
-        self.selection_serial
+        self.latest_press
+            .as_ref()
+            .map(|press| SelectionSerial(press.serial))
+    }
+
+    /// Returns the latest press if a still-alive surface had focus when it arrived.
+    pub fn activation_context(&self) -> Option<ActivationContext> {
+        let press = self.latest_press.as_ref()?;
+        let surface = press
+            .focused_surface
+            .as_ref()
+            .filter(|surface| surface.is_alive())?;
+        Some(ActivationContext {
+            serial: press.serial,
+            requesting_surface: surface.clone(),
+        })
     }
 }
 

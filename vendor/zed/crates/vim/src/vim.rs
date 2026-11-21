@@ -83,10 +83,6 @@ struct Number(usize);
 
 #[derive(Clone, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
-struct SelectRegister(String);
-
-#[derive(Clone, Deserialize, JsonSchema, PartialEq, Action)]
-#[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
 struct PushObject {
     around: bool,
@@ -206,8 +202,6 @@ actions!(
         Tab,
         /// Inserts a newline.
         Enter,
-        /// Selects inner text object.
-        InnerObject,
         /// Maximizes the current pane.
         MaximizePane,
         /// Resets all pane sizes to default.
@@ -1195,6 +1189,9 @@ impl Vim {
                     }
                     _ => {
                         vim.update_editor(cx, |_, editor, cx| editor.paste(&Paste, window, cx));
+                        if vim.mode == Mode::HelixSelect {
+                            vim.switch_mode(Mode::HelixNormal, true, window, cx);
+                        }
                     }
                 },
             );

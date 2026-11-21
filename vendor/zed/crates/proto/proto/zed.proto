@@ -100,7 +100,7 @@ message Envelope {
     UpdateBuffer update_buffer = 60;
     UpdateBufferFile update_buffer_file = 61;
     SaveBuffer save_buffer = 62;
-    SaveBufferChecked save_buffer_checked = 496;
+    SaveBufferChecked save_buffer_checked = 505;
     BufferSaved buffer_saved = 63;
     BufferReloaded buffer_reloaded = 64;
     ReloadBuffers reload_buffers = 65;
@@ -466,13 +466,6 @@ message Envelope {
     KillKernel kill_kernel = 428;
     GitRemoveWorktree git_remove_worktree = 431;
     GitRenameWorktree git_rename_worktree = 432;
-    GitCreateCheckpoint git_create_checkpoint = 433;
-    GitCreateCheckpointResponse git_create_checkpoint_response = 434;
-    GitRestoreCheckpoint git_restore_checkpoint = 435;
-    GitCompareCheckpoints git_compare_checkpoints = 436;
-    GitCompareCheckpointsResponse git_compare_checkpoints_response = 437;
-    GitDiffCheckpoints git_diff_checkpoints = 438;
-    GitDiffCheckpointsResponse git_diff_checkpoints_response = 439;
     GitGetHeadSha git_get_head_sha = 440;
     GitGetHeadShaResponse git_get_head_sha_response = 441;
     GitRepairWorktrees git_repair_worktrees = 442;
@@ -526,7 +519,15 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
-    // current max: 496
+    GetGlobalSkills get_global_skills = 496;
+    GetGlobalSkillsResponse get_global_skills_response = 497;
+    GlobalSkillsChanged global_skills_changed = 498;
+    CreateGlobalSkill create_global_skill = 499;
+    CreateGlobalSkillResponse create_global_skill_response = 500;
+    TrashGlobalSkill trash_global_skill = 501;
+    ResolveGlobalSkillPath resolve_global_skill_path = 502;
+    ResolveGlobalSkillPathResponse resolve_global_skill_path_response = 503;
+    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504; // current max: 505
   }
 
   reserved 87 to 88;
@@ -555,6 +556,7 @@ message Envelope {
   reserved 211 to 216, 232 to 233;
   reserved 397 to 398;
   reserved 406 to 408;
+  reserved 433 to 439;
 }
 
 message Hello {
@@ -589,7 +591,8 @@ enum ErrorCode {
   RemoteUpgradeRequired = 17;
   RateLimitExceeded = 18;
   CommitFailed = 19;
-  SaveConflict = 20;
+  AlreadyExists = 20;
+  SaveConflict = 21;
   reserved 6;
   reserved 14 to 15;
 }

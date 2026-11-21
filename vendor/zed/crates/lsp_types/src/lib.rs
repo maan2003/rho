@@ -1224,8 +1224,12 @@ pub struct DocumentFilter {
     pub scheme: Option<String>,
 
     /// A glob pattern, like `*.{ts,js}`.
+    ///
+    /// @since 3.18.0 - support for relative patterns. Whether clients support
+    /// relative patterns depends on the client capability
+    /// `textDocument.filters.relativePatternSupport`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
+    pub pattern: Option<GlobPattern>,
 }
 
 /// A document selector is the combination of one or many document filters.
@@ -1766,12 +1770,30 @@ pub struct TextDocumentClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<DiagnosticClientCapabilities>,
 
+    /// Defines which filters the client supports.
+    ///
+    /// @since 3.18.0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<TextDocumentFilterClientCapabilities>,
+
     /// Capabilities specific to the `textDocument/inlineCompletion` request.
     ///
     /// @since 3.18.0
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg(feature = "proposed")]
     pub inline_completion: Option<InlineCompletionClientCapabilities>,
+}
+
+/// @since 3.18.0
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextDocumentFilterClientCapabilities {
+    /// The client supports relative patterns in the `pattern` of document
+    /// filters.
+    ///
+    /// @since 3.18.0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_pattern_support: Option<bool>,
 }
 
 /// Where ClientCapabilities are currently empty:
@@ -2972,6 +2994,30 @@ mod tests {
         test_serialization(&NumberOrString::Number(123), r#"123"#);
 
         test_serialization(&NumberOrString::String("abcd".into()), r#""abcd""#);
+    }
+
+    #[test]
+    fn document_filter_pattern() {
+        test_serialization(
+            &DocumentFilter {
+                language: Some("json".into()),
+                scheme: None,
+                pattern: Some(GlobPattern::String("**/package.json".into())),
+            },
+            r#"{"language":"json","pattern":"**/package.json"}"#,
+        );
+
+        test_serialization(
+            &DocumentFilter {
+                language: None,
+                scheme: Some("file".into()),
+                pattern: Some(GlobPattern::Relative(RelativePattern {
+                    base_uri: OneOf::Right("file:///project".parse().unwrap()),
+                    pattern: "**/*.toml".into(),
+                })),
+            },
+            r#"{"scheme":"file","pattern":{"baseUri":"file:///project","pattern":"**/*.toml"}}"#,
+        );
     }
 
     #[test]

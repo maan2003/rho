@@ -1265,7 +1265,6 @@ mod test {
         state::Mode::{self},
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use language;
 
     #[gpui::test]
     async fn test_h(cx: &mut gpui::TestAppContext) {

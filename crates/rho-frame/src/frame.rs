@@ -917,7 +917,7 @@ impl Frame {
                 binding
                     .keystrokes()
                     .iter()
-                    .map(|key| key.unparse())
+                    .map(|key| key.unparse(cx.platform_info().os))
                     .collect::<Vec<_>>()
                     .join(" ")
             })
