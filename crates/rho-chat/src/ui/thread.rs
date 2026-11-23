@@ -649,11 +649,7 @@ impl ThreadView {
         let start = buffer.point_to_offset(Point::new(row, 0));
         let end = buffer.point_to_offset(Point::new(row, buffer.line_len(row)));
         let line: String = buffer.text_for_range(start..end).collect();
-        let column = cursor.column as usize;
-        links(&line)
-            .into_iter()
-            .find(|link| link.start <= column && column < link.end)
-            .and_then(|link| url::Url::parse(&line[link]).ok())
+        link_at_column(&line, cursor.column as usize).and_then(|url| url::Url::parse(url).ok())
     }
 
     fn item_row(&self, key: &Key, cx: &App) -> Option<u32> {
@@ -1836,6 +1832,71 @@ fn links(text: &str) -> Vec<Range<usize>> {
         at = start + length.max(scheme.len());
     }
     found
+}
+
+/// Closing `)` of a Markdown link destination, allowing balanced parentheses
+/// inside the URL and rejecting whitespace.
+fn markdown_link_end(rest: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, character) in rest.char_indices() {
+        if character.is_whitespace() {
+            return None;
+        }
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(index);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The web URL at `column` on `line`: either a Markdown `[label](https://...)`
+/// link (whose destination `rho_window::markdown` conceals) or a bare URL.
+fn link_at_column(line: &str, column: usize) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while let Some(open) = line[at..].find('[') {
+        let open = at + open;
+        let rest = &line[open + 1..];
+        let Some(close_rel) = rest.find(']') else {
+            break;
+        };
+        let label = &rest[..close_rel];
+        if let Some(inner) = label.rfind('[') {
+            at = open + 1 + inner;
+            continue;
+        }
+        let close = open + 1 + close_rel;
+        if bytes.get(close + 1) == Some(&b'(')
+            && let Some(end_rel) = markdown_link_end(&line[close + 2..])
+        {
+            let target = &line[close + 2..close + 2 + end_rel];
+            let scheme = ["https://", "http://"]
+                .into_iter()
+                .find(|scheme| target.starts_with(scheme));
+            let end = close + 2 + end_rel + 1;
+            if let Some(scheme) = scheme
+                && target.len() > scheme.len()
+                && open <= column
+                && column < end
+            {
+                return Some(target);
+            }
+            at = end;
+            continue;
+        }
+        at = close + 1;
+    }
+    links(line)
+        .into_iter()
+        .find(|link| link.start <= column && column < link.end)
+        .map(|link| &line[link])
 }
 
 fn message_item(
@@ -3258,5 +3319,40 @@ mod tests {
         let text = "https://x.y/a https://x.y/b";
         let found: Vec<&str> = links(text).into_iter().map(|link| &text[link]).collect();
         assert_eq!(found, ["https://x.y/a", "https://x.y/b"]);
+    }
+
+    #[test]
+    fn link_at_column_opens_markdown_and_bare_web_links() {
+        let line = "see [PR #125](https://github.com/o/r/pull/125) and https://example.com/a";
+        let label_start = line.find("PR").unwrap();
+        let label_end = line.find(']').unwrap() - 1;
+        assert_eq!(link_at_column(line, label_start - 2), None);
+        assert_eq!(
+            link_at_column(line, label_start),
+            Some("https://github.com/o/r/pull/125")
+        );
+        assert_eq!(
+            link_at_column(line, label_end),
+            Some("https://github.com/o/r/pull/125")
+        );
+        assert_eq!(link_at_column(line, line.find("and").unwrap()), None);
+        assert_eq!(
+            link_at_column(line, line.find("https://example.com").unwrap()),
+            Some("https://example.com/a")
+        );
+        // Non-web links are ignored; an unmatched `[` before a link does not
+        // swallow it.
+        let tricky = "[note [commit](https://github.com/o/r/commit/abc) and [file](file:///tmp/a)";
+        assert_eq!(
+            link_at_column(tricky, tricky.find("commit").unwrap()),
+            Some("https://github.com/o/r/commit/abc")
+        );
+        assert_eq!(link_at_column(tricky, tricky.find("file]").unwrap()), None);
+        // Balanced parentheses in URLs (e.g. Wikipedia) are preserved.
+        let parens = "see [Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) now";
+        assert_eq!(
+            link_at_column(parens, parens.find("Rust").unwrap()),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+        );
     }
 }
