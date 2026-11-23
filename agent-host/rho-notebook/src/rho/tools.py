@@ -167,43 +167,49 @@ class Mail:
     def join(self, thread):
         """Follow later mail in `thread` and under it. Direct mail is
         delivered only to its addressee."""
+        thread = rho_mail.ident(thread)
         self._thread(thread)
-        rho_mail.join(int(thread), self._agent)
-        return report(f"Joined #{int(thread)}.")
+        rho_mail.join(thread, self._agent)
+        return report(f"Joined #{thread}.")
 
     def leave(self, thread):
         """Stop receiving `thread`'s messages; a mention still reaches you."""
+        thread = rho_mail.ident(thread)
         self._thread(thread)
-        rho_mail.leave(int(thread), self._agent)
-        return report(f"Left #{int(thread)}.")
+        rho_mail.leave(thread, self._agent)
+        return report(f"Left #{thread}.")
 
     def name(self, thread, name):
         """Give a thread you are in a name."""
+        thread = rho_mail.ident(thread)
         self._member(thread)
-        rho_mail.name(self._agent, int(thread), str(name))
-        return report(f"Named #{int(thread)}.")
+        rho_mail.name(self._agent, thread, str(name))
+        return report(f"Named #{thread}.")
 
     def move(self, message, to):
         """Move a message of a thread you are in, and the thread under it,
         into thread `to`."""
-        record = rho_mail.message(int(message))
+        message, to = rho_mail.ident(message), rho_mail.ident(to)
+        record = rho_mail.message(message)
         if record is None:
-            raise ValueError(f"no message #{int(message)}")
+            raise ValueError(f"no message #{message}")
         self._member(rho_mail.thread_of(record))
         self._thread(to)
-        rho_mail.reparent(self._agent, int(message), int(to))
-        return report(f"Moved #{int(message)} to #{int(to)}.")
+        rho_mail.reparent(self._agent, message, to)
+        return report(f"Moved #{message} to #{to}.")
 
     def _thread(self, thread):
-        head = rho_mail.thread(int(thread))
+        thread = rho_mail.ident(thread)
+        head = rho_mail.thread(thread)
         if head is None:
-            raise ValueError(f"no thread #{int(thread)}")
+            raise ValueError(f"no thread #{thread}")
         return head
 
     def _member(self, thread):
+        thread = rho_mail.ident(thread)
         head = self._thread(thread)
         if self._agent not in head["agents"]:
-            raise ValueError(f"you are not in #{int(thread)}: join it first")
+            raise ValueError(f"you are not in #{thread}: join it first")
         return head
 
     def read(self, id, last=20):
@@ -283,7 +289,7 @@ class Chat(Mail):
         rho_mail.join(thread, self._agent)
         return _MessageId(thread)
 
-    def start(self, project, text, kind):
+    def start(self, project, text, kind="message"):
         """Start and follow a thread with a message."""
         if kind != "message":
             raise ValueError("a thread starts with a message; post a flash in an existing thread")
@@ -295,6 +301,9 @@ class Chat(Mail):
         rho_mail.join(thread, self._agent)
         print(f"Started #{thread}.")
         return _MessageId(thread)
+
+    def __repr__(self):
+        return "<chat>"
 
 
 
@@ -410,8 +419,8 @@ class Agents(Messages):
         child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
             f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
-            f"results will arrive by mail. It works in {cwd}. Follow up with "
-            f"mail.send({label(child.id)!r}, text)."
+            f"results will arrive as a message. It works in {cwd}. Follow up with "
+            f"agents.message(agent_id={label(child.id)!r}, message=text)."
         )
 
     def spawn_new_advisor(self, msg):
@@ -424,7 +433,7 @@ class Agents(Messages):
         advisor = self._spawn(advisor_runtime(me.runtime), props, str(msg))
         return report(
             f"Advisor {label(advisor.id)} is considering the question. Its answer will arrive "
-            f"by mail."
+            f"as a message."
         )
 
     def cancel(self, *, agent_id):
@@ -465,8 +474,10 @@ class UserAgents(Agents):
             thread = _origin_root(me.props)
             if thread is None:
                 raise ValueError("you were not started from a thread; pass thread=")
-        elif rho_mail.thread(int(thread)) is None:
-            raise ValueError(f"no thread #{int(thread)}")
+        else:
+            thread = rho_mail.ident(thread)
+            if rho_mail.thread(thread) is None:
+                raise ValueError(f"no thread #{thread}")
         self._check_depth()
         message = rho_mail.send(me.id, rho_mail.USER, str(prompt), thread=thread, ping=False)
         rho_mail.name(me.id, message, str(task_name))

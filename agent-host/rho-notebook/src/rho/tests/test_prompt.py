@@ -14,6 +14,7 @@ from rho.prompt import render, template
 
 GPT, CLAUDE = "gpt", "claude"
 
+
 def gpt(name, team="", owned="", context=""):
     return render(template(GPT, name), team, owned, context)
 
@@ -30,29 +31,50 @@ class Templates(unittest.TestCase):
     def test_engineer_chat_contract(self):
         for family in [GPT, CLAUDE]:
             text = render(template(family, "engineer"), "", "", "")
-            acting = between(text, "Acting and talking", "Before ending a turn")
+            acting = between(text, "Acting and talking", "How time works")
             for rule in [
                 "chat.send(text, kind, *, thread) → int",
-                "chat.start(project, text, kind) → int",
+                "chat.start(project, text) → int",
                 "chat.fork(message, text, kind) → int",
                 "does the user need to read this?",
-                "It makes a card on their desk and stays in the record.",
-                "It never makes a card.",
-                "once something newer exists in the thread",
-                "edit it with new findings",
-                "read the thread with `chat.read`",
-                "Say what you answer in the first line",
-                "under `## proof`",
-                "last output lines verbatim in a code block",
-                "a screenshot if the change is visible",
-                "Another agent is reached with `agents.message`, never through chat.",
+                "creates a card on the user's desk",
+                "It never makes a card",
+                "disappears 20 minutes after posting",
+                "update it with `chat.edit(id, text)`",
+                "never before replying in a thread you are already reading",
+                "Never flash and proceed on irreversible or shared-state actions",
+                "Simplified Technical English (ASD-STE100)",
+                "agents.message(*, agent_id, message) → Awaitable[str]",
             ]:
                 self.assertIn(rule, acting, family)
-            for obsolete in ["mail.", "human.", "message_agent", "chat.direct", "ping=", "replace_last", "reply_to", "## recap"]:
+            for obsolete in [
+                "mail.",
+                "human.",
+                "message_agent",
+                "chat.direct",
+                "ping=",
+                "replace_last",
+                "reply_to",
+                "## recap",
+                "long or irreversible",
+                "Before you send or edit a message to the user, read the thread",
+                r"\(...\)",
+                "@thread-actors",
+            ]:
                 self.assertNotIn(obsolete, text, family)
-            communication = text.split("# Communication", 1)[1] if family == CLAUDE else text.split("## Working with the user", 1)[1]
-            self.assertIn("A result message must be fully self-contained", communication, family)
-            self.assertIn('for kind="message"; flashes are plain prose and the host does not check them', communication, family)
+            communication = (
+                text.split("# Communication", 1)[1]
+                if family == CLAUDE
+                else text.split("## Working with the user", 1)[1]
+            )
+            for rule in [
+                "Lead with the answer or outcome in the first line.",
+                "Keep result messages self-contained",
+                "`## proof`",
+                "last output lines verbatim in a code block",
+                "src/rho/tools.py:270-274",
+            ]:
+                self.assertIn(rule, communication, family)
 
     def test_every_template_fills_its_slots(self):
         for family in [GPT, CLAUDE]:
@@ -74,7 +96,7 @@ class Templates(unittest.TestCase):
             "## Autonomy And Persistence", "## Engineering Principles", "## Discovery Discipline",
             "## Verification", "## Actions Requiring Explicit Approval", "## Acting and talking",
             "## How time works", "## The notebook", "## Working with other agents",
-            "## Working with the user", "## Diagrams",
+            "## Working with the user",
         ])
         discovery = between(text, "## Discovery Discipline", "## Verification")
         self.assertIn("web.run", discovery)
@@ -83,16 +105,20 @@ class Templates(unittest.TestCase):
         collaboration = between(text, "## Working with other agents", "## Working with the user")
         self.assertTrue(collaboration.startswith("\n\nTEAM_SENTINEL\n\n"))
         self.assertLess(collaboration.index("### Advisor"), collaboration.index("### Engineers"))
-        for needle in ["agents.spawn_new_advisor(msg: str)", "agents.spawn_new_engineer(*, task_name:",
-                       "task_name is a short kebab-case label", "agents.cancel(",
-                       "loads applicable AGENTS.md guidance and the skill catalogue",
-                       "Without an explicit request, do NOT consult the Advisor for:"]:
+        for needle in [
+            "agents.spawn_new_advisor(msg: str)",
+            "agents.spawn_new_engineer(*, task_name:",
+            "task_name",
+            "agents.cancel(",
+            "loads applicable `AGENTS.md` files and skills automatically",
+            "do NOT consult the Advisor for routine self-review",
+        ]:
             self.assertIn(needle, collaboration)
-        self.assertIn('chat.send(text, kind, *, thread) → int', text)
-        self.assertNotIn('mail.status', text)
+        self.assertIn("chat.send(text, kind, *, thread) → int", text)
+        self.assertNotIn("mail.status", text)
         self.assertNotIn("Post passing progress", text)
-        self.assertIn("A kept message cannot contain a sentence of more than 25 words", text)
-        self.assertIn("it reports back to you with `agents.message`.", text)
+        self.assertIn("sentence over 25 words", text)
+        self.assertIn("it reports back with `agents.message`", text)
         self.assertIn("Task.from_session_id(session_id: int) → Task", text)
         self.assertIn("def papercut(", text)
         self.assertTrue(text.endswith("WORKSPACE_SENTINEL"))
@@ -100,14 +126,22 @@ class Templates(unittest.TestCase):
             self.assertNotIn(gone, text)
 
     def test_advisor_prompt_has_only_its_capabilities(self):
-        text = gpt("advisor", "TEAM_SENTINEL\n\n")
-        self.assertIn("## Working with other agents\n\nTEAM_SENTINEL\n\n", text)
-        self.assertIn("focused result with mail.send", text)
-        self.assertIn("mail.send(agent, text, *, reply_to=None) → int", text)
-        self.assertIn("Use `mail.send` when a known agent has context", text)
-        for forbidden in ["spawn_new_advisor", "spawn_new_engineer", "agents.cancel(*", "human.",
-                          "archive()", "## Diagrams", "chat.direct"]:
-            self.assertNotIn(forbidden, text)
+        for family in [GPT, CLAUDE]:
+            text = render(template(family, "advisor"), "TEAM_SENTINEL\n\n", "", "")
+            self.assertIn("Working with other agents\n\nTEAM_SENTINEL\n\n", text, family)
+            self.assertIn("agents.message(*, agent_id: str, message: str) → Awaitable[str]", text, family)
+            for forbidden in [
+                "mail.send",
+                "spawn_new_advisor",
+                "spawn_new_engineer",
+                "agents.cancel(*",
+                "human.",
+                "archive()",
+                "Diagrams",
+                "chat.direct",
+                "chat.send",
+            ]:
+                self.assertNotIn(forbidden, text, family)
 
     def test_a_child_keeps_the_engineering_policy_and_reports_to_its_parent(self):
         text = gpt("child", "TEAM_SENTINEL\n\n", "", "WORKSPACE_SENTINEL")
@@ -118,28 +152,41 @@ class Templates(unittest.TestCase):
             "## How time works", "## The notebook", "## Working with other agents",
             "## Reporting to your parent",
         ])
-        self.assertIn("Your parent agent sees only what you\nsend it with mail.send, not your code", text)
-        for forbidden in ["human.", "archive()", "spawn_new_advisor", "spawn_new_engineer", "chat.direct"]:
-            self.assertNotIn(forbidden, text)
+        for family in [GPT, CLAUDE]:
+            child = render(template(family, "child"), "TEAM_SENTINEL\n\n", "", "")
+            self.assertIn("agents.message(*, agent_id: str, message: str) → Awaitable[str]", child, family)
+            self.assertIn("parent sees only what you send with `agents.message`", child, family)
+            for forbidden in [
+                "mail.send",
+                "human.",
+                "archive()",
+                "spawn_new_advisor",
+                "spawn_new_engineer",
+                "chat.direct",
+                "chat.send",
+            ]:
+                self.assertNotIn(forbidden, child, family)
 
     def test_engineer_delegation_rules_in_both_families(self):
         for text in [gpt("engineer"), claude_t("engineer")]:
             self.assertIn(" Engineers\n\n```python\nagents.spawn_new_engineer(", text)
-            self.assertLess(text.index("agents.spawn_new_engineer("), text.index("When to use an Engineer:"))
+            self.assertLess(text.index("agents.spawn_new_engineer("), text.index("Use an Engineer only when:"))
             communication = text.split("# Working with other agents", 1)[1]
-            for rule in ["say whether another reply is needed",
-                         "Stop exchanging messages when\nthe requested work is complete",
-                         "do not create acknowledgment loops"]:
+            for rule in [
+                "state whether another reply is needed",
+                "Stop once the work is complete",
+                "no acknowledgment loops",
+            ]:
                 self.assertIn(rule, communication)
         for text in [gpt("advisor"), claude_t("advisor")]:
-            self.assertNotIn("When to use an Engineer:", text)
+            self.assertNotIn("Use an Engineer only when:", text)
 
     def test_claude_transport_wording(self):
         for name in ["engineer", "child", "advisor"]:
             text = claude_t(name)
-            self.assertIn("only the first exec call in a\nresponse runs", text)
+            self.assertIn("only the first `exec` call in a response runs", text)
             self.assertNotIn("mcp__py__exec", text)
-            self.assertIn("The check-in comes 120 seconds after your last response", text)
+            self.assertIn("The check-in arrives 120 seconds after your last response", text)
 
 
 class Sections(unittest.TestCase):
@@ -219,10 +266,10 @@ class Instructions(unittest.TestCase):
     def test_a_direct_native_engineer_gets_the_gpt_engineer_prompt_whole(self):
         agent = self.agent(native(), preset="engineer")
         team = (
-            f"You are the primary agent in a team of agents collaborating to fulfill the user\'s goals. Your agent id is eng-{agent.id}."
-            "\n\nYou were started directly and own the user\'s technical outcome."
+            f"You are the primary agent in a team of agents collaborating to fulfill the user's goals. Your agent id is eng-{agent.id}."
+            "\n\nYou were started directly and own the user's technical outcome."
             "\n\nAnother agent's message to you arrives in this format:\n```\n[message from <agent id>]\n<text>\n```"
-            '\n\nReply with `agents.message(agent_id=sender, message=text)`, where `sender` is the agent ID from the header.\n\n'
+            '\n\nReply with `agents.message(agent_id=sender, message=text)`, where `sender` is the agent ID from the header. Agent messages never ping the user.\n\n'
         )
         context = (
             prompt.workspace(self.dir.name, self.cwd, True)
@@ -245,10 +292,22 @@ class Instructions(unittest.TestCase):
         for runtime in [native(), claude()]:
             child = self.agent(runtime, preset="child", parent=parent.id)
             text = prompt.instructions(child)
-            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with mail.send('eng-{parent.id}', text).", text)
+            self.assertIn(
+                f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\n"
+                f"Messages from your parent define your task. Report to your parent with "
+                f"`agents.message(agent_id='eng-{parent.id}', message=text)`.",
+                text,
+            )
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
-            for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
-                              "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
+            for forbidden in [
+                "mail.send",
+                "human.",
+                "archive()",
+                "agents.spawn_new_engineer(*",
+                "## Diagrams",
+                "agents.spawn_user_owned_engineer",
+                "Engineers the user manages",
+            ]:
                 self.assertNotIn(forbidden, text)
 
     def test_an_advisor_reports_its_analysis(self):
@@ -259,13 +318,15 @@ class Instructions(unittest.TestCase):
             self.assertIn(
                 f"Your agent id is adv-{advisor.id}; your parent agent is eng-{parent.id}."
                 "\n\nMessages from your parent define your task. Report to your parent with "
-                f"mail.send('eng-{parent.id}', text)."
-                f"\n\nComplete your independent analysis and send it to your parent with mail.send('eng-{parent.id}', text). "
+                f"`agents.message(agent_id='eng-{parent.id}', message=text)`."
+                "\n\nComplete your independent analysis and send it to your parent with "
+                f"`agents.message(agent_id='eng-{parent.id}', message=text)`. "
                 "Ask a known agent for context the same way, and end your turn when blocked on a reply.\n",
                 text,
             )
             self.assertIn("[message from <agent id>]", text)
-            self.assertEqual(text.count("the user can read it one level down and never gets a card from it."), 1)
+            self.assertEqual(text.count("Agent messages never ping the user."), 1)
+            self.assertNotIn("mail.send", text)
             self.assertNotIn("agents.spawn_user_owned_engineer", text)
 
     def test_only_agents_the_user_manages_may_start_engineers_for_the_user(self):
@@ -275,16 +336,17 @@ class Instructions(unittest.TestCase):
         for agent in [direct, owned]:
             text = prompt.instructions(agent)
             self.assertIn(signature, text)
-            self.assertLess(text.index("# Engineers\n"), text.index(signature))
+            self.assertLess(text.index("## Engineers\n"), text.index(signature))
             self.assertIn("chat.send(text, kind, *, thread)", text)
             self.assertNotIn("mail.send", text)
-        note = (f"Engineer eng-{direct.id} started you for the user; if you need more context, "
-                f"ask it with agents.message(agent_id='eng-{direct.id}', message=text). You own the user\'s technical outcome.")
+        note = (
+            f"Engineer eng-{direct.id} started you for the user; if you need more context, "
+            f"ask it with agents.message(agent_id='eng-{direct.id}', message=text). You own the user's technical outcome."
+        )
         self.assertIn(note, prompt.instructions(owned))
         self.assertNotIn("started you for the user", prompt.instructions(direct))
         native_text = gpt("engineer", "", template(GPT, "user-owned-engineers"))
         self.assertLess(native_text.index("### Engineers\n"), native_text.index("### Engineers the user manages"))
-        self.assertLess(native_text.index("### Engineers the user manages"), native_text.index("### Briefing and integrating work"))
 
     def test_a_missing_working_directory_still_gets_instructions(self):
         gone = os.path.join(self.dir.name, "gone")

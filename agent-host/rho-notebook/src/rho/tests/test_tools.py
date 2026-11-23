@@ -63,7 +63,7 @@ class Tools(WorksetCase):
         brief = self.state.messages[-1]
         self.assertEqual((brief["sender"], brief["mentions"], brief["text"]), (self.root, [(child, "direct")], "Fix it."))
         self.assertEqual(self.state.messages[0]["text"], "Agent mail")
-        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive by mail. It works in {work}. Follow up with mail.send(\'eng-{child}\', text).')
+        self.assertEqual(reply, f'Spawned agent eng-{child} for task "fix-it". It is working now; its results will arrive as a message. It works in {work}. Follow up with agents.message(agent_id=\'eng-{child}\', message=text).')
         self.assertEqual(printed, reply + "\n")
         self.assertEqual(asyncio.run(_await(reply)), reply)
         # The child holds its brief.
@@ -105,7 +105,7 @@ class Tools(WorksetCase):
             "props": {"name": "advisor", "preset": "advisor", "parent": self.root, "cwd": self.tmp},
         })
         self.assertEqual(self.state.messages[-1]['mentions'], [(adv, 'direct')])
-        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive by mail.")
+        self.assertEqual(reply, f"Advisor adv-{adv} is considering the question. Its answer will arrive as a message.")
 
     def test_spawn_user_owned_engineer(self):
         ns, _ = self.notebook(self.root)
@@ -251,6 +251,35 @@ class Tools(WorksetCase):
             self.assertEqual(ns["mail"].send("user", "Old update.", thread=thread, ping=False), 53)
             old_post.assert_called_once_with(self.root, thread, "Old update.", to="user",
                                              ping=False, reply_to=None, replace_last=False)
+
+    def test_chat_start_defaults_to_message_and_thread_methods_accept_hash_ids(self):
+        ns, _ = self.notebook(self.root)
+        chat = ns["chat"]
+        self.assertEqual(repr(chat), "<chat>")
+        with self.assertRaisesRegex(ValueError, "starts with a message"):
+            chat.start("ops", "Flashing.", "flash")
+        _, started = run(lambda: chat.start("ops", "Starting."))
+        self.assertEqual(fake_rho.message(started)["text"], "Starting.")
+        self.assertEqual(fake_rho.thread(started)["agents"], [self.root])
+
+        other = fake_rho.post_user(None, "other")
+        reply = fake_rho.post_user(started, "Note.")
+        run(lambda: chat.leave(f"#{started}"))
+        self.assertEqual(fake_rho.thread(started)["agents"], [])
+        run(lambda: chat.join(f"#{started}"))
+        self.assertEqual(fake_rho.thread(started)["agents"], [self.root])
+        run(lambda: chat.name(f"#{started}", "Renamed"))
+        self.assertEqual(fake_rho.thread(started)["name"], "Renamed")
+        run(lambda: chat.move(f"#{reply}", f"#{other}"))
+        self.assertEqual(fake_rho.message(reply)["parent"], other)
+        with self.assertRaisesRegex(ValueError, "expected a mail id"):
+            chat.join("#-1")
+
+        # spawn_user_owned_engineer accepts `#id` for thread= as well.
+        run(lambda: ns["agents"].spawn_user_owned_engineer(
+            task_name="side", prompt="Do side work.", thread=f"#{other}",
+        ))
+        self.assertEqual(self.state.messages[-1]["parent"], other)
 
     def test_agent_message_addresses_only_the_other_agent(self):
         advisor = add_agent(self.state, native(), preset="advisor", parent=self.root, cwd=self.tmp)
