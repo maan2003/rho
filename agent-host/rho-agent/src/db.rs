@@ -156,12 +156,7 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
 /// What a runtime's usage is billed as.
 pub fn usage_model_of(runtime: &Runtime) -> AgentUsageModel {
     match runtime {
-        Runtime::Native { model, .. } => match model {
-            crate::inference::config::InferenceModel::Astra => AgentUsageModel::ASTRA,
-            crate::inference::config::InferenceModel::Terra => AgentUsageModel::TERRA,
-            crate::inference::config::InferenceModel::Sol => AgentUsageModel::GPT,
-            crate::inference::config::InferenceModel::Hydrogen => AgentUsageModel::HYDROGEN,
-        },
+        Runtime::Native { model, .. } => AgentUsageModel::native(*model),
         Runtime::Claude { model, .. } => match model {
             rho_claude::Model::Opus => AgentUsageModel::OPUS,
             rho_claude::Model::Fable | rho_claude::Model::Sonnet | rho_claude::Model::Haiku => {

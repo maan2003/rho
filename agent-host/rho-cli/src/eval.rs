@@ -26,10 +26,10 @@ pub(crate) struct EvalArgs {
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
     /// Engineer runtime. mini-eng runs GPT-6.1 Terra, med-eng GPT-6.2 Sol,
-    /// high-eng GPT-6.2 Astra, hydrogen-eng Gemini 4 Hydrogen through the
+    /// high-eng GPT-6.2 Astra, hydrogen-eng and neon-eng Gemini 4 through the
     /// host's Antigravity login; opus-eng and fable-eng run Claude Code and
     /// need --claude-accounts. Every runtime works in the Python notebook.
-    #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "hydrogen-eng", "opus-eng", "fable-eng"])]
+    #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng", "hydrogen-eng", "neon-eng", "opus-eng", "fable-eng"])]
     pub role: String,
     /// The policy function that makes the agent, as a draft names it: the
     /// default policy's `new_agent`, or one --init defines.
@@ -87,6 +87,7 @@ fn role_runtime(role: &str) -> snippets::Runtime {
         "med-eng" => "sol-medium",
         "high-eng" => "astra-high",
         "hydrogen-eng" => "hydrogen-high",
+        "neon-eng" => "neon-high",
         "opus-eng" => "opus-medium",
         "fable-eng" => "fable-medium",
         _ => unreachable!("clap validates evaluation roles"),
@@ -606,6 +607,7 @@ mod tests {
             "med-eng",
             "high-eng",
             "hydrogen-eng",
+            "neon-eng",
             "opus-eng",
             "fable-eng",
         ]
@@ -617,6 +619,7 @@ mod tests {
                 "sol-medium",
                 "astra-high",
                 "hydrogen-high",
+                "neon-high",
                 "opus-medium",
                 "fable-medium"
             ]

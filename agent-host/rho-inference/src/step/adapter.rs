@@ -14,7 +14,7 @@ impl agent::Backend for crate::Inference {
         model: agent::InferenceModel,
     ) -> agent::InferenceSession {
         match model {
-            agent::InferenceModel::Hydrogen => {
+            agent::InferenceModel::Hydrogen | agent::InferenceModel::Neon => {
                 crate::gemini::Session::new(self.clone(), profile, model)
             }
             agent::InferenceModel::Sol

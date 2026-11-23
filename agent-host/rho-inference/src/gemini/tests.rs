@@ -98,10 +98,10 @@ fn a_call_replays_signed_and_its_report_answers_it_by_id() {
         request["toolConfig"]["functionCallingConfig"]["mode"],
         "AUTO"
     );
-    // Gemini has no `xhigh`: it refuses the request.
+    // Hydrogen must not send `xhigh` in its thinking config.
     assert_eq!(
-        request["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-        "high"
+        request["generationConfig"]["thinkingConfig"],
+        json!({"thinkingLevel": "high"})
     );
     assert_eq!(request["sessionId"], CacheKey::from_u128(7).to_string());
     assert_eq!(
@@ -109,6 +109,35 @@ fn a_call_replays_signed_and_its_report_answers_it_by_id() {
         CacheKey::from_u128(7).to_string()
     );
     assert_eq!(body(&items)["model"], "gemini-4-hydrogen-sonar");
+}
+
+#[test]
+fn neon_matches_antigravity_thinking_config_for_each_effort() {
+    for (effort, id, thinking_level) in [
+        (ReasoningEffort::Low, "gemini-4-neon-low", json!("LOW")),
+        (
+            ReasoningEffort::Medium,
+            "gemini-4-neon-medium",
+            json!("MEDIUM"),
+        ),
+        (ReasoningEffort::High, "gemini-4-neon-high", json!("HIGH")),
+        (ReasoningEffort::Xhigh, "gemini-4-neon-xhigh", json!(100)),
+    ] {
+        let request = wire::body(
+            InferenceModel::Neon,
+            effort,
+            "aicode-consumers",
+            "be brief",
+            &[user("compute")],
+            CacheKey::from_u128(7),
+        );
+        assert_eq!(request["model"], id);
+        assert_eq!(
+            request["request"]["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts": true, "thinkingLevel": thinking_level}),
+            "{id}"
+        );
+    }
 }
 
 /// Gemini may call several times in one answer. Only the first is kept, in
@@ -167,21 +196,37 @@ fn a_compaction_summary_replaces_the_history_before_it() {
         report("done", &first.carry),
         Item::CompactionTrigger,
     ];
-    let request = body(&before);
+    let normal = body(&before[..3]);
+    let request = &body(&before)["request"];
     assert_eq!(
-        request["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+        request["toolConfig"]["functionCallingConfig"]["mode"],
         "NONE"
     );
-    let asked = request["request"]["contents"].as_array().unwrap();
+    for field in [
+        "systemInstruction",
+        "tools",
+        "generationConfig",
+        "sessionId",
+    ] {
+        assert_eq!(request[field], normal["request"][field], "{field}");
+    }
+    let asked = request["contents"].as_array().unwrap();
     let last = asked.last().unwrap();
     assert_eq!(last["role"], "user");
     assert!(last["parts"][0].get("functionResponse").is_some());
-    assert!(
-        last["parts"][1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("summary")
-    );
+    let prompt = last["parts"][1]["text"].as_str().unwrap();
+    for heading in [
+        "Task and constraints",
+        "Progress and evidence",
+        "Current state",
+        "Next steps",
+    ] {
+        assert!(
+            prompt.contains(heading),
+            "missing handoff section: {heading}"
+        );
+    }
+    assert!(prompt.contains("Do not call tools"));
 
     let summary = json!({"response": {"candidates": [{"content": {"parts": [
         {"text": "Task: X. Done: work(). Next: verify."}]}, "finishReason": "STOP"}]}});

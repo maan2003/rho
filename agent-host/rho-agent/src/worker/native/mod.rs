@@ -1432,12 +1432,7 @@ fn inference_session(
     model: InferenceModel,
     profile: InferenceProfile,
 ) -> (InferenceSession, String) {
-    let billed = match model {
-        InferenceModel::Astra => crate::log::AgentUsageModel::ASTRA,
-        InferenceModel::Terra => crate::log::AgentUsageModel::TERRA,
-        InferenceModel::Sol => crate::log::AgentUsageModel::GPT,
-        InferenceModel::Hydrogen => crate::log::AgentUsageModel::HYDROGEN,
-    };
+    let billed = crate::log::AgentUsageModel::native(model);
     (inference.session(profile, model), billed.name().to_owned())
 }
 

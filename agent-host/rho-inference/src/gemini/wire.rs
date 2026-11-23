@@ -24,12 +24,19 @@ const FOREIGN_COMPACTION: &str =
     "Your context was compacted by another model. What came before it is not available.";
 const UNPAIRED: &str = "Exec output, not from the user:\n";
 const NO_OUTPUT: &str = "(no output)";
-const COMPACT: &str = "Stop work for a moment. Your context is about to be replaced by a \
-summary that you write now. Write it for yourself: you will continue from it alone, without \
-the conversation. Include the task and its requirements as the user stated them, what is done \
-and how it was verified, the current state of the files and running work, decisions and their \
-reasons, and the exact next steps. Keep exact names, paths, commands, ids and numbers. Do not \
-call any tool. Answer with the summary only.";
+const COMPACT: &str = "Write a concise handoff for the next context window. It will have this \
+summary instead of the conversation above. Do not call tools or continue the task. Return only \
+the summary, with these headings:
+
+- Task and constraints: The user's requested outcome, success criteria, scope, and commitments. \
+Separate the user's requirements from your assumptions.
+- Progress and evidence: What changed, what you verified, and what remains unverified. Keep the \
+file paths, IDs, commands, and results needed to resume. Include failed approaches only if they \
+affect the next step.
+- Current state: Work in flight, relevant session or job IDs, decisions and their reasons, and \
+blockers or unanswered questions.
+- Next steps: The remaining actions in order, including checks and cleanup. If the task is \
+complete, say so.";
 
 #[derive(Serialize, Deserialize)]
 struct Replay {
@@ -67,7 +74,7 @@ fn call_of(carry: &Carry) -> Option<Option<String>> {
 }
 
 fn thinking_level(effort: ReasoningEffort) -> &'static str {
-    // Gemini has no level above `high`.
+    // Hydrogen uses the standard thinking config, which has no `xhigh`.
     match effort {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
@@ -210,8 +217,27 @@ pub(super) fn body(
         contents.user(COMPACT.into(), &[]);
     }
     contents.close();
+    let (model_id, thinking_config) = if model == InferenceModel::Neon {
+        // Antigravity sends both the catalog ID and the level. On its JSON
+        // wire, Extra High is a numeric enum value, not a string.
+        let level = match effort {
+            ReasoningEffort::Low => json!("LOW"),
+            ReasoningEffort::Medium => json!("MEDIUM"),
+            ReasoningEffort::High => json!("HIGH"),
+            ReasoningEffort::Xhigh => json!(100),
+        };
+        (
+            format!("{}-{}", model.as_str(), effort.as_str()),
+            json!({"includeThoughts": true, "thinkingLevel": level}),
+        )
+    } else {
+        (
+            model.as_str().to_owned(),
+            json!({"thinkingLevel": thinking_level(effort)}),
+        )
+    };
     json!({
-        "model": model.as_str(),
+        "model": model_id,
         "project": project,
         "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
         "userAgent": "antigravity",
@@ -232,9 +258,9 @@ pub(super) fn body(
                 },
             }]}],
             "toolConfig": {"functionCallingConfig": {"mode": if compacting { "NONE" } else { "AUTO" }}},
-            "generationConfig": {"thinkingConfig": {"thinkingLevel": thinking_level(effort)}},
             // Cloud Code caches a prompt prefix per session.
             "sessionId": cache_key.to_string(),
+            "generationConfig": {"thinkingConfig": thinking_config},
         },
     })
 }

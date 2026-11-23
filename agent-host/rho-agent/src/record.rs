@@ -204,6 +204,7 @@ impl Runtime {
                 InferenceModel::Terra => "terra",
                 InferenceModel::Astra => "astra",
                 InferenceModel::Hydrogen => "hydrogen",
+                InferenceModel::Neon => "neon",
             },
             Self::Claude { model, .. } => match model {
                 rho_claude::Model::Fable => "fable",

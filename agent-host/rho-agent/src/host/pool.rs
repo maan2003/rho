@@ -1768,6 +1768,7 @@ fn models() -> Vec<Runtime> {
         InferenceModel::Terra,
         InferenceModel::Astra,
         InferenceModel::Hydrogen,
+        InferenceModel::Neon,
     ]
     .map(|model| Runtime::Native {
         model,

@@ -19,6 +19,18 @@ impl AgentUsageModel {
     pub const LUNA: Self = Self(5);
     pub const ASTRA: Self = Self(7);
     pub const HYDROGEN: Self = Self(8);
+    pub const NEON: Self = Self(9);
+
+    pub(crate) fn native(model: crate::inference::config::InferenceModel) -> Self {
+        use crate::inference::config::InferenceModel;
+        match model {
+            InferenceModel::Sol => Self::GPT,
+            InferenceModel::Terra => Self::TERRA,
+            InferenceModel::Astra => Self::ASTRA,
+            InferenceModel::Hydrogen => Self::HYDROGEN,
+            InferenceModel::Neon => Self::NEON,
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -29,6 +41,7 @@ impl AgentUsageModel {
             Self::LUNA => "luna",
             Self::ASTRA => "astra",
             Self::HYDROGEN => "hydrogen",
+            Self::NEON => "neon",
             _ => "unknown",
         }
     }
@@ -43,6 +56,7 @@ impl AgentUsageModel {
             Self::LUNA,
             Self::ASTRA,
             Self::HYDROGEN,
+            Self::NEON,
         ]
         .into_iter()
         .find(|model| model.name() == name)

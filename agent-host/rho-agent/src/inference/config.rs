@@ -40,6 +40,8 @@ pub enum InferenceModel {
     /// Gemini 4 Hydrogen, through an Antigravity account. `-sonar` is the
     /// slug the free tier may call.
     Hydrogen,
+    /// Gemini 4 Neon, through an Antigravity account.
+    Neon,
 }
 
 impl InferenceModel {
@@ -49,6 +51,7 @@ impl InferenceModel {
             Self::Terra => "gpt-6.1-terra",
             Self::Astra => "gpt-6.2-astra",
             Self::Hydrogen => "gemini-4-hydrogen-sonar",
+            Self::Neon => "gemini-4-neon",
         }
     }
 }

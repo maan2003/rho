@@ -89,7 +89,7 @@ pub struct RuntimeLabel(String);
 
 /// The models each runtime kind offers, and the efforts each takes, as
 /// `_rho.pyi` lists them.
-const NATIVE_MODELS: [&str; 4] = ["sol", "terra", "astra", "hydrogen"];
+const NATIVE_MODELS: [&str; 5] = ["sol", "terra", "astra", "hydrogen", "neon"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -100,13 +100,14 @@ const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// The default is the runtime the user picks for agents they start from a
 /// message: `opus-high`, decided once here rather than learned, so a start
 /// that asks nothing still runs where the user would have put it.
-pub const RUNTIMES: [&str; 7] = [
+pub const RUNTIMES: [&str; 8] = [
     "opus-high",
     "sol-medium",
     "sol-high",
     "terra-medium",
     "astra-high",
     "hydrogen-high",
+    "neon-high",
     "fable-high",
 ];
 

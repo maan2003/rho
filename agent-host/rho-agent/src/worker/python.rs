@@ -1432,6 +1432,7 @@ fn spec_from_py(spec: &Bound<'_, PyDict>, current: Option<&AgentSpec>) -> PyResu
                 "terra" => InferenceModel::Terra,
                 "astra" => InferenceModel::Astra,
                 "hydrogen" => InferenceModel::Hydrogen,
+                "neon" => InferenceModel::Neon,
                 _ => return Err(PyValueError::new_err(format!("no native model {model:?}"))),
             };
             let effort = match effort.as_str() {

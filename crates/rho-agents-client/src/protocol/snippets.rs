@@ -221,6 +221,13 @@ mod tests {
         assert!(Runtime::parse("sol").is_err());
         assert_eq!(cycle_runtime("sol-medium"), "sol-high");
         assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
+        assert_eq!(cycle_runtime("hydrogen-high"), "neon-high");
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let runtime = Runtime::parse(&format!("neon-{effort}")).unwrap();
+            assert_eq!(runtime.kind(), RuntimeKind::Rho);
+            assert_eq!((runtime.model(), runtime.effort()), ("neon", effort));
+        }
+        assert!(Runtime::parse("neon-max").is_err());
         assert_eq!(DEFAULT_RUNTIME, "opus-high");
         assert_eq!(parse_runtime("").unwrap().label(), "opus-high");
         assert_eq!(
