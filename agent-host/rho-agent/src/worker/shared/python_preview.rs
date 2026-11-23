@@ -1,6 +1,6 @@
-//! Preview the literal text of a live `mail.send("user", …)` call. Only
-//! a literal user destination can appear here; peer mail stays in its
-//! own thread even while it is being written.
+//! Preview the literal text of a live `chat.send(…)` or `mail.send("user", …)`
+//! call. Only user-bound posts appear here; peer messages stay in their own
+//! thread even while they are being written.
 
 use tree_sitter::{Node, Parser};
 
@@ -39,7 +39,8 @@ pub(crate) fn tool_preview(
 /// A literal thread keyword may already be available as the call streams.
 fn post_thread(parser: &mut Parser, source: &str) -> Option<rho_agent_types::MessageId> {
     let tree = parser.parse(source, None)?;
-    let at = last_send(tree.root_node(), source)? + SEND.len();
+    let (at, kind) = last_send(tree.root_node(), source)?;
+    let at = at + kind.len();
     let rest = source[at..].trim_start().strip_prefix('(')?;
     // Parse what is already complete: topic-like text inside the body
     // never chooses the draft's destination.
@@ -81,15 +82,17 @@ pub(crate) fn preview(parser: &mut Parser, source: &str) -> Option<String> {
     let original = parser.parse(source, None)?;
     let mut starts = Vec::new();
     string_starts(original.root_node(), &mut starts);
-    let latest_send = last_send(original.root_node(), source)?;
-    let rest = source[latest_send + SEND.len()..]
+    let (latest_send, kind) = last_send(original.root_node(), source)?;
+    let rest = source[latest_send + kind.len()..]
         .trim_start()
         .strip_prefix('(')?
         .trim_start();
-    let rest = rest
-        .strip_prefix("\"user\"")
-        .or_else(|| rest.strip_prefix("'user'"))?;
-    rest.trim_start().strip_prefix(',')?;
+    if kind == SendKind::Mail {
+        let rest = rest
+            .strip_prefix("\"user\"")
+            .or_else(|| rest.strip_prefix("'user'"))?;
+        rest.trim_start().strip_prefix(',')?;
+    }
     for start in starts
         .into_iter()
         .rev()
@@ -217,10 +220,31 @@ fn pending_closing_quotes(source: &str, content_start: usize, quote: u8) -> usiz
     }
 }
 
-const SEND: &str = "mail.send";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendKind {
+    Chat,
+    Mail,
+}
+
+impl SendKind {
+    fn from_callee(callee: &str) -> Option<Self> {
+        match callee {
+            "chat.send" => Some(Self::Chat),
+            "mail.send" => Some(Self::Mail),
+            _ => None,
+        }
+    }
+
+    const fn len(self) -> usize {
+        match self {
+            Self::Chat => "chat.send".len(),
+            Self::Mail => "mail.send".len(),
+        }
+    }
+}
 
 /// Whether the literal at `start_at` is in a post that is finished but
-/// not shaped as a message: a post is a topic, the text, then keywords.
+/// not shaped as a message.
 fn finished_post_at(node: Node<'_>, source: &str, start_at: usize) -> bool {
     if node.kind() == "call"
         && !node.has_error()
@@ -228,7 +252,8 @@ fn finished_post_at(node: Node<'_>, source: &str, start_at: usize) -> bool {
         && source.as_bytes().get(node.end_byte().saturating_sub(1)) == Some(&b')')
         && node
             .child_by_field_name("function")
-            .is_some_and(|callee| &source[callee.byte_range()] == SEND)
+            .and_then(|callee| SendKind::from_callee(&source[callee.byte_range()]))
+            .is_some()
     {
         return true;
     }
@@ -237,12 +262,18 @@ fn finished_post_at(node: Node<'_>, source: &str, start_at: usize) -> bool {
         .any(|child| finished_post_at(child, source, start_at))
 }
 
-fn last_send(node: Node<'_>, source: &str) -> Option<usize> {
-    let mut latest = (node.kind() == "attribute" && &source[node.byte_range()] == SEND)
-        .then_some(node.start_byte());
+fn last_send(node: Node<'_>, source: &str) -> Option<(usize, SendKind)> {
+    let mut latest = (node.kind() == "attribute")
+        .then(|| SendKind::from_callee(&source[node.byte_range()]))
+        .flatten()
+        .map(|kind| (node.start_byte(), kind));
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        latest = latest.max(last_send(child, source));
+        if let Some(found) = last_send(child, source)
+            && latest.is_none_or(|(at, _)| found.0 > at)
+        {
+            latest = Some(found);
+        }
     }
     latest
 }
@@ -371,22 +402,32 @@ fn send_string<'a>(
         )
         && node.parent()?.kind() == "expression_statement"
         && node.parent()?.parent()?.kind() == "module"
-        && node
+        && let Some(kind) = node
             .child_by_field_name("function")
-            .is_some_and(|callee| &source[callee.byte_range()] == SEND)
+            .and_then(|callee| SendKind::from_callee(&source[callee.byte_range()]))
     {
         let args = node.child_by_field_name("arguments")?;
-        // A destination, the text, then only keywords.
+        // `mail.send(to, text, **kw)` has 2 positional args then keywords;
+        // `chat.send(text, kind, *, thread)` has text first, optional
+        // positional kind, then keywords.
         let mut cursor = args.walk();
         let keywords_only = args
             .named_children(&mut cursor)
             .skip(2)
             .all(|child| child.kind() == "keyword_argument");
-        let topic = args
+        let first = args
             .named_child(0)
-            .is_some_and(|topic| topic.kind() != "keyword_argument");
-        if args.named_child_count() >= 2 && topic && keywords_only {
-            let arg = args.named_child(1)?;
+            .is_some_and(|arg| arg.kind() != "keyword_argument");
+        let text_arg = match kind {
+            SendKind::Mail if args.named_child_count() >= 2 && first && keywords_only => {
+                args.named_child(1)
+            }
+            SendKind::Chat if args.named_child_count() >= 1 && first && keywords_only => {
+                args.named_child(0)
+            }
+            _ => None,
+        };
+        if let Some(arg) = text_arg {
             if !arg.has_error() {
                 if synthetic_boundary.is_some()
                     && arg.kind() == "string"
@@ -814,6 +855,74 @@ mod tests {
             }
             if visible {
                 assert!(draft.is_some(), "lost Claude draft at {prefix:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn previews_chat_send_while_streaming_and_completed() {
+        use rho_agent_types::{ChatSeq, MessageId};
+        use rho_agents_client::protocol::transcript::ArgumentsFormat;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        for (source, expected) in [
+            ("chat.send('Hel", Some("Hel")),
+            ("chat.send(\"Fixed it.\", \"mes", Some("Fixed it.")),
+            (
+                "chat.send(\"Fixed it.\", \"message\", thread=12)",
+                Some("Fixed it."),
+            ),
+            (
+                "chat.send(\"Checking logs.\", \"flash\", thread='#12')",
+                Some("Checking logs."),
+            ),
+            (
+                "chat.send(\"Hi \" + name, \"message\", thread=12)",
+                Some("Hi "),
+            ),
+            (
+                "chat.send('old', 'flash', thread=12)\nchat.send('new",
+                Some("new"),
+            ),
+            ("chat.send('bad', 'message', extra)", None),
+            (
+                "if False:\n    chat.send('untaken', 'message', thread=12)",
+                None,
+            ),
+        ] {
+            assert_eq!(
+                preview(&mut parser, source).as_deref(),
+                expected,
+                "{source:?}"
+            );
+        }
+        let draft = tool_preview(
+            "exec",
+            "chat.send('Hello', 'message', thread='#41')",
+            ArgumentsFormat::Text,
+        )
+        .unwrap();
+        assert_eq!(draft.thread, Some(MessageId(ChatSeq(41))));
+        assert_eq!(draft.text, "Hello");
+
+        // Streaming JSON prefix for chat.send must never drop a visible draft
+        // while streaming kind/thread.
+        let source = "chat.send(\"\"\"First line.\nSecond line.\"\"\", \"message\", thread=12)";
+        let arguments = serde_json::json!({"source": source}).to_string();
+        let mut visible = false;
+        for (i, _) in arguments
+            .char_indices()
+            .chain(std::iter::once((arguments.len(), '\0')))
+        {
+            let prefix = &arguments[..i];
+            let draft = tool_preview("mcp__py__exec", prefix, ArgumentsFormat::Json);
+            if draft.is_some() {
+                visible = true;
+            }
+            if visible {
+                assert!(draft.is_some(), "lost chat.send draft at {prefix:?}");
             }
         }
     }

@@ -223,7 +223,6 @@ mod prior_ping {
                     event: ChatEvent::Posted {
                         parent: None,
                         reply_to: None,
-                        thread_reply: None,
                         from: Address::User,
                         content: vec![ContentPart::Text {
                             text: format!("mail {key}"),

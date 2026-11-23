@@ -1036,11 +1036,6 @@ async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_t
             None,
         )
         .unwrap();
-    assert_eq!(
-        write.mail_writer(second),
-        Some(b),
-        "a reply can still identify the writer"
-    );
     assert!(
         !write.expire_flash(later, second),
         "the post emits one tombstone, not two"
@@ -1049,6 +1044,11 @@ async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_t
 
     let read = db.read();
     assert!(read.flash_deadlines().is_empty());
+    assert_eq!(
+        read.message(second).unwrap().from,
+        Address::Agent(b),
+        "a reply can still identify the writer"
+    );
     assert_eq!(read.message(first).unwrap().revision, Revision::Deleted);
     assert_eq!(read.message(second).unwrap().revision, Revision::Deleted);
     assert_eq!(read.message(third).unwrap().text(), "Try a second clock");
