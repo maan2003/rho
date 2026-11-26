@@ -418,12 +418,8 @@ pub struct BuildIdentity {
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct DealerPolicySnapshot {
-    pub queue_floor: f64,
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
-    /// The expiry of result cards in older sessions; zero when expiry is
-    /// disabled.
-    pub fyi_reply_pace_days: f64,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,
@@ -1060,7 +1056,8 @@ mod tests {
         assert!(error.to_string().contains("exit the GUI"));
     }
 
-    /// A session recorded with the retired channel policy still decodes.
+    /// A session recorded with the retired channel policy, the deal floor
+    /// and result expiry still decodes.
     #[test]
     fn a_policy_with_retired_fields_still_decodes() {
         use bytes::BytesMut;
@@ -1102,7 +1099,7 @@ mod tests {
 
         let mut bytes = buffer.freeze();
         let policy = DealerPolicySnapshot::decode(&mut bytes).unwrap();
-        assert_eq!(policy.fyi_reply_pace_days, 3.0);
+        assert_eq!(policy.blocked_reply_slope_per_day, 12.0);
         assert_eq!(policy.skip_cooldown_minutes, 15);
     }
 
@@ -1114,10 +1111,8 @@ mod tests {
                 git_commit: Some("deadbeef".into()),
             },
             dealer_policy: DealerPolicySnapshot {
-                queue_floor: 1.0,
                 blocked_reply_head_start: 2.0,
                 blocked_reply_slope_per_day: 3.0,
-                fyi_reply_pace_days: 4.0,
                 skip_cooldown_minutes: 6,
                 lamp_threshold: 7.0,
                 chime_threshold: 8.0,

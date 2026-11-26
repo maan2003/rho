@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use jiff::{Timestamp, Zoned};
 
 use crate::address::Address;
-use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
+use crate::curve::{self, Curve};
 use crate::facts::{Seen, Snooze};
 use crate::marks::Marks;
 
@@ -111,7 +111,7 @@ impl Card {
     }
 }
 
-/// Every card above the floor, in deal order, and when the hand
+/// Every card, in deal order, and when the hand
 /// next changes with nobody touching anything.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hand {
@@ -263,26 +263,6 @@ pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, mut trace: Trace) -> (Han
     (hand, trace)
 }
 
-/// Waiting mail is a queue, not a competition between pressure scores.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum DealOrder {
-    Overdue,
-    Waiting(Timestamp),
-    Other,
-}
-
-impl Part {
-    fn deal_order(&self, now: Timestamp) -> DealOrder {
-        match (self.curve, self.kind) {
-            (Curve::Deadline { by, .. }, _) if by < now => DealOrder::Overdue,
-            (Curve::Waiting { since, .. }, CardKind::Waits | CardKind::Stop(_)) => {
-                DealOrder::Waiting(since)
-            }
-            _ => DealOrder::Other,
-        }
-    }
-}
-
 fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) -> Hand {
     let at = now.timestamp();
     let marks = sources.marks;
@@ -388,9 +368,7 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         {
             for part in address_parts.iter_mut().filter(|part| part.from_source) {
                 match &mut part.curve {
-                    Curve::Waiting { since, .. } | Curve::Fading { since, .. }
-                        if *since < snooze.until =>
-                    {
+                    Curve::Waiting { since, .. } if *since < snooze.until => {
                         *since = snooze.until;
                     }
                     _ => {}
@@ -403,15 +381,12 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         let Some((part, priority)) = address_parts
             .iter()
             .map(|part| (part, part.curve.priority(at) + part.bonus))
-            .filter(|(_, priority)| *priority > DEAL_QUEUE_FLOOR)
+            // A deadline not yet in view has no pressure at all.
+            .filter(|(_, priority)| *priority > f64::NEG_INFINITY)
             .max_by(|a, b| a.1.total_cmp(&b.1))
         else {
             if let Some(trace) = trace.as_deref_mut() {
-                let best = address_parts
-                    .iter()
-                    .map(|part| part.curve.priority(at) + part.bonus)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                trace.outcome(&address, format!("no card: below the floor at {best:.3}"));
+                trace.outcome(&address, "no card: a deadline not yet in view".to_owned());
             }
             continue;
         };
@@ -443,7 +418,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
             .unwrap_or_else(|| name(sources, &address));
         cards.push((
             skip.map(|(skipped, _)| skipped),
-            part.deal_order(at),
             Card {
                 title,
                 context,
@@ -457,29 +431,24 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
             },
         ));
     }
-    // A skip is a turn at the back, not a lower score: a card waiting for
-    // hours outscores any fixed penalty, and skipping went back and forth
-    // between the same two cards. Skipped cards go behind the rest, the
-    // longest-skipped first, so every card is dealt once before any comes
-    // round again.
-    cards.sort_by(|(a_skipped, a_order, a), (b_skipped, b_order, b)| {
+    // The highest priority deals first: waiting rises with age, so nothing
+    // starves, and a thread the user just wrote in comes ahead of mail that
+    // has waited less than its bonus is worth (A1, A7). A skip is a turn at
+    // the back, not a lower score: a card waiting for hours outscores any
+    // fixed penalty, and skipping went back and forth between the same two
+    // cards. Skipped cards go behind the rest, the longest-skipped first,
+    // so every card is dealt once before any comes round again (X2).
+    cards.sort_by(|(a_skipped, a), (b_skipped, b)| {
         match (a_skipped, b_skipped) {
-            (Some(a_skipped), Some(b_skipped)) => a_skipped
-                .cmp(b_skipped)
-                .then_with(|| a.address.cmp(&b.address)),
+            (Some(a_skipped), Some(b_skipped)) => a_skipped.cmp(b_skipped),
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
-            (None, None) => a_order
-                .cmp(b_order)
-                .then_with(|| match a_order {
-                    DealOrder::Overdue | DealOrder::Other => b.priority.total_cmp(&a.priority),
-                    _ => Ordering::Equal,
-                })
-                .then_with(|| a.address.cmp(&b.address)),
+            (None, None) => b.priority.total_cmp(&a.priority),
         }
+        .then_with(|| a.address.cmp(&b.address))
     });
     Hand {
-        cards: cards.into_iter().map(|(_, _, card)| card).collect(),
+        cards: cards.into_iter().map(|(_, card)| card).collect(),
         next_change: steps.into_iter().filter(|step| *step > at).min(),
     }
 }

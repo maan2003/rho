@@ -1432,7 +1432,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn queuing_a_reply_settles_only_its_ask_on_this_device(cx: &mut gpui::TestAppContext) {
+    fn queuing_a_reply_settles_the_thread_through_what_it_saw_on_this_device(
+        cx: &mut gpui::TestAppContext,
+    ) {
         use rho_agent_types::{ChatEvent, ChatRecord, Mention};
         let host = EndpointId([3; 32]);
         let thread = ThreadId {
@@ -1440,11 +1442,13 @@ mod tests {
             message: MessageId(ChatSeq(2)),
         };
         let first = MessageId(ChatSeq(3));
-        let dealt_first = MessageVersion {
-            message: first,
-            version: first.0,
-        };
         let second = MessageId(ChatSeq(4));
+        // The card as it was read: both asks in view, the newer answered.
+        let read = MessageVersion {
+            message: second,
+            version: second.0,
+        };
+        let third = MessageId(ChatSeq(6));
         let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let record = |id: MessageId, from: Party, parent, thread_reply, mentions| ChatRecord {
             seq: id.0,
@@ -1488,22 +1492,20 @@ mod tests {
         let (_, mail, _db) = search_bench::fixture(cx, log);
         cx.update(|cx| {
             mail.update(cx, |mail, cx| {
+                // How far the waiting card reads the thread, if one waits.
                 let dealt = |mail: &ChatSystem, cx: &App| {
                     let claims = mail.claims(&Marks::default(), Timestamp::now(), None, cx);
-                    assert_eq!(claims.len(), 1);
-                    cards::attention_mail(claims[0].seen)
+                    assert!(claims.len() <= 1);
+                    claims.first().map(|claim| claim.seen)
                 };
-                assert_eq!(dealt(mail, cx), Some(first));
+                let waiting = Some(rho_dealer::facts::Seen::Topic(second.0.0));
+                assert_eq!(dealt(mail, cx), waiting);
                 let words = "Keep the reference clock.";
-                let id = mail.reply(thread, Some(dealt_first), words.into(), cx);
-                assert_eq!(dealt(mail, cx), Some(second));
+                let id = mail.reply(thread, Some(read), words.into(), cx);
+                assert_eq!(dealt(mail, cx), None, "both asks were in view");
                 assert_eq!(mail.outbox.next(host).unwrap().0, id);
                 mail.outbox.failed(host);
-                assert_eq!(
-                    dealt(mail, cx),
-                    Some(second),
-                    "a lost connection is not a refusal"
-                );
+                assert_eq!(dealt(mail, cx), None, "a lost connection is not a refusal");
                 assert_eq!(mail.outbox.next(host).unwrap().0, id);
                 let refusal = RpcAnswer::Failed {
                     reason: "the thread moved".into(),
@@ -1512,7 +1514,7 @@ mod tests {
                     panic!("a host refusal must not be retried as a transport error");
                 };
                 mail.refuse_reply(host, reason, cx);
-                assert_eq!(dealt(mail, cx), Some(first));
+                assert_eq!(dealt(mail, cx), waiting);
                 let retained = mail.local_under(host, Some(thread.message));
                 assert_eq!(retained.len(), 1);
                 assert_eq!(rho_agent_types::content_text(&retained[0].content), words);
@@ -1525,24 +1527,36 @@ mod tests {
                 assert!(mail.outbox.next(host).is_none());
                 // The successful path must not briefly redeal the same mail
                 // when the receipt arrives before the host's log.
-                let second_attempt = mail.reply(thread, Some(dealt_first), words.into(), cx);
+                let second_attempt = mail.reply(thread, Some(read), words.into(), cx);
                 assert_eq!(mail.outbox.next(host).unwrap().0, second_attempt);
                 let logged = MessageId(ChatSeq(5));
                 mail.outbox.posted(host, logged);
                 mail.finish_posted(host, cx);
-                assert_eq!(dealt(mail, cx), Some(second));
+                assert_eq!(dealt(mail, cx), None);
                 mail.logs.get_mut(&host).unwrap().tell(&record(
                     logged,
                     Party::User,
                     Some(thread.message),
                     Some(rho_agent_types::ThreadReply {
-                        settles: Some(dealt_first),
+                        settles: Some(read),
                     }),
                     vec![],
                 ));
                 mail.finish_posted(host, cx);
-                assert_eq!(dealt(mail, cx), Some(second));
+                assert_eq!(dealt(mail, cx), None);
                 assert_eq!(mail.local_under(host, Some(thread.message)).len(), 1);
+                // Mail after what the reply saw deals again.
+                mail.logs.get_mut(&host).unwrap().tell(&record(
+                    third,
+                    Party::Agent(agent),
+                    Some(thread.message),
+                    None,
+                    vec![Mention::User { ping: true }],
+                ));
+                assert_eq!(
+                    dealt(mail, cx),
+                    Some(rho_dealer::facts::Seen::Topic(third.0.0))
+                );
             })
         });
     }

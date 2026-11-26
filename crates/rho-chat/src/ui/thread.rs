@@ -974,7 +974,10 @@ impl ThreadView {
             .clone()
             .with_seen(thread.address(), cx, move |seen, cx| {
                 system.update(cx, |system, cx| {
-                    system.reply(thread, seen.and_then(cards::card_version), text, cx);
+                    let settles = seen.and_then(|seen| {
+                        cards::answered(system.host_chat(thread.host)?, thread.message, seen)
+                    });
+                    system.reply(thread, settles, text, cx);
                     system.set_draft(thread.host, Some(thread.message), String::new());
                     cx.emit(Event::DraftSent(thread));
                 });
@@ -1274,7 +1277,11 @@ impl ThreadView {
     }
 
     fn chosen_work<'a>(&self, dealt: Option<Seen>, cx: &'a App) -> Option<(AgentId, &'a Message)> {
-        self.authored_mail(cards::card_version(dealt?)?.message, cx)
+        let chat = self.system.read(cx).host_chat(self.thread.host)?;
+        self.authored_mail(
+            cards::answered(chat, self.thread.message, dealt?)?.message,
+            cx,
+        )
     }
 
     fn work_participants<'a>(

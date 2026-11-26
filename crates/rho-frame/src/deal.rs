@@ -503,11 +503,9 @@ impl Frame {
 pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
     use rho_dealer::curve::*;
     rho_journal::DealerPolicySnapshot {
-        queue_floor: DEAL_QUEUE_FLOOR,
         skip_cooldown_minutes: SKIP_HOLD.as_mins(),
         blocked_reply_head_start: AGENT_BLOCKED_HEAD_START,
         blocked_reply_slope_per_day: WAITING_SLOPE_PER_DAY,
-        fyi_reply_pace_days: 0.0, // Results no longer fade.
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,

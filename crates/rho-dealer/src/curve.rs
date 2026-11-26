@@ -8,9 +8,9 @@
 
 use jiff::{SignedDuration, Timestamp};
 
-/// A card at or under this is not dealt at all.
-pub const DEAL_QUEUE_FLOOR: f64 = -1.0;
-/// Someone waiting on the user rises this much a day.
+/// Someone waiting on the user rises this much a day: half a unit an
+/// hour, so a thread left waiting overtakes a newer one in the end and
+/// none starves.
 pub const WAITING_SLOPE_PER_DAY: f64 = 12.0;
 /// A project mail addressed to the user: an ask, result, or stop.
 pub const AGENT_BLOCKED_HEAD_START: f64 = 1.0;
@@ -25,16 +25,17 @@ pub const SKIP_HOLD: SignedDuration = SignedDuration::from_mins(30);
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub const LAMP_THRESHOLD: f64 = 0.5;
-/// At 1.2 curve units a blocked agent chimes after about 24 minutes
-/// unnoticed, an agent completed within about 12 minutes of interaction
-/// chimes immediately through the recency bonus, and a ping takes about
-/// 14 hours to cross. Sound therefore marks pressure, not every new card.
+/// At 1.2 curve units waiting mail chimes after 24 minutes unnoticed
+/// (`AGENT_BLOCKED_HEAD_START` plus the slope), and mail in a thread the
+/// user wrote in chimes at once while the recency bonus is above 0.2, the
+/// first 38 minutes after they wrote. Sound therefore marks pressure, not
+/// every new card.
 pub const CHIME_THRESHOLD: f64 = 1.2;
-/// The agent the user just wrote to contributes 1.5 curve units. This must
-/// remain above the 1.2 chime threshold or recently-driven agents lose
-/// their instant completion chime; the quadratic fall below gives about 6
-/// minutes of instant chime and about 25 minutes above the 0.5 lamp
-/// threshold.
+/// The thread the user just wrote in gains 1.5 curve units: as much as
+/// three hours of waiting, so the answer to active work deals ahead of
+/// mail that has waited less. On its own it stays above the 1.2 chime
+/// threshold for about 6 minutes and above the 0.5 lamp threshold for
+/// about 25.
 pub const AGENT_RECENCY_BONUS: f64 = 1.5;
 /// The nudge is gone within the hour and falls steeply from the start
 /// (quadratic: 0.375 left at 30 minutes), so "just spoke to" means minutes,
@@ -51,13 +52,6 @@ pub enum Curve {
     /// Someone waits on the user: rises from a head start by
     /// [`WAITING_SLOPE_PER_DAY`] for every day since `since`.
     Waiting { head_start: f64, since: Timestamp },
-    /// For the user's information: falls from a head start to the floor
-    /// in `gone_days`.
-    Fading {
-        head_start: f64,
-        since: Timestamp,
-        gone_days: f64,
-    },
     /// Due at `by`: shows `lead_days` before, rises to it, and jumps over
     /// everything once it has passed.
     Deadline { by: Timestamp, lead_days: u32 },
@@ -68,13 +62,6 @@ impl Curve {
         match *self {
             Self::Waiting { head_start, since } => {
                 head_start + WAITING_SLOPE_PER_DAY * days(since, now).max(0.0)
-            }
-            Self::Fading {
-                head_start,
-                since,
-                gone_days,
-            } => {
-                head_start - (head_start - DEAL_QUEUE_FLOOR) * days(since, now).max(0.0) / gone_days
             }
             Self::Deadline { by, lead_days } => {
                 let late = days(by, now);
@@ -92,9 +79,7 @@ impl Curve {
     /// filled in, or the curve's own words for a deadline.
     pub fn label(&self, reason: &str, now: Timestamp) -> String {
         match *self {
-            Self::Waiting { since, .. } | Self::Fading { since, .. } => {
-                reason.replace("{age}", &age(since, now))
-            }
+            Self::Waiting { since, .. } => reason.replace("{age}", &age(since, now)),
             Self::Deadline { by, .. } => match days(by, now) {
                 late if late > 0.0 => format!("deadline · {}d late", late.floor() as u64),
                 late => format!("deadline · {}d", (-late).ceil() as u64),
@@ -105,7 +90,7 @@ impl Curve {
     /// The first moment after `now` when its words say another age.
     pub(crate) fn label_changes(&self, now: Timestamp) -> Timestamp {
         match *self {
-            Self::Waiting { since, .. } | Self::Fading { since, .. } => age_changes(since, now),
+            Self::Waiting { since, .. } => age_changes(since, now),
             Self::Deadline { by, .. } => {
                 let day = SignedDuration::from_hours(24);
                 let late = now.duration_since(by);
@@ -125,7 +110,7 @@ impl Curve {
     /// deadline coming into view or passing.
     pub(crate) fn steps(&self) -> Vec<Timestamp> {
         match *self {
-            Self::Waiting { .. } | Self::Fading { .. } => Vec::new(),
+            Self::Waiting { .. } => Vec::new(),
             Self::Deadline { by, lead_days } => vec![
                 by - SignedDuration::from_hours(24 * i64::from(lead_days.max(1))),
                 by,
@@ -231,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn someone_waiting_rises_and_information_fades_to_the_floor() {
+    fn someone_waiting_rises_half_a_unit_an_hour() {
         let waiting = Curve::Waiting {
             head_start: AGENT_BLOCKED_HEAD_START,
             since: ago(2.0),
@@ -244,13 +229,11 @@ mod tests {
             waiting.label("needs reply · {age}", noon()),
             "needs reply · 2.0d"
         );
-        let information = |days| Curve::Fading {
-            head_start: 0.0,
-            since: ago(days),
-            gone_days: 3.0,
+        let hour_ago = Curve::Waiting {
+            head_start: AGENT_BLOCKED_HEAD_START,
+            since: ago(1.0 / 24.0),
         };
-        assert!(information(2.9).priority(noon()) > DEAL_QUEUE_FLOOR);
-        assert!(information(3.0).priority(noon()) <= DEAL_QUEUE_FLOOR);
+        assert!((hour_ago.priority(noon()) - (AGENT_BLOCKED_HEAD_START + 0.5)).abs() < 1e-9);
     }
 
     #[test]

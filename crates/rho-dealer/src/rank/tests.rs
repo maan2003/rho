@@ -347,6 +347,59 @@ fn note(w: &mut World, name: &str) -> Address {
     address
 }
 
+// Threads
+
+/// The deal is by priority, not by arrival: the answer in a thread the
+/// user just wrote in comes ahead of mail that has waited an hour, and
+/// once the bonus has faded the older mail is on top again.
+#[test]
+fn a7_a_thread_the_user_just_wrote_in_deals_ahead_until_its_bonus_fades() {
+    let mut w = world();
+    let old = w.agent("old");
+    w.asks(&old);
+    w.pass(hours(1));
+    let recent = w.agent("recent");
+    w.writes_to(&recent);
+    w.pass(mins(5));
+    w.asks(&recent);
+    // 1 + 0.5/h × 65 minutes, against 1 + 1.5 × (55/60)².
+    let old_now = 1.0 + 0.5 * 65.0 / 60.0;
+    let recent_now = 1.0 + 1.5 * (55.0f64 / 60.0).powi(2);
+    assert!(close(w.priority(&old).unwrap(), old_now));
+    assert!(close(w.priority(&recent).unwrap(), recent_now));
+    assert_eq!(w.hand(), "recent · waits · now\nold · waits · 1.1h");
+    assert!(recent_now >= CHIME_THRESHOLD);
+
+    // An hour on, the bonus is gone and the older wait is higher.
+    w.pass(hours(1));
+    assert!(close(w.priority(&recent).unwrap(), 1.5));
+    assert!(close(w.priority(&old).unwrap(), 1.0 + 0.5 * 125.0 / 60.0));
+    assert_eq!(w.hand(), "old · waits · 2.1h\nrecent · waits · 1.0h");
+}
+
+/// Without a bonus, a wait rises half a unit an hour, so the older card
+/// is on top; equal waits deal by address, not by name.
+#[test]
+fn a1_waits_rise_with_age_and_equal_ones_deal_by_address() {
+    let mut w = world();
+    let b = w.agent("b");
+    let a = w.agent("a");
+    w.asks(&a);
+    w.asks(&b);
+    assert_eq!(w.priority(&a), w.priority(&b));
+    assert_eq!(w.hand(), "b · waits · now\na · waits · now");
+    let c = w.agent("c");
+    w.pass(hours(2));
+    w.asks(&c);
+    w.pass(mins(30));
+    assert!(close(w.priority(&a).unwrap(), 2.25));
+    assert!(close(w.priority(&c).unwrap(), 1.25));
+    assert_eq!(
+        w.hand(),
+        "b · waits · 2.5h\na · waits · 2.5h\nc · waits · 30m"
+    );
+}
+
 // Snoozes
 
 #[test]
@@ -717,6 +770,14 @@ proptest::proptest! {
             proptest::prop_assert_eq!(&hand, &w.deal());
             // X1: one card per address.
             proptest::prop_assert_eq!(addresses(&hand).len(), hand.cards.len());
+            // X2 and the deal order: every skipped card behind every card
+            // not skipped, and those highest priority first.
+            for pair in hand.cards.windows(2) {
+                proptest::prop_assert!(!pair[0].skipped || pair[1].skipped);
+                if !pair[1].skipped {
+                    proptest::prop_assert!(pair[0].priority >= pair[1].priority);
+                }
+            }
             let at = w.now.timestamp();
             for card in &hand.cards {
                 let facts = w.marks.get(&card.address).facts();

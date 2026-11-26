@@ -27,7 +27,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 ### 2. The dealer still models a priority curve where `product/` has a FIFO queue and two time rules (structure + undocumented rules)
 - **Kind:** product + code
 - **Level:** high-level (reverse)
-- **Status:** open
+- **Status:** fixed
 - **Where:** `deal.Card` order, `window.Status line` lamp and chime, `deal.Verdict.snooze`
 - **Evidence:**
   - Order: the card order is `DealOrder::{Overdue, Waiting(since), Other}` (`crates/rho-dealer/src/rank.rs:266-284`). The `f64` priority now only breaks ties among `Overdue` and `Other`, and nothing current produces either (see Finding 8). Yet every claim still carries a `Curve::Waiting { head_start, since }` with a slope of 12/day (`crates/rho-dealer/src/curve.rs:14-16`), a recency `bonus` (`crates/rho-chat/src/cards.rs:187-193`), and a `Curve::Fading` that nothing produces (`curve.rs:56-61`).

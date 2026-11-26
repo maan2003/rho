@@ -719,7 +719,10 @@ async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<
     let [claim] = claims.as_slice() else {
         anyhow::bail!("refused start did not deal one card")
     };
-    assert_eq!(cards::attention_mail(claim.seen), Some(mail.id));
+    assert_eq!(
+        cards::answered(&history, thread, claim.seen).map(|answer| answer.message),
+        Some(mail.id)
+    );
     assert_eq!(claim.title, "Check the tide clock.");
     Ok(format!(
         "a missing directory refused the start and dealt stop mail #{}",

@@ -245,14 +245,17 @@ pub enum Seen {
     /// A note or a user-assigned date: there is nothing more to see.
     #[default]
     Whole,
-    /// A legacy mail verdict, through this position in its host's log.
+    /// A chat thread read through this position in its host's log: every
+    /// message and edit at or before it. What done says on a thread now.
     Topic(u64),
     /// A chat thread, through this message, and through every stop its
     /// agents were in that began by `stopped`, in unix milliseconds on
     /// the host's clock: a stop is no message, so the instant its host
     /// gave it is where it stands.
     Thread { message: u64, stopped: u64 },
-    /// One dealt mail and the version read, both positions in its host's log.
+    /// One dealt mail and the version read, both positions in its host's
+    /// log: what done said on a thread before it settled the whole thread.
+    /// Older entries still read.
     Mail { message: u64, version: u64 },
 }
 
@@ -303,7 +306,8 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// The latest legacy thread-wide read. New mail verdicts name one mail.
+    /// How far the thread is read: the furthest done, or old read, said
+    /// on it.
     pub fn seen_topic(self) -> Option<u64> {
         self.seen()
             .filter_map(|seen| match seen {
@@ -313,7 +317,8 @@ impl<'a> Facts<'a> {
             .max()
     }
 
-    /// Individual mail and version pairs a verdict took out of the deal.
+    /// Individual mail and version pairs an older build's verdict took out
+    /// of the deal.
     pub fn seen_mail(self) -> impl Iterator<Item = (u64, u64)> + 'a {
         self.seen().filter_map(|seen| match *seen {
             Seen::Mail { message, version } => Some((message, version)),

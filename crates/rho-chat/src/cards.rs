@@ -1,8 +1,8 @@
-//! Deal the first waiting mail after the user's reply. When there is no
-//! such mail, the oldest unanswered pinging mail still waits.
-//! A visible mail is the only source of a claim; a stop remains after its
-//! agent moves on, and no addressed result fades unread. Marks still belong
-//! to the user, and a reply settles the mail that preceded it.
+//! A thread with pinging mail the user has not read is a card. Done or a
+//! reply reads the thread through the newest mail in view: what came
+//! before is settled, and only a newer message or edit deals it again.
+//! A stop remains after its agent moves on, and no addressed result fades
+//! unread. Marks still belong to the user.
 
 use std::collections::BTreeMap;
 
@@ -55,6 +55,8 @@ fn unix(ms: u64) -> Timestamp {
 }
 
 /// Every thread on the host that wants the user, as a claim each.
+/// `local_answers` are this device's replies the host has not logged yet:
+/// each settles its thread as a logged one does.
 pub fn claims(
     host: &Host<'_>,
     marks: &Marks,
@@ -67,10 +69,6 @@ pub fn claims(
     // of the user in log order, and the newest message the user wrote in
     // it. Ranking happens on every change, and a host's chat is long.
     let mut threads: BTreeMap<MessageId, ThreadMessages<'_>> = BTreeMap::new();
-    let mut answered = BTreeMap::new();
-    for seen in local_answers {
-        remember(&mut answered, seen);
-    }
     for message in chat.messages() {
         let mentioned = message.pings_user();
         let from_user = message.from == Party::User;
@@ -83,11 +81,12 @@ pub fn claims(
         }
         if from_user {
             thread.user_wrote = Some(message);
-            if let Some(seen) = settled_by(message) {
-                remember(&mut answered, seen);
-            } else if let Some(through) = legacy_read_through(message) {
-                thread.legacy_read_through = Some(through);
-            }
+            thread.replied = thread.replied.max(replied_through(message));
+        }
+    }
+    for answer in local_answers {
+        if let Some(thread) = threads.get_mut(&chat.subthread_of(answer.message)) {
+            thread.replied = thread.replied.max(Some(answer.version));
         }
     }
     let mut claims = Vec::new();
@@ -99,11 +98,12 @@ pub fn claims(
         .address();
         let facts = marks.get(&address).facts();
         let user_wrote = messages.user_wrote;
-        let seen = SeenMail::new(facts, messages.legacy_read_through);
-        let through = |mail| seen.through(mail).max(answered.get(&mail).copied());
+        let seen = SeenMail::new(facts, messages.replied);
+        let through = |mail| seen.through(mail);
         let mut unseen = messages
             .mentions
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|message| {
                 through(message.id).is_none_or(|version| message.version().0 > version)
             })
@@ -121,18 +121,8 @@ pub fn claims(
             );
             trace.input(&address, "read", format!("{seen:?}"));
         }
-
-        // A reply from the deal settles only that card. Older unanswered mail
-        // still waits, but the next mail in the conversation is where to land.
-        let next = user_wrote
-            .filter(|reply| reply.id != thread)
-            .and_then(|reply| {
-                unseen
-                    .iter()
-                    .copied()
-                    .find(|mail| mail.version().0 > reply.id.0)
-            });
-        let Some(mail) = next.or_else(|| unseen.first().copied()) else {
+        // The card waits from the oldest mail not yet read.
+        let Some(mail) = unseen.first().copied() else {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.outcome(&address, "no card: nothing unread".to_owned());
             }
@@ -158,19 +148,25 @@ pub fn claims(
             head_start: curve::AGENT_BLOCKED_HEAD_START,
             since,
         };
-        // The cursor locates the trigger and notices new pings, not edits
-        // of a ping the user hasn't settled yet.
+        // The cursor locates the oldest unread mail and notices new pings,
+        // not edits of a ping the user hasn't settled yet.
         let newest = unseen
             .iter()
             .map(|mail| waiting_since(mail).0)
             .max()
-            .expect("the trigger is unseen");
+            .expect("the oldest unread is unseen");
         let cursor = format!("{}/{}", mail.id.0.0, newest.0);
         let mut claim = Claim::new(address, curve, reason, cursor);
-        claim.seen = Seen::Mail {
-            message: mail.id.0.0,
-            version: mail.version().0.0,
-        };
+        // Done or a reply reads the thread through its newest mail in
+        // view, so every ping in it now is settled at once.
+        claim.seen = Seen::Topic(
+            messages
+                .mentions
+                .iter()
+                .map(|mail| mail.version().0.0)
+                .max()
+                .expect("the thread has unread mail"),
+        );
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
         // A snooze or mute on the project holds its threads too.
@@ -196,6 +192,24 @@ pub fn claims(
     claims
 }
 
+/// What a reply on a card tells the host it answers: the newest ping the
+/// user could see in the thread, and how far they read, which settles
+/// every ping in the thread at or before it.
+pub fn answered(chat: &HostChat, thread: MessageId, seen: Seen) -> Option<MessageVersion> {
+    let Seen::Topic(through) = seen else {
+        return None;
+    };
+    let through = ChatSeq(through);
+    chat.reading_order(thread)
+        .filter(|mail| chat.subthread_of(mail.id) == thread)
+        .filter(|mail| mail.pings_user() && mail.version().0 <= through)
+        .max_by_key(|mail| mail.version().0)
+        .map(|mail| MessageVersion {
+            message: mail.id,
+            version: through,
+        })
+}
+
 /// What a thread is called on a card, and where it is, for a thread no
 /// claim named: one the user's own dates brought up.
 pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
@@ -215,64 +229,35 @@ pub(crate) fn context_at_root(chat: &HostChat, root: MessageId, host_name: &str)
     )
 }
 
-/// A logged reply settles the specific observation it carries. Old,
-/// addressed replies are already historical and froze the target at send.
-pub(crate) fn settled_by(post: &Message) -> Option<MessageVersion> {
+/// How far a user's post read its thread. A reply records it. An older
+/// post that does not, addressed or not, was written with everything
+/// before it in view.
+fn replied_through(post: &Message) -> Option<ChatSeq> {
     match post.thread_reply {
-        Some(reply) => reply.settles,
-        None => post.reply_to.map(|message| MessageVersion {
-            message,
-            version: post.id.0,
-        }),
+        Some(reply) => reply.settles.map(|seen| seen.version),
+        None => Some(post.id.0),
     }
 }
 
-pub(crate) fn legacy_read_through(post: &Message) -> Option<ChatSeq> {
-    (post.thread_reply.is_none() && post.reply_to.is_none()).then_some(post.id.0)
-}
-
-pub(crate) fn remember(exact: &mut BTreeMap<MessageId, ChatSeq>, seen: MessageVersion) {
-    let through = exact.entry(seen.message).or_insert(seen.version);
-    *through = (*through).max(seen.version);
-}
-
-pub(crate) fn card_version(seen: Seen) -> Option<MessageVersion> {
-    match seen {
-        Seen::Mail { message, version } => Some(MessageVersion {
-            message: MessageId(ChatSeq(message)),
-            version: ChatSeq(version),
-        }),
-        _ => None,
-    }
-}
-
-/// The mail a project card opens on.
-pub fn attention_mail(seen: Seen) -> Option<MessageId> {
-    card_version(seen).map(|seen| seen.message)
-}
-
-/// How much of a thread is read: whole-thread cutoffs (including from old
-/// devices) and the latest verdict on each specific mail.
+/// How much of a thread is read: how far done and the user's replies
+/// read it, and the verdicts older builds said on one mail each.
 #[derive(Debug)]
-pub(crate) struct SeenMail {
+struct SeenMail {
     through: Option<ChatSeq>,
     exact: BTreeMap<MessageId, ChatSeq>,
 }
 
 impl SeenMail {
-    pub(crate) fn new(facts: Facts<'_>, wrote: Option<ChatSeq>) -> Self {
+    fn new(facts: Facts<'_>, replied: Option<ChatSeq>) -> Self {
         let mut exact = BTreeMap::new();
         for (message, version) in facts.seen_mail() {
-            remember(
-                &mut exact,
-                MessageVersion {
-                    message: MessageId(ChatSeq(message)),
-                    version: ChatSeq(version),
-                },
-            );
+            let through = exact
+                .entry(MessageId(ChatSeq(message)))
+                .or_insert(ChatSeq(version));
+            *through = (*through).max(ChatSeq(version));
         }
         Self {
-            through: facts.seen_topic().map(ChatSeq).max(wrote),
+            through: facts.seen_topic().map(ChatSeq).max(replied),
             exact,
         }
     }
@@ -286,7 +271,8 @@ impl SeenMail {
 struct ThreadMessages<'a> {
     mentions: Vec<&'a Message>,
     user_wrote: Option<&'a Message>,
-    legacy_read_through: Option<ChatSeq>,
+    /// How far the user's replies read the thread.
+    replied: Option<ChatSeq>,
 }
 
 #[cfg(test)]
@@ -298,8 +284,8 @@ mod tests {
         AgentIdDomain, ChatEvent, ChatRecord, ContentPart, Mention, Stop, UnixMs,
     };
     use rho_dealer::curve::*;
-    use rho_dealer::facts::{Device, Entry, Fact};
-    use rho_dealer::rank::{Hand, Sources};
+    use rho_dealer::facts::{Device, Entry, EntryId, Fact};
+    use rho_dealer::rank::{Card, Hand, Sources};
     use rho_dealer::{Address, Skips, Until, rank};
 
     use super::*;
@@ -473,35 +459,39 @@ mod tests {
             });
         }
 
-        fn tell(&mut self, fact: Fact) {
+        fn tell(&mut self, fact: Fact) -> EntryId {
             let at = self.marks.next_at(&self.now);
             self.now = at.clone();
-            self.marks.apply([Entry {
+            let entry = Entry {
                 device: Device([0; 16]),
                 at,
                 fact,
-            }]);
+            };
+            let id = entry.id();
+            self.marks.apply([entry]);
+            id
         }
 
         fn newest(&self, thread: MessageId) -> Seen {
             Seen::Topic(self.chat.newest_in(thread).map_or(0, |(seq, _)| seq.0))
         }
 
-        fn done(&mut self, thread: MessageId) {
+        /// Done on the card as the hand holds it, as the frame says it.
+        fn done(&mut self, thread: MessageId) -> EntryId {
             let seen = self
                 .deal()
                 .cards
                 .iter()
                 .find(|card| card.address == self.address(thread))
                 .map_or(Seen::Whole, |card| card.seen);
-            self.done_through(thread, seen);
+            self.done_through(thread, seen)
         }
 
-        fn done_through(&mut self, thread: MessageId, seen: Seen) {
+        fn done_through(&mut self, thread: MessageId, seen: Seen) -> EntryId {
             self.tell(Fact::Settled {
                 node: self.address(thread),
                 seen,
-            });
+            })
         }
 
         /// What an older build wrote for "marked read".
@@ -540,12 +530,24 @@ mod tests {
         }
 
         fn deal(&self) -> Hand {
+            self.deal_with([])
+        }
+
+        /// The hand with replies this device has queued and the host has
+        /// not logged.
+        fn deal_with(&self, local_answers: impl IntoIterator<Item = MessageVersion>) -> Hand {
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: "lab",
             };
-            let claims = claims(&host, &self.marks, self.now.timestamp(), None, []);
+            let claims = claims(
+                &host,
+                &self.marks,
+                self.now.timestamp(),
+                None,
+                local_answers,
+            );
             let names = |address: &Address| {
                 let id = ThreadId::from_address(address)?;
                 name(&host, id.message)
@@ -571,6 +573,17 @@ mod tests {
                 .join("\n")
         }
 
+        /// The mail a reply on the thread's card says it answers.
+        fn answered(&self, thread: MessageId) -> Option<MessageId> {
+            let address = self.address(thread);
+            let card = self
+                .deal()
+                .cards
+                .into_iter()
+                .find(|card| card.address == address)?;
+            Some(answered(&self.chat, thread, card.seen)?.message)
+        }
+
         fn priority(&self, thread: MessageId) -> Option<f64> {
             let address = self.address(thread);
             self.deal()
@@ -579,6 +592,12 @@ mod tests {
                 .find(|card| card.address == address)
                 .map(|card| card.priority)
         }
+    }
+
+    /// The oldest unread mail, which the card waits from.
+    fn unread_from(card: &Card) -> MessageId {
+        let (mail, _) = card.cursor.split_once('/').expect("a thread cursor");
+        MessageId(ChatSeq(mail.parse().unwrap()))
     }
 
     /// A card is a thread's: a mention in the root message itself is the
@@ -601,7 +620,7 @@ mod tests {
             cards
                 .iter()
                 .find(|card| card.address == w.address(thread))
-                .and_then(|card| attention_mail(card.seen))
+                .map(unread_from)
         };
         assert_eq!(trigger(root), Some(root));
         assert_eq!(trigger(a), Some(ask));
@@ -613,11 +632,14 @@ mod tests {
         );
     }
 
+    /// A reply reads the whole thread through how far it records the
+    /// user saw, whichever mail it names; mail past that still deals.
     #[test]
-    fn a_thread_reply_does_not_settle_other_asks_or_an_edit_the_deal_did_not_show() {
+    fn a16_a_reply_settles_the_thread_through_what_was_in_view() {
         let mut w = world();
         let thread = w.agent("Clock");
         let early = w.asks(thread);
+        w.pass(mins(2));
         let later = w.asks(thread);
         let say = |w: &mut World, settles| {
             w.record(ChatEvent::Posted {
@@ -632,12 +654,11 @@ mod tests {
                 }],
             });
         };
-        let card = |w: &mut World| attention_mail(w.deal().cards[0].seen);
         say(&mut w, None);
         assert_eq!(
-            card(&mut w),
-            Some(early),
-            "opening by name does not settle either ask"
+            w.hand(),
+            "rho@lab › Clock · waits · 2m",
+            "a reply that saw nothing waiting settles nothing"
         );
         say(
             &mut w,
@@ -646,8 +667,14 @@ mod tests {
                 version: early.0,
             }),
         );
-        assert_eq!(card(&mut w), Some(later), "an unrelated wait stays");
-        w.record(ChatEvent::Revised {
+        assert_eq!(
+            w.hand(),
+            "rho@lab › Clock · waits · now",
+            "the later ask was not in view, though the reply came after it"
+        );
+        assert_eq!(unread_from(&w.deal().cards[0]), later);
+        w.pass(mins(1));
+        let edit = w.record(ChatEvent::Revised {
             message: early,
             author: w.agents[&thread],
             ping: None,
@@ -656,32 +683,91 @@ mod tests {
             }],
         });
         assert_eq!(
-            card(&mut w),
+            w.answered(thread),
             Some(early),
-            "a version the user never saw stays unread"
+            "a reply answers the newest ping in view, the edit"
         );
+        // Names the edited ask, and reads through the later one too.
+        say(
+            &mut w,
+            Some(MessageVersion {
+                message: early,
+                version: edit.0,
+            }),
+        );
+        assert_eq!(w.hand(), "");
+        w.asks(thread);
+        assert_eq!(w.hand(), "rho@lab › Clock · waits · now");
     }
 
+    /// What a reply tells the host it answers: the newest ping in the
+    /// thread at or before how far the card was read, never a ping on a
+    /// tangent or one that came later.
     #[test]
-    fn an_addressed_reply_does_not_settle_other_mail() {
+    fn a_reply_answers_the_newest_ping_in_view() {
         let mut w = world();
         let a = w.agent("a");
         let first = w.asks(a);
         let second = w.asks(a);
-        let result = w.finishes(a);
-        let trigger = |w: &World| {
-            w.deal()
-                .cards
-                .first()
-                .and_then(|card| attention_mail(card.seen))
+        let progress = w.sends(a, false);
+        let tangent = w.sends_under(a, Some(progress), true);
+        let third = w.asks(a);
+        let read = |through: MessageId| answered(&w.chat, a, Seen::Topic(through.0.0));
+        let answer = |message: MessageId, through: MessageId| MessageVersion {
+            message,
+            version: through.0,
         };
-        assert_eq!(trigger(&w), Some(first));
+        assert_eq!(read(first), Some(answer(first, first)));
+        assert_eq!(read(tangent), Some(answer(second, tangent)));
+        assert_eq!(read(third), Some(answer(third, third)));
+        assert_eq!(read(MessageId(ChatSeq(0))), None);
+        assert_eq!(answered(&w.chat, a, Seen::Whole), None);
+        // The tangent is its own thread, with its own answer.
+        assert_eq!(
+            answered(&w.chat, progress, Seen::Topic(third.0.0)),
+            Some(answer(tangent, third))
+        );
+    }
+
+    /// A reply this device has queued settles the thread as the logged one
+    /// will, through how far it saw: nothing comes back while it is on its
+    /// way, and mail after it still deals.
+    #[test]
+    fn a_queued_reply_settles_the_thread_through_what_was_in_view() {
+        let mut w = world();
+        let a = w.agent("a");
+        let first = w.asks(a);
+        let second = w.stop(a, Stop::Failed);
+        let saw = |message: MessageId, through: MessageId| MessageVersion {
+            message,
+            version: through.0,
+        };
+        assert_eq!(w.deal_with([saw(first, second)]).cards, []);
+        assert_eq!(
+            w.deal_with([saw(first, first)]).cards[0].kind,
+            CardKind::Stop("failed"),
+            "the stop came after what the reply saw"
+        );
+        w.pass(mins(1));
+        let third = w.asks(a);
+        let hand = w.deal_with([saw(second, second)]);
+        assert_eq!(hand.cards.len(), 1);
+        assert_eq!(unread_from(&hand.cards[0]), third);
+    }
+
+    /// An older build's reply to one mail was written with the thread in
+    /// view, so it reads the thread through itself.
+    #[test]
+    fn an_older_addressed_reply_reads_the_thread_through_itself() {
+        let mut w = world();
+        let a = w.agent("a");
+        w.asks(a);
+        let second = w.asks(a);
+        w.finishes(a);
         w.answers(a, second);
-        assert_eq!(trigger(&w), Some(first));
-        w.answers(a, first);
-        assert_eq!(trigger(&w), Some(result));
-        w.writes_to(a);
-        assert_eq!(trigger(&w), None);
+        assert_eq!(w.hand(), "");
+        w.asks(a);
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
     }
 
     #[test]
@@ -713,7 +799,7 @@ mod tests {
             .find(|card| card.address == w.address(a))
             .unwrap();
         assert_eq!(card.label, "waits · 6.0d");
-        assert_eq!(attention_mail(card.seen), Some(result));
+        assert_eq!(unread_from(card), result);
         w.writes_to(a);
         assert_eq!(w.hand(), "rho@lab › b · waits · 6.0d");
     }
@@ -747,8 +833,10 @@ mod tests {
         );
     }
 
+    /// Mail and stops deal by priority: older waits first, and the answer
+    /// in the thread the user just wrote in ahead of them all.
     #[test]
-    fn pinging_mail_and_stops_deal_oldest_first() {
+    fn pinging_mail_and_stops_deal_by_priority() {
         let mut w = world();
         let old_result = w.agent("later-alphabetically");
         let new_result = w.agent("earlier-alphabetically");
@@ -771,9 +859,17 @@ mod tests {
                 .iter()
                 .map(|card| card.address.clone())
                 .collect::<Vec<_>>(),
-            [old_result, new_result, old_ask, stop, new_ask].map(|thread| w.address(thread)),
+            [new_ask, old_result, new_result, old_ask, stop].map(|thread| w.address(thread)),
         );
-        assert!(w.priority(new_ask).unwrap() > w.priority(old_ask).unwrap());
+        // Half a unit an hour, and the full bonus for words just written.
+        let waited = |mins: f64| AGENT_BLOCKED_HEAD_START + 0.5 * mins / 60.0;
+        for (thread, priority) in [
+            (new_ask, AGENT_BLOCKED_HEAD_START + AGENT_RECENCY_BONUS),
+            (old_result, waited(47.0)),
+            (stop, waited(12.0)),
+        ] {
+            assert!((w.priority(thread).unwrap() - priority).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -846,7 +942,7 @@ mod tests {
                 Some(true) => {
                     assert_ne!(hand.cards[0].cursor, original);
                     assert_eq!(hand.cards[0].label, "waits · now");
-                    assert_eq!(attention_mail(hand.cards[0].seen), Some(ask));
+                    assert_eq!(unread_from(&hand.cards[0]), ask);
                 }
             }
         }
@@ -874,8 +970,8 @@ mod tests {
         let [card] = hand.cards.as_slice() else {
             panic!("{:?}", hand.cards)
         };
-        assert_eq!(attention_mail(card.seen), Some(ask));
-        assert_ne!(attention_mail(card.seen), Some(older));
+        assert_eq!(unread_from(card), ask);
+        assert_ne!(unread_from(card), older);
         assert_eq!(card.label, "waits · now", "age is the revision's");
         w.done(a);
         assert_eq!(w.hand(), "");
@@ -924,11 +1020,11 @@ mod tests {
         };
         assert_eq!(card.kind, CardKind::Stop("failed"));
         assert_eq!(card.label, "failed · now");
-        assert_eq!(attention_mail(card.seen), Some(failure));
+        assert_eq!(unread_from(card), failure);
     }
 
     #[test]
-    fn a7_a_recent_reply_raises_chime_pressure_without_jumping_the_hand() {
+    fn a7_an_answer_soon_after_the_users_words_deals_first_and_chimes() {
         let mut w = world();
         let a = w.agent("a");
         let b = w.agent("b");
@@ -938,7 +1034,7 @@ mod tests {
         w.finishes(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › b · waits · 5m\nrho@lab › a · waits · now"
+            "rho@lab › a · waits · now\nrho@lab › b · waits · 5m"
         );
         assert!(w.priority(a).unwrap() >= CHIME_THRESHOLD);
         assert!(w.priority(b).unwrap() < CHIME_THRESHOLD);
@@ -994,7 +1090,7 @@ mod tests {
         let trigger = w.sends_under(a, Some(reply), true);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(reply));
-        assert_eq!(attention_mail(hand.cards[0].seen), Some(trigger));
+        assert_eq!(unread_from(&hand.cards[0]), trigger);
         w.done(a);
         assert_eq!(w.deal().cards.len(), 1);
         w.done(reply);
@@ -1045,7 +1141,7 @@ mod tests {
             "rho@lab › a · failed · 2m\nrho@lab › b · lost · now"
         );
         let card = &w.deal().cards[0];
-        assert_eq!(attention_mail(card.seen), Some(first));
+        assert_eq!(unread_from(card), first);
         w.done(a);
         w.writes_to(b);
         assert_eq!(w.hand(), "");
@@ -1053,35 +1149,25 @@ mod tests {
         let second = w.stop(a, Stop::Stuck);
         w.done_through(a, Seen::Topic(first.0.0));
         assert_eq!(w.hand(), "rho@lab › a · stuck · now");
-        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(second));
+        assert_eq!(unread_from(&w.deal().cards[0]), second);
     }
 
+    /// Done reads the whole thread through its newest mail: both pings
+    /// go at once, and only a newer ping or an edit deals it again.
     #[test]
-    fn done_on_one_ping_leaves_the_next_ping_in_the_same_thread() {
+    fn a15_done_settles_every_ping_in_view_and_only_newer_mail_deals_again() {
         let mut w = world();
         let thread = w.agent("two asks");
         let first = w.asks(thread);
         w.pass(mins(3));
         let second = w.stop(thread, Stop::Failed);
-        let dealt = w.deal();
-        assert_eq!(attention_mail(dealt.cards[0].seen), Some(first));
+        let dealt = w.deal().cards.remove(0);
+        assert_eq!(unread_from(&dealt), first);
+        assert_eq!(dealt.seen, Seen::Topic(second.0.0));
 
         w.done(thread);
-        let remaining = w.deal();
-        assert_eq!(remaining.cards.len(), 1, "the second ping still waits");
-        assert_eq!(attention_mail(remaining.cards[0].seen), Some(second));
-        assert_eq!(remaining.cards[0].kind, CardKind::Stop("failed"));
-    }
-
-    #[test]
-    fn done_on_a_dealt_version_does_not_acknowledge_an_edit_made_while_it_was_open() {
-        let mut w = world();
-        let thread = w.agent("the clock");
-        let first = w.asks(thread);
-        let dealt = w.deal().cards.remove(0);
-        w.pass(mins(4));
-        let second = w.asks(thread);
-        w.pass(mins(7));
+        assert_eq!(w.hand(), "", "the stop was in view too");
+        w.pass(mins(5));
         w.record(ChatEvent::Revised {
             message: first,
             author: w.agents[&thread],
@@ -1090,42 +1176,86 @@ mod tests {
                 text: "A different question about the same clock.".into(),
             }],
         });
+        assert_eq!(w.hand(), "rho@lab › two asks · waits · now");
+        w.done(thread);
+        assert_eq!(w.hand(), "");
+        w.pass(mins(1));
+        let third = w.asks(thread);
+        let next = w.deal().cards.remove(0);
+        assert_eq!(
+            (unread_from(&next), next.label.as_str()),
+            (third, "waits · now")
+        );
+    }
+
+    /// Undo takes the done back: the card returns as it was, waiting from
+    /// its oldest unread mail.
+    #[test]
+    fn undoing_done_brings_the_thread_back_as_it_was() {
+        let mut w = world();
+        let thread = w.agent("two asks");
+        w.asks(thread);
+        w.pass(mins(3));
+        w.asks(thread);
+        let before = w.hand();
+        assert_eq!(before, "rho@lab › two asks · waits · 3m");
+        let done = w.done(thread);
+        assert_eq!(w.hand(), "");
+        w.tell(Fact::Retract { of: done });
+        assert_eq!(w.hand(), before);
+    }
+
+    /// A card read before an edit, as an inspection holds it, settles
+    /// only what it saw: the edit and the ping after it still deal.
+    #[test]
+    fn done_on_what_was_seen_before_an_edit_leaves_the_edit() {
+        let mut w = world();
+        let thread = w.agent("the clock");
+        let first = w.asks(thread);
+        let dealt = w.deal().cards.remove(0);
+        w.pass(mins(4));
+        let second = w.asks(thread);
+        w.pass(mins(7));
+        let edit = w.record(ChatEvent::Revised {
+            message: first,
+            author: w.agents[&thread],
+            ping: None,
+            content: vec![ContentPart::Text {
+                text: "A different question about the same clock.".into(),
+            }],
+        });
         let edited = w.deal().cards.remove(0);
-        assert_eq!(attention_mail(edited.seen), Some(first));
-        assert_ne!(edited.seen, dealt.seen);
+        assert_eq!(unread_from(&edited), first);
+        assert_eq!(edited.seen, Seen::Topic(edit.0.0));
         assert_eq!(edited.cursor, format!("{}/{}", first.0.0, second.0.0));
 
         w.done_through(thread, dealt.seen);
         let next = w.deal().cards.remove(0);
-        assert_eq!(attention_mail(next.seen), Some(second));
+        assert_eq!(unread_from(&next), second);
         assert_eq!(next.label, "waits · 7m");
         w.done_through(thread, next.seen);
-        let revised = w.deal().cards.remove(0);
-        assert_eq!(revised.seen, edited.seen);
-        assert_eq!(revised.label, "waits · now");
+        assert_eq!(w.hand(), "", "the live card saw the edit");
     }
 
+    /// The user's replies read the thread: later mail deals from where
+    /// the newest one left off.
     #[test]
-    fn a_dealt_thread_continues_after_the_latest_reply_without_losing_older_mail() {
+    fn a_reply_reads_the_thread_and_only_later_mail_deals() {
         let mut w = world();
         let a = w.agent("a");
-        let older = w.stop(a, Stop::Failed);
+        w.stop(a, Stop::Failed);
         let answered = w.asks(a);
         w.answers(a, answered);
         w.sends(a, false);
         let next = w.finishes(a);
         w.pass(mins(3));
-        let newest = w.asks(a);
+        w.asks(a);
 
         let card = &w.deal().cards[0];
-        assert_eq!(attention_mail(card.seen), Some(next));
+        assert_eq!(unread_from(card), next);
         assert_eq!(card.label, "waits · 3m");
         w.answers(a, next);
-        // This reply is after the latest ask; it did not answer that ask or
-        // the older stop, and both still wait.
-        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(older));
-        w.answers(a, older);
-        assert_eq!(attention_mail(w.deal().cards[0].seen), Some(newest));
+        assert_eq!(w.hand(), "", "the reply came after the newest ask too");
     }
 
     #[test]
@@ -1138,7 +1268,7 @@ mod tests {
         let deal = w.deal();
         let card = &deal.cards[0];
         assert_eq!(card.label, "waits · 2m");
-        assert_eq!(attention_mail(card.seen), Some(ask));
+        assert_eq!(unread_from(card), ask);
         w.mute(a);
         assert_eq!(w.hand(), "");
     }
