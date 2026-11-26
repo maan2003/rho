@@ -15,7 +15,8 @@ use jiff::Timestamp;
 use language::{Buffer, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_dealer::Addressed as _;
-use rho_frame::{FrameLink, Layout, Mode, PhoneTool, Surface, phone_editor_tap};
+use rho_frame::minibuffer::delete_word;
+use rho_frame::{FrameLink, Layout, Mode, PhoneTool, Surface, keys, phone_editor_tap};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
@@ -92,6 +93,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui::KeyBinding::new("ctrl-n", NextNote, query),
         gpui::KeyBinding::new("ctrl-p", PreviousNote, query),
     ]);
+    cx.bind_keys(rho_frame::keys::prompt_line("RhoNotesQuery"));
 }
 
 pub struct NotesView {
@@ -99,7 +101,7 @@ pub struct NotesView {
     system: Entity<NoteSystem>,
     transcript: Transcript<Key, Class, Option<NoteId>>,
     editor: Entity<Editor>,
-    query: Entity<Editor>,
+    pub(crate) query: Entity<Editor>,
     finding: bool,
     phone: bool,
     /// A note may be left before its first write reaches the list.
@@ -490,6 +492,15 @@ impl Render for NotesView {
             .child(
                 div()
                     .key_context("RhoNotesQuery")
+                    .on_action(
+                        cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
+                            this.query
+                                .update(cx, |query, cx| delete_word(query, window, cx));
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
+                        this.query.update(cx, |query, cx| query.clear(window, cx));
+                    }))
                     .flex_none()
                     .flex()
                     .items_center()

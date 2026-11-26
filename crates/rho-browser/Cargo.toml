@@ -8,11 +8,19 @@ version.workspace = true
 
 [features]
 # Pages as the frame shows them: the `page` system and its surfaces.
-ui = ["dep:redb", "dep:rho-db", "dep:rho-dealer", "dep:rho-frame", "dep:rho-window"]
+ui = [
+  "dep:blake3",
+  "dep:redb",
+  "dep:rho-db",
+  "dep:rho-dealer",
+  "dep:rho-frame",
+  "dep:rho-window",
+]
 
 [dependencies]
 anyhow.workspace = true
 async-channel = "2"
+blake3 = { workspace = true, optional = true }
 dirs.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "wayland",
@@ -35,6 +43,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures-lite = "2"
+jiff.workspace = true
+rho-ledger = { workspace = true, features = ["client"] }
 tempfile.workspace = true
 # The fake browser example is a Wayland client: rho's browser compositor
 # tears a page down if no top-level window ever binds.

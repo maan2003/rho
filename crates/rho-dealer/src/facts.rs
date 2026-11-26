@@ -192,6 +192,19 @@ pub enum Fact {
     Deleted {
         note: uuid::Uuid,
     },
+    /// A page the user keeps by name: `node` is the system's own address
+    /// for it, which the browser mints. The newest one said is the
+    /// bookmark. Later still than `Deleted`.
+    Bookmarked {
+        node: Address,
+        title: String,
+        url: String,
+    },
+    /// The bookmark removed. A `Bookmarked` said after it brings it back,
+    /// and a retract of this entry too.
+    Unbookmarked {
+        node: Address,
+    },
 }
 
 impl Fact {
@@ -208,7 +221,9 @@ impl Fact {
             | Self::Unmute { node }
             | Self::Named { node, .. }
             | Self::About { node, .. }
-            | Self::Read { node, .. } => Some(node.clone()),
+            | Self::Read { node, .. }
+            | Self::Bookmarked { node, .. }
+            | Self::Unbookmarked { node } => Some(node.clone()),
             Self::Wrote { note, .. } | Self::Deleted { note } => Some(Address::note(*note)),
             Self::Label { .. }
             | Self::Unlabel { .. }

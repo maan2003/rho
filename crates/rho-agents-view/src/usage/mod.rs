@@ -1,7 +1,12 @@
 //! What the agents have spent, as charts.
 //!
 //! Eight charts, each its own `usage:` address (`SPEC-usage-addresses`):
-//! four pictures over the two windows worth looking at. The agents system
+//! four pictures over the two windows worth looking at. The chart screen
+//! switches window and picture in place ([`UsageSurface`]): the frame puts
+//! the other chart where this one stood in history
+//! ([`rho_frame::Frame::replace_current`]), so switching piles nothing up
+//! to walk back through, and what is restored after a restart is the
+//! chart in view. The agents system
 //! asks every attached host for the series a chart needs when it opens,
 //! keeps each host's answer apart in [`Usage`], and merges them on the way
 //! out; a [`UsageSurface`] observes the system and paints the merge.
@@ -47,6 +52,17 @@ impl Chart {
             Self::UsageShare => "usage-share",
             Self::AgentCost => "agent-cost",
         }
+    }
+
+    /// The picture after this one, or before it, wrapping.
+    pub fn step(self, forward: bool) -> Self {
+        let at = Self::ALL.iter().position(|chart| *chart == self).unwrap();
+        let len = Self::ALL.len();
+        Self::ALL[if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        }]
     }
 
     pub fn title(self) -> &'static str {
@@ -126,6 +142,22 @@ impl UsageChart {
                 .into_iter()
                 .map(move |days| Self { chart, days })
         })
+    }
+
+    /// The same picture over the other window.
+    pub fn other_window(self) -> Self {
+        Self {
+            days: self.days.other(),
+            ..self
+        }
+    }
+
+    /// The next picture over the same window, or the one before.
+    pub fn step(self, forward: bool) -> Self {
+        Self {
+            chart: self.chart.step(forward),
+            ..self
+        }
     }
 
     /// `rate limit · 7d`.
@@ -484,5 +516,36 @@ mod tests {
                 since_ms: 56 * DAY_MS
             }
         );
+    }
+
+    /// Stepping walks all four pictures and wraps either way; the other
+    /// window keeps the picture.
+    #[test]
+    fn switching_steps_through_every_picture_and_window() {
+        let start = UsageChart {
+            chart: Chart::RateLimit,
+            days: Days::Seven,
+        };
+        let mut seen = vec![start];
+        let mut at = start;
+        for _ in 0..4 {
+            at = at.step(true);
+            seen.push(at);
+        }
+        assert_eq!(
+            seen.iter().map(|chart| chart.chart).collect::<Vec<_>>(),
+            [
+                Chart::RateLimit,
+                Chart::ModelCost,
+                Chart::UsageShare,
+                Chart::AgentCost,
+                Chart::RateLimit,
+            ]
+        );
+        assert!(seen.iter().all(|chart| chart.days == Days::Seven));
+        assert_eq!(start.step(false).chart, Chart::AgentCost);
+        let wider = start.step(true).other_window();
+        assert_eq!(wider.address().key(), "usage:model-cost/30");
+        assert_eq!(wider.other_window().address().key(), "usage:model-cost/7");
     }
 }

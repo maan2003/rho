@@ -200,6 +200,30 @@ impl<K: Clone + Eq + Hash, S> History<K, S> {
         }
     }
 
+    /// Show `key` in place of the entry under the cursor: it takes that
+    /// entry's place in the list, so nothing is appended and back and
+    /// forward reach what they reached before. For a screen that switches
+    /// what it shows without the reader going anywhere. A key already
+    /// elsewhere in the list leaves it, as on [`Self::show`].
+    pub fn replace_current(&mut self, key: K, surface: S) {
+        if key != *self.current_key()
+            && let Some(slot) = self.live.remove(&key)
+        {
+            // Not the cursor: the cursor's key is the current key and this
+            // one is not it.
+            self.unlink(slot);
+        }
+        let cursor = self.cursor;
+        let old = std::mem::replace(&mut self.entry_mut(cursor).key, key.clone());
+        if self.live.get(&old) == Some(&cursor) {
+            self.live.remove(&old);
+        }
+        self.cursor_forgotten = false;
+        self.entry_mut(cursor).surface = surface;
+        self.live.insert(key, cursor);
+        self.note_visit();
+    }
+
     /// Up: one step back through history. `None` when the reader is at the
     /// oldest entry, and then the caller decides whether that means
     /// anything.
@@ -729,5 +753,43 @@ mod tests {
             "slab grew to {} slots",
             history.slots.len()
         );
+    }
+
+    /// A screen that switches what it shows stays where it stood: three
+    /// switches in the middle of history leave its length, and every
+    /// step back and forward, as they were.
+    #[test]
+    fn replacing_the_current_entry_keeps_its_place() {
+        let mut history = history();
+        history.show("a", 1);
+        history.show("usage 7d", 2);
+        history.show("b", 3);
+        history.back();
+        let len = history.len();
+        for key in ["usage 30d", "cost 30d", "cost 7d"] {
+            history.replace_current(key, 4);
+        }
+        assert_eq!(history.len(), len);
+        assert_eq!(*history.current_key(), "cost 7d");
+        assert_eq!(back_keys(&history), ["a", "home"]);
+        assert_eq!(forward_keys(&history), ["b"]);
+        assert!(!history.holds(&"usage 7d") && !history.holds(&"usage 30d"));
+        assert_eq!(history.recent(), [&"b", &"a", &"home"]);
+        assert_eq!(history.forward().copied(), Some(3));
+        assert_eq!(history.back().copied(), Some(4));
+    }
+
+    /// Switching to something already elsewhere in history takes it out of
+    /// where it was, as opening it would: a key is in the list once.
+    #[test]
+    fn replacing_with_a_key_behind_takes_it_from_there() {
+        let mut history = history();
+        history.show("usage 30d", 1);
+        history.show("usage 7d", 2);
+        history.replace_current("usage 30d", 3);
+        assert_eq!(history.len(), 2);
+        assert_eq!(back_keys(&history), ["home"]);
+        assert_eq!(history.back().copied(), Some(0));
+        assert_eq!(history.forward().copied(), Some(3));
     }
 }

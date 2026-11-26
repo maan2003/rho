@@ -3,9 +3,9 @@
 //!
 //! Attention facts are kept per node for [`crate::facts::Facts`] to read.
 //! What a node is called and what it is about settle on the last one
-//! said. A note is its newest revision. A retracted entry counts for
-//! nothing, whenever the retract arrives. The label facts older builds
-//! wrote are about no node ([`Fact::node`]), so nothing here reads them.
+//! said. A note is its newest revision, and so is a bookmark. A retracted entry
+//! counts for nothing, whenever the retract arrives. The label facts older
+//! builds wrote are about no node ([`Fact::node`]), so nothing here reads them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -31,6 +31,15 @@ pub struct NodeMarks {
     pub deleted: bool,
     /// What a note is about.
     pub about: Option<Address>,
+    /// A bookmark's page, until it is removed.
+    pub bookmark: Option<Bookmark>,
+}
+
+/// A page the user keeps by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bookmark {
+    pub title: String,
+    pub url: String,
 }
 
 static EMPTY: NodeMarks = NodeMarks {
@@ -41,6 +50,7 @@ static EMPTY: NodeMarks = NodeMarks {
     created_ms: None,
     deleted: false,
     about: None,
+    bookmark: None,
 };
 
 impl NodeMarks {
@@ -143,6 +153,13 @@ impl Marks {
                     marks.deleted = false;
                 }
                 Fact::Deleted { .. } => marks.deleted = true,
+                Fact::Bookmarked { title, url, .. } => {
+                    marks.bookmark = Some(Bookmark {
+                        title: title.clone(),
+                        url: url.clone(),
+                    });
+                }
+                Fact::Unbookmarked { .. } => marks.bookmark = None,
                 Fact::Label { .. }
                 | Fact::Unlabel { .. }
                 | Fact::Repository { .. }
@@ -179,6 +196,13 @@ impl Marks {
                 && marks.body.as_ref().is_some_and(|body| !body.is_empty())
                 && !marks.deleted
         })
+    }
+
+    /// Every bookmark the user keeps.
+    pub fn bookmarks(&self) -> impl Iterator<Item = (&Address, &Bookmark)> {
+        self.nodes
+            .iter()
+            .filter_map(|(node, marks)| Some((node, marks.bookmark.as_ref()?)))
     }
 
     /// The user's private replies under `node`: the notes about it, oldest
@@ -442,5 +466,42 @@ mod tests {
         let next = marks.next_at(&at(5));
         assert!(next.timestamp() > at(10).timestamp());
         assert_eq!(marks.next_at(&at(20)), at(20));
+    }
+
+    /// A bookmark is what was said last about it from any device: a
+    /// removal said after it takes it away whatever order they arrive in,
+    /// and saying it again, or taking the removal back, brings it back.
+    #[test]
+    fn a_bookmark_is_the_last_thing_said_about_it() {
+        let page = Address::new("bookmark", "slack");
+        let kept = |device, minute, title: &str| {
+            said(
+                device,
+                minute,
+                Fact::Bookmarked {
+                    node: page.clone(),
+                    title: title.into(),
+                    url: "https://example.slack.com/".into(),
+                },
+            )
+        };
+        let removed = said(PHONE, 2, Fact::Unbookmarked { node: page.clone() });
+        let mut marks = Marks::default();
+        marks.apply([removed.clone(), kept(LAPTOP, 1, "slack")]);
+        assert_eq!(marks.bookmarks().count(), 0, "removed after it was kept");
+        assert!(marks.nodes().all(|(node, _)| *node != page));
+
+        marks.apply([kept(LAPTOP, 3, "work slack")]);
+        let held: Vec<_> = marks.bookmarks().collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].1.title, "work slack");
+
+        let mut undone = Marks::default();
+        undone.apply([
+            kept(LAPTOP, 1, "slack"),
+            removed.clone(),
+            said(PHONE, 4, Fact::Retract { of: removed.id() }),
+        ]);
+        assert_eq!(undone.bookmarks().count(), 1, "a retracted removal");
     }
 }

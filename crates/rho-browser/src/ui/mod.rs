@@ -54,7 +54,6 @@ impl Addressed for PageId {
 
 pub struct PageSystem {
     browser: Browser,
-    db: RhoDb,
     pages: Pages<gpui::Task<()>>,
     frame: FrameLink,
     /// The page model whose tab changes are heard, and the hearing.
@@ -65,11 +64,20 @@ impl PageSystem {
     /// The browser keeps its state under `state_dir`, the GUI's own state
     /// directory, and talks to its extension over a socket there: one
     /// GUI per state directory, which the browser's lock already says.
-    pub fn new(state_dir: PathBuf, db: RhoDb, frame: FrameLink) -> Self {
+    pub fn new(state_dir: PathBuf, db: RhoDb, frame: FrameLink, cx: &mut Context<Self>) -> Self {
         let socket = state_dir.join("rho-browser.sock");
+        // Bookmarks an older build kept on this device alone go into the
+        // ledger once the frame has read it.
+        frame.with(cx, move |frame, _, cx| {
+            let Some(writes) = bookmarks::local::writes(&db, frame.marks()) else {
+                return;
+            };
+            frame.write_marks(writes, cx);
+            cx.background_spawn(async move { bookmarks::local::retire(&db).await })
+                .detach();
+        });
         Self {
             browser: Browser::new(state_dir, socket),
-            db,
             pages: Pages::default(),
             frame,
             watched: None,
@@ -162,7 +170,6 @@ impl PageSystem {
     }
 
     fn bookmark_page(
-        this: Entity<Self>,
         url: Url,
         title: String,
         frame: &mut Frame,
@@ -183,28 +190,61 @@ impl PageSystem {
                     .into_iter()
                     .collect()
             }),
-            Rc::new(move |_, input, _, cx| {
+            Rc::new(move |frame, input, _, cx| {
                 let title = input.split_whitespace().collect::<Vec<_>>().join(" ");
                 if title.is_empty() {
                     return;
                 }
-                this.update(cx, |system, cx| {
-                    let db = system.db.clone();
-                    let url = url.clone();
-                    let frame = system.frame.clone();
-                    cx.spawn(async move |_, cx| {
-                        let title = cx
-                            .background_spawn(async move {
-                                bookmarks::save(&db, &title, &url).await;
-                                title
-                            })
-                            .await;
-                        let _ = cx.update(|cx| {
-                            frame.echo(format!("bookmarked: {title}"), StyleClass::SystemInfo, cx);
-                        });
+                frame.write_marks(vec![bookmarks::save(&title, &url)], cx);
+                frame.echo(&format!("bookmarked: {title}"), StyleClass::SystemInfo, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// `remove bookmark:` asks which bookmark goes, the page in view's
+    /// own first.
+    fn remove_bookmark(
+        current: Option<Url>,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        let kept = bookmarks::removable(frame.marks(), current.as_ref());
+        if kept.is_empty() {
+            frame.echo("no bookmarks", StyleClass::SystemInfo, cx);
+            return;
+        }
+        let offered = kept.clone();
+        frame.open_prompt(
+            "remove bookmark:",
+            Rc::new(move |_, input, _| {
+                let needle = input.trim().to_lowercase();
+                offered
+                    .iter()
+                    .filter(|kept| {
+                        kept.title.to_lowercase().contains(&needle)
+                            || kept.url.as_str().to_lowercase().contains(&needle)
                     })
-                    .detach();
-                });
+                    .map(|kept| Candidate {
+                        value: kept.title.clone(),
+                        description: kept.url.to_string(),
+                    })
+                    .collect()
+            }),
+            Rc::new(move |frame, input, _, cx| {
+                let input = input.trim();
+                let Some(gone) = kept.iter().find(|kept| kept.title == input) else {
+                    frame.echo("no such bookmark", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                frame.write_marks(vec![bookmarks::remove(gone.id)], cx);
+                frame.echo(
+                    &format!("removed bookmark: {}", gone.title),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
             }),
             window,
             cx,
@@ -331,41 +371,52 @@ impl rho_frame::System for PageSystem {
     }
 
     fn visit(&mut self, address: &Address, cx: &mut Context<Self>) -> bool {
-        let Some(bookmark) =
-            BookmarkId::from_address(address).and_then(|id| bookmarks::get(&self.db, id))
-        else {
+        let Some(id) = BookmarkId::from_address(address) else {
             return false;
         };
-        if let Some((page, _)) = recent_pages()
-            .into_iter()
-            .find(|(_, page)| page.url == bookmark.url.as_str())
-        {
-            self.frame.open(page.address(), cx);
-        } else {
-            self.open_url(&bookmark.url, cx);
-        }
+        // The bookmark is the user's marks, which the frame holds and is
+        // busy with now.
+        let this = cx.entity();
+        self.frame.with(cx, move |frame, window, cx| {
+            let Some(bookmark) = bookmarks::get(frame.marks(), id) else {
+                frame.echo("no such bookmark", StyleClass::SystemInfo, cx);
+                return;
+            };
+            match recent_pages()
+                .into_iter()
+                .find(|(_, page)| page.url == bookmark.url.as_str())
+            {
+                Some((page, _)) => frame.open(page.address(), window, cx),
+                None => this.update(cx, |system, cx| system.open_url(&bookmark.url, cx)),
+            }
+        });
         true
     }
 
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
-        let this = cx.entity();
-        let open = this.clone();
+        let open = cx.entity();
         let mut rows = vec![Row::run("o", "open page…", move |frame, window, cx| {
             Self::ask_page(open.clone(), frame, window, cx)
         })];
-        if let Some(page) = PageId::from_address(&point.surface)
-            && let Some(meta) = crate::native_host::page_metadata(page)
-            && let Some(url) = bookmarks::page_url(&meta.url)
-        {
-            let title = title(page);
+        let here = PageId::from_address(&point.surface)
+            .and_then(|page| Some((page, crate::native_host::page_metadata(page)?)))
+            .and_then(|(page, meta)| Some((page, bookmarks::page_url(&meta.url)?)));
+        if let Some((page, url)) = &here {
+            let (url, title) = (url.clone(), title(*page));
             rows.push(Row::run(
                 "",
                 "bookmark this page…",
                 move |frame, window, cx| {
-                    Self::bookmark_page(this.clone(), url.clone(), title.clone(), frame, window, cx)
+                    Self::bookmark_page(url.clone(), title.clone(), frame, window, cx)
                 },
             ));
         }
+        let current = here.map(|(_, url)| url);
+        rows.push(Row::run(
+            "",
+            "remove bookmark…",
+            move |frame, window, cx| Self::remove_bookmark(current.clone(), frame, window, cx),
+        ));
         rows
     }
 
@@ -384,7 +435,7 @@ impl rho_frame::System for PageSystem {
         Some((title(page), PLACE.to_owned()))
     }
 
-    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
         live_pages()
             .into_iter()
             .map(|(id, metadata)| Found {
@@ -394,20 +445,13 @@ impl rho_frame::System for PageSystem {
                 thread: None,
                 recency: metadata.last_accessed_ms,
             })
-            .chain(
-                bookmarks::named(&self.db)
-                    .into_iter()
-                    .map(|bookmark| Found {
-                        address: bookmark.id.address(),
-                        title: bookmark.title,
-                        description: format!(
-                            "bookmark · {}",
-                            bookmark.url.host_str().unwrap_or_default()
-                        ),
-                        thread: None,
-                        recency: 0,
-                    }),
-            )
+            .chain(bookmarks::named(marks).into_iter().map(|bookmark| Found {
+                address: bookmark.id.address(),
+                title: bookmark.title,
+                description: format!("bookmark · {}", bookmark.url.host_str().unwrap_or_default()),
+                thread: None,
+                recency: 0,
+            }))
             .collect()
     }
 }

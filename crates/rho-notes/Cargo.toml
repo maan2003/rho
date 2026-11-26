@@ -25,3 +25,16 @@ rho-transcript.workspace = true
 rho-window.workspace = true
 theme = { path = "../../vendor/zed/crates/theme" }
 uuid.workspace = true
+
+[dev-dependencies]
+assets = { path = "../../vendor/zed/crates/assets" }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }
+release_channel = { path = "../../vendor/zed/crates/release_channel" }
+rho-db.workspace = true
+semver = "1"
+settings = { path = "../../vendor/zed/crates/settings", features = [
+  "test-support",
+] }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }

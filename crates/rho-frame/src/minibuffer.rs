@@ -45,6 +45,23 @@ pub fn token_start(text_before_cursor: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// `ctrl-w` on a prompt line: deletes the word before the cursor, with
+/// any spaces between it and the cursor, or the selection when there is one.
+pub fn delete_word(editor: &mut Editor, window: &mut Window, cx: &mut gpui::Context<Editor>) {
+    let selection = editor
+        .selections
+        .newest::<multi_buffer::MultiBufferOffset>(&editor.display_snapshot(cx));
+    if selection.is_empty() {
+        let text = editor.text(cx);
+        let start = token_start(text[..selection.start.0].trim_end());
+        let start = multi_buffer::MultiBufferOffset(start);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([start..selection.end]);
+        });
+    }
+    editor.insert("", window, cx);
+}
+
 pub fn completion_start(text_before_cursor: &str, whole_input: bool) -> usize {
     if whole_input {
         0
@@ -572,20 +589,8 @@ impl Minibuffer {
     }
 
     pub(crate) fn delete_word(&mut self, window: &mut Window, cx: &mut App) {
-        self.editor.update(cx, |editor, cx| {
-            let selection = editor
-                .selections
-                .newest::<multi_buffer::MultiBufferOffset>(&editor.display_snapshot(cx));
-            if selection.is_empty() {
-                let text = editor.text(cx);
-                let start = token_start(text[..selection.start.0].trim_end());
-                let start = multi_buffer::MultiBufferOffset(start);
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_ranges([start..selection.end]);
-                });
-            }
-            editor.insert("", window, cx);
-        });
+        self.editor
+            .update(cx, |editor, cx| delete_word(editor, window, cx));
     }
 
     /// Consumes the minibuffer into its input and handler; the caller

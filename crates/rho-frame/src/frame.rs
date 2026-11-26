@@ -617,6 +617,42 @@ impl Frame {
         cx.notify();
     }
 
+    /// Shows `address` in place of the screen in view, for a screen that
+    /// switches what it shows (a usage chart's window or picture): the
+    /// history entry becomes `address` where it stands, so switching adds
+    /// nothing to walk back through. Desk is never replaced; from it this
+    /// opens `address` as usual.
+    pub fn replace_current(
+        &mut self,
+        address: Address,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.current_address().clone();
+        if old == address || old.kind() == FRAME_KIND {
+            return self.open(address, window, cx);
+        }
+        if !self.surfaces.contains_key(&address) && !self.hold(&address, window, cx) {
+            self.echo(
+                &format!("nothing opens {address}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        self.surfaces[&address].opened(window, cx);
+        rho_journal::record(rho_journal::Event::SurfaceShown {
+            surface: journal_surface(&address),
+            method: rho_journal::SurfaceShowMethod::Open,
+        });
+        self.history.replace_current(address, ScreenEntry::Opened);
+        self.surfaces.remove(&old);
+        self.moved();
+        self.close_overlays(window, cx);
+        self.focus_surface(window, cx);
+        cx.notify();
+    }
+
     /// Opens a web link the user chose: the system that shows the web
     /// takes it.
     pub fn open_link(&mut self, url: url::Url, cx: &mut Context<Self>) {
@@ -2622,7 +2658,6 @@ mod tests {
             })
             .unwrap();
     }
-
     type Answered = tokio::sync::oneshot::Receiver<GitApprovalDecision>;
 
     /// A host asks, as its connection says it: request `request`, for the
@@ -2775,6 +2810,52 @@ mod tests {
                 );
                 assert!(frame.minibuffer.is_none());
                 assert!(frame.questions.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// Switching a screen in place three times leaves history as long as
+    /// it was, with the screen where it stood, and what is written down
+    /// for the next start names the screen as it is now.
+    #[gpui::test]
+    fn switching_a_screen_in_place_adds_no_history(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let thread = Address::new("thread", "lab/2");
+                let charts = [
+                    "rate-limit/7d",
+                    "rate-limit/30d",
+                    "model-cost/30d",
+                    "model-cost/7d",
+                ]
+                .map(|chart| Address::new("usage", chart));
+                for address in std::iter::once(&thread).chain(&charts) {
+                    let view = cx.new(|cx| OpenCard(cx.focus_handle()));
+                    frame
+                        .surfaces
+                        .insert(address.clone(), AnySurface::new(view));
+                }
+                frame.open(thread.clone(), window, cx);
+                frame.open(charts[0].clone(), window, cx);
+                let len = frame.history.len();
+                for chart in &charts[1..] {
+                    frame.replace_current(chart.clone(), window, cx);
+                }
+                assert_eq!(frame.history.len(), len);
+                assert_eq!(frame.current_address(), &charts[3]);
+                assert_eq!(
+                    frame.history.keys_back().cloned().collect::<Vec<_>>(),
+                    [thread.clone(), Frame::desk_address()]
+                );
+                for gone in &charts[..3] {
+                    assert!(frame.surface(gone).is_none(), "{gone} went");
+                }
+                let saved = place::Saved::of(&frame.history);
+                assert_eq!(
+                    saved.history(&Frame::desk_address()).current_key(),
+                    &charts[3]
+                );
             })
             .unwrap();
     }

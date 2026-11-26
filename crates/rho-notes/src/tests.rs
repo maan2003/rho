@@ -328,3 +328,66 @@ fn previews_stop_at_word_or_character_limits_without_splitting_utf8() {
         "1 2 3 4 5 6 7…"
     );
 }
+
+/// The find line takes the prompt's editing keys: `ctrl-w` takes only the
+/// last word, `ctrl-a` goes to the start without changing the text, and
+/// `ctrl-u` clears it.
+#[gpui::test]
+fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
+    use std::rc::Rc;
+
+    use gpui::{AppContext as _, Focusable as _, VisualTestContext};
+    use rho_frame::AnySystem;
+
+    cx.update(|cx| {
+        assets::Assets.load_test_fonts(cx);
+        let settings = settings::SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        editor::init(cx);
+    });
+    let window = cx.add_window(|window, cx| {
+        let frame = FrameLink::new(window.window_handle().downcast::<Frame>().unwrap());
+        let notes = cx.new(|cx| NoteSystem::new(frame, cx));
+        let db = rho_db::RhoDb::in_memory();
+        Frame::new(
+            db,
+            vec![AnySystem::new(notes)],
+            Vec::new(),
+            Rc::new(|| {}),
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let list = window
+        .update(cx, |frame, window, cx| {
+            frame.open(notes_address(), window, cx);
+            frame
+                .current_surface()
+                .view()
+                .downcast::<NotesView>()
+                .expect("the list of notes")
+        })
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let query = list.read_with(&cx, |list, _| list.query.clone());
+    cx.update(|window, cx| {
+        query.update(cx, |query, cx| query.set_text("find the  milk", window, cx));
+        let find = list.read(cx).query.focus_handle(cx);
+        window.focus(&find, cx);
+        query.update(cx, |query, cx| {
+            query.move_to_end(&editor::actions::MoveToEnd, window, cx)
+        });
+    });
+    let text = |cx: &mut VisualTestContext| query.read_with(cx, |query, cx| query.text(cx));
+
+    cx.simulate_keystrokes("ctrl-w");
+    assert_eq!(text(&mut cx), "find the  ");
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("now ");
+    assert_eq!(text(&mut cx), "now find the  ", "ctrl-a moved to the start");
+    cx.simulate_keystrokes("ctrl-u");
+    assert_eq!(text(&mut cx), "");
+}

@@ -5,17 +5,31 @@ use std::sync::Arc;
 use editor::display_map::CustomBlockId;
 use editor::{Editor, HighlightKey};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, HighlightStyle, Pixels, Window, div};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, HighlightStyle, KeyBinding, Pixels, Window, div,
+};
 use language::Point;
 use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
-use rho_frame::Surface;
+use rho_frame::{Addressed as _, Row, Surface};
 use text::Bias;
 use theme::ActiveTheme as _;
 
 use super::paint::{self, Summary};
 use super::{Chart, UsageChart, UsageMoved};
 use crate::system::AgentsSystem;
+
+gpui::actions!(
+    rho_usage,
+    [
+        /// `] w`, `[ w`: the same picture over the other window.
+        OtherWindow,
+        /// `] v`: the next picture.
+        NextChart,
+        /// `[ v`: the picture before.
+        PreviousChart,
+    ]
+);
 
 /// One chart, as a buffer: the title and the totals are its text, and the
 /// picture is a block under them, so search, yank and the point work on it
@@ -78,6 +92,28 @@ impl UsageSurface {
             height: Pixels::ZERO,
             block: None,
         }
+    }
+
+    /// `] w` and `] v` are free in Helix and in vim's `]` motions; Helix's
+    /// own `]` keys go to the next thing of a kind, as these do.
+    pub(crate) fn bind_keys(cx: &mut App) {
+        for context in rho_frame::normal_contexts("RhoUsage", " && vim_operator == none") {
+            cx.bind_keys([
+                // The palette names the binding added last.
+                KeyBinding::new("[ w", OtherWindow, Some(&context)),
+                KeyBinding::new("] w", OtherWindow, Some(&context)),
+                KeyBinding::new("] v", NextChart, Some(&context)),
+                KeyBinding::new("[ v", PreviousChart, Some(&context)),
+            ]);
+        }
+    }
+
+    /// Shows `chart` here instead, in place: history gains nothing.
+    fn switch(&self, chart: UsageChart, cx: &mut App) {
+        let frame = self.system.read(cx).frame().clone();
+        frame.with(cx, move |frame, window, cx| {
+            frame.replace_current(chart.address(), window, cx)
+        });
     }
 
     /// What the system holds for this chart, reduced to the picture's
@@ -248,6 +284,26 @@ impl Surface for UsageSurface {
         format!("usage › {}", self.chart.title())
     }
 
+    fn rows(
+        &mut self,
+        _: Option<rho_frame::surface::Seen>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Row> {
+        let switch = |chart: UsageChart| {
+            Row::run(
+                "",
+                format!("show {}", chart.title()),
+                move |frame, window, cx| frame.replace_current(chart.address(), window, cx),
+            )
+        };
+        vec![
+            switch(self.chart.other_window()).bound_to(OtherWindow),
+            switch(self.chart.step(true)).bound_to(NextChart),
+            switch(self.chart.step(false)).bound_to(PreviousChart),
+        ]
+    }
+
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
         Some(self.editor.clone())
     }
@@ -269,6 +325,17 @@ impl Render for UsageSurface {
         let (old_columns, old_height) = (self.columns, self.height);
         div()
             .key_context("RhoUsage")
+            .on_action(cx.listener(|this, _: &OtherWindow, _, cx| {
+                this.switch(this.chart.other_window(), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextChart, _, cx| this.switch(this.chart.step(true), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousChart, _, cx| {
+                    this.switch(this.chart.step(false), cx)
+                }),
+            )
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.editor.clone())

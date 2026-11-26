@@ -13862,16 +13862,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "blake3",
  "dirs 7.0.0",
  "futures-lite",
  "gpui",
  "image",
+ "jiff",
  "libc",
  "redb",
  "rho-browser-wayland",
  "rho-db",
  "rho-dealer",
  "rho-frame",
+ "rho-ledger",
  "rho-window",
  "serde",
  "serde_json",
@@ -14469,16 +14472,22 @@ dependencies = [
 name = "rho-notes"
 version = "0.1.0"
 dependencies = [
+ "assets",
  "editor",
  "gpui",
  "jiff",
  "language",
  "multi_buffer",
+ "release_channel",
+ "rho-db",
  "rho-dealer",
  "rho-frame",
  "rho-transcript",
  "rho-window",
+ "semver",
+ "settings",
  "theme",
+ "theme_settings",
  "uuid",
 ]
 

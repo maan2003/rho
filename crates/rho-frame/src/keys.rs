@@ -48,8 +48,10 @@ actions!(
         MinibufferCancel,
         MinibufferNext,
         MinibufferPrevious,
+        /// `ctrl-w` on a prompt line ([`prompt_line`]).
         MinibufferDeleteWord,
         MinibufferComplete,
+        /// `ctrl-u` on a prompt line ([`prompt_line`]).
         MinibufferClear,
     ]
 );
@@ -172,23 +174,30 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
-        KeyBinding::new(
-            "ctrl-w",
-            MinibufferDeleteWord,
-            Some("RhoMinibuffer > Editor"),
-        ),
         KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
-        KeyBinding::new("ctrl-u", MinibufferClear, Some("RhoMinibuffer > Editor")),
+    ]);
+    bindings.extend(prompt_line("RhoMinibuffer"));
+    bindings
+}
+
+/// The editing keys of every one-line prompt (`window.Prompt`): the
+/// minibuffer's, and a screen's own find line under `context`, which
+/// answers [`MinibufferDeleteWord`] and [`MinibufferClear`] for its own
+/// editor ([`crate::minibuffer::delete_word`]).
+pub fn prompt_line(context: &str) -> [KeyBinding; 3] {
+    let editor = format!("{context} > Editor");
+    [
+        KeyBinding::new("ctrl-w", MinibufferDeleteWord, Some(&editor)),
+        KeyBinding::new("ctrl-u", MinibufferClear, Some(&editor)),
         KeyBinding::new(
             "ctrl-a",
             editor::actions::MoveToBeginningOfLine {
                 stop_at_soft_wraps: false,
                 stop_at_indent: false,
             },
-            Some("RhoMinibuffer > Editor"),
+            Some(&editor),
         ),
-    ]);
-    bindings
+    ]
 }
 
 #[cfg(test)]
@@ -293,20 +302,24 @@ mod tests {
             Some("Editor"),
         )]);
         keymap.add_bindings(bindings());
-        let stack = [
-            KeyContext::parse("RhoMinibuffer").unwrap(),
-            KeyContext::parse("Editor").unwrap(),
-        ];
-        let typed = Keystroke::parse("ctrl-a").unwrap();
-        let (matches, _) = keymap.bindings_for_input(&[typed], &stack);
-        let action = matches[0].action().as_any();
-        assert!(
-            action.downcast_ref::<editor::actions::MoveToBeginningOfLine>()
-                == Some(&editor::actions::MoveToBeginningOfLine {
-                    stop_at_soft_wraps: false,
-                    stop_at_indent: false,
-                })
-        );
+        keymap.add_bindings(prompt_line("RhoNotesQuery"));
+        for prompt in ["RhoMinibuffer", "RhoNotesQuery"] {
+            let stack = [
+                KeyContext::parse(prompt).unwrap(),
+                KeyContext::parse("Editor").unwrap(),
+            ];
+            let typed = Keystroke::parse("ctrl-a").unwrap();
+            let (matches, _) = keymap.bindings_for_input(&[typed], &stack);
+            let action = matches[0].action().as_any();
+            assert!(
+                action.downcast_ref::<editor::actions::MoveToBeginningOfLine>()
+                    == Some(&editor::actions::MoveToBeginningOfLine {
+                        stop_at_soft_wraps: false,
+                        stop_at_indent: false,
+                    }),
+                "{prompt}"
+            );
+        }
     }
 
     #[test]

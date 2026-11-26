@@ -122,6 +122,7 @@ impl AgentsSystem {
             }
         });
         AgentSurface::bind_keys(cx);
+        UsageSurface::bind_keys(cx);
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
         rho_desktop_client::ui::bind_keys(cx);
@@ -1002,6 +1003,10 @@ impl AgentsSystem {
 
     pub(crate) fn usage(&self) -> &Usage {
         &self.usage
+    }
+
+    pub(crate) fn frame(&self) -> &FrameLink {
+        &self.frame
     }
 
     /// Every host's quota history merged, with the accounts agents run on;
