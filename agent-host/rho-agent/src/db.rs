@@ -58,22 +58,7 @@ type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// each from a savepoint `rho debug rollback` can put it back to. Oldest
 /// first. Existing records retain their layout; seed the new projection and
 /// gate downgrade before older hosts encounter new event variants.
-const MIGRATIONS: &[Migration] = &[
-    ("e41b7c2a", "a8f02c31", crate::store::migrate_mail),
-    // Old postings retain their encoding; only the new Direct kind needs
-    // the newer reader.
-    ("a8f02c31", "b5082aa5", |_| {}),
-    // Existing rows decode unchanged. An old host cannot decode MailWritten.
-    ("b5082aa5", "d8e4c62f", |_| {}),
-    // Existing mail rows decode unchanged. Older hosts cannot read a new
-    // live revision or a stop with no agent.
-    ("d8e4c62f", "9f7265ce", |_| {}),
-    (
-        "9f7265ce",
-        CURRENT_AGENT_DB_FORMAT,
-        crate::store::mail::migrate_pings,
-    ),
-];
+const MIGRATIONS: &[Migration] = &[];
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -570,90 +555,6 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn mail_upgrade_preserves_names_ids_and_projects_the_first_join() {
-        use rho_agent_types::{Address, ContentPart};
-
-        use crate::store::{MailRead as _, MailWrite as _, NewMessage};
-
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(dir.path().join("db"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent = write.alloc_agent_id();
-        let first = write
-            .post(
-                UnixMs(4),
-                None,
-                NewMessage {
-                    from: Address::User,
-                    reply_to: None,
-                    mentions: Vec::new(),
-                    content: vec![ContentPart::Text {
-                        text: "Legacy channel".into(),
-                    }],
-                },
-                Some(77),
-            )
-            .unwrap();
-        let later = write
-            .post(
-                UnixMs(5),
-                Some(first),
-                NewMessage {
-                    from: Address::Agent(agent),
-                    reply_to: None,
-                    mentions: Vec::new(),
-                    content: vec![ContentPart::Text {
-                        text: "Legacy body".into(),
-                    }],
-                },
-                None,
-            )
-            .unwrap();
-        write.join(UnixMs(6), first, agent).unwrap();
-        write.join(UnixMs(7), later, agent).unwrap();
-        write
-            .name(UnixMs(8), first, "Renamed in old build".into())
-            .unwrap();
-        write
-            .open_table(redb::TableDefinition::<AgentId, u64>::new(
-                "chat_first_thread",
-            ))
-            .remove(agent);
-        write.open_table(FORMAT).insert((), "e41b7c2a".to_owned());
-        write.commit();
-        let original = db
-            .read()
-            .mail_since(rho_agent_types::ChatSeq::ZERO, usize::MAX);
-
-        prepare(&db).await;
-        let read = db.read();
-        assert_eq!(read.first_thread(agent), Some(first));
-        assert_eq!(read.message(later).unwrap().text(), "Legacy body");
-        assert_eq!(read.project_named("Renamed in old build"), Some(first));
-        assert_eq!(
-            read.mail_since(rho_agent_types::ChatSeq::ZERO, usize::MAX),
-            original
-        );
-        let mut hops: Vec<_> = savepoints(&db)
-            .await
-            .into_iter()
-            .map(|(_, hop)| hop.unwrap())
-            .collect();
-        hops.sort();
-        assert_eq!(
-            hops,
-            [
-                "9f7265ce->7c2a5f9d",
-                "a8f02c31->b5082aa5",
-                "b5082aa5->d8e4c62f",
-                "d8e4c62f->9f7265ce",
-                "e41b7c2a->a8f02c31"
-            ]
-        );
-    }
 
     /// A savepoint recorded for a hop this build does not know goes when
     /// the store is prepared: nothing could roll back to it.

@@ -258,6 +258,8 @@ fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -273,10 +275,33 @@ mod tests {
         );
     }
 
+    /// The catalogue's pairs of `kinds`, without `current`: what a prompt
+    /// should offer, worked out apart from its order.
+    fn expected(kinds: &[RuntimeKind], current: &str) -> BTreeSet<String> {
+        kinds
+            .iter()
+            .flat_map(|kind| Runtime::choices(*kind))
+            .filter(|choice| choice != current)
+            .collect()
+    }
+
+    /// Each choice once, the usual ones of `kinds` first, in their order.
+    fn assert_offered(choices: &[String], kinds: &[RuntimeKind], current: &str) {
+        let offered: BTreeSet<String> = choices.iter().cloned().collect();
+        assert_eq!(offered.len(), choices.len(), "no choice twice: {choices:?}");
+        assert_eq!(offered, expected(kinds, current));
+        let usual: Vec<&str> = RUNTIMES
+            .into_iter()
+            .filter(|choice| *choice != current)
+            .filter(|choice| kinds.contains(&Runtime::parse(choice).unwrap().kind()))
+            .collect();
+        assert_eq!(&choices[..usual.len()], usual.as_slice());
+    }
+
     #[test]
     fn runtime_prompt_lists_every_supported_effort_and_model_of_the_current_kind() {
         let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", false).collect();
-        assert_eq!(choices.len(), 19);
+        assert_offered(&choices, &[RuntimeKind::Claude], "opus-high");
         for choice in ["fable-max", "opus-medium", "sonnet-low", "haiku-xhigh"] {
             assert!(choices.iter().any(|offered| offered == choice), "{choice}");
         }
@@ -290,7 +315,11 @@ mod tests {
     #[test]
     fn a_stopped_agent_without_history_can_choose_another_kind() {
         let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", true).collect();
-        assert_eq!(choices.len(), 35);
+        assert_offered(
+            &choices,
+            &[RuntimeKind::Claude, RuntimeKind::Rho],
+            "opus-high",
+        );
         assert!(choices.iter().any(|choice| choice == "terra-xhigh"));
         assert!(choices.iter().all(|choice| Runtime::parse(choice).is_ok()));
     }

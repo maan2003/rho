@@ -14,9 +14,8 @@
 //!
 //! Addresses are `note:<id>`
 //! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)), and the list
-//! of them is `notes:all`. A deadline on
-//! a note is the dealer's to rank, like on anything else; a bare reminder
-//! is a note with a deadline. This system only opens the card.
+//! of them is `notes:all`. A note is never a card: the dealer reads
+//! nothing of the deadlines older builds wrote on notes.
 
 pub(crate) mod list;
 mod view;

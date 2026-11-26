@@ -26,6 +26,8 @@ mod desktop;
 mod gccp;
 mod host;
 mod mail;
+// Not served: see `Protocol::Voice` in `serve_stream`.
+#[allow(dead_code)]
 mod realtime;
 mod secret_store;
 mod transcript;
@@ -1267,10 +1269,6 @@ impl Services {
         }
     }
 
-    async fn set_auth_account_enabled(&self, name: &str, enabled: bool) {
-        self.inference.set_account_enabled(name, enabled).await;
-    }
-
     /// An agent named by its id or a unique prefix of it, with or without
     /// a handle prefix (`eng-`) in front, which is presentation only.
     fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
@@ -1321,8 +1319,6 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match open.protocol {
-        Protocol::Agents => anyhow::bail!("the agents protocol is now the worksets protocol"),
-        Protocol::Ledger => anyhow::bail!("the old ledger protocol is no longer supported"),
         Protocol::Worksets => agents::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Chat => mail::serve(services, open.unpack()?, reader, writer).await,
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
@@ -1332,17 +1328,23 @@ where
         Protocol::Terminal => {
             agents::serve_terminals(services, open.unpack()?, reader, writer).await
         }
+        // Voice is not in `product/`, so no window has a way to start it.
+        // The host refuses it until it is; `realtime` stays built and tested.
         Protocol::Voice => {
-            let rho_rtc::protocol::Open {
-                offer_sdp,
-                agent_id,
-                thread,
-            } = open.unpack()?;
-            realtime::serve(services, reader, writer, offer_sdp, agent_id, thread).await
+            let mut writer = writer;
+            write_frame(
+                &mut writer,
+                &rho_rtc::protocol::Opened::Refused {
+                    reason: VOICE_OFF.to_owned(),
+                },
+            )
+            .await?;
+            anyhow::bail!(VOICE_OFF)
         }
-        Protocol::Workspace => anyhow::bail!("the workspace file protocol is no longer served"),
     }
 }
+
+const VOICE_OFF: &str = "voice is off: this host does not serve voice sessions";
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 

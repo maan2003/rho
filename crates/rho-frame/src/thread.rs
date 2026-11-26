@@ -1,5 +1,5 @@
 //! The keys of a thread screen, the same on every thread the window
-//! shows, whether a channel or a thread on a host.
+//! shows.
 //!
 //! The mails and draft share one editor under [`SCREEN`].
 

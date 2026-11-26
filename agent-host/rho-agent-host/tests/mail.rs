@@ -12,12 +12,11 @@ use rho_agent_types::{
 };
 use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
-    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, MailLaunch, RestartWorkset, RewindAgent,
-    StartFromMail, StopAgent,
+    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset, RewindAgent, StopAgent,
 };
 use rho_chat::protocol::{
-    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Open, Post, PostIdea,
-    PostIdeaReply, Project, ResolveProject, RetryIdea, ServerFrame,
+    ChangeProject, ClientFrame, CreateProject, Open, Post, PostIdea, PostIdeaReply, Project,
+    ResolveProject, RetryIdea, ServerFrame,
 };
 use rho_chat::{HostChat, cards};
 use rho_rpc::protocol::client::{call, connect};
@@ -125,11 +124,10 @@ def new_agent(*, runtime, **kwargs):
         } else if scenario == rho_fake_model::Scenario::MailChain {
             run_peer_chain(&paths, root).await
         } else {
-            let refused = run_refused_start(&paths, root).await?;
             let mail = run(&paths, root).await?;
             let live = run_live_ask(&paths, root).await?;
             let recovery = run_startup_failure(&paths, root).await?;
-            anyhow::Ok(format!("{refused}\n{mail}\n{live}\n{recovery}"))
+            anyhow::Ok(format!("{mail}\n{live}\n{recovery}"))
         }
     })
     .await
@@ -450,17 +448,8 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     assert_ne!(fresh, next_agent);
     assert_ne!(fresh, standing);
     wait_for_delivery(paths, fresh, per_idea).await?;
-    call(
-        paths,
-        ImportProject {
-            project: one,
-            config: one_config,
-        },
-    )
-    .await?;
-
     // A new session, with no previous settings, sees the host's existing
-    // choices rather than the old device-only preference it tried to import.
+    // choices.
     let mut second_device = connect_chat(paths).await?;
     let ServerFrame::Hello { head, .. } = read_frame(&mut second_device).await? else {
         anyhow::bail!("no new device hello");
@@ -654,82 +643,6 @@ async fn wait_for_delivery(
     }
 }
 
-async fn run_refused_start(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
-    let mut stream = connect_chat(paths).await?;
-    let ServerFrame::Hello { head, host } = read_frame(&mut stream).await? else {
-        anyhow::bail!("no mail hello");
-    };
-    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
-    let project = post(paths, 100, None, "reef").await?;
-    let thread = post(paths, 101, Some(project), "Check the tide clock.").await?;
-    let missing = root.join("does-not-exist");
-    let error = call(
-        paths,
-        StartFromMail {
-            origin: thread,
-            launch: MailLaunch::New(CreateWorkset {
-                kind: WorksetKind::Host {
-                    cwd: missing.to_str().unwrap().into(),
-                },
-                code: "raise AssertionError('directory check did not run')".into(),
-            }),
-            host_label: "lab".into(),
-        },
-    )
-    .await
-    .expect_err("the requested directory is missing");
-    let reason = format!("{} does not exist on lab", missing.display());
-    assert_eq!(error.to_string(), reason);
-    let mut history = HostChat::default();
-    let mail = loop {
-        let ServerFrame::Messages { records } = read_frame(&mut stream).await? else {
-            continue;
-        };
-        let mut failure = None;
-        for record in records {
-            history.tell(&record);
-            failure = failure.or_else(|| {
-                rho_agent_types::Message::from_record(&record)
-                    .filter(|mail| mail.from == Address::StartFailed)
-            });
-        }
-        if let Some(mail) = failure {
-            break mail;
-        }
-    };
-    assert_eq!(mail.parent, Some(thread));
-    assert_eq!(mail.reply_to, Some(thread));
-    assert_eq!(
-        mail.text(),
-        format!(
-            "failed · did not start · {reason}\n\nreply to retry, or change where it works from the project's palette."
-        )
-    );
-    let claims = cards::claims(
-        &cards::Host {
-            endpoint: host,
-            chat: &history,
-            name: "lab",
-        },
-        &rho_dealer::Marks::default(),
-        jiff::Timestamp::now(),
-        None,
-        [],
-    );
-    let [claim] = claims.as_slice() else {
-        anyhow::bail!("refused start did not deal one card")
-    };
-    assert_eq!(
-        cards::answered(&history, thread, claim.seen).map(|answer| answer.message),
-        Some(mail.id)
-    );
-    assert_eq!(claim.title, "Check the tide clock.");
-    Ok(format!(
-        "a missing directory refused the start and dealt stop mail #{}",
-        mail.id.0.0
-    ))
-}
-
 async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
     let mut stream = connect_chat(paths).await?;
     let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
@@ -738,12 +651,17 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
     let project = post(paths, 110, None, "lighthouse").await?;
     let thread = post(paths, 111, Some(project), "Check the clock offsets.").await?;
-    let make_agent = || async {
+    // Each in a directory of its own: the fake model counts its tool
+    // rounds in a file in the working directory, and both agents work at
+    // once when one reply wakes them.
+    let make_agent = |name: &'static str| async move {
+        let cwd = root.join(name);
+        std::fs::create_dir_all(&cwd)?;
         let created = call(
             paths,
             CreateWorkset {
                 kind: WorksetKind::Host {
-                    cwd: root.to_str().unwrap().into(),
+                    cwd: cwd.to_str().unwrap().into(),
                 },
                 code:
                     r#"new_agent(runtime={"kind": "native", "model": "sol", "effort": "medium"})"#
@@ -754,8 +672,8 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         let agent = created.result.agent.context("no agent")?;
         anyhow::Ok((agent, created.workset))
     };
-    let (a, aw) = make_agent().await?;
-    let (b, bw) = make_agent().await?;
+    let (a, aw) = make_agent("a").await?;
+    let (b, bw) = make_agent("b").await?;
     let eval = |workset, code| async move {
         let result = call(paths, Eval { workset, code }).await?;
         anyhow::ensure!(result.error.is_none(), "{:?}", result.error);
@@ -1146,9 +1064,9 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     assert!(text.starts_with("lost · "), "{text}");
     assert!(text.contains("Last transcript lines:"), "{text}");
 
-    // A former participant does not become a recipient because the card
-    // is theirs. The settlement still identifies the version the user saw.
-    call(paths, Leave { thread, agent }).await?;
+    // The user's reply goes to the thread, with no addressee, even though
+    // the card was the agent's. Its settlement names the version the user
+    // saw.
     let seen = rho_agent_types::MessageVersion {
         message: MessageId(origin_result.seq),
         version: origin_result.seq,

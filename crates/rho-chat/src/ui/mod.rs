@@ -49,18 +49,10 @@ use crate::protocol::{Name, Post, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
 use crate::{ThreadId, cards};
 
-/// What mail tells its listeners: the agents system starts an agent from a
-/// mail once the host has logged it.
+/// What the chat tells its listeners.
 pub enum Event {
     /// The thread's draft was queued by a frame action.
     DraftSent(ThreadId),
-    /// The host logged a message the user wrote, under the id this client
-    /// gave it when it was written.
-    Delivered {
-        endpoint: EndpointId,
-        client_id: u64,
-        message: MessageId,
-    },
     /// The user opened the transcript from one of its mails.
     Inspect { mail: Message, agent: AgentId },
     /// A host's forest changed.
@@ -118,7 +110,6 @@ pub struct ChatSystem {
     /// Each project being created, and the idea waiting to address it.
     creating_projects: Vec<(ThreadId, Option<ProjectCreated>)>,
     settings: HashMap<EndpointId, HashMap<ProjectId, ProjectConfig>>,
-    legacy_places: HashMap<(EndpointId, ProjectId), ProjectConfig>,
     known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
     drafts: TextIndex<(EndpointId, Option<MessageId>)>,
@@ -150,7 +141,6 @@ impl ChatSystem {
                 idea::prompt_later(chat, cx);
             }
         });
-        let legacy_places = projects::legacy_places(&db);
         let cache = Cache::open_on(db).expect("the chat copy opens");
         let loaded = cache.load();
         let mut logs = HashMap::new();
@@ -197,7 +187,6 @@ impl ChatSystem {
             outbox,
             creating_projects: Vec::new(),
             settings: HashMap::new(),
-            legacy_places,
             known_places: Rc::new(|_, _| Vec::new()),
             last_project: loaded.last_project,
             drafts,
@@ -420,7 +409,6 @@ impl ChatSystem {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
                     self.settings
                         .insert(endpoint, configured.into_iter().collect());
-                    self.import_legacy_projects(endpoint, cx);
                     self.finish_project_creation(cx);
                     self.changed(endpoint, cx);
                 }
@@ -554,26 +542,6 @@ impl ChatSystem {
         cx.notify();
     }
 
-    /// The explicit options path sends an ordinary post and starts the
-    /// user-selected agent once the mail is logged.
-    pub fn post_draft_with_options(
-        &mut self,
-        thread: ThreadId,
-        cx: &mut Context<Self>,
-    ) -> Option<u64> {
-        let parent = Some(thread.message);
-        let text = self.draft(thread.host, parent).trim().to_owned();
-        if text.is_empty() {
-            return None;
-        }
-        // Effects run after this update. Let the view clear its old draft
-        // and reconcile the queued mail together, before the post's notify.
-        cx.emit(Event::DraftSent(thread));
-        let id = self.queue_thread_post(thread, text, Delivery::Mail, None, None, cx);
-        self.set_draft(thread.host, parent, String::new());
-        Some(id)
-    }
-
     fn project_root(&self, thread: ThreadId) -> Option<ThreadId> {
         let chat = self.host_chat(thread.host)?;
         chat.message(thread.message)?;
@@ -622,11 +590,6 @@ impl ChatSystem {
             return;
         };
         self.cache.write_outbox(endpoint, kept, None);
-        cx.emit(Event::Delivered {
-            endpoint,
-            client_id,
-            message,
-        });
         if outgoing.delivery == Delivery::Idea {
             let pending = PendingIdeaId(client_id).address();
             let posted = ThreadId {

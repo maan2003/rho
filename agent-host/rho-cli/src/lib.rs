@@ -87,17 +87,14 @@ async fn run(command: Command) -> Result<()> {
 fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> String {
     use rho_rpc::protocol::{Protocol, describe_as};
     match open.protocol {
-        Protocol::Agents => "retired agents protocol".to_owned(),
         Protocol::Worksets => describe_as::<agents::worksets::Open>(open, reply),
         Protocol::Chat => describe_as::<rho_chat::protocol::Open>(open, reply),
         Protocol::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
         Protocol::Host => describe_as::<host::Open>(open, reply),
-        Protocol::Ledger => "retired ledger protocol".to_owned(),
         Protocol::LedgerLog => describe_as::<rho_ledger::protocol::Open>(open, reply),
         Protocol::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
         Protocol::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
         Protocol::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
-        Protocol::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
 }
 

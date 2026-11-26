@@ -173,12 +173,16 @@ pub(crate) fn python(agent: rho_agent_types::AgentId, db: &rho_db::RhoDb) {
                                 .collect(),
                         )
                     }
-                    PyRequest::SendMail {
+                    // What `_rho.send_mail` asks today; `Human` never
+                    // replaces its last message.
+                    PyRequest::SendMail2 {
                         sender,
                         parent,
                         reply_to,
                         mentions,
                         content,
+                        replace_last: false,
+                        ..
                     } => {
                         let db = db(sender)?;
                         let mut write = db.write().await;

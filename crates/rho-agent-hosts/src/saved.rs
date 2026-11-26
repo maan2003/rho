@@ -4,17 +4,15 @@
 //! One row in the client's database, holding the whole list in attachment
 //! order, which is the order hosts are listed in and nothing more. The
 //! list is rewritten whole on every attach and detach, so what is saved is
-//! always exactly what is attached. Beside it, the host this client last
-//! placed an agent on, by its [`HostKey`]: the default for the next one.
+//! always exactly what is attached.
 
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
-use crate::{AttachTarget, HostKey, HostSpec, IrohAccess};
+use crate::{AttachTarget, HostSpec, IrohAccess};
 
 const SAVED: TableDefinition<(), Sen<SavedHosts>> = TableDefinition::new("rho_hosts_saved_v1");
-const LAST_PLACED: TableDefinition<(), String> = TableDefinition::new("rho_hosts_last_placed_v1");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 struct SavedHosts {
@@ -165,26 +163,6 @@ pub fn save<'a>(db: &RhoDb, hosts: impl IntoIterator<Item = &'a HostSpec>) {
     });
 }
 
-/// The host this client last placed an agent on, if it has.
-pub fn load_last_placed(db: &RhoDb) -> Option<HostKey> {
-    let read = db.read();
-    if !read.has_table(LAST_PLACED.name()) {
-        return None;
-    }
-    let key = read.open_table(LAST_PLACED).get(())?.value();
-    Some(HostKey::from_stored(key))
-}
-
-pub fn save_last_placed(db: &RhoDb, key: &HostKey) {
-    futures::executor::block_on(async {
-        let mut write = db.write().await;
-        write
-            .open_table(LAST_PLACED)
-            .insert((), key.as_str().to_owned());
-        write.commit();
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,15 +201,6 @@ mod tests {
 
     /// What was attached is what the next start attaches, in the same
     /// order.
-    #[test]
-    fn the_last_placed_host_comes_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rho_db::client::open(dir.path()).unwrap();
-        assert_eq!(load_last_placed(&db), None);
-        let key = iroh_spec("fern").target.key();
-        save_last_placed(&db, &key);
-        assert_eq!(load_last_placed(&db), Some(key));
-    }
 
     #[test]
     fn the_saved_set_comes_back_in_attachment_order() {

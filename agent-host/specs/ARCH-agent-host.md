@@ -94,9 +94,9 @@ uses a different transport. The log lives on the host because the GUI is often o
 mail crosses worksets, and it survives workset deletion.
 
 Mail and agents are separate hierarchies. They meet only through
-membership and through mentions. A user's addressed reply also records
-the exact mail it answers, independently of parentage: its writer receives
-it even if they left the thread, and a move does not undo the answer.
+membership and through mentions. A user's reply also records the version
+of the card it answers (`thread_reply`), independently of parentage, and
+goes to the whole thread like any other message there.
 Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
@@ -177,17 +177,18 @@ send again. The user sees approved harnesses and
 acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
 and `rho gccp remove`.
 
-A mention carries a kind (`ask`, `result`, `fyi`); a mention of the user is
-the only way a message asks for the user's attention, so a message has no kind
-of its own. The user's mentions of agents are `ask`.
+A mention of the user, which pings or not, is the only way a message asks
+for the user's attention, so a message has no kind of its own. Other
+mentions name the agents a message reaches.
 
-The message comes first and the agent second. The GUI starts an agent from an
-existing message, and Python records that message as the agent's `origin` prop
-(`chat:<message id>`), not as a host field, so other origins such as Slack can
-follow. The default policy then joins the agent to that message's thread and
-hands it that message first.
+The message comes first and the agent second. The GUI posts an idea under a
+project (`PostIdea`), and the host starts the work by the project's place,
+mode and runtime, or hands it to the project's standing agent. The agent's
+`origin` prop records that message (`chat:<message id>`), not a host field,
+so other origins such as Slack can follow. The default policy then joins the
+agent to that message's thread and hands it that message first.
 
-Agents send with `rho.mail.send`, specifying the recipient. Policy Python
+Agents send with `chat.send`, as a message or a flash. Policy Python
 reads each agent's inbox and hands each message to the agent as an input that
 names it. The delivery position is derived from the `Request` rows that carried
 them, so the mail log keeps no cursors. Slack is separate from project mail: agents reach it through the host's

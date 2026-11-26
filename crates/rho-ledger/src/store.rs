@@ -2,7 +2,7 @@
 //! append writes only the bytes it adds.
 use std::collections::BTreeMap;
 
-use redb::{AccessGuard, TableDefinition, TableHandle};
+use redb::{AccessGuard, TableDefinition};
 use rho_db::{ReadTxn, WriteTxn};
 
 use crate::protocol::LogId;
@@ -10,22 +10,10 @@ use crate::protocol::LogId;
 /// `(log, offset)` → the bytes appended at that offset.
 const ROWS: TableDefinition<([u8; 16], u64), &[u8]> = TableDefinition::new("ledger_log_rows_v3");
 const LENGTHS: TableDefinition<[u8; 16], u64> = TableDefinition::new("ledger_log_lengths_v3");
-// Each log as one value, rewritten whole by every append. Remove once every
-// device and host has opened a build with rows.
-const WHOLE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("ledger_logs_v2");
 
 pub fn open(write: &mut WriteTxn) {
     write.open_table(ROWS);
     write.open_table(LENGTHS);
-    let whole: Vec<([u8; 16], Vec<u8>)> = write
-        .open_table(WHOLE)
-        .iter()
-        .map(|(log, bytes)| (log.value(), bytes.value().to_vec()))
-        .collect();
-    for (log, bytes) in whole {
-        append(write, LogId(log), 0, &bytes);
-    }
-    write.delete_table(WHOLE.name());
 }
 
 pub fn lengths(read: &ReadTxn) -> BTreeMap<LogId, u64> {
@@ -135,19 +123,5 @@ mod tests {
         assert_eq!(read(&txn, log, 2, 3), b"cde");
         assert_eq!(read(&txn, log, 7, usize::MAX), b"");
         assert_eq!(read(&txn, LogId([2; 16]), 0, usize::MAX), b"");
-    }
-
-    #[tokio::test]
-    async fn whole_logs_move_into_rows() {
-        let db = RhoDb::in_memory();
-        let log = LogId([1; 16]);
-        let mut write = db.write().await;
-        write.open_table(WHOLE).insert(log.0, b"held".as_slice());
-        open(&mut write);
-        write.commit();
-        assert!(!db.read().has_table("ledger_logs_v2"));
-        let txn = db.read();
-        assert_eq!(lengths(&txn), BTreeMap::from([(log, 4)]));
-        assert_eq!(read(&txn, log, 0, usize::MAX), b"held");
     }
 }

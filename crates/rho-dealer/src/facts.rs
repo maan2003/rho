@@ -92,14 +92,15 @@ pub enum Fact {
         start: Option<Until>,
         seen: Seen,
     },
-    /// Due by `by`, pressing from `lead_days` before.
+    /// Was due by `by`, pressing from `lead_days` before. No build writes
+    /// it any more, as notes and threads are never dealt by date; it stays
+    /// so old entries decode, and reads as nothing.
     Deadline {
         node: Address,
         by: Until,
         lead_days: u32,
     },
-    /// Done, having seen this far: takes back the node's deadline and
-    /// snooze.
+    /// Done, having seen this far: takes back the node's snooze.
     Settled {
         node: Address,
         seen: Seen,
@@ -138,7 +139,8 @@ pub enum Fact {
         label: uuid::Uuid,
         present: bool,
     },
-    /// What the user calls a node, over what its source calls it.
+    /// What the user called a node. Written by no build, read by none:
+    /// a thread is named on its host. It stays so old entries decode.
     Named {
         node: Address,
         name: Option<String>,
@@ -157,7 +159,7 @@ pub enum Fact {
     /// more, as piles went with the rooms (docs/rho2.md); it stays so old
     /// entries decode. One still in a log reads as [`Fact::Settled`] said
     /// at the same instant: the user put the node away, so it takes back
-    /// the deadline and snooze before it. It carries no [`Seen`], so it
+    /// the snooze before it. It carries no [`Seen`], so it
     /// moves nobody's cursor. Later than `Retract`, as entries decode by
     /// variant order.
     Piled {
@@ -208,24 +210,24 @@ pub enum Fact {
 }
 
 impl Fact {
-    /// The node the fact is about; `None` for a retract, and for the label
-    /// facts, which nothing reads.
+    /// The node the fact is about; `None` for a retract, and for the facts
+    /// no build reads any more: the label facts, deadlines and names.
     pub fn node(&self) -> Option<Address> {
         match self {
             Self::Snooze { node, .. }
             | Self::Piled { node, .. }
             | Self::Todo { node, .. }
-            | Self::Deadline { node, .. }
             | Self::Settled { node, .. }
             | Self::Mute { node }
             | Self::Unmute { node }
-            | Self::Named { node, .. }
             | Self::About { node, .. }
             | Self::Read { node, .. }
             | Self::Bookmarked { node, .. }
             | Self::Unbookmarked { node } => Some(node.clone()),
             Self::Wrote { note, .. } | Self::Deleted { note } => Some(Address::note(*note)),
-            Self::Label { .. }
+            Self::Deadline { .. }
+            | Self::Named { .. }
+            | Self::Label { .. }
             | Self::Unlabel { .. }
             | Self::Repository { .. }
             | Self::Host { .. }
@@ -239,8 +241,8 @@ impl Fact {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum Seen {
     /// An agent's story, through this position: what agent cards read
-    /// before topics replaced them. Only the migration to topics reads
-    /// it; it stays so `main`'s entries still decode.
+    /// before topics replaced them. Read by none; it stays so old entries
+    /// still decode.
     Agent(u64),
     /// A note or a user-assigned date: there is nothing more to see.
     #[default]
@@ -264,13 +266,6 @@ pub enum Seen {
 pub struct Snooze {
     pub set: Zoned,
     pub until: Timestamp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Deadline {
-    pub set: Zoned,
-    pub by: Timestamp,
-    pub lead_days: u32,
 }
 
 /// A node's attention entries, oldest first and none of them retracted,
@@ -326,17 +321,6 @@ impl<'a> Facts<'a> {
         })
     }
 
-    /// When the newest stop of a thread's agents the user had seen began:
-    /// a stop that began later is news.
-    pub fn seen_stopped(self) -> Option<u64> {
-        self.seen()
-            .filter_map(|seen| match seen {
-                Seen::Thread { stopped, .. } => Some(*stopped),
-                _ => None,
-            })
-            .max()
-    }
-
     pub fn muted(self) -> bool {
         self.0
             .iter()
@@ -360,20 +344,6 @@ impl<'a> Facts<'a> {
                 Fact::Snooze { until, .. } => Some(Snooze {
                     set: entry.at.clone(),
                     until: until.resolve(&entry.at),
-                }),
-                _ => None,
-            })
-    }
-
-    pub fn deadline(self) -> Option<Deadline> {
-        self.since_cleared()
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.fact {
-                Fact::Deadline { by, lead_days, .. } => Some(Deadline {
-                    set: entry.at.clone(),
-                    by: by.resolve(&entry.at),
-                    lead_days: *lead_days,
                 }),
                 _ => None,
             })
@@ -479,21 +449,9 @@ mod tests {
         )
     }
 
-    fn deadline(minute: i64) -> Entry {
-        entry(
-            minute,
-            Fact::Deadline {
-                node: agent(),
-                by: Until::Day(jiff::civil::date(2027, 1, 16)),
-                lead_days: 3,
-            },
-        )
-    }
-
     #[test]
-    fn settled_takes_back_the_deadline_and_the_snooze_before_it() {
+    fn settled_takes_back_the_snooze_before_it() {
         let entries = [
-            deadline(0),
             snooze(1),
             entry(
                 2,
@@ -504,7 +462,6 @@ mod tests {
             ),
         ];
         let facts = Facts(&entries);
-        assert_eq!(facts.deadline(), None);
         assert_eq!(facts.snooze(), None);
         assert_eq!(facts.snoozes(), 1, "every snooze is kept");
         assert_eq!(facts.seen_topic(), Some(4));
@@ -521,9 +478,8 @@ mod tests {
                 pile: "friday".into(),
             },
         );
-        let before = [deadline(0), snooze(1), piled.clone()];
+        let before = [snooze(1), piled.clone()];
         let facts = Facts(&before);
-        assert_eq!(facts.deadline(), None);
         assert_eq!(facts.snooze(), None);
         assert_eq!(facts.seen_topic(), None, "a pile saw nothing");
         assert!(!facts.muted());
@@ -541,7 +497,6 @@ mod tests {
     #[test]
     fn an_old_todo_reads_as_read() {
         let entries = [
-            deadline(0),
             snooze(1),
             entry(
                 2,
@@ -555,6 +510,5 @@ mod tests {
         let facts = Facts(&entries);
         assert_eq!(facts.seen_topic(), Some(7));
         assert_eq!(facts.snooze().map(|snooze| snooze.set), Some(at(1)));
-        assert!(facts.deadline().is_some());
     }
 }

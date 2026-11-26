@@ -72,11 +72,6 @@ pub struct HostKey(String);
 
 #[cfg(feature = "client")]
 impl HostKey {
-    /// A key as the desk stored it.
-    pub fn from_stored(text: String) -> Self {
-        Self(text)
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }

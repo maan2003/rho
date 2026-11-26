@@ -17,8 +17,6 @@ pub mod protocol;
 #[cfg(feature = "client")]
 pub mod cache;
 #[cfg(feature = "client")]
-pub mod create;
-#[cfg(feature = "client")]
 pub mod find;
 #[cfg(feature = "client")]
 pub mod fold;
@@ -43,8 +41,6 @@ pub mod stream;
 #[cfg(feature = "client")]
 pub mod usage;
 
-#[cfg(feature = "client")]
-pub use create::{Creation, Start, StartBase, StartFieldMode};
 #[cfg(feature = "client")]
 pub use find::AgentHit;
 #[cfg(feature = "client")]

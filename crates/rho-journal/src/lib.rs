@@ -256,9 +256,7 @@ pub enum SurfaceIdentity {
         page_id: String,
     },
     /// Retired: Zulip is gone from rho and nothing writes these. They
-    /// stay because a journal already on disk decodes by variant order,
-    /// and taking one out of the middle would misread every file that has
-    /// a later variant in it.
+    /// stay so the rows on disk that name them still decode.
     ZulipInbox,
     ZulipNarrow {
         label: String,
@@ -273,30 +271,8 @@ pub enum SurfaceIdentity {
         machine_seed: u64,
         topic: u64,
     },
-    /// The streams and their topics. Last: journals decode by variant
-    /// order.
+    /// The streams and their topics.
     Topics,
-}
-
-#[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CreateMethod {
-    /// The `new` transient: the user asked for it and chose the area.
-    New,
-    /// A browser tab that was born rather than opened from a link.
-    TabBirth,
-}
-
-#[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CreatedKind {
-    Note,
-    Page,
-    Agent,
 }
 
 #[derive(
@@ -348,45 +324,9 @@ pub enum HistoryDirection {
     senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum HistoryAppendMethod {
-    Deal,
-    Overview,
-    Command,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
 pub enum HistoryRemoveMethod {
     Close,
     Dedupe,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum DealModeAction {
-    Enter,
-    Interacted,
-    Exit,
 }
 
 #[derive(
@@ -427,6 +367,10 @@ pub struct DealerPolicySnapshot {
     pub agent_recency_window_ms: i64,
 }
 
+/// What the GUI records. Only what some site records is here: a variant
+/// is known on disk by a hash of its name, not by its place, so one that
+/// nothing records any more goes, and a row an older build wrote for it is
+/// skipped by the dump without misreading any other.
 #[derive(
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
@@ -435,9 +379,6 @@ pub enum Event {
     SessionStarted {
         build: BuildIdentity,
         dealer_policy: DealerPolicySnapshot,
-    },
-    WindowFocusChanged {
-        focused: bool,
     },
     UserIdle {
         timeout_s: u64,
@@ -461,28 +402,9 @@ pub enum Event {
         position: usize,
         len: usize,
     },
-    HistoryAppended {
-        identity: SurfaceIdentity,
-        method: HistoryAppendMethod,
-    },
     HistoryRemoved {
         identity: SurfaceIdentity,
         method: HistoryRemoveMethod,
-    },
-    DealMode {
-        action: DealModeAction,
-        card: Option<DealerCardIdentity>,
-    },
-    SurfaceClosed {
-        surface: SurfaceIdentity,
-        dealt_untouched: bool,
-    },
-    OverviewOpened,
-    AgentOpened {
-        agent_id: AgentIdentity,
-    },
-    AgentSelected {
-        agent_id: Option<String>,
     },
     MinibufferOpened {
         prompt: String,
@@ -494,15 +416,6 @@ pub enum Event {
     MinibufferCancelled {
         prompt: String,
         input: String,
-    },
-    DeskRawModeToggled {
-        enabled: bool,
-    },
-    /// A manual Desk heading lookup is a miss signal for future dealing.
-    Find {
-        query: String,
-        target: String,
-        found: bool,
     },
     /// What one card was told to do. There is no session behind it: the
     /// verdict is about the card the reader had in front of them, so what
@@ -518,28 +431,6 @@ pub enum Event {
     VerdictUndone {
         card: DealerCardIdentity,
         verdict: DealerVerdict,
-    },
-    /// A new node the user asked for, and where it was filed.
-    Created {
-        node_id: NodeIdentity,
-        kind: CreatedKind,
-        method: CreateMethod,
-        at_root: bool,
-    },
-    /// Retired: the carry-over it recorded ran once, on the first run of
-    /// the build that deleted the inbox, and that build is behind every
-    /// device. The variant stays because a journal already on disk decodes
-    /// by variant order, and taking one out of the middle would misread
-    /// every file that has one.
-    CaptureCarryover {
-        notes: u32,
-        unreadable: u32,
-    },
-    /// One event per scroll burst. The position is a coarse vertical row or
-    /// line offset; surfaces without a readable viewport report zero.
-    Scroll {
-        surface: SurfaceIdentity,
-        rough_position: i64,
     },
     PhoneFlick {
         direction: PhoneFlickDirection,
@@ -561,58 +452,10 @@ pub enum Event {
         weighed: Vec<WeighedNode>,
         next_change: Option<String>,
     },
-    /// The user said the card in front of them should not have been dealt,
-    /// or not there. A [`Event::Deal`] with the same moment holds the hand.
-    WrongCard {
-        card: DealerCardIdentity,
-        kind: DealerCardKind,
-        reason: String,
-        occurred_at: String,
-    },
-    /// One key the user pressed, as GPUI resolved it: what it was bound to
-    /// and where it landed.
-    Key {
-        key: String,
-        text: Option<String>,
-        action: Option<String>,
-        surface: Option<SurfaceIdentity>,
-    },
-    /// A message the user sent an agent, whole.
-    AgentMessageSent {
-        agent: String,
-        text: String,
-        images: u32,
-    },
-    /// A line the GUI told the user, in the echo area and the messages
-    /// buffer: notices, host connections, errors.
-    Told {
-        text: String,
-        class: String,
-    },
-    /// What the GUI believes about an agent, each time the host changes it.
-    /// Times are the host's, in unix milliseconds.
-    AgentChanged {
-        agent: String,
-        title: String,
-        last_user_message_at: u64,
-        /// Written by builds before chat; `None` since: an agent sends to
-        /// topics, and what wants the user is a topic's.
-        last_sent_at: Option<u64>,
-        /// Written by builds before chat; `None` since, as `last_sent_at`.
-        unread: Option<String>,
-    },
     /// A menu item run, by its key or by a tap.
     MenuRan {
         action: String,
         count: Option<u32>,
-    },
-    /// A mouse button pressed anywhere in the workspace, in window pixels.
-    Click {
-        button: String,
-        x: f32,
-        y: f32,
-        clicks: usize,
-        surface: Option<SurfaceIdentity>,
     },
 }
 
@@ -663,40 +506,22 @@ impl Event {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SessionStarted { .. } => "session_started",
-            Self::WindowFocusChanged { .. } => "window_focus_changed",
             Self::UserIdle { .. } => "user_idle",
             Self::UserResumed => "user_resumed",
             Self::LampTransition { .. } => "lamp_transition",
             Self::ChimeRing { .. } => "chime_ring",
             Self::SurfaceShown { .. } => "surface_shown",
             Self::HistoryStepped { .. } => "history_stepped",
-            Self::HistoryAppended { .. } => "history_appended",
             Self::HistoryRemoved { .. } => "history_removed",
-            Self::DealMode { .. } => "deal_mode",
-            Self::SurfaceClosed { .. } => "surface_closed",
-            Self::OverviewOpened => "overview_opened",
-            Self::AgentOpened { .. } => "agent_opened",
-            Self::AgentSelected { .. } => "agent_selected",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",
-            Self::DeskRawModeToggled { .. } => "desk_raw_mode_toggled",
-            Self::Created { .. } => "created",
-            Self::CaptureCarryover { .. } => "capture_carryover",
-            Self::Scroll { .. } => "scroll",
-            Self::Find { .. } => "find",
             Self::Dealer { .. } => "dealer",
             Self::VerdictUndone { .. } => "verdict_undone",
             Self::PhoneFlick { .. } => "phone_flick",
             Self::PhoneVerdict { .. } => "phone_verdict",
             Self::Deal { .. } => "deal",
-            Self::WrongCard { .. } => "wrong_card",
-            Self::Key { .. } => "key",
-            Self::AgentMessageSent { .. } => "agent_message_sent",
-            Self::Told { .. } => "told",
-            Self::AgentChanged { .. } => "agent_changed",
             Self::MenuRan { .. } => "menu_ran",
-            Self::Click { .. } => "click",
         }
     }
 }
@@ -723,15 +548,11 @@ impl Journal {
     /// holds every other kind of client state too, under its own names;
     /// this touches the journal's and nothing else.
     pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
-        let scrubbed = db.read().has_table(SCRUBBED.name());
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
             write.delete_table("gui_action_journal_v1");
             write.open_table(EVENTS);
-            if !scrubbed {
-                scrub_secret_inputs(&mut write);
-            }
             write.commit();
         });
         let sequence = next_sequence(&db);
@@ -784,45 +605,6 @@ fn next_sequence(db: &RhoDb) -> u64 {
                 .checked_add(1)
                 .expect("action journal sequence overflow")
         })
-}
-
-/// Temporary: builds before secret prompts journaled what was typed into
-/// them: the Slack token and cookie, and the ledger's secret phrase. The
-/// scrub blanks those inputs once; this table says it ran. Remove both once
-/// every device has opened its journal with this build.
-const SCRUBBED: TableDefinition<(), ()> = TableDefinition::new("gui_action_journal_scrubbed_v1");
-
-fn secret_prompt(prompt: &str) -> bool {
-    prompt.ends_with(" xoxc token:")
-        || prompt.ends_with(" d cookie:")
-        || prompt.starts_with("secret phrase")
-}
-
-fn scrub_secret_inputs(write: &mut rho_db::WriteTxn) {
-    let leaked: Vec<(u64, Entry)> = write
-        .open_table(STORED_EVENTS)
-        .iter()
-        .filter_map(|(sequence, value)| {
-            let mut bytes = value.value();
-            let mut entry = <Entry as senax_encoder::Decoder>::decode(&mut bytes).ok()?;
-            let (Event::MinibufferSubmitted { prompt, input }
-            | Event::MinibufferCancelled { prompt, input }) = &mut entry.event
-            else {
-                return None;
-            };
-            if !secret_prompt(prompt) || input.is_empty() {
-                return None;
-            }
-            input.clear();
-            Some((sequence.value(), entry))
-        })
-        .collect();
-    let mut events = write.open_table(EVENTS);
-    for (sequence, entry) in &leaked {
-        events.insert(sequence, SenValue::borrowed(entry));
-    }
-    drop(events);
-    write.open_table(SCRUBBED).insert((), ());
 }
 
 /// Entries taken into one commit at most. A commit syncs the file, so a
@@ -917,18 +699,6 @@ pub fn dump(
     // Exclusively: the journal is tables in the client's one database, and
     // a GUI holding it is a GUI whose rows are still being written.
     let db = rho_db::client::open(state_dir)?;
-    let read = db.read();
-    let needs_scrub = read.has_table(STORED_EVENTS.name()) && !read.has_table(SCRUBBED.name());
-    drop(read);
-    if needs_scrub {
-        tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(async {
-                let mut write = db.write().await;
-                scrub_secret_inputs(&mut write);
-                write.commit();
-            });
-    }
     dump_db(&db, kind, output)
 }
 
@@ -992,7 +762,7 @@ mod tests {
                 .insert(999, b"not an entry this build knows".as_slice());
             write.commit();
         });
-        journal.record(Event::DeskRawModeToggled { enabled: true });
+        journal.record(Event::UserIdle { timeout_s: 60 });
         journal.flush().unwrap();
 
         let mut output = Vec::new();
@@ -1007,17 +777,90 @@ mod tests {
                     .to_owned()
             })
             .collect::<Vec<_>>();
-        assert_eq!(events, vec!["user_resumed", "desk_raw_mode_toggled"]);
+        assert_eq!(events, vec!["user_resumed", "user_idle"]);
+    }
+
+    /// Variants are told apart by a hash of their names, not by their
+    /// place, so retiring one never misreads a row that names another: a
+    /// row for a retired variant is skipped, and the rest read as written.
+    #[test]
+    fn a_retired_event_is_skipped_and_never_misreads_another() {
+        mod old {
+            #[derive(senax_encoder::Encode)]
+            pub struct Entry {
+                pub timestamp: String,
+                pub event: Event,
+            }
+
+            /// An older vocabulary, in another order, with a variant this
+            /// build no longer has.
+            #[derive(senax_encoder::Encode)]
+            pub enum Event {
+                Told { text: String, class: String },
+                MenuRan { action: String, count: Option<u32> },
+                UserIdle { timeout_s: u64 },
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        let rows = [
+            old::Event::Told {
+                text: "[devbox connected]".into(),
+                class: "SystemInfo".into(),
+            },
+            old::Event::UserIdle { timeout_s: 60 },
+            old::Event::MenuRan {
+                action: "quit".into(),
+                count: None,
+            },
+        ];
+        futures::executor::block_on(async {
+            let mut write = journal.db.write().await;
+            let mut table = write.open_table(STORED_EVENTS);
+            for (sequence, event) in rows.into_iter().enumerate() {
+                let entry = old::Entry {
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    event,
+                };
+                let bytes = senax_encoder::encode(&entry).unwrap();
+                table.insert(sequence as u64, bytes.as_ref());
+            }
+            drop(table);
+            write.commit();
+        });
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let events: Vec<Event> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                serde_json::from_value(value["event"].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::UserIdle { timeout_s: 60 },
+                Event::MenuRan {
+                    action: "quit".into(),
+                    count: None,
+                },
+            ]
+        );
     }
 
     #[test]
     fn persists_events_and_dumps_filtered_json_lines() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
-        journal.record(Event::AgentOpened {
-            agent_id: "agent-a".into(),
+        journal.record(Event::MinibufferOpened {
+            prompt: "find:".into(),
         });
-        journal.record(Event::DeskRawModeToggled { enabled: true });
+        journal.record(Event::MenuRan {
+            action: "quit".into(),
+            count: None,
+        });
         journal.record(Event::UserIdle { timeout_s: 60 });
         journal.record(Event::UserResumed);
         journal.flush().unwrap();
@@ -1031,15 +874,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0]["sequence"], 0);
-        assert_eq!(entries[0]["event"]["type"], "agent_opened");
+        assert_eq!(entries[0]["event"]["type"], "minibuffer_opened");
         assert_eq!(entries[1]["sequence"], 1);
-        assert_eq!(entries[1]["event"]["type"], "desk_raw_mode_toggled");
+        assert_eq!(entries[1]["event"]["type"], "menu_ran");
         assert_eq!(entries[2]["event"]["type"], "user_idle");
         assert_eq!(entries[2]["event"]["timeout_s"], 60);
         assert_eq!(entries[3]["event"]["type"], "user_resumed");
 
         let mut filtered = Vec::new();
-        journal.dump(Some("agent_opened"), &mut filtered).unwrap();
+        journal
+            .dump(Some("minibuffer_opened"), &mut filtered)
+            .unwrap();
         assert_eq!(String::from_utf8(filtered).unwrap().lines().count(), 1);
     }
 
@@ -1047,9 +892,7 @@ mod tests {
     fn standalone_dump_reports_an_active_gui_journal() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
-        journal.record(Event::AgentOpened {
-            agent_id: "agent-a".into(),
-        });
+        journal.record(Event::UserResumed);
         journal.flush().unwrap();
 
         let error = dump(dir.path(), None, Vec::new()).unwrap_err();
@@ -1155,18 +998,6 @@ mod tests {
     }
 
     #[test]
-    fn surface_close_records_whether_a_deal_was_untouched() {
-        let event = Event::SurfaceClosed {
-            surface: SurfaceIdentity::Transcript {
-                agent_id: AgentIdentity("agent-a".into()),
-            },
-            dealt_untouched: true,
-        };
-        let encoded = serde_json::to_string(&event).unwrap();
-        assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
-    }
-
-    #[test]
     fn history_events_round_trip_direction_position_and_methods() {
         let surface = SurfaceIdentity::Transcript {
             agent_id: AgentIdentity("agent-a".into()),
@@ -1176,10 +1007,6 @@ mod tests {
                 direction: HistoryDirection::Back,
                 position: 3,
                 len: 7,
-            },
-            Event::HistoryAppended {
-                identity: surface.clone(),
-                method: HistoryAppendMethod::Deal,
             },
             Event::HistoryRemoved {
                 identity: surface,
@@ -1208,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deal_and_a_wrong_card_are_kept_and_dumped() {
+    fn a_deal_is_kept_and_dumped() {
         let card = DealerCardIdentity {
             host: 0,
             node_id: NodeIdentity::Note { uuid: [7; 16] },
@@ -1239,16 +1066,9 @@ mod tests {
             }],
             next_change: None,
         };
-        let wrong = Event::WrongCard {
-            card,
-            kind: DealerCardKind::Note,
-            reason: "done yesterday".into(),
-            occurred_at: "2026-09-25T20:00:00Z".into(),
-        };
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
         journal.record(deal.clone());
-        journal.record(wrong.clone());
         journal.flush().unwrap();
         let mut output = Vec::new();
         journal.dump(None, &mut output).unwrap();
@@ -1260,82 +1080,23 @@ mod tests {
                 serde_json::from_value(value["event"].clone()).unwrap()
             })
             .collect();
-        assert_eq!(events, vec![deal, wrong]);
+        assert_eq!(events, vec![deal]);
     }
 
     #[test]
-    fn a_journal_from_before_secret_prompts_loses_what_was_typed_into_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let typed = |prompt: &str, input: &str| Event::MinibufferSubmitted {
-            prompt: prompt.into(),
-            input: input.into(),
-        };
-        {
-            let db = rho_db::client::open(dir.path()).unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let mut write = db.write().await;
-                let mut events = write.open_table(EVENTS);
-                for (sequence, event) in [
-                    typed("acme xoxc token:", "xoxc-1"),
-                    Event::MinibufferCancelled {
-                        prompt: "acme d cookie:".into(),
-                        input: "cookie".into(),
-                    },
-                    typed(
-                        "secret phrase from another device (empty makes a new one):",
-                        "abandon",
-                    ),
-                    typed("find:", "abandon"),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let entry = Entry {
-                        timestamp: "2026-09-01T00:00:00Z".into(),
-                        event,
-                    };
-                    events.insert(sequence as u64, SenValue::borrowed(&entry));
-                }
-                drop(events);
-                write.commit();
-            });
-        }
-        let mut output = Vec::new();
-        dump(dir.path(), None, &mut output).unwrap();
-        let dumped = String::from_utf8(output).unwrap();
-        assert!(!dumped.contains("xoxc-1"), "{dumped}");
-        assert!(!dumped.contains("cookie\""), "{dumped}");
-        assert_eq!(dumped.matches("abandon").count(), 1, "{dumped}");
-        assert!(
-            dumped.contains(r#""prompt":"find:","input":"abandon""#),
-            "{dumped}"
-        );
-    }
-
-    #[test]
-    fn a_burst_of_keys_is_kept_whole_and_in_order() {
+    fn a_burst_is_kept_whole_and_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
         let keys: Vec<Event> = (0..3000)
-            .map(|at| Event::Key {
-                key: format!("k{at}"),
-                text: Some("k".into()),
-                action: None,
-                surface: Some(SurfaceIdentity::Transcript {
-                    agent_id: AgentIdentity("a".into()),
-                }),
+            .map(|at| Event::MenuRan {
+                action: format!("k{at}"),
+                count: Some(at),
             })
             .collect();
         for key in keys.clone() {
             journal.record(key);
         }
-        journal.record(Event::Told {
-            text: "[devbox connected]".into(),
-            class: "SystemInfo".into(),
-        });
+        journal.record(Event::UserResumed);
         journal.flush().unwrap();
         let mut output = Vec::new();
         journal.dump(None, &mut output).unwrap();
@@ -1353,7 +1114,7 @@ mod tests {
             .map(|entry| serde_json::from_value(entry["event"].clone()).unwrap())
             .collect();
         assert_eq!(dumped, keys);
-        assert_eq!(entries[3000]["event"]["type"], "told");
+        assert_eq!(entries[3000]["event"]["type"], "user_resumed");
     }
 
     #[test]

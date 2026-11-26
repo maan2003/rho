@@ -52,7 +52,6 @@ members = [
   "crates/rho-desktop-client",
   "crates/rho-desktop-media",
   "crates/rho-desktop-proto",
-  "crates/rho-files",
   "crates/rho-frame",
   "crates/rho-gui",
   "crates/rho-iroh-auth",
@@ -149,7 +148,6 @@ rho-desktop-media = { path = "crates/rho-desktop-media" }
 rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }
 rho-devshell = { path = "agent-host/rho-devshell" }
 rho-fake-model = { path = "agent-host/rho-fake-model" }
-rho-files = { path = "crates/rho-files" }
 rho-frame = { path = "crates/rho-frame" }
 rho-fs-view = { path = "agent-host/rho-fs-view" }
 rho-git = { path = "agent-host/rho-git" }

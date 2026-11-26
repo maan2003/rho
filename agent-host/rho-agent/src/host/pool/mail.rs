@@ -84,19 +84,6 @@ impl AgentPool {
         Ok(())
     }
 
-    /// A start refused before an agent existed. There is no agent or
-    /// transcript to own this stop; the project speaks in its thread.
-    pub async fn post_start_failure(&self, origin: MessageId, reason: &str) -> anyhow::Result<()> {
-        let text = format!(
-            "failed · did not start · {}\n\nreply to retry, or change where it works from the project's palette.",
-            rho_agent_types::one_line(reason)
-        );
-        let mut write = self.db.write().await;
-        self.write_start_failure(&mut write, origin, text)?;
-        write.commit();
-        Ok(())
-    }
-
     pub(super) fn write_start_failure(
         &self,
         write: &mut rho_db::WriteTxn,

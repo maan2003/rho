@@ -28,7 +28,6 @@ rho-db.workspace = true
 rho-desktop-client.workspace = true
 rho-desktop-media = { workspace = true, features = ["encoder"] }
 rho-desktop-proto = { workspace = true, features = ["local"] }
-rho-files.workspace = true
 rho-fs-view.workspace = true
 rho-inference.workspace = true
 rho-ledger.workspace = true

@@ -3,8 +3,9 @@
 An agent host (`rho-agent-host`) hosts agents: one worker process per
 workset. Everything else it does is agent-adjacent: desktops agents run
 that the user watches, terminals and shells in an agent's workset, the
-git an agent uses and the user approves, voice, and a copy of the desk
-for devices to sync through.
+git an agent uses and the user approves, and a copy of the desk for
+devices to sync through. Voice (`realtime`) is built but refused on the
+wire until it is in `product/`.
 
 The host is the `rho-agent-host` binary. The `rho` command (rho-cli) runs
 beside it and is mostly the agents' own: tools they call from their shell,

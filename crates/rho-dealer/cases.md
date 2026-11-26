@@ -10,9 +10,9 @@ stops wait until answered, rising half a unit an hour from a head start,
 so the longest wait comes to the top and none starves. A thread the user
 wrote in within the hour gains a bonus that fades over it, so the answer
 to their active work deals first. The same priority lights the lamp and
-rings the chime. The user's overdue deadlines go first, and skips go to
-the back. The user answers waiting mail with a reply or verdict; either
-reads the whole thread through the newest mail in view.
+rings the chime. Skips go to the back. The user answers waiting mail with
+a reply or verdict; either reads the whole thread through the newest mail
+in view.
 
 ## Threads
 
@@ -53,31 +53,26 @@ A card is titled by the thread's subject and the project's address.
 | Z3 | Snooze ends, the node wants nothing | nothing |
 | Z4 | Snoozed, then the user wrote in the thread | the snooze holds, but a reply within 1h of the user's message comes through |
 | Z6 | Snoozed again and again | every snooze is kept; not ranked on yet |
-| Z7 | A channel is snoozed | its threads hold too |
+| T6 | Done or muted | takes back the snooze |
 
 ## What older builds wrote
 
 Piles and todos went with the rooms (`docs/rho2.md`); their facts stay in
-the user's logs and still read.
+the user's logs and still read. Deadlines and names went too: their facts
+still decode and read as nothing.
 
 | # | History and facts | Card |
 |---|---|---|
-| P1 | An old pile | done said then, having seen nothing: takes back the snooze and deadline before it, and holds nothing back |
+| P1 | An old pile | done said then, having seen nothing: takes back the snooze before it, and holds nothing back |
 | T1 | An old todo | a read: what it saw is handled, it takes nothing back and deals no card of its own |
-
-## Deadlines
-
-| # | History and facts | Card |
-|---|---|---|
-| T3 | Deadline, lead N days (3 unless said) | shows N days before, rises, jumps to the top once late |
-| T6 | Done or muted | takes back the deadline and the snooze |
+| T3 | An old deadline, on a thread or a note, late or not | nothing: no card, and the hand never changes for it |
 
 ## Notes
 
 | # | History and facts | Card |
 |---|---|---|
 | N1 | A plain note | no card |
-| N2 | Deadline | as T3 |
+| N2 | An old deadline | as T3: a note is never a card |
 | N3 | Done or deleted | nothing |
 
 ## Every history
@@ -87,6 +82,6 @@ the user's logs and still read.
 | X1 | One card per node |
 | X6 | Cards not skipped deal highest priority first, equal ones by address |
 | X2 | A skip sends the card behind every card not skipped, for 30 minutes, in memory only; skipped cards come round longest-skipped first, so each is dealt once before any repeats. The node's source moving voids the skip. Every deal takes the top card at that moment |
-| X3 | The hand changes by itself only at `next_change`: a snooze ending, a deadline coming into view or passing, a skip running out, a card's words saying another age |
+| X3 | The hand changes by itself only at `next_change`: a snooze ending, a skip running out, a card's words saying another age |
 | X4 | "In 1h" is an hour on any clock; "tomorrow" starts at the user's own midnight |
 | X5 | Ranking with a warm cache is ranking from scratch |

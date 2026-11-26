@@ -19,13 +19,11 @@ enum Said {
     Done,
     Mute,
     Snooze { until: Until },
-    Deadline { by: Until, lead_days: u32 },
 }
 
 /// One thing a stand-in source holds.
 struct Thread {
     posts: Vec<Post>,
-    channel: Option<Address>,
 }
 
 struct Post {
@@ -85,13 +83,8 @@ impl World {
 
     fn agent(&mut self, name: &str) -> Address {
         let address = Address::new("thread", format!("0/{}", self.things.len() + 1));
-        self.things.insert(
-            address.clone(),
-            Thread {
-                posts: Vec::new(),
-                channel: None,
-            },
-        );
+        self.things
+            .insert(address.clone(), Thread { posts: Vec::new() });
         self.names.insert(address.clone(), name.into());
         address
     }
@@ -158,11 +151,6 @@ impl World {
             },
             Said::Mute => Fact::Mute { node },
             Said::Snooze { until } => Fact::Snooze { node, until },
-            Said::Deadline { by, lead_days } => Fact::Deadline {
-                node,
-                by,
-                lead_days,
-            },
         };
         self.tell(fact);
     }
@@ -180,15 +168,13 @@ impl World {
         self.say(address, Said::Done);
     }
 
-    /// A deadline `hours` from now, pressing from a day before.
-    fn due_in(&mut self, address: &Address, hours: i64) {
-        self.say(
-            address,
-            Said::Deadline {
-                by: Until::In(self::hours(hours)),
-                lead_days: 1,
-            },
-        );
+    /// A deadline `hours` from now, as older builds wrote one.
+    fn old_deadline(&mut self, address: &Address, hours: i64) {
+        self.tell(Fact::Deadline {
+            node: address.clone(),
+            by: Until::In(self::hours(hours)),
+            lead_days: 1,
+        });
     }
 
     fn write_note(&mut self, address: &Address, body: &str, deleted: bool) {
@@ -212,7 +198,7 @@ impl World {
         let at = self.at();
         let mut claims = Vec::new();
         let mut trace = trace;
-        for (address, Thread { posts, channel }) in &self.things {
+        for (address, Thread { posts }) in &self.things {
             let facts = self.marks.get(address).facts();
             // Done, or the user's own words, see through to there.
             let seen = facts.seen_topic().unwrap_or(0).max(
@@ -270,7 +256,6 @@ impl World {
                     claim.breaks_snooze_set_by = Some(spoke);
                 }
             }
-            claim.under.clone_from(channel);
             claims.push(claim);
         }
         claims
@@ -278,17 +263,11 @@ impl World {
 
     fn deal(&self) -> Hand {
         let claims = self.claims(None);
-        let names = |address: &Address| {
-            self.names
-                .get(address)
-                .map(|name| (name.clone(), String::new()))
-        };
         rank(
             &Sources {
                 claims: &claims,
                 marks: &self.marks,
                 skips: &self.skips,
-                names: &names,
             },
             &self.now,
         )
@@ -297,17 +276,11 @@ impl World {
     fn traced(&self) -> (Hand, Trace) {
         let mut trace = Trace::default();
         let claims = self.claims(Some(&mut trace));
-        let names = |address: &Address| {
-            self.names
-                .get(address)
-                .map(|name| (name.clone(), String::new()))
-        };
         rank_traced(
             &Sources {
                 claims: &claims,
                 marks: &self.marks,
                 skips: &self.skips,
-                names: &names,
             },
             &self.now,
             trace,
@@ -482,45 +455,25 @@ fn z6_every_snooze_is_kept() {
     assert_eq!(w.hand(), "D1 · waits · now");
 }
 
-#[test]
-fn z7_a_snoozed_room_holds_what_is_under_it() {
-    let mut w = world();
-    let room = Address::new("topic", "0/100");
-    w.snooze(&room, hours(1));
-    let thread = w.agent("thread");
-    w.things.get_mut(&thread).unwrap().channel = Some(room);
-    w.asks(&thread);
-    assert_eq!(w.hand(), "");
-    w.pass(hours(1));
-    assert!(w.priority(&thread).is_some());
-}
-
 // What older builds wrote
 
 /// An old pile is done said when it was piled, having seen nothing: it
-/// takes back the snooze and the deadline before it, and holds nothing
-/// back itself.
+/// takes back the snooze before it, and holds nothing back itself.
 #[test]
 fn p1_an_old_pile_clears_what_came_before_and_holds_nothing() {
     let mut w = world();
     let d = w.agent("D1");
     w.asks(&d);
-    let n = note(&mut w, "n");
     w.snooze(&d, hours(3));
-    w.due_in(&n, 2);
-    for address in [&d, &n] {
-        w.tell(Fact::Piled {
-            node: address.clone(),
-            pile: "friday".into(),
-        });
-    }
+    w.tell(Fact::Piled {
+        node: d.clone(),
+        pile: "friday".into(),
+    });
     assert_eq!(
         w.hand(),
         "D1 · waits · now",
         "the snooze is gone and the pile saw nothing"
     );
-    w.pass(hours(3));
-    assert_eq!(w.priority(&n), None, "the deadline is gone");
 }
 
 /// An old todo is a read: what it saw is handled, it deals no card of its
@@ -548,37 +501,34 @@ fn t1_an_old_todo_reads_as_a_read() {
     assert_eq!(w.hand(), "a · waits · now", "a newer ask still deals");
 }
 
-// Deadlines
-
+/// An old deadline reads as nothing: on a note, which no verdict can
+/// settle, it never deals, late or not, and never changes the hand.
 #[test]
-fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
+fn t3_n2_an_old_deadline_deals_nothing() {
     let mut w = world();
     let n = note(&mut w, "n");
-    w.say(
-        &n,
-        Said::Deadline {
-            by: Until::In(hours(24 * 5)),
-            lead_days: DEADLINE_LEAD_DAYS,
-        },
-    );
+    w.old_deadline(&n, -24);
+    w.old_deadline(&n, 2);
     assert_eq!(w.hand(), "");
-    w.pass(hours(24 * 2 + 1));
-    assert_eq!(w.hand(), "n · deadline · 3d");
-    w.pass(hours(24 * 4));
-    assert_eq!(w.hand(), "n · deadline · 1d late");
-    assert!(w.priority(&n).unwrap() > 1_000_000.0);
+    assert_eq!(w.deal().next_change, None);
+    w.pass(hours(24 * 5));
+    assert_eq!(w.hand(), "");
 }
 
 #[test]
-fn t6_done_or_mute_takes_back_the_deadline_and_the_snooze() {
+fn t6_done_or_mute_takes_back_the_snooze() {
     for take_back in [Said::Done, Said::Mute] {
         let mut w = world();
-        let n = note(&mut w, "n");
-        w.due_in(&n, 1);
-        w.snooze(&n, hours(1));
-        w.say(&n, take_back);
+        let d = w.agent("D1");
+        w.asks(&d);
+        w.snooze(&d, hours(1));
+        let muted = matches!(take_back, Said::Mute);
+        w.say(&d, take_back);
         w.pass(hours(48));
-        assert_eq!(w.hand(), "");
+        assert_eq!(w.hand(), "", "nothing new since done, or muted");
+        w.asks(&d);
+        let expected = if muted { "" } else { "D1 · waits · now" };
+        assert_eq!(w.hand(), expected, "no snooze still holds it");
     }
 }
 
@@ -589,19 +539,8 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
     let mut w = world();
     note(&mut w, "plain");
     let gone = note(&mut w, "gone");
-    w.due_in(&gone, 1);
     w.write_note(&gone, "gone", true);
     assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a_note_names_itself_by_its_first_line() {
-    let mut w = world();
-    let n = note(&mut w, "buy milk\nand eggs");
-    w.due_in(&n, 1);
-    let hand = w.deal();
-    assert_eq!(hand.cards[0].address, n);
-    assert_eq!(hand.cards[0].heading(), "buy milk");
 }
 
 // Every history
@@ -611,13 +550,7 @@ fn x1_a_node_is_one_card_at_its_strongest() {
     let mut w = world();
     let a = w.agent("a");
     w.asks(&a);
-    w.say(
-        &a,
-        Said::Deadline {
-            by: Until::In(hours(24)),
-            lead_days: 3,
-        },
-    );
+    w.old_deadline(&a, -1);
     assert_eq!(w.hand(), "a · waits · now");
 }
 
@@ -833,7 +766,7 @@ fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
         trace.nodes[&asking]
             .inputs
             .iter()
-            .any(|(key, _)| *key == "snoozes")
+            .any(|(key, _)| *key == "snooze")
     );
     assert!(!trace.nodes[&asking].parts.is_empty());
 }

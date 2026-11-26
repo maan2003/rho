@@ -3,11 +3,10 @@
 //!
 //! [`rank`] is the whole algorithm. A source hands it [`Claim`]s: for each
 //! thing of its own that wants the user, where that stands in time and how
-//! it presses. The dealer adds the user's own dates from their facts,
-//! holds back what they snoozed or muted, and works each card out
-//! from scratch; nothing it decides is kept between calls. What a source
-//! must claim for each of its cases is that source's own test; the cases
-//! the dealer itself must meet are in `cases.md`, and each has a test
+//! it presses. The dealer holds back what the user snoozed or muted, and
+//! works each card out from scratch; nothing it decides is kept between calls.
+//! What a source must claim for each of its cases is that source's own test;
+//! the cases the dealer itself must meet are in `cases.md`, and each has a test
 //! under its name.
 
 use std::cmp::Ordering;
@@ -17,7 +16,7 @@ use jiff::{Timestamp, Zoned};
 
 use crate::address::Address;
 use crate::curve::{self, Curve};
-use crate::facts::{Seen, Snooze};
+use crate::facts::Seen;
 use crate::marks::Marks;
 
 /// What is waiting, independent of the words in which it appears.
@@ -57,9 +56,6 @@ pub struct Claim {
     /// A reply this soon after the user's own words comes through a
     /// snooze said before them (Z4).
     pub breaks_snooze_set_by: Option<Timestamp>,
-    /// An address a snooze on which holds this one too: the room a thread
-    /// is in.
-    pub under: Option<Address>,
 }
 
 impl Claim {
@@ -74,7 +70,6 @@ impl Claim {
             seen: Seen::Whole,
             bonus: 0.0,
             breaks_snooze_set_by: None,
-            under: None,
         }
     }
 }
@@ -158,18 +153,12 @@ impl Trace {
     }
 }
 
-/// What a thing is called when no claim says: a title and where it is.
-pub type Namer<'a> = &'a dyn Fn(&Address) -> Option<(String, String)>;
-
 /// Everything [`rank`] reads.
 #[derive(Clone, Copy)]
 pub struct Sources<'a> {
     pub claims: &'a [Claim],
     pub marks: &'a Marks,
     pub skips: &'a Skips,
-    /// Names for the addresses only the user's own dates bring up, which
-    /// no claim named. Notes name themselves.
-    pub names: Namer<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,9 +209,6 @@ struct Part {
     seen: Seen,
     bonus: f64,
     breaks_snooze_set_by: Option<Timestamp>,
-    /// From a source, which a snooze's end moves; the user's own dates
-    /// stand where they were said.
-    from_source: bool,
 }
 
 impl Part {
@@ -234,19 +220,6 @@ impl Part {
             seen: claim.seen,
             bonus: claim.bonus,
             breaks_snooze_set_by: claim.breaks_snooze_set_by,
-            from_source: true,
-        }
-    }
-
-    fn dated(curve: Curve, cursor: String) -> Self {
-        Self {
-            curve,
-            kind: CardKind::Other,
-            cursor,
-            seen: Seen::Whole,
-            bonus: 0.0,
-            breaks_snooze_set_by: None,
-            from_source: false,
         }
     }
 }
@@ -268,7 +241,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
     let marks = sources.marks;
     let mut parts: BTreeMap<Address, Vec<Part>> = BTreeMap::new();
     let mut named: HashMap<Address, (String, String)> = HashMap::new();
-    let mut under: HashMap<Address, Address> = HashMap::new();
 
     for claim in sources.claims {
         parts
@@ -278,22 +250,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         named
             .entry(claim.address.clone())
             .or_insert_with(|| (claim.title.clone(), claim.context.clone()));
-        if let Some(room) = &claim.under {
-            under.insert(claim.address.clone(), room.clone());
-        }
-    }
-
-    // The user's own dates (T3, T6, N2), on any address.
-    for (address, held) in marks.nodes() {
-        if let Some(deadline) = held.facts().deadline() {
-            parts.entry(address.clone()).or_default().push(Part::dated(
-                Curve::Deadline {
-                    by: deadline.by,
-                    lead_days: deadline.lead_days,
-                },
-                format!("deadline {}", deadline.set.timestamp().as_millisecond()),
-            ));
-        }
     }
 
     // One card per address (X1): what the user said about it decides
@@ -313,13 +269,12 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
                 .iter()
                 .map(|part| {
                     format!(
-                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} breaks_snooze_set_by {:?}",
+                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} breaks_snooze_set_by {:?}",
                         part.kind,
                         part.curve,
                         part.curve.priority(at),
                         part.bonus,
                         part.cursor,
-                        part.from_source,
                         part.breaks_snooze_set_by,
                     )
                 })
@@ -332,17 +287,9 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
             }
             continue;
         }
-        // A snooze on the room holds everything in it too.
-        let snoozes: Vec<Snooze> = std::iter::once(&address)
-            .chain(under.get(&address))
-            .filter_map(|address| marks.get(address).facts().snooze())
-            .collect();
+        let snooze = held.facts().snooze();
         // Z1, and Z4's way through.
-        if let Some(snooze) = snoozes
-            .iter()
-            .filter(|snooze| at < snooze.until)
-            .max_by_key(|snooze| snooze.until)
-        {
+        if let Some(snooze) = snooze.as_ref().filter(|snooze| at < snooze.until) {
             steps.push(snooze.until);
             let set = snooze.set.timestamp();
             address_parts
@@ -361,12 +308,8 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
             }
         }
         // Z2: an address back from a snooze counts from the snooze's end.
-        if let Some(snooze) = snoozes
-            .iter()
-            .filter(|snooze| snooze.until <= at)
-            .max_by_key(|snooze| snooze.until)
-        {
-            for part in address_parts.iter_mut().filter(|part| part.from_source) {
+        if let Some(snooze) = snooze.as_ref().filter(|snooze| snooze.until <= at) {
+            for part in &mut address_parts {
                 match &mut part.curve {
                     Curve::Waiting { since, .. } if *since < snooze.until => {
                         *since = snooze.until;
@@ -392,11 +335,11 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         };
         let skip = sources.skips.held(&address, &part.cursor, at);
         if let Some(trace) = trace.as_deref_mut() {
-            let snoozes: Vec<String> = snoozes
-                .iter()
-                .map(|snooze| format!("until {} (said {})", snooze.until, snooze.set))
-                .collect();
-            trace.input(&address, "snoozes", format!("{snoozes:?}"));
+            let snooze = snooze.as_ref().map_or_else(
+                || "none".to_owned(),
+                |snooze| format!("until {} (said {})", snooze.until, snooze.set),
+            );
+            trace.input(&address, "snooze", snooze);
             trace.outcome(
                 &address,
                 format!(
@@ -415,7 +358,7 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         steps.push(part.curve.label_changes(at));
         let (title, context) = named
             .remove(&address)
-            .unwrap_or_else(|| name(sources, &address));
+            .expect("every address here was claimed");
         cards.push((
             skip.map(|(skipped, _)| skipped),
             Card {
@@ -451,19 +394,6 @@ fn rank_into(sources: &Sources<'_>, now: &Zoned, mut trace: Option<&mut Trace>) 
         cards: cards.into_iter().map(|(_, card)| card).collect(),
         next_change: steps.into_iter().filter(|step| *step > at).min(),
     }
-}
-
-/// What an address only the user's dates brought up is called: a note by
-/// its first line, anything else as its system says.
-fn name(sources: &Sources<'_>, address: &Address) -> (String, String) {
-    if address.as_note().is_some() {
-        let title = match sources.marks.get(address).title() {
-            "" => "untitled note".to_owned(),
-            title => title.to_owned(),
-        };
-        return (title, String::new());
-    }
-    (sources.names)(address).unwrap_or_else(|| (address.key().to_owned(), String::new()))
 }
 
 #[cfg(test)]

@@ -239,6 +239,7 @@ mod tests {
             }],
             revision: rho_agent_types::Revision::Original,
             ping_started: None,
+            thread_reply: None,
         }
     }
 

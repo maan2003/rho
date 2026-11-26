@@ -39,13 +39,6 @@ rho_rpc::calls! {
         RetryIdea(RetryIdea) -> MessageId;
         CreateProject(CreateProject) -> ProjectId;
         ChangeProject(ChangeProject) -> ();
-        /// One-time import of an old device-only place, if the host still has none.
-        ImportProject(ImportProject) -> ();
-        /// Puts a message and its thread under another message, or among
-        /// the roots.
-        Reparent(Reparent) -> ();
-        /// The user takes an agent out of a thread.
-        Leave(Leave) -> ();
         /// Names a thread; an empty name takes the name back.
         Name(Name) -> ();
         /// Looks up the project part of `project@host`. The GUI owns host aliases.
@@ -106,24 +99,6 @@ pub struct CreateProject {
 pub struct ChangeProject {
     pub project: ProjectId,
     pub change: ProjectChange,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct ImportProject {
-    pub project: ProjectId,
-    pub config: ProjectConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Reparent {
-    pub message: MessageId,
-    pub parent: Option<MessageId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Leave {
-    pub thread: MessageId,
-    pub agent: AgentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]

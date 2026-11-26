@@ -45,7 +45,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 3. Five tests fail on `main` for stale reasons
 - **Kind:** code
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: a, b, c and d; e is environment and was not touched)
 - **Where:** test code left behind by the mail→chat and runtime-catalogue changes
 - **Evidence and root causes:**
   - **a. `rho-agent` lib tests do not compile** (`E0559`, `E0599`). Commit `003ecf05c` (2026-11-21, "Send user replies to the whole chat thread") added `thread_reply: None` to every `ChatEvent::Posted` literal. One of them, `store/mail.rs:226`, is in `mod prior_ping`, which declares the old `Posted` shape without that field, on purpose. The same commit removed `MailWrite::mail_writer`, but `store/tests.rs:1040` still asserts on it ("a reply can still identify the writer"). The writer-addressed reply is gone, so the assertion has no meaning now. `prior_ping` is a one-hop migration from `f34338421` (2026-11-20). The `temp-migration` skill says to remove such code after one or two commits.
@@ -78,7 +78,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 6. The `start agent` menu is a second, undocumented way to start work
 - **Kind:** product (undocumented)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: cut)
 - **Where:** `chat.Project.receive an idea`, `agents.Workset`
 - **Evidence:** `crates/rho-agents-view/src/system/start.rs:39-160` adds `start agent` and `send and start agent with options` to the palette on a thread. Its rows are `new workset on a repository`, `here, in a directory on the host`, and `join <subject>`, each followed by a runtime prompt and a policy `Function` name. The menu calls `Worksets::StartFromMail` (`worksets.rs:63`). `chat.md` rejected "the model chosen only through `start agent` · that path asks the place again and never makes a project thread". `agents.md` says of `start agent here`: "no command has that name".
 - **Cost:** rare, but it asks the place again and bypasses the project's mode, which `chat.Project` says is asked once.
@@ -96,7 +96,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 8. Retired protocols, crates and endpoints still on the wire
 - **Kind:** code (zombie)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`, with exceptions: `RestartWorkset` stays because `rho-agent-host debug restart-workset` calls it; `RequestNotice::ThreadCold` stays because saved turns hold it; `ResolveProject` and `Post.mentions` are outside this wave. Voice is refused on the wire, its crates kept)
 - **Where:** `rho_rpc::protocol::Protocol` and the protocols it names
 - **Evidence (each item serves nothing in `product/`):**
   - `Protocol::Agents`, `Protocol::Ledger`, `Protocol::Workspace` (`rho-rpc/src/protocol/mod.rs:169,178,186`): the host only refuses them (`rho-agent-host/src/lib.rs:1324-1325,1343`). Two tests use `Protocol::Agents` as "some other protocol" (`rho-agent-hosts/src/protocol.rs:318`, `rho-rpc/src/protocol/mod.rs:665`).

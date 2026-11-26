@@ -567,7 +567,6 @@ pub mod gccp;
 pub mod mail;
 mod projects;
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
-pub(crate) use mail::migrate_mail;
 pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
 pub use projects::*;
 #[cfg(test)]

@@ -9,8 +9,8 @@ use rho_agent::host::pool::{ProjectIdea, ProjectIdeaResult};
 use rho_agent::store::{Appended, MailRead as _, ProjectRead as _};
 use rho_agent_types::ChatSeq;
 use rho_chat::protocol::{
-    ChangeProject, ClientFrame, CreateProject, ImportProject, Leave, Name, Open, Post, PostIdea,
-    PostIdeaReply, Project, Reparent, Request, ResolveProject, RetryIdea, ServerFrame,
+    ChangeProject, ClientFrame, CreateProject, Name, Open, Post, PostIdea, PostIdeaReply, Project,
+    Request, ResolveProject, RetryIdea, ServerFrame,
 };
 use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, write_frame};
@@ -239,16 +239,6 @@ where
             )
             .await
         }
-        Request::ImportProject(call) => {
-            respond(
-                writer,
-                call,
-                |ImportProject { project, config }| async move {
-                    services.pool.import_project(project, config).await
-                },
-            )
-            .await
-        }
         Request::PostIdea(call) => {
             respond(
                 writer,
@@ -350,18 +340,6 @@ where
                         .await
                 },
             )
-            .await
-        }
-        Request::Reparent(call) => {
-            respond(writer, call, |Reparent { message, parent }| async move {
-                services.pool.reparent_user(message, parent).await
-            })
-            .await
-        }
-        Request::Leave(call) => {
-            respond(writer, call, |Leave { thread, agent }| async move {
-                services.pool.leave_user(thread, agent).await
-            })
             .await
         }
         Request::Name(call) => {

@@ -9,20 +9,18 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent::host::pool::HostDirectoryError;
 use rho_agent::record::Event;
-use rho_agent::store::{AgentHead, Appended, MailRead as _, StoreRead as _, WorksetHead};
+use rho_agent::store::{AgentHead, Appended, StoreRead as _, WorksetHead};
 use rho_agent_types::{AgentId, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
     AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
-    DeleteWorksets, Eval, EvalResult, LogNext, MailLaunch, Open, Request, RestartWorkset,
-    RewindAgent, RewoundAgent, ServerFrame, StartFromMail, StopAgent, WorksetEntry,
+    DeleteWorksets, Eval, EvalResult, LogNext, Open, Request, RestartWorkset, RewindAgent,
+    RewoundAgent, ServerFrame, StopAgent, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
-    QuotaUsage, RecordVisualization, SetAuthAccountEnabled, SetClaudeAccount, Visualization,
-    VisualizationContent,
+    QuotaUsage, RecordVisualization, SetClaudeAccount, Visualization, VisualizationContent,
 };
 use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
@@ -542,44 +540,6 @@ fn expand_directory(kind: WorksetKind) -> WorksetKind {
     }
 }
 
-async fn start_from_mail(services: &Services, call: StartFromMail) -> anyhow::Result<AgentId> {
-    let StartFromMail {
-        origin,
-        launch,
-        host_label,
-    } = call;
-    anyhow::ensure!(
-        services.db.read().message(origin).is_some(),
-        "no mail #{}",
-        origin.0.0,
-    );
-    let evaluated = match launch {
-        MailLaunch::New(CreateWorkset { kind, code }) => services
-            .pool
-            .create_workset(expand_directory(kind), code)
-            .await
-            .map(|(_, evaluated)| evaluated),
-        MailLaunch::Existing(Eval { workset, code }) => services.pool.eval(workset, code).await,
-    };
-    let reason = match evaluated {
-        Ok(evaluated) => {
-            if let Some(agent) = evaluated.agent {
-                return Ok(agent);
-            }
-            eval_result(evaluated)
-                .raised()
-                .unwrap_or("no agent was created")
-                .to_owned()
-        }
-        Err(error) if error.is::<HostDirectoryError>() => {
-            format!("{error:#} on {}", rho_agent_types::one_line(&host_label))
-        }
-        Err(error) => format!("{error:#}"),
-    };
-    services.pool.post_start_failure(origin, &reason).await?;
-    anyhow::bail!("{reason}")
-}
-
 /// One call stream's call.
 async fn serve_call<W>(
     services: &Arc<Services>,
@@ -608,9 +568,6 @@ where
                 Ok(eval_result(services.pool.eval(workset, code).await?))
             })
             .await
-        }
-        Request::StartFromMail(call) => {
-            respond(writer, call, |call| start_from_mail(services, call)).await
         }
         Request::RewindAgent(call) => {
             respond(writer, call, |RewindAgent { agent, turns }| async move {
@@ -672,17 +629,6 @@ where
                 write.commit();
                 claude_accounts(&services.db, &services.claude)
             })
-            .await
-        }
-        Request::SetAuthAccountEnabled(call) => {
-            respond(
-                writer,
-                call,
-                |SetAuthAccountEnabled { name, enabled }| async move {
-                    services.set_auth_account_enabled(&name, enabled).await;
-                    Ok(())
-                },
-            )
             .await
         }
         Request::Visualization(call) => {

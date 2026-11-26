@@ -1906,11 +1906,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sending_the_draft_with_options_keeps_point_at_the_top(cx: &mut gpui::TestAppContext) {
-        check_thread(cx, CheckThread::Options);
-    }
-
-    #[gpui::test]
     fn sending_a_stuck_draft_preserves_the_first_visible_history_row(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2271,7 +2266,6 @@ mod tests {
 
     enum CheckThread {
         Inline,
-        Options,
         Stuck,
         ThreadReply,
         ProofRow,
@@ -2607,16 +2601,9 @@ mod tests {
             assert_eq!(before.1.as_deref(), Some("The latest question."));
         }
 
-        if matches!(check, CheckThread::Options) {
-            cx.update(|cx| {
-                mail.update(cx, |system, cx| system.post_draft_with_options(thread, cx))
-                    .unwrap();
-            });
-        } else {
-            window
-                .update(cx, |view, window, cx| view.send(&SendMessage, window, cx))
-                .unwrap();
-        }
+        window
+            .update(cx, |view, window, cx| view.send(&SendMessage, window, cx))
+            .unwrap();
         cx.draw_window(window.into());
         assert_eq!(
             draft_and_history(cx, true),

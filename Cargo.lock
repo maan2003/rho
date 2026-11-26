@@ -14016,7 +14016,6 @@ dependencies = [
  "rho-desktop-media",
  "rho-desktop-proto",
  "rho-fake-model",
- "rho-files",
  "rho-fs-view",
  "rho-inference",
  "rho-ledger",
@@ -14184,33 +14183,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
-]
-
-[[package]]
-name = "rho-files"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "buffer_diff",
- "bytes",
- "camino",
- "clock",
- "editor",
- "futures",
- "gpui",
- "language",
- "multi_buffer",
- "path",
- "rho-agent-hosts",
- "rho-agent-types",
- "rho-files",
- "rho-rpc",
- "rho-window",
- "senax-encoder",
- "text",
- "theme",
- "tokio",
- "tracing",
 ]
 
 [[package]]

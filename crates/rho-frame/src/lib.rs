@@ -13,11 +13,11 @@
 //! same history and the same surfaces.
 //!
 //! Everything the user looks at belongs to a [`System`]: chat,
-//! agents, notes, files. A system plugs in under address
+//! agents, notes, pages. A system plugs in under address
 //! kinds ([`rho_dealer::Address`]): it opens a surface for an address,
 //! offers menu rows for what is in view, claims the user's attention for
-//! the things of its own that want it, lists what has moved for the desk and
-//! what it has for `find`, and runs its own streams to each host. The frame
+//! the things of its own that want it, lists what it has for `find`, and
+//! runs its own streams to each host. The frame
 //! knows no system by name, so the list of systems is the binary's, and a
 //! system is written once for the desk and the phone alike.
 //!

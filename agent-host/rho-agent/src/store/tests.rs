@@ -1036,11 +1036,6 @@ async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_t
             None,
         )
         .unwrap();
-    assert_eq!(
-        write.mail_writer(second),
-        Some(b),
-        "a reply can still identify the writer"
-    );
     assert!(
         !write.expire_flash(later, second),
         "the post emits one tombstone, not two"

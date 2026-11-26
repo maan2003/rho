@@ -169,17 +169,6 @@ pub fn claims(
         );
         claim.title = chat.name(thread).unwrap_or_default();
         claim.context = context(host.chat, thread, host.name);
-        // A snooze or mute on the project holds its threads too.
-        let root = chat.root_of(thread);
-        if root != thread {
-            claim.under = Some(
-                ThreadId {
-                    host: host.endpoint,
-                    message: root,
-                }
-                .address(),
-            );
-        }
         if let Some(wrote) = user_wrote {
             let spoke = unix(wrote.at.0);
             claim.bonus = curve::recency_bonus(spoke, now);
@@ -210,8 +199,8 @@ pub fn answered(chat: &HostChat, thread: MessageId, seen: Seen) -> Option<Messag
         })
 }
 
-/// What a thread is called on a card, and where it is, for a thread no
-/// claim named: one the user's own dates brought up.
+/// What a thread is called, and where it is: its subject and the address
+/// of its project.
 pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
     let title = host.chat.name(thread)?;
     Some((title, context(host.chat, thread, host.name)))
@@ -548,16 +537,11 @@ mod tests {
                 None,
                 local_answers,
             );
-            let names = |address: &Address| {
-                let id = ThreadId::from_address(address)?;
-                name(&host, id.message)
-            };
             rank(
                 &Sources {
                     claims: &claims,
                     marks: &self.marks,
                     skips: &self.skips,
-                    names: &names,
                 },
                 &self.now,
             )
@@ -1298,14 +1282,14 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_with_only_the_users_dates_is_named_by_the_chat() {
+    fn an_old_deadline_on_a_thread_deals_nothing() {
         let mut w = world();
         let a = w.agent("a");
         w.tell(Fact::Deadline {
             node: w.address(a),
-            by: Until::In(SignedDuration::from_hours(1)),
+            by: Until::In(SignedDuration::from_hours(-1)),
             lead_days: 1,
         });
-        assert_eq!(w.hand(), "rho@lab › a · deadline · 1d");
+        assert_eq!(w.hand(), "");
     }
 }

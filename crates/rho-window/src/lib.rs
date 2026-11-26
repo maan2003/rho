@@ -13,7 +13,6 @@ pub mod draft;
 pub mod editor_config;
 pub mod highlights;
 pub mod history;
-pub mod image_view;
 pub mod languages;
 pub mod markdown;
 pub mod style;

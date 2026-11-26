@@ -2,24 +2,20 @@
 //! `to:` chooser and the palette. These prompts write to the host; only
 //! its mail session can change what every Desk shows.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{App, Context, Entity, Window};
-use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{
-    ChatSeq, EndpointId, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
-    ProjectName, ProjectPlace, RUNTIMES, RuntimeKind, RuntimeLabel,
+    EndpointId, ProjectChange, ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace,
+    RUNTIMES, RuntimeKind, RuntimeLabel,
 };
-use rho_db::{RhoDb, Sen};
 use rho_frame::{Candidate, Frame, Point, Row, Rows};
 use rho_window::style::StyleClass;
-use senax_encoder::{Decode, Encode};
 
 use super::ChatSystem;
 use super::idea::IdeaProject;
 use crate::ThreadId;
-use crate::protocol::{ChangeProject, CreateProject, ImportProject};
+use crate::protocol::{ChangeProject, CreateProject};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
@@ -90,50 +86,6 @@ impl ChatSystem {
             Some("no place set".into())
         } else {
             None
-        }
-    }
-
-    pub(super) fn import_legacy_projects(&mut self, endpoint: EndpointId, cx: &mut Context<Self>) {
-        let Some(settings) = self.settings.get(&endpoint) else {
-            return;
-        };
-        let Some(log) = self.host_chat(endpoint) else {
-            return;
-        };
-        let pending: Vec<_> = self
-            .legacy_places
-            .keys()
-            .filter(|(host, project)| *host == endpoint && log.is_project(project.0))
-            .copied()
-            .collect();
-        let imports: Vec<_> = pending
-            .into_iter()
-            .filter_map(|(host, project)| {
-                let configured = settings.contains_key(&project);
-                let config = self.legacy_places.remove(&(host, project));
-                if configured {
-                    None
-                } else {
-                    Some((project, config?))
-                }
-            })
-            .collect();
-        for (project, config) in imports {
-            self.call(
-                endpoint,
-                ImportProject {
-                    project,
-                    config: config.clone(),
-                },
-                cx,
-                move |mail, result, _| {
-                    if result.is_err() {
-                        // Retry at the next snapshot. The old rows are also
-                        // retained on disk if this window closes.
-                        mail.legacy_places.insert((endpoint, project), config);
-                    }
-                },
-            );
         }
     }
 
@@ -589,58 +541,9 @@ fn prompt_runtime(
     );
 }
 
-// The former on-device answers remain on disk as a downgrade copy. Import
-// only to an unconfigured host, never use them as live launch settings.
-#[derive(Clone, Debug, Decode, Encode)]
-enum Answered {
-    Repository {
-        repo: String,
-        #[senax(rename = "rev")]
-        _rev: String,
-    },
-    Directory {
-        cwd: String,
-    },
-}
-
-pub(super) fn legacy_places(db: &RhoDb) -> HashMap<(EndpointId, ProjectId), ProjectConfig> {
-    let places: TableDefinition<([u8; 32], u64), Sen<Answered>> =
-        TableDefinition::new("gui_channel_place_v1");
-    let read = db.read();
-    if !read.has_table(places.name()) {
-        return HashMap::new();
-    }
-    read.open_table(places)
-        .iter()
-        .filter_map(|(key, stored)| {
-            let (host, project) = key.value();
-            let place = match stored.value().into_owned() {
-                Answered::Directory { cwd } => ProjectPlace::parse(&cwd).ok()?,
-                Answered::Repository { repo, .. } => {
-                    let place = ProjectPlace::parse(&repo).ok()?;
-                    if place.is_repository() {
-                        place
-                    } else {
-                        let url = url::Url::from_file_path(repo).ok()?;
-                        ProjectPlace::parse(url.as_str()).ok()?
-                    }
-                }
-            };
-            Some((
-                (EndpointId(host), ProjectId(MessageId(ChatSeq(project)))),
-                ProjectConfig {
-                    place,
-                    mode: ProjectMode::One,
-                    runtime: RuntimeLabel::default(),
-                },
-            ))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use rho_db::SenValue;
+    use rho_agent_types::{ChatSeq, MessageId};
     use rho_dealer::Addressed as _;
 
     use super::*;
@@ -739,45 +642,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_pre_project_device_can_still_read_its_old_place_to_import() {
-        let db = RhoDb::in_memory();
-        // Use the old literal names, including the revision even though an
-        // ordinary project starts on the repository's default branch now.
-        mod prior {
-            #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
-            pub enum Answered {
-                Repository { repo: String, rev: String },
-                Directory { cwd: String },
-            }
-        }
-        futures::executor::block_on(async {
-            let mut write = db.write().await;
-            let table: TableDefinition<([u8; 32], u64), Sen<prior::Answered>> =
-                TableDefinition::new("gui_channel_place_v1");
-            write.open_table(table).insert(
-                ([7; 32], 39),
-                SenValue::borrowed(&prior::Answered::Repository {
-                    repo: "/tmp/old work/tree".into(),
-                    rev: "".into(),
-                }),
-            );
-            write.open_table(table).insert(
-                ([7; 32], 48),
-                SenValue::borrowed(&prior::Answered::Directory {
-                    cwd: "/tmp/not-a-clone".into(),
-                }),
-            );
-            write.commit();
-        });
-        let answers = legacy_places(&db);
-        let config = |id| &answers[&(EndpointId([7; 32]), ProjectId(MessageId(ChatSeq(id))))];
-        assert_eq!(config(39).place.as_str(), "file:///tmp/old%20work/tree");
-        assert_eq!(config(39).mode, ProjectMode::One);
-        assert_eq!(config(39).runtime.as_str(), "opus-high");
-        assert_eq!(config(48).place.as_str(), "/tmp/not-a-clone");
-        assert!(!config(48).place.is_repository());
-    }
     #[test]
     fn runtime_choices_rank_the_project_without_losing_unfeatured_pairs() {
         let current = RuntimeLabel::parse("haiku-max").unwrap();

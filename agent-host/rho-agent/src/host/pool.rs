@@ -1038,27 +1038,6 @@ impl AgentPool {
         Ok(id)
     }
 
-    /// The user takes `agent` out of `thread`.
-    pub async fn leave_user(&self, thread: MessageId, agent: AgentId) -> anyhow::Result<()> {
-        let mut write = self.db.write().await;
-        write.leave(UnixMs::now(), thread, agent)?;
-        write.commit();
-        Ok(())
-    }
-
-    /// The user puts a message and its thread under `parent`, or among the
-    /// roots.
-    pub async fn reparent_user(
-        &self,
-        message: MessageId,
-        parent: Option<MessageId>,
-    ) -> anyhow::Result<()> {
-        let mut write = self.db.write().await;
-        write.reparent(UnixMs::now(), message, parent)?;
-        write.commit();
-        Ok(())
-    }
-
     /// The user names a thread; empty takes the name back.
     pub async fn name_user(&self, thread: MessageId, name: String) -> anyhow::Result<()> {
         let mut write = self.db.write().await;

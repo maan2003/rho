@@ -73,9 +73,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/65";
+pub const IROH_ALPN: &[u8] = b"rho/ui/66";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP44";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP45";
 
 /// The agent host's runtime directory on this machine: where it meets its
 /// local peers (the IPC rendezvous in `ipc/`, its endpoint id in
@@ -164,30 +164,22 @@ impl RuntimePaths {
 /// crate that speaks it, so this names the protocols and nothing more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Protocol {
-    /// The agents: their journal and what is asked of them
-    /// (`rho-agents-client`).
-    Agents,
     /// The desktops in the host's worksets, and a live view of one
     /// (`rho-desktop-client`).
     Desktop,
     /// The machine itself: Git transport and administration
     /// (`rho-agent-hosts`).
     Host,
-    /// What the user put in, sealed, for the host to keep and pass between
-    /// their devices (`rho-ledger`).
-    Ledger,
     /// An agent's shell (`rho-shell-view`).
     Shell,
     /// An agent's terminals (`rho-terminal`).
     Terminal,
     /// A voice session (`rho-rtc`).
     Voice,
-    /// An agent's workspace files (`rho-files`).
-    Workspace,
-    /// Append-only sealed byte logs; the old Ledger protocol is retired.
+    /// Append-only sealed byte logs (`rho-ledger`).
     LedgerLog,
     /// Worksets and the agent directory (`rho-agents-client`,
-    /// `protocol::worksets`). Replaces `Agents`.
+    /// `protocol::worksets`).
     Worksets,
     /// The host's chat log and what the user writes to it.
     #[senax(rename = "Chat")]
@@ -629,7 +621,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP43\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP44\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -662,7 +654,7 @@ mod tests {
         round_trips(envelope.clone());
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
         let other = super::Open {
-            protocol: Protocol::Agents,
+            protocol: Protocol::Shell,
             open: envelope.open.clone(),
         };
         assert!(other.unpack::<Open>().is_err());

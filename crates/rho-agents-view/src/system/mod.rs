@@ -5,8 +5,8 @@
 //! of every agent in it; `agent:<id>` is the same transcript narrowed to
 //! one agent ([`Scope`]). The system holds the model thread's client, the
 //! directory, the transcripts it has open, and one [`AgentModel`] per
-//! opened scope; a surface observes its model. Starting an agent is a row
-//! on a thread surface: the message under the point is the agent's origin.
+//! opened scope; a surface observes its model. Agents start from a
+//! project's ideas, on the host, never from a menu here.
 //!
 //! A workset's terminals, shells and desktops hang under the agents that
 //! started them ([`AgentAddress`]): the same system opens them, with the
@@ -19,7 +19,6 @@
 mod accounts;
 mod address;
 mod commands;
-mod start;
 mod steer;
 mod surface;
 
@@ -87,13 +86,6 @@ pub struct AgentsSystem {
     usage: Usage,
     mail: Entity<ChatSystem>,
     frame: FrameLink,
-    /// Agents asked for with the user's message, by the id the chat gave
-    /// the message: started once the host has logged it.
-    starting: HashMap<(EndpointId, u64), start::Plan>,
-    /// Agents this window started whose first turn has not ended, and
-    /// whether it got to work: a failure before then is the start failing,
-    /// and the echo line says so.
-    first_turns: HashMap<AgentId, bool>,
     timer: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -136,11 +128,6 @@ impl AgentsSystem {
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
         let delivered = cx.subscribe(&mail, |this, _, event: &MailEvent, cx| match event {
-            MailEvent::Delivered {
-                endpoint,
-                client_id,
-                message,
-            } => this.delivered(*endpoint, *client_id, *message, cx),
             // The workset's transcript, at the step that wrote the mail.
             MailEvent::Inspect { agent, mail } => {
                 let agent = *agent;
@@ -196,8 +183,6 @@ impl AgentsSystem {
             usage: Usage::default(),
             mail,
             frame,
-            starting: HashMap::new(),
-            first_turns: HashMap::new(),
             timer: None,
             _tasks: vec![pump, desktops_pump],
             _subscriptions: vec![delivered],
@@ -208,10 +193,40 @@ impl AgentsSystem {
         &self.registry
     }
 
+    /// The places `Start a project` offers on the host with this identity:
+    /// the repositories its worksets were made on, then the directories its
+    /// agents work in as they are, newest first and each once.
     pub fn known_project_places(&self, endpoint: EndpointId) -> Vec<Candidate> {
-        self.host_of(endpoint)
-            .map(|host| start::known_project_places(self, host))
-            .unwrap_or_default()
+        let Some(host) = self.host_of(endpoint) else {
+            return Vec::new();
+        };
+        let registry = self.registry();
+        let mut agents: Vec<_> = registry
+            .host_agents(host)
+            .into_iter()
+            .filter_map(|agent| registry.agent_identity(agent))
+            .collect();
+        agents.sort_by_key(|agent| std::cmp::Reverse(agent.entry.created_at));
+        let repositories = agents
+            .iter()
+            .filter_map(|agent| Some((agent.repository()?.to_owned(), "repository")));
+        let directories = agents.iter().filter_map(|agent| {
+            let place = agent.place();
+            place
+                .workset
+                .is_none()
+                .then(|| (place.cwd.to_string(), "directory on the host"))
+        });
+        let mut places: Vec<Candidate> = Vec::new();
+        for (value, description) in repositories.chain(directories) {
+            if !places.iter().any(|known| known.value == value) {
+                places.push(Candidate {
+                    value,
+                    description: description.to_owned(),
+                });
+            }
+        }
+        places
     }
 
     /// What the chat calls an agent of the host with this identity and
@@ -347,7 +362,6 @@ impl AgentsSystem {
                     self.land(agent_id, TranscriptFrame::Runtime(state.clone()), cx);
                 }
                 if self.registry.set_runtime(agent_id, Heard { state, since }) {
-                    self.first_turn_moved(agent_id, cx);
                     self.changed(cx);
                 }
             }
@@ -855,64 +869,6 @@ impl AgentsSystem {
             });
         })
         .detach();
-    }
-
-    /// Watches the first turn of an agent this window just started: the
-    /// start is not done until the agent got to work.
-    pub(crate) fn watch_first_turn(&mut self, agent: AgentId, cx: &mut Context<Self>) {
-        self.first_turns.insert(agent, false);
-        self.first_turn_moved(agent, cx);
-    }
-
-    fn first_turn_moved(&mut self, agent: AgentId, cx: &mut Context<Self>) {
-        use rho_agent_types::Activity;
-        let Some(worked) = self.first_turns.get_mut(&agent) else {
-            return;
-        };
-        let Some(heard) = self.registry.agent_facts(agent).runtime else {
-            return;
-        };
-        match heard.doing().activity {
-            Activity::Failed | Activity::Lost => {
-                self.first_turns.remove(&agent);
-                let reason = heard.stopped_because().unwrap_or("its host gave no reason");
-                self.frame.echo(
-                    format!("agent did not start: {reason}"),
-                    StyleClass::SystemImportant,
-                    cx,
-                );
-            }
-            Activity::Working | Activity::Retrying => *worked = true,
-            Activity::Waiting | Activity::Archived => {
-                self.first_turns.remove(&agent);
-            }
-            Activity::Idle => {
-                if *worked {
-                    self.first_turns.remove(&agent);
-                }
-            }
-        }
-    }
-
-    /// The host logged a message the user sent to start an agent with.
-    fn delivered(
-        &mut self,
-        endpoint: EndpointId,
-        client_id: u64,
-        message: MessageId,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(plan) = self.starting.remove(&(endpoint, client_id)) {
-            start::create(
-                self,
-                plan,
-                ThreadId {
-                    host: endpoint,
-                    message,
-                },
-                cx,
-            );
-        }
     }
 
     /// What a surface under the agent dials with: its host's link, its
@@ -1433,30 +1389,8 @@ impl System for AgentsSystem {
         if self.registry.hosts().next().is_none() {
             return vec![account];
         }
-        let mut rows = commands::rows(this.clone(), self.here(point, cx));
+        let mut rows = commands::rows(this, self.here(point, cx));
         rows.push(account);
-        let Some(thread) = self.thread_at(point, cx) else {
-            return rows;
-        };
-        if self.host_of(thread.host).is_none() {
-            return rows;
-        }
-        let draft = self
-            .mail
-            .read(cx)
-            .thread_of(&point.surface)
-            .filter(|surface| {
-                !self
-                    .mail
-                    .read(cx)
-                    .draft(surface.host, Some(surface.message))
-                    .trim()
-                    .is_empty()
-            });
-        let (start_from, origin) = draft.map_or((thread, start::Origin::Mail), |draft| {
-            (draft, start::Origin::Draft)
-        });
-        rows.extend(start::rows(self, this, start_from, origin, cx).into_commands());
         rows
     }
 

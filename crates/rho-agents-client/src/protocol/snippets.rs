@@ -149,8 +149,6 @@ pub fn set_runtime(id: AgentId, runtime: &Runtime) -> String {
     agent(id, &format!("set_runtime({})", python_runtime(runtime)))
 }
 
-/// Branches the agent's history before its `turns`-th last input from the
-/// user.
 /// Gives a native agent a fresh prompt cache key.
 pub fn new_cache_key(id: AgentId) -> String {
     agent(id, "new_cache_key()")

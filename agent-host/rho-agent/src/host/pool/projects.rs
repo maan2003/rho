@@ -195,20 +195,6 @@ impl AgentPool {
     }
 
     /// Does not overwrite a host-owned setting with an old device copy.
-    pub async fn import_project(&self, id: ProjectId, config: ProjectConfig) -> anyhow::Result<()> {
-        let _gate = self.projects.lock(id).await;
-        let mut write = self.db.write().await;
-        let read = self.db.read();
-        ensure!(read.is_project(id), "no such project on this host");
-        if read.project_settings(id).is_some() {
-            return Ok(());
-        }
-        write.set_project_settings(id, &ProjectSettings::new(config));
-        write.commit();
-        self.projects.changed.send_replace(());
-        Ok(())
-    }
-
     pub async fn change_project(&self, id: ProjectId, change: ProjectChange) -> anyhow::Result<()> {
         let _gate = self.projects.lock(id).await;
         let mut write = self.db.write().await;

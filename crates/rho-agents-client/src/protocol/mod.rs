@@ -63,13 +63,6 @@ pub struct SetClaudeAccount {
     pub name: String,
 }
 
-/// Enables or disables one provider account namespace on this host.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct SetAuthAccountEnabled {
-    pub name: String,
-    pub enabled: bool,
-}
-
 /// Window represented by each point in the agent-cost distribution graph.
 pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 

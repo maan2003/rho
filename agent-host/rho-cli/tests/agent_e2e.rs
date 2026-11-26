@@ -80,8 +80,9 @@ class _MailCompat:
 
 def _on_notebook(agent, ns):
     _default_on_notebook(agent, ns)
-    if "mail" not in ns:
-        ns["mail"] = _MailCompat(agent.id)
+    # The fake model answers through `mail.send`. Replace whatever `mail`
+    # the defaults gave, so every answer posts a flash and then a message.
+    ns["mail"] = _MailCompat(agent.id)
 
 hooks.on_notebook = _on_notebook
 "#,

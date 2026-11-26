@@ -89,12 +89,10 @@ impl Frame {
         read: impl FnOnce(&Sources<'_>) -> R,
     ) -> R {
         let claims = self.claims(trace, cx);
-        let names = |address: &Address| self.name_of(address, cx);
         let sources = Sources {
             claims: &claims,
             marks: &self.attention.marks,
             skips: &self.attention.skips,
-            names: &names,
         };
         read(&sources)
     }

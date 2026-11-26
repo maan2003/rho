@@ -16,7 +16,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 ### 1. Zombie `start agent` menus are in every thread's Palette and bypass the project
 - **Kind:** code
 - **Level:** high-level (reverse)
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: menu, `rho-agents-client::create`, `StartFromMail`/`MailLaunch` and the host handler deleted; `known_project_places` now on `AgentsSystem` beside `Start a project`)
 - **Where:** `window.Palette` on any `chat.Thread`, and `desk.Desk` with a thread row selected; `chat.Project.receive an idea`
 - **Evidence:**
   - Code: `AgentsSystem::rows` appends `start::rows(...)` on every thread point (`crates/rho-agents-view/src/system/mod.rs:1266-1269`). The menu is titled `start agent`, or `send and start agent with options` when the draft has text (`crates/rho-agents-view/src/system/start.rs:46-49`). Its rows are `new workset on a repository`, `here, in a directory on the host` and `join <subject>`, and each one then asks for a runtime (`start.rs:57-150`). The Palette flattens them into commands such as `start agent › here, in a directory on the host`. Behind them sit `rho-agents-client::create` (509 lines, still documented as a "start field" that Shift-Tab cycles, `crates/rho-agents-client/src/create.rs:21-31`) and the `StartFromMail`/`MailLaunch` RPC (`crates/rho-agents-client/src/protocol/worksets.rs:63, 82-95`).
@@ -84,7 +84,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 
 ### 7. Dead crates, modules, tables and RPCs that the GUI no longer reaches
 - **Kind:** code
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: `rho-files`, `image_view`, `rho_hosts_last_placed_v1`, Chat `Reparent`/`Leave`, `Protocol::{Agents, Ledger, Workspace}` deleted with an epoch bump to `rho/ui/66`; stale frame docs fixed. Voice kept per owner: crates stay, the host refuses `Protocol::Voice`)
 - **Evidence (each verified to have no GUI caller):**
   - **`rho-files`** (1,018 lines): the GUI never enables its `client` feature, which only its own dev-deps turn on. The host refuses the protocol: *"the workspace file protocol is no longer served"* (`agent-host/rho-agent-host/src/lib.rs:1343`). The only user is `rho-cli`'s protocol describer (`agent-host/rho-cli/src/lib.rs:100`). The diff view and buffers left the GUI with the Zed workspace.
   - **`rho-rtc` client half** (`session.rs` and `session/native.rs`, 547 lines of WebRTC and audio): no crate enables `client`. The GUI dropped voice in `c71816dce` (2026-11-15). The host still serves `Protocol::Voice` (`rho-agent-host/src/realtime.rs`), so voice has no client at all. `product/` never mentions voice, so it is **undocumented** if anyone means to keep it.
@@ -98,7 +98,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 
 ### 8. Legacy dealer paths are still live, and one can deal a card that cannot be settled
 - **Kind:** code
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: `Deadline` and `Named` facts read as no node, `Claim::under` and the dealer's date path deleted, `cases.md` pruned. `Fact` variants, `Curve` and `Seen::Topic`/`Seen::Mail` reads kept)
 - **Evidence:**
   - **Deadlines:** no build writes `Fact::Deadline` (the only writer is a test, `crates/rho-chat/src/cards.rs:1174`). Yet `rank_into` turns any deadline in the ledger into a card on **any** address, notes included (`crates/rho-dealer/src/rank.rs:306-318`). A passed deadline gets `DealOrder::Overdue` with priority 1e6, so it deals first and keeps the lamp on (`curve.rs:79-86`). `NoteView` and `NotesView` have `CardHere::None`, so on a note that card cannot take a verdict. This contradicts `notes.md` (*"A standalone note is never a dealable `deal.Card`"*). `rho-notes/src/lib.rs:17-19` still says *"a bare reminder is a note with a deadline"*. **Conditional:** this bites only if some device's ledger still holds an unsettled `Deadline` fact from an older build. I did not inspect a real ledger.
   - **Project-level hold (`Claim::under`):** a snooze on the project root holds its threads (`cards.rs:176-186`, `rank.rs:355-360`). No surface can target a project root any more, because a project has no screen (`chat.md:37`). The comment *"A snooze or mute on the project…"* is also wrong, since mute ignores `under`.
@@ -120,13 +120,13 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 
 ### 10. The action journal is an undocumented instrument, half of it is dead, and one comment states adaptive intent
 - **Kind:** code (with a product note)
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: the 18 unrecorded variants and their helper types deleted, which is safe because senax tags variants by a hash of the name; the `SCRUBBED` scrub and the `Find` comment gone)
 - **Evidence:** Of 35 `rho_journal::Event` variants, 18 are never recorded by any crate: `OverviewOpened`, `AgentOpened`, `AgentSelected`, `DeskRawModeToggled`, `Find`, `Created`, `CaptureCarryover`, `WrongCard`, `Key`, `AgentMessageSent`, `Told`, `AgentChanged`, `Click`, `Scroll`, `DealMode`, `SurfaceClosed`, `HistoryAppended` and `WindowFocusChanged` (`crates/rho-journal/src/lib.rs:438-621`). `Event::Find` is documented as *"a miss signal for future dealing"* (`lib.rs:505`). That conflicts with `index.md:40`: *"Nothing adapts on its own."* The one-off secret scrub (`SCRUBBED`, `lib.rs:793-830`, from 2026-09-25) is past its window.
 - **Direction:** Keep the variants for decode order, but mark them retired, remove their writers' types, and delete the scrub. Rewrite the `Find` comment so that it states the journal is inert. `product/` needs no entry, because this is a developer instrument that is never uploaded.
 
 ### 11. Temporary migrations are past their window
 - **Kind:** code
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc1-zombies-and-tests`: all five GUI migrations and `ImportProject` deleted; `gui_browser_bookmark_v1` kept)
 - **Evidence:** These are kept "until every device has opened this build". Per the `temp-migration` skill, they should usually last 1–2 commits:
   - `retire_slack.rs` (256 lines, 2026-11-20)
   - `gui_channel_place_v1` with the `ImportProject` RPC (`crates/rho-chat/src/ui/projects.rs:569-600`, 2026-11-20)

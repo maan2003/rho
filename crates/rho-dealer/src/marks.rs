@@ -2,10 +2,11 @@
 //! in time order.
 //!
 //! Attention facts are kept per node for [`crate::facts::Facts`] to read.
-//! What a node is called and what it is about settle on the last one
-//! said. A note is its newest revision, and so is a bookmark. A retracted entry
-//! counts for nothing, whenever the retract arrives. The label facts older
-//! builds wrote are about no node ([`Fact::node`]), so nothing here reads them.
+//! What a note is about settles on the last one said. A note is its newest
+//! revision, and so is a bookmark. A retracted entry counts for nothing,
+//! whenever the retract arrives. The label, deadline and name facts older
+//! builds wrote are about no node ([`Fact::node`]), so nothing here reads
+//! them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -20,8 +21,6 @@ use crate::facts::{Entry, EntryId, Fact, Facts};
 pub struct NodeMarks {
     /// Its attention facts, oldest first, none retracted.
     pub facts: Vec<Entry>,
-    /// What the user calls it, over what its source calls it.
-    pub name: Option<String>,
     /// A note's text; its first line is its title.
     pub body: Option<String>,
     /// When the note's newest revision was written.
@@ -44,7 +43,6 @@ pub struct Bookmark {
 
 static EMPTY: NodeMarks = NodeMarks {
     facts: Vec::new(),
-    name: None,
     body: None,
     written_ms: None,
     created_ms: None,
@@ -139,12 +137,10 @@ impl Marks {
                 Fact::Snooze { .. }
                 | Fact::Piled { .. }
                 | Fact::Todo { .. }
-                | Fact::Deadline { .. }
                 | Fact::Settled { .. }
                 | Fact::Mute { .. }
                 | Fact::Unmute { .. }
                 | Fact::Read { .. } => marks.facts.push(entry.clone()),
-                Fact::Named { name, .. } => marks.name = name.clone(),
                 Fact::About { about, .. } => marks.about = about.clone(),
                 Fact::Wrote { text, created, .. } => {
                     marks.body = Some(text.clone());
@@ -160,7 +156,9 @@ impl Marks {
                     });
                 }
                 Fact::Unbookmarked { .. } => marks.bookmark = None,
-                Fact::Label { .. }
+                Fact::Deadline { .. }
+                | Fact::Named { .. }
+                | Fact::Label { .. }
                 | Fact::Unlabel { .. }
                 | Fact::Repository { .. }
                 | Fact::Host { .. }
@@ -247,32 +245,36 @@ mod tests {
     }
 
     #[test]
-    fn a_name_settles_on_the_last_thing_said_from_any_device() {
+    fn what_a_note_is_about_settles_on_the_last_thing_said_from_any_device() {
         let mut marks = Marks::default();
-        let named = |device, minute, name: &str| {
+        let about = |device, minute, key: &str| {
             said(
                 device,
                 minute,
-                Fact::Named {
+                Fact::About {
                     node: agent(),
-                    name: Some(name.into()),
+                    about: Some(Address::new("thread", key)),
                 },
             )
         };
-        let entries = [named(LAPTOP, 0, "eng"), named(PHONE, 1, "fixer")];
+        let entries = [about(LAPTOP, 0, "eng"), about(PHONE, 1, "fixer")];
         // Arriving in any order, and twice, comes to the same.
         let mut backwards = entries.to_vec();
         backwards.reverse();
         marks.apply(backwards);
         let touched = marks.apply(entries);
         assert!(touched.is_empty(), "entries already held move nothing");
-        assert_eq!(marks.get(&agent()).name.as_deref(), Some("fixer"));
+        assert_eq!(
+            marks.get(&agent()).about,
+            Some(Address::new("thread", "fixer"))
+        );
     }
 
-    /// The label facts older builds wrote still decode, and come to
-    /// nothing: no node, no move.
+    /// The label, deadline and name facts older builds wrote still decode,
+    /// and come to nothing: no node, no move. A deadline left in a log
+    /// can never deal a card that no verdict settles.
     #[test]
-    fn old_label_facts_come_to_nothing() {
+    fn old_label_deadline_and_name_facts_come_to_nothing() {
         let mut marks = Marks::default();
         let label = uuid::Uuid::new_v4();
         let entries = [
@@ -311,6 +313,23 @@ mod tests {
                 },
             ),
             said(PHONE, 4, Fact::Unlabel { label }),
+            said(
+                PHONE,
+                5,
+                Fact::Deadline {
+                    node: Address::note(uuid::Uuid::new_v4()),
+                    by: crate::until::Until::Day(jiff::civil::date(2026, 1, 1)),
+                    lead_days: 3,
+                },
+            ),
+            said(
+                LAPTOP,
+                6,
+                Fact::Named {
+                    node: agent(),
+                    name: Some("fixer".into()),
+                },
+            ),
         ];
         let read: Vec<Entry> = entries
             .iter()
@@ -324,28 +343,24 @@ mod tests {
     #[test]
     fn a_retract_takes_an_entry_back_whenever_it_arrives() {
         let mut marks = Marks::default();
-        let rename = said(
-            PHONE,
-            1,
-            Fact::Named {
-                node: agent(),
-                name: Some("new".into()),
-            },
-        );
-        let retract = said(PHONE, 2, Fact::Retract { of: rename.id() });
-        marks.apply([
+        let about = |device, minute, key: &str| {
             said(
-                LAPTOP,
-                0,
-                Fact::Named {
+                device,
+                minute,
+                Fact::About {
                     node: agent(),
-                    name: Some("old".into()),
+                    about: Some(Address::new("thread", key)),
                 },
-            ),
-            retract,
-        ]);
-        marks.apply([rename]);
-        assert_eq!(marks.get(&agent()).name.as_deref(), Some("old"));
+            )
+        };
+        let moved = about(PHONE, 1, "new");
+        let retract = said(PHONE, 2, Fact::Retract { of: moved.id() });
+        marks.apply([about(LAPTOP, 0, "old"), retract]);
+        marks.apply([moved]);
+        assert_eq!(
+            marks.get(&agent()).about,
+            Some(Address::new("thread", "old"))
+        );
     }
 
     #[test]

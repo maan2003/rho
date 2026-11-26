@@ -19,8 +19,6 @@ use std::sync::OnceLock;
 
 use crate::RhoDb;
 
-mod retire_slack;
-
 pub const FILE_NAME: &str = "rho-client.redb";
 /// Held for as long as the database is open. redb takes its own lock and
 /// panics on a second opener; this one is taken first so a second rho
@@ -42,7 +40,6 @@ pub fn open(state_dir: &Path) -> std::io::Result<RhoDb> {
     let lock = acquire_lock(state_dir)?;
     let db = RhoDb::open(path(state_dir)).holding(lock);
     own_the_file(state_dir)?;
-    retire_slack::migrate(state_dir, &db).map_err(std::io::Error::other)?;
     Ok(db)
 }
 
