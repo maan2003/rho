@@ -13,14 +13,15 @@ use rho_agent_types::{
 };
 use rho_db::{RhoDb, Sen};
 use rho_dealer::Addressed as _;
-use rho_frame::idea::{NewIdeaProject, runtime_candidates};
-use rho_frame::{Candidate, Frame, Point, Row};
+use rho_frame::idea::{NewIdeaProject, ProjectCreated, runtime_candidates};
+use rho_frame::system::System as _;
+use rho_frame::{Candidate, Frame, Point, Row, Rows};
 use rho_window::style::StyleClass;
 use senax_encoder::{Decode, Encode};
 
-use super::{ChatSystem, CreatedProject};
+use super::ChatSystem;
+use crate::ThreadId;
 use crate::protocol::{ChangeProject, CreateProject, ImportProject};
-use crate::{AgentRef, ThreadId};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
@@ -97,60 +98,68 @@ impl ChatSystem {
         }
     }
 
+    /// The project commands work from anywhere: on the current thread's
+    /// project, or on the one the user names.
     pub(super) fn project_rows(&self, point: &Point, cx: &Context<Self>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let this = cx.entity();
-        let on_agent = point
-            .subject()
-            .is_some_and(|subject| subject.kind() == AgentRef::KIND);
-        if !self.hosts().is_empty() && !on_agent {
-            let this = this.clone();
-            rows.push(Row::run("c", "new project", move |frame, window, cx| {
-                Self::prompt_project_address(this.clone(), frame, window, cx);
-            }));
+        if self.hosts().is_empty() {
+            return Vec::new();
         }
-        let Some(project) = self.thread_of(&point.surface) else {
-            return rows;
-        };
-        let Some(address) = self.project_address(project) else {
-            return rows;
-        };
-        let config = self.project_config(project);
-        let place = config.map(|c| c.place.clone());
-        let change = this.clone();
-        let place_address = address.clone();
-        rows.push(Row::run("", "works on…", move |frame, window, cx| {
-            let change = change.clone();
-            Self::prompt_place(
-                &change,
-                project.host,
-                &place_address,
-                place.as_ref(),
-                Rc::new({
-                    let change = change.clone();
-                    move |_, place, _, cx| {
-                        change.update(cx, |mail, cx| {
-                            mail.change_project(project, ProjectChange::Place(place), cx)
-                        });
-                    }
+        let this = cx.entity();
+        let here = self
+            .thread_of(&point.surface)
+            .and_then(|thread| self.project_root(thread));
+        // Each row has its own key: a menu keeps only the first row on a key.
+        let mut rows = Rows::new("project");
+        let create = this.clone();
+        rows.push(Row::run("n", "new", move |frame, window, cx| {
+            Self::prompt_project_address(create.clone(), frame, window, cx);
+        }));
+        let place = this.clone();
+        rows.push(Row::run("w", "works on…", move |frame, window, cx| {
+            let this = place.clone();
+            Self::for_project(
+                place.clone(),
+                here,
+                Rc::new(move |frame, project, address, window, cx| {
+                    let current = this
+                        .read(cx)
+                        .project_config(project)
+                        .map(|config| config.place.clone());
+                    let change = this.clone();
+                    Self::prompt_place(
+                        &this,
+                        project.host,
+                        &address,
+                        current.as_ref(),
+                        Rc::new(move |_, place, _, cx| {
+                            change.update(cx, |mail, cx| {
+                                mail.change_project(project, ProjectChange::Place(place), cx)
+                            });
+                        }),
+                        frame,
+                        window,
+                        cx,
+                    );
                 }),
                 frame,
                 window,
                 cx,
             );
         }));
-        if let Some(config) = config {
-            let mode = config.mode;
-            let mode_address = address.clone();
-            let change = this.clone();
-            rows.push(Row::run(
-                "",
-                format!("agents: {}", mode.label()),
-                move |frame, window, cx| {
-                    let change = change.clone();
+        let mode = this.clone();
+        rows.push(Row::run("a", "agents…", move |frame, window, cx| {
+            let this = mode.clone();
+            Self::for_project(
+                mode.clone(),
+                here,
+                Rc::new(move |frame, project, address, window, cx| {
+                    let Some(config) = this.read(cx).project_config(project) else {
+                        return no_place(frame, &address, cx);
+                    };
+                    let change = this.clone();
                     prompt_mode(
-                        &mode_address,
-                        mode,
+                        &address,
+                        config.mode,
                         Rc::new(move |_, mode, _, cx| {
                             change.update(cx, |mail, cx| {
                                 mail.change_project(project, ProjectChange::Mode(mode), cx)
@@ -160,27 +169,87 @@ impl ChatSystem {
                         window,
                         cx,
                     );
-                },
-            ));
-            let current = config.runtime.clone();
-            rows.push(Row::run("", "runtime…", move |frame, window, cx| {
-                let change = this.clone();
-                prompt_runtime(
-                    format!("{address} runtime ({current}):"),
-                    current.clone(),
-                    "current",
-                    Rc::new(move |_, runtime, _, cx| {
-                        change.update(cx, |mail, cx| {
-                            mail.change_project(project, ProjectChange::Runtime(runtime), cx)
-                        });
-                    }),
-                    frame,
-                    window,
-                    cx,
-                );
-            }));
+                }),
+                frame,
+                window,
+                cx,
+            );
+        }));
+        rows.push(Row::run("r", "runtime…", move |frame, window, cx| {
+            let runtime = this.clone();
+            Self::for_project(
+                this.clone(),
+                here,
+                Rc::new(move |frame, project, address, window, cx| {
+                    let Some(config) = runtime.read(cx).project_config(project) else {
+                        return no_place(frame, &address, cx);
+                    };
+                    let current = config.runtime.clone();
+                    let change = runtime.clone();
+                    prompt_runtime(
+                        format!("{address} runtime ({current}):"),
+                        current,
+                        "current",
+                        Rc::new(move |_, runtime, _, cx| {
+                            change.update(cx, |mail, cx| {
+                                mail.change_project(project, ProjectChange::Runtime(runtime), cx)
+                            });
+                        }),
+                        frame,
+                        window,
+                        cx,
+                    );
+                }),
+                frame,
+                window,
+                cx,
+            );
+        }));
+        rows.into_commands()
+    }
+
+    /// Runs `then` on the current thread's project, or asks `project:`
+    /// first when the point is in no project.
+    fn for_project(
+        this: Entity<Self>,
+        here: Option<ThreadId>,
+        then: ProjectAnswer,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        if let Some(project) = here
+            && let Some(address) = this.read(cx).project_address(project)
+        {
+            return then(frame, project, address, window, cx);
         }
-        rows
+        let names = this.clone();
+        frame.open_prompt(
+            "project:",
+            Rc::new(move |_, needle, cx| {
+                let mail = names.read(cx);
+                let needle = needle.trim();
+                mail.idea_projects(cx)
+                    .into_iter()
+                    .filter(|project| project.name.contains(needle))
+                    .map(|project| Candidate {
+                        description: ThreadId::from_address(&project.address)
+                            .and_then(|thread| mail.project_details(thread))
+                            .unwrap_or_default(),
+                        value: project.name,
+                    })
+                    .collect()
+            }),
+            Rc::new(move |frame, input, window, cx| {
+                let input = input.trim();
+                match this.read(cx).project_named(input) {
+                    Some(project) => then(frame, project, input.to_owned(), window, cx),
+                    None => frame.echo("project: no such project", StyleClass::SystemInfo, cx),
+                }
+            }),
+            window,
+            cx,
+        );
     }
 
     fn prompt_project_address(
@@ -231,7 +300,7 @@ impl ChatSystem {
                 Self::prompt_project(
                     this.clone(),
                     NewIdeaProject { host, name },
-                    CreatedProject::Open,
+                    None,
                     frame,
                     window,
                     cx,
@@ -245,7 +314,7 @@ impl ChatSystem {
     pub(super) fn prompt_project(
         this: Entity<Self>,
         project: NewIdeaProject,
-        created: CreatedProject,
+        created: Option<ProjectCreated>,
         frame: &mut Frame,
         window: &mut Window,
         cx: &mut Context<Frame>,
@@ -350,7 +419,7 @@ impl ChatSystem {
         &self,
         project: NewIdeaProject,
         config: ProjectConfig,
-        created: CreatedProject,
+        created: Option<ProjectCreated>,
         cx: &mut Context<Self>,
     ) {
         self.call(
@@ -446,6 +515,16 @@ fn prompt_mode(
                 .then_some("choose one or per idea")
         });
     }
+}
+
+type ProjectAnswer = Rc<dyn Fn(&mut Frame, ThreadId, String, &mut Window, &mut Context<Frame>)>;
+
+fn no_place(frame: &mut Frame, address: &str, cx: &mut Context<Frame>) {
+    frame.echo(
+        &format!("{address}: no place set · answer project › works on… first"),
+        StyleClass::SystemInfo,
+        cx,
+    );
 }
 
 type RuntimeAnswer = Rc<dyn Fn(&mut Frame, RuntimeLabel, &mut Window, &mut Context<Frame>)>;
@@ -580,6 +659,45 @@ mod tests {
             }
             cx.dispatch_action(*window, rho_frame::keys::MinibufferConfirm);
             assert_eq!(picked.borrow_mut().take().unwrap().as_str(), expected);
+        }
+    }
+
+    /// Every project command is in the palette, from Desk and from a
+    /// thread alike.
+    #[gpui::test]
+    fn the_project_commands_work_from_anywhere(cx: &mut gpui::TestAppContext) {
+        let (_window, mail, _db) =
+            super::super::search_bench::fixture(cx, crate::HostChat::default());
+        let thread = ThreadId {
+            host: EndpointId([3; 32]),
+            message: MessageId(ChatSeq(2)),
+        };
+        for surface in [Frame::desk_address(), thread.address()] {
+            let point = Point {
+                surface,
+                subject: rho_frame::Subject::Own,
+                card: None,
+            };
+            let labels = cx.update(|cx| {
+                mail.update(cx, |mail, cx| {
+                    mail.project_rows(&point, cx)
+                        .iter()
+                        .map(|row| match &row.pick {
+                            rho_frame::menu::Pick::Run { label, .. } => label.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            });
+            assert_eq!(
+                labels,
+                [
+                    "project › new",
+                    "project › works on…",
+                    "project › agents…",
+                    "project › runtime…"
+                ]
+            );
         }
     }
 

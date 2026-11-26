@@ -7,11 +7,10 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_types::{Activity, AgentId, Message, MessageId};
 use rho_agents_client::protocol::transcript::{RuntimeKind, RuntimeState};
-use rho_agents_client::protocol::worksets::{Cancel, RewindAgent};
+use rho_agents_client::protocol::worksets::{Cancel, RewindAgent, StopAgent};
 use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
 use rho_frame::{Addressed as _, Candidate, CardHere, Row, Subject, Surface};
 use rho_window::style::StyleClass;
-use theme::ActiveTheme as _;
 
 use super::AgentsSystem;
 use crate::agent_view::{AgentModel, AgentModelEvent};
@@ -332,7 +331,7 @@ impl Surface for AgentSurface {
         cx: &mut Context<Self>,
     ) -> Vec<Row> {
         let agent = self.agent;
-        let mut rows = steer_rows(self.system.clone(), agent);
+        let mut rows = Vec::new();
         let origin = self.system.read(cx).agent_thread(agent, cx);
         if let Some(thread) = origin {
             rows.push(Row::run(
@@ -351,8 +350,8 @@ fn in_trouble(activity: Activity) -> bool {
     matches!(activity, Activity::Retrying | Activity::Failed)
 }
 
-/// The rows that steer an agent, from its transcript or from a thread's
-/// `with` line. Each carries the change to the agent's host.
+/// The rows that steer an agent, from any of its screens or from a thread
+/// it works in. Each carries the change to the agent's host.
 pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Row> {
     let eval = |description: &'static str,
                 key: &'static str,
@@ -478,6 +477,38 @@ pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Ro
             );
         },
     ));
+    let stop_system = system.clone();
+    rows.push(Row::run("s", "stop agent", move |_, _, cx| {
+        stop_system.update(cx, |system, cx| {
+            let Some(agents) = system.agents_for(agent) else {
+                system.frame.echo(
+                    "the agent's host is not attached",
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+                return;
+            };
+            let reply = agents.call(StopAgent { agent });
+            let frame = system.frame.clone();
+            let label = system.registry().agent_display_label(agent);
+            cx.spawn(async move |_, cx| {
+                let reply = reply.await;
+                cx.update(|cx| match reply {
+                    Ok(()) => frame.echo(
+                        format!("stopped by you: {label}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                    Err(error) => frame.echo(
+                        format!("did not stop {label}: {error:#}"),
+                        StyleClass::SystemImportant,
+                        cx,
+                    ),
+                });
+            })
+            .detach();
+        });
+    }));
     let cancel_system = system.clone();
     rows.push(Row::run(
         "shift-c",
@@ -579,11 +610,6 @@ impl Focusable for AgentSurface {
 
 impl Render for AgentSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor_text = self
-            .editor
-            .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let colors = cx.theme().colors();
-        let brief = self.system.read(cx).brief(self.agent, cx);
         div()
             .id("rho-agent-transcript")
             .key_context("RhoAgent")
@@ -596,22 +622,7 @@ impl Render for AgentSurface {
                 }),
             )
             .size_full()
-            .flex()
-            .flex_col()
-            .children(brief.map(|brief| {
-                div()
-                    .flex_none()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(colors.border_variant)
-                    .font_family(editor_text.font_family)
-                    .text_size(editor_text.font_size)
-                    .line_height(editor_text.line_height)
-                    .child(div().text_color(colors.text_muted).child("brief"))
-                    .child(div().line_clamp(4).child(brief))
-            }))
-            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(self.editor.clone())
     }
 }
 

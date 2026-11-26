@@ -590,12 +590,7 @@ impl Minibuffer {
                 let index = rows[self.selected].index;
                 let blank = input.trim().is_empty();
                 Box::new(move |frame, window, cx| match &listing.choices[index] {
-                    Choice::Place(place) => match &place.card {
-                        Some(card) if !blank || place.visit.is_none() => {
-                            frame.open_card(card.clone(), window, cx)
-                        }
-                        _ => frame.open(place.found.address.clone(), window, cx),
-                    },
+                    Choice::Place(place) => frame.choose_place(place, blank, window, cx),
                     Choice::Words(hit) => frame.open_text_match(hit, window, cx),
                     Choice::Command(entry) => match &entry.pick {
                         Pick::Run { run, .. } | Pick::Infix { run, .. } => {

@@ -26,8 +26,6 @@ use crate::{Frame, FrameLink};
 pub struct IdeaProject {
     pub address: Address,
     pub name: String,
-    /// Host-owned project settings, presented under the narrowed Desk title.
-    pub details: Option<String>,
     pub runtime: Option<RuntimeLabel>,
 }
 
@@ -794,6 +792,26 @@ mod tests {
             self.projects.clone()
         }
 
+        fn idea_project(&self, address: &Address, _: &App) -> Option<IdeaProject> {
+            self.projects
+                .iter()
+                .find(|project| &project.address == address)
+                .cloned()
+        }
+
+        fn find(&self, _: &crate::Marks, _: &App) -> Vec<crate::system::Found> {
+            self.projects
+                .iter()
+                .map(|project| crate::system::Found {
+                    address: project.address.clone(),
+                    title: project.name.clone(),
+                    description: "on /srv/tide · one agent · opus-high".into(),
+                    thread: None,
+                    recency: 0,
+                })
+                .collect()
+        }
+
         fn create_idea_project(
             &mut self,
             new: NewIdeaProject,
@@ -804,7 +822,6 @@ mod tests {
             let project = IdeaProject {
                 address: Address::new("project", name),
                 name: format!("{name}@lab"),
-                details: None,
                 runtime: None,
             };
             self.projects.push(project.clone());
@@ -814,6 +831,57 @@ mod tests {
         fn send_idea(&mut self, mail: IdeaMail, _: &mut Context<Self>) {
             self.sent.push(mail);
         }
+    }
+
+    /// A project has no screen: choosing it in the palette filters the
+    /// palette to its threads.
+    #[gpui::test]
+    fn choosing_a_project_in_the_palette_filters_to_its_threads(cx: &mut gpui::TestAppContext) {
+        let host = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            cx.new(|_| ProjectHost {
+                projects: vec![IdeaProject {
+                    address: Address::new("project", "tide"),
+                    name: "tide@lab".into(),
+                    runtime: None,
+                }],
+                sent: Vec::new(),
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            Frame::new(
+                rho_db::RhoDb::in_memory(),
+                vec![AnySystem::new(host.clone())],
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |frame, window, cx| {
+                frame.palette(window, cx);
+                frame
+                    .minibuffer_mut()
+                    .unwrap()
+                    .set_input("tide@lab".into(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), crate::keys::MinibufferConfirm);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, cx| {
+                assert_eq!(frame.current_address(), &Frame::desk_address());
+                let palette = frame.minibuffer_mut().expect("the palette stays open");
+                assert_eq!(palette.input(cx), "tide@lab ");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -277,17 +277,8 @@ impl SeenMail {
         }
     }
 
-    pub(crate) fn note(&mut self, seen: MessageVersion) {
-        remember(&mut self.exact, seen);
-    }
-
     fn through(&self, mail: MessageId) -> Option<ChatSeq> {
         self.through.max(self.exact.get(&mail).copied())
-    }
-
-    pub(crate) fn is_unread(&self, message: &Message) -> bool {
-        self.through(message.id)
-            .is_none_or(|seen| message.version().0 > seen)
     }
 }
 

@@ -445,27 +445,6 @@ impl HostChat {
         newest
     }
 
-    /// Every message in a thread or under it that is not the user's,
-    /// newest first: what can be unread.
-    pub fn others_in(&self, thread: MessageId) -> Vec<MessageId> {
-        let mut found = Vec::new();
-        let mut stack = vec![thread];
-        while let Some(at) = stack.pop() {
-            if let Some(message) = self.messages.get(&at)
-                && message.from != Address::User
-                && !matches!(
-                    message.revision,
-                    Revision::Deleted | Revision::TakenBack { .. }
-                )
-            {
-                found.push(at);
-            }
-            stack.extend(self.children(Some(at)).iter().copied());
-        }
-        found.sort_unstable_by_key(|id| std::cmp::Reverse(self.messages[id].version().0));
-        found
-    }
-
     /// The root whose name is `name`, if there is one.
     pub fn root_named(&self, name: &str) -> Option<MessageId> {
         let wanted = one_line(name);
@@ -818,7 +797,6 @@ mod tests {
         assert_eq!(mail.members_under(Some(id(2))), [a, b]);
         assert_eq!(mail.members_under(Some(id(1))), [b]);
         assert_eq!(mail.newest_in(id(2)), Some((id(5).0, UnixMs(5))));
-        assert_eq!(mail.others_in(id(2)), [id(4)]);
         assert_eq!(mail.root_named(" rho "), Some(id(1)));
         assert_eq!(mail.root_named("ops"), None);
 

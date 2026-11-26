@@ -9,11 +9,8 @@ pub use vim::enter_normal_mode;
 actions!(
     rho_thread,
     [
-        /// Posts the draft; in a channel on a host, as an idea an
-        /// agent starts from.
+        /// Posts the draft as the thread's next message.
         SendMessage,
-        /// Posts the draft and starts nothing, in a channel too.
-        SendOnly,
         /// Opens what the cursor is on: a thread under a message, the
         /// thread above, a link, or a quote.
         OpenRow,
@@ -24,8 +21,6 @@ actions!(
 
 /// The key context of the whole screen.
 pub const SCREEN: &str = "RhoThread";
-/// The project list has a second way to send an idea.
-pub const PROJECT_SCREEN: &str = "RhoThread RhoProjectThread";
 /// A message's time on the user's clock, as every thread says it: the hour
 /// when it is today, the day in front of it when it is not.
 pub fn when(at_ms: i64) -> String {
@@ -41,14 +36,7 @@ pub fn when(at_ms: i64) -> String {
 
 pub(crate) fn bind(cx: &mut App) {
     let screen = format!("{SCREEN} > Editor");
-    let mut bindings = vec![
-        KeyBinding::new("ctrl-enter", SendMessage, Some(&screen)),
-        KeyBinding::new(
-            "ctrl-shift-enter",
-            SendOnly,
-            Some("RhoProjectThread > Editor"),
-        ),
-    ];
+    let mut bindings = vec![KeyBinding::new("ctrl-enter", SendMessage, Some(&screen))];
     for context in
         crate::normal_contexts(SCREEN, " && vim_operator == none && !showing_completions")
     {

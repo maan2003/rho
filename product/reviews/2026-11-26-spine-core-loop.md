@@ -44,7 +44,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 3. Cached `Thread` screens ignore `show_card` and `opened`, reopening dealt cards deep in stale history
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/c2-thread-desk`)
 - **Where:** `chat.Thread` (`states: full`) / `deal.Clear what waits` (step 1)
 - **Evidence:**
   - Product model: `chat.md:133` (*"whether opened by the deal or by name, the window starts at the top of the document: the `Draft`, with the point in it where it was left, then the newest message... Returning to a place restores it as left"*); `deal.md:22` (*"put a message that wants the user in reach, without making them look through the whole thread"*).
@@ -57,7 +57,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 4. `Thread` never shows when an agent is `working`, and cannot `stop agent` without leaving the thread
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/c2-thread-desk`)
 - **Where:** `chat.Thread` (`shows`, `mock, with a flash`) & `agents.Steer an agent` (step 2)
 - **Evidence:**
   - Product model: `chat.md:173` shows `working` in the `Thread` status line (`clock@lab › Flaky clock test   working   NOR`); `index.md:40` (*"what each agent is doing"*); `agents.md:44, 176` (`Steer an agent` from `chat.Thread` palette).
@@ -111,7 +111,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 8. `Agent` transcript traps the `brief` in a fixed `line_clamp(4)` header outside the editor
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/c2-thread-desk`)
 - **Where:** `agents.Agent` (`shows: the brief once, then the transcript in order`)
 - **Evidence:**
   - Product model: `agents.md:110` (*"the brief once, then the transcript in order... nothing the agent was given is shortened, since this screen is for finding out what happened"*); `index.md` Value 6 (*"Every screen is text the user moves through with the same keys"*) and `non-goal Fixed controls`.
@@ -136,7 +136,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 10. Narrowed `Desk` (`Project`) leaks scope on skip/next, hides project settings from threads, and leaves a dead `Project` list screen in code and `design.md`
 - **Kind:** product
 - **Level:** high-level
-- **Status:** decided (2026-11-26: killed narrowed Project Desk completely; Palette filters by project and exposes global project commands; code cleanup queued for Loop 2)
+- **Status:** decided (2026-11-26: killed narrowed Project Desk completely; Palette filters by project and exposes global project commands; code cleanup queued for Loop 2) → fixed (2026-11-26, Loop 2 branch `loop2/c2-thread-desk`)
 - **Where:** `desk.Desk` (`narrow`) / `chat.Project` / `agents.a refused start leaves a message` / `design.Row`
 - **Evidence:**
   - Product model: `desk.md:24` & `chat.md:37` state *"a project has no screen of its own"* (opening a project narrows `Desk`), and `chat.md:242` rejected *"two send keys, one that starts an agent and one that only sends"*.

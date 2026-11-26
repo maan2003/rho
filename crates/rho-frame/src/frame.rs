@@ -312,12 +312,6 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
-        if self
-            .project_for(address, cx)
-            .is_some_and(|(_, project)| &project.address == address)
-        {
-            return Some(AnySurface::new(self.desk.clone()));
-        }
         self.systems
             .clone()
             .into_iter()
@@ -993,6 +987,35 @@ impl Frame {
         self.open_minibuffer(":", Answer::palette(listing), None, window, cx);
     }
 
+    /// What choosing a place in the palette does. A project has no screen
+    /// of its own: choosing one narrows the palette to its threads, which
+    /// carry its address.
+    pub(crate) fn choose_place(
+        &mut self,
+        place: &palette::Place,
+        blank: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address = &place.found.address;
+        if let Some((_, project)) = self
+            .project_for(address, cx)
+            .filter(|(_, project)| &project.address == address)
+        {
+            self.palette(window, cx);
+            if let Some(prompt) = self.minibuffer.as_mut() {
+                prompt.set_input(format!("{} ", project.name), window, cx);
+            }
+            return;
+        }
+        match &place.card {
+            Some(card) if !blank || place.visit.is_none() => {
+                self.open_card(card.clone(), window, cx)
+            }
+            _ => self.open(address.clone(), window, cx),
+        }
+    }
+
     pub(crate) fn text_search(&self, query: String, limit: usize, cx: &App) -> crate::TextSearch {
         let mut search = crate::TextSearch::new(query, limit);
         if limit != 0 {
@@ -1484,12 +1507,23 @@ impl Frame {
         let (heading, state, state_color) = if composing_idea {
             ("idea".to_owned(), String::new(), colors.text_muted)
         } else if let Some(address) = own_card {
-            let card = self.card_for(&address, cx);
-            let heading = surface.heading(cx).unwrap_or_else(|| card.heading());
-            if self.marks().get(&address).facts().muted() {
-                (heading, "muted".to_owned(), colors.text_muted)
-            } else {
-                (heading, card.label, status.warning)
+            // The card's words while it waits; otherwise the surface says
+            // what it is doing, as any other screen does.
+            let heading = surface
+                .heading(cx)
+                .unwrap_or_else(|| self.card_for(&address, cx).heading());
+            let waiting = self
+                .hand()
+                .cards
+                .iter()
+                .find(|card| card.address == address)
+                .map(|card| card.label.clone());
+            match waiting {
+                _ if self.marks().get(&address).facts().muted() => {
+                    (heading, "muted".to_owned(), colors.text_muted)
+                }
+                Some(label) => (heading, label, status.warning),
+                None => (heading, surface_status, colors.text_muted),
             }
         } else {
             let title = if let Some(titles) = phone_titles {
@@ -1965,14 +1999,13 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_row_in_a_narrow_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
+    fn a_row_on_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
         let frame = test_frame(cx, rho_db::RhoDb::in_memory());
         frame
             .update(cx, |frame, _, cx| {
                 let project = crate::idea::IdeaProject {
                     address: Address::new("thread", "lab/1"),
                     name: "tide@lab".into(),
-                    details: None,
                     runtime: None,
                 };
                 let subject = Address::new("thread", "lab/2");
@@ -1983,13 +2016,10 @@ mod tests {
                     next_change: None,
                 };
                 let rows = desk_rows(&hand, |_| Some(project.clone()), |_| None);
-                frame.desk.update(cx, |desk, cx| {
-                    desk.set_rows(rows, Some(project.clone()), false, cx)
-                });
                 frame
-                    .surfaces
-                    .insert(project.address.clone(), AnySurface::new(frame.desk.clone()));
-                frame.history.show(project.address, ScreenEntry::Opened);
+                    .desk
+                    .update(cx, |desk, cx| desk.set_rows(rows, false, cx));
+                assert!(frame.desk_in_view());
                 assert_eq!(
                     frame.card_target(cx),
                     Some(subject.clone()),

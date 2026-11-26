@@ -46,23 +46,24 @@ on Desk.
 
 ### Start an empty project and change the next idea's mode
 
-Open the palette with `:`, choose `new project`, and enter `tide@lab`. Make an
+Open the palette with `:`, choose `project › new`, and enter `tide@lab`. Make an
 empty directory with `mkdir "$rig/tide"`; enter that path at `tide@lab works on:`.
 Known places, such as `$rig/repo` after the clock agent starts, appear as
-completions. Accept `one` at `tide@lab agents:` and `opus-high` at `tide@lab runtime:`; Desk opens narrowed to
-`tide@lab · on tide · one agent · opus-high`, with `0 wait`. At phone width (including a
-second local device), open `tide@lab` by name and `form_shot phone empty-project`.
+completions. Accept `one` at `tide@lab agents:` and `opus-high` at `tide@lab runtime:`; the echo reads
+`created project: tide@lab`, and the palette row for `tide@lab` reads `on tide · one agent · opus-high`. At phone width (including a
+second local device), type `tide@lab` in the palette and `form_shot phone empty-project`.
 
-For the `per idea` project capture below, first open `clock@lab` by name
-on either window. In its palette choose `agents: one`, then select `per idea`
-(Down, Enter). The narrowed Desk updates its heading; the running agent and
-the existing waiting thread stay. `works on…` shows the present place and
-lets you replace it without moving that agent.
+For the `per idea` project capture below, choose `project › agents…` in the
+palette on either window, answer `project:` with `clock@lab`, then select `per idea`
+(Down, Enter). The project's palette row updates; the running agent and
+the existing waiting thread stay. `project › works on…` shows the present place and
+lets you replace it without moving that agent. From a `clock@lab` thread these
+commands skip the `project:` question.
 
 ### Show the project runtime and an idea override
 
-In the narrowed `clock@lab` Desk, choose `runtime…` in the palette and set
-`sol-high`. The Desk heading includes the new runtime. Open `i` for the
+Choose `project › runtime…` in the palette, answer `project:` with `clock@lab`, and set
+`sol-high`. The project's palette row includes the new runtime. Open `i` for the
 [automatic choice on laptop](laptop-idea-empty.png); `on:` shows `sol-high`
 without adding it to the draft. Use `form_shot laptop idea-empty`. For the
 [explicit choice on phone](phone-idea-runtime.png), move from the words to
@@ -91,8 +92,8 @@ Run `form_gui phone` with no identity argument. Wait for the focused 390×844 lo
 
 | Render | Capture |
 | --- | --- |
-| [Narrow Desk (per idea)](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. The project opens a narrow Desk. |
-| Verdict sheet over the unpaired card | Tap the project's **open**, then the card's **more**: `form_way phone click 390 1640; sleep .55; form_way phone click 702 1640; sleep .55`. |
+| [Palette filtered to a project (per idea)](phone-project.png) | From Desk, `form_way phone input 'text::' 'wait:380' 'text:clock@lab' 'wait:480' 'key:enter' 'wait:800'; form_shot phone project`. The first result is the project. Enter fills `clock@lab ` and the palette lists its threads. |
+| Verdict sheet over the unpaired card | Open the waiting thread, then tap the card's **more**: `form_way phone input 'key:enter' 'wait:800'; form_way phone click 702 1640; sleep .55`. |
 | [Blank palette over Desk](phone-prompt.png) | `form_way phone input 'key:escape' 'wait:350' 'key:tab' 'wait:400' 'text::' 'wait:600'; form_shot phone prompt`. |
 | [Command-only palette](phone-palette-commands.png) | From the blank palette, `form_way phone input 'text:> note' 'wait:550'; form_shot phone palette-commands`. Only commands appear, without shortcut hints. |
 | [Text-only palette](phone-palette-text.png) | From the command-only palette, `form_way phone input 'key:escape' 'wait:320' 'text::' 'wait:280' 'text:/ behavior' 'wait:550'; form_shot phone palette-text`. Tap the message row to open its matching line. |
@@ -252,7 +253,7 @@ Build `rho-browser --example fake_browser` and point `RHO_CUSTOM_BRAVE_BIN` at `
 ## What the renders expose
 
 - The compact `unpaired` notice leaves the reason and age visible on the phone; a long subject gives way first. The same notice is absent when the laptop identity is reused.
-- Desk shows the wait count, waiting subjects with their projects, and any overflow. Choosing a project narrows the same Desk and adds its host-owned place and mode to the top line.
+- Desk shows the wait count, waiting subjects with their projects, and any overflow. Choosing a project in the palette fills its name, so the palette lists that project's threads; the project's row shows its host-owned place, mode, and runtime.
 - In a thread, the draft leads the newest-first message; `reply` appears at its caret while it is empty. The thin left bar marks the draft and the user’s sent message, not the project’s words. The card bar gives `done` and `snooze` their own buttons in Normal, and `undo` and `send` while writing. The [idea draft](laptop-idea.png) fills the window instead of adding a strip or tail.
 - The palette can match message body words absent from the subject. `>` limits rows to commands, `/` to message and note text; `chat:` and `note:` retain their narrower scopes. Up and Down wrap the selection without changing the query. Blank on Desk it shows recently visited places other than waiting threads, followed by commands. Narrow command rows omit shortcuts.
 - Both transcripts start with the brief and land on the message's writing step. The phone shows the directory basename and wraps the step in the same reading area.

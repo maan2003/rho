@@ -8,15 +8,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use editor::display_map::ToDisplayPoint as _;
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EntityId, Subscription, Task, WeakEntity, Window};
-use language::{Buffer, Capability};
-use multi_buffer::MultiBuffer;
+use language::{Buffer, Capability, Point};
+use multi_buffer::{MultiBuffer, PathKey};
 use rho_agents_client::now_ms;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::FrameSummary;
+use rho_window::style::{Region, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
 use crate::render::{Label, Labels};
@@ -39,6 +41,9 @@ const HISTORY_CHUNK_ROWS: usize = 40;
 /// How close to the top of what is composed the reader comes before the
 /// next screenful of history is composed.
 const PRELOAD_ROWS: f64 = 40.0;
+
+/// The word above the brief.
+const BRIEF_LABEL: &str = "brief";
 
 /// What the reader has asked the transcript's history for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,6 +106,8 @@ pub struct AgentModel {
     /// Where the point was when an editor over this model last moved it,
     /// as a store position: what returning to the surface goes back to.
     remembered_point: Option<StorePoint>,
+    /// The idea the agent works from, in full above its transcript.
+    brief: Option<Entity<Buffer>>,
     /// Editors currently displaying this agent, weakly held: surfaces own
     /// their editors; the model only reconciles whoever is still alive.
     editors: Vec<WeakEntity<Editor>>,
@@ -144,6 +151,7 @@ impl AgentModel {
             history_task: None,
             pending_point: None,
             remembered_point: None,
+            brief: None,
             editors: Vec::new(),
             _subscriptions: Vec::new(),
         }
@@ -260,11 +268,74 @@ impl AgentModel {
                 _ => {}
             },
         ));
+        self.style_brief(&editor, cx);
         self.editors.push(editor.downgrade());
         if let Some(point) = self.remembered_point {
             self.go_to_store_point(&editor, point, window, cx);
         }
         editor
+    }
+
+    /// Shows `brief`, the idea the agent works from, whole at the top of
+    /// the document: it is where the work starts, so it reads before the
+    /// first step.
+    pub(crate) fn set_brief(&mut self, brief: Option<&str>, cx: &mut Context<Self>) {
+        let text = brief.map(|brief| format!("{BRIEF_LABEL}\n{}\n", brief.trim_end()));
+        if self.brief.as_ref().map(|buffer| buffer.read(cx).text()) == text {
+            return;
+        }
+        let buffer = text.map(|text| cx.new(|cx| Buffer::local(text, cx)));
+        self.document_multi_buffer
+            .update(cx, |document, cx| match &buffer {
+                Some(buffer) => {
+                    let end = buffer.read(cx).max_point();
+                    document.set_excerpts_for_path(
+                        PathKey::min(),
+                        buffer.clone(),
+                        [Point::zero()..end],
+                        0,
+                        cx,
+                    );
+                }
+                None => document.remove_excerpts_for_paths(vec![PathKey::min()], cx),
+            });
+        self.brief = buffer;
+        for editor in self.live_editors() {
+            self.style_brief(&editor, cx);
+        }
+    }
+
+    /// The brief's label reads quieter than the idea under it.
+    fn style_brief(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let label = self.brief.as_ref().and_then(|buffer| {
+            let buffer = buffer.read(cx);
+            let range = buffer.anchor_before(Point::zero())
+                ..buffer.anchor_after(Point::new(0, BRIEF_LABEL.len() as u32));
+            let snapshot = self.document_multi_buffer.read(cx).snapshot(cx);
+            rho_window::highlights::excerpt_range(&snapshot, &range)
+        });
+        let class = StyleClass::SystemInfo;
+        let style = class.resolve(cx);
+        editor.update(cx, |editor, cx| {
+            editor.highlight_text(
+                class.highlight_key(Region::System),
+                label.into_iter().collect(),
+                style,
+                cx,
+            );
+        });
+    }
+
+    /// How many display rows the brief takes above the transcript.
+    fn brief_rows(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> f64 {
+        let Some(buffer) = &self.brief else {
+            return 0.0;
+        };
+        let rows = buffer.read(cx).max_point().row;
+        editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            Point::new(rows + 1, 0).to_display_point(&display).row().0 as f64
+        })
     }
 
     pub(crate) fn unresolved_mail(&self) -> impl Iterator<Item = (usize, Label)> + '_ {
@@ -514,7 +585,9 @@ impl AgentModel {
         if !self.transcript.has_uncomposed() || self.composing {
             return;
         }
-        let top = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+        // Measured from where the transcript starts, below the brief.
+        let top = editor.update(cx, |editor, cx| editor.scroll_position(cx).y)
+            - self.brief_rows(editor, cx);
         if top > PRELOAD_ROWS {
             return;
         }

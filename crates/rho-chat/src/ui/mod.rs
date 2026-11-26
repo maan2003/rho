@@ -89,12 +89,6 @@ pub struct Participant {
 /// once it is gone; the agents system owns the answer.
 pub type Participants = Rc<dyn Fn(EndpointId, AgentId, &App) -> Option<Participant>>;
 
-#[derive(Clone)]
-enum CreatedProject {
-    Open,
-    AddressDraft(ProjectCreated),
-}
-
 enum PostAnswer {
     Posted(MessageId),
     IdeaRefused(String),
@@ -118,7 +112,8 @@ pub struct ChatSystem {
     logs: HashMap<EndpointId, HostChat>,
     cursors: Cursors,
     outbox: Outbox,
-    creating_projects: Vec<(ThreadId, CreatedProject)>,
+    /// Each project being created, and the idea waiting to address it.
+    creating_projects: Vec<(ThreadId, Option<ProjectCreated>)>,
     settings: HashMap<EndpointId, HashMap<ProjectId, ProjectConfig>>,
     legacy_places: HashMap<(EndpointId, ProjectId), ProjectConfig>,
     known_places: projects::KnownPlaces,
@@ -439,9 +434,8 @@ impl ChatSystem {
                 && let Some(project) = self.idea_project_at(*creation)
             {
                 let echo = format!("created project: {}", project.name);
-                match created {
-                    CreatedProject::Open => self.frame.open(project.address, cx),
-                    CreatedProject::AddressDraft(created) => created(project, cx),
+                if let Some(created) = created {
+                    created(project, cx);
                 }
                 self.frame.echo(echo, StyleClass::SystemInfo, cx);
                 false
@@ -548,11 +542,6 @@ impl ChatSystem {
         cx.notify();
     }
 
-    /// The project starts work on the host after this durable local post.
-    fn queue_idea(&mut self, project: ThreadId, text: String, cx: &mut Context<Self>) -> u64 {
-        self.queue_thread_post(project, text, Delivery::Idea, None, None, cx)
-    }
-
     /// The explicit options path sends an ordinary post and starts the
     /// user-selected agent once the mail is logged.
     pub fn post_draft_with_options(
@@ -592,7 +581,6 @@ impl ChatSystem {
         Some(IdeaProject {
             address: project.address(),
             name,
-            details: self.project_details(project),
             runtime: self
                 .project_config(project)
                 .map(|config| config.runtime.clone()),
@@ -779,38 +767,6 @@ impl ChatSystem {
             .flatten()
     }
 
-    /// The messages of others in a thread the user has not read, newest
-    /// first: those newer than their verdicts or the user's own last mail.
-    pub(crate) fn unread_ids_in(
-        &self,
-        chat: &HostChat,
-        thread: ThreadId,
-        marks: &Marks,
-    ) -> Vec<MessageId> {
-        let facts = marks.get(&thread.address()).facts();
-        if facts.muted() {
-            return Vec::new();
-        }
-        let user_posts = chat
-            .reading_order(thread.message)
-            .filter(|mail| mail.from == Party::User);
-        let through = user_posts
-            .clone()
-            .filter_map(cards::legacy_read_through)
-            .max();
-        let mut seen = cards::SeenMail::new(facts, through);
-        for card in user_posts
-            .filter_map(cards::settled_by)
-            .chain(self.outbox.settlements(thread.host))
-        {
-            seen.note(card);
-        }
-        chat.others_in(thread.message)
-            .into_iter()
-            .filter(|id| chat.message(*id).is_some_and(|mail| seen.is_unread(mail)))
-            .collect()
-    }
-
     fn with_host<R>(
         &self,
         endpoint: EndpointId,
@@ -862,7 +818,12 @@ impl System for ChatSystem {
             ));
         }
         let thread = self.thread_of(address)?;
-        self.logs.get(&thread.host)?.message(thread.message)?;
+        let chat = self.logs.get(&thread.host)?;
+        chat.message(thread.message)?;
+        // A project is an address to write to, with no screen of its own.
+        if chat.is_project(thread.message) {
+            return None;
+        }
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
@@ -918,20 +879,9 @@ impl System for ChatSystem {
         let this = cx.entity();
         let mut rows = Vec::new();
         rows.extend(self.project_rows(point, cx));
-        // A mail is not necessarily its thread's head. In a thread, the
-        // name belongs to the open thread; in a project, to the selected
-        // thread row. A desk row and a blank line are not rename contexts.
-        let rename = self.thread_of(&point.surface).and_then(|surface| {
-            let at = self.thread_of(point.subject()?)?;
-            let chat = self.logs.get(&surface.host)?;
-            let thread = if chat.is_project(surface.message) {
-                at
-            } else {
-                surface
-            };
-            if chat.is_project(thread.message) {
-                return None;
-            }
+        // The name belongs to the open thread, wherever the point is in it.
+        let rename = self.thread_of(&point.surface).and_then(|thread| {
+            let chat = self.logs.get(&thread.host)?;
             Some((thread, chat.name(thread.message)?))
         });
         if let Some((thread, current)) = rename {
@@ -1082,14 +1032,7 @@ impl System for ChatSystem {
         let this = cx.entity();
         let frame = self.frame.clone();
         frame.with(cx, move |frame, window, cx| {
-            Self::prompt_project(
-                this,
-                project,
-                CreatedProject::AddressDraft(created),
-                frame,
-                window,
-                cx,
-            );
+            Self::prompt_project(this, project, Some(created), frame, window, cx);
         });
     }
 
@@ -1170,6 +1113,10 @@ impl System for ChatSystem {
             });
             let address = |id| Address::new(ThreadId::KIND, ThreadId::key_under(host_key, id));
             let thread = chat.subthread_of(id.message);
+            // A project root is no place to read.
+            if chat.is_project(thread) {
+                return None;
+            }
             let thread_id = ThreadId {
                 message: thread,
                 ..id
@@ -1249,8 +1196,14 @@ impl System for ChatSystem {
                 };
                 found.push(Found {
                     address: ThreadId { host, message: id }.address(),
-                    title: if is_project { project.clone() } else { subject },
-                    description: if is_project { String::new() } else { project },
+                    // A project row says where and how its agents work.
+                    description: if is_project {
+                        self.project_details(ThreadId { host, message: id })
+                            .unwrap_or_default()
+                    } else {
+                        project.clone()
+                    },
+                    title: if is_project { project } else { subject },
                     thread,
                     recency,
                 });
@@ -1300,12 +1253,18 @@ mod tests {
         let title = "Test the thermocouple offline.";
         cx.update(|cx| {
             mail.update(cx, |mail, cx| {
-                let id = mail.queue_idea(
-                    ThreadId {
-                        host: endpoint,
-                        message: project,
+                let id = 77;
+                mail.send_idea(
+                    IdeaMail {
+                        client_id: id,
+                        project: ThreadId {
+                            host: endpoint,
+                            message: project,
+                        }
+                        .address(),
+                        text: title.into(),
+                        runtime: None,
                     },
-                    title.into(),
                     cx,
                 );
                 let pending = PendingIdeaId(id).address();

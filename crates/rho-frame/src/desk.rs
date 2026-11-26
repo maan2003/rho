@@ -211,7 +211,6 @@ pub(crate) struct DeskView {
     transcript: Transcript<DeskKey, DeskClass, Address>,
     editor: Entity<Editor>,
     rows: DeskRows,
-    project: Option<IdeaProject>,
     layout: DeskLayout,
     text_system: Rc<WindowTextSystem>,
 }
@@ -294,7 +293,6 @@ impl DeskView {
             transcript: Transcript::new(buffer),
             editor,
             rows: DeskRows::default(),
-            project: None,
             layout,
             text_system: window.text_system().clone(),
         };
@@ -346,27 +344,13 @@ impl DeskView {
         true
     }
 
-    pub(crate) fn set_rows(
-        &mut self,
-        mut rows: DeskRows,
-        project: Option<IdeaProject>,
-        hold: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let changed_scope =
-            self.project.as_ref().map(|p| &p.address) != project.as_ref().map(|p| &p.address);
-        let changed_title = self.project.as_ref().and_then(|p| p.details.as_ref())
-            != project.as_ref().and_then(|p| p.details.as_ref());
-        self.project = project;
-        if hold && !changed_scope && Layout::of(self.layout.viewport) == Layout::Phone {
+    pub(crate) fn set_rows(&mut self, mut rows: DeskRows, hold: bool, cx: &mut Context<Self>) {
+        if hold && Layout::of(self.layout.viewport) == Layout::Phone {
             // Update displayed words in place. A newly ranked row can't
             // take the place of one the user is about to tap.
             DeskRows::keep_order(&mut rows.waiting, &self.rows.waiting);
         }
-        if rows == self.rows && !changed_scope {
-            if changed_title {
-                cx.notify();
-            }
+        if rows == self.rows {
             return;
         }
         self.rows = rows;
@@ -525,15 +509,7 @@ impl DeskView {
 
 impl Surface for DeskView {
     fn title(&self, _cx: &App) -> String {
-        self.project.as_ref().map_or_else(
-            || "desk".into(),
-            |project| {
-                project.details.as_ref().map_or_else(
-                    || project.name.clone(),
-                    |details| format!("{} · {details}", project.name),
-                )
-            },
-        )
+        "desk".into()
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -855,7 +831,6 @@ mod tests {
                 Some(IdeaProject {
                     address: address.clone(),
                     name: "shoal@lab".into(),
-                    details: None,
                     runtime: None,
                 })
             },
@@ -900,7 +875,6 @@ mod tests {
             Some(IdeaProject {
                 address: Address::new("project", id),
                 name: if id == 3 { "clock@lab" } else { "reef@lab" }.into(),
-                details: None,
                 runtime: None,
             })
         };
@@ -947,7 +921,6 @@ mod tests {
             Some(IdeaProject {
                 address: Address::new("project", 1),
                 name: "clock@lab".into(),
-                details: None,
                 runtime: None,
             })
         };

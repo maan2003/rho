@@ -358,17 +358,9 @@ impl Frame {
         // A pull ranks afresh: the skip just said moves it on, and time
         // has passed since the last change.
         let hand = self.rank(cx);
-        let scope = self.desk_project(cx);
-        let scoped = hand.cards.iter().filter(|card| {
-            scope.as_ref().is_none_or(|project| {
-                self.project_for(&card.address, cx)
-                    .is_some_and(|(_, owner)| owner.address == project.address)
-            })
-        });
-        let card = scoped
-            .clone()
-            .find(|card| in_view.as_ref() != Some(&card.address))
-            .or_else(|| scoped.into_iter().next())
+        let card = hand
+            .top(in_view.as_ref())
+            .or_else(|| hand.cards.first())
             .cloned();
         if card.is_none() {
             // Focus Desk against the empty deal, not the previous hand.
@@ -491,37 +483,7 @@ impl Frame {
     /// Desk is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated or the hand changes by itself, never on a timer of
     /// its own.
-    fn desk_project(&self, cx: &gpui::App) -> Option<crate::idea::IdeaProject> {
-        if !self.desk_in_view() {
-            return None;
-        }
-        self.project_for(self.current_address(), cx)
-            .map(|(_, project)| project)
-    }
-
     pub(crate) fn refresh_desk(&mut self, hand: &Hand, hold: bool, cx: &mut Context<Self>) {
-        let project = self.desk_project(cx);
-        let belongs = |address: &Address| {
-            project.as_ref().is_none_or(|project| {
-                self.project_for(address, cx)
-                    .is_some_and(|(_, owner)| owner.address == project.address)
-            })
-        };
-        let scoped;
-        let hand = if project.is_some() {
-            scoped = Hand {
-                cards: hand
-                    .cards
-                    .iter()
-                    .filter(|card| belongs(&card.address))
-                    .cloned()
-                    .collect(),
-                next_change: hand.next_change,
-            };
-            &scoped
-        } else {
-            hand
-        };
         let rows = desk_rows(
             hand,
             |address| self.project_for(address, cx).map(|(_, project)| project),
@@ -532,7 +494,7 @@ impl Frame {
             },
         );
         self.desk
-            .update(cx, |desk, cx| desk.set_rows(rows, project, hold, cx));
+            .update(cx, |desk, cx| desk.set_rows(rows, hold, cx));
     }
 }
 

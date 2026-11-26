@@ -363,6 +363,7 @@ impl AgentsSystem {
         else {
             return;
         };
+        self.show_brief(agent, model, cx);
         model.update(cx, |model, cx| {
             model.sync(
                 state,
@@ -445,7 +446,14 @@ impl AgentsSystem {
                 continue;
             }
             self.refresh_mail_labels(*agent, model, cx);
+            self.show_brief(*agent, model, cx);
         }
+    }
+
+    /// The agent's brief is its origin message, which mail owns.
+    fn show_brief(&self, agent: AgentId, model: &Entity<AgentModel>, cx: &mut Context<Self>) {
+        let brief = self.brief(agent, cx);
+        model.update(cx, |model, cx| model.set_brief(brief.as_deref(), cx));
     }
 
     fn refresh_mail_labels(
@@ -610,6 +618,7 @@ impl AgentsSystem {
         } else if model.read(cx).initial_load_ready() {
             self.sync(agent, FrameSummary::nothing(), cx);
         }
+        self.show_brief(agent, &model, cx);
         model
     }
 
@@ -831,7 +840,7 @@ impl AgentsSystem {
             return Vec::new();
         }
         let this = cx.entity();
-        let mut rows = vec![Self::stop_row(this.clone(), agent)];
+        let mut rows = Vec::new();
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
@@ -1072,40 +1081,6 @@ impl AgentsSystem {
         }
     }
 
-    fn stop_row(system: Entity<Self>, agent: AgentId) -> rho_frame::Row {
-        rho_frame::Row::run("shift-c", "stop agent", move |_, _, cx| {
-            system.update(cx, |system, cx| {
-                let Some(agents) = system.agents_for(agent) else {
-                    system.frame.echo(
-                        "the agent's host is not attached",
-                        StyleClass::SystemImportant,
-                        cx,
-                    );
-                    return;
-                };
-                let reply = agents.call(rho_agents_client::protocol::worksets::StopAgent { agent });
-                let frame = system.frame.clone();
-                let label = system.registry.agent_display_label(agent);
-                cx.spawn(async move |_, cx| {
-                    let reply = reply.await;
-                    cx.update(|cx| match reply {
-                        Ok(()) => frame.echo(
-                            format!("stopped by you: {label}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        ),
-                        Err(error) => frame.echo(
-                            format!("did not stop {label}: {error:#}"),
-                            StyleClass::SystemImportant,
-                            cx,
-                        ),
-                    });
-                })
-                .detach();
-            });
-        })
-    }
-
     fn thread_at(&self, point: &Point, cx: &App) -> Option<ThreadId> {
         let chat = self.mail.read(cx);
         point
@@ -1212,7 +1187,9 @@ impl System for AgentsSystem {
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         let this = cx.entity();
         if let Some(here) = AgentAddress::from_address(&point.surface) {
-            return self.agent_rows(here, cx);
+            let mut rows = surface::steer_rows(this.clone(), here.agent);
+            rows.extend(self.agent_rows(here, cx));
+            return rows;
         }
         let mut rows = Vec::new();
         // A thread draft can identify its worker without changing what
@@ -1241,9 +1218,7 @@ impl System for AgentsSystem {
             let system = self.mail.read(cx);
             let here = system.thread_of(&point.surface);
             let chat = system.host_chat(thread.host);
-            let desk = here.is_none()
-                || here
-                    .is_some_and(|place| chat.is_some_and(|chat| chat.is_project(place.message)));
+            let desk = here.is_none();
             let author = |mail: &Message| match mail.from {
                 Party::Agent(agent) | Party::System { agent, .. } => Some(agent),
                 _ => None,
