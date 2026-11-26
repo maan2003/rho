@@ -30,8 +30,9 @@ pub enum Subject {
 }
 
 /// The card a verdict pressed over a surface is about. Only a surface that
-/// stands for, lists or looks into a dealt card has one; a page, a chart
-/// or a note is no card, so the verdicts never reach it.
+/// stands for, lists or looks into a dealt card has one, and a note,
+/// which deals when a reminder on it comes due; a page or a chart is no
+/// card, so the verdicts never reach it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardHere {
     /// The surface is a card: a thread, wherever the point is in it.
@@ -41,7 +42,12 @@ pub enum CardHere {
     /// The surface looks into the work of the card the reader stepped
     /// down from, while that card still waits. Opened by name, it has none.
     Inspected,
-    /// No card: a page, a chart, a note, a list of notes.
+    /// The surface is a card the user schedules: a note, which deals when
+    /// the reminder the user set on it comes due. It takes a snooze, the
+    /// reminder, whether or not it waits, done only while it waits, and
+    /// never a mute.
+    Reminder,
+    /// No card: a page, a chart, a list of notes.
     None,
 }
 

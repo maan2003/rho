@@ -233,6 +233,7 @@ where
                      client_id,
                      project,
                      runtime,
+                     mode,
                      mut content,
                      host_label,
                  }| async move {
@@ -249,6 +250,7 @@ where
                             content,
                             host_label,
                             runtime,
+                            mode,
                         })
                         .await
                     })
@@ -296,6 +298,7 @@ where
                             content,
                             host_label,
                             runtime: None,
+                            mode: None,
                         })
                         .await
                     })

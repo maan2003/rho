@@ -45,7 +45,7 @@ impl Controller {
             },
             Control::Retry => match self {
                 Self::Rho(agent) => agent.retry(),
-                Self::Claude(_) => {}
+                Self::Claude(agent) => agent.retry(),
             },
             Control::CacheKey => match self {
                 Self::Rho(agent) => agent.new_cache_key().await?,
@@ -53,9 +53,9 @@ impl Controller {
                     anyhow::bail!("prompt cache keys are only available for native agents")
                 }
             },
-            Control::Rewind(turns) => match self {
-                Self::Rho(agent) => agent.rewind(turns).await?,
-                Self::Claude(agent) => agent.rewind(turns).await?,
+            Control::Rewind(back) => match self {
+                Self::Rho(agent) => agent.rewind(back).await?,
+                Self::Claude(agent) => agent.rewind(back).await?,
             },
         }
         Ok(())

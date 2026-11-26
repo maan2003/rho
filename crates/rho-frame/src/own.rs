@@ -71,7 +71,7 @@ pub static QUIT: Spelling = Spelling {
 
 /// The window's commands, with what each acts on from where the user is.
 pub(crate) fn commands(frame: &Frame, cx: &gpui::App) -> Vec<Command> {
-    let waiting = frame.waiting_card(cx);
+    let snoozable = frame.snooze_target(cx);
     let card_words = |address: &rho_dealer::Address| frame.card_for(address, cx).heading();
     let muted = frame
         .card_in_view(cx)
@@ -87,7 +87,7 @@ pub(crate) fn commands(frame: &Frame, cx: &gpui::App) -> Vec<Command> {
         })
         .keys("space u"),
         Command::new(&SNOOZE, |frame, argument, window, cx| {
-            let Some(target) = frame.waiting_card(cx) else {
+            let Some(target) = frame.snooze_target(cx) else {
                 return frame.echo("snooze: no waiting card here", StyleClass::SystemInfo, cx);
             };
             match argument.as_deref().map(parse_snooze) {
@@ -100,7 +100,7 @@ pub(crate) fn commands(frame: &Frame, cx: &gpui::App) -> Vec<Command> {
         })
         .keys("space s")
         .target(
-            waiting
+            snoozable
                 .as_ref()
                 .map_or_else(|| "no waiting card".to_owned(), card_words),
         ),

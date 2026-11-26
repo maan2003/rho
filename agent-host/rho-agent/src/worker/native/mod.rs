@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::transcript::ExecId;
-use rho_agent_types::{AgentId, CellEnd, ContentPart, MessageId, Role, UnixMs, Wpos};
+use rho_agent_types::{AgentId, CellEnd, ContentPart, MessageId, Rewind, Role, UnixMs, Wpos};
 use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -156,8 +156,8 @@ impl AgentHandle {
 
     /// Branch before the `turns`-th last input from the user; the notebook
     /// stays.
-    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
-        self.ask(|reply| Control::Rewind { turns, reply }).await
+    pub async fn rewind(&self, back: Rewind) -> anyhow::Result<()> {
+        self.ask(|reply| Control::Rewind { back, reply }).await
     }
 
     async fn ask(
@@ -206,7 +206,7 @@ enum Control {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     Rewind {
-        turns: u32,
+        back: Rewind,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Tell the live tail whole, for a client that just started looking.
@@ -563,8 +563,8 @@ impl Agent {
                 }
                 let _ = reply.send(result);
             }
-            Control::Rewind { turns, reply } => {
-                let result = self.rewind(turns).await;
+            Control::Rewind { back, reply } => {
+                let result = self.rewind(back).await;
                 if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
                     return result;
                 }
@@ -614,8 +614,11 @@ impl Agent {
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`); the notebook, its globals and
     /// anything it did are not rewound.
-    async fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
-        anyhow::ensure!(turns > 0, ":rewind turns must be greater than zero");
+    async fn rewind(&mut self, back: Rewind) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            back != Rewind::Turns(0),
+            ":rewind turns must be greater than zero"
+        );
         anyhow::ensure!(
             !self.responding,
             ":rewind is not available while the model is responding"
@@ -623,7 +626,10 @@ impl Agent {
         self.drain_outbox().await?;
         self.flush().await?;
         let rows = self.host.history().await?;
-        let to = rewind_point(&rows, turns).context("the agent has not made a model request")?;
+        let to = rewind_point(&rows, back).context(match back {
+            Rewind::Turns(_) => "the agent has not made a model request",
+            Rewind::After(_) => "no turn started after this step",
+        })?;
         self.host
             .append(Event::Rewound {
                 agent: self.agent_id,
@@ -1404,7 +1410,7 @@ impl Agent {
 
 /// A turn starts with the first request, new inputs, or a scheduled check-in.
 /// Requests sent to finish an open call are not separate turns.
-fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<Wpos> {
+fn rewind_point(rows: &[(Wpos, Record<'_>)], back: Rewind) -> Option<Wpos> {
     let mut boundaries = Vec::new();
     for (pos, row) in rows {
         if let Event::Request {
@@ -1419,9 +1425,7 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<Wpos> {
             }
         }
     }
-    boundaries
-        .get(boundaries.len().saturating_sub(turns as usize))
-        .copied()
+    boundaries.get(back.first_taken(&boundaries)?).copied()
 }
 
 /// The inference session for a spec's model and profile, and the name its

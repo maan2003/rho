@@ -713,7 +713,11 @@ fn compact(py: Python<'_>, agent: &str) -> PyResult<()> {
 
 #[pyfunction]
 fn rewind(py: Python<'_>, agent: &str, turns: u32) -> PyResult<()> {
-    control(py, agent, Control::Rewind(turns))
+    control(
+        py,
+        agent,
+        Control::Rewind(rho_agent_types::Rewind::Turns(turns)),
+    )
 }
 
 #[pyfunction]

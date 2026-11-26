@@ -197,14 +197,37 @@ async fn a_record_larger_than_one_wire_chunk_is_read_once_complete() {
 }
 
 #[tokio::test]
-async fn the_first_device_makes_the_phrase_and_a_later_one_pairs_with_it() {
+async fn an_empty_first_host_makes_no_phrase() {
     let (server, _dir) = host().await;
     let mut first = device(None).await;
+    first
+        .streams
+        .append(Channel::Facts, vec![b"before pairing".to_vec()])
+        .await;
+    assert!(
+        matches!(next(&mut first).await, LedgerEvent::Appended(_)),
+        "its own write"
+    );
     let a = connect(&server, &first);
-    let LedgerEvent::SecretMade(secret) = next(&mut first).await else {
-        panic!("the first device makes the phrase");
-    };
+    // Long enough for the hello and the answer to have gone both ways.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        first.events.try_recv().is_err(),
+        "no event: nothing was made"
+    );
+    assert_eq!(first.streams.ledger().pairing(), Pairing::Unasked);
+    assert!(first.streams.ledger().secret().is_none());
+    assert!(server.lengths().is_empty(), "what it said stays on it");
+    a.abort();
+}
+
+#[tokio::test]
+async fn a_device_paired_later_brings_what_it_said_before() {
+    let (server, _dir) = host().await;
+    let first = device(None).await;
+    let secret = first.streams.make_secret().await.unwrap();
     assert_eq!(first.streams.ledger().pairing(), Pairing::Paired);
+    let a = connect(&server, &first);
     // It has said nothing yet, and the host holds its log all the same.
     tokio::time::timeout(Duration::from_secs(5), async {
         while server.lengths().is_empty() {
@@ -219,22 +242,31 @@ async fn the_first_device_makes_the_phrase_and_a_later_one_pairs_with_it() {
         .await;
 
     let mut later = device(None).await;
+    later.streams.ledger().decline().await;
     later
         .streams
-        .append(Channel::Facts, vec![b"before pairing".to_vec()])
+        .append(Channel::Facts, vec![b"verdict before pairing".to_vec()])
+        .await;
+    later
+        .streams
+        .append(Channel::Notes, vec![b"note before pairing".to_vec()])
         .await;
     let b = connect(&server, &later);
-    assert!(
-        matches!(next(&mut later).await, LedgerEvent::Appended(_)),
-        "its own write"
-    );
+    for _ in 0..2 {
+        assert!(
+            matches!(next(&mut later).await, LedgerEvent::Appended(_)),
+            "its own writes"
+        );
+    }
     assert_eq!(next(&mut later).await, LedgerEvent::NeedsKey);
     assert_eq!(later.streams.ledger().pairing(), Pairing::Unpaired);
-    assert!(
-        later.streams.ledger().secret().is_none(),
-        "a later device makes no phrase"
-    );
 
+    // A new phrase would split the user's devices in two.
+    let fresh = later.streams.make_secret().await;
+    assert_eq!(
+        fresh.unwrap_err().to_string(),
+        "your other devices hold a phrase already: type it"
+    );
     // Real words with a good checksum, but not the phrase.
     let wrong = later.streams.set_secret(Secret::generate()).await;
     assert_eq!(
@@ -245,21 +277,28 @@ async fn the_first_device_makes_the_phrase_and_a_later_one_pairs_with_it() {
 
     later.streams.set_secret(secret).await.unwrap();
     assert_eq!(later.streams.ledger().pairing(), Pairing::Paired);
-    let facts = |device: &Device| {
-        let mut facts: Vec<Vec<u8>> = device
+    let said = |device: &Device, channel| {
+        let mut said: Vec<Vec<u8>> = device
             .streams
             .ledger()
-            .items(Channel::Facts)
+            .items(channel)
             .into_iter()
             .map(|item| item.bytes)
             .collect();
-        facts.sort();
-        facts
+        said.sort();
+        said
     };
-    let both = vec![b"before pairing".to_vec(), b"from the first".to_vec()];
-    assert_eq!(facts(&later), both);
+    let facts = vec![
+        b"from the first".to_vec(),
+        b"verdict before pairing".to_vec(),
+    ];
+    let notes = vec![b"note before pairing".to_vec()];
+    assert_eq!(said(&later, Channel::Facts), facts);
+    assert_eq!(said(&later, Channel::Notes), notes);
     wait_for(&first, Channel::Facts, 2).await;
-    assert_eq!(facts(&first), both);
+    wait_for(&first, Channel::Notes, 1).await;
+    assert_eq!(said(&first, Channel::Facts), facts);
+    assert_eq!(said(&first, Channel::Notes), notes);
     a.abort();
     b.abort();
 }

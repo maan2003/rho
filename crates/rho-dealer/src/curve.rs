@@ -14,6 +14,9 @@ use jiff::{SignedDuration, Timestamp};
 pub const WAITING_SLOPE_PER_DAY: f64 = 12.0;
 /// A project mail addressed to the user: an ask, result, or stop.
 pub const AGENT_BLOCKED_HEAD_START: f64 = 1.0;
+/// A note's reminder come due: the user asked to be brought it then, so
+/// it presses as mail addressed to them does, lighting the lamp at once.
+pub const REMINDER_HEAD_START: f64 = 1.0;
 /// How many days before a deadline it starts to press, when the user did
 /// not say.
 pub const DEADLINE_LEAD_DAYS: u32 = 3;

@@ -22,9 +22,6 @@ pub enum LedgerEvent {
     /// Another device's writes arrived, and this device has no phrase to
     /// read them with.
     NeedsKey,
-    /// This device is the first, and made the phrase: the one time anyone
-    /// is told it.
-    SecretMade(Secret),
 }
 pub struct LedgerStreams {
     ledger: Ledger,
@@ -67,11 +64,20 @@ impl LedgerStreams {
         let _ = self.events.unbounded_send(LedgerEvent::Appended(own));
         let _ = self.changed.send(());
     }
+    /// Takes the phrase the user typed, with what it opens.
     pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<()> {
         let received = self.ledger.set_secret(secret).await?;
         self.report(received, None);
         let _ = self.changed.send(());
         Ok(())
+    }
+    /// Makes a phrase for a new user, and sends what this device said
+    /// sealed with it.
+    pub async fn make_secret(&self) -> anyhow::Result<Secret> {
+        let (secret, received) = self.ledger.make_secret().await?;
+        self.report(received, None);
+        let _ = self.changed.send(());
+        Ok(secret)
     }
     fn report(&self, result: Received, log: Option<LogId>) {
         if result.needs_key {
@@ -118,14 +124,6 @@ impl LedgerStreams {
         let ServerFrame::Lengths { logs } = read_frame(&mut reader).await? else {
             anyhow::bail!("host did not answer hello with lengths")
         };
-        // A host that holds nothing, met by a device that holds nothing and
-        // has no phrase, means no other device has written yet.
-        if logs.is_empty()
-            && let Some(secret) = self.ledger.make_secret_if_first().await
-        {
-            let _ = self.events.unbounded_send(LedgerEvent::SecretMade(secret));
-            let _ = self.changed.send(());
-        }
         let mut host_lengths = logs;
         self.send_missing(&mut writer, &mut host_lengths).await?;
         // A frame read half-way must not be dropped when a change wakes the

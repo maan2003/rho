@@ -577,10 +577,10 @@ pub mod gccp;
 pub mod mail;
 mod projects;
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
-pub(crate) use mail::migrate_voices;
 #[cfg(test)]
 pub(crate) use mail::voice_migration_tests::old_root;
 pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
+pub(crate) use mail::{log_standing_agents, migrate_voices};
 pub use projects::*;
 #[cfg(test)]
 mod tests;

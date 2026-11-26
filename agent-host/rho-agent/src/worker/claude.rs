@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_agent_types::{
-    AgentId, CallTiming, ContentPart, ExecTiming, MessageId, Role, UnixMs, Wpos,
+    AgentId, CallTiming, ContentPart, ExecTiming, MessageId, Rewind, Role, UnixMs, Wpos,
 };
 use rho_claude::{
     ClaudeCode, ClaudeCodeOptions, Effort, Model, PermissionMode, SdkMcpServer, Session,
@@ -95,10 +95,15 @@ impl ClaudeAgent {
         let _ = self.control.send(ClaudeControl::Cancel);
     }
 
-    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+    /// Try a failed turn again, if what it ran on has changed since.
+    pub fn retry(&self) {
+        let _ = self.control.send(ClaudeControl::Retry);
+    }
+
+    pub async fn rewind(&self, back: Rewind) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
-            .send(ClaudeControl::Rewind { turns, reply })
+            .send(ClaudeControl::Rewind { back, reply })
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?;
         result
             .await
@@ -128,8 +133,12 @@ enum ClaudeControl {
     },
     Compact,
     Cancel,
+    /// A failed turn goes again when its account, model or effort has
+    /// changed since it failed: switching the Claude account unblocks an
+    /// agent the old account stopped (`usage.md`, `switch claude account`).
+    Retry,
     Rewind {
-        turns: u32,
+        back: Rewind,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Tell the live tail whole, for a client that just started looking.
@@ -739,8 +748,19 @@ impl ClaudeLoop {
                 }
                 self.recover_pending_rewind().await?;
             }
-            ClaudeControl::Rewind { turns, reply } => {
-                let result = self.rewind(turns).await;
+            ClaudeControl::Retry => {
+                let failed = matches!(self.inference_state, InferenceState::Failed { .. });
+                if failed
+                    && !self.archived
+                    && !self.call_open()
+                    && self.launched.as_ref() != Some(&self.launch().await?)
+                {
+                    self.set_kind(InferenceState::Idle);
+                    self.request(vec![RequestNotice::Relaunched]).await?;
+                }
+            }
+            ClaudeControl::Rewind { back, reply } => {
+                let result = self.rewind(back).await;
                 if result.as_ref().is_err_and(|error| error.is::<StoreError>()) {
                     return result;
                 }
@@ -1207,8 +1227,11 @@ impl ClaudeLoop {
         }
     }
 
-    async fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
-        anyhow::ensure!(turns > 0, ":rewind turns must be greater than zero");
+    async fn rewind(&mut self, back: Rewind) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            back != Rewind::Turns(0),
+            ":rewind turns must be greater than zero"
+        );
         if self.waiting_in_call() {
             self.release_waiting_call().await?;
         }
@@ -1220,8 +1243,10 @@ impl ClaudeLoop {
             ":rewind is only available while idle or errored; use :cancel first"
         );
         let rows = self.host.history().await?;
-        let (to, sent) =
-            rewind_point(&rows, turns).context("no recorded model turn can be rewound")?;
+        let (to, sent) = rewind_point(&rows, back).context(match back {
+            Rewind::Turns(_) => "no recorded model turn can be rewound",
+            Rewind::After(_) => "no turn started after this step",
+        })?;
         let root = self.root.clone();
         let (source_session_id, messages) = if self.pending_rewind {
             match self.start_mode {
@@ -2234,7 +2259,7 @@ enum ClaudeLoopEvent {
 /// Where a rewind of `turns` goes: the position of the `turns`-th last
 /// request handed over as a new Claude turn. A request that only answers
 /// a pending call has no session line and cannot start another turn.
-fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uuid>)> {
+fn rewind_point(rows: &[(Wpos, Record<'_>)], back: Rewind) -> Option<(Wpos, Vec<Uuid>)> {
     let handed_off: Vec<_> = rows
         .iter()
         .filter_map(|(pos, record)| match &record.event {
@@ -2244,7 +2269,8 @@ fn rewind_point(rows: &[(Wpos, Record<'_>)], turns: u32) -> Option<(Wpos, Vec<Uu
             _ => None,
         })
         .collect();
-    let index = handed_off.len().saturating_sub(turns as usize);
+    let starts: Vec<Wpos> = handed_off.iter().map(|(pos, _)| *pos).collect();
+    let index = back.first_taken(&starts)?;
     let (pos, _) = *handed_off.get(index)?;
     Some((
         pos,
@@ -2530,6 +2556,116 @@ mod tests {
         );
     }
 
+    /// Switching the Claude account moves a running agent: its next
+    /// request launches on the new account, and a turn the old account
+    /// failed goes again at once on the new one. A retry with nothing
+    /// changed leaves the failure alone.
+    #[tokio::test]
+    async fn a_running_agent_picks_up_a_switched_claude_account() {
+        use crate::db::AgentWriteTxnExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let agent_id = agent(1);
+        let workset = WorksetId([1; 6]);
+        let mut write = db.write().await;
+        write.init_store_tables();
+        write.init_agent_tables();
+        write.create_workset(workset, UnixMs(1), WorksetKind::Isolated, String::new());
+        write
+            .append(
+                workset,
+                &Record {
+                    at: UnixMs(2),
+                    event: Event::AgentCreated {
+                        agent: agent_id,
+                        spec: AgentSpec {
+                            runtime: Runtime::Claude {
+                                model: Model::Opus,
+                                effort: Effort::High,
+                                session_id: Uuid::new_v4(),
+                            },
+                            props: Default::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        write.set_claude_account("main");
+        write.commit();
+        crate::testing::python(agent_id, &db);
+        let host = crate::testing::services_pair(db.clone(), agent_id, std::sync::Weak::new());
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap();
+        let paths = rho_claude::accounts::ClaudePaths::at(root.join("claude"));
+        let (agent, mut runtime) = ClaudeLoop::load(
+            agent_id,
+            host.clone(),
+            crate::inference::testing::backend(),
+            paths.clone(),
+            Arc::new(Permissions::Bypass),
+            root,
+        )
+        .await
+        .unwrap();
+        // As if its process were running on the account in force.
+        let running = runtime.launch().await.unwrap();
+        assert_eq!(running.account, "main");
+        runtime.launched = Some(running.clone());
+        let explanation = "You've hit your session limit · resets 5:30pm (UTC)";
+        runtime
+            .handle_event(rho_claude::ClaudeEvent::Result(
+                serde_json::from_value(serde_json::json!({
+                    "subtype": "success",
+                    "is_error": true,
+                    "result": explanation
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let rows_after_failure = host.history().await.unwrap().len();
+
+        runtime.handle_control(ClaudeControl::Retry).await.unwrap();
+        assert!(matches!(
+            agent.status().runtime.inference,
+            InferenceState::Failed { error, .. } if error == explanation
+        ));
+        assert_eq!(
+            host.history().await.unwrap().len(),
+            rows_after_failure,
+            "on the same account, the failed turn waits for the user"
+        );
+
+        let mut write = db.write().await;
+        write.set_claude_account("spare");
+        write.commit();
+        let next = runtime.launch().await.unwrap();
+        assert_eq!(next.account, "spare", "the next request reads the switch");
+        assert_ne!(
+            runtime.launched.as_ref(),
+            Some(&next),
+            "so the running process is replaced at the next request"
+        );
+
+        // The launch builds the notebook's web tools, which speak TLS.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        runtime.handle_control(ClaudeControl::Retry).await.unwrap();
+        // No Claude Code runs in a test, so the attempt fails to start;
+        // it was made, on the new account.
+        assert!(
+            !matches!(
+                agent.status().runtime.inference,
+                InferenceState::Failed { ref error, .. } if error == explanation
+            ),
+            "the old account's failure is over: {:?}",
+            agent.status().runtime.inference
+        );
+        assert!(
+            paths.account_dir("spare").unwrap().exists(),
+            "the retry launched on the switched account"
+        );
+        assert!(!paths.account_dir("main").unwrap().exists());
+    }
+
     /// A turn the CLI ends because its account holds no login fails with
     /// what to do on the host, not with the CLI's own `/login`, which is a
     /// command of a session the user never sees.
@@ -2655,18 +2791,32 @@ mod tests {
             row(6, sent(a, Role::User, Some(second))),
             row(8, sent(a, Role::User, Some(third))),
         ];
-        assert_eq!(rewind_point(&rows, 1), Some((Wpos(8), vec![third])));
-        assert_eq!(rewind_point(&rows, 2), Some((Wpos(6), vec![second, third])));
+        let turns = Rewind::Turns;
+        assert_eq!(rewind_point(&rows, turns(1)), Some((Wpos(8), vec![third])));
         assert_eq!(
-            rewind_point(&rows, 3),
+            rewind_point(&rows, turns(2)),
+            Some((Wpos(6), vec![second, third]))
+        );
+        assert_eq!(
+            rewind_point(&rows, turns(3)),
             Some((Wpos(3), vec![message, second, third]))
         );
         assert_eq!(
-            rewind_point(&rows, 9),
+            rewind_point(&rows, turns(9)),
             Some((Wpos(1), vec![first, message, second, third])),
             "more turns than there are go back to the first"
         );
-        assert_eq!(rewind_point(&rows[2..3], 1), None);
+        assert_eq!(rewind_point(&rows[2..3], turns(1)), None);
+        // To a step: the turn it is in stays, every later one goes. A step
+        // that starts a turn keeps that turn.
+        let after = |at| rewind_point(&rows, Rewind::After(Wpos(at)));
+        assert_eq!(after(4), Some((Wpos(6), vec![second, third])));
+        assert_eq!(after(6), Some((Wpos(8), vec![third])));
+        assert_eq!(
+            after(0),
+            Some((Wpos(1), vec![first, message, second, third]))
+        );
+        assert_eq!(after(8), None, "nothing started after the last turn");
     }
 
     #[test]

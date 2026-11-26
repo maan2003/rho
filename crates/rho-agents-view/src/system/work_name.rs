@@ -1,7 +1,9 @@
 //! What the work is called on every screen and prompt about it
 //! (`agents.An agent is labour, not a colleague`): `<project> · <thread
-//! subject>`, read from the thread the work is for. An agent's short code
-//! follows only where it tells two agents of one workset apart.
+//! subject>`, read from the thread the work is for, or `<project>` alone
+//! for the workset of the agent that stands for a project (`one` mode),
+//! which works on every idea sent to it. An agent's short code follows
+//! only where it tells two agents of one workset apart.
 
 /// What one agent's work is called, as the chat log and the directory say
 /// it now.
@@ -14,6 +16,8 @@ pub(super) struct WorkName {
     pub subject: Option<String>,
     /// The agent's short code, `eng-q9tz`.
     pub code: String,
+    /// The work is the project's standing agent's: it has no one subject.
+    pub standing: bool,
     /// Another agent works in the same workset.
     pub shared: bool,
 }
@@ -22,7 +26,7 @@ impl WorkName {
     /// The agent: its work, with its code after it in a shared workset.
     pub fn agent(&self) -> String {
         let mut label = self.work();
-        if self.shared && self.subject.is_some() {
+        if self.shared && (self.subject.is_some() || self.standing && self.project.is_some()) {
             label.push_str(" · ");
             label.push_str(&self.code);
         }
@@ -32,6 +36,11 @@ impl WorkName {
     /// The workset, and its tools: the work alone, never an agent's code
     /// while the subject is known.
     pub fn work(&self) -> String {
+        if self.standing
+            && let Some(project) = &self.project
+        {
+            return project.clone();
+        }
         match (&self.project, &self.subject) {
             (Some(project), Some(subject)) => format!("{project} · {subject}"),
             (None, Some(subject)) => subject.clone(),
@@ -89,7 +98,38 @@ mod tests {
             subject: subject.map(str::to_owned),
             code: "eng-q9tz".into(),
             shared,
+            standing: false,
         }
+    }
+
+    fn standing(shared: bool) -> WorkName {
+        WorkName {
+            standing: true,
+            ..name(Some("tide"), Some("Flaky clock test"), shared)
+        }
+    }
+
+    /// The standing agent works on every idea of its project, so its
+    /// workset is the project's, whatever thread it last joined.
+    #[test]
+    fn a_standing_workset_is_called_by_its_project_alone() {
+        let alone = standing(false);
+        assert_eq!(alone.work(), "tide");
+        assert_eq!(alone.agent(), "tide");
+        let shared = standing(true);
+        assert_eq!(shared.work(), "tide");
+        assert_eq!(shared.agent(), "tide · eng-q9tz");
+        assert_eq!(
+            tool_title(&shared.work(), &super::super::Part::Shell),
+            "tide · shell"
+        );
+        // Before the log names the project, the code stands in.
+        let early = WorkName {
+            project: None,
+            subject: None,
+            ..standing(false)
+        };
+        assert_eq!(early.work(), "eng-q9tz");
     }
 
     #[test]

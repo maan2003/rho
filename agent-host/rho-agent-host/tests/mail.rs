@@ -12,7 +12,8 @@ use rho_agent_types::{
 };
 use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
-    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset, RewindAgent, StopAgent,
+    AgentLog, CreateWorkset, Eval, EvalResult, FinishWork, LogEvent, RestartWorkset, RewindAgent,
+    StopAgent,
 };
 use rho_chat::protocol::{
     ChangeProject, ClientFrame, CreateProject, Open, Post, PostIdea, PostIdeaReply, Project,
@@ -222,7 +223,11 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         ],
     );
 
-    let post_as = |project: ProjectId, client_id, text: &'static str, runtime| async move {
+    let post_in = |project: ProjectId,
+                   client_id,
+                   text: &'static str,
+                   runtime,
+                   mode: Option<ProjectMode>| async move {
         call(
             paths,
             PostIdea {
@@ -231,10 +236,13 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
                 content: vec![ContentPart::Text { text: text.into() }],
                 host_label: "lab".into(),
                 runtime,
+                mode,
             },
         )
         .await
     };
+    let post_as =
+        |project, client_id, text, runtime| post_in(project, client_id, text, runtime, None);
     let send = |project, client_id, text| async move {
         let PostIdeaReply::Posted(message) = post_as(project, client_id, text, None).await? else {
             anyhow::bail!("an idea without an override was refused");
@@ -318,6 +326,35 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     let after_stop = send(one, 803, "Test the stopped channel's stern clock.").await?;
     assert_eq!(idea_agent(paths, after_stop).await?, standing);
     wait_for_delivery(paths, standing, after_stop).await?;
+    // Woken by an idea whose `on:` was left alone, it keeps the runtime it
+    // was switched to, not the project's newer default.
+    assert_eq!(agent_runtime(paths, standing).await?, "sol-high");
+    // Every device can name the standing agent's workset by the project.
+    assert_eq!(standing_agent(paths, one).await?, Some(standing));
+
+    // `in: new` gives this one idea a fresh agent; the standing agent
+    // stays the project's and takes the next idea.
+    let PostIdeaReply::Posted(fresh_idea) = post_in(
+        one,
+        806,
+        "Try this one on its own.",
+        None,
+        Some(ProjectMode::PerIdea),
+    )
+    .await?
+    else {
+        anyhow::bail!("an `in: new` idea was refused");
+    };
+    let fresh_one = idea_agent(paths, fresh_idea).await?;
+    assert_ne!(fresh_one, standing);
+    assert_eq!(
+        agent_runtime(paths, fresh_one).await?,
+        next_default.as_str()
+    );
+    wait_for_delivery(paths, fresh_one, fresh_idea).await?;
+    assert_eq!(standing_agent(paths, one).await?, Some(standing));
+    let back_to_standing = send(one, 807, "And this one goes to the usual agent.").await?;
+    assert_eq!(idea_agent(paths, back_to_standing).await?, standing);
 
     let PostIdeaReply::Posted(first) = post_as(
         each,
@@ -335,6 +372,55 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     assert_ne!(first_agent, second_agent);
     wait_for_delivery(paths, first_agent, first).await?;
     wait_for_delivery(paths, second_agent, second).await?;
+    assert_eq!(standing_agent(paths, each).await?, None);
+    // `in: one` in a per-idea project starts its standing agent, and the
+    // next `in: one` idea goes to that same agent.
+    let mut ones = Vec::new();
+    for (client_id, text) in [
+        (812, "Keep one agent on the docs."),
+        (813, "And the changelog."),
+    ] {
+        let PostIdeaReply::Posted(idea) =
+            post_in(each, client_id, text, None, Some(ProjectMode::One)).await?
+        else {
+            anyhow::bail!("an `in: one` idea was refused");
+        };
+        ones.push(idea_agent(paths, idea).await?);
+    }
+    assert_eq!(ones[0], ones[1]);
+    assert!(![first_agent, second_agent].contains(&ones[0]));
+    assert_eq!(standing_agent(paths, each).await?, Some(ones[0]));
+
+    // A project renamed is the same project under its new name; a name
+    // another project has is refused.
+    let rename = |name: &str| ChangeProject {
+        project: each,
+        change: ProjectChange::Name(ProjectName::parse(name).unwrap()),
+    };
+    call(paths, rename("apart")).await?;
+    let resolved = call(
+        paths,
+        ResolveProject {
+            name: "apart".into(),
+        },
+    )
+    .await?;
+    assert_eq!(resolved.map(|project| project.id), Some(each));
+    assert!(call(paths, rename("same")).await.is_err());
+    // Retired, it starts nothing new; its settings and threads stay.
+    call(
+        paths,
+        ChangeProject {
+            project: each,
+            change: ProjectChange::Retire,
+        },
+    )
+    .await?;
+    assert!(
+        post_as(each, 814, "Too late for this project.", None)
+            .await
+            .is_err()
+    );
 
     let failed = send(
         failed_project,
@@ -546,6 +632,57 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         assert_eq!(checkout.error, None);
         assert_eq!(checkout.output.trim(), "tide-checked-out");
     }
+    // `finish work`: a checkout holding changes of its own stays, and a
+    // clean one with nothing unpushed goes.
+    let touched = call(
+        paths,
+        Eval {
+            workset: first_workset,
+            code:
+                "from pathlib import Path\nPath('/src/checkouts-tide/draft.txt').write_text('mine')"
+                    .into(),
+        },
+    )
+    .await?;
+    assert_eq!(touched.error, None);
+    // The fake model leaves its round counter in the checkout, as an
+    // agent leaves its work; the second workset's agent cleans up.
+    let cleaned = call(paths, Eval {
+        workset: second_workset,
+        code: "from pathlib import Path\nfor p in Path('/src/checkouts-tide').glob('.rho-fake-rounds-*'):\n    p.unlink()".into(),
+    }).await?;
+    assert_eq!(cleaned.error, None);
+    let kept = call(paths, FinishWork { agent: first_agent }).await?;
+    assert_eq!(
+        (kept.removed, kept.kept),
+        (
+            Vec::<String>::new(),
+            vec!["checkouts-tide: 2 uncommitted changes".to_owned()]
+        )
+    );
+    let removed = call(
+        paths,
+        FinishWork {
+            agent: second_agent,
+        },
+    )
+    .await?;
+    assert_eq!(
+        (removed.removed, removed.kept),
+        (vec!["checkouts-tide".to_owned()], Vec::<String>::new())
+    );
+    for (workset, there) in [(first_workset, "True"), (second_workset, "False")] {
+        let left = call(
+            paths,
+            Eval {
+                workset,
+                code: "from pathlib import Path\nprint(Path('/src/checkouts-tide').exists())"
+                    .into(),
+            },
+        )
+        .await?;
+        assert_eq!(left.output.trim(), there, "{workset}");
+    }
     let create_at = |agent| {
         agents
             .iter()
@@ -634,6 +771,62 @@ async fn read_projects(paths: &RuntimePaths) -> anyhow::Result<Vec<(ProjectId, P
         }
     }
     Ok(projects)
+}
+
+/// The runtime the agent's spec names now, `sol-high`.
+async fn agent_runtime(paths: &RuntimePaths, agent: AgentId) -> anyhow::Result<String> {
+    let log = call(
+        paths,
+        AgentLog {
+            agent,
+            from: Wpos::ZERO,
+        },
+    )
+    .await?;
+    log.rows
+        .iter()
+        .rev()
+        .find_map(|(_, row)| match row {
+            LogEvent::AgentCreated {
+                agent: of, spec, ..
+            }
+            | LogEvent::AgentChanged {
+                agent: of, spec, ..
+            } if *of == agent => Some(spec.runtime_label()),
+            _ => None,
+        })
+        .context("the agent has no spec")
+}
+
+/// The agent that stands for `project`, as a new device folds the log.
+async fn standing_agent(
+    paths: &RuntimePaths,
+    project: ProjectId,
+) -> anyhow::Result<Option<AgentId>> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no chat hello");
+    };
+    write_frame(
+        &mut stream,
+        &ClientFrame::Follow {
+            since: rho_agent_types::ChatSeq::ZERO,
+        },
+    )
+    .await?;
+    let mut chat = HostChat::default();
+    while chat.head < head {
+        let ServerFrame::Messages { records } = read_frame(&mut stream).await? else {
+            continue;
+        };
+        for record in &records {
+            chat.tell(record);
+        }
+    }
+    Ok(chat
+        .standing_agents()
+        .find(|(root, _)| *root == project.0)
+        .map(|(_, agent)| agent))
 }
 
 async fn idea_agent(paths: &RuntimePaths, thread: MessageId) -> anyhow::Result<AgentId> {
@@ -1494,7 +1687,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
         paths,
         RewindAgent {
             agent: leader,
-            turns: 2,
+            back: rho_agent_types::Rewind::Turns(2),
         },
     )
     .await?;

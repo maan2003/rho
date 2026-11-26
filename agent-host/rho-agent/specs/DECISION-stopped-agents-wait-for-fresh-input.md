@@ -7,7 +7,8 @@ Authority: inferred
 A cancelled or failed agent starts no further requests on its own. Output from
 tools still winding down reaches history at the next boundary, but it may not
 itself cause one. Fresh user input or a peer message revives the agent;
-output from existing work does not.
+output from existing work does not. The user switching the Claude account also
+revives a Claude agent whose turn failed on the account it ran on before.
 
 Being stopped is derived rather than recorded: `Standing::Cancelled` and
 `Standing::Failed` carry the instant it happened, and the agent counts as stopped

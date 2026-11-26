@@ -27,15 +27,29 @@ const RETIRED: [&str; 8] = [
 ];
 const KEY_CONTEXT: &str = "rho 2026-09-24 ledger";
 
-// Keep the old row's exact serialized shape so existing identities and secrets
-// survive.
 #[derive(Clone, Debug, Encode, Decode)]
 struct SelfRecord {
     device: DeviceId,
+    #[senax(default)]
+    phrase: Phrase,
+    /// Where builds before `phrase` kept the phrase: [`Ledger::open`]
+    /// carries it into `phrase`. Drop it once every device has opened
+    /// with this build.
+    #[senax(skip_default)]
     secret: Option<[u8; 16]>,
     clock: (u64, u32),
     seq: u64,
     since_base: u32,
+}
+/// What this device holds of the user's phrase, and whether it asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+enum Phrase {
+    /// The user has not answered whether they are new or hold a phrase.
+    #[default]
+    Unasked,
+    /// The user chose to keep this device to itself.
+    Declined,
+    Held([u8; 16]),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Channel {
@@ -55,16 +69,16 @@ struct Envelope {
     channel: Channel,
     payloads: Vec<Vec<u8>>,
 }
-/// Whether this device holds the user's secret phrase, as far as it can
-/// tell.
+/// Whether this device holds the user's secret phrase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pairing {
     /// It holds the phrase: what it says reaches the user's other devices.
     Paired,
-    /// No phrase, and nothing from another device: it may be the first.
-    Alone,
-    /// No phrase, and it holds what another device wrote, which it cannot
-    /// read: what it says stays on it until the user types the phrase.
+    /// The user has not yet said whether they are new or hold a phrase.
+    /// What it says stays on it meanwhile.
+    Unasked,
+    /// The user chose to keep it to itself: what it says stays on it until
+    /// the user pairs it.
     Unpaired,
 }
 #[derive(Default)]
@@ -147,12 +161,19 @@ impl Ledger {
                 (),
                 SenValue::borrowed(&SelfRecord {
                     device: DeviceId(id),
+                    phrase: Phrase::Unasked,
                     secret: None,
                     clock: (0, 0),
                     seq: 0,
                     since_base: 0,
                 }),
             );
+        }
+        // A phrase an older build kept moves to where it is kept now.
+        let mut me = table.get(()).expect("ledger identity").value().into_owned();
+        if let Some(secret) = me.secret.take() {
+            me.phrase = Phrase::Held(secret);
+            table.insert((), SenValue::borrowed(&me));
         }
         drop(table);
         write.commit();
@@ -171,52 +192,30 @@ impl Ledger {
         self.me().device
     }
     pub fn secret(&self) -> Option<Secret> {
-        self.me().secret.map(Secret)
+        match self.me().phrase {
+            Phrase::Held(secret) => Some(Secret(secret)),
+            Phrase::Unasked | Phrase::Declined => None,
+        }
     }
     pub fn pairing(&self) -> Pairing {
-        match (self.secret(), self.lengths().is_empty()) {
-            (Some(_), _) => Pairing::Paired,
-            // Without a phrase a device's own writes stay unsent, so every
-            // log it holds is another device's.
-            (None, true) => Pairing::Alone,
-            (None, false) => Pairing::Unpaired,
+        match self.me().phrase {
+            Phrase::Held(_) => Pairing::Paired,
+            Phrase::Unasked => Pairing::Unasked,
+            Phrase::Declined => Pairing::Unpaired,
         }
     }
-    /// Makes the phrase when this device is the first: it holds none and
-    /// knows of no other device. What it said so far is sealed with it, and
-    /// its log is started even when that is nothing, so that a host holds
-    /// a log from now on and the next device knows it is not the first.
-    pub async fn make_secret_if_first(&self) -> Option<Secret> {
+    /// The user chose to keep this device to itself, for now: it is not
+    /// asked again.
+    pub async fn decline(&self) {
         let mut write = self.db.write().await;
-        let mut me = write
-            .open_table(SELF)
-            .get(())
-            .expect("ledger identity")
-            .value()
-            .into_owned();
-        if me.secret.is_some() || !store::lengths_in(&mut write).is_empty() {
-            return None;
+        let mut table = write.open_table(SELF);
+        let mut me = table.get(()).expect("ledger identity").value().into_owned();
+        if me.phrase == Phrase::Unasked {
+            me.phrase = Phrase::Declined;
+            table.insert((), SenValue::borrowed(&me));
         }
-        let secret = Secret::generate();
-        me.secret = Some(secret.0);
-        write.open_table(SELF).insert((), SenValue::borrowed(&me));
-        let pending = take_unsent(&mut write);
-        if pending.is_empty() {
-            append_sealed(
-                &mut write,
-                secret,
-                &Envelope {
-                    device: me.device,
-                    channel: Channel::Facts,
-                    payloads: Vec::new(),
-                },
-            );
-        }
-        for envelope in pending {
-            append_sealed(&mut write, secret, &envelope);
-        }
+        drop(table);
         write.commit();
-        Some(secret)
     }
     pub fn items(&self, channel: Channel) -> Vec<Item> {
         let read = self.db.read();
@@ -284,7 +283,7 @@ impl Ledger {
             channel,
             payloads,
         };
-        if let Some(secret) = me.secret {
+        if let Phrase::Held(secret) = me.phrase {
             append_sealed(&mut write, Secret(secret), &envelope);
         } else {
             let next = write
@@ -298,7 +297,45 @@ impl Ledger {
         }
         write.commit();
     }
+    /// Makes a new phrase for a user who has none: nothing another device
+    /// wrote may be held, since those devices hold a phrase already.
+    pub async fn make_secret(&self) -> anyhow::Result<(Secret, Received)> {
+        let secret = Secret::generate();
+        // Its log starts even when it has said nothing, so that a device
+        // that pairs later has something to check the phrase against.
+        let received = self.keep_secret(secret, true, |write, _| {
+            anyhow::ensure!(
+                store::lengths_in(write).is_empty(),
+                "your other devices hold a phrase already: type it"
+            );
+            Ok(())
+        });
+        Ok((secret, received.await?))
+    }
+    /// Takes the phrase the user typed. Every log held is another device's.
+    /// Twelve real words can still be the wrong phrase (the checksum misses
+    /// one typo in sixteen), and a device that took one could never read
+    /// the others, so a phrase must open what they wrote before it is kept.
     pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<Received> {
+        self.keep_secret(secret, false, |write, key| {
+            let held = store::lengths_in(write);
+            anyhow::ensure!(
+                held.is_empty() || held.keys().any(|log| opens_first_record(write, key, *log)),
+                "this phrase does not open what your other devices wrote"
+            );
+            Ok(())
+        })
+        .await
+    }
+    /// Keeps `secret` once `fits` says it may, and seals with it what this
+    /// device said before it held one. With `start_log` its log starts even
+    /// when it has said nothing.
+    async fn keep_secret(
+        &self,
+        secret: Secret,
+        start_log: bool,
+        fits: impl FnOnce(&mut rho_db::WriteTxn, &[u8; 32]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Received> {
         let mut write = self.db.write().await;
         let mut me = write
             .open_table(SELF)
@@ -306,29 +343,29 @@ impl Ledger {
             .expect("ledger identity")
             .value()
             .into_owned();
-        if let Some(held) = me.secret {
+        if let Phrase::Held(held) = me.phrase {
             anyhow::ensure!(
                 held == secret.0,
                 "this device already holds another secret phrase"
             );
             return Ok(Received::default());
         }
-        // Every log held is another device's. Twelve real words can still be
-        // the wrong phrase (the checksum misses one typo in sixteen), and a
-        // device that took one could never read the others, so a phrase
-        // must open what they wrote before it is kept.
-        let key = secret.derive(KEY_CONTEXT);
-        let held = store::lengths_in(&mut write);
-        anyhow::ensure!(
-            held.is_empty()
-                || held
-                    .keys()
-                    .any(|log| opens_first_record(&mut write, &key, *log)),
-            "this phrase does not open what your other devices wrote"
-        );
-        me.secret = Some(secret.0);
+        fits(&mut write, &secret.derive(KEY_CONTEXT))?;
+        me.phrase = Phrase::Held(secret.0);
         write.open_table(SELF).insert((), SenValue::borrowed(&me));
-        for envelope in take_unsent(&mut write) {
+        let pending = take_unsent(&mut write);
+        if start_log && pending.is_empty() {
+            append_sealed(
+                &mut write,
+                secret,
+                &Envelope {
+                    device: me.device,
+                    channel: Channel::Facts,
+                    payloads: Vec::new(),
+                },
+            );
+        }
+        for envelope in pending {
             append_sealed(&mut write, secret, &envelope);
         }
         write.commit();
@@ -430,6 +467,83 @@ mod tests {
         ledger.set_secret(Secret::generate()).await.unwrap();
         assert_eq!(ledger.items(Channel::Notes)[0].bytes, b"unsent");
         assert_eq!(ledger.lengths().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_answer_to_whether_to_pair_outlives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.redb");
+        let ledger = Ledger::open(RhoDb::open(&path)).await;
+        assert_eq!(ledger.pairing(), Pairing::Unasked);
+        ledger.decline().await;
+        assert_eq!(ledger.pairing(), Pairing::Unpaired);
+        drop(ledger);
+        let ledger = Ledger::open(RhoDb::open(&path)).await;
+        assert_eq!(ledger.pairing(), Pairing::Unpaired);
+        let secret = ledger.set_secret(Secret::generate()).await.map(|_| ());
+        assert!(secret.is_ok());
+        ledger.decline().await;
+        assert_eq!(
+            ledger.pairing(),
+            Pairing::Paired,
+            "declining unpairs nothing"
+        );
+    }
+
+    /// The row as builds before [`Phrase`] wrote it.
+    mod old {
+        use super::*;
+
+        #[derive(Clone, Debug, Encode, Decode)]
+        pub struct SelfRecord {
+            pub device: DeviceId,
+            pub secret: Option<[u8; 16]>,
+            pub clock: (u64, u32),
+            pub seq: u64,
+            pub since_base: u32,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phrase_an_older_build_kept_is_still_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.redb");
+        async fn written_by_old_build(path: &std::path::Path, secret: Option<[u8; 16]>) -> Ledger {
+            let db = RhoDb::open(path);
+            let table: TableDefinition<(), Sen<old::SelfRecord>> =
+                TableDefinition::new("ledger_self_v1");
+            let mut write = db.write().await;
+            write.open_table(table).insert(
+                (),
+                SenValue::borrowed(&old::SelfRecord {
+                    device: DeviceId([3; 16]),
+                    secret,
+                    clock: (5, 1),
+                    seq: 2,
+                    since_base: 0,
+                }),
+            );
+            write.commit();
+            Ledger::open(db).await
+        }
+        let secret = Secret::generate();
+        let ledger = written_by_old_build(&path, Some(secret.0)).await;
+        assert_eq!(ledger.device(), DeviceId([3; 16]));
+        assert!(ledger.secret() == Some(secret));
+        assert_eq!(ledger.pairing(), Pairing::Paired);
+        drop(ledger);
+        let ledger = Ledger::open(RhoDb::open(&path)).await;
+        assert!(
+            ledger.secret() == Some(secret),
+            "and after it is written anew"
+        );
+        drop(ledger);
+        std::fs::remove_file(&path).unwrap();
+        // One without a phrase was never asked.
+        assert_eq!(
+            written_by_old_build(&path, None).await.pairing(),
+            Pairing::Unasked
+        );
     }
 
     #[tokio::test]

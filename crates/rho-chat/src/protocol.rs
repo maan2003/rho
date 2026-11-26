@@ -9,7 +9,7 @@
 
 use rho_agent_types::{
     ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ProjectChange, ProjectConfig,
-    ProjectId, ProjectName, RuntimeCatalogue, RuntimeLabel, ThreadWork,
+    ProjectId, ProjectMode, ProjectName, RuntimeCatalogue, RuntimeLabel, ThreadWork,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -65,6 +65,10 @@ pub struct PostIdea {
     /// An explicit answer; without one the host keeps a standing agent's
     /// runtime or uses the project's default for a new agent.
     pub runtime: Option<RuntimeLabel>,
+    /// The idea's `in:` line: `One` for the project's standing agent,
+    /// `PerIdea` for a fresh agent in a fresh workset. Without one, the
+    /// project's mode.
+    pub mode: Option<ProjectMode>,
     pub content: Vec<ContentPart>,
     /// The name this device uses for the host, for a failed start's mail.
     pub host_label: String,
@@ -194,6 +198,7 @@ mod tests {
                 client_id: 17,
                 project,
                 runtime: Some(RuntimeLabel::parse("sol-high").unwrap()),
+                mode: Some(ProjectMode::PerIdea),
                 content: vec![ContentPart::Text {
                     text: "New idea".into(),
                 }],

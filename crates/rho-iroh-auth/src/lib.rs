@@ -11,7 +11,9 @@ pub mod gccp_hosts;
 mod server;
 mod shared;
 
-pub use server::{ApproveError, IrohAuth, PAIRING_TTL, PreapprovedEndpoint, ServerAuthDecision};
+pub use server::{
+    ApproveError, IrohAuth, PAIRING_TTL, PreapprovedEndpoint, ServerAuthDecision, TrustedClient,
+};
 pub use shared::{
     EnrollmentCode, PAIRING_SCHEME, PairingKey, PairingLink, ParseEnrollmentCodeError,
 };
@@ -87,9 +89,9 @@ pub async fn authenticate_server_connection(
             anyhow::ensure!(request == AUTH_REQUEST_V1, "invalid iroh auth request");
         }
         let pairing = (key != [0; 32]).then(|| PairingKey::from_bytes(key));
-        // Pin trust established at admission for this connection. Revocation
-        // affects later connections, not one whose authenticated handshake
-        // already passed admission. Unknown peers may still become approved
+        // Pin trust established at admission for this connection: a revoke
+        // while it waits here closes it once it is admitted
+        // ([`IrohAuth::admit`]). Unknown peers may still become approved
         // while waiting for enrollment capacity.
         let decision = match preapproved {
             Some(preapproved) => {
@@ -112,6 +114,10 @@ pub async fn authenticate_server_connection(
         anyhow::ensure!(ack == AUTH_ACK, "invalid iroh auth acknowledgement");
         if decision == ServerAuthDecision::Approved {
             connection.set_max_idle_timeout(Some(AUTHENTICATED_IDLE_TIMEOUT));
+            anyhow::ensure!(
+                auth.admit(connection).await,
+                "the client's key was revoked while it was admitted"
+            );
         }
         Ok(decision)
     })

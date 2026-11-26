@@ -63,6 +63,11 @@ rho_rpc::calls! {
         SetClaudeAccount(super::SetClaudeAccount) -> super::ClaudeAccountList;
         RewindAgent(RewindAgent) -> RewoundAgent;
         StopAgent(StopAgent) -> ();
+        /// Ends the work of the agent's workset: its agents are archived,
+        /// its process ends with its shells and terminals, and each clean,
+        /// pushed checkout of an isolated workset is removed. A later reply
+        /// wakes the work again.
+        FinishWork(FinishWork) -> FinishedWork;
     }
 }
 
@@ -81,7 +86,7 @@ pub struct Eval {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct RewindAgent {
     pub agent: AgentId,
-    pub turns: u32,
+    pub back: rho_agent_types::Rewind,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -92,6 +97,20 @@ pub struct RewoundAgent {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct StopAgent {
     pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct FinishWork {
+    pub agent: AgentId,
+}
+
+/// What finishing the work did with the workset's checkouts.
+#[derive(Clone, Debug, Default, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct FinishedWork {
+    /// Checkouts removed: clean, with every commit on a remote.
+    pub removed: Vec<String>,
+    /// Checkouts kept, each with why: `rho: 2 unpushed commits`.
+    pub kept: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]

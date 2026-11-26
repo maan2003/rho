@@ -29,7 +29,7 @@ pub(crate) enum Control {
     Cancel,
     Retry,
     CacheKey,
-    Rewind(u32),
+    Rewind(rho_agent_types::Rewind),
 }
 
 /// A notebook host function the agent host answers for the worker.

@@ -1,6 +1,8 @@
-use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use rho_dealer::facts::{Device, Entry};
+use jiff::{SignedDuration, Timestamp, Zoned};
+use rho_dealer::Until;
+use rho_dealer::facts::{Device, Entry, Seen};
+use rho_frame::when::{SnoozeUnit, snooze_target};
 
 use super::*;
 
@@ -49,6 +51,36 @@ impl World {
         if deleted {
             self.say(Fact::Deleted { note: note.0 });
         }
+    }
+}
+
+/// The instant `minute` minutes after the test worlds' start, in UTC.
+fn minute(minute: i64) -> Zoned {
+    Timestamp::from_second(1_800_000_000 + minute * 60)
+        .unwrap()
+        .to_zoned(TimeZone::UTC)
+}
+
+/// The hand at `now`, as the notes claim it: `title · label`, top first.
+fn hand(marks: &Marks, now: &Zoned) -> Vec<String> {
+    let claims = reminder_claims(marks, |note| note_title(marks, &note.address()));
+    let skips = rho_dealer::Skips::default();
+    let sources = rho_dealer::rank::Sources {
+        claims: &claims,
+        marks,
+        skips: &skips,
+    };
+    rho_dealer::rank(&sources, now)
+        .cards
+        .iter()
+        .map(|card| format!("{} · {}", card.heading(), card.label))
+        .collect()
+}
+
+fn snooze(note: NoteId, until: Until) -> Fact {
+    Fact::Snooze {
+        node: note.address(),
+        until,
     }
 }
 
@@ -270,7 +302,9 @@ fn places_find_every_note_by_its_first_line() {
 
 #[test]
 fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
-    let now = Timestamp::from_second(1_800_000_000).unwrap();
+    let now = Timestamp::from_second(1_800_000_000)
+        .unwrap()
+        .to_zoned(TimeZone::UTC);
     let written = Timestamp::from_second(1_800_000_000 - 7 * 60).unwrap();
     let mut listed = Listed {
         note: NoteId(uuid::Uuid::new_v4()),
@@ -281,8 +315,9 @@ fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
             mail: Some("Can this ship before noon on Friday?".into()),
             thread: Some("Fix the flaky test".into()),
         }),
+        reminder: None,
     };
-    let (text, styles) = list::row(&listed, now);
+    let (text, styles) = list::row(&listed, &now);
     assert_eq!(
         text,
         "  verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  · 7m"
@@ -295,12 +330,43 @@ fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
     );
 
     listed.reply = Some(ReplyContext::default());
-    assert!(list::row(&listed, now).0.contains("↳ private reply"));
+    assert!(list::row(&listed, &now).0.contains("↳ private reply"));
     listed.reply = None;
     assert_eq!(
-        list::row(&listed, now).0,
+        list::row(&listed, &now).0,
         "  verify on CI too  it failed last night  · 7m"
     );
+}
+
+/// A row says when its reminder comes due, on the user's clock: the hour
+/// today, the day and hour after, and that it is due once it is.
+#[test]
+fn a_row_says_when_its_reminder_is_due() {
+    // Friday 15 January 2027, 08:00 UTC.
+    let now = Timestamp::from_second(1_800_000_000)
+        .unwrap()
+        .to_zoned(TimeZone::UTC);
+    let mut listed = Listed {
+        note: NoteId(uuid::Uuid::new_v4()),
+        title: "Call the dentist".into(),
+        preview: String::new(),
+        written: now.timestamp() - jiff::SignedDuration::from_mins(7),
+        reply: None,
+        reminder: None,
+    };
+    let row = |listed: &Listed| list::row(listed, &now).0;
+    let in_mins = |mins| Some(now.timestamp() + jiff::SignedDuration::from_mins(mins));
+    listed.reminder = in_mins(90);
+    assert_eq!(row(&listed), "  Call the dentist  · reminder 09:30 · 7m");
+    listed.reminder = in_mins(25 * 60);
+    assert_eq!(
+        row(&listed),
+        "  Call the dentist  · reminder Sat 16 Jan 09:00 · 7m"
+    );
+    listed.reminder = in_mins(-1);
+    assert_eq!(row(&listed), "  Call the dentist  · reminder due · 7m");
+    let styles = list::row(&listed, &now).1;
+    assert_eq!(styles[1].0, list::Class::Muted, "the reminder is quiet");
 }
 
 /// The title follows the first line as it is typed, before it is written.
@@ -329,14 +395,11 @@ fn previews_stop_at_word_or_character_limits_without_splitting_utf8() {
     );
 }
 
-/// The find line takes the prompt's editing keys: `ctrl-w` takes only the
-/// last word, `ctrl-a` goes to the start without changing the text, and
-/// `ctrl-u` clears it.
-#[gpui::test]
-fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
+/// A window over the notes alone.
+fn notes_window(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Frame> {
     use std::rc::Rc;
 
-    use gpui::{AppContext as _, Focusable as _, VisualTestContext};
+    use gpui::AppContext as _;
     use rho_frame::AnySystem;
 
     cx.update(|cx| {
@@ -347,7 +410,7 @@ fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
         release_channel::init(semver::Version::new(0, 0, 0), cx);
         editor::init(cx);
     });
-    let window = cx.add_window(|window, cx| {
+    cx.add_window(|window, cx| {
         let frame = FrameLink::new(window.window_handle().downcast::<Frame>().unwrap());
         let notes = cx.new(|cx| NoteSystem::new(frame, cx));
         let db = rho_db::RhoDb::in_memory();
@@ -359,7 +422,51 @@ fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
             window,
             cx,
         )
-    });
+    })
+}
+
+/// `space s` on an open note sets its reminder and leaves the note on
+/// screen, its status line saying when; it is no card until then.
+#[gpui::test]
+fn a_reminder_set_on_an_open_note_shows_on_its_status_line(cx: &mut gpui::TestAppContext) {
+    let window = notes_window(cx);
+    cx.run_until_parked();
+    let note = window
+        .update(cx, |frame, window, cx| {
+            start_note(frame, "Call the dentist".into(), window, cx);
+            NoteId::from_address(frame.current_address()).expect("a note in view")
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |frame, window, cx| {
+            assert_eq!(frame.current_surface().status(cx), None, "no reminder yet");
+            frame.snooze(&note.address(), SnoozeUnit::Hours, Some(2), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |frame, _, cx| {
+            assert_eq!(
+                frame.current_address(),
+                &note.address(),
+                "still on the note"
+            );
+            let status = frame.current_surface().status(cx).expect("the reminder");
+            assert!(status.starts_with("reminder "), "{status}");
+            assert!(frame.hand().cards.is_empty(), "not yet due");
+        })
+        .unwrap();
+}
+
+/// The find line takes the prompt's editing keys: `ctrl-w` takes only the
+/// last word, `ctrl-a` goes to the start without changing the text, and
+/// `ctrl-u` clears it.
+#[gpui::test]
+fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
+    use gpui::{Focusable as _, VisualTestContext};
+
+    let window = notes_window(cx);
     cx.run_until_parked();
     let list = window
         .update(cx, |frame, window, cx| {
@@ -390,4 +497,152 @@ fn the_find_line_edits_like_a_prompt(cx: &mut gpui::TestAppContext) {
     assert_eq!(text(&mut cx), "now find the  ", "ctrl-a moved to the start");
     cx.simulate_keystrokes("ctrl-u");
     assert_eq!(text(&mut cx), "");
+}
+
+/// A note with a reminder is no card until the reminder is due; then it
+/// is one card, waiting from then, until done, after which it stays off
+/// the desk. A note without one, or deleted, never deals.
+#[test]
+fn a_reminder_deals_once_when_due_and_done_keeps_it_off_the_desk() {
+    let mut world = World::default();
+    world.note("Buy milk");
+    let gone = world.note("Gone");
+    let note = world.note("Call the dentist\nask about Friday");
+    world.say(snooze(note, Until::In(SignedDuration::from_hours(2))));
+    let set = world.minute;
+    world.say(snooze(gone, Until::In(SignedDuration::from_hours(1))));
+    world.write(gone, "Gone", true);
+    assert_eq!(hand(&world.marks, &minute(set + 119)), [] as [&str; 0]);
+    assert_eq!(
+        hand(&world.marks, &minute(set + 120)),
+        ["Call the dentist · due · now"]
+    );
+    assert_eq!(
+        hand(&world.marks, &minute(set + 125)),
+        ["Call the dentist · due · 5m"],
+        "one card, however often the hand is ranked"
+    );
+
+    world.minute = set + 130;
+    world.say(Fact::Settled {
+        node: note.address(),
+        seen: Seen::Whole,
+    });
+    for later in [set + 131, set + 60 * 24 * 30] {
+        assert_eq!(hand(&world.marks, &minute(later)), [] as [&str; 0]);
+    }
+    assert_eq!(
+        listed(&world.marks, "dentist", |_| ReplyContext::default())[0].reminder,
+        None
+    );
+}
+
+/// Snoozed again, the reminder waits for the new time: `tomorrow`, as
+/// the deal's snooze names it, is 09:00 the next day on the user's clock.
+#[test]
+fn a_reminder_snoozed_again_moves_to_the_new_time() {
+    let mut world = World::default();
+    let note = world.note("Call the dentist");
+    world.say(snooze(note, Until::In(SignedDuration::from_hours(1))));
+    let set = world.minute;
+    assert_eq!(hand(&world.marks, &minute(set + 60)).len(), 1);
+
+    world.minute = set + 61;
+    let (tomorrow, said) = snooze_target(SnoozeUnit::Days, 1, &minute(set + 62));
+    assert_eq!(said, "tomorrow · 09:00");
+    world.say(snooze(note, tomorrow));
+    // Saturday 16 January 2027, 09:00 UTC.
+    let nine = Timestamp::from_second(1_800_000_000 + 25 * 3600).unwrap();
+    let at = |delta: i64| (nine + SignedDuration::from_secs(delta)).to_zoned(TimeZone::UTC);
+    assert_eq!(hand(&world.marks, &minute(set + 62)), [] as [&str; 0]);
+    assert_eq!(hand(&world.marks, &at(-1)), [] as [&str; 0]);
+    assert_eq!(hand(&world.marks, &at(0)), ["Call the dentist · due · now"]);
+    assert_eq!(
+        listed(&world.marks, "", |_| ReplyContext::default())[0].reminder,
+        Some(nine)
+    );
+}
+
+/// The phone holds what the laptop said once their sealed logs meet: a
+/// reminder set on the laptop is due on the phone, and done on the phone
+/// takes it off the laptop's desk. What passes between them holds neither
+/// the note's words nor the reminder in the clear.
+#[test]
+fn a_reminder_set_on_one_device_is_due_on_the_other() {
+    use rho_db::RhoDb;
+    use rho_ledger::{Channel, Ledger, Secret};
+
+    futures_lite::future::block_on(async {
+        let scratch = tempfile::tempdir().unwrap();
+        let laptop = Ledger::open(RhoDb::open(scratch.path().join("laptop.redb"))).await;
+        let phone = Ledger::open(RhoDb::open(scratch.path().join("phone.redb"))).await;
+        let secret = Secret::generate();
+        laptop.set_secret(secret).await.unwrap();
+        phone.set_secret(secret).await.unwrap();
+        // Everything `from` holds that `to` does not, as a host carries it.
+        let carry = async |from: &Ledger, to: &Ledger, clear: &[Vec<u8>]| {
+            for (log, length) in from.lengths() {
+                let held = to.lengths().get(&log).copied().unwrap_or(0);
+                let bytes = from.bytes_after(log, held, usize::MAX);
+                for plain in clear {
+                    assert!(
+                        !bytes.windows(plain.len()).any(|window| window == plain),
+                        "sealed"
+                    );
+                }
+                to.receive(log, held, bytes).await;
+                assert_eq!(to.lengths().get(&log), Some(&length));
+            }
+        };
+        let marks = |ledger: &Ledger| {
+            let mut marks = Marks::default();
+            marks.apply(
+                ledger
+                    .items(Channel::Facts)
+                    .iter()
+                    .filter_map(|item| Entry::decode(&item.bytes)),
+            );
+            marks
+        };
+
+        let note = NoteId(uuid::Uuid::new_v4());
+        let said = [
+            Entry {
+                device: Device(laptop.device().0),
+                at: minute(0),
+                fact: Fact::Wrote {
+                    note: note.0,
+                    text: "Call the dentist".into(),
+                    created: minute(0).timestamp(),
+                },
+            },
+            Entry {
+                device: Device(laptop.device().0),
+                at: minute(1),
+                fact: snooze(note, Until::In(SignedDuration::from_hours(2))),
+            },
+        ];
+        let encoded: Vec<_> = said.iter().map(Entry::encode).collect();
+        laptop.append(Channel::Facts, encoded.clone()).await;
+        let mut clear = encoded;
+        clear.push(b"Call the dentist".to_vec());
+        carry(&laptop, &phone, &clear).await;
+        assert_eq!(hand(&marks(&phone), &minute(120)), [] as [&str; 0]);
+        assert_eq!(
+            hand(&marks(&phone), &minute(121)),
+            ["Call the dentist · due · now"]
+        );
+
+        let done = Entry {
+            device: Device(phone.device().0),
+            at: minute(125),
+            fact: Fact::Settled {
+                node: note.address(),
+                seen: Seen::Whole,
+            },
+        };
+        phone.append(Channel::Facts, vec![done.encode()]).await;
+        carry(&phone, &laptop, &[done.encode()]).await;
+        assert_eq!(hand(&marks(&laptop), &minute(126)), [] as [&str; 0]);
+    });
 }

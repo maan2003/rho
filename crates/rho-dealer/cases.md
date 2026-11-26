@@ -69,11 +69,16 @@ still decode and read as nothing.
 
 ## Notes
 
+A note the user wrote is no card. A snooze the user set on one is a
+reminder, which the notes claim (`rho-notes`); the rows below are what
+the dealer makes of a source shaped like it.
+
 | # | History and facts | Card |
 |---|---|---|
 | N1 | A plain note | no card |
-| N2 | An old deadline | as T3: a note is never a card |
+| N2 | An old deadline | as T3: nothing |
 | N3 | Done or deleted | nothing |
+| N4 | A reminder: the note snoozed | nothing until it is due, then one card, `due`, waiting from then (Z1, Z2); snoozed again it waits for the new time; done takes it back for good |
 
 ## Every history
 

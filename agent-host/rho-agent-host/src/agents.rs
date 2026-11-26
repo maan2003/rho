@@ -15,8 +15,8 @@ use rho_agent_types::{AgentId, WorksetId, WorksetKind, Wpos};
 use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
     AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
-    DeleteWorksets, Eval, EvalResult, LogNext, Open, Request, RestartWorkset, RewindAgent,
-    RewoundAgent, ServerFrame, StopAgent, TellAgent, WorksetEntry,
+    DeleteWorksets, Eval, EvalResult, FinishWork, LogNext, Open, Request, RestartWorkset,
+    RewindAgent, RewoundAgent, ServerFrame, StopAgent, TellAgent, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -570,10 +570,16 @@ where
             .await
         }
         Request::RewindAgent(call) => {
-            respond(writer, call, |RewindAgent { agent, turns }| async move {
+            respond(writer, call, |RewindAgent { agent, back }| async move {
                 Ok(RewoundAgent {
-                    taken_back: services.pool.rewind_agent(agent, turns).await?,
+                    taken_back: services.pool.rewind_agent(agent, back).await?,
                 })
+            })
+            .await
+        }
+        Request::FinishWork(call) => {
+            respond(writer, call, |FinishWork { agent }| async move {
+                services.pool.finish_work(agent).await
             })
             .await
         }
@@ -636,9 +642,12 @@ where
                 // mount it; a switch to a name with no directory would fail
                 // at the next turn of every agent at once.
                 services.claude.bootstrap(&name)?;
-                let mut write = services.db.write().await;
-                write.set_claude_account(&name);
-                write.commit();
+                {
+                    let mut write = services.db.write().await;
+                    write.set_claude_account(&name);
+                    write.commit();
+                }
+                services.pool.claude_account_switched().await;
                 claude_accounts(&services.db, &services.claude)
             })
             .await

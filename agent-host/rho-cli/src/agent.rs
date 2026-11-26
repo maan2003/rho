@@ -1194,7 +1194,7 @@ impl ChatState {
                     self.names.insert(*thread, name.clone());
                 }
             }
-            ChatEvent::Project { .. } => {}
+            ChatEvent::Project { .. } | ChatEvent::Standing { .. } | ChatEvent::Retired { .. } => {}
         }
     }
 

@@ -27,6 +27,8 @@ pub enum CardKind {
     /// Something staged that runs only on the user's word, such as a
     /// `push` or a `fetch`.
     Approve(&'static str),
+    /// A reminder the user set on a note came due.
+    Due,
     Other,
 }
 
@@ -36,6 +38,7 @@ impl CardKind {
             Self::Waits => "waits · {age}".to_owned(),
             Self::Stop(word) => format!("{word} · {{age}}"),
             Self::Approve(what) => format!("approve {what} · {{age}}"),
+            Self::Due => "due · {age}".to_owned(),
             Self::Other => String::new(), // Deadlines supply their own words.
         }
     }

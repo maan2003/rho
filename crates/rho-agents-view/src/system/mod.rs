@@ -240,6 +240,7 @@ impl AgentsSystem {
                     let heard = self.registry.agent_facts(agent).runtime;
                     Participant {
                         label: self.registry.agent_display_label(agent),
+                        code: self.registry.agent_code(agent),
                         runtime: Some(format!(
                             "{}-{}",
                             entry.identity.entry.spec.model, entry.identity.entry.spec.effort
@@ -254,6 +255,7 @@ impl AgentsSystem {
                 }),
             None => Some(Participant {
                 label: agent.encoded(),
+                code: agent.encoded(),
                 runtime: None,
                 created_at: None,
                 doing: None,
@@ -299,6 +301,16 @@ impl AgentsSystem {
                 .and_then(|lead| self.agent_thread(lead, cx))
         });
         let mail = self.mail.read(cx);
+        let standing = self.standing_project(agent, cx);
+        if let Some(root) = standing {
+            return WorkName {
+                project: mail.project_address(root),
+                subject: None,
+                code: self.registry.agent_code(agent),
+                shared: self.shares_workset(agent),
+                standing: true,
+            };
+        }
         let (project, subject) = thread
             .and_then(|thread| {
                 let root = mail.host_chat(thread.host)?.root_of(thread.message);
@@ -314,16 +326,43 @@ impl AgentsSystem {
                 Some((project, subject))
             })
             .unwrap_or_default();
-        let shared = self
-            .registry
-            .agent_workset(agent)
-            .is_some_and(|workset| self.workset_agents(workset).len() > 1);
         WorkName {
             project,
             subject,
             code: self.registry.agent_code(agent),
-            shared,
+            shared: self.shares_workset(agent),
+            standing: false,
         }
+    }
+
+    /// The project whose standing agent leads the agent's workset.
+    fn standing_project(&self, agent: AgentId, cx: &App) -> Option<ThreadId> {
+        let lead = self.lead_of(agent).unwrap_or(agent);
+        let host = self
+            .registry
+            .host_endpoint(self.registry.mirrored(lead)?.host)?;
+        let root = self.mail.read(cx).host_chat(host)?.standing_for(lead)?;
+        Some(ThreadId {
+            host,
+            message: root,
+        })
+    }
+
+    /// The agent whose step stands at `block` of the transcript of `scope`,
+    /// and the workset row of that step.
+    pub(super) fn step_at(
+        &self,
+        scope: Scope,
+        block: usize,
+    ) -> Option<(AgentId, rho_agent_types::Wpos)> {
+        self.transcripts.told_at(&scope, block)
+    }
+
+    /// Another agent works in the agent's workset.
+    fn shares_workset(&self, agent: AgentId) -> bool {
+        self.registry
+            .agent_workset(agent)
+            .is_some_and(|workset| self.workset_agents(workset).len() > 1)
     }
 
     fn host_label(&self, agent: AgentId) -> String {
@@ -1466,6 +1505,20 @@ impl System for AgentsSystem {
             None => AgentAddress::from_address(address)?.agent,
         };
         self.registry.host_of_agent(agent)
+    }
+
+    /// A transcript, or a tool of a workset, is in the project of the
+    /// thread its work is for (or of the project its lead stands for).
+    fn project(&self, address: &Address, cx: &App) -> Option<rho_frame::Project> {
+        let agent = match Scope::from_address(address) {
+            Some(scope) => self.scope_agents(scope)?.0,
+            None => AgentAddress::from_address(address)?.agent,
+        };
+        let lead = self.lead_of(agent).unwrap_or(agent);
+        let thread = self
+            .standing_project(lead, cx)
+            .or_else(|| self.agent_thread(lead, cx))?;
+        rho_frame::System::project(self.mail.read(cx), &thread.address(), cx)
     }
 
     /// The usage charts, each found by `usage` too. Transcripts and the

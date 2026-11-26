@@ -144,7 +144,10 @@ the host writes the stop in the idea's thread instead. Neither is agent input.
 
 A project is a root with a `Project` event in the log, which holds its
 place, mode and runtime; the latest event wins, so every device folds the
-same settings. A root without one, such as the root of agents' direct
+same settings. The log also names each project's standing agent
+(`Standing`) and marks a retired project (`Retired`), so every device names
+the standing agent's work by its project and offers no retired project for an
+idea. A root without one, such as the root of agents' direct
 messages, is no project, and the GUI shows it as the agents'. The host says
 the runtimes it offers in its chat `Hello` (`RuntimeCatalogue`); the GUI
 offers and checks those, not its own build's list. The host alone chooses what

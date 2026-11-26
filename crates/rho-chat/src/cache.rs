@@ -56,6 +56,9 @@ pub struct IdeaDraft {
     pub recipient: String,
     /// The `on:` line, when it overrides the project's runtime.
     pub runtime: Option<String>,
+    /// The `in:` line, when it overrides the project's mode.
+    #[senax(default)]
+    pub mode: Option<String>,
     pub text: String,
 }
 
@@ -535,6 +538,7 @@ mod tests {
             }],
             delivery: crate::outbox::Delivery::Idea,
             runtime: None,
+            mode: None,
             state: crate::outbox::OutgoingState::Queued,
         };
         tokio::runtime::Builder::new_current_thread()
@@ -578,6 +582,7 @@ mod tests {
             address: Some("thread:lab/1".into()),
             recipient: "tide@lab".into(),
             runtime: Some("sol-high".into()),
+            mode: None,
             text: "Check the tide\nand the moon".into(),
         };
         let v1_only = IdeaDraft {
@@ -638,6 +643,7 @@ mod tests {
             content: vec![ContentPart::Text { text: "hi".into() }],
             delivery: crate::outbox::Delivery::Retry,
             runtime: None,
+            mode: None,
             state: crate::outbox::OutgoingState::Refused {
                 reason: "target was removed".into(),
             },
@@ -656,6 +662,7 @@ mod tests {
             address: None,
             recipient: "tide@".into(),
             runtime: Some("sol-high".into()),
+            mode: Some("new".into()),
             text: "Check the tide".into(),
         };
         cache.write_idea(Some(idea.clone()));

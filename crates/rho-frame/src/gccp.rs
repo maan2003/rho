@@ -240,7 +240,7 @@ fn remove(frame: &mut Frame, host: HostId, window: &mut Window, cx: &mut Context
 
 /// Makes a call that changes the host, and echoes `said` once the host
 /// has done it, or why it would not.
-fn tell(
+pub(crate) fn tell(
     frame: &mut Frame,
     command: &'static str,
     host: HostId,
@@ -264,7 +264,7 @@ fn tell(
 }
 
 /// The rows that hold every typed word, in their id or what they are.
-fn matching(rows: &[Candidate], needle: &str) -> Vec<Candidate> {
+pub(crate) fn matching(rows: &[Candidate], needle: &str) -> Vec<Candidate> {
     let needle = needle.trim().to_lowercase();
     rows.iter()
         .filter(|row| {

@@ -241,6 +241,7 @@ fn run() -> Result<()> {
                             || {
                                 Some(rho_chat::ui::Participant {
                                     label: agent.encoded(),
+                                    code: agent.encoded(),
                                     runtime: None,
                                     created_at: None,
                                     doing: None,
@@ -329,6 +330,9 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            // A new device asks whether the user holds a phrase, once the
+            // link it was opened with has its name.
+            let _ = window.update(cx, |frame, window, cx| frame.ask_pairing(window, cx));
         });
     // The window is gone and everything it ran has written what it keeps.
     // Settled, the file opens at once on the next start instead of being

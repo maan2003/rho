@@ -304,10 +304,10 @@ impl Listing {
                         })
                     })
                     .flatten();
-                let (tier, weight, naming, inline) = [searched, named]
-                    .into_iter()
-                    .flatten()
-                    .min_by_key(|(tier, weight, ..)| (*tier, Reverse(*weight)))?;
+                let (tier, weight, naming, inline) =
+                    [searched, named].into_iter().flatten().min_by_key(
+                        |(tier, weight, naming, _)| (Reverse(*naming), *tier, Reverse(*weight)),
+                    )?;
                 let marks = match tier {
                     Tier::Name | Tier::NamePrefix | Tier::NameWords | Tier::InName => {
                         Self::marks(&words.name, &terms[..naming])
@@ -817,5 +817,55 @@ mod tests {
         assert!(rows[0].marks.is_empty());
         let rows = listing.rank("rename thread New name");
         assert_eq!(rows[0].marks, [0..6, 7..13], "the argument marks nothing");
+    }
+
+    /// A whole-line command match (`rewind agent to here`) ranks strictly
+    /// ahead of a shorter command prefix with a leftover inline argument
+    /// (`rewind agent` + `to here`), while `:rewind agent 3` still passes
+    /// `3` as its inline argument.
+    #[test]
+    fn whole_line_command_beats_shorter_prefix_with_inline_argument() {
+        let listing = Listing::new(
+            vec![
+                (
+                    spelled!("rewind agent", "rewind" = 9, "undo turn" = 7; "turns"),
+                    String::new(),
+                ),
+                (
+                    spelled!(
+                        "rewind agent to here",
+                        "rewind to here" = 9,
+                        "rewind here" = 8,
+                        "rewind to step" = 7
+                    ),
+                    String::new(),
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            names(&listing, "rewind agent to here"),
+            ["rewind agent to here", "rewind agent"]
+        );
+        assert_eq!(
+            first(&listing, "rewind agent to here"),
+            ("rewind agent to here", None)
+        );
+        assert_eq!(
+            first(&listing, "rewind to here"),
+            ("rewind agent to here", None)
+        );
+        assert_eq!(
+            first(&listing, "rewind here"),
+            ("rewind agent to here", None)
+        );
+        assert_eq!(
+            first(&listing, "rewind agent 3"),
+            ("rewind agent", Some("3".into()))
+        );
+        assert_eq!(
+            names(&listing, "rewind agent"),
+            ["rewind agent", "rewind agent to here"]
+        );
     }
 }

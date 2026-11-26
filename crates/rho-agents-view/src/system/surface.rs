@@ -315,6 +315,30 @@ impl Surface for TranscriptSurface {
     fn card(&self, _cx: &App) -> CardHere {
         CardHere::Inspected
     }
+
+    /// On a step of an agent's work, `rewind agent to here` takes back
+    /// every turn after it.
+    fn commands(
+        &mut self,
+        _card: Option<rho_frame::surface::Seen>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<rho_frame::Command> {
+        let Some(point) = self.model.read(cx).store_point(&self.editor, cx) else {
+            return Vec::new();
+        };
+        let Some((agent, step)) = self.system.read(cx).step_at(self.scope, point.block) else {
+            return Vec::new();
+        };
+        let system = self.system.clone();
+        let label = system.read(cx).label(agent, cx).0;
+        vec![
+            rho_frame::Command::simple(&super::commands::REWIND_AGENT_TO_HERE, move |_, _, cx| {
+                super::steer::rewind(&system, agent, rho_agent_types::Rewind::After(step), cx)
+            })
+            .target(label),
+        ]
+    }
 }
 
 /// How much an agent doing this wants looking at: lower is more. Work in

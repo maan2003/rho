@@ -327,7 +327,7 @@ pub(crate) fn migrate_voices(
         let mode = match settings.routing {
             prior_voice::Routing::One { agent } => {
                 if let Some(agent) = agent {
-                    write.set_standing_agent(project, agent);
+                    write.index_standing_agent(project, Some(agent));
                 }
                 rho_agent_types::ProjectMode::One
             }
@@ -954,10 +954,43 @@ pub trait MailWrite {
         project: rho_agent_types::ProjectId,
         config: rho_agent_types::ProjectConfig,
     );
+    /// Names the agent that stands for a project, or none. Logs nothing
+    /// when it already does.
+    fn set_standing_agent(
+        &mut self,
+        at: UnixMs,
+        project: rho_agent_types::ProjectId,
+        agent: Option<AgentId>,
+    );
+    /// Retires a project; a retired one logs nothing.
+    fn retire_project(&mut self, at: UnixMs, project: rho_agent_types::ProjectId);
     /// Replays one event into the indexes: what [`MailWrite::post`] and the
     /// others do after they append. The migration rebuilds the indexes
     /// with it.
     fn index_mail_event(&mut self, seq: ChatSeq, event: &ChatEvent);
+}
+
+/// Logs the standing agent of every project whose index holds one: before
+/// format `5d0e8a13` the host kept it off the log, so no device could name
+/// its workset by the project. Remove with that hop.
+pub(crate) fn log_standing_agents(write: &mut WriteTxn) {
+    let standing: Vec<_> = write
+        .open_table(super::projects::STANDING_TABLE)
+        .iter()
+        .map(|(anchor, agent)| (anchor.value(), agent.value()))
+        .collect();
+    let at = UnixMs::now();
+    for (anchor, agent) in standing {
+        let project = rho_agent_types::ProjectId(MessageId(ChatSeq(anchor)));
+        append(
+            write,
+            at,
+            ChatEvent::Standing {
+                project,
+                agent: Some(agent),
+            },
+        );
+    }
 }
 
 fn next_seq(write: &mut WriteTxn) -> ChatSeq {
@@ -1693,6 +1726,29 @@ impl MailWrite for WriteTxn {
         self.index_mail_event(seq, &event);
     }
 
+    fn set_standing_agent(
+        &mut self,
+        at: UnixMs,
+        project: rho_agent_types::ProjectId,
+        agent: Option<AgentId>,
+    ) {
+        if self.held_standing_agent(project) == agent {
+            return;
+        }
+        let event = ChatEvent::Standing { project, agent };
+        let seq = append(self, at, event.clone());
+        self.index_mail_event(seq, &event);
+    }
+
+    fn retire_project(&mut self, at: UnixMs, project: rho_agent_types::ProjectId) {
+        if self.held_retired(project) {
+            return;
+        }
+        let event = ChatEvent::Retired { project };
+        let seq = append(self, at, event.clone());
+        self.index_mail_event(seq, &event);
+    }
+
     fn index_mail_event(&mut self, seq: ChatSeq, event: &ChatEvent) {
         match event {
             ChatEvent::Posted {
@@ -1738,6 +1794,10 @@ impl MailWrite for WriteTxn {
             ChatEvent::Project { project, config } => {
                 self.index_project(*project, config);
             }
+            ChatEvent::Standing { project, agent } => {
+                self.index_standing_agent(*project, *agent);
+            }
+            ChatEvent::Retired { project } => self.index_retired(*project),
             ChatEvent::Named { thread, name } => {
                 let mut names = self.open_table(NAMES);
                 if name.is_empty() {

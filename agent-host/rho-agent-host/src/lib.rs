@@ -971,6 +971,7 @@ async fn run_iroh_listener(
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             let uni_task = tokio::spawn(async move { uni.receive_uni().await });
+            let caller = connection.remote_id();
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
                 let media = media.clone();
@@ -1014,7 +1015,7 @@ async fn run_iroh_listener(
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        serve_stream(services, iroh_auth, open, recv, writer).await
+                        serve_stream(services, iroh_auth, caller, open, recv, writer).await
                     }
                     .await;
                     if let Err(error) = result {
@@ -1148,6 +1149,7 @@ impl Services {
 async fn serve_stream<R, W>(
     services: Arc<Services>,
     iroh_auth: rho_iroh_auth::IrohAuth,
+    caller: iroh::EndpointId,
     open: Open,
     reader: R,
     writer: W,
@@ -1161,7 +1163,9 @@ where
         Protocol::Chat => mail::serve(services, open.unpack()?, reader, writer).await,
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
-        Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
+        Protocol::Host => {
+            host::serve(services, iroh_auth, caller, open.unpack()?, reader, writer).await
+        }
         Protocol::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
         Protocol::Terminal => {
             agents::serve_terminals(services, open.unpack()?, reader, writer).await

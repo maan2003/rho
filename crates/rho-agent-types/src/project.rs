@@ -316,6 +316,10 @@ pub enum ProjectChange {
     Place(ProjectPlace),
     Mode(ProjectMode),
     Runtime(RuntimeLabel),
+    /// The anchor's thread name, which is the project's name.
+    Name(ProjectName),
+    /// See [`ChatEvent::Retired`](crate::ChatEvent::Retired).
+    Retire,
 }
 
 /// A validated name without the client-owned host alias.

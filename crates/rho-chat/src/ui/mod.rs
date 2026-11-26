@@ -11,6 +11,8 @@
 mod git;
 mod idea;
 mod pending;
+#[cfg(test)]
+mod private_tests;
 mod projects;
 #[cfg(test)]
 mod search_bench;
@@ -71,12 +73,15 @@ pub static SPELLINGS: &[&Spelling] = &[
     &projects::SET_PROJECT_PLACE,
     &projects::SET_PROJECT_MODE,
     &projects::SET_PROJECT_RUNTIME,
+    &projects::RENAME_PROJECT,
+    &projects::RETIRE_PROJECT,
     &pending::WRITE_IDEA_AGAIN,
     &thread::REPLY_PRIVATELY,
     &thread::QUOTE_MESSAGE,
     &thread::WRITE_REPLY_AGAIN,
     &thread::SEND_MESSAGE,
     &thread::OPEN_UNDER_CURSOR,
+    &thread::FORK_THREAD,
 ];
 
 /// What the chat tells its listeners.
@@ -102,6 +107,9 @@ struct Slot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
     pub label: String,
+    /// Its short code, `eng-q9tz`: what tells two of a thread's agents
+    /// apart.
+    pub code: String,
     pub runtime: Option<String>,
     pub created_at: Option<rho_agent_types::UnixMs>,
     /// `None` while its host has said nothing of it.
@@ -248,6 +256,7 @@ impl ChatSystem {
             participants: Rc::new(|_, agent, _| {
                 Some(Participant {
                     label: agent.encoded(),
+                    code: agent.encoded(),
                     runtime: None,
                     created_at: None,
                     doing: None,
@@ -412,6 +421,22 @@ impl ChatSystem {
         self.drafts.body(&(endpoint, parent)).unwrap_or("")
     }
 
+    /// `fork thread` on `tangent`, a message: its thread's draft quotes it,
+    /// unless the user has already written there.
+    pub(super) fn start_tangent(&mut self, tangent: ThreadId) {
+        if !self.draft(tangent.host, Some(tangent.message)).is_empty() {
+            return;
+        }
+        let Some(mail) = self
+            .host_chat(tangent.host)
+            .and_then(|chat| chat.message(tangent.message))
+        else {
+            return;
+        };
+        let quote = thread::quote_lines(crate::reading::body(&mail.content).trim_end());
+        self.set_draft(tangent.host, Some(tangent.message), quote);
+    }
+
     pub fn set_draft(&mut self, endpoint: EndpointId, parent: Option<MessageId>, text: String) {
         self.cache.write_draft(endpoint, parent, text.clone());
         if text.is_empty() {
@@ -571,6 +596,7 @@ impl ChatSystem {
                 content: vec![ContentPart::Text { text }],
                 delivery,
                 runtime: None,
+                mode: None,
                 state: OutgoingState::Queued,
             },
         );
@@ -626,6 +652,7 @@ impl ChatSystem {
             name: names.address(&held.name, alias),
             qualified: names::qualified(&held.name, alias),
             runtime: Some(held.config.runtime),
+            mode: held.config.mode,
         })
     }
 
@@ -811,6 +838,7 @@ impl ChatSystem {
             }],
             delivery: Delivery::Idea,
             runtime: mail.runtime,
+            mode: mail.mode,
             state: OutgoingState::Queued,
         };
         let (_, kept) = self.outbox.keep(project.host, mail.client_id, outgoing);
@@ -851,6 +879,7 @@ impl ChatSystem {
             },
             text: rho_agent_types::content_text(&outgoing.content),
             runtime: outgoing.runtime.clone(),
+            mode: outgoing.mode,
         })
     }
 
@@ -913,6 +942,7 @@ impl ChatSystem {
                             client_id,
                             project,
                             runtime: outgoing.runtime,
+                            mode: outgoing.mode,
                             content: outgoing.content,
                             host_label,
                         },
@@ -1432,9 +1462,57 @@ pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::Voice;
+    use rho_agent_types::{ProjectMode, Voice};
 
     use super::*;
+
+    /// `fork thread` on a message: the tangent's draft quotes it, and
+    /// words the user already wrote there stay as they are.
+    #[gpui::test]
+    fn a_tangent_draft_quotes_its_message_once(cx: &mut gpui::TestAppContext) {
+        let endpoint = EndpointId([3; 32]);
+        let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let mut log = HostChat::default();
+        for (seq, parent, from, text) in [
+            (1, None, Party::User, "tide"),
+            (
+                2,
+                Some(1),
+                Party::Agent(agent),
+                "The clock drifts.\n\nShould I pin it?\n",
+            ),
+        ] {
+            log.tell(&rho_agent_types::ChatRecord {
+                seq: ChatSeq(seq),
+                at: UnixMs(seq),
+                event: rho_agent_types::ChatEvent::Posted {
+                    parent: parent.map(|parent| MessageId(ChatSeq(parent))),
+                    retry_of: None,
+                    thread_reply: None,
+                    from,
+                    voice: Voice::Message,
+                    content: vec![ContentPart::Text { text: text.into() }],
+                },
+            });
+        }
+        let (_, mail, _db) = search_bench::fixture(cx, log);
+        let tangent = ThreadId {
+            host: endpoint,
+            message: MessageId(ChatSeq(2)),
+        };
+        cx.update(|cx| {
+            mail.update(cx, |mail, _| {
+                mail.start_tangent(tangent);
+                assert_eq!(
+                    mail.draft(endpoint, Some(tangent.message)),
+                    "> The clock drifts.\n> \n> Should I pin it?\n"
+                );
+                mail.set_draft(endpoint, Some(tangent.message), "Pin it.".into());
+                mail.start_tangent(tangent);
+                assert_eq!(mail.draft(endpoint, Some(tangent.message)), "Pin it.");
+            })
+        });
+    }
 
     #[gpui::test]
     fn a_queued_idea_is_findable_until_its_post_is_in_the_log(cx: &mut gpui::TestAppContext) {
@@ -1470,6 +1548,7 @@ mod tests {
                         },
                         text: title.into(),
                         runtime: None,
+                        mode: None,
                     },
                     cx,
                 );
@@ -1565,6 +1644,7 @@ mod tests {
                         project: address,
                         text: title.into(),
                         runtime: Some(runtime.clone()),
+                        mode: Some(ProjectMode::PerIdea),
                     },
                     cx,
                 );
@@ -1586,6 +1666,11 @@ mod tests {
                     (id.0, &address, title)
                 );
                 assert_eq!(idea.runtime, Some(runtime.clone()));
+                assert_eq!(
+                    idea.mode,
+                    Some(ProjectMode::PerIdea),
+                    "the `in:` line is kept"
+                );
                 mail.withdraw_refused_idea(id, cx);
                 assert!(!mail.outbox.contains(id.0));
                 assert_eq!(status(mail, cx), Vec::<String>::new());

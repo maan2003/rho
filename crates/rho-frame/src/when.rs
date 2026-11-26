@@ -96,13 +96,26 @@ pub fn snooze_said(at: &Zoned, now: &Zoned) -> String {
 /// still today, the day in front of it when it is not, and the day alone
 /// when it ends at the start of one.
 pub fn until_said(at: &Zoned, now: &Zoned) -> String {
+    format!("until {}", clock_said(at, now))
+}
+
+/// A note's reminder, on its status line and its row in `Notes`: when it
+/// comes due, as [`until_said`] says it, or that it is due.
+pub fn reminder_said(at: &Zoned, now: &Zoned) -> String {
+    match at.timestamp() <= now.timestamp() {
+        true => "reminder due".to_owned(),
+        false => format!("reminder {}", clock_said(at, now)),
+    }
+}
+
+fn clock_said(at: &Zoned, now: &Zoned) -> String {
     match (
         at.date() == now.date(),
         at.time() == jiff::civil::Time::midnight(),
     ) {
-        (true, _) => format!("until {}", at.strftime("%H:%M")),
-        (false, true) => format!("until {}", at.strftime("%a %-d %b")),
-        (false, false) => format!("until {}", at.strftime("%a %-d %b %H:%M")),
+        (true, _) => at.strftime("%H:%M").to_string(),
+        (false, true) => at.strftime("%a %-d %b").to_string(),
+        (false, false) => at.strftime("%a %-d %b %H:%M").to_string(),
     }
 }
 

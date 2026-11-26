@@ -8,8 +8,8 @@ use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
     GccpState, GitDecision, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
-    IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus,
-    Request, Snapshot,
+    IrohApprove, IrohDevice, IrohDevices, IrohPair, IrohRevoke, IrohTrustInMemory, Open,
+    PlatformSecretsSet, PlatformStatus, Request, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -21,6 +21,7 @@ use crate::{Services, debug};
 pub(crate) async fn serve<R, W>(
     services: Arc<Services>,
     iroh_auth: rho_iroh_auth::IrohAuth,
+    caller: iroh::EndpointId,
     open: Open,
     reader: R,
     mut writer: W,
@@ -31,7 +32,9 @@ where
 {
     match open {
         Open::GitProvider => serve_git_provider(services, reader, writer).await,
-        Open::Request(request) => serve_call(&services, &iroh_auth, request, &mut writer).await,
+        Open::Request(request) => {
+            serve_call(&services, &iroh_auth, caller, request, &mut writer).await
+        }
         Open::GitTransport { request } => {
             serve_git_transport_request(&services.git_transport, reader, writer, request).await
         }
@@ -162,10 +165,11 @@ where
     write_frame(writer, &Answer::from(reply)).await
 }
 
-/// One call stream's call.
+/// One call stream's call, from the client with the key `caller`.
 async fn serve_call<W>(
     services: &Arc<Services>,
     iroh_auth: &rho_iroh_auth::IrohAuth,
+    caller: iroh::EndpointId,
     request: Request,
     writer: &mut W,
 ) -> anyhow::Result<()>
@@ -265,6 +269,21 @@ where
                 let host = services.pool.gccp_revoke(host).await;
                 anyhow::ensure!(client || host, "this iroh endpoint is not approved");
                 Ok(endpoint_text(endpoint_id))
+            })
+            .await
+        }
+        Request::IrohDevices(call) => {
+            respond(writer, call, |IrohDevices| async move {
+                Ok(iroh_auth
+                    .trusted_clients()
+                    .await
+                    .into_iter()
+                    .map(|client| IrohDevice {
+                        endpoint_id: endpoint_text(client.endpoint_id),
+                        trusted_at_unix_secs: client.trusted_at_unix_secs,
+                        asking: client.endpoint_id == caller,
+                    })
+                    .collect())
             })
             .await
         }

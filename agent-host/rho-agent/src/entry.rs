@@ -196,6 +196,9 @@ pub enum RequestNotice {
         thread: rho_agent_types::MessageId,
         minutes: u64,
     },
+    /// The last turn failed, and what it ran on has changed since: the
+    /// user switched the Claude account.
+    Relaunched,
 }
 
 impl RequestNotice {
@@ -221,6 +224,9 @@ impl RequestNotice {
             }
             Self::Checkin => "Check-in: nothing new.",
             Self::NothingNew => "Nothing new.",
+            Self::Relaunched => {
+                "Your last request failed, and the user has since switched the account you run on. Carry on from where you stopped."
+            }
             Self::ThreadCold { thread, minutes } => return format!(
                 "Thread #{} is cold after {minutes} minutes away. The next pinging mail should let the user answer without opening the history. Put the needed context under a ## recap heading.",
                 thread.0.0

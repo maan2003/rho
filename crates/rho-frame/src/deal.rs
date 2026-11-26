@@ -69,7 +69,7 @@ impl Frame {
 
     /// The project `address` is in, or is, from the system that keeps
     /// projects.
-    pub(crate) fn project_of(&self, address: &Address, cx: &gpui::App) -> Option<Project> {
+    pub fn project_of(&self, address: &Address, cx: &gpui::App) -> Option<Project> {
         self.systems
             .iter()
             .find_map(|system| system.project(address, cx))
@@ -258,7 +258,8 @@ impl Frame {
 
     /// A verdict on `address`, said in `verb`'s words. The surface showing
     /// the card closes and the next is dealt; a row on Desk stays where
-    /// the reader is.
+    /// the reader is, and so does a screen that was no waiting card, such
+    /// as a note the user sets a reminder on.
     pub fn verdict(
         &mut self,
         address: &Address,
@@ -268,6 +269,7 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         tracing::debug!(address = %address, ?verdict, "verdict");
+        let waited = self.waits(address);
         let called = self.called(address, cx);
         let seen = self.seen(address, cx);
         let fact = crate::attention::Attention::fact(address, &verdict, seen);
@@ -288,7 +290,7 @@ impl Frame {
             skip_until: None,
         });
         let said = format!("{verb}: {called}");
-        if matches!(verdict, Verdict::Unmute) {
+        if matches!(verdict, Verdict::Unmute) || !waited {
             self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
             return;

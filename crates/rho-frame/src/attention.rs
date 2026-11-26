@@ -144,6 +144,16 @@ impl Attention {
         futures::executor::block_on(self.streams.set_secret(secret))
     }
 
+    /// A phrase for a user who has none yet.
+    pub fn make_secret(&self) -> anyhow::Result<Secret> {
+        futures::executor::block_on(self.streams.make_secret())
+    }
+
+    /// The user keeps this device to itself, and is not asked again.
+    pub fn decline(&self) {
+        futures::executor::block_on(self.streams.ledger().decline());
+    }
+
     /// Says `writes` on this device, and returns what takes each back and
     /// which addresses moved.
     pub fn say(&mut self, writes: Vec<Write>) -> (Vec<Takeback>, BTreeSet<Address>) {
@@ -220,8 +230,6 @@ impl Attention {
             ),
             // The status line says it for as long as it lasts.
             LedgerEvent::NeedsKey => (BTreeSet::new(), Vec::new()),
-            // The frame shows it, once.
-            LedgerEvent::SecretMade(_) => (BTreeSet::new(), Vec::new()),
         }
     }
 
@@ -247,20 +255,7 @@ impl Frame {
         &self.attention.marks
     }
 
-    pub(crate) fn ledger_event(
-        &mut self,
-        event: LedgerEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let LedgerEvent::SecretMade(secret) = &event {
-            self.show_secret(
-                *secret,
-                "write down your secret phrase · it pairs your other devices · enter:",
-                window,
-                cx,
-            );
-        }
+    pub(crate) fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
         let (touched, said) = self.attention.ledger_event(event);
         for line in said {
             self.echo(&line, StyleClass::SystemInfo, cx);
@@ -270,10 +265,31 @@ impl Frame {
         cx.notify();
     }
 
-    /// The phrase on the prompt line, for the user to write down: when the
-    /// first device makes it, and by name (`show my secret phrase`) on a
-    /// device that holds it. Enter or escape puts it away. The phrase is a
-    /// row under the question rather than the question itself, since the
+    /// Asks whether the user holds a phrase ([`Frame::prompt_pair`]) when
+    /// the window starts on a device that has never asked. It waits while
+    /// a prompt or a menu is open or an idea is being written, rather
+    /// than take keys meant for them.
+    pub fn ask_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pairing_due = self.attention.pairing() == Pairing::Unasked;
+        self.ask_pairing_when_free(window, cx);
+    }
+
+    /// Asks the question [`Frame::ask_pairing`] keeps, once nothing the
+    /// user is in the middle of would lose keys to it.
+    pub(crate) fn ask_pairing_when_free(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pairing_due || self.is_asking() || self.current_surface().composes(cx) {
+            return;
+        }
+        self.pairing_due = false;
+        if self.attention.pairing() == Pairing::Unasked {
+            self.prompt_pair(String::new(), None, window, cx);
+        }
+    }
+
+    /// The phrase on the prompt line, for the user to write down: when a
+    /// new user makes it, and by name (`show secret phrase`) on a device
+    /// that holds it. Enter or escape puts it away. The phrase is a row
+    /// under the question rather than the question itself, since the
     /// journal keeps every question asked.
     pub(crate) fn show_secret(
         &mut self,
@@ -298,9 +314,11 @@ impl Frame {
         }
     }
 
-    /// `pair this device`: asks for the phrase another device made, word
-    /// by word with completion. A phrase that is wrong asks again with
-    /// what was typed, and says what is wrong with it.
+    /// `pair device`, and what a new device asks once: the phrase another
+    /// device made, word by word with completion, or nothing for a new
+    /// user, who is given one to write down. A phrase that is wrong asks
+    /// again with what was typed, and says what is wrong with it. Escape
+    /// keeps the device to itself.
     pub(crate) fn prompt_pair(
         &mut self,
         typed: String,
@@ -310,9 +328,9 @@ impl Frame {
     ) {
         let prompt = match problem {
             Some(problem) => format!("secret phrase ({problem}):"),
-            None => "secret phrase:".to_owned(),
+            None => "secret phrase · enter alone makes a new one:".to_owned(),
         };
-        self.open_prompt(
+        self.open_prompt_cancellable(
             prompt,
             Rc::new(|_, input, _| {
                 let word = &input[token_start(input)..];
@@ -327,6 +345,21 @@ impl Frame {
                     .collect()
             }),
             Rc::new(|frame, input, window, cx| {
+                if input.trim().is_empty() {
+                    match frame.attention.make_secret() {
+                        Ok(secret) => frame.show_secret(
+                            secret,
+                            "write down your secret phrase · it pairs your other devices · enter:",
+                            window,
+                            cx,
+                        ),
+                        Err(problem) => {
+                            frame.prompt_pair(input, Some(problem.to_string()), window, cx)
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 let paired = Secret::from_words(&input)
                     .and_then(|secret| frame.attention.pair(secret).map_err(|e| e.to_string()));
                 match paired {
@@ -339,6 +372,10 @@ impl Frame {
                 }
                 cx.notify();
             }),
+            Some(Rc::new(|frame, _, cx| {
+                frame.attention.decline();
+                cx.notify();
+            })),
             window,
             cx,
         );

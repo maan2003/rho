@@ -56,6 +56,23 @@ pub static SET_PROJECT_RUNTIME: Spelling = Spelling {
     argument: Some("runtime"),
 };
 
+pub static RENAME_PROJECT: Spelling = Spelling {
+    name: "rename project",
+    aliases: &[("project name", 7), ("rename", 4)],
+    argument: Some("new name"),
+};
+
+pub static RETIRE_PROJECT: Spelling = Spelling {
+    name: "retire project",
+    aliases: &[
+        ("archive project", 8),
+        ("close project", 7),
+        ("remove project", 6),
+        ("delete project", 5),
+    ],
+    argument: Some("project"),
+};
+
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
 /// A validated project name on the host that will own it.
@@ -125,6 +142,9 @@ impl ChatSystem {
         let create = this.clone();
         let place = this.clone();
         let mode = this.clone();
+        let rename = this.clone();
+        let retire = this.clone();
+        let here_name = here_config.as_ref().map(|(address, _)| address.clone());
         vec![
             Command::new(&NEW_PROJECT, move |frame, named, window, cx| match named {
                 Some(named) => Self::new_project_named(create.clone(), &named, frame, window, cx),
@@ -139,7 +159,7 @@ impl ChatSystem {
                         let change = this.clone();
                         let accept: PlaceAnswer = Rc::new(move |_, place, _, cx| {
                             change.update(cx, |mail, cx| {
-                                mail.change_project(project, ProjectChange::Place(place), cx)
+                                mail.change_project(project, ProjectChange::Place(place), None, cx)
                             });
                         });
                         match &typed {
@@ -183,7 +203,7 @@ impl ChatSystem {
                         let change = this.clone();
                         let accept: ModeAnswer = Rc::new(move |_, mode, _, cx| {
                             change.update(cx, |mail, cx| {
-                                mail.change_project(project, ProjectChange::Mode(mode), cx)
+                                mail.change_project(project, ProjectChange::Mode(mode), None, cx)
                             });
                         });
                         match &typed {
@@ -221,7 +241,12 @@ impl ChatSystem {
                         let change = runtime.clone();
                         let accept: RuntimeAnswer = Rc::new(move |_, runtime, _, cx| {
                             change.update(cx, |mail, cx| {
-                                mail.change_project(project, ProjectChange::Runtime(runtime), cx)
+                                mail.change_project(
+                                    project,
+                                    ProjectChange::Runtime(runtime),
+                                    None,
+                                    cx,
+                                )
                             });
                         });
                         let current = config.runtime;
@@ -250,6 +275,118 @@ impl ChatSystem {
                 );
             })
             .target(target(&|config| config.runtime.to_string())),
+            Command::new(&RENAME_PROJECT, move |frame, typed, window, cx| {
+                let this = rename.clone();
+                Self::for_project(
+                    rename.clone(),
+                    here,
+                    Rc::new(move |frame, project, address, window, cx| {
+                        let change = this.clone();
+                        let was = address.clone();
+                        let accept = Rc::new(
+                            move |frame: &mut Frame, input: String, cx: &mut Context<Frame>| {
+                                match ProjectName::parse(&input) {
+                                    Ok(name) => change.update(cx, |mail, cx| {
+                                        let done = format!("renamed: {was} → {}", name.as_str());
+                                        mail.change_project(
+                                            project,
+                                            ProjectChange::Name(name),
+                                            Some(done),
+                                            cx,
+                                        )
+                                    }),
+                                    Err(reason) => echo_invalid(frame, &RENAME_PROJECT, reason, cx),
+                                }
+                            },
+                        );
+                        match &typed {
+                            Some(typed) => accept(frame, typed.clone(), cx),
+                            None => {
+                                let current = address.clone();
+                                frame.open_prompt(
+                                    format!("rename {address} to:"),
+                                    Rc::new(|_, _, _| Vec::new()),
+                                    Rc::new(move |frame, input, _, cx| accept(frame, input, cx)),
+                                    window,
+                                    cx,
+                                );
+                                if let Some(prompt) = frame.minibuffer_mut() {
+                                    let (name, _) = names::split(&current);
+                                    prompt.set_input(name.to_owned(), window, cx);
+                                }
+                            }
+                        }
+                    }),
+                    frame,
+                    window,
+                    cx,
+                );
+            })
+            .target(
+                here_name
+                    .clone()
+                    .unwrap_or_else(|| "pick project…".to_owned()),
+            ),
+            // Always asked, with the project in view first, so a project
+            // is never retired by the screen alone.
+            Command::new(&RETIRE_PROJECT, move |frame, typed, window, cx| {
+                let this = retire.clone();
+                let done = Rc::new(
+                    move |frame: &mut Frame, input: &str, cx: &mut Context<Frame>| {
+                        let found = {
+                            let mail = this.read(cx);
+                            mail.project_named(input)
+                                .and_then(|project| Some((project, mail.project_address(project)?)))
+                        };
+                        match found {
+                            Some((project, address)) => this.update(cx, |mail, cx| {
+                                mail.change_project(
+                                    project,
+                                    ProjectChange::Retire,
+                                    Some(format!("retired: {address}")),
+                                    cx,
+                                )
+                            }),
+                            None => frame.echo(
+                                "retire project: no such project",
+                                StyleClass::SystemInfo,
+                                cx,
+                            ),
+                        }
+                    },
+                );
+                if let Some(typed) = &typed {
+                    return done(frame, typed.trim(), cx);
+                }
+                let names = retire.clone();
+                let first = here.and_then(|project| retire.read(cx).project_address(project));
+                frame.open_prompt(
+                    "retire project:",
+                    Rc::new(move |_, needle, cx| {
+                        let mail = names.read(cx);
+                        let needle = needle.trim().to_lowercase();
+                        let mut projects: Vec<_> = mail
+                            .idea_projects()
+                            .into_iter()
+                            .filter(|project| project.contains(&needle))
+                            .collect();
+                        projects.sort_by_key(|project| first.as_ref() != Some(&project.name));
+                        projects
+                            .into_iter()
+                            .map(|project| Candidate {
+                                description: mail
+                                    .project_details(project.thread)
+                                    .unwrap_or_default(),
+                                value: project.name,
+                            })
+                            .collect()
+                    }),
+                    Rc::new(move |frame, input, _, cx| done(frame, &input, cx)),
+                    window,
+                    cx,
+                );
+            })
+            .target(here_name.unwrap_or_else(|| "pick project…".to_owned())),
         ]
     }
 
@@ -369,16 +506,21 @@ impl ChatSystem {
             this.clone(),
             NewProject { host, name },
             None,
+            None,
             frame,
             window,
             cx,
         );
     }
 
+    /// Asks where, how and on what the new project works. `runtime` is
+    /// the `on:` line of the idea that named it, which `runtime:` offers
+    /// first when the host knows it.
     pub(super) fn prompt_project(
         this: Entity<Self>,
         project: NewProject,
         created: Option<ProjectCreated>,
+        runtime: Option<&str>,
         frame: &mut Frame,
         window: &mut Window,
         cx: &mut Context<Frame>,
@@ -387,7 +529,9 @@ impl ChatSystem {
         let Some(catalogue) = this.read(cx).runtime_catalogue(project.host) else {
             return host_away(frame, cx);
         };
-        let Some(default) = catalogue.default_runtime().cloned() else {
+        let written = runtime.and_then(|runtime| catalogue.label(runtime).ok());
+        let description = if written.is_some() { "on:" } else { "default" };
+        let Some(default) = written.or_else(|| catalogue.default_runtime().cloned()) else {
             return frame.echo(
                 "new project: the host offers no runtime",
                 StyleClass::SystemInfo,
@@ -419,7 +563,7 @@ impl ChatSystem {
                             prompt.clone(),
                             catalogue.clone(),
                             default.clone(),
-                            "default",
+                            description,
                             Rc::new(move |_, runtime, _, cx| {
                                 this.update(cx, |mail, cx| {
                                     mail.create_project(
@@ -522,7 +666,15 @@ impl ChatSystem {
         );
     }
 
-    fn change_project(&self, project: ThreadId, change: ProjectChange, cx: &mut Context<Self>) {
+    /// Asks the project's host for `change`; the echo says `done` once
+    /// the host has made it, or why it would not.
+    fn change_project(
+        &self,
+        project: ThreadId,
+        change: ProjectChange,
+        done: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.call(
             project.host,
             ChangeProject {
@@ -530,14 +682,17 @@ impl ChatSystem {
                 change,
             },
             cx,
-            |mail, result, cx| {
-                if let Err(error) = result {
-                    mail.frame.echo(
-                        format!("project: {error:#}"),
-                        StyleClass::SystemImportant,
-                        cx,
-                    );
+            move |mail, result, cx| match result {
+                Ok(()) => {
+                    if let Some(done) = done {
+                        mail.frame.echo(done, StyleClass::SystemInfo, cx);
+                    }
                 }
+                Err(error) => mail.frame.echo(
+                    format!("project: {error:#}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                ),
             },
         );
     }
@@ -813,6 +968,78 @@ mod tests {
         );
     }
 
+    /// `Start a project` from an idea: the runtime prompt starts on the
+    /// draft's `on:` line when the host knows it, and on the host's default
+    /// otherwise.
+    #[gpui::test]
+    fn a_new_project_starts_on_the_runtime_the_idea_wrote(cx: &mut gpui::TestAppContext) {
+        use super::super::idea::tests::init;
+        let (window, mail, _db) = init(cx);
+        let endpoint = EndpointId([3; 32]);
+        let first_runtime = |written: Option<&'static str>, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, window, cx| {
+                    ChatSystem::prompt_project(
+                        mail.clone(),
+                        NewProject {
+                            host: endpoint,
+                            name: ProjectName::parse("kelp").unwrap(),
+                        },
+                        None,
+                        written,
+                        frame,
+                        window,
+                        cx,
+                    );
+                    frame
+                        .minibuffer_mut()
+                        .unwrap()
+                        .set_input("/srv/kelp".into(), window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            // The place, then the mode as offered.
+            for _ in 0..2 {
+                cx.dispatch_action(window.into(), rho_frame::keys::MinibufferConfirm);
+                cx.run_until_parked();
+            }
+            let first = window
+                .update(cx, |frame, _, _| {
+                    let prompt = frame.minibuffer_mut().unwrap();
+                    assert_eq!(prompt.prompt(), "kelp runtime:");
+                    prompt
+                        .selected_candidate()
+                        .map(|(row, _)| (row.value, row.description))
+                })
+                .unwrap();
+            cx.dispatch_action(window.into(), rho_frame::keys::MinibufferCancel);
+            cx.run_until_parked();
+            first
+        };
+        let default = cx.update(|cx| {
+            mail.read(cx)
+                .runtime_catalogue(endpoint)
+                .unwrap()
+                .default_runtime()
+                .unwrap()
+                .to_string()
+        });
+        assert_ne!(default, "haiku-low", "the case tells the two apart");
+        assert_eq!(
+            first_runtime(Some("haiku-low"), cx),
+            Some(("haiku-low".to_owned(), "on:".to_owned()))
+        );
+        assert_eq!(
+            first_runtime(None, cx),
+            Some((default.clone(), "default".to_owned()))
+        );
+        assert_eq!(
+            first_runtime(Some("no-such-runtime"), cx),
+            Some((default, "default".to_owned())),
+            "a word the host does not know is no runtime"
+        );
+    }
+
     /// Every project command is in `Commands`, from Desk and from a
     /// thread alike, by its flat name, and asks for a project where the
     /// screen names none.
@@ -846,6 +1073,8 @@ mod tests {
                     ("set project place", pick.clone()),
                     ("set project mode", pick.clone()),
                     ("set project runtime", pick.clone()),
+                    ("rename project", pick.clone()),
+                    ("retire project", pick.clone()),
                 ]
             );
         }

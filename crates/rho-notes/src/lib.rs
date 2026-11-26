@@ -9,13 +9,18 @@
 //! note's text: every revision this crate says is a buffer's text as the user
 //! left it.
 //!
-//! Notes stay off Desk. The `list notes` command opens [`NotesView`], where the
-//! user can find or start a note without sending their words anywhere.
+//! Notes stay off Desk unless a reminder is due. A reminder is a snooze
+//! the user said on a note (`space s` on it): the same fact a snooze on a
+//! card is, synced sealed between their devices with the rest of the
+//! ledger, so no host or agent reads it. Once it is due the note claims a
+//! card ([`reminder_claims`]) until the user says done or snoozes it
+//! again. The `list notes` command opens [`NotesView`], where the user can
+//! find or start a note without sending their words anywhere.
 //!
 //! Addresses are `note:<id>`
 //! ([SPEC-note-addresses](../specs/SPEC-note-addresses.md)), and the list
-//! of them is `notes:all`. A note is never a card: the dealer reads
-//! nothing of the deadlines older builds wrote on notes.
+//! of them is `notes:all`. The dealer reads nothing of the deadlines older
+//! builds wrote on notes.
 
 pub(crate) mod list;
 mod view;
@@ -27,8 +32,10 @@ use std::time::Duration;
 use gpui::{App, AppContext as _, Context, EventEmitter, Subscription, Task, Window};
 use jiff::Timestamp;
 pub use list::NotesView;
-use rho_dealer::facts::Fact;
-use rho_dealer::{Address, Addressed, Marks};
+use rho_dealer::curve::{Curve, REMINDER_HEAD_START};
+use rho_dealer::facts::{Fact, Snooze};
+use rho_dealer::rank::{CardKind, Trace};
+use rho_dealer::{Address, Addressed, Claim, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{
     AnySurface, Command, Found, FoundText, Frame, FrameLink, Opening, Point, SearchPoint, Spelling,
@@ -151,6 +158,38 @@ fn new_note_marks(note: NoteId, about: Option<&Address>) -> Vec<Write> {
         .collect()
 }
 
+/// The reminder the user set on `note`, due or not: its last snooze,
+/// unless done took it back.
+fn reminder(marks: &Marks, note: &Address) -> Option<Snooze> {
+    marks.get(note).facts().snooze()
+}
+
+/// Every note with a reminder, as a card waiting from when it is due:
+/// the dealer holds it back until then, as it holds any snoozed card.
+/// `title` reads a note's first line.
+fn reminder_claims(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Claim> {
+    marks
+        .notes()
+        .filter_map(|(address, _)| {
+            let note = NoteId::from_address(address)?;
+            let snooze = reminder(marks, address)?;
+            let mut claim = Claim::new(
+                address.clone(),
+                Curve::Waiting {
+                    head_start: REMINDER_HEAD_START,
+                    since: snooze.until,
+                },
+                CardKind::Due,
+                // Snoozed again, it is another reminder: a skip of the
+                // last one does not hold it.
+                snooze.set.timestamp().to_string(),
+            );
+            claim.title = title(note);
+            Some(claim)
+        })
+        .collect()
+}
+
 /// The mail's words and the thread's title can be different.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReplyContext {
@@ -166,6 +205,8 @@ struct Listed {
     preview: String,
     written: Timestamp,
     reply: Option<ReplyContext>,
+    /// When the reminder on it comes due, or came.
+    reminder: Option<Timestamp>,
 }
 
 /// Match every typed term across the entire body, in any order, without
@@ -189,6 +230,7 @@ fn listed(marks: &Marks, query: &str, place: impl Fn(&Address) -> ReplyContext) 
                 preview: excerpt(body.lines().skip(1).flat_map(str::split_whitespace)),
                 written: Timestamp::from_millisecond(held.written_ms?).ok()?,
                 reply: held.about.as_ref().map(&place),
+                reminder: reminder(marks, address).map(|snooze| snooze.until),
             })
         })
         .collect();
@@ -363,6 +405,15 @@ impl NoteSystem {
         });
     }
 
+    /// What `note` is called: its first line as the user is typing it,
+    /// else as written.
+    fn title(&self, marks: &Marks, note: NoteId) -> String {
+        match self.pending_text(note) {
+            Some(text) => title_of(text),
+            None => note_title(marks, &note.address()),
+        }
+    }
+
     fn pending_text(&self, note: NoteId) -> Option<&str> {
         self.typing(note)
             .then(|| self.search.body(&note).expect("pending note has text"))
@@ -472,20 +523,24 @@ impl System for NoteSystem {
     /// user types, else the one written.
     fn name(&self, address: &Address, marks: &Marks, _cx: &App) -> Option<(String, String)> {
         let note = NoteId::from_address(address)?;
-        let title = match self.pending_text(note) {
-            Some(text) => title_of(text),
-            None => note_title(marks, address),
-        };
-        Some((title, String::new()))
+        Some((self.title(marks, note), String::new()))
     }
 
     /// Every note, by its first line as the user is typing it, for
     /// `Places`.
     fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
-        found(marks, |note| match self.pending_text(note) {
-            Some(text) => title_of(text),
-            None => note_title(marks, &note.address()),
-        })
+        found(marks, |note| self.title(marks, note))
+    }
+
+    /// The notes whose reminders are set; each deals once it is due.
+    fn claims(
+        &self,
+        marks: &Marks,
+        _now: Timestamp,
+        _trace: Option<&mut Trace>,
+        _cx: &App,
+    ) -> Vec<Claim> {
+        reminder_claims(marks, |note| self.title(marks, note))
     }
 
     fn text_sources(&self, search: &mut TextSearch, _current: &Address, _cx: &App) {

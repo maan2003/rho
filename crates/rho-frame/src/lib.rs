@@ -32,6 +32,7 @@ pub mod command;
 mod commands;
 pub mod deal;
 mod desk;
+mod devices;
 pub mod focus;
 pub mod frame;
 mod gccp;
@@ -91,6 +92,8 @@ pub static SPELLINGS: &[&Spelling] = &[
     &gccp::LIST_GCCP,
     &gccp::APPROVE_GCCP,
     &gccp::REMOVE_GCCP,
+    &devices::LIST_DEVICES,
+    &devices::REVOKE_DEVICE,
 ];
 
 /// The key context every surface is drawn in. A system binds its keys

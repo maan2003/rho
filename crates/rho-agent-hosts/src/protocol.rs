@@ -69,6 +69,8 @@ rho_rpc::calls! {
         IrohTrustInMemory(IrohTrustInMemory) -> ();
         /// Answered with the revoked endpoint id.
         IrohRevoke(IrohRevoke) -> String;
+        /// Answered with every device the host trusts for good.
+        IrohDevices(IrohDevices) -> Vec<IrohDevice>;
         /// Answered with a `rho://` pairing link, good for one client for
         /// ten minutes.
         IrohPair(IrohPair) -> String;
@@ -145,12 +147,29 @@ pub struct IrohTrustInMemory {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohPair;
 
-/// Revokes what an iroh endpoint was approved as: a client's persistent
-/// trust, or a GCCP host's approval with every acceptance of an address on
-/// it.
+/// Revokes what an iroh endpoint was approved as: a client's trust, with
+/// every connection it has open, or a GCCP host's approval with every
+/// acceptance of an address on it.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohRevoke {
     pub endpoint_id: String,
+}
+
+/// Lists the devices the host trusts for good, each by its key: those an
+/// `IrohApprove` or a pairing link trusted. `IrohRevoke` takes one back.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct IrohDevices;
+
+/// A device the host trusts, as [`IrohDevices`] lists it.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct IrohDevice {
+    /// Its endpoint id: 52 of z-base-32.
+    pub endpoint_id: String,
+    /// When the host came to trust it, in seconds since the Unix epoch on
+    /// the host's clock.
+    pub trusted_at_unix_secs: u64,
+    /// The call came over this key: it is the device that asks.
+    pub asking: bool,
 }
 
 /// Lists whom the host talks to over GCCP: the harnesses the user

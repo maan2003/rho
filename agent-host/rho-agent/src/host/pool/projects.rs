@@ -50,6 +50,8 @@ pub struct ProjectIdea {
     pub content: Vec<ContentPart>,
     pub host_label: String,
     pub runtime: Option<RuntimeLabel>,
+    /// The idea's `in:` line; without one, the project's mode.
+    pub mode: Option<ProjectMode>,
 }
 
 impl AgentPool {
@@ -142,11 +144,12 @@ impl AgentPool {
             .read()
             .project(id)
             .context("no such project on this host")?;
+        let at = UnixMs::now();
         let config = match change {
             // A new place or mode needs a new agent; the runtime is a
             // default for the next new agent, not a change to one running.
             ProjectChange::Place(place) => {
-                write.clear_standing_agent(id);
+                write.set_standing_agent(at, id, None);
                 ProjectConfig {
                     place,
                     ..held.clone()
@@ -154,7 +157,7 @@ impl AgentPool {
             }
             ProjectChange::Mode(mode) => {
                 if mode != held.mode {
-                    write.clear_standing_agent(id);
+                    write.set_standing_agent(at, id, None);
                 }
                 ProjectConfig {
                     mode,
@@ -165,11 +168,29 @@ impl AgentPool {
                 runtime,
                 ..held.clone()
             },
+            // The name is the anchor's thread name, which every thread of
+            // the project reads its address from.
+            ProjectChange::Name(name) => {
+                let read = self.db.read();
+                if let Some(other) = read.project_named(name.as_str()) {
+                    ensure!(other == id.0, "project {} already exists", name.as_str());
+                }
+                drop(read);
+                write.name(at, id.0, name.as_str().to_owned())?;
+                write.commit();
+                return Ok(());
+            }
+            // Its agents keep their work; only new ideas are refused.
+            ProjectChange::Retire => {
+                write.retire_project(at, id);
+                write.commit();
+                return Ok(());
+            }
         };
         if config == held {
             return Ok(());
         }
-        write.set_project(UnixMs::now(), id, config);
+        write.set_project(at, id, config);
         write.commit();
         Ok(())
     }
@@ -188,6 +209,10 @@ impl AgentPool {
                 read.root_of(idea.parent) == Some(idea.project.0),
                 "idea is not under this project"
             );
+            ensure!(
+                !read.project_retired(idea.project),
+                "the project is retired"
+            );
             if let Some(target) = idea.failed_start {
                 ensure!(
                     read.message(target).is_some_and(|failed| {
@@ -203,7 +228,7 @@ impl AgentPool {
             {
                 return Ok(ProjectIdeaResult::Posted(message));
             }
-            let standing = match config.mode {
+            let standing = match idea.mode.unwrap_or(config.mode) {
                 ProjectMode::One if posted.is_none() => read
                     .standing_agent(idea.project)
                     .and_then(|agent| read.agent(agent).map(|head| (agent, head))),
@@ -285,8 +310,8 @@ impl AgentPool {
                 if origin != message {
                     write.deliver(agent, message);
                 }
-                if config.mode == ProjectMode::One {
-                    write.set_standing_agent(idea.project, agent);
+                if idea.mode.unwrap_or(config.mode) == ProjectMode::One {
+                    write.set_standing_agent(UnixMs::now(), idea.project, Some(agent));
                 }
             }
             Err(error) => {

@@ -57,6 +57,10 @@ pub struct HostChat {
     names: HashMap<MessageId, String>,
     /// Each project's newest settings, by its anchor.
     projects: BTreeMap<MessageId, ProjectConfig>,
+    /// The agent that stands for each project that has one, by its anchor.
+    standing: BTreeMap<MessageId, AgentId>,
+    /// The projects the user retired, by their anchors.
+    retired: BTreeSet<MessageId>,
     work: BTreeMap<MessageId, ThreadWork>,
     /// What each agent last said about each thread: joined or left.
     members: BTreeMap<(MessageId, AgentId), bool>,
@@ -124,6 +128,17 @@ impl HostChat {
                 }
                 #[cfg(not(feature = "ui"))]
                 let _ = was;
+                Told::Thread(project.0)
+            }
+            ChatEvent::Standing { project, agent } => {
+                match agent {
+                    Some(agent) => self.standing.insert(project.0, *agent),
+                    None => self.standing.remove(&project.0),
+                };
+                Told::Thread(project.0)
+            }
+            ChatEvent::Retired { project } => {
+                self.retired.insert(project.0);
                 Told::Thread(project.0)
             }
             ChatEvent::Joined { thread, agent } => {
@@ -277,6 +292,24 @@ impl HostChat {
             name: self.name(root)?,
             config: self.projects.get(&root)?.clone(),
         })
+    }
+
+    /// Whether the user retired the project anchored at `root`.
+    pub fn is_retired(&self, root: MessageId) -> bool {
+        self.retired.contains(&root)
+    }
+
+    /// Every project's standing agent, by the project's anchor.
+    pub fn standing_agents(&self) -> impl Iterator<Item = (MessageId, AgentId)> + '_ {
+        self.standing.iter().map(|(root, agent)| (*root, *agent))
+    }
+
+    /// The project `agent` stands for, by its anchor, while it does.
+    pub fn standing_for(&self, agent: AgentId) -> Option<MessageId> {
+        self.standing
+            .iter()
+            .find(|(_, standing)| **standing == agent)
+            .map(|(root, _)| *root)
     }
 
     /// Every live project, oldest first.

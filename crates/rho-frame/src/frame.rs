@@ -138,6 +138,9 @@ pub struct Frame {
     pub(crate) place: place::Writer,
     last_input: Option<Timestamp>,
     focus_lost: Option<Instant>,
+    /// The question whether to pair this device waits to be asked
+    /// ([`Frame::ask_pairing`]).
+    pub(crate) pairing_due: bool,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -243,6 +246,7 @@ impl Frame {
             place: place::Writer::spawn(db.clone()),
             last_input,
             focus_lost: None,
+            pairing_due: false,
             _subscriptions: vec![menu_keys, activation, desk_selection],
             _tasks: Vec::new(),
         };
@@ -253,9 +257,9 @@ impl Frame {
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
-                let updated = this.update_in(cx, |this, window, cx| {
+                let updated = this.update(cx, |this, cx| {
                     for event in batch {
-                        this.ledger_event(event, window, cx);
+                        this.ledger_event(event, cx);
                     }
                 });
                 if updated.is_err() {
@@ -447,7 +451,7 @@ impl Frame {
         let current = self.current_surface();
         let subject = current.subject(self.card_seen(&surface, cx), cx);
         let card = match current.card(cx) {
-            CardHere::Itself => Some(surface.clone()),
+            CardHere::Itself | CardHere::Reminder => Some(surface.clone()),
             CardHere::Row(row) => row,
             CardHere::Inspected => match self.recent.current() {
                 ScreenEntry::Inspection(inspection) if self.waits(&inspection.address) => {
@@ -487,7 +491,7 @@ impl Frame {
             .filter(|address| address == self.current_address())
     }
 
-    fn waits(&self, address: &Address) -> bool {
+    pub(crate) fn waits(&self, address: &Address) -> bool {
         self.hand()
             .cards
             .iter()
@@ -548,7 +552,9 @@ impl Frame {
     }
 
     /// A place not yet made whose system resolves it later (`visit`) is
-    /// the system's to show; everything else shows now.
+    /// the system's to show. A note about a line another screen shows, a
+    /// private reply under its message, is read there, at that line.
+    /// Everything else shows now.
     fn open_by(
         &mut self,
         address: Address,
@@ -556,6 +562,16 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(about) = self.attention.marks.get(&address).about.clone()
+            && let Some(screen) = self.shown_in(&about, cx)
+        {
+            let at = crate::SearchPoint::Message {
+                message: about,
+                line: 0,
+            };
+            self.open_at(screen, &at, window, cx);
+            return;
+        }
         if !self.surfaces.contains_key(&address)
             && self
                 .systems
@@ -672,6 +688,7 @@ impl Frame {
         self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
+        self.ask_pairing_when_free(window, cx);
         cx.notify();
     }
 
@@ -714,6 +731,7 @@ impl Frame {
         self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
+        self.ask_pairing_when_free(window, cx);
         cx.notify();
     }
 
@@ -779,6 +797,7 @@ impl Frame {
             self.settle(window, cx);
             self.close_overlays(window, cx);
             self.focus_surface(window, cx);
+            self.ask_pairing_when_free(window, cx);
         }
         self.moved();
         cx.notify();
@@ -887,9 +906,7 @@ impl Frame {
 
     fn close_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        if self.minibuffer.is_some() {
-            self.minibuffer_cancel(window, cx);
-        }
+        self.close_minibuffer(window, cx);
         self.overlay_return = None;
     }
 
@@ -903,9 +920,7 @@ impl Frame {
             );
             return;
         }
-        if self.minibuffer.is_some() {
-            self.minibuffer_cancel(window, cx);
-        }
+        self.close_minibuffer(window, cx);
         self.take_keyboard(window, cx);
         self.menu = Some(OpenMenu {
             transient: rows.transient(),
@@ -1289,12 +1304,24 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.current_address() == &hit.address {
+        self.open_at(hit.address.clone(), &hit.point, window, cx);
+    }
+
+    /// Opens `address` with the point on `point` in it: a message in its
+    /// thread, a line in a note.
+    pub fn open_at(
+        &mut self,
+        address: Address,
+        point: &crate::SearchPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.current_address() == &address {
             true => self
                 .current_surface()
                 .clone()
-                .show_search_match(&hit.point, window, cx),
-            false => self.open_by(hit.address.clone(), Open::Search(&hit.point), window, cx),
+                .show_search_match(point, window, cx),
+            false => self.open_by(address, Open::Search(point), window, cx),
         }
     }
 
@@ -1368,6 +1395,7 @@ impl Frame {
         commands.extend(crate::focus::commands(self, cx));
         commands.extend(crate::hosts::commands(self));
         commands.extend(crate::gccp::commands());
+        commands.extend(crate::devices::commands());
         let surface = self.current_surface().clone();
         commands.extend(surface.commands(self.card_seen(self.current_address(), cx), window, cx));
         for system in self.systems.clone() {
@@ -1450,7 +1478,8 @@ impl Frame {
 
     /// `space`: the leader. On every screen `f` opens `Places` and, while
     /// there is a verdict to take back, `u` undoes it; on a waiting card,
-    /// its verdicts too, and on a muted one `m` unmutes it.
+    /// its verdicts too, and on a muted one `m` unmutes it. A reminder
+    /// takes `s` whether or not it waits, and only done besides.
     pub(crate) fn leader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.leader_rows(cx);
         self.open_menu(rows, window, cx);
@@ -1470,13 +1499,20 @@ impl Frame {
         rows.push(Row::run("f", "places", |frame, window, cx| {
             frame.places(window, cx)
         }));
-        match (card, waiting) {
-            (Some(target), _) if self.marks().get(&target).facts().muted() => {
+        match (card, waiting, self.reminder_in_view(cx)) {
+            (Some(target), _, _) if self.marks().get(&target).facts().muted() => {
                 rows.push(Row::run("m", "unmute", move |frame, window, cx| {
                     frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
                 }));
             }
-            (_, Some(target)) => {
+            // A reminder is never muted: it is the user's own.
+            (_, Some(target), Some(_)) => {
+                let [done, _mute] = verdict_rows(target.clone());
+                rows.push(done);
+                rows.push(Row::menu("s", snooze_rows(&target)));
+            }
+            (_, None, Some(target)) => rows.push(Row::menu("s", snooze_rows(&target))),
+            (_, Some(target), None) => {
                 match self.own_verdicts(&target, cx) {
                     // A card its system answers is never muted: it ends
                     // when it is answered, and until then it can only wait.
@@ -1498,6 +1534,18 @@ impl Frame {
     /// The card in view while it waits: what a verdict lands on.
     pub(crate) fn waiting_card(&self, cx: &App) -> Option<Address> {
         self.card_in_view(cx).filter(|address| self.waits(address))
+    }
+
+    /// The reminder the screen in view is, due or not.
+    fn reminder_in_view(&self, cx: &App) -> Option<Address> {
+        (self.current_surface().card(cx) == CardHere::Reminder)
+            .then(|| self.current_address().clone())
+    }
+
+    /// What a snooze lands on: the card in view while it waits, or the
+    /// reminder in view, which the user schedules before it ever waits.
+    pub(crate) fn snooze_target(&self, cx: &App) -> Option<Address> {
+        self.waiting_card(cx).or_else(|| self.reminder_in_view(cx))
     }
 
     /// The answers the system that owns `address` gives its cards in place
@@ -1605,10 +1653,25 @@ impl Frame {
         });
         self.give_keyboard_back(window, cx);
         submission(self, window, cx);
+        self.ask_pairing_when_free(window, cx);
         cx.notify();
     }
 
+    /// Escape on a prompt: it closes, and its asker hears that the user
+    /// said no ([`CancelHandler`]).
     pub(crate) fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_cancel = self.minibuffer.as_ref().and_then(Minibuffer::on_cancel);
+        self.close_minibuffer(window, cx);
+        if let Some(on_cancel) = on_cancel {
+            on_cancel(self, window, cx);
+        }
+        self.ask_pairing_when_free(window, cx);
+        cx.notify();
+    }
+
+    /// Closes the prompt without an answer, as a move away from it does:
+    /// its asker hears nothing.
+    fn close_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(minibuffer) = self.minibuffer.take() else {
             return;
         };
@@ -1619,11 +1682,7 @@ impl Frame {
                 false => minibuffer.input(cx),
             },
         });
-        let on_cancel = minibuffer.on_cancel();
         self.give_keyboard_back(window, cx);
-        if let Some(on_cancel) = on_cancel {
-            on_cancel(self, window, cx);
-        }
         cx.notify();
     }
 
@@ -1713,7 +1772,7 @@ impl Frame {
                     .0 == *title
                 })
         });
-        let unpaired = (self.echo.is_none() && self.attention.pairing() == Pairing::Unpaired)
+        let unpaired = (self.echo.is_none() && self.attention.pairing() != Pairing::Paired)
             .then_some(match layout {
                 Layout::Desktop => Some("verdicts stay on this device until it is paired"),
                 Layout::Phone => show_phone_notice.then_some("unpaired"),
@@ -3025,6 +3084,211 @@ mod tests {
             .unwrap();
     }
 
+    /// A screen the user schedules, as a note is; the point it was last
+    /// put on, as a thread shows a message.
+    struct Scheduled {
+        focus: gpui::FocusHandle,
+        card: CardHere,
+        shown: Rc<std::cell::RefCell<Option<crate::SearchPoint>>>,
+    }
+
+    impl gpui::Focusable for Scheduled {
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.focus.clone()
+        }
+    }
+
+    impl gpui::Render for Scheduled {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl crate::Surface for Scheduled {
+        fn title(&self, _: &App) -> String {
+            "Call the dentist".into()
+        }
+
+        fn card(&self, _: &App) -> CardHere {
+            self.card.clone()
+        }
+
+        fn show_search_match(
+            &mut self,
+            point: &crate::SearchPoint,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) {
+            *self.shown.borrow_mut() = Some(point.clone());
+        }
+    }
+
+    /// Notes, which are reminders, and threads, which show messages, with
+    /// the claims the test sets.
+    struct Reminders {
+        wants: Rc<std::cell::RefCell<Vec<rho_dealer::Claim>>>,
+        shown: Rc<std::cell::RefCell<Option<crate::SearchPoint>>>,
+    }
+
+    impl crate::System for Reminders {
+        fn kinds(&self) -> &'static [&'static str] {
+            &["note", "thread"]
+        }
+
+        fn open(&mut self, address: &Address, _: &mut Window, cx: &mut Context<Self>) -> Opening {
+            let card = match address.kind() {
+                "note" => CardHere::Reminder,
+                _ => CardHere::Itself,
+            };
+            let shown = self.shown.clone();
+            Opening::Surface(AnySurface::new(cx.new(|cx| Scheduled {
+                focus: cx.focus_handle(),
+                card,
+                shown,
+            })))
+        }
+
+        fn claims(
+            &self,
+            _: &rho_dealer::Marks,
+            _: Timestamp,
+            _: Option<&mut rho_dealer::rank::Trace>,
+            _: &App,
+        ) -> Vec<rho_dealer::Claim> {
+            self.wants.borrow().clone()
+        }
+
+        /// A message `thread/lab/7.3` is read in `thread/lab/7`.
+        fn shown_in(&self, address: &Address, _: &App) -> Option<Address> {
+            let (thread, _) = address.rest().split_once('.')?;
+            Some(Address::new("thread", thread))
+        }
+    }
+
+    fn reminders_frame(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Frame>,
+        Rc<std::cell::RefCell<Vec<rho_dealer::Claim>>>,
+        Rc<std::cell::RefCell<Option<crate::SearchPoint>>>,
+    ) {
+        let wants = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let shown = Rc::new(std::cell::RefCell::new(None));
+        let system = Reminders {
+            wants: wants.clone(),
+            shown: shown.clone(),
+        };
+        let frame = test_frame_with(cx, rho_db::RhoDb::in_memory(), move |cx| {
+            vec![AnySystem::new(cx.new(|_| system))]
+        });
+        (frame, wants, shown)
+    }
+
+    /// A note takes `space s` before it waits, which sets its reminder
+    /// and leaves the note on screen. Once the reminder is due it is a
+    /// card that takes done too, never mute, and done puts it away and
+    /// deals the next, as any card's does.
+    #[gpui::test]
+    fn a_note_takes_a_reminder_before_it_waits_and_done_once_it_is_due(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (frame, wants, _) = reminders_frame(cx);
+        let note = Address::note(uuid::Uuid::new_v4());
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.open(note.clone(), window, cx);
+                assert_eq!(labels(&frame.leader_rows(cx)), ["places", "snooze"]);
+                assert_eq!(frame.snooze_target(cx), Some(note.clone()), ":snooze too");
+                frame.snooze(&note, SnoozeUnit::Hours, Some(3), window, cx);
+                assert_eq!(frame.current_address(), &note, "the note stays on screen");
+                assert!(!frame.desk_in_view());
+                let snooze = frame.marks().get(&note).facts().snooze().expect("set");
+                assert_eq!(
+                    snooze.set.timestamp().duration_until(snooze.until),
+                    jiff::SignedDuration::from_hours(3)
+                );
+                assert_eq!(
+                    labels(&frame.leader_rows(cx)),
+                    ["places", "snooze", "undo"],
+                    "no done before it is due"
+                );
+                // It came due: as if the time passed, a snooze that ended.
+                frame.write_marks(
+                    vec![crate::attention::Write::Fact(
+                        rho_dealer::facts::Fact::Snooze {
+                            node: note.clone(),
+                            until: rho_dealer::Until::In(-jiff::SignedDuration::from_secs(1)),
+                        },
+                    )],
+                    cx,
+                );
+                let mut due = rho_dealer::Claim::new(
+                    note.clone(),
+                    rho_dealer::curve::Curve::Waiting {
+                        head_start: rho_dealer::curve::REMINDER_HEAD_START,
+                        since: Timestamp::now(),
+                    },
+                    rho_dealer::rank::CardKind::Due,
+                    "set",
+                );
+                due.title = "Call the dentist".into();
+                *wants.borrow_mut() = vec![due];
+                frame.systems_changed(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, window, cx| {
+                assert_eq!(
+                    labels(&frame.leader_rows(cx)),
+                    ["places", "done", "snooze", "undo"]
+                );
+                wants.borrow_mut().clear();
+                frame.verdict(&note, Verdict::Done, "done".to_owned(), window, cx);
+                assert!(frame.desk_in_view(), "put away, and nothing else waits");
+                assert!(frame.marks().get(&note).facts().snooze().is_none());
+            })
+            .unwrap();
+    }
+
+    /// A private reply is read under its message: opening the note opens
+    /// the thread the message is in, at the message.
+    #[gpui::test]
+    fn a_private_reply_opens_its_thread_at_its_message(cx: &mut gpui::TestAppContext) {
+        let (frame, _, shown) = reminders_frame(cx);
+        let note = Address::note(uuid::Uuid::new_v4());
+        let alone = Address::note(uuid::Uuid::new_v4());
+        let message = Address::new("thread", "lab/7.3");
+        use crate::attention::Write;
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.write_marks(
+                    vec![Write::Fact(rho_dealer::facts::Fact::About {
+                        node: note.clone(),
+                        about: Some(message.clone()),
+                    })],
+                    cx,
+                );
+                frame.open(note.clone(), window, cx);
+                assert_eq!(frame.current_address(), &Address::new("thread", "lab/7"));
+                assert_eq!(
+                    *shown.borrow(),
+                    Some(crate::SearchPoint::Message {
+                        message: message.clone(),
+                        line: 0
+                    })
+                );
+                assert!(!frame.surfaces.contains_key(&note), "no screen of its own");
+                frame.open(alone.clone(), window, cx);
+                assert_eq!(
+                    frame.current_address(),
+                    &alone,
+                    "a note about nothing opens"
+                );
+            })
+            .unwrap();
+    }
+
     /// `:snooze 3h` snoozes the card in view in one line; a time it cannot
     /// read is echoed and changes nothing; and what ran last leads the
     /// blank `Commands`.
@@ -3442,8 +3706,8 @@ mod tests {
     // ---- commands that act on a host ----
 
     use rho_agent_hosts::protocol::{
-        GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove, GccpState, Open as HostOpen,
-        Request as HostRequest,
+        GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove, GccpState, IrohDevice,
+        IrohDevices, IrohRevoke, Open as HostOpen, Request as HostRequest,
     };
     use rho_rpc::protocol::{Answer as HostAnswer, read_frame, write_frame};
 
@@ -3514,6 +3778,12 @@ mod tests {
                         }
                         HostRequest::GccpApprove(_) | HostRequest::GccpRemove(_) => {
                             write_frame(&mut stream, &HostAnswer::from(Ok(()))).await
+                        }
+                        HostRequest::IrohDevices(IrohDevices) => {
+                            write_frame(&mut stream, &HostAnswer::from(Ok(trusted_devices()))).await
+                        }
+                        HostRequest::IrohRevoke(IrohRevoke { endpoint_id }) => {
+                            write_frame(&mut stream, &HostAnswer::from(Ok(endpoint_id))).await
                         }
                         other => panic!("not asked of a host here: {other:?}"),
                     }
@@ -3788,6 +4058,337 @@ mod tests {
                 assert_eq!(
                     echo_of(frame).as_deref(),
                     Some("list gccp agents: lab answered while another prompt was open · run it again")
+                );
+            })
+            .unwrap();
+    }
+
+    // ---- this device: pairing, and the devices a host trusts ----
+
+    const PAIR_QUESTION: &str = "secret phrase · enter alone makes a new one:";
+
+    /// A screen where an idea is being written.
+    struct Composer(gpui::FocusHandle);
+
+    impl gpui::Focusable for Composer {
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.0.clone()
+        }
+    }
+
+    impl gpui::Render for Composer {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl crate::Surface for Composer {
+        fn title(&self, _: &App) -> String {
+            "new idea".into()
+        }
+
+        fn composes(&self, _: &App) -> bool {
+            true
+        }
+    }
+
+    /// The window asks a new device once, when it starts: escape keeps the
+    /// device to itself, and neither a move nor the next start asks again.
+    #[gpui::test]
+    fn a_new_device_is_asked_once(cx: &mut gpui::TestAppContext) {
+        let db = rho_db::RhoDb::in_memory();
+        let frame = test_frame(cx, db.clone());
+        frame
+            .update(cx, |frame, window, cx| {
+                assert_eq!(frame.attention.pairing(), Pairing::Unasked);
+                assert_eq!(prompt_of(frame), None, "only the window's start asks");
+                frame.ask_pairing(window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some(PAIR_QUESTION));
+                frame.minibuffer_cancel(window, cx);
+                assert_eq!(prompt_of(frame), None);
+                assert_eq!(frame.attention.pairing(), Pairing::Unpaired);
+                let page = Address::new("page", "7");
+                let view = cx.new(|cx| Page(cx.focus_handle()));
+                frame.surfaces.insert(page.clone(), AnySurface::new(view));
+                frame.open(page, window, cx);
+                assert_eq!(prompt_of(frame), None, "a move does not ask again");
+            })
+            .unwrap();
+        let restarted = test_frame(cx, db);
+        restarted
+            .update(cx, |frame, window, cx| {
+                frame.ask_pairing(window, cx);
+                assert_eq!(prompt_of(frame), None, "nor does the next start");
+                assert_eq!(frame.attention.pairing(), Pairing::Unpaired);
+                // `pair device` still asks when the user wants it.
+                run_line(frame, "pair device", window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some(PAIR_QUESTION));
+            })
+            .unwrap();
+    }
+
+    /// The question never takes keys from an idea being written or from
+    /// another prompt: it waits until they are done.
+    #[gpui::test]
+    fn the_question_waits_for_an_idea_and_a_prompt(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let idea = Address::new("idea", "1");
+                let view = cx.new(|cx| Composer(cx.focus_handle()));
+                frame.surfaces.insert(idea.clone(), AnySurface::new(view));
+                frame.open(idea.clone(), window, cx);
+                frame.ask_pairing(window, cx);
+                assert_eq!(prompt_of(frame), None, "the idea keeps its keys");
+                frame.open_prompt(
+                    "name this host:",
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+                answer(frame, "lab", window, cx);
+                assert_eq!(prompt_of(frame), None, "the idea is still being written");
+                frame.close(&idea, window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some(PAIR_QUESTION));
+            })
+            .unwrap();
+        // A prompt open when the window starts keeps its keys too.
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.open_prompt(
+                    "name this host:",
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+                frame.ask_pairing(window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some("name this host:"));
+                answer(frame, "lab", window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some(PAIR_QUESTION));
+                assert_eq!(frame.attention.pairing(), Pairing::Unasked);
+            })
+            .unwrap();
+    }
+
+    /// Enter alone makes a new user's phrase, shows it to write down, and
+    /// seals with it what the device said before: a device that takes the
+    /// phrase reads the verdict and the note from the sealed bytes.
+    #[gpui::test]
+    fn a_new_user_seals_what_was_said_before(cx: &mut gpui::TestAppContext) {
+        use rho_dealer::facts::{Entry, Fact};
+
+        use crate::attention::Write;
+
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        let card = Address::new("thread", "lab/1");
+        let note = uuid::Uuid::from_u128(7);
+        let (secret, sealed) = frame
+            .update(cx, |frame, window, cx| {
+                frame.attention.say(vec![
+                    Write::Fact(Fact::Mute { node: card.clone() }),
+                    Write::Note {
+                        note,
+                        body: Some("buy oat milk".to_owned()),
+                        deleted: None,
+                    },
+                ]);
+                let ledger = frame.attention.streams().ledger().clone();
+                assert!(ledger.lengths().is_empty(), "nothing leaves it unpaired");
+                frame.ask_pairing(window, cx);
+                answer(frame, "", window, cx);
+                let secret = frame.attention.secret().expect("a phrase is made");
+                assert_eq!(frame.attention.pairing(), Pairing::Paired);
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("write down your secret phrase · it pairs your other devices · enter:")
+                );
+                assert_eq!(
+                    candidates_of(frame),
+                    [(secret.to_words(), "your secret phrase".to_owned())]
+                );
+                let sealed: Vec<_> = ledger
+                    .lengths()
+                    .into_keys()
+                    .map(|log| (log, ledger.bytes_after(log, 0, usize::MAX)))
+                    .collect();
+                (secret, sealed)
+            })
+            .unwrap();
+        assert!(!sealed.is_empty(), "a host has something to carry");
+        assert!(
+            sealed
+                .iter()
+                .all(|(_, bytes)| !bytes.windows(8).any(|w| w == b"oat milk")),
+            "sealed, not plain"
+        );
+        let other = futures::executor::block_on(async {
+            let other = rho_ledger::Ledger::open(rho_db::RhoDb::in_memory()).await;
+            other.set_secret(secret).await.unwrap();
+            for (log, bytes) in sealed {
+                other.receive(log, 0, bytes).await;
+            }
+            other
+        });
+        let mut marks = rho_dealer::Marks::default();
+        marks.apply(
+            other
+                .items(rho_ledger::Channel::Facts)
+                .iter()
+                .filter_map(|item| Entry::decode(&item.bytes))
+                .collect::<Vec<_>>(),
+        );
+        assert!(marks.get(&card).facts().muted(), "the verdict");
+        assert_eq!(
+            marks.get(&Address::note(note)).body.as_deref(),
+            Some("buy oat milk"),
+            "the note"
+        );
+    }
+
+    /// A phrase with a word that is no phrase word, or too few words, asks
+    /// again with the reason and keeps what was typed; neither answers the
+    /// question, so only escape keeps the device to itself.
+    #[gpui::test]
+    fn a_wrong_phrase_asks_again_with_the_reason(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        let typed = |frame: &Frame, cx: &App| frame.minibuffer.as_ref().unwrap().input(cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.ask_pairing(window, cx);
+                let words =
+                    "abandon ability able about above absent absorb abstract absurd abuse access";
+                let wrong = format!("{words} quokkaz");
+                answer(frame, &wrong, window, cx);
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("secret phrase (`quokkaz` is not a phrase word):")
+                );
+                assert_eq!(typed(frame, cx), wrong);
+                answer(frame, words, window, cx);
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("secret phrase (12 words, not 11):")
+                );
+                assert_eq!(typed(frame, cx), words);
+                assert_eq!(frame.attention.pairing(), Pairing::Unasked);
+                assert!(frame.attention.secret().is_none());
+                frame.minibuffer_cancel(window, cx);
+                assert_eq!(frame.attention.pairing(), Pairing::Unpaired);
+            })
+            .unwrap();
+    }
+
+    const THIS_DEVICE: &str = "u3pdkbb7qgxxsfwnj4c9euyyk8ynwkha6yikonub8qcxxfthrqwy";
+    const LOST: &str = "9kpjn6yxeu4jfy5o3xjnsq3qfqe9zd5ab6dn7ommq3tjsbzzkzby";
+
+    /// What a host trusts: this device, which asks, and a lost one.
+    fn trusted_devices() -> Vec<IrohDevice> {
+        vec![
+            IrohDevice {
+                endpoint_id: THIS_DEVICE.to_owned(),
+                trusted_at_unix_secs: 1_780_000_000,
+                asking: true,
+            },
+            IrohDevice {
+                endpoint_id: LOST.to_owned(),
+                trusted_at_unix_secs: 1_790_000_000,
+                asking: false,
+            },
+        ]
+    }
+
+    /// `list devices` lists each key the host trusts, this device's marked.
+    #[gpui::test]
+    fn list_devices_marks_this_one(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        let asked = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_line(frame, "list devices", window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*asked.borrow(), [HostRequest::IrohDevices(IrohDevices)]);
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("devices lab trusts · enter copies:")
+                );
+                assert_eq!(
+                    candidates_of(frame),
+                    [
+                        (
+                            THIS_DEVICE.to_owned(),
+                            "this device · trusted since 2026-05-28".to_owned()
+                        ),
+                        (LOST.to_owned(), "trusted since 2026-09-21".to_owned()),
+                    ]
+                );
+            })
+            .unwrap();
+    }
+
+    /// `revoke device` asks which host, offers only the other devices,
+    /// refuses this one, and tells only the chosen host to revoke the
+    /// lost one.
+    #[gpui::test]
+    fn revoke_device_takes_back_a_lost_one_and_never_this_one(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        let lab = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        let sea = attach_in_process(&frame, "sea", Ok(gccp_state()), cx);
+        let choose_sea = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
+            run_line(frame, "revoke device", window, cx);
+            assert_eq!(prompt_of(frame).as_deref(), Some("host:"));
+            answer(frame, "sea", window, cx);
+        };
+        frame
+            .update(cx, |frame, window, cx| choose_sea(frame, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, window, cx| {
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("revoke a device sea trusts:")
+                );
+                assert_eq!(
+                    candidates_of(frame),
+                    [(LOST.to_owned(), "trusted since 2026-09-21".to_owned())]
+                );
+                answer(frame, THIS_DEVICE, window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("revoke device: that is this device · revoke it from another")
+                );
+                choose_sea(frame, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, window, cx| answer(frame, LOST, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(lab.borrow().is_empty(), "the other host is not asked");
+        assert_eq!(
+            *sea.borrow(),
+            [
+                HostRequest::IrohDevices(IrohDevices),
+                HostRequest::IrohDevices(IrohDevices),
+                HostRequest::IrohRevoke(IrohRevoke {
+                    endpoint_id: LOST.to_owned(),
+                }),
+            ],
+            "this device is never revoked"
+        );
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(
+                    echo_of(frame),
+                    Some(format!("revoked: sea no longer trusts {LOST}"))
                 );
             })
             .unwrap();

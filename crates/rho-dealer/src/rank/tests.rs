@@ -258,6 +258,23 @@ impl World {
             }
             claims.push(claim);
         }
+        // A note the user snoozed is a reminder, waiting from when it is
+        // due, as the notes claim theirs.
+        for (address, held) in self.marks.notes() {
+            if let Some(snooze) = held.facts().snooze() {
+                let mut claim = Claim::new(
+                    address.clone(),
+                    Curve::Waiting {
+                        head_start: REMINDER_HEAD_START,
+                        since: snooze.until,
+                    },
+                    CardKind::Due,
+                    snooze.set.timestamp().to_string(),
+                );
+                claim.title = held.title().to_owned();
+                claims.push(claim);
+            }
+        }
         claims
     }
 
@@ -541,6 +558,42 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
     let gone = note(&mut w, "gone");
     w.write_note(&gone, "gone", true);
     assert_eq!(w.hand(), "");
+}
+
+/// A reminder is a note the user snoozed: nothing until it is due, then
+/// one card waiting from then. Snoozing it again moves it, and done
+/// takes it back for good.
+#[test]
+fn n4_a_reminder_deals_when_due_until_done() {
+    let mut w = world();
+    let n = note(&mut w, "call the dentist");
+    w.snooze(&n, hours(2));
+    let due = w.at() + hours(2);
+    assert_eq!(w.hand(), "");
+    assert_eq!(
+        w.deal().next_change,
+        Some(due),
+        "the hand changes when it is due"
+    );
+    w.pass(mins(119));
+    assert_eq!(w.hand(), "");
+    w.pass(mins(1));
+    assert_eq!(w.hand(), "call the dentist · due · now");
+    assert!(close(w.priority(&n).unwrap(), REMINDER_HEAD_START));
+    w.pass(hours(1));
+    assert_eq!(w.hand(), "call the dentist · due · 1.0h");
+
+    w.snooze(&n, hours(3));
+    w.pass(mins(179));
+    assert_eq!(w.hand(), "", "a reschedule holds it until the new time");
+    w.pass(mins(1));
+    assert_eq!(w.hand(), "call the dentist · due · now");
+
+    w.done(&n);
+    assert_eq!(w.hand(), "");
+    w.pass(hours(24 * 30));
+    assert_eq!(w.hand(), "", "done is for good");
+    assert_eq!(w.deal().next_change, None);
 }
 
 // Every history

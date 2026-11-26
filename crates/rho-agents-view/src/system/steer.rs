@@ -6,9 +6,11 @@ use std::rc::Rc;
 
 use gpui::{Context, Entity, Window};
 use rho_agent_hosts::HostStatus;
-use rho_agent_types::{AgentId, RuntimeCatalogue};
+use rho_agent_types::{AgentId, Rewind, RuntimeCatalogue};
 use rho_agents_client::protocol::transcript::RuntimeKind;
-use rho_agents_client::protocol::worksets::{Cancel, CancelResult, RewindAgent, StopAgent};
+use rho_agents_client::protocol::worksets::{
+    Cancel, CancelResult, FinishWork, FinishedWork, RewindAgent, StopAgent,
+};
 use rho_agents_client::snippets;
 use rho_frame::{Candidate, Frame};
 use rho_window::style::StyleClass;
@@ -37,11 +39,12 @@ pub(super) fn unreachable(status: Option<&HostStatus>) -> Option<&'static str> {
     }
 }
 
-/// Takes back the agent's last `turns` turns; it waits for the user.
+/// Takes the agent `back`: its last turns, or every turn after a step of
+/// its transcript; it waits for the user.
 pub(super) fn rewind(
     system: &Entity<AgentsSystem>,
     agent: AgentId,
-    turns: u32,
+    back: Rewind,
     cx: &mut Context<Frame>,
 ) {
     let system = system.read(cx);
@@ -51,12 +54,12 @@ pub(super) fn rewind(
         return;
     };
     let label = system.label(agent, cx).0;
-    let reply = agents.call(RewindAgent { agent, turns });
+    let reply = agents.call(RewindAgent { agent, back });
     cx.spawn(async move |_, cx| {
         let result = reply.await;
         cx.update(|cx| match result {
             Ok(undone) => frame.echo(
-                rewound(&label, turns, &undone.taken_back),
+                rewound(&label, back, &undone.taken_back),
                 StyleClass::SystemInfo,
                 cx,
             ),
@@ -215,6 +218,45 @@ pub(super) fn stop(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Conte
     .detach();
 }
 
+/// Finishes the agent's work and echoes what became of its checkouts:
+/// `finished: tide · Flaky clock test · removed rho · kept web: 2 unpushed
+/// commits`.
+pub(super) fn finish_work(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
+    let system = system.read(cx);
+    let frame = system.frame.clone();
+    let Some(agents) = system.agents_for(agent) else {
+        frame.echo(NOT_ATTACHED, StyleClass::SystemImportant, cx);
+        return;
+    };
+    let reply = agents.call(FinishWork { agent });
+    let label = system.work_label(agent, cx).0;
+    cx.spawn(async move |_, cx| {
+        let reply = reply.await;
+        cx.update(|cx| match reply {
+            Ok(finished) => {
+                frame.echo(finished_echo(&label, &finished), StyleClass::SystemInfo, cx)
+            }
+            Err(error) => frame.echo(
+                format!("did not finish {label}: {error:#}"),
+                StyleClass::SystemImportant,
+                cx,
+            ),
+        });
+    })
+    .detach();
+}
+
+fn finished_echo(label: &str, finished: &FinishedWork) -> String {
+    let mut echo = format!("finished: {label}");
+    if !finished.removed.is_empty() {
+        echo.push_str(&format!(" · removed {}", finished.removed.join(", ")));
+    }
+    for kept in &finished.kept {
+        echo.push_str(&format!(" · kept {kept}"));
+    }
+    echo
+}
+
 /// Stops what the agent is asking its model now.
 pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
     let system = system.read(cx);
@@ -267,10 +309,11 @@ fn switchable(
 
 /// What the echo says once `turns` of the turns of the agent called `label`
 /// are taken back: it does nothing until the user writes.
-fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
-    let turns = match turns {
-        1 => "one turn".to_owned(),
-        turns => format!("{turns} turns"),
+fn rewound(label: &str, back: Rewind, taken_back: &[String]) -> String {
+    let turns = match back {
+        Rewind::Turns(1) => "one turn".to_owned(),
+        Rewind::Turns(turns) => format!("{turns} turns"),
+        Rewind::After(_) => "to the step".to_owned(),
     };
     let mut echo = format!("rewound {turns}: {label}");
     if let Some(words) = taken_back.first() {
@@ -310,14 +353,30 @@ mod tests {
     }
 
     #[test]
+    fn finish_echo_names_each_removed_and_kept_checkout() {
+        let finished = FinishedWork {
+            removed: vec!["rho".to_owned(), "web".to_owned()],
+            kept: vec!["notes: 2 unpushed commits".to_owned()],
+        };
+        assert_eq!(
+            finished_echo("tide · Flaky clock test", &finished),
+            "finished: tide · Flaky clock test · removed rho, web · kept notes: 2 unpushed commits"
+        );
+        assert_eq!(
+            finished_echo("tide", &FinishedWork::default()),
+            "finished: tide"
+        );
+    }
+
+    #[test]
     fn rewind_echo_uses_the_host_receipt_not_the_transcripts_current_text() {
         let earlier = "Could you clarify the timer?";
         assert_eq!(
-            rewound("eng-ka35", 1, &[earlier.into()]),
+            rewound("eng-ka35", Rewind::Turns(1), &[earlier.into()]),
             "rewound one turn: eng-ka35 · took back \"Could you clarify the timer?\" · waiting for you"
         );
         assert_eq!(
-            rewound("eng-ka35", 2, &[]),
+            rewound("eng-ka35", Rewind::Turns(2), &[]),
             "rewound 2 turns: eng-ka35 · waiting for you"
         );
     }

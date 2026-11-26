@@ -246,6 +246,17 @@ impl Transcripts {
             .retain(|agent_id| open.contains_key(&agent_id) || keep(agent_id));
     }
 
+    /// The agent whose block stands at `block` on the screen of `scope`,
+    /// and the workset row that told it; `None` for a heading, or what the
+    /// runtime is still saying.
+    pub fn told_at(&self, scope: &Scope, block: usize) -> Option<(AgentId, Wpos)> {
+        let view = self.views.get(scope)?;
+        view.placed.iter().find_map(|(agent, placed)| {
+            let index = placed.binary_search(&block).ok()?;
+            Some((*agent, self.open.get(agent)?.position(index)?))
+        })
+    }
+
     /// What the screen of `scope` draws, once [`Self::show`] made it.
     pub fn view(&self, scope: &Scope) -> Option<&UiAgentState> {
         self.views.get(scope).map(|view| &view.state)

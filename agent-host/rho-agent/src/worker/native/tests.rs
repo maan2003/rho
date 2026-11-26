@@ -569,7 +569,10 @@ async fn rewind_branches_before_the_last_human_message() {
         })
         .await;
 
-    handle.rewind(1).await.unwrap();
+    handle
+        .rewind(rho_agent_types::Rewind::Turns(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(script.requests().len(), 2, "a rewind starts no turn");
     assert!(
@@ -613,7 +616,10 @@ async fn rewinding_a_failed_agent_takes_the_turn_back_and_waits() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    handle.rewind(1).await.unwrap();
+    handle
+        .rewind(rho_agent_types::Rewind::Turns(1))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         script.requests().len(),

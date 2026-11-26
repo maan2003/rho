@@ -2,8 +2,11 @@
 //! the chat; its name is that root's thread name; its settings are the
 //! newest [`ChatEvent::Project`](rho_agent_types::ChatEvent::Project) for
 //! it in the log, indexed here in the commit that appends it. Which agent
-//! stands for a project in `one` mode is the host's own routing, never on
-//! the wire.
+//! stands for a project (`one` mode) and whether it is retired are logged
+//! the same way ([`ChatEvent::Standing`](rho_agent_types::ChatEvent::Standing),
+//! [`ChatEvent::Retired`](rho_agent_types::ChatEvent::Retired)): every
+//! device names a standing agent's workset by the project alone, and
+//! leaves a retired project off its `to:` line.
 
 use redb::TableDefinition;
 use rho_agent_types::{AgentId, MessageId, ProjectConfig, ProjectId, Revision};
@@ -15,6 +18,10 @@ use super::MailRead as _;
 const PROJECTS: TableDefinition<u64, Sen<ProjectConfig>> = TableDefinition::new("chat_projects");
 /// The agent that receives each idea of a project in `one` mode.
 const STANDING: TableDefinition<u64, AgentId> = TableDefinition::new("project_standing_agents");
+/// Read by the one-hop migration that logs what it holds.
+pub(super) const STANDING_TABLE: TableDefinition<u64, AgentId> = STANDING;
+/// The projects the user retired.
+const RETIRED: TableDefinition<u64, ()> = TableDefinition::new("project_retired");
 // Set in the same transaction as an existing agent's idea, or after a new
 // agent or a failure stop is recorded. A lost receipt cannot start it twice.
 const STARTED: TableDefinition<u64, ()> = TableDefinition::new("mail_project_starts");
@@ -24,6 +31,9 @@ pub trait ProjectRead {
     fn project(&self, project: ProjectId) -> Option<ProjectConfig>;
     fn projects(&self) -> Vec<(ProjectId, ProjectConfig)>;
     fn standing_agent(&self, project: ProjectId) -> Option<AgentId>;
+    /// Every standing agent, by project, as the index holds them.
+    fn standing_agents(&self) -> Vec<(ProjectId, AgentId)>;
+    fn project_retired(&self, project: ProjectId) -> bool;
     fn project_start_complete(&self, idea: MessageId) -> bool;
 }
 
@@ -60,6 +70,20 @@ impl ProjectRead for ReadTxn {
             .map(|agent| agent.value())
     }
 
+    fn standing_agents(&self) -> Vec<(ProjectId, AgentId)> {
+        self.open_table(STANDING)
+            .iter()
+            .map(|(anchor, agent)| {
+                let anchor = MessageId(rho_agent_types::ChatSeq(anchor.value()));
+                (ProjectId(anchor), agent.value())
+            })
+            .collect()
+    }
+
+    fn project_retired(&self, ProjectId(anchor): ProjectId) -> bool {
+        self.open_table(RETIRED).get(anchor.0.0).is_some()
+    }
+
     fn project_start_complete(&self, idea: MessageId) -> bool {
         self.open_table(STARTED).get(idea.0.0).is_some()
     }
@@ -71,8 +95,13 @@ pub trait ProjectWrite {
     fn held_project(&mut self, project: ProjectId) -> Option<ProjectConfig>;
     /// Folds a logged [`rho_agent_types::ChatEvent::Project`] into the index.
     fn index_project(&mut self, project: ProjectId, config: &ProjectConfig);
-    fn set_standing_agent(&mut self, project: ProjectId, agent: AgentId);
-    fn clear_standing_agent(&mut self, project: ProjectId);
+    /// The standing agent the index holds, read in this write.
+    fn held_standing_agent(&mut self, project: ProjectId) -> Option<AgentId>;
+    /// Folds a logged [`rho_agent_types::ChatEvent::Standing`] into the index.
+    fn index_standing_agent(&mut self, project: ProjectId, agent: Option<AgentId>);
+    fn held_retired(&mut self, project: ProjectId) -> bool;
+    /// Folds a logged [`rho_agent_types::ChatEvent::Retired`] into the index.
+    fn index_retired(&mut self, project: ProjectId);
     fn complete_project_start(&mut self, idea: MessageId);
 }
 
@@ -80,6 +109,7 @@ impl ProjectWrite for WriteTxn {
     fn init_project_tables(&mut self) {
         self.open_table(PROJECTS);
         self.open_table(STANDING);
+        self.open_table(RETIRED);
         self.open_table(STARTED);
     }
 
@@ -94,12 +124,26 @@ impl ProjectWrite for WriteTxn {
             .insert(anchor.0.0, SenValue::borrowed(config));
     }
 
-    fn set_standing_agent(&mut self, ProjectId(anchor): ProjectId, agent: AgentId) {
-        self.open_table(STANDING).insert(anchor.0.0, agent);
+    fn held_standing_agent(&mut self, ProjectId(anchor): ProjectId) -> Option<AgentId> {
+        self.open_table(STANDING)
+            .get(anchor.0.0)
+            .map(|agent| agent.value())
     }
 
-    fn clear_standing_agent(&mut self, ProjectId(anchor): ProjectId) {
-        self.open_table(STANDING).remove(anchor.0.0);
+    fn index_standing_agent(&mut self, ProjectId(anchor): ProjectId, agent: Option<AgentId>) {
+        let mut standing = self.open_table(STANDING);
+        match agent {
+            Some(agent) => standing.insert(anchor.0.0, agent),
+            None => standing.remove(anchor.0.0),
+        };
+    }
+
+    fn held_retired(&mut self, ProjectId(anchor): ProjectId) -> bool {
+        self.open_table(RETIRED).get(anchor.0.0).is_some()
+    }
+
+    fn index_retired(&mut self, ProjectId(anchor): ProjectId) {
+        self.open_table(RETIRED).insert(anchor.0.0, ());
     }
 
     fn complete_project_start(&mut self, idea: MessageId) {

@@ -21,13 +21,51 @@ async fn auth(
     client: &iroh::Endpoint,
     pairing: Option<&rho_iroh_auth::PairingKey>,
 ) -> Result<ClientAuthResult> {
+    Ok(dial(host, client, pairing).await?.1)
+}
+
+async fn dial(
+    host: iroh::EndpointId,
+    client: &iroh::Endpoint,
+    pairing: Option<&rho_iroh_auth::PairingKey>,
+) -> Result<(iroh::endpoint::Connection, ClientAuthResult)> {
     let connection = tokio::time::timeout(
         Duration::from_secs(40),
         client.connect(host, rho_rpc::protocol::IROH_ALPN),
     )
     .await
     .context("connect timed out")??;
-    rho_rpc::authenticate_iroh_client(&connection, client.id(), pairing).await
+    let result = rho_rpc::authenticate_iroh_client(&connection, client.id(), pairing).await?;
+    Ok((connection, result))
+}
+
+/// One call over a client's own connection, as a window makes it.
+async fn call_over<C: rho_rpc::protocol::Call>(
+    connection: &iroh::endpoint::Connection,
+    call: C,
+) -> Result<C::Reply> {
+    let (send, recv) = connection.open_bi().await?;
+    let mut client =
+        rho_rpc::protocol::client::Client::from_stream(rho_rpc::Stream::new(recv, send));
+    client.open(&call.open()).await?;
+    client
+        .recv::<rho_rpc::protocol::Answer<C::Reply>>()
+        .await?
+        .into_result()
+}
+
+fn endpoint_text(endpoint: &iroh::Endpoint) -> String {
+    rho_agent_types::EndpointId(*endpoint.id().as_bytes()).to_string()
+}
+
+async fn pair(paths: &rho_rpc::protocol::RuntimePaths) -> Result<(PairingLink, iroh::Endpoint)> {
+    let link: PairingLink = rho_rpc::protocol::client::call(paths, host::IrohPair)
+        .await?
+        .parse()
+        .map_err(anyhow::Error::msg)?;
+    let device = rho_rpc::bind_ephemeral_iroh_client().await?;
+    ensure!(auth(link.endpoint_id, &device, Some(&link.key)).await? == ClientAuthResult::Approved);
+    Ok((link, device))
 }
 
 async fn start(temp: &Path) -> Result<(Child, rho_rpc::protocol::RuntimePaths)> {
@@ -95,5 +133,57 @@ async fn a_pairing_link_trusts_the_first_client_for_good_and_no_other() -> Resul
         auth(link.endpoint_id, &paired, None).await? == ClientAuthResult::Approved,
         "the paired client needs no key again"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_trusted_no_longer() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_host, paths) = start(temp.path()).await?;
+    let (link, laptop) = pair(&paths).await?;
+    let (_, lost) = pair(&paths).await?;
+
+    let (connection, approved) = dial(link.endpoint_id, &laptop, None).await?;
+    ensure!(approved == ClientAuthResult::Approved);
+    let mut listed = call_over(&connection, host::IrohDevices).await?;
+    listed.sort_by_key(|device| !device.asking);
+    let ids: Vec<_> = listed
+        .iter()
+        .map(|device| (device.endpoint_id.clone(), device.asking))
+        .collect();
+    ensure!(
+        ids == [
+            (endpoint_text(&laptop), true),
+            (endpoint_text(&lost), false)
+        ],
+        "both devices, the one that asks marked: {ids:?}"
+    );
+    ensure!(listed.iter().all(|device| device.trusted_at_unix_secs > 0));
+
+    let revoked = call_over(
+        &connection,
+        host::IrohRevoke {
+            endpoint_id: endpoint_text(&lost),
+        },
+    )
+    .await?;
+    ensure!(revoked == endpoint_text(&lost));
+    ensure!(
+        matches!(
+            auth(link.endpoint_id, &lost, None).await?,
+            ClientAuthResult::EnrollmentRequired(_)
+        ),
+        "the lost device must enroll again"
+    );
+    ensure!(
+        auth(link.endpoint_id, &laptop, None).await? == ClientAuthResult::Approved,
+        "the device that revoked it is still trusted"
+    );
+    let left: Vec<_> = call_over(&connection, host::IrohDevices)
+        .await?
+        .into_iter()
+        .map(|device| device.endpoint_id)
+        .collect();
+    ensure!(left == [endpoint_text(&laptop)], "{left:?}");
     Ok(())
 }

@@ -63,7 +63,12 @@ fn every_name_is_its_own_and_plain() {
         "set agent runtime",
         "cancel agent request",
         "stop agent",
+        "rewind agent to here",
+        "finish work",
         "rename thread",
+        "fork thread",
+        "rename project",
+        "retire project",
         "set project place",
         "set project mode",
         "set project runtime",
@@ -93,6 +98,8 @@ fn every_name_is_its_own_and_plain() {
         "write reply again",
         "pair device",
         "show secret phrase",
+        "list devices",
+        "revoke device",
         "upload performance report",
         "quit",
         "snooze",
@@ -156,9 +163,13 @@ fn inline_arguments_reach_their_command() {
         ),
         ("bookmark Slack", "bookmark page", "Slack"),
         ("rewind 2", "rewind agent", "2"),
+        ("rewind agent 3", "rewind agent", "3"),
         ("attach lab=local", "attach host", "lab=local"),
         ("detach lab", "detach host", "lab"),
         ("filter whole workset", "filter transcript", "whole workset"),
+        ("finish work clock", "finish work", "clock"),
+        ("rename project apart", "rename project", "apart"),
+        ("retire project tide", "retire project", "tide"),
         (
             "switch claude account work",
             "switch claude account",
@@ -196,6 +207,8 @@ fn everyday_words_find_what_they_mean() {
         ("undo", "undo verdict"),
         ("exit", "quit"),
         ("hosts", "list hosts"),
+        ("devices", "list devices"),
+        ("lost laptop", "revoke device"),
         ("notes", "list notes"),
         ("url", "open page"),
         ("go", "open page"),
@@ -208,11 +221,22 @@ fn everyday_words_find_what_they_mean() {
         ("idea", "write idea"),
         ("slow", "upload performance report"),
         ("account", "switch claude account"),
+        ("tangent", "fork thread"),
+        ("finish", "finish work"),
+        ("rewind agent to here", "rewind agent to here"),
+        ("rewind to here", "rewind agent to here"),
+        ("rewind here", "rewind agent to here"),
     ] {
         assert_eq!(first(word).0, command, "{word}");
     }
+    assert_eq!(
+        names("rewind agent to here")[..2],
+        ["rewind agent to here", "rewind agent"]
+    );
     // `undo turn` is the agent's rewind only when said outright.
     assert_eq!(first("undo turn").0, "rewind agent");
+    // `rewind` alone takes back the last turn, not to a step.
+    assert_eq!(first("rewind").0, "rewind agent");
 }
 
 /// `focus` sets the dealer's focus and `focus off` clears it, though one

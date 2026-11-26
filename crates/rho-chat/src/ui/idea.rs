@@ -1,6 +1,9 @@
-//! The idea draft as a screen (`chat.Write an idea`): its `to:` and `on:`
-//! lines over its words, which fill the window. The `to:` line completes
-//! against existing projects; making one is a separate, explicit choice.
+//! The idea draft as a screen (`chat.Write an idea`): its `to:`, `in:` and
+//! `on:` lines over its words, which fill the window. The `to:` line
+//! completes against existing projects; making one is a separate, explicit
+//! choice. The `in:` and `on:` lines show the project's mode and runtime as
+//! quiet hints until the user writes on them: an untouched line sends
+//! nothing, so the host keeps a standing agent's runtime as it is.
 //!
 //! The draft is chat's, kept beside the thread drafts ([`crate::cache`])
 //! across restarts until it is sent. Sending hands it to the outbox and
@@ -18,7 +21,7 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent, Point};
 use multi_buffer::MultiBuffer;
-use rho_agent_types::{ProjectName, RuntimeLabel};
+use rho_agent_types::{ProjectMode, ProjectName, RuntimeLabel};
 use rho_dealer::{Address, Addressed as _};
 use rho_frame::minibuffer::NEW_PROJECT;
 use rho_frame::surface::PhoneSend;
@@ -37,8 +40,10 @@ actions!(
     [
         /// `enter` on the `on:` line: choose a runtime from the host's.
         ChooseRuntime,
-        /// `shift-tab`: the next of the `to:` line, the `on:` line and the
-        /// words.
+        /// `enter` on the `in:` line: choose `one` or `new`.
+        ChooseMode,
+        /// `shift-tab`: the next of the `to:`, `in:` and `on:` lines and
+        /// the words.
         NextLine,
         /// `ctrl-enter`: hand the idea to its project.
         SendIdea,
@@ -60,6 +65,7 @@ pub(super) fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-t", keys::PromptIdea, Some(screen)),
         KeyBinding::new("enter", keys::PromptIdea, Some("RhoIdeaAddress > Editor")),
         KeyBinding::new("enter", ChooseRuntime, Some("RhoIdeaRuntime > Editor")),
+        KeyBinding::new("enter", ChooseMode, Some("RhoIdeaMode > Editor")),
         KeyBinding::new("shift-tab", NextLine, Some(screen)),
         KeyBinding::new("ctrl-enter", SendIdea, Some(screen)),
         // The idea is a screen: `ctrl-g` closes it as `q` does, from any
@@ -78,6 +84,7 @@ pub(super) struct IdeaProject {
     /// Its address with its host, `tide@lab`, which always names it.
     pub(super) qualified: String,
     pub(super) runtime: Option<RuntimeLabel>,
+    pub(super) mode: ProjectMode,
 }
 
 impl IdeaProject {
@@ -101,6 +108,25 @@ pub(super) struct IdeaMail {
     pub(super) project: ThreadId,
     pub(super) text: String,
     pub(super) runtime: Option<RuntimeLabel>,
+    pub(super) mode: Option<ProjectMode>,
+}
+
+/// How the `in:` line says a mode: `one` for the project's standing agent,
+/// `new` for a fresh agent in a fresh workset.
+pub(super) fn mode_word(mode: ProjectMode) -> &'static str {
+    match mode {
+        ProjectMode::One => "one",
+        ProjectMode::PerIdea => "new",
+    }
+}
+
+/// The mode an `in:` line names, or why it names none.
+fn parse_mode_word(text: &str) -> Result<ProjectMode, String> {
+    let text = text.trim().to_lowercase();
+    ProjectMode::ALL
+        .into_iter()
+        .find(|mode| mode_word(*mode) == text)
+        .ok_or_else(|| format!("in: `{text}` is neither one nor new"))
 }
 
 /// The idea being written. Its words outlive its screen: closing the
@@ -113,6 +139,8 @@ pub(super) struct Idea {
     recipient: String,
     /// The `on:` line as written, when it overrides the project's runtime.
     runtime: Option<String>,
+    /// The `in:` line as written, when it overrides the project's mode.
+    mode: Option<String>,
     /// Its screen, while the window holds it.
     view: WeakEntity<IdeaView>,
     _edits: Subscription,
@@ -133,6 +161,7 @@ impl Idea {
                 .and_then(ThreadId::from_address),
             recipient: saved.recipient,
             runtime: saved.runtime,
+            mode: saved.mode,
             view: WeakEntity::new_invalid(),
         }
     }
@@ -146,7 +175,10 @@ impl Idea {
     }
 
     fn is_empty(&self, cx: &App) -> bool {
-        self.text.read(cx).is_empty() && self.recipient.is_empty() && self.runtime.is_none()
+        self.text.read(cx).is_empty()
+            && self.recipient.is_empty()
+            && self.runtime.is_none()
+            && self.mode.is_none()
     }
 }
 
@@ -160,6 +192,9 @@ impl ChatSystem {
             .iter()
             .flat_map(|(&host, chat)| {
                 chat.roots().iter().filter_map(move |&message| {
+                    if chat.is_retired(message) {
+                        return None;
+                    }
                     let thread = ThreadId { host, message };
                     let project = self.idea_project_in(names, thread)?;
                     (self.project_named(&project.qualified) == Some(thread)).then_some(project)
@@ -183,12 +218,19 @@ impl ChatSystem {
             .project
             .and_then(|project| self.idea_project_at(project))
             && project.answers(typed)
+            && !self.retired(project.thread)
         {
             return Some(project);
         }
         self.idea_projects()
             .into_iter()
             .find(|project| project.answers(typed))
+    }
+
+    /// Whether the user retired the project, which takes no more ideas.
+    fn retired(&self, project: ThreadId) -> bool {
+        self.host_chat(project.host)
+            .is_some_and(|chat| chat.is_retired(project.message))
     }
 
     fn save_idea(&self, cx: &App) {
@@ -198,6 +240,7 @@ impl ChatSystem {
             address: idea.project.map(|project| project.address().to_string()),
             recipient: idea.recipient.clone(),
             runtime: idea.runtime.clone(),
+            mode: idea.mode.clone(),
             text,
         });
         self.cache.write_idea(draft);
@@ -210,23 +253,31 @@ impl ChatSystem {
         self.idea.project = None;
         self.idea.recipient.clear();
         self.idea.runtime = None;
+        self.idea.mode = None;
         self.save_idea(cx);
     }
 
     /// A `to:` line nobody has written names the project chosen for the
     /// draft or, while the draft is empty, the project of the screen the
-    /// user is on, or else the last one they wrote to.
-    fn address_idea(&mut self, here: &Address, window: &mut Window, cx: &mut Context<Self>) {
+    /// user is on (`here`: a thread's, or a transcript's or tool's work's),
+    /// or else the last one they wrote to.
+    fn address_idea(
+        &mut self,
+        here: Option<ThreadId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.idea.recipient.is_empty() {
             return;
         }
         let project = match self.idea.project {
             Some(project) => self.idea_project_at(project),
-            None if self.idea.text.read(cx).is_empty() => self
-                .idea_project_of(here)
+            None if self.idea.text.read(cx).is_empty() => here
+                .and_then(|here| self.idea_project_at(here))
                 .or_else(|| self.idea_project_at(self.last_project?)),
             None => None,
-        };
+        }
+        .filter(|project| !self.retired(project.thread));
         let Some(project) = project else {
             return;
         };
@@ -370,8 +421,12 @@ fn prompt(
         choose_project(chat, Intent::Address, frame, window, cx);
         return;
     }
-    let here = frame.current_address().clone();
-    chat.update(cx, |chat, cx| chat.address_idea(&here, window, cx));
+    // The system that owns the screen in view says its project: a thread's
+    // own, or the work's thread's for a transcript or one of its tools.
+    let here = frame
+        .project_of(frame.current_address(), cx)
+        .and_then(|project| ThreadId::from_address(&project.address));
+    chat.update(cx, |chat, cx| chat.address_idea(here, window, cx));
     frame.open(address(), window, cx);
 }
 
@@ -411,10 +466,12 @@ fn choose_project(
                 }
                 Some(ProjectChoice::New(project)) => {
                     let created = when_created(chat.clone(), intent, cx);
+                    let runtime = chat.read(cx).idea.runtime.clone();
                     ChatSystem::prompt_project(
                         chat.clone(),
                         project,
                         Some(created),
+                        runtime.as_deref(),
                         frame,
                         window,
                         cx,
@@ -472,7 +529,7 @@ fn choose_to(
         view.address.update(cx, |address, cx| {
             address.set_text(project.name.as_str(), window, cx)
         });
-        view.refresh_runtime_hint(window, cx);
+        view.refresh_hints(window, cx);
         window.focus(&view.editor.focus_handle(cx), cx);
     });
     if matches!(intent, Intent::Send) {
@@ -486,12 +543,13 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
     if !in_view(frame) {
         return;
     }
-    let (text, project, runtime) = {
+    let (text, project, runtime, mode) = {
         let chat = chat.read(cx);
         (
             chat.idea.text.read(cx).text(),
             chat.resolved_idea_project(),
             chat.idea.runtime.clone(),
+            chat.idea.mode.clone(),
         )
     };
     if text.trim().is_empty() {
@@ -522,6 +580,10 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
         }
         None => None,
     };
+    let mode = match mode.as_deref().map(parse_mode_word).transpose() {
+        Ok(mode) => mode,
+        Err(reason) => return frame.echo(&reason, StyleClass::SystemImportant, cx),
+    };
     let echo = format!("queued for {}: {}", project.name, first_line(&text));
     let client_id = rand::random();
     chat.update(cx, |chat, cx| {
@@ -531,6 +593,7 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
                 project: project.thread,
                 text,
                 runtime,
+                mode,
             },
             cx,
         );
@@ -572,6 +635,7 @@ pub(super) fn write_again(
             .unwrap_or_default();
         chat.idea.project = Some(idea.project);
         chat.idea.runtime = idea.runtime.map(|runtime| runtime.label());
+        chat.idea.mode = idea.mode.map(|mode| mode_word(mode).to_owned());
         chat.save_idea(cx);
     });
     prompt(chat, frame, window, cx);
@@ -642,6 +706,62 @@ fn set_runtime(
     window.focus(&field.focus_handle(cx), cx);
 }
 
+/// `enter` on the `in:` line: `one` or `new`, the project's own mode first.
+fn choose_mode(
+    chat: Entity<ChatSystem>,
+    frame: &mut Frame,
+    window: &mut Window,
+    cx: &mut Context<Frame>,
+) {
+    if !in_view(frame) {
+        return;
+    }
+    let Some(project) = chat.read(cx).resolved_idea_project() else {
+        frame.echo("to: choose a project first", StyleClass::SystemInfo, cx);
+        return;
+    };
+    frame.open_prompt(
+        "in:",
+        Rc::new(move |_, needle, _| {
+            let mut modes = ProjectMode::ALL;
+            modes.sort_by_key(|mode| *mode != project.mode);
+            modes
+                .into_iter()
+                .filter(|mode| mode_word(*mode).starts_with(needle.trim()))
+                .map(|mode| Candidate {
+                    value: mode_word(mode).to_owned(),
+                    description: match mode {
+                        ProjectMode::One => "the project's standing agent",
+                        ProjectMode::PerIdea => "a fresh agent in its own workset",
+                    }
+                    .to_owned(),
+                })
+                .collect()
+        }),
+        Rc::new(
+            move |frame, input, window, cx| match parse_mode_word(&input) {
+                Ok(mode) => set_mode(&chat, mode, window, cx),
+                Err(reason) => frame.echo(&reason, StyleClass::SystemImportant, cx),
+            },
+        ),
+        window,
+        cx,
+    );
+}
+
+fn set_mode(chat: &Entity<ChatSystem>, mode: ProjectMode, window: &mut Window, cx: &mut App) {
+    let Some(view) = chat.read(cx).idea.view.upgrade() else {
+        return;
+    };
+    chat.update(cx, |chat, cx| {
+        chat.idea.mode = Some(mode_word(mode).to_owned());
+        chat.save_idea(cx);
+    });
+    let field = view.read(cx).mode.clone();
+    field.update(cx, |field, cx| field.set_text(mode_word(mode), window, cx));
+    window.focus(&field.focus_handle(cx), cx);
+}
+
 /// An idea as the echo names it: its first written line, cut short.
 fn first_line(text: &str) -> String {
     text.lines()
@@ -653,15 +773,16 @@ fn first_line(text: &str) -> String {
         .collect()
 }
 
-/// The idea draft as a screen: its `to:` and `on:` lines over its words.
-/// It is a screen like any other, so the window's keys act on it and never
-/// on the one before.
+/// The idea draft as a screen: its `to:`, `in:` and `on:` lines over its
+/// words. It is a screen like any other, so the window's keys act on it
+/// and never on the one before.
 pub(super) struct IdeaView {
     chat: Entity<ChatSystem>,
     editor: Entity<Editor>,
     address: Entity<Editor>,
+    mode: Entity<Editor>,
     runtime: Entity<Editor>,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
 }
 
 impl IdeaView {
@@ -701,13 +822,20 @@ impl IdeaView {
             })
         };
         let address = line(Some(&idea.recipient), window, cx);
+        let mode = line(idea.mode.as_deref(), window, cx);
         let runtime = line(idea.runtime.as_deref(), window, cx);
-        if let Some(hint) = system
-            .resolved_idea_project()
-            .and_then(|project| project.runtime)
+        let project = system.resolved_idea_project();
+        if let Some(hint) = project
+            .as_ref()
+            .and_then(|project| project.runtime.as_ref())
         {
             runtime.update(cx, |field, cx| {
                 field.set_placeholder_text(hint.as_str(), window, cx)
+            });
+        }
+        if let Some(project) = &project {
+            mode.update(cx, |field, cx| {
+                field.set_placeholder_text(mode_word(project.mode), window, cx)
             });
         }
         let words = cx.subscribe(&idea.text, |view, _, event: &BufferEvent, cx| {
@@ -727,7 +855,7 @@ impl IdeaView {
                             chat.save_idea(cx);
                         }
                     });
-                    view.refresh_runtime_hint(window, cx);
+                    view.refresh_hints(window, cx);
                 }
             },
         );
@@ -743,16 +871,29 @@ impl IdeaView {
                 });
             }
         });
-        // What the projects say moves under the hint.
+        let mode_edits = cx.subscribe(&mode, |view, mode, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::Edited { .. }) {
+                let text = mode.read(cx).text(cx);
+                let written = (!text.is_empty()).then_some(text);
+                view.chat.update(cx, |chat, cx| {
+                    if chat.idea.mode != written {
+                        chat.idea.mode = written;
+                        chat.save_idea(cx);
+                    }
+                });
+            }
+        });
+        // What the projects say moves under the hints.
         let projects = cx.observe_in(&chat, window, |view, _, window, cx| {
-            view.refresh_runtime_hint(window, cx)
+            view.refresh_hints(window, cx)
         });
         Self {
             chat,
             editor,
             address,
+            mode,
             runtime,
-            _subscriptions: [words, address_edits, runtime_edits, projects],
+            _subscriptions: [words, address_edits, mode_edits, runtime_edits, projects],
         }
     }
 
@@ -767,24 +908,31 @@ impl IdeaView {
         rho_window::draft::style(editor, range, "idea", cx);
     }
 
-    /// The `on:` line's hint is the project's runtime: a placeholder, not a
-    /// copied setting. Writing on the line replaces it with words.
-    fn refresh_runtime_hint(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let label = self
-            .chat
-            .read(cx)
-            .resolved_idea_project()
-            .and_then(|project| project.runtime);
-        let hint = label.as_ref().map_or("", RuntimeLabel::as_str);
-        self.runtime.update(cx, |field, cx| {
-            if field.placeholder_text(cx).as_deref() != Some(hint) {
-                field.set_placeholder_text(hint, window, cx);
-            }
-        });
+    /// The `in:` and `on:` lines' hints are the project's mode and runtime:
+    /// placeholders, not copied settings, so they follow the `to:` line
+    /// until the user writes on a line, which replaces its hint with words.
+    fn refresh_hints(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.chat.read(cx).resolved_idea_project();
+        let runtime = project
+            .as_ref()
+            .and_then(|project| project.runtime.as_ref())
+            .map_or("", RuntimeLabel::as_str);
+        let mode = project
+            .as_ref()
+            .map_or("", |project| mode_word(project.mode));
+        for (field, hint) in [(&self.runtime, runtime), (&self.mode, mode)] {
+            field.update(cx, |field, cx| {
+                if field.placeholder_text(cx).as_deref() != Some(hint) {
+                    field.set_placeholder_text(hint, window, cx);
+                }
+            });
+        }
     }
 
     fn next_line(&mut self, _: &NextLine, window: &mut Window, cx: &mut Context<Self>) {
         let handle = if self.address.focus_handle(cx).is_focused(window) {
+            self.mode.focus_handle(cx)
+        } else if self.mode.focus_handle(cx).is_focused(window) {
             self.runtime.focus_handle(cx)
         } else if self.runtime.focus_handle(cx).is_focused(window) {
             self.editor.focus_handle(cx)
@@ -804,10 +952,10 @@ impl Surface for IdeaView {
         Some(self.editor.clone())
     }
 
-    /// The `to:` and `on:` lines are plain lines that always type; the
-    /// words are a modal buffer, whose mode is vim's to say.
+    /// The `to:`, `in:` and `on:` lines are plain lines that always type;
+    /// the words are a modal buffer, whose mode is vim's to say.
     fn mode(&self, window: &Window, cx: &App) -> Option<Mode> {
-        [&self.address, &self.runtime]
+        [&self.address, &self.mode, &self.runtime]
             .into_iter()
             .any(|line| line.focus_handle(cx).is_focused(window))
             .then_some(Mode::Insert)
@@ -874,8 +1022,14 @@ impl Render for IdeaView {
             .on_action(cx.listener(|view, _: &ChooseRuntime, _, cx| {
                 later(view.chat.clone(), choose_runtime, cx)
             }))
+            .on_action(
+                cx.listener(|view, _: &ChooseMode, _, cx| {
+                    later(view.chat.clone(), choose_mode, cx)
+                }),
+            )
             .on_action(cx.listener(Self::next_line))
             .child(line("RhoIdeaAddress", "to:", &self.address))
+            .child(line("RhoIdeaMode", "in:", &self.mode))
             .child(line("RhoIdeaRuntime", "on:", &self.runtime))
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
@@ -1071,6 +1225,123 @@ pub(super) mod tests {
         });
     }
 
+    /// `chat.Write an idea`: the `in:` line says the project's mode while
+    /// nothing is written on it, and follows `to:`; nothing written sends
+    /// no mode, so the project decides. A written word stays across `to:`
+    /// changes and goes with the idea; a word that is no mode sends nothing.
+    #[gpui::test]
+    fn the_in_line_hints_the_projects_mode_and_sends_what_is_written(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, chat, _db) = init(cx);
+        // `reef` starts a fresh agent for each idea.
+        cx.update(|cx| {
+            chat.update(cx, |chat, _| {
+                let log = chat.logs.get_mut(&LAB).unwrap();
+                let seq = ChatSeq(log.head.0 + 1);
+                log.tell(&ChatRecord {
+                    seq,
+                    at: UnixMs(seq.0),
+                    event: ChatEvent::Project {
+                        project: ProjectId(MessageId(ChatSeq(2))),
+                        config: ProjectConfig {
+                            place: ProjectPlace::parse("/srv/lab").unwrap(),
+                            mode: ProjectMode::PerIdea,
+                            runtime: RuntimeLabel::parse("opus-high").unwrap(),
+                        },
+                    },
+                });
+            })
+        });
+        let mode_hint = |view: &Entity<IdeaView>, cx: &mut App| {
+            let mode = view.read(cx).mode.clone();
+            mode.update(cx, |line, cx| {
+                line.placeholder_text(cx).map(|hint| hint.to_string())
+            })
+        };
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread(3).address(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view(&chat, cx);
+            assert_eq!(line(&view.read(cx).mode, cx), "");
+            assert_eq!(mode_hint(&view, cx).as_deref(), Some("one"));
+        });
+        let set = |field: fn(&IdeaView) -> &Entity<Editor>,
+                   text: &'static str,
+                   cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    let editor = field(view(&chat, cx).read(cx)).clone();
+                    editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+                })
+                .unwrap();
+        };
+        set(|view| &view.address, "reef@lab", cx);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view(&chat, cx);
+            assert_eq!(line(&view.read(cx).mode, cx), "", "a hint is never text");
+            assert_eq!(mode_hint(&view, cx).as_deref(), Some("new"));
+        });
+
+        // Written, the word stays when `to:` moves on.
+        set(|view| &view.mode, "one", cx);
+        set(|view| &view.address, "tide", cx);
+        set(|view| &view.address, "reef@lab", cx);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(line(&view(&chat, cx).read(cx).mode, cx), "one");
+            write(&chat, "Keep one agent on it", cx);
+        });
+        cx.dispatch_action(window.into(), SendIdea);
+        cx.run_until_parked();
+
+        // Unwritten, the project's own mode holds on the host.
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        set(|view| &view.address, "reef@lab", cx);
+        cx.update(|cx| write(&chat, "As the project does", cx));
+        cx.dispatch_action(window.into(), SendIdea);
+        cx.run_until_parked();
+
+        // A word that is no mode is refused before anything is sent.
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        set(|view| &view.address, "reef@lab", cx);
+        set(|view| &view.mode, "maybe", cx);
+        cx.update(|cx| write(&chat, "Somewhere", cx));
+        cx.dispatch_action(window.into(), SendIdea);
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let chat = chat.read(cx);
+            let sent: Vec<_> = chat
+                .outbox
+                .ideas()
+                .map(|(_, _, outgoing)| {
+                    (
+                        rho_agent_types::content_text(&outgoing.content),
+                        outgoing.mode,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    ("Keep one agent on it".to_owned(), Some(ProjectMode::One)),
+                    ("As the project does".to_owned(), None),
+                ]
+            );
+            assert_eq!(chat.idea.text.read(cx).text(), "Somewhere", "kept to fix");
+        });
+    }
+
     /// The idea is a screen of its own, so the window's keys act on it and
     /// never on the thread it came from; closing it keeps its words.
     #[gpui::test]
@@ -1113,7 +1384,15 @@ pub(super) mod tests {
             })
             .unwrap();
 
-        // `shift-tab` walks the lines and the words.
+        // `shift-tab` walks the lines, `to:`, `in:`, `on:`, and the words.
+        cx.dispatch_action(window.into(), NextLine);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                let view = view(&chat, cx);
+                assert!(view.read(cx).mode.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
         cx.dispatch_action(window.into(), NextLine);
         cx.run_until_parked();
         window
@@ -1277,6 +1556,7 @@ pub(super) mod tests {
             project: thread(1),
             text: "Check the tide".into(),
             runtime: Some(RuntimeLabel::parse("sol-high").unwrap()),
+            mode: Some(ProjectMode::PerIdea),
         };
         cx.update(|cx| write(&chat, "Another thought", cx));
         window
@@ -1456,6 +1736,38 @@ pub(super) mod tests {
             assert_eq!(chat.project_named("reef@lab"), Some(thread(2)));
             assert_eq!(chat.project_named("reef@box"), None);
             assert_eq!(chat.project_named("skiff"), Some(on_box(2)));
+        });
+    }
+
+    /// `retire project`: a retired project leaves `to:` completion and
+    /// takes no idea, and its threads stay findable.
+    #[gpui::test]
+    fn a_retired_project_takes_no_more_ideas(cx: &mut gpui::TestAppContext) {
+        let (_window, chat, _db) = init(cx);
+        cx.update(|cx| {
+            chat.update(cx, |chat, _| {
+                let log = chat.logs.get_mut(&LAB).unwrap();
+                let seq = ChatSeq(log.head.0 + 1);
+                log.tell(&ChatRecord {
+                    seq,
+                    at: UnixMs(seq.0),
+                    event: ChatEvent::Retired {
+                        project: ProjectId(MessageId(ChatSeq(1))),
+                    },
+                });
+            });
+            let chat = chat.read(cx);
+            let shown: Vec<_> = chat
+                .idea_projects()
+                .into_iter()
+                .map(|project| project.name)
+                .collect();
+            assert_eq!(shown, ["reef"]);
+            let found = chat.find(&rho_dealer::Marks::default(), cx);
+            assert!(
+                found.iter().any(|row| row.title == "Check the clock"),
+                "its thread is still found"
+            );
         });
     }
 

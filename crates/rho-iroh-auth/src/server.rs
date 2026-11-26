@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::EndpointId;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, WeakConnectionHandle};
 use redb::{TableDefinition, TypeName};
 use redb_derive::Value;
 use rho_db::RhoDb;
@@ -15,6 +15,8 @@ const TRUSTED_CLIENTS: TableDefinition<TrustedClientId, TrustedClientValue> =
 const MEMORY_TRUST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MEMORY_TRUSTED_CLIENTS: usize = 4096;
 const MAX_RECENT_ENROLLMENT_CODES: usize = 4096;
+/// Why a client's connection closed when its key was revoked.
+const REVOKED: &[u8] = b"this device's key was revoked";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct TrustedClientId(EndpointId);
@@ -22,6 +24,14 @@ struct TrustedClientId(EndpointId);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Value)]
 struct TrustedClientValue {
     trusted_at_unix_secs: u64,
+}
+
+/// A client the host trusts for good: a device's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedClient {
+    pub endpoint_id: EndpointId,
+    /// When it came to be trusted, in seconds since the Unix epoch.
+    pub trusted_at_unix_secs: u64,
 }
 
 /// Error while approving an enrollment code.
@@ -63,6 +73,10 @@ struct IrohAuthInner {
     memory_trusted: tokio::sync::Mutex<MemoryTrustedClients>,
     pending: tokio::sync::Mutex<PendingEnrollments>,
     pairing: tokio::sync::Mutex<PairingKeys>,
+    /// Each client's connections admitted while they are open, by its key:
+    /// what revoking the key closes. A handle does not keep its connection
+    /// open, and one closed goes at the next admission.
+    admitted: std::sync::Mutex<HashMap<EndpointId, Vec<WeakConnectionHandle>>>,
 }
 
 /// How long a pairing key printed by the host stays good.
@@ -191,6 +205,18 @@ impl TrustedClients {
         let read = self.db.read();
         let table = read.open_table(TRUSTED_CLIENTS);
         table.get(TrustedClientId(client_endpoint_id)).is_some()
+    }
+
+    async fn all(&self) -> Vec<TrustedClient> {
+        self.ensure_tables().await;
+        let read = self.db.read();
+        read.open_table(TRUSTED_CLIENTS)
+            .iter()
+            .map(|(id, value)| TrustedClient {
+                endpoint_id: id.value().0,
+                trusted_at_unix_secs: value.value().trusted_at_unix_secs,
+            })
+            .collect()
     }
 
     async fn trust(&self, client_endpoint_id: EndpointId) {
@@ -368,6 +394,7 @@ impl IrohAuth {
                 memory_trusted: tokio::sync::Mutex::new(MemoryTrustedClients::default()),
                 pending: tokio::sync::Mutex::new(pending),
                 pairing: tokio::sync::Mutex::new(PairingKeys::default()),
+                admitted: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -421,9 +448,9 @@ impl IrohAuth {
         }
     }
 
-    /// Pins a trusted identity at connection admission. Revocation applies to
-    /// subsequent connections, while the returned token keeps this connection
-    /// approved through its explicit first-stream confirmation.
+    /// Pins a trusted identity at connection admission: the returned token
+    /// approves this connection through its explicit first-stream
+    /// confirmation, and a revoke meanwhile closes it once it is admitted.
     pub async fn preapprove_endpoint(
         &self,
         client_endpoint_id: EndpointId,
@@ -476,8 +503,45 @@ impl IrohAuth {
             .trust(client_endpoint_id);
     }
 
-    /// Remove persistent trust for a client endpoint. Existing connections
-    /// close normally; subsequent connections require enrollment again.
+    /// Every client trusted for good, by an approved code or a pairing link.
+    /// One trusted only for a connection's while, through the user's ssh
+    /// login or on this machine, is none of them.
+    pub async fn trusted_clients(&self) -> Vec<TrustedClient> {
+        self.inner.trusted.all().await
+    }
+
+    /// Holds `connection`, just admitted as a client, for a revoke of its
+    /// key to close. One whose key was revoked while it was being admitted
+    /// is closed now; the answer says whether it stays open.
+    pub(crate) async fn admit(&self, connection: &Connection) -> bool {
+        let client = connection.remote_id();
+        {
+            let mut admitted = self.inner.admitted.lock().expect("admitted connections");
+            admitted.retain(|_, held| {
+                held.retain(|handle| {
+                    handle
+                        .upgrade()
+                        .is_some_and(|open| open.close_reason().is_none())
+                });
+                !held.is_empty()
+            });
+            admitted
+                .entry(client)
+                .or_default()
+                .push(connection.weak_handle());
+        }
+        // A revoke takes trust away before it closes what it holds, so a
+        // connection held after that close finds the trust gone here.
+        if self.is_trusted_endpoint(client).await {
+            return true;
+        }
+        connection.close(0u32.into(), REVOKED);
+        false
+    }
+
+    /// Takes back trust in a client endpoint, persistent or for its
+    /// connections' while, and closes every connection it has open: it must
+    /// enroll again to reach the host.
     pub async fn revoke(&self, client_endpoint_id: EndpointId) -> bool {
         let memory_removed = self
             .inner
@@ -485,7 +549,18 @@ impl IrohAuth {
             .lock()
             .await
             .revoke(client_endpoint_id);
-        self.inner.trusted.revoke(client_endpoint_id).await || memory_removed
+        let removed = self.inner.trusted.revoke(client_endpoint_id).await || memory_removed;
+        let open = self
+            .inner
+            .admitted
+            .lock()
+            .expect("admitted connections")
+            .remove(&client_endpoint_id)
+            .unwrap_or_default();
+        for connection in open.iter().filter_map(WeakConnectionHandle::upgrade) {
+            connection.close(0u32.into(), REVOKED);
+        }
+        removed
     }
 }
 
@@ -550,6 +625,45 @@ mod tests {
                 .begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JN").unwrap())
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_is_no_longer_listed_or_trusted() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), endpoint_id(1));
+        let (laptop, phone, session) = (endpoint_id(2), endpoint_id(3), endpoint_id(4));
+        for (client, code) in [(laptop, "ABCD-EFGH-JK"), (phone, "ABCD-EFGH-JM")] {
+            let code = EnrollmentCode::from_str(code).unwrap();
+            auth.begin_enrollment(client, code).await.unwrap();
+            auth.approve_code(&code).await.unwrap();
+        }
+        // Trusted only for its connections, through the user's ssh login.
+        auth.trust_in_memory(session).await;
+        let listed = |auth: &IrohAuth| {
+            let auth = auth.clone();
+            async move {
+                let mut ids: Vec<_> = auth
+                    .trusted_clients()
+                    .await
+                    .into_iter()
+                    .map(|client| client.endpoint_id)
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let mut both = vec![laptop, phone];
+        both.sort();
+        assert_eq!(listed(&auth).await, both);
+
+        assert!(auth.revoke(laptop).await);
+        assert_eq!(listed(&auth).await, [phone]);
+        assert!(!auth.is_trusted_endpoint(laptop).await);
+        assert!(auth.preapprove_endpoint(laptop).await.is_none());
+        assert!(
+            auth.is_trusted_endpoint(phone).await,
+            "the other device stays"
         );
     }
 

@@ -9,13 +9,16 @@
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div};
+use jiff::{Timestamp, Zoned};
 use language::{Buffer, BufferEvent, Capability};
 use multi_buffer::{Anchor, MultiBuffer};
-use rho_frame::{FrameLink, Surface, phone_editor_tap};
+use rho_dealer::Addressed as _;
+use rho_frame::when::reminder_said;
+use rho_frame::{CardHere, FrameLink, Surface, phone_editor_tap};
 use rho_window::draft::focus_writing_at;
 use theme::ActiveTheme as _;
 
-use crate::{NoteId, NoteSystem, title_of};
+use crate::{NoteId, NoteSystem, reminder, title_of};
 
 /// Sets a buffer's whole text, when it differs.
 fn set_text(buffer: &Entity<Buffer>, text: &str, cx: &mut App) {
@@ -48,6 +51,9 @@ pub struct NoteView {
     /// only when it moved away from it, and a text from another device
     /// replaces the buffer only when it differs from it.
     synced: Option<String>,
+    /// When the reminder the user set on the note comes due, as last read
+    /// with its text: the status line is drawn while the frame is busy.
+    reminder: Option<Timestamp>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -108,6 +114,7 @@ impl NoteView {
             editor,
             body,
             synced: None,
+            reminder: None,
             _subscriptions: subscriptions,
         }
     }
@@ -151,11 +158,15 @@ impl NoteView {
     /// Brings the surface up to the marks unless the user is typing.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let note = self.note;
-        let Some(text) = self.frame.read(cx, |frame, cx| {
-            self.system.read(cx).text(frame.marks(), note)
+        let Some((text, reminder)) = self.frame.read(cx, |frame, cx| {
+            (
+                self.system.read(cx).text(frame.marks(), note),
+                reminder(frame.marks(), &note.address()).map(|snooze| snooze.until),
+            )
         }) else {
             return;
         };
+        self.reminder = reminder;
         if self.synced.as_ref() != Some(&text) {
             set_text(&self.body, &text, cx);
             self.synced = Some(text);
@@ -184,6 +195,19 @@ impl NoteView {
 impl Surface for NoteView {
     fn title(&self, cx: &App) -> String {
         title_of(&self.body.read(cx).text())
+    }
+
+    /// When the reminder comes due, quietly, while the note is no card.
+    fn status(&self, _cx: &App) -> Option<String> {
+        let now = Zoned::now();
+        self.reminder
+            .map(|until| reminder_said(&until.to_zoned(now.time_zone().clone()), &now))
+    }
+
+    /// A note is a card the user schedules: `space s` sets its reminder,
+    /// and it deals once that is due.
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::Reminder
     }
 
     fn edits_at_point(&self, _cx: &App) -> bool {

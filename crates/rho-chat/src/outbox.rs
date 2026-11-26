@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{ContentPart, EndpointId, MessageId, MessageVersion, RuntimeLabel, UnixMs};
+use rho_agent_types::{
+    ContentPart, EndpointId, MessageId, MessageVersion, ProjectMode, RuntimeLabel, UnixMs,
+};
 use senax_encoder::{Decode, Encode};
 
 /// One message on disk until its host takes it.
@@ -28,6 +30,9 @@ pub struct Outgoing {
     #[senax(default)]
     pub delivery: Delivery,
     pub runtime: Option<RuntimeLabel>,
+    /// An idea's `in:` line, when it overrides the project's mode.
+    #[senax(default)]
+    pub mode: Option<ProjectMode>,
     #[senax(default)]
     pub state: OutgoingState,
 }
@@ -271,6 +276,7 @@ mod tests {
             content: text(words),
             delivery: Delivery::Mail,
             runtime: None,
+            mode: None,
             state: OutgoingState::Queued,
         }
     }
@@ -431,6 +437,7 @@ mod tests {
             content: text("explicit choice"),
             delivery: Delivery::Idea,
             runtime: Some(label.clone()),
+            mode: None,
             state: OutgoingState::Queued,
         };
         let bytes = senax_encoder::encode(&outgoing).unwrap();
@@ -461,6 +468,7 @@ mod tests {
             content: vec![ContentPart::Text { text: text.into() }],
             delivery: Delivery::Mail,
             runtime: None,
+            mode: None,
             state: OutgoingState::Queued,
         };
         let mut outbox = Outbox::load(vec![

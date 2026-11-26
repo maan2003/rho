@@ -51,7 +51,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "3e9d51b7";
+const CURRENT_AGENT_DB_FORMAT: &str = "5d0e8a13";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
@@ -60,7 +60,12 @@ type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 const MIGRATIONS: &[Migration] = &[
     // Each post gets one voice and project settings move into the log. An
     // older host cannot decode the voiced log.
-    ("7c2a5f9d", CURRENT_AGENT_DB_FORMAT, migrate_voices),
+    ("7c2a5f9d", "3e9d51b7", migrate_voices),
+    // Each project's standing agent moves onto the log, so every device
+    // names its workset by the project. An older host cannot decode it.
+    ("3e9d51b7", CURRENT_AGENT_DB_FORMAT, |write| {
+        crate::store::log_standing_agents(write)
+    }),
 ];
 
 /// The place an agent works: its repository for a clone, else its directory.
@@ -629,7 +634,47 @@ mod tests {
             .into_iter()
             .map(|(_, hop)| hop.unwrap())
             .collect();
-        assert_eq!(hops, [format!("7c2a5f9d->{CURRENT_AGENT_DB_FORMAT}")]);
+        assert_eq!(
+            hops,
+            [
+                "7c2a5f9d->3e9d51b7".to_owned(),
+                format!("3e9d51b7->{CURRENT_AGENT_DB_FORMAT}")
+            ]
+        );
+    }
+
+    /// A store from before the standing agent was logged logs it once, so
+    /// every device folds the same standing agent the index holds.
+    #[tokio::test]
+    async fn the_standing_hop_logs_each_standing_agent_once() {
+        use rho_agent_types::{ChatEvent, ProjectId};
+
+        use crate::store::{MailRead as _, ProjectRead as _, ProjectWrite as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        write.init_store_tables();
+        let agent = write.alloc_agent_id();
+        let project = ProjectId(rho_agent_types::MessageId(rho_agent_types::ChatSeq(4)));
+        write.index_standing_agent(project, Some(agent));
+        write.open_table(FORMAT).insert((), "3e9d51b7".to_owned());
+        write.commit();
+
+        prepare(&db).await;
+        prepare(&db).await;
+        let read = db.read();
+        assert_eq!(read.standing_agents(), [(project, agent)]);
+        let logged: Vec<_> = read
+            .mail_since(rho_agent_types::ChatSeq(0), usize::MAX)
+            .into_iter()
+            .filter_map(|record| match record.event {
+                ChatEvent::Standing { project, agent } => Some((project, agent)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logged, [(project, Some(agent))]);
     }
 
     /// A savepoint recorded for a hop this build does not know goes when

@@ -350,11 +350,15 @@ impl AuthenticatedIrohListener {
 
 #[cfg(any(feature = "server", feature = "native-client"))]
 fn install_crypto_provider() -> anyhow::Result<()> {
+    // Another thread may install it between the check and the install;
+    // the one that lands is as good.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
+    anyhow::ensure!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "failed to install the AWS-LC rustls crypto provider"
+    );
     Ok(())
 }
 
@@ -1007,6 +1011,81 @@ mod tests {
                 }
             }
             assert!(through.try_recv().is_err(), "nothing else got through");
+            listening.abort();
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Revoking a client's key closes the connections it has open, as well
+    /// as turning it away next time; another client's connection stays.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn a_revoked_client_loses_its_open_connection() -> anyhow::Result<()> {
+        install_crypto_provider()?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let temp = tempfile::tempdir()?;
+            let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+            let secret = load_or_create_server_secret(&db).await?;
+            let auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .secret_key(secret)
+                .alpns(vec![b"app".to_vec()])
+                .bind()
+                .await?;
+            let address = endpoint.addr();
+            let mut listener =
+                AuthenticatedIrohListener::new(endpoint, b"app".to_vec(), auth.clone(), 4)?;
+            let (accepted, mut through) = tokio::sync::mpsc::unbounded_channel();
+            let listening = tokio::spawn(async move {
+                while let Some(next) = listener.accept().await {
+                    if let Ok(Accepted::Client(next)) = next {
+                        accepted.send(next).unwrap();
+                    }
+                }
+            });
+            let bind = || iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay).bind();
+            // Each trusted for good, as a pairing link trusts a device.
+            let mut open = Vec::new();
+            for device in [bind().await?, bind().await?] {
+                let key = auth.mint_pairing_key().await;
+                let connection = device.connect(address.clone(), b"app").await?;
+                let said = authenticate_iroh_client(&connection, device.id(), Some(&key)).await?;
+                assert_eq!(said, rho_iroh_auth::ClientAuthResult::Approved);
+                let held = through.recv().await.expect("admitted");
+                assert_eq!(held.remote_id(), device.id());
+                open.push((device, connection, held));
+            }
+            let [
+                (lost, lost_connection, _lost_held),
+                (kept, kept_connection, kept_held),
+            ] = <[_; 2]>::try_from(open).ok().unwrap();
+
+            assert!(auth.revoke(lost.id()).await);
+            let reason = lost_connection.closed().await;
+            assert!(
+                matches!(&reason, iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                    if &close.reason[..] == b"this device's key was revoked"),
+                "{reason:?}"
+            );
+            // The other device's connection still carries streams.
+            let (mut send, recv) = kept_connection.open_bi().await?;
+            send.write_all(b"x").await?;
+            let (_, mut on_host) = kept_held.accept_bi().await?;
+            let mut byte = [0; 1];
+            on_host.read_exact(&mut byte).await?;
+            assert_eq!(&byte, b"x");
+            drop(recv);
+            assert!(kept_connection.close_reason().is_none());
+
+            // And the lost device is a stranger now.
+            let again = lost.connect(address.clone(), b"app").await?;
+            let said = authenticate_iroh_client(&again, lost.id(), None).await?;
+            assert!(
+                matches!(said, rho_iroh_auth::ClientAuthResult::EnrollmentRequired(_)),
+                "{said:?}"
+            );
+            drop(kept);
             listening.abort();
             Ok(())
         })

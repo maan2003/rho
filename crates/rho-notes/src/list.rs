@@ -11,7 +11,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, HighlightStyle, MouseButton, Subscription, Task,
     Window, div,
 };
-use jiff::Timestamp;
+use jiff::Zoned;
 use language::{Buffer, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_dealer::Addressed as _;
@@ -255,7 +255,7 @@ impl NotesView {
         };
         let selected = self.cursor_note(cx);
         self.transcript
-            .reconcile(items(&notes, filtering, self.phone, Timestamp::now()), cx);
+            .reconcile(items(&notes, filtering, self.phone, &Zoned::now()), cx);
         // Clearing the field on departure also emits an edit event. It
         // restores the full list without choosing its first row.
         let new_filter = changed_query && filtering;
@@ -379,7 +379,7 @@ fn items(
     notes: &[Listed],
     filtering: bool,
     phone: bool,
-    now: Timestamp,
+    now: &Zoned,
 ) -> Vec<Item<Key, Class, Option<NoteId>>> {
     if notes.is_empty() {
         let text = match (filtering, phone) {
@@ -404,7 +404,7 @@ fn items(
         .collect()
 }
 
-pub(crate) fn row(listed: &Listed, now: Timestamp) -> (String, Vec<(Class, Range<usize>)>) {
+pub(crate) fn row(listed: &Listed, now: &Zoned) -> (String, Vec<(Class, Range<usize>)>) {
     let mut text = format!("  {}", listed.title);
     let mut styles = vec![(Class::Title, 2..text.len())];
     let muted = text.len();
@@ -425,7 +425,12 @@ pub(crate) fn row(listed: &Listed, now: Timestamp) -> (String, Vec<(Class, Range
         }
     }
     text.push_str("  · ");
-    text.push_str(&rho_dealer::curve::age(listed.written, now));
+    if let Some(until) = listed.reminder {
+        let until = until.to_zoned(now.time_zone().clone());
+        text.push_str(&rho_frame::when::reminder_said(&until, now));
+        text.push_str(" · ");
+    }
+    text.push_str(&rho_dealer::curve::age(listed.written, now.timestamp()));
     styles.push((Class::Muted, muted..text.len()));
     (text, styles)
 }

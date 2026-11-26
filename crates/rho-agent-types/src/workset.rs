@@ -33,6 +33,30 @@ impl Wpos {
     }
 }
 
+/// How far `rewind agent` takes an agent back: its last turns, or every
+/// turn that started after a step of its log (`rewind agent to here`).
+/// Which requests start a turn is its runtime's to say; each lists their
+/// starts, oldest first, and this picks the first taken back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Rewind {
+    Turns(u32),
+    After(Wpos),
+}
+
+impl Rewind {
+    /// Of `starts`, the turns' first rows oldest first, the index of the
+    /// first turn taken back; `None` when there is none to take back.
+    pub fn first_taken(self, starts: &[Wpos]) -> Option<usize> {
+        match self {
+            Self::Turns(0) => None,
+            Self::Turns(turns) => {
+                (!starts.is_empty()).then(|| starts.len().saturating_sub(turns as usize))
+            }
+            Self::After(step) => starts.iter().position(|start| *start > step),
+        }
+    }
+}
+
 /// Who speaks in an input: where the model reads it and how soon it wakes for
 /// it ([DECISION-roles](../../../agent-host/rho-agent/specs/DECISION-roles.
 /// md)).

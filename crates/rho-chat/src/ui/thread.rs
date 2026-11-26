@@ -75,6 +75,17 @@ pub static SEND_MESSAGE: Spelling = Spelling {
     argument: None,
 };
 
+pub static FORK_THREAD: Spelling = Spelling {
+    name: "fork thread",
+    aliases: &[
+        ("tangent", 9),
+        ("new tangent", 8),
+        ("branch thread", 6),
+        ("fork", 7),
+    ],
+    argument: None,
+};
+
 pub static OPEN_UNDER_CURSOR: Spelling = Spelling {
     name: "open under cursor",
     aliases: &[("follow link", 7), ("open link", 7), ("open", 4)],
@@ -993,11 +1004,19 @@ fn history_items(
         })
         .unwrap_or_default();
     let now = Timestamp::now();
+    // While more than one agent has a live message here, each project
+    // message says which agent wrote it, quietly, by its short code.
+    let several = live_writers(chat.reading_order(thread.message)).len() > 1;
     let mail_item = |message: &Message| {
         let voice = match (message.from, message.voice) {
             (Party::Agent(agent), Voice::ToAgent(_)) => system
                 .agent_label(host, agent, cx)
                 .or_else(|| Some(agent.encoded())),
+            (Party::Agent(agent), Voice::Message) if several => Some(
+                system
+                    .participant(host, agent, cx)
+                    .map_or_else(|| agent.encoded(), |participant| participant.code),
+            ),
             _ => None,
         };
         message_item(message, voice.as_deref(), &expanded.quotes, now)
@@ -1031,19 +1050,21 @@ fn history_items(
             items.extend(mail_item(message));
         }
         items.extend(private.remove(&id).unwrap_or_default());
-        // The opening mail's children are this history, not a tangent.
+        // The opening mail's children are this history, not a tangent. A
+        // mail with messages under it is the opening of one tangent: the
+        // thread `fork thread` (or an agent's `chat.fork`) starts there.
         let replies = chat.children(Some(id));
         if id != thread.message && !replies.is_empty() {
             let (_, at) = chat.newest_in(id).unwrap_or_else(|| message.version());
             let text = format!(
-                "  ↳ {} {} · {} · {}",
+                "  ↳ 1 tangent · {} · {} {} · {}",
+                chat.name(id).unwrap_or_default(),
                 replies.len(),
                 if replies.len() == 1 {
-                    "reply"
+                    "message"
                 } else {
-                    "replies"
+                    "messages"
                 },
-                chat.name(id).unwrap_or_default(),
                 thread::when(at.0 as i64),
             );
             items.push(line(Key::Fold(id), &text, Class::Fold).with_lines(vec![Meta::Thread(id)]));
@@ -1054,6 +1075,27 @@ fn history_items(
     }
     items.extend(crumb);
     without_trailing_gap(items)
+}
+
+/// The agents with a live message (`chat.the last message stays live`):
+/// one they sent since the user's last message, and did not take back.
+fn live_writers<'a>(messages: impl Iterator<Item = &'a Message>) -> BTreeSet<AgentId> {
+    let mut live = BTreeSet::new();
+    for message in messages.filter(|message| message.voice == Voice::Message) {
+        match message.from {
+            Party::User => live.clear(),
+            Party::Agent(agent)
+                if !matches!(
+                    message.revision,
+                    Revision::Deleted | Revision::TakenBack { .. }
+                ) =>
+            {
+                live.insert(agent);
+            }
+            _ => {}
+        }
+    }
+    live
 }
 
 /// One group per author, independent of edit versions and display state.
@@ -1801,7 +1843,7 @@ fn selected_lines(range: Range<Point>) -> std::ops::RangeInclusive<u32> {
     range.start.row..=end
 }
 
-fn quote_lines(text: &str) -> String {
+pub(super) fn quote_lines(text: &str) -> String {
     let mut quote = String::new();
     for line in text.split('\n') {
         quote.push_str("> ");
@@ -2142,6 +2184,23 @@ impl Surface for ThreadView {
                 })
                 .bound_to(QuoteSelection),
             );
+        }
+        // A message under the point, other than the one this thread opens
+        // with, can open a tangent of its own.
+        if let Some(mail) = self
+            .line_meta(self.cursor_row(cx), cx)
+            .and_then(Meta::mail)
+            .filter(|mail| *mail != self.thread.message)
+        {
+            let system = self.system.clone();
+            let tangent = ThreadId {
+                host: self.thread.host,
+                message: mail,
+            };
+            commands.push(Command::simple(&FORK_THREAD, move |frame, window, cx| {
+                system.update(cx, |system, _| system.start_tangent(tangent));
+                frame.open(tangent.address(), window, cx);
+            }));
         }
         if self.system.read(cx).refused_reply(self.thread).is_some() {
             let view = this.clone();
@@ -3523,7 +3582,7 @@ mod tests {
         let fold = thread
             .text(cx)
             .lines()
-            .find(|line| line.starts_with("  ↳ 1 reply"))
+            .find(|line| line.starts_with("  ↳ 1 tangent") && line.contains("1 message"))
             .unwrap()
             .to_owned();
         thread.at(cx, &fold, "  ↳ ".len() as u32);
@@ -3613,6 +3672,7 @@ mod tests {
                 system.set_participants(Rc::new(move |host, id, _| {
                     (host == thread.host && (id == worker || id == other)).then(|| Participant {
                         label: if id == worker { "worker" } else { "other" }.into(),
+                        code: if id == worker { "eng-work" } else { "eng-othr" }.into(),
                         runtime: Some("sol".into()),
                         created_at: Some(UnixMs(1)),
                         doing: None,
@@ -4032,6 +4092,60 @@ mod tests {
             }],
             revision,
         }
+    }
+
+    /// `chat.the last message stays live`: an agent holds a live message
+    /// from its message since the user's last one, until it is deleted or
+    /// taken back; a flash never holds one.
+    #[test]
+    fn only_messages_since_the_users_last_are_live() {
+        let domain = rho_agent_types::AgentIdDomain(0);
+        let a = AgentId::from_counter(1, &domain).unwrap();
+        let b = AgentId::from_counter(2, &domain).unwrap();
+        let said = |from: Party| mail(from, Revision::Original, "words");
+        let flash = |agent| Message {
+            voice: Voice::Flash,
+            ..said(Party::Agent(agent))
+        };
+        let taken_back = |agent| {
+            mail(
+                Party::Agent(agent),
+                Revision::TakenBack {
+                    seq: ChatSeq(9),
+                    at: UnixMs(9),
+                },
+                "words",
+            )
+        };
+        let live = |messages: &[Message]| {
+            live_writers(messages.iter())
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            live(&[
+                said(Party::Agent(a)),
+                said(Party::User),
+                said(Party::Agent(b)),
+                said(Party::Agent(a)),
+            ]),
+            [a, b]
+        );
+        assert_eq!(
+            live(&[
+                said(Party::Agent(a)),
+                said(Party::Agent(b)),
+                said(Party::User),
+                flash(b),
+            ]),
+            Vec::<AgentId>::new(),
+            "the user's reply answered both, and a flash is no message"
+        );
+        assert_eq!(
+            live(&[said(Party::Agent(a)), taken_back(b)]),
+            [a],
+            "words taken back hold no place"
+        );
     }
 
     #[test]

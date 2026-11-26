@@ -165,6 +165,18 @@ pub enum ChatEvent {
         message: MessageId,
         content: Vec<ContentPart>,
     },
+    /// The agent that stands for a project (`one` mode) changes: it reads
+    /// every idea sent `in: one`, and its workset is called by the project
+    /// alone. `None`: no agent stands for it until the next such idea.
+    Standing {
+        project: crate::ProjectId,
+        agent: Option<AgentId>,
+    },
+    /// The project is done with: no idea starts in it and no device offers
+    /// it on a `to:` line. Its threads stay readable and searchable.
+    Retired {
+        project: crate::ProjectId,
+    },
 }
 
 /// What a thread's agents are doing beside its messages, for as long as it
