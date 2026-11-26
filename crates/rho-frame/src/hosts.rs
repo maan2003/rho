@@ -5,9 +5,10 @@
 //! the ledger rides along. What is attached is written down, so the next
 //! start attaches the same hosts.
 
+use std::future::Future;
 use std::rc::Rc;
 
-use gpui::Window;
+use gpui::{Context, Window};
 use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostId, HostSpec};
@@ -157,9 +158,7 @@ impl Frame {
             } => {
                 let who = match agent {
                     Some(agent) => self
-                        .systems
-                        .iter()
-                        .find_map(|system| system.agent_name(agent, cx))
+                        .agent_name(agent, cx)
                         .unwrap_or_else(|| format!("agent {} on {name}", agent.encoded())),
                     None => name,
                 };
@@ -196,6 +195,114 @@ impl Frame {
             }
         }
         cx.notify();
+    }
+
+    /// What the window calls an agent a host names, such as `eng-b8os`,
+    /// when a system holds it.
+    pub(crate) fn agent_name(
+        &self,
+        agent: rho_agent_types::AgentId,
+        cx: &gpui::App,
+    ) -> Option<String> {
+        self.systems
+            .iter()
+            .find_map(|system| system.agent_name(agent, cx))
+    }
+
+    /// Runs `then` on the host a command means: the only one attached, or
+    /// the one the user names at `host:`. With none attached the echo line
+    /// says so, under `command`'s name
+    /// (`window.commands are global in the palette`).
+    pub fn choose_host(
+        &mut self,
+        command: &'static str,
+        then: OnHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let only = match self.hosts.ids().as_slice() {
+            [] => {
+                self.echo(
+                    &format!("{command}: no agent host is attached"),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            }
+            [host] => Some(*host),
+            _ => None,
+        };
+        if let Some(host) = only {
+            return then(self, host, window, cx);
+        }
+        self.open_prompt(
+            "host:",
+            Rc::new(|frame, needle, _| {
+                frame
+                    .hosts
+                    .iter()
+                    .filter(|host| host.name.contains(needle.trim()))
+                    .map(|host| Candidate {
+                        value: host.name.clone(),
+                        description: host.status.label(),
+                    })
+                    .collect()
+            }),
+            Rc::new(move |frame, input, window, cx| {
+                let name = input.trim();
+                match frame.hosts.by_name(name).map(|host| host.id) {
+                    Some(host) => then(frame, host, window, cx),
+                    None => frame.echo(
+                        &format!("{command}: no host called {name}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Waits for `host`'s `answer` and hands it to `then`, which asks the
+    /// user what to do with it. Meanwhile the echo line says whom it asked;
+    /// a refusal or a lost host is echoed under `command`'s name. An answer
+    /// that comes while the user has another prompt or menu open does not
+    /// take it from them.
+    pub fn when_host_answers<T: 'static>(
+        &mut self,
+        command: &'static str,
+        host: HostId,
+        answer: impl Future<Output = anyhow::Result<T>> + 'static,
+        then: impl FnOnce(&mut Frame, T, &mut Window, &mut Context<Frame>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.hosts.host_label(host);
+        self.echo(
+            &format!("{command}: asking {name}…"),
+            StyleClass::SystemInfo,
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            let _ = this.update_in(cx, |frame, window, cx| match answer {
+                Err(error) => frame.echo(
+                    &format!("{command}: {name}: {error:#}"),
+                    StyleClass::StatusError,
+                    cx,
+                ),
+                Ok(_) if frame.minibuffer.is_some() || frame.menu.is_some() => frame.echo(
+                    &format!(
+                        "{command}: {name} answered while another prompt was open · run it again"
+                    ),
+                    StyleClass::SystemInfo,
+                    cx,
+                ),
+                Ok(answer) => then(frame, answer, window, cx),
+            });
+        })
+        .detach();
     }
 
     /// What picking a host in the palette does: a host that does not
@@ -287,6 +394,9 @@ impl Frame {
         let _ = question.response.send(decision);
     }
 }
+
+/// What a host command does once it knows which host it means.
+pub type OnHost = Rc<dyn Fn(&mut Frame, HostId, &mut Window, &mut Context<Frame>)>;
 
 const ALLOW: &str = "allow";
 const DENY: &str = "deny";

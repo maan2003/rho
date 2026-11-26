@@ -28,6 +28,7 @@ pub mod attention;
 pub mod deal;
 mod desk;
 pub mod frame;
+mod gccp;
 pub mod hosts;
 pub mod keys;
 pub mod link;
@@ -46,6 +47,7 @@ pub mod when;
 
 pub use deal::dealer_policy_snapshot;
 pub use frame::{CardInspection, Frame, Point};
+pub use hosts::OnHost;
 pub use keys::normal_contexts;
 pub use link::FrameLink;
 pub use menu::{Row, Rows};

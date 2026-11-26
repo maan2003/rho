@@ -16,6 +16,7 @@
 //! The system also opens the usage charts ([`crate::usage`]): it asks the
 //! hosts it reaches and keeps their answers, and a chart observes it.
 
+mod accounts;
 mod address;
 mod commands;
 mod start;
@@ -1417,13 +1418,23 @@ impl System for AgentsSystem {
     }
 
     /// The commands about agents are on every screen once any host has
-    /// agents to act on; the screen says only which they act on.
+    /// agents to act on; the screen says only which they act on. Switching
+    /// the Claude account is on every screen always: with no host attached
+    /// it says so.
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
-        if self.registry.hosts().next().is_none() {
-            return Vec::new();
-        }
         let this = cx.entity();
+        let reported = this.downgrade();
+        let account = accounts::row(Rc::new(move |host, cx| {
+            reported
+                .upgrade()
+                .map(|system| system.read(cx).quotas.summaries(host).to_vec())
+                .unwrap_or_default()
+        }));
+        if self.registry.hosts().next().is_none() {
+            return vec![account];
+        }
         let mut rows = commands::rows(this.clone(), self.here(point, cx));
+        rows.push(account);
         let Some(thread) = self.thread_at(point, cx) else {
             return rows;
         };

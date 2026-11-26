@@ -59,6 +59,12 @@ impl Quotas {
         self.summaries.insert(host, summaries);
     }
 
+    /// What `host` last said is left of each allowance; nothing until it
+    /// has said.
+    pub fn summaries(&self, host: HostId) -> &[QuotaSummary] {
+        self.summaries.get(&host).map_or(&[], Vec::as_slice)
+    }
+
     pub fn set_history(&mut self, host: HostId, series: Vec<QuotaSeries>) {
         self.history.insert(host, series);
     }

@@ -1312,6 +1312,7 @@ impl Frame {
                 cx,
             );
         }));
+        rows.push(Row::menu("g", crate::gccp::rows()));
         for (index, host) in self.hosts.iter().enumerate() {
             let id = host.id;
             rows.push(Row::run(
@@ -2705,6 +2706,8 @@ mod tests {
             .minibuffer_mut()
             .expect("a prompt is open")
             .set_input(text.to_owned(), window, cx);
+        // As typing does: the answers offered follow the line.
+        frame.refresh_minibuffer(cx);
         frame.minibuffer_confirm(window, cx);
     }
 
@@ -2865,6 +2868,364 @@ mod tests {
                 assert_eq!(
                     saved.history(&Frame::desk_address()).current_key(),
                     &charts[3]
+                );
+            })
+            .unwrap();
+    }
+
+    // ---- commands that act on a host ----
+
+    use rho_agent_hosts::protocol::{
+        GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove, GccpState, Open as HostOpen,
+        Request as HostRequest,
+    };
+    use rho_rpc::protocol::{Answer as HostAnswer, read_frame, write_frame};
+
+    const HARNESS: &str = "9kpjn6yxeu4jfy5o3xjnsq3qfqe9zd5ab6dn7ommq3tjsbzzkzby";
+    const ADDRESS: &str = "9kpjn6yxeu4jfy5o3xjnsq3qfqe9zd5ab6dn7ommq3tjsbzzkzby/4";
+
+    /// What a host says of GCCP: one approved harness, and one address on
+    /// it the test system's agent accepted.
+    fn gccp_state() -> GccpState {
+        GccpState {
+            endpoint: Some("this-host-endpoint".to_owned()),
+            hosts: vec![GccpHost {
+                endpoint: HARNESS.to_owned(),
+                name: "fable lab".to_owned(),
+            }],
+            contacts: vec![GccpContact {
+                agent: HostBacked::asker().encoded(),
+                address: ADDRESS.to_owned(),
+                name: "reviewer".to_owned(),
+            }],
+        }
+    }
+
+    /// What a host in this process was asked, in order.
+    type Asked = Rc<std::cell::RefCell<Vec<HostRequest>>>;
+
+    /// Attaches a host called `name` and puts it in this process: it
+    /// answers `GccpList` with `listed` (or refuses with it), and does
+    /// whatever else it is asked.
+    fn attach_in_process(
+        frame: &gpui::WindowHandle<Frame>,
+        name: &str,
+        listed: Result<GccpState, &'static str>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Asked {
+        let streams = frame
+            .update(cx, |frame, _, cx| {
+                let spec = HostSpec {
+                    name: name.to_owned(),
+                    target: rho_agent_hosts::AttachTarget::Local {
+                        runtime_dir: format!("/nonexistent/{name}").into(),
+                    },
+                };
+                let host = frame.attach_host(spec, cx);
+                frame
+                    .hosts()
+                    .connection(host)
+                    .unwrap()
+                    .link()
+                    .connect_in_process()
+            })
+            .unwrap();
+        let asked = Asked::default();
+        let record = asked.clone();
+        cx.foreground_executor()
+            .spawn(async move {
+                let mut streams = streams;
+                while let Some(mut stream) = streams.recv().await {
+                    let open: rho_rpc::protocol::Open = read_frame(&mut stream).await.unwrap();
+                    let HostOpen::Request(request) = open.unpack::<HostOpen>().unwrap() else {
+                        panic!("only calls here");
+                    };
+                    record.borrow_mut().push(request.clone());
+                    match request {
+                        HostRequest::GccpList(GccpList) => {
+                            let answer = listed.clone().map_err(|reason| anyhow::anyhow!(reason));
+                            write_frame(&mut stream, &HostAnswer::from(answer)).await
+                        }
+                        HostRequest::GccpApprove(_) | HostRequest::GccpRemove(_) => {
+                            write_frame(&mut stream, &HostAnswer::from(Ok(()))).await
+                        }
+                        other => panic!("not asked of a host here: {other:?}"),
+                    }
+                    .unwrap();
+                }
+            })
+            .detach();
+        asked
+    }
+
+    fn gccp_frame(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Frame> {
+        cx.update(gpui_tokio::init);
+        host_backed_frame(cx).0
+    }
+
+    /// Runs the palette's command called `label`, as `enter` on its row.
+    fn run_command(frame: &mut Frame, label: &str, window: &mut Window, cx: &mut Context<Frame>) {
+        let commands = frame.commands(window, cx);
+        let Some(row) = commands.iter().find(|row| row.pick.label() == label) else {
+            let labels: Vec<_> = commands.iter().map(|row| row.pick.label()).collect();
+            panic!("no {label:?} in {labels:?}");
+        };
+        let Pick::Run { run, .. } = &row.pick else {
+            panic!("{label} is no command");
+        };
+        run.clone()(frame, None, window, cx);
+    }
+
+    fn echo_of(frame: &Frame) -> Option<String> {
+        frame.echo.as_ref().map(|echo| echo.text().to_owned())
+    }
+
+    fn candidates_of(frame: &Frame) -> Vec<(String, String)> {
+        frame
+            .minibuffer
+            .as_ref()
+            .expect("a prompt is open")
+            .candidates()
+            .iter()
+            .map(|row| (row.value.clone(), row.description.clone()))
+            .collect()
+    }
+
+    const GCCP: [&str; 3] = [
+        "hosts › gccp › list",
+        "hosts › gccp › approve…",
+        "hosts › gccp › remove…",
+    ];
+
+    /// The GCCP commands are the window's own: on the desk, on a page that
+    /// says nothing of hosts, and with no host attached at all.
+    #[gpui::test]
+    fn gccp_commands_are_on_every_screen(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                let page = Address::new("page", "7");
+                let view = cx.new(|cx| Page(cx.focus_handle()));
+                frame.surfaces.insert(page.clone(), AnySurface::new(view));
+                for screen in [None, Some(page)] {
+                    if let Some(screen) = screen {
+                        frame.open(screen, window, cx);
+                    }
+                    let commands = frame.commands(window, cx);
+                    for label in GCCP {
+                        let row = commands
+                            .iter()
+                            .find(|row| row.pick.label() == label)
+                            .unwrap_or_else(|| panic!("{label} on {}", frame.current_address()));
+                        assert_eq!(row.scope, crate::menu::Scope::Window, "{label}");
+                    }
+                }
+                run_command(frame, GCCP[0], window, cx);
+                assert_eq!(prompt_of(frame), None, "nothing to ask about");
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("gccp list: no agent host is attached")
+                );
+            })
+            .unwrap();
+    }
+
+    /// With one host attached, `gccp list` asks it without asking which,
+    /// and lists its endpoint, its harnesses and what its agents accepted,
+    /// each agent by the name the window calls it; enter copies an id.
+    #[gpui::test]
+    fn one_host_is_asked_without_a_host_prompt(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        let asked = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_command(frame, GCCP[0], window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*asked.borrow(), [HostRequest::GccpList(GccpList)]);
+        frame
+            .update(cx, |frame, window, cx| {
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("gccp on lab · enter copies:")
+                );
+                assert_eq!(
+                    candidates_of(frame),
+                    [
+                        (
+                            "this-host-endpoint".to_owned(),
+                            "lab · give it to another harness's owner to approve".to_owned()
+                        ),
+                        (
+                            HARNESS.to_owned(),
+                            "approved harness \"fable lab\"".to_owned()
+                        ),
+                        (
+                            ADDRESS.to_owned(),
+                            "eng-b8os accepted it as \"reviewer\"".to_owned()
+                        ),
+                    ]
+                );
+                answer(frame, ADDRESS, window, cx);
+                assert_eq!(echo_of(frame), Some(format!("copied: {ADDRESS}")));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(ADDRESS.to_owned())
+        );
+        assert_eq!(asked.borrow().len(), 1, "listing changes nothing");
+    }
+
+    /// With two hosts attached, the command asks `host:` first, and only
+    /// the chosen host is asked and told.
+    #[gpui::test]
+    fn two_hosts_ask_which_and_remove_goes_to_the_chosen_one(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        let lab = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        let sea = attach_in_process(&frame, "sea", Ok(gccp_state()), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_command(frame, GCCP[2], window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some("host:"));
+                let hosts: Vec<_> = candidates_of(frame)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                assert_eq!(hosts, ["lab", "sea"]);
+                answer(frame, "sea", window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(lab.borrow().is_empty(), "the other host is not asked");
+        let row = format!("eng-b8os {ADDRESS}");
+        frame
+            .update(cx, |frame, window, cx| {
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("remove gccp address on sea:")
+                );
+                assert_eq!(
+                    candidates_of(frame),
+                    [(row.clone(), "\"reviewer\"".to_owned())]
+                );
+                answer(frame, &row, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(lab.borrow().is_empty());
+        assert_eq!(
+            *sea.borrow(),
+            [
+                HostRequest::GccpList(GccpList),
+                HostRequest::GccpRemove(GccpRemove {
+                    agent: HostBacked::asker().encoded(),
+                    address: ADDRESS.to_owned(),
+                }),
+            ],
+            "the host is told the agent by its id, not the window's name for it"
+        );
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(
+                    echo_of(frame),
+                    Some(format!("sea: eng-b8os no longer accepts {ADDRESS}"))
+                );
+            })
+            .unwrap();
+    }
+
+    /// `gccp approve` takes the endpoint and the rest of the line as the
+    /// harness's name; a line without a name tells the host nothing.
+    #[gpui::test]
+    fn approve_sends_the_endpoint_and_the_whole_name(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        let asked = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_command(frame, GCCP[1], window, cx);
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some("approve a gccp harness on lab · <endpoint id> <name>:")
+                );
+                answer(frame, HARNESS, window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("gccp approve: give the harness's endpoint id, then a name for it")
+                );
+                run_command(frame, GCCP[1], window, cx);
+                answer(frame, &format!("  {HARNESS}   fable lab  "), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            *asked.borrow(),
+            [HostRequest::GccpApprove(GccpApprove {
+                endpoint: HARNESS.to_owned(),
+                name: "fable lab".to_owned(),
+            })]
+        );
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(
+                    echo_of(frame),
+                    Some(format!(
+                        "lab: approved gccp harness {HARNESS} as \"fable lab\""
+                    ))
+                );
+            })
+            .unwrap();
+    }
+
+    /// A host that refuses is named on the echo line with its reason, and
+    /// no prompt opens.
+    #[gpui::test]
+    fn a_refusal_opens_nothing(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        attach_in_process(&frame, "lab", Err("gccp needs an iroh endpoint"), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_command(frame, GCCP[2], window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(prompt_of(frame), None);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("gccp remove: lab: gccp needs an iroh endpoint")
+                );
+            })
+            .unwrap();
+    }
+
+    /// An answer that comes while the user has another prompt open does
+    /// not take it from them.
+    #[gpui::test]
+    fn a_late_answer_leaves_the_users_prompt_alone(cx: &mut gpui::TestAppContext) {
+        let frame = gccp_frame(cx);
+        attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
+        frame
+            .update(cx, |frame, window, cx| {
+                run_command(frame, GCCP[0], window, cx);
+                frame.open_prompt(
+                    "attach host:",
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, _, _| {
+                assert_eq!(prompt_of(frame).as_deref(), Some("attach host:"));
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("gccp list: lab answered while another prompt was open · run it again")
                 );
             })
             .unwrap();

@@ -155,6 +155,22 @@ impl Hosts {
         self.get(host).map(Host::connection)
     }
 
+    /// The way a client crate reaches `host`. A host detached since
+    /// answers as a dropped one does: not connected.
+    pub fn link(&self, host: HostId) -> crate::Link {
+        self.connection(host)
+            .map_or_else(crate::Link::detached, Connection::link)
+    }
+
+    /// Makes one call of `host`'s machine; see [`Self::link`].
+    pub fn call<C: rho_rpc::protocol::Call>(
+        &self,
+        host: HostId,
+        call: C,
+    ) -> impl std::future::Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
+        self.link(host).call(call)
+    }
+
     pub fn is_online(&self, host: HostId) -> bool {
         self.get(host).is_some_and(|entry| entry.status.is_online())
     }

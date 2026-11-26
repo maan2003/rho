@@ -192,16 +192,26 @@ impl Link {
         self.run(|dialer| dial_gui_telemetry(dialer, snapshot))
     }
 
+    /// Makes one call of the machine on a stream of its own. The answer
+    /// needs no particular executor; a refusal is an error.
+    pub fn call<C: rho_rpc::protocol::Call>(
+        &self,
+        call: C,
+    ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static + use<C> {
+        self.run(|dialer| dial_call(dialer, call))
+    }
+
     /// Runs `work` against the host on the connection's runtime. The answer
     /// needs no particular executor; dropping it cancels the work. An
     /// in-process host's work runs in the answer itself, on whatever
     /// executor polls it: nothing in it needs a runtime, and a test steps
     /// it with everything else.
-    pub fn run<T, F>(
+    pub fn run<T, F, W>(
         &self,
-        work: impl FnOnce(Dialer) -> F,
-    ) -> impl Future<Output = anyhow::Result<T>> + Send + 'static
+        work: W,
+    ) -> impl Future<Output = anyhow::Result<T>> + Send + 'static + use<T, F, W>
     where
+        W: FnOnce(Dialer) -> F,
         F: Future<Output = anyhow::Result<T>> + Send + 'static,
         T: Send + 'static,
     {
@@ -242,15 +252,6 @@ impl Connection {
     /// Dials again now, rather than after the wait since the last try.
     pub fn retry_now(&self) {
         self.retry.notify_one();
-    }
-
-    /// Makes one call of the machine on a stream of its own. The answer
-    /// needs no particular executor; a refusal is an error.
-    pub fn call<C: rho_rpc::protocol::Call>(
-        &self,
-        call: C,
-    ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
-        self.link.run(|dialer| dial_call(dialer, call))
     }
 }
 

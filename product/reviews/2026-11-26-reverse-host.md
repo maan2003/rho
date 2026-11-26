@@ -121,7 +121,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 10. Host features that only the CLI reaches, and one undocumented palette command
 - **Kind:** product (undocumented)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 Wave C5 branch `loop2/wc5-gui-accounts-gccp`: global `switch claude account…` and `hosts › gccp › list`, `approve…`, `remove…` in the palette; rename and the performance report were documented in `0ebdae409`)
 - **Where:** `usage.Chart`, `hosts.Host`, `chat.Thread`
 - **Evidence:**
   - Account switching: `Worksets::ClaudeAccounts`/`SetClaudeAccount` are called only by `rho-cli`. Yet `usage.md` Chart `principle:` says the user can "start the next agent on an account with room", and no product action does that.

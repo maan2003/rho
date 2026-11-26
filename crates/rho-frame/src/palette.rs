@@ -945,6 +945,34 @@ mod tests {
         assert_eq!(ids(&listing, "usage 30d"), [1]);
     }
 
+    /// The account switch is found by `usage` too, but after the charts:
+    /// typing `usage` still puts `rate limit · 7d` first. Its own words
+    /// find it before any place. (The row is the agents system's.)
+    #[test]
+    fn usage_finds_the_account_switch_after_the_charts() {
+        let chart = Place {
+            found: Found {
+                address: Address::new("usage", "rate-limit/7d"),
+                title: "usage › rate limit · 7d".into(),
+                description: String::new(),
+                thread: None,
+                recency: 0,
+            },
+            card: None,
+            visit: None,
+            visited_ms: None,
+            current: false,
+            shortcut: None,
+        };
+        let switch = Row::run("", "switch claude account…", |_, _, _| {})
+            .also("usage")
+            .window_wide();
+        let listing = Listing::new(commands(&[switch], |_| None), vec![chart]);
+        assert_eq!(ids(&listing, "usage"), [0, 1]);
+        assert_eq!(ids(&listing, "account"), [1]);
+        assert_eq!(ids(&listing, "switch acc"), [1]);
+    }
+
     #[test]
     #[ignore = "performance benchmark"]
     fn bench_palette_rank() {

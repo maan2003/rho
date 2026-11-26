@@ -551,6 +551,15 @@ impl Minibuffer {
             || self.completed_selection.is_some()
     }
 
+    /// The answers the prompt offers for what is typed now.
+    #[cfg(test)]
+    pub(crate) fn candidates(&self) -> &[Candidate] {
+        match &self.answer {
+            Answer::Text { rows, .. } => rows,
+            Answer::Palette { .. } => &[],
+        }
+    }
+
     pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
         let Answer::Text { rows, .. } = &self.answer else {
             return None;
