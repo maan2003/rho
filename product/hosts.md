@@ -17,8 +17,8 @@ costs: two devices agree only when both hold the user's secret phrase.
 ## bet The window holds the secrets
 instead of: a host holding the user's browser session or ssh login.
 serves: Reach anything.
-because: the window is the user's own device, and an agent that needs the user's ssh login (or pushes to `main` / `master`) asks for it each time, so no agent uses it without the user's word. Scoped platform tokens (such as `GITHUB_TOKEN` on `octo`, which blocks `main`/`master` and tags) may live on the host for feature-branch automation.
-costs: a prompt that opens over whatever the user is doing, and a push that fails when they do not answer in a minute.
+because: the window is the user's own device, and an agent that needs the user's ssh login (or pushes to `main` / `master`) parks on an asynchronous action `deal.Card` until the user explicitly approves it, so no agent uses it without the user's word. Scoped platform tokens (such as `GITHUB_TOKEN` on `octo`, which blocks `main`/`master` and tags) may live on the host for feature-branch automation.
+costs: protected pushes wait until the user deals the approval card on a device that holds their ssh login.
 
 ## journey A new machine
 goal: the user can put their first idea to work within minutes on a new machine.

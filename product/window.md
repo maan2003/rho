@@ -115,7 +115,7 @@ does:
 
 A prompt for a secret, such as the phrase that pairs devices, shows what is typed or pasted like any other prompt. Only rho's history of what was typed at prompts keeps nothing of it.
 
-A question from a host, such as whether an agent may push, queues cleanly without clobbering an open user prompt; see `agents.Approve a push or a fetch`.
+A privileged action from a host, such as whether an agent may push to `main`/`master`, arrives as an asynchronous `deal.Card` rather than interrupting an open prompt; see `agents.Approve a push or a fetch`.
 
 ## concept Phone bar
 status: phone ergonomics and thread interaction on mobile are currently on hold while desktop settles.

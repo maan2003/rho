@@ -32,9 +32,10 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
+status: currently addresses still always show `@host` even when project names are unique across attached hosts.
 purpose: give each project one address to write to, and one answer, asked once, to where, how, and on what model its agents work.
-principle: the user sends an idea to `tide@lab`; the project starts the work at its place, in its mode, on its runtime, and sends its asks and results from that address.
-sees: its name and host as an address, such as `tide@lab`; where it works, its mode, and its runtime when configuring it or filtering by it in `window.Palette`. A project has no screen of its own.
+principle: the user sends an idea to `tide` (or `tide@lab` when two attached hosts share the name `tide`); the project starts the work at its place, in its mode, on its runtime, and sends its asks and results from that address.
+sees: its name (such as `tide`, adding `@host` only when two attached hosts have a project of the same name); where it works, its mode, and its runtime when configuring it or filtering by it in `window.Palette`. A project has no screen of its own.
 has:
 - many `Thread`
 does:
@@ -66,15 +67,16 @@ does:
 ## concept Message
 purpose: carry an idea, an ask, or a result in the voice of the project, keep it as the record of the work, and let the user answer in the thread.
 principle: the project asks a question; the user reads it on top of the thread with the project's earlier words one glance below, and replies without needing to know the writer's name.
-sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes; proof on a result
+sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes
 does:
-- show proof: a result message designates evidence under `## proof`
 - ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on the message: open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
 - reply: the user's words go into the thread, and every agent in it reads them; there is no addressee. With two asks open, the user names the agent in words or deals the next card
 - edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and keeps the card as it is
 - reply privately `alt-r`: write a remark directly beneath this message, as in `notes.Reply privately`
 rejected:
+- a required `## proof` section on every result message · 2026-11-26 · rigid templates fight different kinds of work; let agents back up results flexibly in prose, links, or captures, and use the workset transcript when deeper inspection is needed
+- replacing conversational request-response threads with a rigid mutable casefile state machine · 2026-11-26 · back-and-forth brainstorming and follow-ups need real conversation
 - kinds of message, `ask`, `result`, and `fyi` · 2026-11-20 · one yes or no, whether the message pings, does the job; a result waits like an ask
 - a message that is kept but does not ping · 2026-11-21 · anything worth the record is worth a card, and agents used it to be polite; progress is a `Flash`
 - a `## recap` section on a cold message, so it reads without the history · 2026-11-21 · with the newest message on top, the context is one glance below; the recap fold hid whole messages, and agents wrote it badly

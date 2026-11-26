@@ -23,8 +23,8 @@ purpose: put a message that wants the user in reach, without making them look th
 principle: a project asks whether a test can use a separate clock; the deal opens the thread at its reading position, with point in the draft, the user replies, and its card goes away.
 sees: the `chat.Project` address, the `chat.Thread` subject, and since when it waits, `waits · 2h`, or a stop's word, `failed · 1h`; open, the `chat.Message` that pings.
 has:
-- one `chat.Thread`
-- one `chat.Message` that pings the user, or reports a stop
+- one `chat.Thread` (or a staged privileged action from `agents.Approve a push or a fetch`)
+- one `chat.Message` that pings the user, reports a stop, or asks approval for a staged push/fetch
 does:
 - deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last
 

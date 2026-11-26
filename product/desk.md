@@ -23,6 +23,7 @@ does:
 - write an idea `i` on any row: open the idea draft, as `chat.Write an idea`
 rejected:
 - a narrowed Desk screen per `chat.Project` · 2026-11-26 · Desk is one global glance of what waits; filtering by project belongs in `window.Palette`
+- deleting `Desk` and staying on the previous screen across cold returns · 2026-11-26 · after ten minutes idle the user's mental context has flushed; a calm home buffer screen is easier to return to than a stale mid-file view, and `ctrl-k` still returns to the previous place in one key
 
 ## screen Desk
 answers: what needs the user now?

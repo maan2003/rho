@@ -173,22 +173,23 @@ cases: more than one running terminal; the host is on this machine, where deskto
 when the user sends a `chat.Message` as a new idea to a `chat.Project`, then the work starts in the `chat.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `chat.Project.receive an idea`.
 
 ## flow Approve a push or a fetch
+status: currently still implemented as a synchronous 60-second queued prompt over the active window rather than an asynchronous `deal.Card`.
 runs: 3 a day
 day: Keep the work moving.
 when: an agent pushes to `main` or `master`, or pushes to / fetches from a repository that needs the user's ssh login
-want: see exactly which agent asks, where it goes, and what it pushes, and say yes or no
-so that: no agent pushes to a protected branch or uses the user's ssh login without their word, and the agent does not wait long
+want: see exactly which agent asks, where it goes, and what it pushes, and say yes or no when ready — without being interrupted mid-typing or failing after a minute away
+so that: no agent pushes to a protected branch or uses the user's ssh login without their word, and background work does not time out while the user is busy or away
 steps:
-1. a prompt opens with the requesting agent's name, `git asks`, the target repository and branches/tags, and one unambiguous allow/deny choice (never clobbering an open user prompt or dropping concurrent approvals)
-2. the user explicitly confirms to allow
-   - denying or `escape` refuses the push
-   - after a minute with no answer, the push or fetch fails, and the echo line says that the approval timed out
-system: uses the ssh login of the device the window runs on for protected pushes and ssh remotes, so the host never holds the ssh key; queues concurrent approvals FIFO so the second waits for the first; names each branch and tag a push would change. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
-user: the yes or the no.
-cases: two agents push at once, where the second question waits for the first; an approval arrives while the user is mid-prompt; a push to a repository the user does not recognise.
+1. the host stages the exact push or fetch intent (requesting agent, target repository, branches/tags, and commits/diff) and raises an asynchronous action `deal.Card` (signaling only via `window.Status line` lamp — never popping a modal over what the user is typing)
+2. when the user deals the card, they inspect the target repository, refs, and summary, and explicitly confirm `approve` (or `deny` to refuse)
+system: keeps the user uninterrupted; holds the staged push asynchronously with no 60-second timeout; executes using the user's ssh login once approved. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
+user: the approve or deny verdict.
+cases: two agents request protected pushes at once (two cards in the deal); a push requested while the user is typing in a terminal or while the laptop is shut; a push to a repository the user does not recognise.
+rejected:
+- a synchronous 60-second pop-over prompt over whatever screen is active · 2026-11-26 · stole keypresses, broke `One place, in focus` (`The lamp is the only pull allowed`), and always timed out while away
 
 ## rule a push waits for the user
-when an `Agent` pushes to `main` or `master`, or pushes/fetches through the user's ssh login, then the window asks the user first, and without explicit approval the push or fetch does not happen. Feature-branch pushes to GitHub may run unprompted through a host-held `GITHUB_TOKEN` via `octo`, which enforces that only non-`main`/non-`master` branches may be pushed.
+when an `Agent` pushes to `main` or `master`, or pushes/fetches through the user's ssh login, then it parks on an asynchronous action `deal.Card` until the user explicitly approves it; without approval the push or fetch does not happen. Feature-branch pushes to GitHub may run unprompted through a host-held `GITHUB_TOKEN` via `octo`, which enforces that only non-`main`/non-`master` branches may be pushed.
 
 ## rule a refused start leaves a message
 when a start cannot use the `chat.Project`'s place before it creates an `Agent`, then the `chat.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works with project › works on…`. A later start shows its own progress without erasing the stop from history.
