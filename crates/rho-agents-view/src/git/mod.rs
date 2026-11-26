@@ -6,8 +6,10 @@
 //! login and waits for as long as it takes. Here each request that waits is
 //! a card, `git:<request>`, dealt like any other: the lamp is its only
 //! pull, Desk lists it, and dealing it opens a screen that says exactly
-//! what it would do. The card is answered with `approve` or `deny` in
-//! place of done and mute; nothing pops up over what the user is doing.
+//! what it would do: the work that asks, the repository, each ref it
+//! changes, and for a push the commits and diff it carries. The card is
+//! answered with `approve` or `deny`, or snoozed, in place of done and
+//! mute; nothing pops up over what the user is doing.
 //!
 //! The requests are the host's: this window keeps only what each host has
 //! said waits, and forgets a host's requests when its stream goes, as the
@@ -35,8 +37,16 @@ use rho_frame::{AnySurface, FrameLink, Opening, Row, System};
 use rho_window::style::StyleClass;
 pub use surface::GitAskSurface;
 
-/// What the window calls an agent, such as `eng-b8os`, when it knows it.
-pub type AgentNames = Rc<dyn Fn(AgentId, &App) -> Option<String>>;
+/// What the window knows of an agent, when it knows it.
+pub type KnownAgents = Rc<dyn Fn(AgentId, &App) -> Option<KnownAgent>>;
+
+pub struct KnownAgent {
+    /// What the window calls it, such as `eng-b8os`.
+    pub name: String,
+    /// The work it does, as `<project> · <thread subject>`, such as `tide
+    /// · Flaky clock test`; `None` when its work has no thread.
+    pub work: Option<String>,
+}
 
 /// One request, by the id its host gave it. Hosts draw ids at random, so
 /// one id names one request on every host and across restarts.
@@ -70,7 +80,7 @@ pub struct GitApprovals {
     waiting: BTreeMap<GitAskAddress, Waiting>,
     /// What the user calls each attached host.
     hosts: HashMap<HostId, String>,
-    names: AgentNames,
+    agents: KnownAgents,
     frame: FrameLink,
     _pump: Task<()>,
 }
@@ -81,7 +91,7 @@ impl GitApprovals {
             GitStreams,
             futures::channel::mpsc::UnboundedReceiver<GitEvent>,
         ),
-        names: AgentNames,
+        agents: KnownAgents,
         frame: FrameLink,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -96,7 +106,7 @@ impl GitApprovals {
             streams,
             waiting: BTreeMap::new(),
             hosts: HashMap::new(),
-            names,
+            agents,
             frame,
             _pump: pump,
         }
@@ -187,19 +197,33 @@ impl GitApprovals {
         let host = self.host_name(waiting.host);
         match waiting.ask.request.agent {
             Some(agent) => {
-                let name = (self.names)(agent, cx).unwrap_or_else(|| agent.encoded());
+                let name =
+                    (self.agents)(agent, cx).map_or_else(|| agent.encoded(), |known| known.name);
                 format!("{name}@{host}")
             }
             None => host,
         }
     }
 
+    /// The work that asks, `tide · Flaky clock test`, when the asker is an
+    /// agent whose work has a thread.
+    fn work(&self, waiting: &Waiting, cx: &App) -> Option<String> {
+        (self.agents)(waiting.ask.request.agent?, cx)?.work
+    }
+
+    /// Where the card is: the work that asks, or who asks when the work
+    /// has no thread.
+    fn context(&self, waiting: &Waiting, cx: &App) -> String {
+        self.work(waiting, cx)
+            .unwrap_or_else(|| self.asker(waiting, cx))
+    }
+
     /// The card's title: what it does, where, in short.
     fn title(&self, ask: &GitAsk) -> String {
         let repository = format!("{}/{}", ask.request.host, ask.request.repository);
-        match ask.is_push() {
-            true => format!("push {} to {repository}", ask.refs().join(", ")),
-            false => format!("fetch from {repository}"),
+        match ask.push() {
+            Some(_) => format!("push {} to {repository}", ask.refs().join(", ")),
+            None => format!("fetch from {repository}"),
         }
     }
 
@@ -239,10 +263,10 @@ impl System for GitApprovals {
         };
         let screen = surface::Shown {
             title: self.title(&waiting.ask),
+            work: self.work(waiting, cx),
             asker: self.asker(waiting, cx),
-            is_push: waiting.ask.is_push(),
             destination: waiting.ask.destination(),
-            refs: waiting.ask.refs(),
+            push: waiting.ask.push().cloned(),
             asked: Self::since(&waiting.ask),
         };
         Opening::Surface(AnySurface::new(
@@ -299,7 +323,7 @@ impl System for GitApprovals {
                     address.rest(),
                 );
                 claim.title = self.title(&waiting.ask);
-                claim.context = self.asker(waiting, cx);
+                claim.context = self.context(waiting, cx);
                 claim
             })
             .collect()
@@ -307,6 +331,6 @@ impl System for GitApprovals {
 
     fn name(&self, address: &Address, _marks: &Marks, cx: &App) -> Option<(String, String)> {
         let waiting = self.waiting.get(&GitAskAddress::from_address(address)?)?;
-        Some((self.title(&waiting.ask), self.asker(waiting, cx)))
+        Some((self.title(&waiting.ask), self.context(waiting, cx)))
     }
 }

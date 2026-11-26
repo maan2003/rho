@@ -5,6 +5,8 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, div};
 use jiff::Timestamp;
+use rho_agent_hosts::git::{display_field, display_lines, ref_name};
+use rho_agent_hosts::protocol::{GitPush, GitRefChange, MAX_PUSH_DIFF_BYTES};
 use rho_frame::{CardHere, Subject, Surface};
 use theme::ActiveTheme as _;
 
@@ -12,38 +14,117 @@ use theme::ActiveTheme as _;
 /// request never changes while it waits; one that ends closes its screen.
 pub(crate) struct Shown {
     pub title: String,
+    /// The work that asks, `tide · Flaky clock test`, when it has a thread.
+    pub work: Option<String>,
     pub asker: String,
-    pub is_push: bool,
     pub destination: String,
-    pub refs: Vec<String>,
+    /// What a push carries; `None` for a fetch.
+    pub push: Option<GitPush>,
     pub asked: Timestamp,
 }
 
 impl Shown {
-    /// The screen's text, one fact a line.
+    /// The screen's text, one fact a line. The verdicts come before the
+    /// diff, which can be long.
     pub(crate) fn text(&self) -> String {
-        let action = match self.is_push {
-            true => "push",
-            false => "fetch",
-        };
-        let mut lines = vec![
-            format!("{} asks to {action} with your ssh login", self.asker),
-            String::new(),
-            format!("repository {}", self.destination),
-            "changes".to_owned(),
-        ];
         // The screen's font is proportional, so nothing lines up in
-        // columns: each ref sits indented on its own line.
-        lines.extend(self.refs.iter().map(|reference| format!("  {reference}")));
-        let asked = self
-            .asked
-            .to_zoned(jiff::tz::TimeZone::system())
-            .strftime("%a %H:%M");
-        lines.push(format!("asked {asked}"));
+        // columns: each item sits indented on its own line.
+        let mut lines = Vec::new();
+        lines.extend(self.work.clone());
+        let action = match self.push {
+            Some(_) => "push",
+            None => "fetch",
+        };
+        lines.push(format!(
+            "{} asks to {action} with your ssh login",
+            self.asker
+        ));
         lines.push(String::new());
-        lines.push("space a approves · space d denies".to_owned());
+        lines.push(format!("repository {}", self.destination));
+        match &self.push {
+            Some(push) => push_lines(push, &mut lines),
+            None => lines.push(
+                "a fetch changes nothing there · Git names the refs it wants once you approve"
+                    .to_owned(),
+            ),
+        }
+        lines.push(format!("asked {}", local(self.asked, "%a %H:%M")));
+        lines.push(String::new());
+        lines.push("space a approves · space d denies · space s snoozes".to_owned());
+        if let Some(push) = &self.push {
+            diff_lines(push, &mut lines);
+        }
         lines.join("\n")
     }
+}
+
+/// Each ref it changes, as the agent's repository last saw the remote, and
+/// the commits it carries.
+fn push_lines(push: &GitPush, lines: &mut Vec<String>) {
+    lines.push("changes, from where the agent's repository last saw them".to_owned());
+    lines.extend(push.updates.iter().map(|update| {
+        let name = ref_name(&update.reference);
+        let change = match &update.change {
+            GitRefChange::Create { new } => format!("new at {}", short(new)),
+            GitRefChange::FastForward { old, new } => format!("{}..{}", short(old), short(new)),
+            GitRefChange::Force { old, new, dropped } => {
+                let dropped = match dropped {
+                    Some(1) => "drops 1 commit".to_owned(),
+                    Some(count) => format!("drops {count} commits"),
+                    None => "drops commits the agent never fetched".to_owned(),
+                };
+                format!("FORCE-PUSH {}..{} · {dropped}", short(old), short(new))
+            }
+            GitRefChange::Delete { old: Some(old) } => format!("deleted, was {}", short(old)),
+            GitRefChange::Delete { old: None } => "deleted".to_owned(),
+        };
+        format!("  {name}  {change}")
+    }));
+    lines.push(match push.commit_count {
+        1 => "1 commit".to_owned(),
+        count => format!("{count} commits"),
+    });
+    lines.extend(push.commits.iter().map(|commit| {
+        let date = Timestamp::from_second(commit.authored_at)
+            .map_or_else(|_| "?".to_owned(), |at| local(at, "%Y-%m-%d"));
+        format!(
+            "  {} {} · {} · {date}",
+            display_field(&commit.short_id),
+            display_field(&commit.subject),
+            display_field(&commit.author),
+        )
+    }));
+    let unlisted = push.commit_count.saturating_sub(push.commits.len() as u64);
+    if unlisted > 0 {
+        lines.push(format!("  and {unlisted} more"));
+    }
+}
+
+/// What each ref's update changes, stat first, then the patch.
+fn diff_lines(push: &GitPush, lines: &mut Vec<String>) {
+    for diff in &push.diffs {
+        lines.push(String::new());
+        lines.push(format!("diff of {}", ref_name(&diff.reference)));
+        lines.extend(display_lines(&diff.text));
+    }
+    if push.diff_cut {
+        lines.push(String::new());
+        lines.push(format!(
+            "the diff stops here: it is longer than {} KiB",
+            MAX_PUSH_DIFF_BYTES / 1024
+        ));
+    }
+}
+
+/// An object id as the screen shows it.
+fn short(object: &str) -> &str {
+    &object[..object.len().min(8)]
+}
+
+fn local(at: Timestamp, format: &str) -> String {
+    at.to_zoned(jiff::tz::TimeZone::system())
+        .strftime(format)
+        .to_string()
 }
 
 pub struct GitAskSurface {

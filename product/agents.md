@@ -172,7 +172,6 @@ cases: more than one running terminal; the host is on this machine, where deskto
 when the user sends a `chat.Message` as a new idea to a `chat.Project`, then the work starts in the `chat.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `chat.Project.receive an idea`.
 
 ## flow Approve a push or a fetch
-status: the card names the refs a push changes, not yet the commits or diff it carries.
 runs: 3 a day
 day: Keep the work moving.
 when: an agent pushes to `main` or `master`, or pushes to / fetches from a repository that needs the user's ssh login
@@ -188,7 +187,7 @@ rejected:
 - a synchronous 60-second pop-over prompt over whatever screen is active · 2026-11-26 · stole keypresses, broke `One place, in focus` (`The lamp is the only pull allowed`), and always timed out while away
 
 ## rule a push waits for the user
-when an `Agent` pushes to `main` or `master`, or pushes/fetches through the user's ssh login, then it parks on an asynchronous action `deal.Card` until the user explicitly approves it; without approval the push or fetch does not happen. Feature-branch pushes to GitHub may run unprompted through a host-held `GITHUB_TOKEN` via `octo`, which enforces that only non-`main`/non-`master` branches may be pushed.
+when an `Agent` pushes to `main` or `master`, or pushes/fetches through the user's ssh login, then it parks on an asynchronous action `deal.Card` until the user explicitly approves it; without approval the push or fetch does not happen. An approved push goes only if Git sets exactly the refs, to exactly the commits, that the card showed; otherwise it fails and the agent asks again. Feature-branch pushes to GitHub may run unprompted through a host-held `GITHUB_TOKEN` via `octo`, which enforces that only non-`main`/non-`master` branches may be pushed.
 
 ## rule a refused start leaves a message
 when a start cannot use the `chat.Project`'s place before it creates an `Agent`, then the `chat.Thread` keeps a `failed` stop that names the place and the host and says `reply to retry, or change where it works with set project place`. A later start shows its own progress without erasing the stop from history.

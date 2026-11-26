@@ -268,12 +268,20 @@ fn run() -> Result<()> {
                     )
                 });
                 // A push or fetch that waits for the user's ssh login names
-                // the agent that asks as the agents system calls it.
-                let named = agents.downgrade();
+                // the agent that asks, and its work, as the agents system
+                // knows them.
+                let known = agents.downgrade();
                 let git = cx.new(|cx| {
                     rho_agents_view::GitApprovals::new(
                         rho_agent_hosts::git::GitStreams::new(),
-                        Rc::new(move |agent, cx| named.upgrade()?.read(cx).agent_name(agent, cx)),
+                        Rc::new(move |agent, cx| {
+                            let agents = known.upgrade()?;
+                            let agents = agents.read(cx);
+                            Some(rho_agents_view::git::KnownAgent {
+                                name: agents.agent_name(agent, cx)?,
+                                work: agents.agent_work(agent, cx),
+                            })
+                        }),
                         frame.clone(),
                         cx,
                     )

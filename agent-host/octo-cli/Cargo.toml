@@ -14,3 +14,6 @@ rho-agent-hosts.workspace = true
 rho-agent-types.workspace = true
 rho-rpc = { workspace = true, features = ["native-client"] }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

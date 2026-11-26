@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rho_agent_hosts::protocol::{GitDecision, GitProviderFrame, GitService, GitTransportRequest};
+use rho_agent_hosts::protocol::{GitDecision, GitIntent, GitProviderFrame, GitTransportRequest};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) trait GitStream:
@@ -185,14 +185,19 @@ impl Drop for Asked<'_> {
 /// What the agent's git reads when the user says no.
 fn denied(request: &GitTransportRequest) -> String {
     let destination = format!("{}:{}", request.host, request.repository);
-    match (request.service, &request.planned_refs) {
-        (GitService::ReceivePack, Some(refs)) => {
+    match &request.intent {
+        GitIntent::Push(push) => {
+            let refs: Vec<&str> = push
+                .updates
+                .iter()
+                .map(|update| update.reference.as_str())
+                .collect();
             format!(
                 "the user denied this push to {destination} ({})",
                 refs.join(", ")
             )
         }
-        _ => format!("the user denied this fetch from {destination}"),
+        GitIntent::Fetch => format!("the user denied this fetch from {destination}"),
     }
 }
 
@@ -215,7 +220,8 @@ mod tests {
     use std::sync::Arc;
 
     use rho_agent_hosts::protocol::{
-        GitDecision, GitProviderFrame, GitService, GitTransportRequest,
+        GitDecision, GitIntent, GitProviderFrame, GitPush, GitRefChange, GitRefUpdate,
+        GitTransportRequest,
     };
     use tokio::sync::mpsc;
 
@@ -227,9 +233,26 @@ mod tests {
             port: 22,
             user: "git".to_owned(),
             repository: "acme/repo".to_owned(),
-            service: GitService::ReceivePack,
-            planned_refs: Some(vec![format!("refs/heads/{branch}")]),
+            intent: GitIntent::Push(GitPush {
+                updates: vec![GitRefUpdate {
+                    reference: format!("refs/heads/{branch}"),
+                    change: GitRefChange::Create {
+                        new: "1".repeat(40),
+                    },
+                }],
+                commits: Vec::new(),
+                commit_count: 0,
+                diffs: Vec::new(),
+                diff_cut: false,
+            }),
             agent: None,
+        }
+    }
+
+    fn pushed_ref(request: GitTransportRequest) -> String {
+        match request.intent {
+            GitIntent::Push(push) => push.updates[0].reference.clone(),
+            GitIntent::Fetch => panic!("a fetch"),
         }
     }
 
@@ -286,17 +309,11 @@ mod tests {
         let _master = broker.request(push("master")).unwrap();
         let mut window = provider(&broker);
         let mut heard = vec![
-            requested(window.recv().await).2.planned_refs.unwrap(),
-            requested(window.recv().await).2.planned_refs.unwrap(),
+            pushed_ref(requested(window.recv().await).2),
+            pushed_ref(requested(window.recv().await).2),
         ];
         heard.sort();
-        assert_eq!(
-            heard,
-            [
-                vec!["refs/heads/main".to_owned()],
-                vec!["refs/heads/master".to_owned()]
-            ]
-        );
+        assert_eq!(heard, ["refs/heads/main", "refs/heads/master"]);
         assert!(window.try_recv().is_err(), "each once");
     }
 

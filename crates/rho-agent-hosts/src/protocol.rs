@@ -244,11 +244,11 @@ pub enum GitProvided {
     Done,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum GitService {
-    UploadPack,
-    ReceivePack,
-}
+/// The most commits a [`GitPush`] lists; [`GitPush::commit_count`] counts
+/// them all.
+pub const MAX_PUSH_COMMITS: usize = 50;
+/// The most diff text a [`GitPush`] carries, over all its [`GitDiff`]s.
+pub const MAX_PUSH_DIFF_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct GitTransportRequest {
@@ -256,13 +256,96 @@ pub struct GitTransportRequest {
     pub port: u16,
     pub user: String,
     pub repository: String,
-    pub service: GitService,
-    /// Destination refs the user approves for a push. Fetches carry `None`.
-    pub planned_refs: Option<Vec<String>>,
+    pub intent: GitIntent,
     /// The agent whose git asks, as the helper found it in
     /// `$RHO_AGENT_ID`; `None` outside an agent's shell. Agents are not
     /// sandboxed, so this names the asker for the user; it proves nothing.
     pub agent: Option<rho_agent_types::AgentId>,
+}
+
+/// What the helper asks to do in the repository.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitIntent {
+    /// Read it. Which refs a fetch wants goes over the transport after
+    /// the answer, so the request cannot say.
+    Fetch,
+    Push(GitPush),
+}
+
+/// A push as the agent's repository plans it. Everything but `updates`
+/// is what that repository says, for the user to read; it proves nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitPush {
+    /// Every ref it changes. A window carries the push only when Git's
+    /// receive-pack commands set exactly these refs to exactly these
+    /// objects.
+    pub updates: Vec<GitRefUpdate>,
+    /// The commits it carries that the remote lacks, as far as the agent's
+    /// repository knows, newest first: at most [`MAX_PUSH_COMMITS`].
+    pub commits: Vec<GitCommit>,
+    /// How many such commits there are in all.
+    pub commit_count: u64,
+    /// What each update that changes files changes, in order.
+    pub diffs: Vec<GitDiff>,
+    /// Whether `diffs` stop short: their text is cut at
+    /// [`MAX_PUSH_DIFF_BYTES`].
+    pub diff_cut: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitRefUpdate {
+    pub reference: String,
+    pub change: GitRefChange,
+}
+
+/// What a push does to one ref. `old` is the ref on the remote as the
+/// agent's repository last saw it; the remote may have moved since.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitRefChange {
+    /// The remote has no such ref.
+    Create { new: String },
+    /// `new` contains `old`.
+    FastForward { old: String, new: String },
+    /// `new` does not contain `old`: the ref loses `dropped` commits, or
+    /// an unknown number when the agent's repository lacks `old`.
+    Force {
+        old: String,
+        new: String,
+        dropped: Option<u64>,
+    },
+    /// `old` is `None` when the agent's repository has not seen the ref
+    /// on the remote.
+    Delete { old: Option<String> },
+}
+
+impl GitRefChange {
+    /// The object the ref names after the push; `None` once deleted.
+    pub fn new_object(&self) -> Option<&str> {
+        match self {
+            Self::Create { new } | Self::FastForward { new, .. } | Self::Force { new, .. } => {
+                Some(new)
+            }
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitCommit {
+    /// The abbreviated id, as `git log` prints it.
+    pub short_id: String,
+    pub author: String,
+    /// The author's date, in seconds since the Unix epoch.
+    pub authored_at: i64,
+    pub subject: String,
+}
+
+/// What one update changes: `git diff --stat --summary --patch` from what
+/// the remote has to the new object.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitDiff {
+    pub reference: String,
+    pub text: String,
 }
 
 #[cfg(test)]
@@ -316,8 +399,7 @@ mod tests {
                 port: 22,
                 user: "git".to_owned(),
                 repository: "acme/repo".to_owned(),
-                service: GitService::UploadPack,
-                planned_refs: None,
+                intent: GitIntent::Fetch,
                 agent: None,
             },
             requested_at_ms: 1_764_000_000_000,
@@ -344,8 +426,34 @@ mod tests {
             port: 2222,
             user: "deploy".to_owned(),
             repository: "team/repo.git".to_owned(),
-            service: GitService::ReceivePack,
-            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
+            intent: GitIntent::Push(GitPush {
+                updates: vec![
+                    GitRefUpdate {
+                        reference: "refs/heads/main".to_owned(),
+                        change: GitRefChange::Force {
+                            old: "a".repeat(40),
+                            new: "b".repeat(40),
+                            dropped: Some(2),
+                        },
+                    },
+                    GitRefUpdate {
+                        reference: "refs/tags/v1".to_owned(),
+                        change: GitRefChange::Delete { old: None },
+                    },
+                ],
+                commits: vec![GitCommit {
+                    short_id: "bbbbbbb".to_owned(),
+                    author: "Ada".to_owned(),
+                    authored_at: 1_764_000_000,
+                    subject: "Fix the clock".to_owned(),
+                }],
+                commit_count: 3,
+                diffs: vec![GitDiff {
+                    reference: "refs/heads/main".to_owned(),
+                    text: " clock.rs | 2 +-\n".to_owned(),
+                }],
+                diff_cut: true,
+            }),
             agent: None,
         };
         opens_as(Open::GitProvider);

@@ -6,7 +6,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use anyhow::{Context, Result};
 use reqwest::Url;
 use rho_agent_hosts::protocol as host;
-use rho_agent_hosts::protocol::{GitService, GitTransportPolicy, GitTransportRequest};
+use rho_agent_hosts::protocol::{
+    GitCommit, GitDiff, GitIntent, GitPush, GitRefChange, GitRefUpdate, GitTransportPolicy,
+    GitTransportRequest, MAX_PUSH_COMMITS, MAX_PUSH_DIFF_BYTES,
+};
 use rho_agent_types::AgentId;
 use rho_rpc::protocol::Opened;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -27,7 +30,7 @@ fn main() -> Result<()> {
     if pat_available {
         run_http_helper(&remote_name, &remote)
     } else {
-        run_raw_remote_helper(&remote_name, remote)
+        run_raw_remote_helper(&remote_name, &remote)
     }
 }
 
@@ -74,15 +77,15 @@ async fn query_pat_available(host: &str) -> Result<bool> {
     .with_context(|| format!("ask the rho-agent-host in {}", paths.directory().display()))
 }
 
-fn run_raw_remote_helper(remote_name: &str, mut remote: Remote) -> Result<()> {
+fn run_raw_remote_helper(remote_name: &str, remote: &Remote) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    run_raw_remote_helper_io(remote_name, &mut remote, stdin.lock(), &mut stdout)
+    run_raw_remote_helper_io(remote_name, remote, stdin.lock(), &mut stdout)
 }
 
 fn run_raw_remote_helper_io(
     remote_name: &str,
-    remote: &mut Remote,
+    remote: &Remote,
     input: impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
@@ -103,7 +106,6 @@ fn run_raw_remote_helper_io(
                 output.flush()?;
             }
             "connect git-upload-pack" => {
-                remote.request.service = GitService::UploadPack;
                 drop(lines);
                 return runtime()?.block_on(run_transport(remote.request.clone(), true));
             }
@@ -131,6 +133,7 @@ fn run_raw_remote_helper_io(
                 let batch = collect_batch(command.to_owned(), &mut lines)?;
                 let (pushes, has_protocol_options) = parse_push_batch(&batch)?;
                 return run_ssh_send_pack(
+                    remote_name,
                     remote,
                     &pushes,
                     &options,
@@ -156,9 +159,19 @@ fn raw_push_option_supported(command: &str) -> bool {
     ) || (name == "pushcert" && value == "false")
 }
 
+/// Git's receive-pack, run by `git send-pack` once the helper has planned
+/// a push: it describes the push from the agent's repository and asks the
+/// host, which holds it until the user answers.
 fn run_bridge() -> Result<()> {
-    let planned_refs = std::env::var("RHO_GIT_REFS").context("RHO_GIT_REFS is missing")?;
-    let planned_refs = parse_planned_refs(&planned_refs)?;
+    let planned = std::env::var("RHO_GIT_UPDATES").context("RHO_GIT_UPDATES is missing")?;
+    let planned = parse_planned_updates(&planned)?;
+    let repository = Repository {
+        git_dir: std::env::var_os("RHO_GIT_DIR")
+            .context("RHO_GIT_DIR is missing")?
+            .into(),
+    };
+    let remote = std::env::var("RHO_GIT_REMOTE").context("RHO_GIT_REMOTE is missing")?;
+    let push = describe_push(&repository, tracking_remote(&remote), planned)?;
     let request = GitTransportRequest {
         host: std::env::var("RHO_GIT_HOST").context("RHO_GIT_HOST is missing")?,
         port: std::env::var("RHO_GIT_PORT")
@@ -167,31 +180,399 @@ fn run_bridge() -> Result<()> {
             .context("RHO_GIT_PORT is invalid")?,
         user: std::env::var("RHO_GIT_USER").context("RHO_GIT_USER is missing")?,
         repository: std::env::var("RHO_GIT_REPOSITORY").context("RHO_GIT_REPOSITORY is missing")?,
-        service: GitService::ReceivePack,
-        planned_refs: Some(planned_refs),
+        intent: GitIntent::Push(push),
         agent: asking_agent(),
     };
     runtime()?.block_on(run_transport(request, false))
 }
 
-fn parse_planned_refs(value: &str) -> Result<Vec<String>> {
+/// One ref a push sets, as the helper planned it: where the remote had it,
+/// as this repository last saw, and the object it is pushed to. `None` is
+/// no such ref there, or a deletion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedUpdate {
+    reference: String,
+    old: Option<String>,
+    new: Option<String>,
+}
+
+/// The plan as it crosses into the bridge: a line per ref, `<old> <new>
+/// <ref>`, with `-` for no object.
+fn format_planned_updates(planned: &[PlannedUpdate]) -> String {
+    let object = |object: &Option<String>| object.clone().unwrap_or_else(|| "-".to_owned());
+    planned
+        .iter()
+        .map(|update| {
+            format!(
+                "{} {} {}",
+                object(&update.old),
+                object(&update.new),
+                update.reference
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_planned_updates(value: &str) -> Result<Vec<PlannedUpdate>> {
     anyhow::ensure!(
-        value.len() <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
-        "planned Git ref list is too large"
+        value.len() <= 3 * octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
+        "planned Git push is too large"
     );
-    let planned_refs = value.lines().map(str::to_owned).collect::<Vec<_>>();
-    anyhow::ensure!(!planned_refs.is_empty(), "planned Git ref list is empty");
+    let object = |field: &str| -> Result<Option<String>> {
+        match field {
+            "-" => Ok(None),
+            id => {
+                anyhow::ensure!(
+                    octo_types::valid_object_id(id),
+                    "planned Git push is invalid"
+                );
+                Ok(Some(id.to_owned()))
+            }
+        }
+    };
+    let planned = value
+        .lines()
+        .map(|line| {
+            let mut fields = line.split(' ');
+            let (Some(old), Some(new), Some(reference), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                anyhow::bail!("planned Git push is invalid");
+            };
+            anyhow::ensure!(
+                octo_types::valid_git_ref(reference),
+                "planned Git push is invalid"
+            );
+            Ok(PlannedUpdate {
+                reference: reference.to_owned(),
+                old: object(old)?,
+                new: object(new)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!planned.is_empty(), "planned Git push is empty");
     anyhow::ensure!(
-        planned_refs
+        planned
             .iter()
-            .all(|reference| octo_types::valid_git_ref(reference)),
-        "planned Git ref list is invalid"
+            .map(|update| &update.reference)
+            .collect::<HashSet<_>>()
+            .len()
+            == planned.len(),
+        "planned Git push sets a ref twice"
     );
-    anyhow::ensure!(
-        planned_refs.iter().collect::<HashSet<_>>().len() == planned_refs.len(),
-        "planned Git ref list contains duplicates"
+    Ok(planned)
+}
+
+/// The helper's remote, when it names one whose remote-tracking refs say
+/// what the remote has: not a bare URL.
+fn tracking_remote(remote_name: &str) -> Option<&str> {
+    octo_types::valid_git_ref(&format!("refs/remotes/{remote_name}/probe")).then_some(remote_name)
+}
+
+/// The agent's repository, as `git` reads it.
+struct Repository {
+    git_dir: PathBuf,
+}
+
+impl Repository {
+    /// The repository the helper runs in, as Git told it.
+    fn current() -> Result<Self> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .stderr(Stdio::inherit())
+            .output()
+            .context("find the Git repository")?;
+        anyhow::ensure!(output.status.success(), "find the Git repository");
+        let git_dir = String::from_utf8(output.stdout).context("Git directory is not UTF-8")?;
+        Ok(Self {
+            git_dir: git_dir.trim_end_matches('\n').into(),
+        })
+    }
+
+    fn git(&self) -> Command {
+        let mut command = Command::new("git");
+        command
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit());
+        command
+    }
+
+    fn read(&self, args: &[&str]) -> Result<String> {
+        let output = self
+            .git()
+            .args(args)
+            .output()
+            .with_context(|| format!("run git {}", args[0]))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {} exited with {}",
+            args[0],
+            output.status
+        );
+        String::from_utf8(output.stdout).with_context(|| format!("git {} is not UTF-8", args[0]))
+    }
+
+    /// Whether git says yes (exit 0) or no (exit 1); anything else is an
+    /// error.
+    fn asks(&self, args: &[&str]) -> Result<bool> {
+        let status = self
+            .git()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("run git {}", args[0]))?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => anyhow::bail!("git {} exited with {status}", args[0]),
+        }
+    }
+
+    fn holds(&self, object: &str) -> bool {
+        self.git()
+            .args(["cat-file", "-e", object])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// What `args` prints, up to `limit` bytes: cut at the last whole line
+    /// when there is more, which is left unread. Says whether it was cut.
+    fn read_at_most(&self, args: &[&str], limit: usize) -> Result<(String, bool)> {
+        let mut child = self
+            .git()
+            .args(args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run git {}", args[0]))?;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .context("git stdout unavailable")?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.len() <= limit {
+            let status = child.wait()?;
+            anyhow::ensure!(status.success(), "git {} exited with {status}", args[0]);
+            return Ok((text, false));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        text.truncate(text[..=limit].rfind('\n').map_or(0, |end| end + 1));
+        Ok((text, true))
+    }
+}
+
+/// What the push does, as the agent's repository says: each ref's change,
+/// the commits it carries that the remote lacks, and the diff from what
+/// the remote has, all bounded so that a huge push stays quick to read.
+fn describe_push(
+    repository: &Repository,
+    remote: Option<&str>,
+    planned: Vec<PlannedUpdate>,
+) -> Result<GitPush> {
+    // What the remote has, as far as this repository knows.
+    let mut known: Vec<String> = match remote {
+        Some(remote) => repository
+            .read(&[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/remotes/{remote}/"),
+            ])?
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        None => Vec::new(),
+    };
+    known.extend(
+        planned
+            .iter()
+            .filter_map(|update| update.old.clone())
+            .filter(|old| repository.holds(old)),
     );
-    Ok(planned_refs)
+    known.sort();
+    known.dedup();
+
+    let mut updates = Vec::with_capacity(planned.len());
+    for PlannedUpdate {
+        reference,
+        old,
+        new,
+    } in planned
+    {
+        let change = match (old, new) {
+            (old, None) => GitRefChange::Delete { old },
+            (None, Some(new)) => GitRefChange::Create { new },
+            (Some(old), Some(new)) if !repository.holds(&old) => GitRefChange::Force {
+                old,
+                new,
+                dropped: None,
+            },
+            (Some(old), Some(new)) => {
+                if repository.asks(&["merge-base", "--is-ancestor", &old, &new])? {
+                    GitRefChange::FastForward { old, new }
+                } else {
+                    let dropped = repository
+                        .read(&["rev-list", "--count", &old, "--not", &new])?
+                        .trim()
+                        .parse()
+                        .context("git rev-list --count")?;
+                    GitRefChange::Force {
+                        old,
+                        new,
+                        dropped: Some(dropped),
+                    }
+                }
+            }
+        };
+        updates.push(GitRefUpdate { reference, change });
+    }
+
+    let news: Vec<&str> = updates
+        .iter()
+        .filter_map(|update| update.change.new_object())
+        .collect();
+    let (commits, commit_count) = match news.is_empty() {
+        true => (Vec::new(), 0),
+        false => {
+            let mut range = news.clone();
+            range.push("--not");
+            range.extend(known.iter().map(String::as_str));
+            let count = repository
+                .read(&[&["rev-list", "--count"][..], &range].concat())?
+                .trim()
+                .parse()
+                .context("git rev-list --count")?;
+            let max_count = format!("--max-count={MAX_PUSH_COMMITS}");
+            let log = repository.read(
+                &[
+                    &[
+                        "log",
+                        "--no-color",
+                        "--no-show-signature",
+                        "--format=%h%x00%an%x00%at%x00%s",
+                        &max_count,
+                    ][..],
+                    &range,
+                ]
+                .concat(),
+            )?;
+            (parse_commits(&log)?, count)
+        }
+    };
+
+    let mut diffs = Vec::new();
+    let mut left = MAX_PUSH_DIFF_BYTES;
+    let mut diff_cut = false;
+    for update in &updates {
+        let (base, new) = match &update.change {
+            GitRefChange::Delete { .. } => continue,
+            GitRefChange::FastForward { old, new }
+            | GitRefChange::Force {
+                old,
+                new,
+                dropped: Some(_),
+            } => (old.clone(), new),
+            GitRefChange::Create { new } | GitRefChange::Force { new, .. } => {
+                (fork_point(repository, new, &known)?, new)
+            }
+        };
+        if left == 0 {
+            diff_cut = true;
+            break;
+        }
+        let (text, cut) = repository.read_at_most(
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--stat",
+                "--summary",
+                "--patch",
+                &base,
+                new,
+            ],
+            left,
+        )?;
+        left -= text.len();
+        if !text.is_empty() {
+            diffs.push(GitDiff {
+                reference: update.reference.clone(),
+                text,
+            });
+        }
+        if cut {
+            diff_cut = true;
+            break;
+        }
+    }
+
+    Ok(GitPush {
+        updates,
+        commits,
+        commit_count,
+        diffs,
+        diff_cut,
+    })
+}
+
+/// Where `new`'s history leaves what the remote has: the best common
+/// ancestor with any of `known`, or the empty tree when it shares none.
+fn fork_point(repository: &Repository, new: &str, known: &[String]) -> Result<String> {
+    if !known.is_empty() {
+        let mut args = vec!["merge-base", new];
+        args.extend(known.iter().map(String::as_str));
+        let output = repository
+            .git()
+            .args(&args)
+            .output()
+            .context("run git merge-base")?;
+        match output.status.code() {
+            Some(0) => {
+                return Ok(String::from_utf8(output.stdout)
+                    .context("git merge-base is not UTF-8")?
+                    .trim()
+                    .to_owned());
+            }
+            Some(1) => {}
+            _ => anyhow::bail!("git merge-base exited with {}", output.status),
+        }
+    }
+    Ok(repository
+        .read(&["hash-object", "-t", "tree", "/dev/null"])?
+        .trim()
+        .to_owned())
+}
+
+/// `git log --format=%h%x00%an%x00%at%x00%s`, a commit a line.
+fn parse_commits(log: &str) -> Result<Vec<GitCommit>> {
+    log.lines()
+        .map(|line| {
+            let mut fields = line.split('\0');
+            let (Some(short_id), Some(author), Some(at), Some(subject), None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                anyhow::bail!("unexpected git log line");
+            };
+            Ok(GitCommit {
+                short_id: short_id.to_owned(),
+                author: author.to_owned(),
+                authored_at: at.parse().context("git log author date")?,
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
 }
 
 async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
@@ -222,10 +603,10 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
 
     let stream = client.into_stream();
     let (mut host_read, mut host_write) = stream.into_split();
-    let service = request.service;
+    let push = matches!(request.intent, GitIntent::Push(_));
     let upload = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
-        if service == GitService::ReceivePack {
+        if push {
             copy_validated_receive_pack(&mut stdin, &mut host_write).await?;
         } else {
             tokio::io::copy(&mut stdin, &mut host_write).await?;
@@ -619,6 +1000,7 @@ fn run_http_helper(remote_name: &str, remote: &Remote) -> Result<()> {
             let _ = helper.child.kill();
             let _ = helper.child.wait();
             return run_ssh_send_pack(
+                remote_name,
                 remote,
                 &pushes,
                 &options,
@@ -803,6 +1185,7 @@ fn parse_push_batch(batch: &[String]) -> Result<(Vec<PushCommand>, bool)> {
 }
 
 fn run_ssh_send_pack(
+    remote_name: &str,
     remote: &Remote,
     pushes: &[PushCommand],
     options: &PushOptions,
@@ -830,6 +1213,8 @@ fn run_ssh_send_pack(
         return Ok(());
     }
 
+    let repository = Repository::current()?;
+    let planned = plan_updates(&repository, pushes, remote_refs)?;
     let executable = std::env::current_exe().context("resolve git-remote-octo executable")?;
     let receive_pack = format!("{} --bridge", shell_quote(&executable.to_string_lossy()));
     let mut command = Command::new("git");
@@ -861,14 +1246,9 @@ fn run_ssh_send_pack(
         .env("RHO_GIT_PORT", remote.request.port.to_string())
         .env("RHO_GIT_USER", &remote.request.user)
         .env("RHO_GIT_REPOSITORY", &remote.request.repository)
-        .env(
-            "RHO_GIT_REFS",
-            pushes
-                .iter()
-                .map(|push| push.destination.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        .env("RHO_GIT_UPDATES", format_planned_updates(&planned))
+        .env("RHO_GIT_DIR", &repository.git_dir)
+        .env("RHO_GIT_REMOTE", remote_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
@@ -888,6 +1268,38 @@ fn run_ssh_send_pack(
     writeln!(output)?;
     output.flush()?;
     Ok(())
+}
+
+/// Each ref the push sets: where the remote had it, as `remote_refs` say,
+/// and the object its source names now. Git's send-pack resolves the same
+/// sources a moment later; a window carries the push only if they agree.
+fn plan_updates(
+    repository: &Repository,
+    pushes: &[PushCommand],
+    remote_refs: &HashMap<String, String>,
+) -> Result<Vec<PlannedUpdate>> {
+    pushes
+        .iter()
+        .map(|push| {
+            let refspec = push.refspec.strip_prefix('+').unwrap_or(&push.refspec);
+            let source = refspec.split_once(':').map_or("", |(source, _)| source);
+            let new = match source {
+                "" => None,
+                source => Some(
+                    repository
+                        .read(&["rev-parse", "--verify", "--end-of-options", source])
+                        .with_context(|| format!("resolve {source}"))?
+                        .trim()
+                        .to_owned(),
+                ),
+            };
+            Ok(PlannedUpdate {
+                reference: push.destination.clone(),
+                old: remote_refs.get(&push.destination).cloned(),
+                new,
+            })
+        })
+        .collect()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -933,8 +1345,7 @@ fn parse_remote(value: &str) -> Result<Remote> {
             port: url.port().unwrap_or(22),
             user: user.to_owned(),
             repository: repository.to_owned(),
-            service: GitService::UploadPack,
-            planned_refs: None,
+            intent: GitIntent::Fetch,
             agent: asking_agent(),
         },
     })
@@ -1060,12 +1471,12 @@ mod tests {
 
     #[test]
     fn no_pat_receive_pack_falls_back_to_plannable_push_protocol() {
-        let mut remote = parse_remote("octo://github.com/acme/library.git").unwrap();
+        let remote = parse_remote("octo://github.com/acme/library.git").unwrap();
         let input = b"capabilities\nconnect git-receive-pack\nlist for-push\n\n";
         let mut output = Vec::new();
         run_raw_remote_helper_io(
             "octo://github.com/acme/library.git",
-            &mut remote,
+            &remote,
             &input[..],
             &mut output,
         )
@@ -1077,14 +1488,324 @@ mod tests {
     }
 
     #[test]
-    fn validates_destination_plan_crossing_the_send_pack_bridge() {
+    fn validates_the_plan_crossing_the_send_pack_bridge() {
+        let (a, b) = ("a".repeat(40), "b".repeat(64));
+        let planned = vec![
+            PlannedUpdate {
+                reference: "refs/heads/main".to_owned(),
+                old: Some(a.clone()),
+                new: Some(a.clone()),
+            },
+            PlannedUpdate {
+                reference: "refs/tags/v1".to_owned(),
+                old: None,
+                new: Some(b.clone()),
+            },
+            PlannedUpdate {
+                reference: "refs/heads/old".to_owned(),
+                old: None,
+                new: None,
+            },
+        ];
+        let crossing = format_planned_updates(&planned);
         assert_eq!(
-            parse_planned_refs("refs/heads/main\nrefs/tags/v1").unwrap(),
-            ["refs/heads/main", "refs/tags/v1"]
+            crossing,
+            format!("{a} {a} refs/heads/main\n- {b} refs/tags/v1\n- - refs/heads/old")
         );
-        for invalid in ["", "refs/heads/main\nrefs/heads/main", "refs/heads/../main"] {
-            assert!(parse_planned_refs(invalid).is_err(), "accepted {invalid:?}");
+        assert_eq!(parse_planned_updates(&crossing).unwrap(), planned);
+        for invalid in [
+            String::new(),
+            format!("- {a} refs/heads/main\n- {a} refs/heads/main"),
+            format!("- {a} refs/heads/../main"),
+            format!("- {a}"),
+            format!("- {a} refs/heads/main extra"),
+            "- abc refs/heads/main".to_owned(),
+        ] {
+            assert!(
+                parse_planned_updates(&invalid).is_err(),
+                "accepted {invalid:?}"
+            );
         }
+    }
+
+    /// A repository in a temporary directory, with commits whose author
+    /// and dates are fixed.
+    struct Scratch {
+        _directory: tempfile::TempDir,
+        repository: Repository,
+        clock: std::cell::Cell<i64>,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let git_dir = directory.path().join("repo.git");
+            let scratch = Self {
+                repository: Repository { git_dir },
+                _directory: directory,
+                clock: std::cell::Cell::new(1_764_000_000),
+            };
+            scratch.git(&["init", "--quiet", "--bare", "--initial-branch=main"]);
+            scratch
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let at = format!("{} +0000", self.clock.get());
+            let output = self
+                .repository
+                .git()
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Ada Lovelace")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada Lovelace")
+                .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .env("GIT_AUTHOR_DATE", &at)
+                .env("GIT_COMMITTER_DATE", &at)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        /// A commit on `parent` whose tree holds `files`, a minute after
+        /// the last.
+        fn commit(&self, parent: Option<&str>, subject: &str, files: &[(&str, &str)]) -> String {
+            self.clock.set(self.clock.get() + 60);
+            let entries: String = files
+                .iter()
+                .map(|(name, text)| {
+                    let blob = self.blob(text);
+                    format!("100644 blob {blob}\t{name}\n")
+                })
+                .collect();
+            let tree = self.with_stdin(&["mktree"], &entries);
+            let mut args = vec!["commit-tree", &tree, "-m", subject];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            self.git(&args)
+        }
+
+        fn blob(&self, text: &str) -> String {
+            self.with_stdin(&["hash-object", "-w", "--stdin"], text)
+        }
+
+        fn with_stdin(&self, args: &[&str], input: &str) -> String {
+            let mut child = self
+                .repository
+                .git()
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+    }
+
+    fn planned(reference: &str, old: Option<&str>, new: Option<&str>) -> PlannedUpdate {
+        PlannedUpdate {
+            reference: reference.to_owned(),
+            old: old.map(str::to_owned),
+            new: new.map(str::to_owned),
+        }
+    }
+
+    /// The push the card shows: each ref's change as the repository sees
+    /// it, the commits the remote lacks newest first, and the diff from
+    /// what the remote has; a deletion carries no diff.
+    #[test]
+    fn describes_a_push_from_the_agents_repository() {
+        let scratch = Scratch::new();
+        let base = scratch.commit(None, "Start", &[("clock.rs", "tick\n")]);
+        let fix = scratch.commit(Some(&base), "Fix the clock", &[("clock.rs", "tock\n")]);
+        let test = scratch.commit(
+            Some(&fix),
+            "Test the clock",
+            &[("clock.rs", "tock\n"), ("test.rs", "assert\n")],
+        );
+        let abandoned = scratch.commit(Some(&base), "Old idea", &[("idea.rs", "x\n")]);
+        scratch.git(&["update-ref", "refs/remotes/origin/main", &base]);
+        scratch.git(&["update-ref", "refs/remotes/origin/rewrite", &abandoned]);
+        scratch.git(&["update-ref", "refs/heads/main", &test]);
+        scratch.git(&["update-ref", "refs/heads/rewrite", &fix]);
+
+        let (pushes, _) = parse_push_batch(&[
+            "push refs/heads/main:refs/heads/main".to_owned(),
+            "push +refs/heads/rewrite:refs/heads/rewrite".to_owned(),
+            format!("push {test}:refs/tags/v1"),
+            "push :refs/heads/gone".to_owned(),
+        ])
+        .unwrap();
+        let remote_refs = HashMap::from([
+            ("refs/heads/main".to_owned(), base.clone()),
+            ("refs/heads/rewrite".to_owned(), abandoned.clone()),
+            ("refs/heads/gone".to_owned(), base.clone()),
+        ]);
+        let planned = plan_updates(&scratch.repository, &pushes, &remote_refs).unwrap();
+        let push = describe_push(&scratch.repository, Some("origin"), planned).unwrap();
+
+        let change = |reference: &str| {
+            push.updates
+                .iter()
+                .find(|update| update.reference == reference)
+                .unwrap()
+                .change
+                .clone()
+        };
+        assert_eq!(
+            change("refs/heads/main"),
+            GitRefChange::FastForward {
+                old: base.clone(),
+                new: test.clone()
+            }
+        );
+        assert_eq!(
+            change("refs/heads/rewrite"),
+            GitRefChange::Force {
+                old: abandoned.clone(),
+                new: fix.clone(),
+                dropped: Some(1),
+            }
+        );
+        assert_eq!(
+            change("refs/tags/v1"),
+            GitRefChange::Create { new: test.clone() }
+        );
+        assert_eq!(
+            change("refs/heads/gone"),
+            GitRefChange::Delete {
+                old: Some(base.clone())
+            }
+        );
+
+        assert_eq!(push.commit_count, 2, "Start is on the remote already");
+        let commits: Vec<(&str, &str, i64)> = push
+            .commits
+            .iter()
+            .map(|commit| {
+                assert!(test.starts_with(&commit.short_id) || fix.starts_with(&commit.short_id));
+                (
+                    commit.subject.as_str(),
+                    commit.author.as_str(),
+                    commit.authored_at,
+                )
+            })
+            .collect();
+        assert_eq!(
+            commits,
+            [
+                ("Test the clock", "Ada Lovelace", 1_764_000_180),
+                ("Fix the clock", "Ada Lovelace", 1_764_000_120),
+            ]
+        );
+
+        let diffs: Vec<&str> = push
+            .diffs
+            .iter()
+            .map(|diff| diff.reference.as_str())
+            .collect();
+        assert_eq!(
+            diffs,
+            ["refs/heads/main", "refs/heads/rewrite", "refs/tags/v1"]
+        );
+        let main = &push.diffs[0].text;
+        assert!(
+            main.starts_with(" clock.rs | 2 +-\n test.rs  | 1 +\n"),
+            "{main}"
+        );
+        assert!(main.contains(" create mode 100644 test.rs\n"), "{main}");
+        assert!(main.contains("\n-tick\n+tock\n"), "{main}");
+        let rewrite = &push.diffs[1].text;
+        assert!(
+            rewrite.contains(" delete mode 100644 idea.rs\n"),
+            "{rewrite}"
+        );
+        assert_eq!(
+            push.diffs[2].text, *main,
+            "a new tag's diff starts where it leaves what the remote has"
+        );
+        assert!(!push.diff_cut);
+    }
+
+    /// A ref the remote had at an object this repository never fetched
+    /// is forced, by an unknown number of commits; a push whose history
+    /// shares nothing with the remote diffs from the empty tree.
+    #[test]
+    fn describes_what_the_repository_cannot_know() {
+        let scratch = Scratch::new();
+        let only = scratch.commit(None, "Everything", &[("all.rs", "all\n")]);
+        let unseen = "f".repeat(40);
+        let push = describe_push(
+            &scratch.repository,
+            None,
+            vec![planned("refs/heads/main", Some(&unseen), Some(&only))],
+        )
+        .unwrap();
+        assert_eq!(
+            push.updates[0].change,
+            GitRefChange::Force {
+                old: unseen,
+                new: only,
+                dropped: None
+            }
+        );
+        assert_eq!(push.commit_count, 1);
+        assert!(push.diffs[0].text.contains("\n+all\n"));
+    }
+
+    /// A huge push keeps its stat and stops its patch at the bound, on a
+    /// whole line, and says it stopped.
+    #[test]
+    fn cuts_a_huge_diff_at_the_bound() {
+        let scratch = Scratch::new();
+        let base = scratch.commit(None, "Start", &[("small.rs", "a\n")]);
+        let lines: String = (0..20_000).map(|line| format!("line {line}\n")).collect();
+        let big = scratch.commit(Some(&base), "Generate", &[("big.txt", &lines)]);
+        let commits: Vec<String> = (0..MAX_PUSH_COMMITS + 5)
+            .scan(big.clone(), |parent, n| {
+                *parent = scratch.commit(
+                    Some(parent),
+                    &format!("Step {n}"),
+                    &[("big.txt", &lines), ("n", &format!("{n}\n"))],
+                );
+                Some(parent.clone())
+            })
+            .collect();
+        let push = describe_push(
+            &scratch.repository,
+            None,
+            vec![
+                planned(
+                    "refs/heads/main",
+                    Some(&base),
+                    commits.last().map(String::as_str),
+                ),
+                planned("refs/heads/other", Some(&base), Some(&big)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(push.commit_count, MAX_PUSH_COMMITS as u64 + 6);
+        assert_eq!(push.commits.len(), MAX_PUSH_COMMITS);
+        assert_eq!(
+            push.commits[0].subject,
+            format!("Step {}", MAX_PUSH_COMMITS + 4)
+        );
+        assert!(push.diff_cut);
+        assert_eq!(push.diffs.len(), 1, "the second ref's diff did not fit");
+        let text = &push.diffs[0].text;
+        assert!(text.len() <= MAX_PUSH_DIFF_BYTES);
+        assert!(text.len() > MAX_PUSH_DIFF_BYTES - 100, "{}", text.len());
+        assert!(text.starts_with(" big.txt  | 20000 +"), "{}", &text[..80]);
+        assert!(text.ends_with('\n'));
     }
 
     #[test]

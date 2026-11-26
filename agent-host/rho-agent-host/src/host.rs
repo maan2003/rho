@@ -452,7 +452,8 @@ mod tests {
 #[cfg(test)]
 mod git_tests {
     use rho_agent_hosts::protocol::{
-        GitDecision, GitProvided, GitProviderFrame, GitService, GitTransportRequest,
+        GitDecision, GitIntent, GitProvided, GitProviderFrame, GitPush, GitRefChange, GitRefUpdate,
+        GitTransportRequest,
     };
     use rho_rpc::protocol::{Opened, read_frame};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -466,11 +467,20 @@ mod git_tests {
             port: 22,
             user: "git".to_owned(),
             repository: "acme/repo".to_owned(),
-            service: GitService::ReceivePack,
-            planned_refs: Some(vec![
-                "refs/heads/main".to_owned(),
-                "refs/tags/v1".to_owned(),
-            ]),
+            intent: GitIntent::Push(GitPush {
+                updates: ["refs/heads/main", "refs/tags/v1"]
+                    .map(|reference| GitRefUpdate {
+                        reference: reference.to_owned(),
+                        change: GitRefChange::Create {
+                            new: "1".repeat(40),
+                        },
+                    })
+                    .to_vec(),
+                commits: Vec::new(),
+                commit_count: 0,
+                diffs: Vec::new(),
+                diff_cut: false,
+            }),
             agent: None,
         }
     }

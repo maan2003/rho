@@ -26,7 +26,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::oneshot;
 
 use crate::protocol::{
-    GitDecision, GitProvided, GitProviderFrame, GitService, GitTransportRequest, Open as HostOpen,
+    GitDecision, GitIntent, GitProvided, GitProviderFrame, GitPush, GitRefUpdate,
+    GitTransportRequest, MAX_PUSH_COMMITS, MAX_PUSH_DIFF_BYTES, Open as HostOpen,
 };
 use crate::{Dialer, HostId, HostStream};
 
@@ -91,8 +92,12 @@ impl GitAsk {
         )
     }
 
-    pub fn is_push(&self) -> bool {
-        self.request.service == GitService::ReceivePack
+    /// The push it asks for; `None` for a fetch.
+    pub fn push(&self) -> Option<&GitPush> {
+        match &self.request.intent {
+            GitIntent::Push(push) => Some(push),
+            GitIntent::Fetch => None,
+        }
     }
 
     /// Where it goes: `ssh://github.com:22/acme/repo`.
@@ -104,33 +109,36 @@ impl GitAsk {
     /// `branch main`, `tag v1`, or the ref itself for anything else. A
     /// fetch changes none.
     pub fn refs(&self) -> Vec<String> {
-        self.request
-            .planned_refs
-            .iter()
-            .flatten()
-            .map(|reference| {
-                let reference = display_field(reference);
-                reference
-                    .strip_prefix("refs/heads/")
-                    .map(|name| format!("branch {name}"))
-                    .or_else(|| {
-                        reference
-                            .strip_prefix("refs/tags/")
-                            .map(|name| format!("tag {name}"))
-                    })
-                    .unwrap_or(reference)
-            })
+        self.push()
+            .into_iter()
+            .flat_map(|push| &push.updates)
+            .map(|update| ref_name(&update.reference))
             .collect()
     }
 
     /// What it asks for, on one line: where it goes and, for a push, every
     /// branch and tag it would change.
     pub fn what(&self) -> String {
-        match self.is_push() {
-            true => format!("push to {}: {}", self.destination(), self.refs().join(", ")),
-            false => format!("fetch from {}", self.destination()),
+        match self.push() {
+            Some(_) => format!("push to {}: {}", self.destination(), self.refs().join(", ")),
+            None => format!("fetch from {}", self.destination()),
         }
     }
+}
+
+/// A ref in the user's words: `branch main`, `tag v1`, or the ref itself
+/// for anything else.
+pub fn ref_name(reference: &str) -> String {
+    let reference = display_field(reference);
+    reference
+        .strip_prefix("refs/heads/")
+        .map(|name| format!("branch {name}"))
+        .or_else(|| {
+            reference
+                .strip_prefix("refs/tags/")
+                .map(|name| format!("tag {name}"))
+        })
+        .unwrap_or(reference)
 }
 
 fn destination(request: &GitTransportRequest) -> String {
@@ -346,7 +354,8 @@ async fn carry_answer(
 }
 
 /// Runs OpenSSH with the user's own login and carries the agent's Git
-/// through it. A push carries exactly the refs the user approved.
+/// through it. A push carries exactly the updates the user approved: the
+/// refs, and the objects they end at, that the card showed.
 async fn run_ssh(
     mut stream: rho_rpc::Stream,
     request: &GitTransportRequest,
@@ -354,9 +363,9 @@ async fn run_ssh(
 ) -> anyhow::Result<()> {
     let remote_command = format!(
         "{} '{}'",
-        match request.service {
-            GitService::UploadPack => "git-upload-pack",
-            GitService::ReceivePack => "git-receive-pack",
+        match request.intent {
+            GitIntent::Fetch => "git-upload-pack",
+            GitIntent::Push(_) => "git-receive-pack",
         },
         request.repository
     );
@@ -384,18 +393,14 @@ async fn run_ssh(
     let (mut transport_read, mut transport_write) = tokio::io::split(&mut stream);
 
     let input = async {
-        if request.service == GitService::ReceivePack {
-            copy_planned_receive_pack(
-                &mut transport_read,
-                &mut ssh_stdin,
-                request
-                    .planned_refs
-                    .as_deref()
-                    .context("SSH Git push is missing its destination ref plan")?,
-            )
-            .await?;
-        } else {
-            rho_rpc::copy_flush(&mut transport_read, &mut ssh_stdin).await?;
+        match &request.intent {
+            GitIntent::Push(push) => {
+                copy_planned_receive_pack(&mut transport_read, &mut ssh_stdin, &push.updates)
+                    .await?
+            }
+            GitIntent::Fetch => {
+                rho_rpc::copy_flush(&mut transport_read, &mut ssh_stdin).await?;
+            }
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -429,7 +434,7 @@ async fn run_ssh(
 async fn copy_planned_receive_pack<R, W>(
     reader: &mut R,
     writer: &mut W,
-    planned_refs: &[String],
+    planned: &[GitRefUpdate],
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -437,31 +442,36 @@ where
 {
     let (prefix, commands) = read_receive_pack_prefix(reader).await?;
     anyhow::ensure!(
-        receive_pack_refs_match(planned_refs, &commands),
-        "Git receive-pack destination refs differ from the approved plan"
+        receive_pack_matches(planned, &commands),
+        "Git's push differs from the one approved: push again to ask anew"
     );
     writer.write_all(&prefix).await?;
     rho_rpc::copy_flush(reader, writer).await?;
     Ok(())
 }
 
-fn receive_pack_refs_match(
-    planned_refs: &[String],
+/// Whether Git's commands set exactly the planned refs, each to the
+/// planned object, in any order. Where a ref was is the remote's to say.
+fn receive_pack_matches(
+    planned: &[GitRefUpdate],
     commands: &octo_types::ReceivePackCommands,
 ) -> bool {
-    if planned_refs.len() != commands.updates.len() {
-        return false;
-    }
-    let planned = planned_refs
+    let planned = planned
         .iter()
-        .map(String::as_str)
+        .map(|update| (update.reference.as_str(), update.change.new_object()))
         .collect::<BTreeSet<_>>();
     let actual = commands
         .updates
         .iter()
-        .map(|update| update.reference.as_str())
+        .map(|update| {
+            let deleted = update.new.bytes().all(|byte| byte == b'0');
+            (
+                update.reference.as_str(),
+                (!deleted).then_some(update.new.as_str()),
+            )
+        })
         .collect::<BTreeSet<_>>();
-    planned.len() == planned_refs.len() && planned == actual
+    commands.updates.len() == actual.len() && planned == actual
 }
 
 async fn read_receive_pack_prefix<R>(
@@ -495,32 +505,61 @@ fn validate_git_transport_request(request: &GitTransportRequest) -> anyhow::Resu
         octo_types::valid_ssh_repository(&request.host, &request.repository),
         "invalid SSH Git repository path"
     );
-    match (&request.service, &request.planned_refs) {
-        (GitService::UploadPack, None) => {}
-        (GitService::ReceivePack, Some(planned_refs)) => {
-            anyhow::ensure!(
-                !planned_refs.is_empty(),
-                "SSH Git push has an empty ref plan"
-            );
-            anyhow::ensure!(
-                planned_refs.iter().map(String::len).sum::<usize>()
-                    <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
-                "SSH Git push ref plan is too large"
-            );
-            let mut unique = HashSet::new();
-            anyhow::ensure!(
-                planned_refs.iter().all(|reference| {
-                    octo_types::valid_git_ref(reference) && unique.insert(reference)
-                }),
-                "SSH Git push ref plan is invalid"
-            );
-        }
-        _ => anyhow::bail!("SSH Git transport has an invalid ref plan"),
+    if let GitIntent::Push(push) = &request.intent {
+        validate_push(push)?;
     }
     Ok(())
 }
 
-fn display_field(value: &str) -> String {
+fn validate_push(push: &GitPush) -> anyhow::Result<()> {
+    use crate::protocol::GitRefChange;
+    anyhow::ensure!(!push.updates.is_empty(), "SSH Git push changes no ref");
+    anyhow::ensure!(
+        push.updates
+            .iter()
+            .map(|update| update.reference.len())
+            .sum::<usize>()
+            <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
+        "SSH Git push changes too many refs"
+    );
+    let mut unique = HashSet::new();
+    anyhow::ensure!(
+        push.updates.iter().all(|update| {
+            let objects_valid = match &update.change {
+                GitRefChange::Create { new } => octo_types::valid_object_id(new),
+                GitRefChange::FastForward { old, new } | GitRefChange::Force { old, new, .. } => {
+                    octo_types::valid_object_id(old) && octo_types::valid_object_id(new)
+                }
+                GitRefChange::Delete { old } => {
+                    old.as_deref().is_none_or(octo_types::valid_object_id)
+                }
+            };
+            objects_valid
+                && octo_types::valid_git_ref(&update.reference)
+                && unique.insert(&update.reference)
+        }),
+        "SSH Git push ref plan is invalid"
+    );
+    anyhow::ensure!(
+        push.commits.len() <= MAX_PUSH_COMMITS
+            && push.commit_count >= push.commits.len() as u64
+            && push.diffs.iter().map(|diff| diff.text.len()).sum::<usize>() <= MAX_PUSH_DIFF_BYTES,
+        "SSH Git push says more than a card shows"
+    );
+    Ok(())
+}
+
+/// Text an agent's repository wrote, such as a diff, a line at a time, as
+/// [`display_field`] shows it; a tab is four spaces.
+pub fn display_lines(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .lines()
+        .map(|line| display_field(&line.replace('\t', "    ")))
+}
+
+/// `value` with every control and bidirectional override replaced, so
+/// text an agent wrote reads as what it is.
+pub fn display_field(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -547,6 +586,7 @@ mod tests {
     use octo_types::{ReceivePackCommands, RefUpdate};
 
     use super::*;
+    use crate::protocol::{GitDiff, GitRefChange};
 
     fn ask(request: GitTransportRequest) -> (GitAsk, oneshot::Receiver<GitDecision>) {
         let (answer, answered) = oneshot::channel();
@@ -571,15 +611,7 @@ mod tests {
 
     #[test]
     fn client_rejects_unsafe_git_transport_fields() {
-        let valid = GitTransportRequest {
-            host: "github.com".to_owned(),
-            port: 22,
-            user: "git".to_owned(),
-            repository: "team/repo".to_owned(),
-            service: GitService::ReceivePack,
-            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
-            agent: None,
-        };
+        let valid = push_to(&[("refs/heads/main", created(&"1".repeat(40)))]);
         assert!(validate_git_transport_request(&valid).is_ok());
         let mut sourcehut = valid.clone();
         sourcehut.host = "git.sr.ht".to_owned();
@@ -604,24 +636,69 @@ mod tests {
             request.repository = repository.to_owned();
             assert!(validate_git_transport_request(&request).is_err());
         }
-        for planned_refs in [
-            None,
-            Some(Vec::new()),
-            Some(vec![
-                "refs/heads/main".to_owned(),
-                "refs/heads/main".to_owned(),
+        let new = "1".repeat(40);
+        for invalid in [
+            push_to(&[]),
+            push_to(&[
+                ("refs/heads/main", created(&new)),
+                ("refs/heads/main", created(&new)),
             ]),
-            Some(vec!["refs/heads/../main".to_owned()]),
+            push_to(&[("refs/heads/../main", created(&new))]),
+            push_to(&[("refs/heads/main", created("not an object"))]),
+            push_to(&[(
+                "refs/heads/main",
+                GitRefChange::Delete {
+                    old: Some("short".to_owned()),
+                },
+            )]),
         ] {
-            let mut request = valid.clone();
-            request.planned_refs = planned_refs;
-            assert!(validate_git_transport_request(&request).is_err());
+            assert!(validate_git_transport_request(&invalid).is_err());
         }
-        let mut fetch = valid;
-        fetch.service = GitService::UploadPack;
-        assert!(validate_git_transport_request(&fetch).is_err());
-        fetch.planned_refs = None;
+        let mut overlong = valid.clone();
+        let GitIntent::Push(push) = &mut overlong.intent else {
+            unreachable!()
+        };
+        push.diffs = vec![GitDiff {
+            reference: "refs/heads/main".to_owned(),
+            text: "+".repeat(MAX_PUSH_DIFF_BYTES + 1),
+        }];
+        assert!(validate_git_transport_request(&overlong).is_err());
+        let fetch = GitTransportRequest {
+            intent: GitIntent::Fetch,
+            ..valid
+        };
         assert!(validate_git_transport_request(&fetch).is_ok());
+    }
+
+    fn created(new: &str) -> GitRefChange {
+        GitRefChange::Create {
+            new: new.to_owned(),
+        }
+    }
+
+    /// A push of `updates` to github.com/team/repo that carries nothing
+    /// else to read.
+    fn push_to(updates: &[(&str, GitRefChange)]) -> GitTransportRequest {
+        GitTransportRequest {
+            host: "github.com".to_owned(),
+            port: 22,
+            user: "git".to_owned(),
+            repository: "team/repo".to_owned(),
+            intent: GitIntent::Push(GitPush {
+                updates: updates
+                    .iter()
+                    .map(|(reference, change)| GitRefUpdate {
+                        reference: (*reference).to_owned(),
+                        change: change.clone(),
+                    })
+                    .collect(),
+                commits: Vec::new(),
+                commit_count: 0,
+                diffs: Vec::new(),
+                diff_cut: false,
+            }),
+            agent: None,
+        }
     }
 
     #[test]
@@ -631,19 +708,16 @@ mod tests {
 
     #[test]
     fn push_prompt_names_destination_refs() {
+        let new = "1".repeat(40);
         let request = GitTransportRequest {
-            host: "github.com".to_owned(),
             port: 2222,
-            user: "git".to_owned(),
             repository: "acme/repo".to_owned(),
-            service: GitService::ReceivePack,
-            planned_refs: Some(vec![
-                "refs/heads/main".to_owned(),
-                "refs/tags/v1".to_owned(),
-                "refs/heads/rho/test".to_owned(),
-                "refs/notes/review".to_owned(),
-            ]),
-            agent: None,
+            ..push_to(&[
+                ("refs/heads/main", created(&new)),
+                ("refs/tags/v1", created(&new)),
+                ("refs/heads/rho/test", created(&new)),
+                ("refs/notes/review", created(&new)),
+            ])
         };
         let (push, _) = ask(request.clone());
         assert_eq!(
@@ -652,39 +726,96 @@ mod tests {
              refs/notes/review"
         );
         let (fetch, _) = ask(GitTransportRequest {
-            service: GitService::UploadPack,
-            planned_refs: None,
+            intent: GitIntent::Fetch,
             ..request
         });
         assert_eq!(fetch.what(), "fetch from ssh://github.com:2222/acme/repo");
         assert!(fetch.refs().is_empty());
     }
 
-    #[test]
-    fn receive_pack_plan_comparison_ignores_order_and_object_ids() {
-        let commands = ReceivePackCommands {
-            end: 0,
-            updates: vec![
-                RefUpdate {
-                    old: "1".repeat(40),
-                    new: "2".repeat(40),
-                    reference: "refs/tags/v1".to_owned(),
-                },
-                RefUpdate {
-                    old: "3".repeat(40),
-                    new: "4".repeat(40),
-                    reference: "refs/heads/main".to_owned(),
-                },
-            ],
+    fn planned(updates: &[(&str, GitRefChange)]) -> Vec<GitRefUpdate> {
+        let GitIntent::Push(push) = push_to(updates).intent else {
+            unreachable!()
         };
-        assert!(receive_pack_refs_match(
-            &["refs/heads/main".to_owned(), "refs/tags/v1".to_owned()],
-            &commands
-        ));
-        assert!(!receive_pack_refs_match(
-            &["refs/heads/main".to_owned()],
-            &commands
-        ));
+        push.updates
+    }
+
+    fn commands(updates: &[(&str, &str, &str)]) -> ReceivePackCommands {
+        ReceivePackCommands {
+            end: 0,
+            updates: updates
+                .iter()
+                .map(|(reference, old, new)| RefUpdate {
+                    old: (*old).to_owned(),
+                    new: (*new).to_owned(),
+                    reference: (*reference).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Git's commands must set the approved refs to the approved objects;
+    /// where each ref was is the remote's to say, as Git read it.
+    #[test]
+    fn receive_pack_must_carry_the_objects_approved() {
+        let (zero, a, b, c) = (
+            "0".repeat(40),
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+        );
+        let plan = planned(&[
+            (
+                "refs/heads/main",
+                GitRefChange::FastForward {
+                    old: a.clone(),
+                    new: b.clone(),
+                },
+            ),
+            ("refs/tags/v1", created(&c)),
+            ("refs/heads/old", GitRefChange::Delete { old: None }),
+        ]);
+        let sent = |main_new: &str| {
+            commands(&[
+                ("refs/tags/v1", &zero, &c),
+                ("refs/heads/old", &a, &zero),
+                // The remote moved since the agent last fetched: Git says
+                // so, and a fast-forward from there is still the push.
+                ("refs/heads/main", &c, main_new),
+            ])
+        };
+        assert!(receive_pack_matches(&plan, &sent(&b)));
+        assert!(
+            !receive_pack_matches(&plan, &sent(&c)),
+            "main ends somewhere the card did not show"
+        );
+        assert!(
+            !receive_pack_matches(&plan, &sent(&zero)),
+            "main deleted, not pushed"
+        );
+        assert!(
+            !receive_pack_matches(&plan[..2], &sent(&b)),
+            "a ref the plan lacks"
+        );
+        assert!(
+            !receive_pack_matches(
+                &plan,
+                &commands(&[("refs/tags/v1", &zero, &c), ("refs/heads/main", &a, &b)])
+            ),
+            "a planned ref left out"
+        );
+        assert!(
+            !receive_pack_matches(
+                &plan,
+                &commands(&[
+                    ("refs/tags/v1", &zero, &c),
+                    ("refs/heads/old", &a, &zero),
+                    ("refs/heads/main", &a, &b),
+                    ("refs/heads/main", &a, &b),
+                ])
+            ),
+            "a ref twice"
+        );
     }
 
     #[test]
@@ -705,7 +836,7 @@ mod tests {
                     copy_planned_receive_pack(
                         &mut transport,
                         &mut ssh,
-                        &["refs/heads/main".to_owned()],
+                        &planned(&[("refs/heads/main", GitRefChange::FastForward { old, new })]),
                     )
                     .await
                 });
@@ -736,7 +867,7 @@ mod tests {
                 let result = copy_planned_receive_pack(
                     &mut transport,
                     &mut ssh,
-                    &["refs/heads/main".to_owned()],
+                    &planned(&[("refs/heads/main", created(&"2".repeat(40)))]),
                 )
                 .await;
                 assert!(result.is_err());
@@ -761,7 +892,7 @@ mod tests {
                 let result = copy_planned_receive_pack(
                     &mut transport,
                     &mut ssh,
-                    &["refs/heads/main".to_owned()],
+                    &planned(&[("refs/heads/main", created(&"2".repeat(40)))]),
                 )
                 .await;
                 assert!(result.is_err());
@@ -836,8 +967,7 @@ mod tests {
             port: 22,
             user: "git".to_owned(),
             repository: "acme/repo".to_owned(),
-            service: GitService::UploadPack,
-            planned_refs: None,
+            intent: GitIntent::Fetch,
             agent: None,
         }
     }

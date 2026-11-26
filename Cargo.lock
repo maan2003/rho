@@ -5955,6 +5955,7 @@ dependencies = [
  "rho-agent-hosts",
  "rho-agent-types",
  "rho-rpc",
+ "tempfile",
  "tokio",
 ]
 
