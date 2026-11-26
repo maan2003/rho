@@ -14,7 +14,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 1. Replying to a waiting thread does not settle its card unless freshly opened via Deal
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2: `Surface::card() -> CardHere`, live `Frame::card_seen`)
 - **Where:** `chat.Answer a message` (step 3) / `deal.a reply settles the card`
 - **Evidence:**
   - Product model: `deal.md:72-73` (`a reply settles the card`: *"when the user replies to a `chat.Message` that waits, then its `Card` goes away"*) and `chat.md:201-206` (`Answer a message`: *"the user opens the thread by the deal or by name... the reply settles that card on this device"*).
@@ -98,7 +98,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 7. `Agent` transcript breaks `space u` (undo) and `space n` (next card) right after settling a card or opening by name
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2)
 - **Where:** `agents.Agent` (`keys: space then u`, `space`) / `deal.Verdict.undo` / `deal.Card.deal`
 - **Evidence:**
   - Product model: `agents.md:113-114` (*"`space` then `u`: undo the last verdict without leaving the transcript. `space`: `deal.Verdict` on the card the user came from; the transcript stays open. Opening the agent by name does not choose a card"*); `deal.md:50-51`.
@@ -152,7 +152,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 11. Constitution & cross-module contradictions: device-local drafts, broken chime suppression on FIFO deal, and stale rejected-feature references
 - **Kind:** product
 - **Level:** high-level
-- **Status:** decided (2026-11-26: drafts stay device-local, `index.md:17` amended, stale refs fixed; chime fix queued for Loop 2)
+- **Status:** fixed (2026-11-26: drafts stay device-local, `index.md:17` amended, stale refs fixed; chime part fixed in Loop 2 with per-card chime set & Desk suppression)
 - **Where:** `index.md` (`user`) vs `chat.Draft` (`chat.md:115`) / `deal.Card` & `window.Status line` (chime) / `deal.md` & `agents.md`
 - **Evidence:**
   1. **Draft sync contradiction:** `index.md:17` promises *"Their verdicts, notes, and drafts are the same on both [devices]"*, while `chat.md:115` states *"A thread has one draft on each device, not shared with other devices"* (matching code: `crates/rho-chat/src/ui/mod.rs:349-356` and `crates/rho-frame/src/place.rs:25-26` store drafts strictly locally, never in `rho-ledger`).

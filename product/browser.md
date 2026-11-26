@@ -50,13 +50,12 @@ keys:
 starts: `Read and reply on a page`
 
 ## concept Bookmark
-status: currently stored locally per device without a remove command.
 purpose: let the user return to a page by name, including a Slack page under their own account, from any paired device.
 principle: the user bookmarks the Slack page they often need and reaches it by name in `window.Palette` on both laptop and phone.
 sees: a saved page by name in `window.Palette`.
 does:
 - bookmark this page…, from `window.Palette`: uses the open page or prompts for an address, and saves it under the chosen name or page title
-- remove bookmark…, from `window.Palette`: removes a saved bookmark (prompting which one, or offering the current page's bookmark first)
+- remove bookmark…, from `window.Palette`: removes a saved bookmark (prompting which one, or offering the current page's bookmark first); echoes `no bookmarks` when none exist
 - open: find the bookmark by name in `window.Palette`; closing its tab does not remove it
 
 Bookmarks sync across paired devices through the user's sealed ledger, the same way as verdicts and notes; see `hosts.Pair this device`.

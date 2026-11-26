@@ -55,7 +55,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 3. `Browser`, `Usage`, and `Note` are treated as dealable Cards — allowing bogus verdicts that close Chrome tabs and mute notes/charts
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2)
 - **Where:** `window.Screen`, `deal.Verdict`, `browser.Page`, `usage.Chart`, `notes.Note`
 - **Evidence:**
   - **Product state:** `product/deal.md` states *"Slack in the browser has no rho verdicts"*, `product/notes.md` states *"a note about nothing stays off the desk"*, and `product/usage.md` has no verdicts. Yet in the built app:
@@ -92,7 +92,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 5. `Approve a push or a fetch` clobbers open prompts, drops concurrent approvals, mislabels the sender, and risks accidental approval while typing
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2)
 - **Where:** `agents.Approve a push or a fetch`, `window.Prompt`
 - **Evidence:**
   - **Product state:** `product/agents.md` (`Approve a push or a fetch`) states that when two agents push at once, *"the second question waits for the first"*, and the prompt names *"the agent's name, `git asks`, ..."*. In the built product:
@@ -111,7 +111,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 6. `Palette`, `Prompt`, and `Hosts` have broken promises, inconsistent interaction, and awkward command ranking
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2: desktop Palette/Prompt clicks, window-wide `new note`, host copy/redial rows)
 - **Where:** `window.Palette`, `window.Prompt`, `hosts.Host`, `hosts.Know my hosts are reachable`, `notes.Note`
 - **Evidence:**
   - **Product state:** `Palette` and `Prompt` are the universal command/navigation backbone (`Go to something by name`, 20/day; `Run a command I rarely use`, 2/day), yet four rough edges fight the user's habits:
@@ -164,7 +164,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 9. Warm restart and early `back` permanently erase host-backed screens from `History` (plus unresolved `not agreed` loading/error states)
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (code part, 2026-11-26, Loop 2: `Opening::{Surface, Waiting, Gone}`; `product/` loading/error states remain `not agreed`)
 - **Where:** `window.Screen`, `desk.a cold return opens the desk`, `desk.Desk` (states), `chat.Thread` (states), `agents.Desktop`
 - **Evidence:**
   - **Product state:** `product/desk.md` (`a cold return opens the desk`) promises that returning within ten minutes leaves the user's `window.Screen` where they left it, and `product/window.md` promises the way back keeps earlier screens. In the built app:
@@ -183,7 +183,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 10. `Notes`, `Browser` bookmarks, and `Usage` introduce awkward mini-UI seams and device gaps
 - **Kind:** product
 - **Level:** high-level
-- **Status:** decided (2026-11-26: sync Browser bookmarks via sealed ledger + delete; unify Notes query with Prompt keys; in-place 7d/30d & chart switching on Usage; code fixes queued for Loop 2)
+- **Status:** fixed (2026-11-26, Loop 2: ledger-synced bookmarks + `remove bookmark…`, Notes prompt keys, in-place usage switching)
 - **Where:** `notes.Notes`, `browser.Bookmark`, `usage.Chart`
 - **Evidence:**
   - **Product state:** Three smaller places diverge from rho's core editor/sync model in ways that create surprising friction:

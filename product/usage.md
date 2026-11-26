@@ -30,7 +30,8 @@ states:
 - error: `no agent host is attached`; a lost host is named by `window.Status line`
 - full: the allowance rows or spending totals, then the picture
 keys:
-- in-screen switching between `7d`/`30d` and the four pictures
+- `] w`, `[ w`: switch between `7d` and `30d` in place
+- `] v`, `[ v`: switch to the next or previous chart in place
 - `window.Palette` to open another place or command
 - `window.Screen` to read, search, or go back
 starts: `Check what is left`
