@@ -1,5 +1,5 @@
-//! Project setup uses the same place and mode prompts from the Idea
-//! address chooser and the Desk. These prompts write to the host; only
+//! Project setup uses the same place and mode prompts from the idea's
+//! `to:` chooser and the palette. These prompts write to the host; only
 //! its mail session can change what every Desk shows.
 
 use std::collections::HashMap;
@@ -9,21 +9,60 @@ use gpui::{App, Context, Entity, Window};
 use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{
     ChatSeq, EndpointId, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
-    ProjectName, ProjectPlace, RuntimeLabel,
+    ProjectName, ProjectPlace, RUNTIMES, RuntimeKind, RuntimeLabel,
 };
 use rho_db::{RhoDb, Sen};
-use rho_dealer::Addressed as _;
-use rho_frame::idea::{NewIdeaProject, ProjectCreated, runtime_candidates};
-use rho_frame::system::System as _;
 use rho_frame::{Candidate, Frame, Point, Row, Rows};
 use rho_window::style::StyleClass;
 use senax_encoder::{Decode, Encode};
 
 use super::ChatSystem;
+use super::idea::IdeaProject;
 use crate::ThreadId;
 use crate::protocol::{ChangeProject, CreateProject, ImportProject};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
+
+/// A validated project name on the host that will own it.
+#[derive(Clone)]
+pub(super) struct NewProject {
+    pub(super) host: EndpointId,
+    pub(super) name: ProjectName,
+}
+
+/// What waits for a project being made: the idea that named it.
+pub(super) type ProjectCreated = Rc<dyn Fn(IdeaProject, &mut App)>;
+
+/// The runtimes the project and idea prompts offer, with `first` and what
+/// it is said to be at the top.
+pub(super) fn runtime_candidates(
+    needle: &str,
+    first: Option<(&RuntimeLabel, &str)>,
+) -> Vec<Candidate> {
+    let needle = needle.trim().to_ascii_lowercase();
+    let mut candidates: Vec<_> = RUNTIMES
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            [RuntimeKind::Rho, RuntimeKind::Claude]
+                .into_iter()
+                .flat_map(RuntimeLabel::choices)
+                .filter(|label| !RUNTIMES.contains(&label.as_str())),
+        )
+        .filter(|label| label.contains(&needle))
+        .map(|value| {
+            let description = first
+                .filter(|(label, _)| label.as_str() == value)
+                .map_or("", |(_, description)| description)
+                .to_owned();
+            Candidate { value, description }
+        })
+        .collect();
+    if let Some((label, _)) = first {
+        candidates.sort_by_key(|candidate| candidate.value != label.as_str());
+    }
+    candidates
+}
 
 impl ChatSystem {
     pub fn set_known_places(&mut self, places: KnownPlaces) {
@@ -229,13 +268,11 @@ impl ChatSystem {
             Rc::new(move |_, needle, cx| {
                 let mail = names.read(cx);
                 let needle = needle.trim();
-                mail.idea_projects(cx)
+                mail.idea_projects()
                     .into_iter()
                     .filter(|project| project.name.contains(needle))
                     .map(|project| Candidate {
-                        description: ThreadId::from_address(&project.address)
-                            .and_then(|thread| mail.project_details(thread))
-                            .unwrap_or_default(),
+                        description: mail.project_details(project.thread).unwrap_or_default(),
                         value: project.name,
                     })
                     .collect()
@@ -299,7 +336,7 @@ impl ChatSystem {
                 };
                 Self::prompt_project(
                     this.clone(),
-                    NewIdeaProject { host, name },
+                    NewProject { host, name },
                     None,
                     frame,
                     window,
@@ -313,7 +350,7 @@ impl ChatSystem {
 
     pub(super) fn prompt_project(
         this: Entity<Self>,
-        project: NewIdeaProject,
+        project: NewProject,
         created: Option<ProjectCreated>,
         frame: &mut Frame,
         window: &mut Window,
@@ -417,7 +454,7 @@ impl ChatSystem {
 
     fn create_project(
         &self,
-        project: NewIdeaProject,
+        project: NewProject,
         config: ProjectConfig,
         created: Option<ProjectCreated>,
         cx: &mut Context<Self>,
@@ -604,6 +641,7 @@ pub(super) fn legacy_places(db: &RhoDb) -> HashMap<(EndpointId, ProjectId), Proj
 #[cfg(test)]
 mod tests {
     use rho_db::SenValue;
+    use rho_dealer::Addressed as _;
 
     use super::*;
 
@@ -739,5 +777,23 @@ mod tests {
         assert_eq!(config(39).runtime.as_str(), "opus-high");
         assert_eq!(config(48).place.as_str(), "/tmp/not-a-clone");
         assert!(!config(48).place.is_repository());
+    }
+    #[test]
+    fn runtime_choices_rank_the_project_without_losing_unfeatured_pairs() {
+        let current = RuntimeLabel::parse("haiku-max").unwrap();
+        let rows = runtime_candidates("", Some((&current, "project")));
+        assert_eq!(
+            (&*rows[0].value, &*rows[0].description),
+            ("haiku-max", "project")
+        );
+        assert_eq!(rows[1].value, "opus-high");
+        assert_eq!(rows.iter().filter(|row| row.value == "sol-high").count(), 1);
+        assert!(
+            rows.iter()
+                .all(|row| RuntimeLabel::parse(&row.value).is_ok())
+        );
+        let filtered = runtime_candidates(" XHigH ", None);
+        assert!(filtered.iter().any(|row| row.value == "astra-xhigh"));
+        assert!(!filtered.iter().any(|row| row.value == "opus-high"));
     }
 }

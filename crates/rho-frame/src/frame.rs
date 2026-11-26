@@ -26,7 +26,6 @@ use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::desk::DeskView;
 use crate::hosts::HostQuestion;
-use crate::idea::IdeaBox;
 use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
     Answer, CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler,
@@ -107,7 +106,6 @@ pub struct Frame {
     history: History<Address, ScreenEntry>,
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
-    pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
     /// What hosts ask the user, oldest first, waiting for the prompt.
     pub(crate) questions: VecDeque<HostQuestion>,
@@ -160,7 +158,6 @@ impl Frame {
         keys::bind(cx);
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
-        let idea = IdeaBox::new(cx, &db);
         let desk = cx.new(|cx| DeskView::new(window, cx));
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -218,7 +215,6 @@ impl Frame {
             history: History::new(desk_address, ScreenEntry::Opened),
             surfaces,
             desk,
-            idea,
             minibuffer: None,
             questions: VecDeque::new(),
             menu: None,
@@ -310,9 +306,6 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Opening {
-        if *address == Self::idea_address() {
-            return Opening::Surface(AnySurface::new(self.make_idea_view(window, cx)));
-        }
         match self
             .systems
             .clone()
@@ -796,6 +789,11 @@ impl Frame {
         self.surfaces.get(address)
     }
 
+    /// Whether a prompt or a menu has the keys.
+    pub fn is_asking(&self) -> bool {
+        self.minibuffer.is_some() || self.menu.is_some()
+    }
+
     // ---- echo ----
 
     /// One line on the status line for a few seconds, and in the process
@@ -1108,9 +1106,9 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         let address = &place.found.address;
-        if let Some((_, project)) = self
-            .project_for(address, cx)
-            .filter(|(_, project)| &project.address == address)
+        if let Some(project) = self
+            .project_of(address, cx)
+            .filter(|project| &project.address == address)
         {
             self.palette(window, cx);
             if let Some(prompt) = self.minibuffer.as_mut() {
@@ -1211,8 +1209,8 @@ impl Frame {
         })
         .window_wide();
         let mut rows = vec![
-            Row::run("", "write an idea", |frame, window, cx| {
-                frame.prompt_idea(window, cx)
+            Row::run("", "write an idea", |_, window, cx| {
+                window.dispatch_action(Box::new(keys::PromptIdea), cx)
             })
             .bound_to(keys::PromptIdea)
             .window_wide(),
@@ -1857,20 +1855,6 @@ impl Render for Frame {
                 }
             }))
             .on_action(cx.listener(|this, _: &keys::Desk, window, cx| this.toggle_desk(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &keys::PromptIdea, window, cx| this.prompt_idea(window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &keys::PromptIdeaRuntime, window, cx| {
-                    this.prompt_idea_runtime(window, cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &keys::FocusIdeaAddress, window, cx| {
-                this.focus_idea_address(window, cx);
-            }))
-            .on_action(
-                cx.listener(|this, _: &keys::SendIdea, window, cx| this.send_idea(window, cx)),
-            )
             .on_action(cx.listener(|this, _: &keys::RedoEdit, window, cx| {
                 let surface = this.current_surface();
                 if surface.edits_at_point(cx)
@@ -2227,10 +2211,9 @@ mod tests {
         let frame = test_frame(cx, rho_db::RhoDb::in_memory());
         frame
             .update(cx, |frame, _, cx| {
-                let project = crate::idea::IdeaProject {
+                let project = crate::Project {
                     address: Address::new("thread", "lab/1"),
                     name: "tide@lab".into(),
-                    runtime: None,
                 };
                 let subject = Address::new("thread", "lab/2");
                 let mut card = frame.card_for(&subject, cx);
@@ -2285,86 +2268,60 @@ mod tests {
             .unwrap();
     }
 
-    /// `chat.Write an idea`: the draft is a screen of its own, so the
-    /// window's keys act on it and never on the screen it came from.
+    /// A system with one project, `tide@lab`, that `find` lists.
+    struct Projects;
+
+    impl crate::System for Projects {
+        fn kinds(&self) -> &'static [&'static str] {
+            &["project"]
+        }
+
+        fn open(&mut self, _: &Address, _: &mut Window, _: &mut Context<Self>) -> Opening {
+            Opening::Gone
+        }
+
+        fn project(&self, address: &Address, _: &App) -> Option<crate::Project> {
+            (address == &Address::new("project", "tide")).then(|| crate::Project {
+                address: address.clone(),
+                name: "tide@lab".into(),
+            })
+        }
+
+        fn find(&self, _: &rho_dealer::Marks, _: &App) -> Vec<Found> {
+            vec![Found {
+                address: Address::new("project", "tide"),
+                title: "tide@lab".into(),
+                description: "on /srv/tide · one agent · opus-high".into(),
+                thread: None,
+                recency: 0,
+            }]
+        }
+    }
+
+    /// A project has no screen: choosing it in the palette filters the
+    /// palette to its threads.
     #[gpui::test]
-    fn the_idea_screen_takes_the_window_keys_from_the_screen_under_it(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let window = test_frame(cx, rho_db::RhoDb::in_memory());
-        let thread = Address::new("thread", "lab/7");
+    fn choosing_a_project_in_the_palette_filters_to_its_threads(cx: &mut gpui::TestAppContext) {
+        let window = test_frame_with(cx, rho_db::RhoDb::in_memory(), |cx| {
+            vec![AnySystem::new(cx.new(|_| Projects))]
+        });
         window
             .update(cx, |frame, window, cx| {
-                let view = cx.new(|cx| OpenCard(cx.focus_handle()));
-                frame.surfaces.insert(thread.clone(), AnySurface::new(view));
-                let mut card = frame.card_for(&thread, cx);
-                card.kind = rho_dealer::rank::CardKind::Waits;
-                frame.signals.hand.cards = vec![card];
-                frame.open(thread.clone(), window, cx);
-                frame.prompt_idea(window, cx);
-                frame.idea.text.update(cx, |draft, cx| {
-                    draft.edit([(0..0, "Half a thought")], None, cx)
-                });
-                assert!(frame.idea_in_view());
+                frame.palette(window, cx);
+                frame
+                    .minibuffer_mut()
+                    .unwrap()
+                    .set_input("tide@lab".into(), window, cx);
             })
             .unwrap();
         cx.run_until_parked();
-
-        // `space` over the idea is about no card: never the thread's done.
-        cx.dispatch_action(window.into(), keys::VerdictMenu);
-        window
-            .update(cx, |frame, window, cx| {
-                let menu = &frame.menu.as_ref().expect("space opens a menu").rows;
-                assert_eq!(labels(menu), ["undo", "next card"]);
-                frame.close_overlays(window, cx);
-            })
-            .unwrap();
+        cx.dispatch_action(window.into(), keys::MinibufferConfirm);
         cx.run_until_parked();
-
-        // The mode word is the editor's, not a fixed `INS`: this test runs
-        // without vim, so the words read `normal`; the `to:` line types.
-        window
-            .update(cx, |frame, window, cx| {
-                assert_eq!(frame.mode(window, cx), "normal");
-                let view = frame.idea_view().unwrap();
-                let address = view.read(cx).address.focus_handle(cx);
-                window.focus(&address, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |frame, window, cx| {
-                assert_eq!(frame.mode(window, cx), "insert");
-                frame.focus_surface(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        // Back and forward walk past the idea like any screen.
-        cx.dispatch_action(window.into(), keys::Back);
-        window
-            .update(cx, |frame, _, _| {
-                assert_eq!(frame.current_address(), &thread)
-            })
-            .unwrap();
-        // The test card draws no focus of its own, so the step back in
-        // is the frame's call rather than a key.
-        window
-            .update(cx, |frame, window, cx| {
-                frame.forward_or_deal(window, cx);
-                assert!(frame.idea_in_view());
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        // `q` closes the idea, not the thread under it, and keeps its words.
-        cx.dispatch_action(window.into(), keys::Close);
         window
             .update(cx, |frame, _, cx| {
-                assert_eq!(frame.current_address(), &thread);
-                assert!(frame.surfaces.contains_key(&thread));
-                assert!(frame.idea_view().is_none());
-                assert_eq!(frame.idea.text.read(cx).text(), "Half a thought");
+                assert_eq!(frame.current_address(), &Frame::desk_address());
+                let palette = frame.minibuffer_mut().expect("the palette stays open");
+                assert_eq!(palette.input(cx), "tide@lab ");
             })
             .unwrap();
     }

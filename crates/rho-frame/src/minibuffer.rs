@@ -33,6 +33,9 @@ pub struct Candidate {
     pub description: String,
 }
 
+/// What a project address prompt calls a row that makes the project.
+pub const NEW_PROJECT: &str = "new project";
+
 pub fn token_start(text_before_cursor: &str) -> usize {
     text_before_cursor
         .char_indices()
@@ -532,7 +535,9 @@ impl Minibuffer {
         self.completion_input = CompletionInput::Word;
     }
 
-    pub(crate) fn complete_project_address(&mut self) {
+    /// The answer is a whole project address, chosen from tappable rows;
+    /// a row described as [`NEW_PROJECT`] leads with those words.
+    pub fn complete_project_address(&mut self) {
         self.completion_input = CompletionInput::Address;
     }
 
@@ -785,7 +790,7 @@ impl Minibuffer {
                 } else if let Answer::Text { rows, .. } = &self.answer {
                     let candidate = &rows[index];
                     row = row.when(layout == crate::Layout::Phone, |row| row.flex_wrap());
-                    let new_project = address && candidate.description == crate::idea::NEW_PROJECT;
+                    let new_project = address && candidate.description == NEW_PROJECT;
                     if new_project {
                         row = row.child(div().max_w_full().child(candidate.description.clone()));
                     }

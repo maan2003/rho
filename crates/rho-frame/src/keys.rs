@@ -53,11 +53,11 @@ actions!(
         DeskPrevious,
         DeskFirst,
         DeskDraft,
+        /// `ctrl-alt-m` anywhere, `i` on Desk: write an idea
+        /// (`chat.Write an idea`). The window offers it; the system that
+        /// keeps ideas answers it.
         PromptIdea,
-        PromptIdeaRuntime,
         RedoEdit,
-        SendIdea,
-        FocusIdeaAddress,
         /// `/`: search forward in what is in view.
         SearchForward,
         /// `?`: search back.
@@ -182,14 +182,6 @@ fn bindings() -> Vec<KeyBinding> {
         bindings.push(KeyBinding::new("i", PromptIdea, Some(&context)));
     }
     bindings.extend([
-        KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
-        KeyBinding::new("enter", PromptIdea, Some("RhoIdeaAddress > Editor")),
-        KeyBinding::new("enter", PromptIdeaRuntime, Some("RhoIdeaRuntime > Editor")),
-        KeyBinding::new("shift-tab", FocusIdeaAddress, Some("RhoIdea > Editor")),
-        KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
-        // The idea is a screen: `ctrl-g` closes it as `q` does, from any
-        // mode, and the draft stays for next time.
-        KeyBinding::new("ctrl-g", Close, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),

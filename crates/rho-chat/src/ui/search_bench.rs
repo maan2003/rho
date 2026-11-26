@@ -57,6 +57,17 @@ pub(super) fn fixture(
 ) {
     let temp = tempfile::tempdir().unwrap();
     let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+    let (window, mail) = fixture_on(cx, log, db);
+    (window, mail, temp)
+}
+
+/// A window over chat alone, on `db`, with `log` as the host
+/// `EndpointId([3; 32])`'s.
+pub(super) fn fixture_on(
+    cx: &mut gpui::TestAppContext,
+    log: HostChat,
+    db: rho_db::RhoDb,
+) -> (gpui::WindowHandle<Frame>, Entity<ChatSystem>) {
     cx.update(|cx| {
         assets::Assets.load_test_fonts(cx);
         let settings = settings::SettingsStore::test(cx);
@@ -83,7 +94,7 @@ pub(super) fn fixture(
         mail = Some(system);
         Frame::new(db, systems, Vec::new(), Rc::new(|| {}), window, cx)
     });
-    (window, mail.unwrap(), temp)
+    (window, mail.unwrap())
 }
 
 #[gpui::test]

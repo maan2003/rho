@@ -22,10 +22,10 @@ use rho_transcript::{Item, Transcript};
 use text::{Bias, ToOffset as _, ToPoint as _};
 use theme::ActiveTheme as _;
 
-use crate::idea::IdeaProject;
 use crate::keys;
 use crate::phone::Layout;
 use crate::surface::{CardHere, Subject, Surface};
+use crate::system::Project;
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
@@ -94,7 +94,7 @@ impl DeskRows {
 
 pub(crate) fn desk_rows(
     hand: &Hand,
-    project_of: impl Fn(&Address) -> Option<IdeaProject>,
+    project_of: impl Fn(&Address) -> Option<Project>,
     flash_at: impl Fn(&Address) -> Option<String>,
 ) -> DeskRows {
     // A project's stops occupy its first stop's place. Every pinging mail
@@ -828,10 +828,9 @@ mod tests {
         let rows = desk_rows(
             &hand,
             |address| {
-                Some(IdeaProject {
+                Some(Project {
                     address: address.clone(),
                     name: "shoal@lab".into(),
-                    runtime: None,
                 })
             },
             |_| None,
@@ -872,10 +871,9 @@ mod tests {
                 "t3" | "t11" => 3,
                 _ => return None,
             };
-            Some(IdeaProject {
+            Some(Project {
                 address: Address::new("project", id),
                 name: if id == 3 { "clock@lab" } else { "reef@lab" }.into(),
-                runtime: None,
             })
         };
         let rows = desk_rows(&hand, project, |_| None);
@@ -918,10 +916,9 @@ mod tests {
             next_change: None,
         };
         let project = |_: &Address| {
-            Some(IdeaProject {
+            Some(Project {
                 address: Address::new("project", 1),
                 name: "clock@lab".into(),
-                runtime: None,
             })
         };
         let rows = desk_rows(&hand, project, |_| None);

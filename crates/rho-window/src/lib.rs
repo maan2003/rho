@@ -9,6 +9,7 @@
 //! This crate names nothing above it: it knows buffers and editors, not
 //! agents or the desk.
 
+pub mod draft;
 pub mod editor_config;
 pub mod highlights;
 pub mod history;

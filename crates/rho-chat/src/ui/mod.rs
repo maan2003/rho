@@ -3,10 +3,12 @@
 //! [`ChatSystem`] owns each host's forest, disk copy, outbox, and session.
 //! It plugs into the frame as a [`System`] under the `thread` kind: a
 //! root anchors a project, and each reply directly below it starts a
-//! thread. Both open as a [`ThreadView`]. [`crate::cards`] says which
-//! threads want the user; this module supplies projects, moving threads,
-//! and the rows for `find`.
+//! thread. Both open as a [`ThreadView`]. The idea being written opens
+//! at `chat:idea` ([`idea`]). [`crate::cards`] says which threads want the
+//! user; this module supplies projects, moving threads, and the rows for
+//! `find`.
 
+mod idea;
 mod pending;
 mod projects;
 #[cfg(test)]
@@ -20,8 +22,10 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, Window};
+use idea::{Idea, IdeaMail, IdeaProject};
 use jiff::Timestamp;
 use pending::{PendingIdea, PendingIdeaId};
+use projects::ProjectCreated;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
@@ -29,10 +33,9 @@ use rho_agent_types::{
 };
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
-use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{
-    AnySurface, Found, FoundText, FoundThread, FrameLink, Opening, Point, Row, SearchPoint, System,
-    TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
+    AnySurface, Found, FoundText, FoundThread, FrameLink, Opening, Point, Project, Row,
+    SearchPoint, System, TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
 use rho_rpc::protocol::Answer as RpcAnswer;
 use rho_window::style::StyleClass;
@@ -119,6 +122,8 @@ pub struct ChatSystem {
     known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
     drafts: TextIndex<(EndpointId, Option<MessageId>)>,
+    /// The idea being written on this device.
+    idea: Idea,
     events: UnboundedSender<MailEvent>,
     frame: FrameLink,
     /// Whether an agent still exists on a host, its label, and what it is
@@ -137,6 +142,14 @@ impl ChatSystem {
         cx: &mut Context<Self>,
     ) -> Self {
         thread::bind(cx);
+        idea::bind(cx);
+        // The window offers the idea key everywhere; chat answers it.
+        let this = cx.weak_entity();
+        App::on_action(cx, move |_: &rho_frame::keys::PromptIdea, cx| {
+            if let Some(chat) = this.upgrade() {
+                idea::prompt_later(chat, cx);
+            }
+        });
         let legacy_places = projects::legacy_places(&db);
         let cache = Cache::open_on(db).expect("the chat copy opens");
         let loaded = cache.load();
@@ -162,6 +175,7 @@ impl ChatSystem {
                 })
                 .collect(),
         );
+        let idea = Idea::load(loaded.idea, cx);
         let mut drafts = TextIndex::default();
         for (seed, parent, text) in loaded.drafts {
             drafts.update((seed, parent), text, 0);
@@ -187,6 +201,7 @@ impl ChatSystem {
             known_places: Rc::new(|_, _| Vec::new()),
             last_project: loaded.last_project,
             drafts,
+            idea,
             cache,
             hosts: HashMap::new(),
             logs,
@@ -406,9 +421,6 @@ impl ChatSystem {
                     self.settings
                         .insert(endpoint, configured.into_iter().collect());
                     self.import_legacy_projects(endpoint, cx);
-                    self.frame.with(cx, |frame, window, cx| {
-                        frame.refresh_idea_runtime(window, cx)
-                    });
                     self.finish_project_creation(cx);
                     self.changed(endpoint, cx);
                 }
@@ -579,7 +591,7 @@ impl ChatSystem {
         // outbox stay usable while the connection is interrupted.
         self.link_for(project.host)?;
         Some(IdeaProject {
-            address: project.address(),
+            thread: project,
             name,
             runtime: self
                 .project_config(project)
@@ -643,6 +655,29 @@ impl ChatSystem {
         self.send_unsent(endpoint, cx);
     }
 
+    /// Queues an idea for its project's host, once per client id.
+    fn send_idea(&mut self, mail: IdeaMail, cx: &mut Context<Self>) {
+        let project = mail.project;
+        if self.outbox.contains(mail.client_id) {
+            return;
+        }
+        let outgoing = Outgoing {
+            at: UnixMs::now(),
+            parent: Some(project.message),
+            failed_start: None,
+            settles: None,
+            mentions: Vec::new(),
+            content: vec![ContentPart::Text {
+                text: mail.text.trim().to_owned(),
+            }],
+            delivery: Delivery::Idea,
+            runtime: mail.runtime,
+            state: OutgoingState::Queued,
+        };
+        let (_, kept) = self.outbox.keep(project.host, mail.client_id, outgoing);
+        self.keep_outgoing(project.host, Some(project.message), kept, cx);
+    }
+
     fn refuse_reply(&mut self, endpoint: EndpointId, reason: String, cx: &mut Context<Self>) {
         let echo = format!("reply not sent: {}", rho_agent_types::one_line(&reason));
         let (_, kept) = self.outbox.refuse(endpoint, reason);
@@ -674,8 +709,7 @@ impl ChatSystem {
             project: ThreadId {
                 host,
                 message: outgoing.parent?,
-            }
-            .address(),
+            },
             text: rho_agent_types::content_text(&outgoing.content),
             runtime: outgoing.runtime.clone(),
         })
@@ -843,6 +877,9 @@ impl ChatSystem {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnySurface> {
+        if *address == idea::address() {
+            return Some(AnySurface::new(self.idea_view(window, cx)));
+        }
         if let Some(id) = PendingIdeaId::from_address(address) {
             let (_, project, outgoing) = self.pending_ideas().find(|(queued, ..)| *queued == id)?;
             let content = rho_agent_types::content_text(&outgoing.content);
@@ -866,7 +903,7 @@ impl ChatSystem {
 
 impl System for ChatSystem {
     fn kinds(&self) -> &'static [&'static str] {
-        &[ThreadId::KIND, PendingIdeaId::KIND]
+        &[ThreadId::KIND, PendingIdeaId::KIND, idea::KIND]
     }
 
     /// A thread opens from the copy this window keeps of its host's log,
@@ -1040,70 +1077,12 @@ impl System for ChatSystem {
             .map(rho_agent_types::Message::headline)
     }
 
-    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
-        self.logs
-            .iter()
-            .flat_map(|(&host, chat)| {
-                chat.roots().iter().filter_map(move |&message| {
-                    let thread = ThreadId { host, message };
-                    let project = self.idea_project_at(thread)?;
-                    // Like project_named, only show the newest of roots with
-                    // the same address. A contextual default knows its exact
-                    // id.
-                    (self.project_named(&project.name) == Some(thread)).then_some(project)
-                })
-            })
-            .collect()
-    }
-
-    fn idea_project(&self, address: &Address, _cx: &App) -> Option<IdeaProject> {
-        let project = self.project_root(self.thread_of(address)?)?;
-        self.idea_project_at(project)
-    }
-
-    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
-        self.idea_project_at(self.last_project?)
-    }
-
-    fn idea_project_hosts(&self, _cx: &App) -> Vec<(EndpointId, String)> {
-        self.hosts()
-    }
-
-    fn create_idea_project(
-        &mut self,
-        project: NewIdeaProject,
-        created: ProjectCreated,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.entity();
-        let frame = self.frame.clone();
-        frame.with(cx, move |frame, window, cx| {
-            Self::prompt_project(this, project, Some(created), frame, window, cx);
-        });
-    }
-
-    fn send_idea(&mut self, mail: IdeaMail, cx: &mut Context<Self>) {
-        let Some(project) = self.thread_of(&mail.project) else {
-            return;
-        };
-        if self.outbox.contains(mail.client_id) {
-            return;
-        }
-        let outgoing = Outgoing {
-            at: UnixMs::now(),
-            parent: Some(project.message),
-            failed_start: None,
-            settles: None,
-            mentions: Vec::new(),
-            content: vec![ContentPart::Text {
-                text: mail.text.trim().to_owned(),
-            }],
-            delivery: Delivery::Idea,
-            runtime: mail.runtime,
-            state: OutgoingState::Queued,
-        };
-        let (_, kept) = self.outbox.keep(project.host, mail.client_id, outgoing);
-        self.keep_outgoing(project.host, Some(project.message), kept, cx);
+    fn project(&self, address: &Address, _cx: &App) -> Option<Project> {
+        let project = self.idea_project_of(address)?;
+        Some(Project {
+            address: project.thread.address(),
+            name: project.name,
+        })
     }
 
     fn text_sources(&self, search: &mut TextSearch, current: &Address, _cx: &App) {
@@ -1302,8 +1281,7 @@ mod tests {
                         project: ThreadId {
                             host: endpoint,
                             message: project,
-                        }
-                        .address(),
+                        },
                         text: title.into(),
                         runtime: None,
                     },
@@ -1392,15 +1370,14 @@ mod tests {
         let address = ThreadId {
             host: endpoint,
             message: project,
-        }
-        .address();
+        };
         let runtime = rho_agent_types::RuntimeLabel::parse("sol-high").unwrap();
         cx.update(|cx| {
             mail.update(cx, |mail, cx| {
                 mail.send_idea(
                     IdeaMail {
                         client_id: id.0,
-                        project: address.clone(),
+                        project: address,
                         text: title.into(),
                         runtime: Some(runtime.clone()),
                     },

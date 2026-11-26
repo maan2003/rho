@@ -41,7 +41,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 ### 3. `rho-frame` is a god object that also owns chat's idea composer, and the `System` trait carries chat-only hooks (structure)
 - **Kind:** code
 - **Level:** high-level (reverse)
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/wc4-frame-idea-split`: the idea is a `rho-chat` surface at `chat:idea` whose draft persists beside the thread drafts; the six `idea_*` hooks became one `System::project`; `draft.rs` is `rho_window::draft`. `deal`/`attention` stay in `Frame`)
 - **Where:** `chat.Write an idea`, `window.*`, `desk.*`, `deal.*`, `hosts.*`
 - **Evidence:**
   - `Frame` has 25 fields (`crates/rho-frame/src/frame.rs:100-134`). They cover host connections and git questions, the ledger and pairing (`attention`), the dealer signals, history and the surface cache, Desk, the idea composer, the minibuffer, menu and echo, search, phone gestures, place persistence and cold return. `frame.rs` is 2,862 lines with 129 functions, and `rho-frame` is 13,090 lines. It implements five `product/` modules: `window`, `desk`, `deal`, `hosts` (approvals, pairing) and `chat.Write an idea`.

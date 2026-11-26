@@ -22,6 +22,7 @@ use theme::ActiveTheme as _;
 
 use crate::attention::Verdict;
 use crate::frame::{Frame, snooze_rows};
+use crate::keys;
 use crate::menu::{Pick, Row, Rows};
 use crate::surface::{AnySurface, PhoneSend};
 
@@ -333,7 +334,7 @@ enum OpenCard {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BarState {
     prompting: bool,
-    composing_idea: bool,
+    composing: bool,
     desk: bool,
     /// A waiting card is open.
     card: Option<OpenCard>,
@@ -350,8 +351,7 @@ fn buttons(state: BarState) -> Vec<Button> {
             prompting: true, ..
         } => vec![Cancel, Enter],
         BarState {
-            composing_idea: true,
-            ..
+            composing: true, ..
         } => vec![Cancel, Send],
         BarState { desk: true, .. } => vec![Menu, Open, More],
         BarState {
@@ -605,7 +605,6 @@ impl Frame {
             || !self.desk_in_view()
             || self.minibuffer.is_some()
             || self.menu.is_some()
-            || self.idea_in_view()
             || self.phone.snap.is_some()
         {
             return;
@@ -632,15 +631,15 @@ impl Frame {
         let send = surface.phone_send(cx);
         let prompting = self.minibuffer.is_some();
         let typing = self.mode(window, cx).contains("insert");
-        let composing_idea = self.idea_in_view();
-        let mut tools = if prompting || composing_idea {
+        let composing = surface.composes(cx);
+        let mut tools = if prompting || composing {
             Vec::new()
         } else {
             surface.phone_tools(typing, cx)
         };
         let state = BarState {
             prompting,
-            composing_idea,
+            composing,
             desk: self.desk_in_view(),
             // Working in a terminal or shell keeps the navigation bar and
             // its Palette; that still offers the same related verdicts.
@@ -773,8 +772,8 @@ impl Frame {
                     .row(Row::run("b", "back", |frame, window, cx| {
                         frame.back(window, cx)
                     }))
-                    .row(Row::run("i", "write an idea", |frame, window, cx| {
-                        frame.prompt_idea(window, cx)
+                    .row(Row::run("i", "write an idea", |_, window, cx| {
+                        window.dispatch_action(Box::new(keys::PromptIdea), cx)
                     }))
                     .row(Row::run("u", "undo", |frame, window, cx| {
                         frame.undo_verdict(window, cx)
@@ -789,15 +788,12 @@ impl Frame {
                     });
                 }
             }
-            Button::Send if self.idea_in_view() => self.send_idea(window, cx),
             Button::Send => {
                 if let Some(send) = send {
                     send(window, cx);
                 }
             }
-            Button::Cancel if self.idea_in_view() && self.minibuffer.is_none() => {
-                self.cancel_idea(window, cx)
-            }
+            Button::Cancel if self.minibuffer.is_none() => self.close_current(window, cx),
             Button::Cancel => self.minibuffer_cancel(window, cx),
             Button::Enter => self.minibuffer_confirm(window, cx),
         }
@@ -1094,7 +1090,7 @@ mod tests {
         assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
         assert_eq!(
             buttons(BarState {
-                composing_idea: true,
+                composing: true,
                 ..thread
             }),
             [Cancel, Send]

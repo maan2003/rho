@@ -182,6 +182,13 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
+    /// Whether the surface is a draft that fills the window, such as an
+    /// idea: the phone's bar then offers only Cancel, which closes it, and
+    /// Send.
+    fn composes(&self, _cx: &App) -> bool {
+        false
+    }
+
     /// The surface's own rows for the palette, for what is in view.
     fn rows(
         &mut self,
@@ -212,6 +219,7 @@ trait SurfaceHandle {
     fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
     fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
+    fn composes(&self, cx: &App) -> bool;
 }
 
 impl<S: Surface> SurfaceHandle for Entity<S> {
@@ -287,6 +295,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
         self.update(cx, |surface, cx| surface.phone_send(cx))
+    }
+
+    fn composes(&self, cx: &App) -> bool {
+        self.read(cx).composes(cx)
     }
 }
 
@@ -375,6 +387,10 @@ impl AnySurface {
 
     pub(crate) fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
         self.0.phone_send(cx)
+    }
+
+    pub(crate) fn composes(&self, cx: &App) -> bool {
+        self.0.composes(cx)
     }
 
     pub fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row> {

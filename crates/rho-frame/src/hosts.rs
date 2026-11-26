@@ -227,7 +227,7 @@ impl Frame {
     /// has the keys: then it waits for them to close. Says whether the
     /// question is now asked.
     pub(crate) fn ask_next(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> bool {
-        if self.minibuffer.is_some() || self.menu.is_some() {
+        if self.is_asking() {
             return false;
         }
         // A host that stopped waiting has nobody to answer.

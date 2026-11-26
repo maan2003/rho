@@ -230,10 +230,10 @@ fn run() -> Result<()> {
                 });
                 let agents = cx
                     .new(|cx| rho_agents_view::AgentsSystem::new(chat.clone(), frame.clone(), cx));
-                // Chat ranks a thread by the agents still in it and by
-                // the stops they are in, and names them with what they do;
-                // the agents system knows all of it, and a thread on screen
-                // reads again when it moves.
+                // A thread names the agents that wrote in it, and steers
+                // its draft to the one agent still working in it; the
+                // agents system knows which agents exist and what they are
+                // called, and a thread on screen reads again when it moves.
                 let participants = agents.downgrade();
                 chat.update(cx, |chat, cx| {
                     chat.set_participants(Rc::new(move |endpoint, agent, cx| {

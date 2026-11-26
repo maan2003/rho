@@ -27,10 +27,8 @@
 pub mod attention;
 pub mod deal;
 mod desk;
-pub mod draft;
 pub mod frame;
 pub mod hosts;
-pub mod idea;
 pub mod keys;
 pub mod link;
 pub mod menu;
@@ -57,7 +55,7 @@ pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, CardHere, Mode, PhoneTool, Subject, Surface};
 pub use system::{
-    AnySystem, Found, FoundText, FoundThread, Opening, SearchPoint, System, TextPresenter,
+    AnySystem, Found, FoundText, FoundThread, Opening, Project, SearchPoint, System, TextPresenter,
 };
 pub use text_search::{TextHit, TextIndex, TextKind, TextSearch, TextTarget};
 

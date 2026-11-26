@@ -17,6 +17,7 @@ use rho_agent_types::{
     content_text,
 };
 use rho_db::{RhoDb, Sen, SenValue};
+use senax_encoder::{Decode, Encode};
 
 use crate::ThreadId;
 use crate::outbox::{Kept, Outgoing};
@@ -34,6 +35,29 @@ const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new
 /// and the parent's id (zero for a root). Sending moves it to the outbox.
 const LAST_PROJECT: TableDefinition<(), (Host, u64)> = TableDefinition::new("chat_last_project_v1");
 const DRAFTS: TableDefinition<(Host, u64), &str> = TableDefinition::new("chat3_draft");
+/// The idea being written on this device ([`IdeaDraft`]); no row when none
+/// is.
+const IDEA: TableDefinition<(), Sen<IdeaDraft>> = TableDefinition::new("chat_idea_draft_v1");
+/// Where the frame kept the idea draft before chat did. Temporary: moved
+/// into [`IDEA`] when the copy opens, until every device has run this
+/// build (`temp-migration`).
+const FRAME_IDEA_V1: TableDefinition<(), (&str, &str)> =
+    TableDefinition::new("gui_frame_idea_draft_v1");
+const FRAME_IDEA_V2: TableDefinition<(), Sen<Option<IdeaDraft>>> =
+    TableDefinition::new("gui_frame_idea_draft_v2");
+
+/// The idea the user is writing (`chat.Write an idea`): its words and its
+/// `to:` and `on:` lines as written, kept until it is sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct IdeaDraft {
+    /// The address of the project chosen on the `to:` line, while that
+    /// line still names it.
+    pub address: Option<String>,
+    pub recipient: String,
+    /// The `on:` line, when it overrides the project's runtime.
+    pub runtime: Option<String>,
+    pub text: String,
+}
 
 /// What the copy holds when a client starts.
 #[derive(Debug, Default, PartialEq)]
@@ -43,6 +67,7 @@ pub struct Loaded {
     pub outbox: Vec<(EndpointId, u64, Outgoing)>,
     pub last_project: Option<ThreadId>,
     pub drafts: Vec<(EndpointId, Option<MessageId>, String)>,
+    pub idea: Option<IdeaDraft>,
 }
 
 enum Write {
@@ -56,6 +81,7 @@ enum Write {
     Reset(Host),
     Outbox(Host, Kept, Option<MessageId>),
     Draft(Host, Option<MessageId>, String),
+    Idea(Option<IdeaDraft>),
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -129,6 +155,7 @@ impl Cache {
     /// touches the copy's and nothing else.
     pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let frame_idea = frame_idea_draft(&db);
         runtime.block_on(async {
             let mut write = db.write().await;
             // Older clients cannot decode live revisions or the new stop.
@@ -143,6 +170,15 @@ impl Cache {
             write.open_table(OUTBOX);
             write.open_table(DRAFTS);
             write.open_table(LAST_PROJECT);
+            let mut idea = write.open_table(IDEA);
+            if let Some(draft) = frame_idea
+                && idea.get(()).is_none()
+            {
+                idea.insert((), SenValue::borrowed(&draft));
+            }
+            drop(idea);
+            write.delete_table(FRAME_IDEA_V1.name());
+            write.delete_table(FRAME_IDEA_V2.name());
             write.commit();
         });
         let (sender, receiver) = mpsc::channel();
@@ -192,6 +228,10 @@ impl Cache {
                     )
                 })
                 .collect(),
+            idea: read
+                .open_table(IDEA)
+                .get(())
+                .map(|row| row.value().into_owned()),
         }
     }
 
@@ -289,6 +329,11 @@ impl Cache {
     /// A draft as it stands; empty drops it.
     pub fn write_draft(&self, host: EndpointId, parent: Option<MessageId>, text: String) {
         self.send(Write::Draft(host.0, parent, text));
+    }
+
+    /// The idea as it stands; `None` once it is sent or cleared.
+    pub fn write_idea(&self, draft: Option<IdeaDraft>) {
+        self.send(Write::Idea(draft));
     }
 
     /// Waits until everything sent so far is committed.
@@ -401,8 +446,36 @@ fn apply(
                 drafts.insert(key, text.as_str());
             }
         }
+        Write::Idea(Some(draft)) => {
+            transaction
+                .open_table(IDEA)
+                .insert((), SenValue::borrowed(&draft));
+        }
+        Write::Idea(None) => {
+            transaction.open_table(IDEA).remove(());
+        }
         Write::Flush(done) => flushed.push(done),
     }
+}
+
+/// The unsent idea the frame kept, if this device has not yet moved it. A
+/// written `gui_frame_idea_draft_v2`, even an empty one, replaced v1.
+fn frame_idea_draft(db: &RhoDb) -> Option<IdeaDraft> {
+    let read = db.read();
+    if read.has_table(FRAME_IDEA_V2.name()) {
+        return read.open_table(FRAME_IDEA_V2).get(())?.value().into_owned();
+    }
+    if !read.has_table(FRAME_IDEA_V1.name()) {
+        return None;
+    }
+    let table = read.open_table(FRAME_IDEA_V1);
+    let row = table.get(())?;
+    let (address, text) = row.value();
+    Some(IdeaDraft {
+        address: Some(address.to_owned()),
+        text: text.to_owned(),
+        ..IdeaDraft::default()
+    })
 }
 
 #[cfg(test)]
@@ -512,6 +585,57 @@ mod tests {
         );
     }
 
+    /// The idea draft the frame kept moves into the copy once, as written.
+    /// An empty v2 row means the user sent the idea, so the v1 draft it
+    /// replaced never comes back.
+    #[test]
+    fn the_frames_unsent_idea_moves_into_the_copy_once() {
+        let written = IdeaDraft {
+            address: Some("thread:lab/1".into()),
+            recipient: "tide@lab".into(),
+            runtime: Some("sol-high".into()),
+            text: "Check the tide\nand the moon".into(),
+        };
+        let v1_only = IdeaDraft {
+            address: Some("thread:lab/9".into()),
+            text: "An older thought".into(),
+            ..IdeaDraft::default()
+        };
+        for (v2, expected) in [
+            (Some(Some(written.clone())), Some(written.clone())),
+            (Some(None), None),
+            (None, Some(v1_only.clone())),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = rho_db::client::open(dir.path()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut write = db.write().await;
+                    write
+                        .open_table(FRAME_IDEA_V1)
+                        .insert((), ("thread:lab/9", "An older thought"));
+                    if let Some(v2) = &v2 {
+                        write
+                            .open_table(FRAME_IDEA_V2)
+                            .insert((), SenValue::borrowed(v2));
+                    }
+                    write.commit();
+                });
+            let cache = Cache::open_on(db.clone()).unwrap();
+            assert_eq!(cache.load().idea, expected, "{v2:?}");
+            let read = db.read();
+            assert!(!read.has_table(FRAME_IDEA_V1.name()));
+            assert!(!read.has_table(FRAME_IDEA_V2.name()));
+            drop(read);
+            // What is written after the move is what the next start reads.
+            cache.write_idea(None);
+            drop(cache);
+            assert_eq!(Cache::open_on(db).unwrap().load().idea, None);
+        }
+    }
+
     /// The log, cursor, outbox and drafts come back as written; a reset
     /// drops one host's log and cursor and leaves the other's.
     #[test]
@@ -545,9 +669,17 @@ mod tests {
         cache.write_draft(H1, None, "a root".into());
         cache.write_draft(H1, Some(MessageId(ChatSeq(2))), "under two".into());
         cache.write_draft(H1, Some(MessageId(ChatSeq(2))), String::new());
+        let idea = IdeaDraft {
+            address: None,
+            recipient: "tide@".into(),
+            runtime: Some("sol-high".into()),
+            text: "Check the tide".into(),
+        };
+        cache.write_idea(Some(idea.clone()));
         cache.flush();
 
         let loaded = cache.load();
+        assert_eq!(loaded.idea, Some(idea), "an idea with no project yet");
         let mut cursors = loaded.cursors.clone();
         cursors.sort();
         assert_eq!(cursors, [(H1, ChatSeq(3)), (H2, ChatSeq(1))]);

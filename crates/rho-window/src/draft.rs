@@ -1,5 +1,6 @@
 //! One editor with a writable draft above read-only history, each in an
-//! excerpt of its own.
+//! excerpt of its own (`window.Edge-stuck excerpt`): the draft stays at the
+//! top edge while the reader is in the history below it.
 
 use editor::{Anchor, Bias, Editor, HighlightKey, Inlay, StuckEdge};
 use gpui::{App, AppContext as _, Context, Entity, Focusable, Pixels, Window};
@@ -50,7 +51,7 @@ pub fn stick(editor: &mut Editor, notice: gpui::SharedString, cx: &mut Context<E
         draft_path(),
         StuckEdge::Top,
         notice,
-        rho_window::style::command_strip_background,
+        crate::style::command_strip_background,
         cx,
     );
 }
@@ -101,20 +102,16 @@ pub fn style(
         cx,
     );
     editor.highlight_text(
-        HighlightKey::SyntaxTreeView(rho_window::style::PROMPT_DRAFT_HIGHLIGHT_KEY),
+        HighlightKey::SyntaxTreeView(crate::style::PROMPT_DRAFT_HIGHLIGHT_KEY),
         if empty {
             Vec::new()
         } else {
             vec![range.clone()]
         },
-        rho_window::style::StyleClass::UserMessage.resolve(cx),
+        crate::style::StyleClass::UserMessage.resolve(cx),
         cx,
     );
-    editor.highlight_gutter::<DraftGutter>(
-        vec![range],
-        rho_window::style::user_prompt_gutter_color,
-        cx,
-    );
+    editor.highlight_gutter::<DraftGutter>(vec![range], crate::style::user_prompt_gutter_color, cx);
 }
 
 /// Where a pointer landed: in the draft, or on the blank line that

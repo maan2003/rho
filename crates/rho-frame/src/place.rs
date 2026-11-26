@@ -20,18 +20,6 @@ use crate::frame::ScreenEntry;
 
 const PLACE: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_place_v1");
 const LAST_INPUT: TableDefinition<(), i64> = TableDefinition::new("gui_frame_last_input_v1");
-const IDEA_DRAFT_V1: TableDefinition<(), (&str, &str)> =
-    TableDefinition::new("gui_frame_idea_draft_v1");
-const IDEA_DRAFT: TableDefinition<(), Sen<Option<IdeaDraft>>> =
-    TableDefinition::new("gui_frame_idea_draft_v2");
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct IdeaDraft {
-    pub address: Option<String>,
-    pub recipient: String,
-    pub runtime: Option<String>,
-    pub text: String,
-}
 
 /// `desk.a cold return opens the desk`: exactly ten minutes is still warm.
 pub(crate) const COLD_RETURN: std::time::Duration = std::time::Duration::from_secs(600);
@@ -50,26 +38,6 @@ pub(crate) fn last_input(db: &RhoDb) -> Option<Timestamp> {
     }
     let millis = read.open_table(LAST_INPUT).get(())?.value();
     Timestamp::from_millisecond(millis).ok()
-}
-
-pub(crate) fn idea_draft(db: &RhoDb) -> Option<IdeaDraft> {
-    let read = db.read();
-    if read.has_table(IDEA_DRAFT.name()) {
-        return read.open_table(IDEA_DRAFT).get(())?.value().into_owned();
-    }
-    // The previous editor could save only drafts bound to an address.
-    if !read.has_table(IDEA_DRAFT_V1.name()) {
-        return None;
-    }
-    let table = read.open_table(IDEA_DRAFT_V1);
-    let value = table.get(())?;
-    let (address, text) = value.value();
-    Some(IdeaDraft {
-        address: Some(address.to_owned()),
-        recipient: String::new(),
-        runtime: None,
-        text: text.to_owned(),
-    })
 }
 
 /// The history as written down: every screen, oldest first, and which of
@@ -200,7 +168,6 @@ pub(crate) fn return_history(
 pub(crate) enum Write {
     Place(Saved),
     Input(Timestamp),
-    IdeaDraft(Option<IdeaDraft>),
 }
 
 /// Saves the most recent update of each kind without waiting for disk in
@@ -219,12 +186,10 @@ impl Writer {
                 while let Ok(first) = receiver.recv() {
                     let mut place = None;
                     let mut input = None;
-                    let mut draft = None;
                     for write in std::iter::once(first).chain(receiver.try_iter()) {
                         match write {
                             Write::Place(value) => place = Some(value),
                             Write::Input(value) => input = Some(value),
-                            Write::IdeaDraft(value) => draft = Some(value),
                         }
                     }
                     futures::executor::block_on(async {
@@ -238,11 +203,6 @@ impl Writer {
                             write
                                 .open_table(LAST_INPUT)
                                 .insert((), input.as_millisecond());
-                        }
-                        if let Some(draft) = draft {
-                            write
-                                .open_table(IDEA_DRAFT)
-                                .insert((), SenValue::borrowed(&draft));
                         }
                         write.commit();
                     })
@@ -463,64 +423,13 @@ mod tests {
     }
 
     #[test]
-    fn an_old_addressed_draft_is_kept_until_replaced_and_never_reappears_after_sending() {
-        let db = RhoDb::in_memory();
-        futures::executor::block_on(async {
-            let mut write = db.write().await;
-            write
-                .open_table(IDEA_DRAFT_V1)
-                .insert((), ("thread:tide", "Check the tide"));
-            write.commit();
-        });
-        assert_eq!(
-            idea_draft(&db),
-            Some(IdeaDraft {
-                address: Some("thread:tide".into()),
-                recipient: String::new(),
-                runtime: None,
-                text: "Check the tide".into(),
-            })
-        );
-        let writer = Writer::spawn(db.clone());
-        writer.write(Write::IdeaDraft(None));
-        drop(writer);
-        assert_eq!(idea_draft(&db), None);
-        assert_eq!(
-            db.read()
-                .open_table(IDEA_DRAFT_V1)
-                .get(())
-                .unwrap()
-                .value()
-                .1,
-            "Check the tide"
-        );
-    }
-
-    #[test]
-    fn input_and_the_unsent_idea_are_written_independently_of_navigation() {
+    fn input_is_written_independently_of_navigation() {
         let db = RhoDb::in_memory();
         let at: Timestamp = "2026-11-20T12:09:59.999Z".parse().unwrap();
         let writer = Writer::spawn(db.clone());
-        let draft = IdeaDraft {
-            address: None,
-            recipient: "tide@".into(),
-            runtime: Some("sol-high".into()),
-            text: "Check the tide".into(),
-        };
-        writer.write(Write::IdeaDraft(Some(draft.clone())));
         writer.write(Write::Input(at));
         drop(writer);
         assert_eq!(last_input(&db), Some(at));
-        assert_eq!(idea_draft(&db), Some(draft));
         assert!(Saved::load(&db).is_none(), "typing did not move the stack");
-        let writer = Writer::spawn(db.clone());
-        writer.write(Write::IdeaDraft(None));
-        drop(writer);
-        assert_eq!(idea_draft(&db), None);
-        assert_eq!(
-            last_input(&db),
-            Some(at),
-            "sending a draft is not a write of navigation"
-        );
     }
 }

@@ -11,8 +11,8 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div};
 use language::{Buffer, BufferEvent, Capability};
 use multi_buffer::{Anchor, MultiBuffer};
-use rho_frame::draft::focus_writing_at;
 use rho_frame::{FrameLink, Surface, phone_editor_tap};
+use rho_window::draft::focus_writing_at;
 use theme::ActiveTheme as _;
 
 use crate::{NoteId, NoteSystem, title_of};

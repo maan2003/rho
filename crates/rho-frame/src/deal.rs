@@ -20,6 +20,7 @@ use crate::attention::{Takeback, Undo, Verdict, Write};
 use crate::desk::desk_rows;
 use crate::frame::Frame;
 use crate::phone::Layout;
+use crate::system::Project;
 use crate::when::{SnoozeUnit, snooze_said, snooze_target};
 
 /// What the echo line says when a pull finds nothing to deal.
@@ -62,6 +63,14 @@ impl Frame {
             .iter()
             .find(|system| system.opens(address, cx))
             .and_then(|system| system.name(address, &self.attention.marks, cx))
+    }
+
+    /// The project `address` is in, or is, from the system that keeps
+    /// projects.
+    pub(crate) fn project_of(&self, address: &Address, cx: &gpui::App) -> Option<Project> {
+        self.systems
+            .iter()
+            .find_map(|system| system.project(address, cx))
     }
 
     /// The screen that shows `address` as one of its lines, from the
@@ -486,7 +495,7 @@ impl Frame {
     pub(crate) fn refresh_desk(&mut self, hand: &Hand, hold: bool, cx: &mut Context<Self>) {
         let rows = desk_rows(
             hand,
-            |address| self.project_for(address, cx).map(|(_, project)| project),
+            |address| self.project_of(address, cx),
             |address| {
                 self.systems
                     .iter()

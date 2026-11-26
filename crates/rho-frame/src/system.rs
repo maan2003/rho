@@ -3,8 +3,8 @@
 //! A system owns a few kinds of address and everything about them: the
 //! surfaces that open them, the rows a menu offers over them, what of
 //! them wants the user, the status changes the desk lists, what `find` finds,
-//! and the streams it keeps to each host. The frame holds systems as a list and
-//! asks each in turn; a system never names another.
+//! and the streams it keeps to each host. The frame holds systems as a list,
+//! asks each in turn, and names none of them.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -19,7 +19,6 @@ use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
 use crate::frame::Point;
-use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 use crate::text_search::{TextHit, TextSearch};
@@ -55,6 +54,15 @@ pub struct Found {
     /// When it last moved, for ordering unvisited places; zero when nothing
     /// says.
     pub recency: u64,
+}
+
+/// A project as the window shows it beside the places under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    /// The project's own address, as the palette lists it.
+    pub address: Address,
+    /// What the user calls it, such as `tide@lab`.
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,31 +170,12 @@ pub trait System: Sized + 'static {
         None
     }
 
-    fn idea_projects(&self, _cx: &App) -> Vec<IdeaProject> {
-        Vec::new()
-    }
-
-    fn idea_project(&self, _address: &Address, _cx: &App) -> Option<IdeaProject> {
+    /// The project `address` is in, or is: Desk keeps a project's stops
+    /// on one row, and choosing a project in the palette narrows the
+    /// palette to its threads.
+    fn project(&self, _address: &Address, _cx: &App) -> Option<Project> {
         None
     }
-
-    fn last_idea_project(&self, _cx: &App) -> Option<IdeaProject> {
-        None
-    }
-
-    fn idea_project_hosts(&self, _cx: &App) -> Vec<(EndpointId, String)> {
-        Vec::new()
-    }
-
-    fn create_idea_project(
-        &mut self,
-        _project: NewIdeaProject,
-        _created: ProjectCreated,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn send_idea(&mut self, _mail: IdeaMail, _cx: &mut Context<Self>) {}
 
     /// Every place of the system's that the palette lists by title. The
     /// frame joins them with the current hand and visit history.
@@ -236,17 +225,7 @@ trait SystemHandle {
 
     fn desk_context(&self, address: &Address, cx: &App) -> Option<String>;
 
-    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject>;
-
-    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject>;
-
-    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject>;
-
-    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)>;
-    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App);
-
-    fn send_idea(&self, mail: IdeaMail, cx: &mut App);
-
+    fn project(&self, address: &Address, cx: &App) -> Option<Project>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
     fn text_sources(&self, search: &mut TextSearch, current: &Address, cx: &App);
@@ -321,30 +300,8 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).desk_context(address, cx)
     }
 
-    fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
-        self.read(cx).idea_projects(cx)
-    }
-
-    fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
-        self.read(cx).idea_project(address, cx)
-    }
-
-    fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
-        self.read(cx).last_idea_project(cx)
-    }
-
-    fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
-        self.read(cx).idea_project_hosts(cx)
-    }
-
-    fn create_idea_project(&self, project: NewIdeaProject, created: ProjectCreated, cx: &mut App) {
-        self.update(cx, |system, cx| {
-            system.create_idea_project(project, created, cx)
-        })
-    }
-
-    fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
-        self.update(cx, |system, cx| system.send_idea(mail, cx))
+    fn project(&self, address: &Address, cx: &App) -> Option<Project> {
+        self.read(cx).project(address, cx)
     }
 
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {
@@ -438,33 +395,8 @@ impl AnySystem {
         self.0.desk_context(address, cx)
     }
 
-    pub(crate) fn idea_projects(&self, cx: &App) -> Vec<IdeaProject> {
-        self.0.idea_projects(cx)
-    }
-
-    pub(crate) fn idea_project(&self, address: &Address, cx: &App) -> Option<IdeaProject> {
-        self.0.idea_project(address, cx)
-    }
-
-    pub(crate) fn last_idea_project(&self, cx: &App) -> Option<IdeaProject> {
-        self.0.last_idea_project(cx)
-    }
-
-    pub(crate) fn idea_project_hosts(&self, cx: &App) -> Vec<(EndpointId, String)> {
-        self.0.idea_project_hosts(cx)
-    }
-
-    pub(crate) fn create_idea_project(
-        &self,
-        project: NewIdeaProject,
-        created: ProjectCreated,
-        cx: &mut App,
-    ) {
-        self.0.create_idea_project(project, created, cx)
-    }
-
-    pub(crate) fn send_idea(&self, mail: IdeaMail, cx: &mut App) {
-        self.0.send_idea(mail, cx)
+    pub(crate) fn project(&self, address: &Address, cx: &App) -> Option<Project> {
+        self.0.project(address, cx)
     }
 
     pub fn find(&self, marks: &Marks, cx: &App) -> Vec<Found> {

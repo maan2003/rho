@@ -157,7 +157,7 @@ impl Surface for PendingIdea {
                 let Some(idea) = system.read(cx).refused_idea(id) else {
                     return;
                 };
-                if frame.write_idea_again(idea, window, cx) {
+                if super::idea::write_again(system.clone(), idea, frame, window, cx) {
                     system.update(cx, |system, cx| system.withdraw_refused_idea(id, cx));
                 }
             },

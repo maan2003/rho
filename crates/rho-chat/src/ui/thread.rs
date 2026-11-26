@@ -26,9 +26,10 @@ use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage};
-use rho_frame::{CardHere, Layout, Row, Subject, Surface, draft};
+use rho_frame::{CardHere, Layout, Row, Subject, Surface};
 use rho_notes::NoteId;
 use rho_transcript::{BlockLine, BlockSpec, Item, Transcript};
+use rho_window::draft;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
