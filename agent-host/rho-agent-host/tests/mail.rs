@@ -1305,6 +1305,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                                 endpoint: host,
                                 chat: &history,
                                 name: "local",
+                                names: &rho_chat::names::ProjectNames::default(),
                             },
                             &rho_dealer::Marks::default(),
                             jiff::Timestamp::now(),
