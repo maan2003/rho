@@ -160,6 +160,25 @@ pub fn transcript(agent: AgentId, rows: &[(Wpos, LogEvent)]) -> UiAgentState {
     TranscriptFold::new(agent, rows).state()
 }
 
+/// The row a block of the transcript came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Told {
+    /// What the agent said or did at this row: a rewind to before it
+    /// takes it back.
+    Said(Wpos),
+    /// A message, delivered or written at this row: it was sent, so no
+    /// rewind unsays it.
+    Sent(Wpos),
+}
+
+impl Told {
+    fn at(self) -> Wpos {
+        match self {
+            Self::Said(at) | Self::Sent(at) => at,
+        }
+    }
+}
+
 /// The transcript as a fold that takes one row at a time, so a row costs
 /// what it changes and never a walk of the whole transcript.
 #[derive(Clone, Debug)]
@@ -170,10 +189,10 @@ pub struct TranscriptFold {
     /// Shared with every state handed out, so a row costs the blocks it
     /// adds or changes and a state is a list of pointers.
     blocks: Vec<Arc<UiBlock>>,
-    /// The row each block came from, so a rewind drops exactly what was
-    /// told after it. `None` for a delivered message, which no rewind takes
-    /// back.
-    told_at: Vec<Option<Wpos>>,
+    /// The row each block came from: where it stands among the workset's
+    /// rows, and, so a rewind drops exactly what was told after it, whether
+    /// a rewind may take it back.
+    told_at: Vec<Told>,
     /// Blocks before this one came before the last request that answered.
     unanswered: usize,
     /// Compactions no request has carried yet; drawn after the blocks.
@@ -239,7 +258,7 @@ impl TranscriptFold {
         fold
     }
 
-    fn push(&mut self, told_at: Option<Wpos>, block: UiBlock) {
+    fn push(&mut self, told_at: Told, block: UiBlock) {
         self.after_error |= matches!(block, UiBlock::Failure { .. });
         // The same notice again, such as a retry failing as the last one
         // did, is counted on the one before.
@@ -436,7 +455,7 @@ impl TranscriptFold {
         let queue = std::mem::take(&mut self.queue);
         let compaction = !queue.is_empty();
         for (_, queued) in queue {
-            self.push(Some(pos), queued);
+            self.push(Told::Said(pos), queued);
         }
         compaction
     }
@@ -455,7 +474,7 @@ impl TranscriptFold {
 
     fn successful_response(&mut self, pos: Wpos) {
         if std::mem::take(&mut self.after_error) {
-            self.push(Some(pos), UiBlock::Responded);
+            self.push(Told::Said(pos), UiBlock::Responded);
         }
     }
 
@@ -489,7 +508,7 @@ impl TranscriptFold {
                         // A message is still a message: a rewind of the
                         // turn it started does not unsay what was written.
                         Some(message) => self.push(
-                            None,
+                            Told::Sent(pos),
                             UiBlock::Delivered {
                                 message,
                                 text: input.text.clone(),
@@ -497,7 +516,7 @@ impl TranscriptFold {
                         ),
                         // No message: what the policy has to tell the agent.
                         None => self.push(
-                            Some(pos),
+                            Told::Said(pos),
                             UiBlock::Notice {
                                 text: input.text.clone(),
                                 times: 1,
@@ -509,7 +528,7 @@ impl TranscriptFold {
                 // A requested compaction already shows as its request.
                 if *compaction && !requested {
                     self.push(
-                        Some(pos),
+                        Told::Said(pos),
                         UiBlock::Notice {
                             text: "compacting context".to_owned(),
                             times: 1,
@@ -524,7 +543,7 @@ impl TranscriptFold {
                 message, version, ..
             } => {
                 self.push(
-                    None,
+                    Told::Sent(pos),
                     UiBlock::MailWritten {
                         message: *message,
                         version: *version,
@@ -559,11 +578,11 @@ impl TranscriptFold {
                     if let UiBlock::Tool(tool) = &mut block {
                         tool.started_at = Some(*at);
                     }
-                    self.push(Some(pos), block);
+                    self.push(Told::Said(pos), block);
                 }
                 if *compacted {
                     self.push(
-                        Some(pos),
+                        Told::Said(pos),
                         UiBlock::Notice {
                             text: "compacted".to_owned(),
                             times: 1,
@@ -577,7 +596,7 @@ impl TranscriptFold {
                     self.successful_response(pos);
                 }
                 self.push(
-                    Some(pos),
+                    Told::Said(pos),
                     match speaker {
                         Speaker::Assistant => UiBlock::AssistantMessage {
                             text: text.clone(),
@@ -592,7 +611,7 @@ impl TranscriptFold {
             LogEvent::Cancelled { .. } => {
                 self.cancel_running();
                 self.push(
-                    Some(pos),
+                    Told::Said(pos),
                     UiBlock::Notice {
                         text: "you cancelled the request".to_owned(),
                         times: 1,
@@ -604,7 +623,7 @@ impl TranscriptFold {
                 // A call the agent never answered is over too.
                 self.cancel_running();
                 self.push(
-                    Some(pos),
+                    Told::Said(pos),
                     UiBlock::Failure {
                         kind: FailureKind::Stopped,
                         text: error.clone(),
@@ -626,7 +645,7 @@ impl TranscriptFold {
             } => {
                 if !text.is_empty() {
                     self.push(
-                        Some(pos),
+                        Told::Said(pos),
                         UiBlock::AssistantMessage {
                             text: text.clone(),
                             phase: None,
@@ -635,7 +654,7 @@ impl TranscriptFold {
                 }
                 if *retrying {
                     self.push(
-                        Some(pos),
+                        Told::Said(pos),
                         UiBlock::Failure {
                             kind: FailureKind::Retrying {
                                 runtime: self.runtime_label.clone(),
@@ -655,7 +674,7 @@ impl TranscriptFold {
                 self.touch(0);
                 self.unanswered = 0;
 
-                let undone = |told: &Option<Wpos>| told.is_some_and(|told| told >= *to);
+                let undone = |told: &Told| matches!(told, Told::Said(told) if told >= to);
                 let blocks = std::mem::take(&mut self.blocks);
                 let told_at = std::mem::take(&mut self.told_at);
                 for (block, told) in blocks.into_iter().zip(told_at) {
@@ -681,6 +700,19 @@ impl TranscriptFold {
                 self.runtime_label = Some(spec.runtime_label());
             }
             LogEvent::WorksetCreated { .. } | LogEvent::Evaluated { .. } => {}
+        }
+    }
+
+    /// The workset row block `index` of [`Self::state`] came from, which
+    /// orders it among the rows of the workset's other agents. A queued
+    /// compaction stands where it was asked for.
+    pub fn position(&self, index: usize) -> Option<Wpos> {
+        match self.told_at.get(index) {
+            Some(told) => Some(told.at()),
+            None => self
+                .queue
+                .get(index - self.told_at.len())
+                .map(|(queued_at, _)| *queued_at),
         }
     }
 

@@ -26,7 +26,9 @@ pub(crate) enum Label {
 impl Label {
     pub(crate) fn for_block(block: &UiBlock) -> Option<Self> {
         match block {
-            UiBlock::MessageDraft { from, .. } => Some(Self::Agent(*from)),
+            UiBlock::MessageDraft { from, .. } | UiBlock::AgentHeading { agent: from } => {
+                Some(Self::Agent(*from))
+            }
             UiBlock::MailWritten { message, version } => Some(Self::Write(*message, *version)),
             UiBlock::Delivered { message, .. } => Some(Self::Delivery(*message)),
             _ => None,
@@ -137,6 +139,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         },
         UiBlock::Reasoning { .. }
         | UiBlock::MessageDraft { .. }
+        | UiBlock::AgentHeading { .. }
         | UiBlock::Tool(_)
         | UiBlock::MailWritten { .. }
         | UiBlock::Notice { .. }
@@ -154,7 +157,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
 pub fn block_visible(block: &UiBlock) -> bool {
     match block {
         UiBlock::Reasoning { .. } | UiBlock::Responded => false,
-        UiBlock::Tool(_) | UiBlock::MailWritten { .. } | UiBlock::Failure { .. } => true,
+        UiBlock::Tool(_)
+        | UiBlock::MailWritten { .. }
+        | UiBlock::Failure { .. }
+        | UiBlock::AgentHeading { .. } => true,
         UiBlock::UserMessage { text }
         | UiBlock::AssistantMessage { text, .. }
         | UiBlock::MessageDraft { text, .. }
@@ -360,6 +366,16 @@ fn render_labelled(
                 text.push('\n');
             }
             spans.push(Span::new(text, StyleClass::Default));
+        }
+        // Whose work follows, set off from the work before it.
+        UiBlock::AgentHeading { agent } => {
+            if prev.is_some() {
+                spans.push(Span::new("\n", StyleClass::Default));
+            }
+            spans.push(Span::new(
+                format!("{}\n", label(Label::Agent(*agent))),
+                StyleClass::AgentLabel,
+            ));
         }
         UiBlock::Tool(tool) => {
             spans.extend(separator(prev, kind));

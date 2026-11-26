@@ -1,40 +1,38 @@
-//! The surface over one agent's transcript.
-
-use std::rc::Rc;
+//! The surface over a transcript: a workset's work, or one agent's of it
+//! ([`Scope`]).
 
 use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_types::{Activity, AgentId, Message, MessageId};
-use rho_agents_client::protocol::transcript::{RuntimeKind, RuntimeState};
-use rho_agents_client::protocol::worksets::{Cancel, RewindAgent, StopAgent};
-use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
-use rho_frame::{Addressed as _, Candidate, CardHere, Row, Subject, Surface};
+use rho_frame::{CardHere, Row, Subject, Surface};
 use rho_window::style::StyleClass;
 
-use super::AgentsSystem;
+use super::{AgentsSystem, Scope};
 use crate::agent_view::{AgentModel, AgentModelEvent};
 
 gpui::actions!(rho_agent, [NextError, PreviousError]);
 
 enum Inspect {
+    /// The agent's log is read until it holds the step that wrote the
+    /// message.
     Reading(Message),
     Ready(Message),
 }
 
-pub struct AgentSurface {
+pub struct TranscriptSurface {
     system: Entity<AgentsSystem>,
-    agent: AgentId,
+    scope: Scope,
     editor: Entity<Editor>,
     model: Entity<AgentModel>,
     inspect_mail: Option<Inspect>,
     default_landing: bool,
 }
 
-impl AgentSurface {
+impl TranscriptSurface {
     pub fn new(
         system: Entity<AgentsSystem>,
-        agent: AgentId,
+        scope: Scope,
         model: Entity<AgentModel>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -72,7 +70,7 @@ impl AgentSurface {
         .detach();
         Self {
             system,
-            agent,
+            scope,
             editor,
             model,
             inspect_mail: None,
@@ -80,51 +78,61 @@ impl AgentSurface {
         }
     }
 
+    /// The workset, then the agent the screen is narrowed to, then the
+    /// folder and runtime of the one it shows: `fern › eng-q9tz · ~/rho ·
+    /// opus-high`, or `fern › eng-q9tz › eng-ka35 · …` narrowed.
     fn title_with_folder(&self, compact: bool, cx: &App) -> String {
         let system = self.system.read(cx);
         let registry = system.registry();
-        let label = if compact {
-            registry.agent_id_label(self.agent)
-        } else {
-            registry.agent_display_label(self.agent)
+        let Some(named) = system.scope_name(self.scope) else {
+            return String::new();
         };
-        let title = registry
-            .host_of_agent(self.agent)
-            .map_or(label.clone(), |host| {
-                format!("{} › {label}", registry.host_name(host))
-            });
-        let title = registry
-            .working_directory(self.agent)
-            .map_or(title.clone(), |directory| {
-                let folder = if compact {
-                    directory.file_name().unwrap_or(directory.as_str())
-                } else {
-                    directory.as_str()
-                };
-                format!("{title} · {folder}")
-            });
-        registry
-            .agent_spec(self.agent)
-            .map_or(title.clone(), |spec| {
-                format!("{title} · {}", spec.runtime_label())
-            })
+        let label = |agent: AgentId| match compact {
+            true => registry.agent_id_label(agent),
+            false => registry.agent_display_label(agent),
+        };
+        let mut title = label(named.workset);
+        if let Some(host) = registry.host_of_agent(named.workset) {
+            title = format!("{} › {title}", registry.host_name(host));
+        }
+        if let Scope::Agent(agent) = self.scope {
+            title = format!("{title} › {}", label(agent));
+        }
+        if let Some(directory) = registry.working_directory(named.shown) {
+            let folder = match compact {
+                true => directory.file_name().unwrap_or(directory.as_str()),
+                false => directory.as_str(),
+            };
+            title = format!("{title} · {folder}");
+        }
+        match registry.agent_spec(named.shown) {
+            Some(spec) => format!("{title} · {}", spec.runtime_label()),
+            None => title,
+        }
     }
 
-    fn runtime(&self, cx: &App) -> Option<RuntimeState> {
-        self.system
-            .read(cx)
-            .registry()
-            .agent_facts(self.agent)
-            .runtime
-            .map(|heard| heard.state)
+    /// What the screen's agents are doing, the most pressing first: one
+    /// failing outweighs the rest working.
+    fn activity(&self, cx: &App) -> Option<Activity> {
+        let system = self.system.read(cx);
+        let (_, agents) = system.scope_agents(self.scope)?;
+        agents
+            .into_iter()
+            .filter_map(|agent| system.registry().agent_facts(agent).runtime)
+            .map(|heard| heard.state.activity())
+            .min_by_key(|activity| pressing(*activity))
     }
 
-    pub(super) fn inspect(&mut self, mail: Message, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .system
-            .read(cx)
-            .read_for_inspection(self.agent, mail.id)
-        {
+    /// Opens on the step that wrote `mail`, which `agent` wrote, once the
+    /// agent's log holds it.
+    pub(super) fn inspect(
+        &mut self,
+        agent: AgentId,
+        mail: Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.system.read(cx).read_for_inspection(agent, mail.id) {
             self.inspect_mail = Some(Inspect::Reading(mail));
         } else {
             self.inspect_mail = Some(Inspect::Ready(mail));
@@ -170,13 +178,12 @@ impl AgentSurface {
 
     fn land(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.land_at(
-            self.runtime(cx)
-                .is_some_and(|state| in_trouble(state.activity())),
+            self.activity(cx)
+                .is_some_and(|activity| pressing(activity) < pressing(Activity::Waiting)),
             window,
             cx,
         )
     }
-
     fn land_at(&self, trouble: bool, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
         let error = (trouble && model.current_errors() != 0)
@@ -249,7 +256,7 @@ impl AgentSurface {
     }
 }
 
-impl Surface for AgentSurface {
+impl Surface for TranscriptSurface {
     fn opened(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.read(cx).initial_load_ready() {
             self.land(window, cx);
@@ -263,26 +270,32 @@ impl Surface for AgentSurface {
     }
 
     fn phone_titles(&self, cx: &App) -> Vec<String> {
-        let registry = self.system.read(cx).registry();
-        let label = registry.agent_id_label(self.agent);
+        let system = self.system.read(cx);
+        let registry = system.registry();
+        let Some(named) = system.scope_name(self.scope) else {
+            return Vec::new();
+        };
+        let mut label = registry.agent_id_label(named.workset);
+        if let Scope::Agent(agent) = self.scope {
+            label = format!("{label} › {}", registry.agent_id_label(agent));
+        }
         let title = registry
-            .host_of_agent(self.agent)
+            .host_of_agent(named.workset)
             .map(|host| format!("{} › {label}", registry.host_name(host)));
         let full = self.title_with_folder(true, cx);
         let runtime = registry
-            .agent_spec(self.agent)
+            .agent_spec(named.shown)
             .map(|spec| spec.runtime_label());
-        let mut titles = Vec::new();
-        if let Some(runtime) = runtime {
-            titles.push(full);
-            titles.extend(title.iter().map(|title| format!("{title} · {runtime}")));
-            titles.push(format!("{label} · {runtime}"));
-        } else {
-            titles.push(full);
-            titles.extend(title);
+        let mut titles = vec![full];
+        match runtime {
+            Some(runtime) => {
+                titles.extend(title.iter().map(|title| format!("{title} · {runtime}")));
+                titles.push(format!("{label} · {runtime}"));
+            }
+            None => titles.extend(title),
         }
         titles.push(label);
-        if self.runtime(cx).is_some() {
+        if self.activity(cx).is_some() {
             for title in &mut titles {
                 title.push_str(" ·");
             }
@@ -303,7 +316,7 @@ impl Surface for AgentSurface {
     }
 
     fn status(&self, cx: &App) -> Option<String> {
-        let activity = self.runtime(cx)?.activity().word();
+        let activity = self.activity(cx)?.word();
         let errors = self.model.read(cx).current_errors();
         Some(match errors {
             0 => activity.to_owned(),
@@ -324,291 +337,37 @@ impl Surface for AgentSurface {
         CardHere::Inspected
     }
 
+    /// Every command about the work is the agents system's, from any
+    /// screen.
     fn rows(
         &mut self,
         _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Vec<Row> {
-        let agent = self.agent;
-        let mut rows = Vec::new();
-        let origin = self.system.read(cx).agent_thread(agent, cx);
-        if let Some(thread) = origin {
-            rows.push(Row::run(
-                "o",
-                "open its thread",
-                move |frame, window, cx| {
-                    frame.open(thread.address(), window, cx);
-                },
-            ));
-        }
-        rows
+        Vec::new()
     }
 }
 
-fn in_trouble(activity: Activity) -> bool {
-    matches!(activity, Activity::Retrying | Activity::Failed)
-}
-
-/// The rows that steer an agent, from any of its screens or from a thread
-/// it works in. Each carries the change to the agent's host.
-pub(crate) fn steer_rows(system: Entity<AgentsSystem>, agent: AgentId) -> Vec<Row> {
-    let eval = |description: &'static str,
-                key: &'static str,
-                code: Rc<dyn Fn(Option<u32>) -> String>,
-                done: fn(Option<u32>, &str) -> Option<String>| {
-        let system = system.clone();
-        Row::counted(key, description, move |_, count, _, cx| {
-            let code = code(count);
-            let label = system.read(cx).registry().agent_display_label(agent);
-            let done = done(count, &label);
-            system.update(cx, |system, cx| {
-                system.eval(agent, description, code, done, cx);
-            });
-        })
-    };
-    let rewind_system = system.clone();
-    let mut rows = vec![
-        Row::counted("r", "rewind turns", move |_, count, _, cx| {
-            let turns = count.unwrap_or(1);
-            let system = rewind_system.read(cx);
-            let frame = system.frame.clone();
-            let Some(agents) = system.agents_for(agent) else {
-                frame.echo(
-                    "the agent's host is not attached",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            };
-            let label = system.registry().agent_display_label(agent);
-            let reply = agents.call(RewindAgent { agent, turns });
-            cx.spawn(async move |_, cx| {
-                let result = reply.await;
-                cx.update(|cx| match result {
-                    Ok(undone) => frame.echo(
-                        rewound(&label, turns, &undone.taken_back),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                    Err(error) => frame.echo(
-                        format!("rewind turns: {error:#}"),
-                        StyleClass::SystemImportant,
-                        cx,
-                    ),
-                });
-            })
-            .detach();
-        }),
-        eval(
-            "compact context",
-            "c",
-            Rc::new(move |_| snippets::compact(agent)),
-            |_, label| Some(format!("compacted: {label}")),
-        ),
-        eval(
-            "new cache key",
-            "k",
-            Rc::new(move |_| snippets::new_cache_key(agent)),
-            |_, label| Some(format!("new cache key: {label}")),
-        ),
-    ];
-    // Read when chosen, not here: the palette asks for rows while this
-    // system is updating.
-    let runtime_system = system.clone();
-    rows.push(Row::run(
-        "shift-r",
-        "set runtime…",
-        move |frame, window, cx| {
-            let system = runtime_system.clone();
-            let (current, choices) = {
-                let system = system.read(cx);
-                let registry = system.registry();
-                let Some(spec) = registry.agent_spec(agent) else {
-                    frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                let current = spec.runtime_label();
-                let can_change_kind = registry
-                    .agent_facts(agent)
-                    .runtime
-                    .is_some_and(|heard| heard.state.may_change_runtime_kind);
-                let choices =
-                    switchable(spec.runtime, &current, can_change_kind).collect::<Vec<_>>();
-                (current, choices)
-            };
-            frame.open_prompt(
-                format!("runtime ({current}):"),
-                Rc::new(move |_, needle, _| {
-                    let needle = needle.to_ascii_lowercase();
-                    choices
-                        .iter()
-                        .filter(|runtime| runtime.contains(&needle))
-                        .map(|runtime| Candidate {
-                            value: runtime.clone(),
-                            description: String::new(),
-                        })
-                        .collect()
-                }),
-                Rc::new(move |frame, input, _, cx| {
-                    if input.trim().is_empty() {
-                        frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                    match snippets::parse_runtime(&input) {
-                        Ok(runtime) => system.update(cx, |system, cx| {
-                            system.eval(
-                                agent,
-                                "set runtime",
-                                snippets::set_runtime(agent, &runtime),
-                                Some(format!(
-                                    "runtime: {} · {} (was {current})",
-                                    system.registry().agent_display_label(agent),
-                                    runtime.label(),
-                                )),
-                                cx,
-                            );
-                        }),
-                        Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
-                    }
-                }),
-                window,
-                cx,
-            );
-        },
-    ));
-    let stop_system = system.clone();
-    rows.push(Row::run("s", "stop agent", move |_, _, cx| {
-        stop_system.update(cx, |system, cx| {
-            let Some(agents) = system.agents_for(agent) else {
-                system.frame.echo(
-                    "the agent's host is not attached",
-                    StyleClass::SystemImportant,
-                    cx,
-                );
-                return;
-            };
-            let reply = agents.call(StopAgent { agent });
-            let frame = system.frame.clone();
-            let label = system.registry().agent_display_label(agent);
-            cx.spawn(async move |_, cx| {
-                let reply = reply.await;
-                cx.update(|cx| match reply {
-                    Ok(()) => frame.echo(
-                        format!("stopped by you: {label}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                    Err(error) => frame.echo(
-                        format!("did not stop {label}: {error:#}"),
-                        StyleClass::SystemImportant,
-                        cx,
-                    ),
-                });
-            })
-            .detach();
-        });
-    }));
-    let cancel_system = system.clone();
-    rows.push(Row::run(
-        "shift-c",
-        "cancel the request",
-        move |frame, _, cx| {
-            let system = cancel_system.read(cx);
-            let Some(agents) = system.agents_for(agent) else {
-                frame.echo(
-                    "the agent's host is not attached",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            };
-            use rho_agents_client::protocol::worksets::CancelResult;
-            let reply = agents.call(Cancel { agent });
-            let label = system.registry().agent_display_label(agent);
-            let link = system.frame.clone();
-            cx.spawn(async move |_, cx| {
-                let result = reply.await;
-                cx.update(|cx| match result {
-                    Ok(CancelResult::WasAsking) => {
-                        link.echo(format!("cancelled: {label}"), StyleClass::SystemInfo, cx)
-                    }
-                    Ok(CancelResult::NoRequest) => link.echo(
-                        format!("not cancelled: {label} · it was not asking its model"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                    Err(error) => link.echo(
-                        format!("cancel the request: {error:#}"),
-                        StyleClass::SystemImportant,
-                        cx,
-                    ),
-                });
-            })
-            .detach();
-        },
-    ));
-    rows
-}
-
-/// The other kind is offered only where no conversation would be lost.
-/// The runtime already in use is not a change.
-fn switchable(
-    kind: RuntimeKind,
-    current: &str,
-    can_change_kind: bool,
-) -> impl Iterator<Item = String> {
-    let other = match kind {
-        RuntimeKind::Claude => RuntimeKind::Rho,
-        RuntimeKind::Rho => RuntimeKind::Claude,
-    };
-    // Keep the usual start choices visible without scrolling, then include
-    // every other supported model and effort.
-    let usual = RUNTIMES.into_iter().filter(move |choice| {
-        Runtime::parse(choice).is_ok_and(|runtime| runtime.kind() == kind || can_change_kind)
-    });
-    let all = Runtime::choices(kind)
-        .chain(
-            can_change_kind
-                .then_some(other)
-                .into_iter()
-                .flat_map(Runtime::choices),
-        )
-        .filter(|choice| !RUNTIMES.contains(&choice.as_str()));
-    usual
-        .map(str::to_owned)
-        .chain(all)
-        .filter(move |choice| choice != current)
-}
-
-/// What the echo says once `turns` of the turns of the agent called `label`
-/// are taken back: it does nothing until the user writes.
-fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
-    let turns = match turns {
-        1 => "one turn".to_owned(),
-        turns => format!("{turns} turns"),
-    };
-    let mut echo = format!("rewound {turns}: {label}");
-    if let Some(words) = taken_back.first() {
-        echo.push_str(&format!(
-            " · took back \"{}\"",
-            crate::render::preview(words)
-        ));
-        if taken_back.len() > 1 {
-            echo.push_str(&format!(" and {} more", taken_back.len() - 1));
-        }
+/// How much an agent doing this wants looking at: lower is more.
+fn pressing(activity: Activity) -> u8 {
+    match activity {
+        Activity::Failed | Activity::Lost => 0,
+        Activity::Retrying => 1,
+        Activity::Waiting => 2,
+        Activity::Working => 3,
+        Activity::Idle => 4,
+        Activity::Archived => 5,
     }
-    echo.push_str(" · waiting for you");
-    echo
 }
 
-impl Focusable for AgentSurface {
+impl Focusable for TranscriptSurface {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
     }
 }
 
-impl Render for AgentSurface {
+impl Render for TranscriptSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rho-agent-transcript")
@@ -623,45 +382,5 @@ impl Render for AgentSurface {
             )
             .size_full()
             .child(self.editor.clone())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rewind_echo_uses_the_host_receipt_not_the_transcripts_current_text() {
-        let earlier = "Could you clarify the timer?";
-        assert_eq!(
-            rewound("eng-ka35", 1, &[earlier.into()]),
-            "rewound one turn: eng-ka35 · took back \"Could you clarify the timer?\" · waiting for you"
-        );
-        assert_eq!(
-            rewound("eng-ka35", 2, &[]),
-            "rewound 2 turns: eng-ka35 · waiting for you"
-        );
-    }
-
-    #[test]
-    fn runtime_prompt_lists_every_supported_effort_and_model_of_the_current_kind() {
-        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", false).collect();
-        assert_eq!(choices.len(), 19);
-        for choice in ["fable-max", "opus-medium", "sonnet-low", "haiku-xhigh"] {
-            assert!(choices.iter().any(|offered| offered == choice), "{choice}");
-        }
-        assert!(
-            !choices
-                .iter()
-                .any(|choice| choice == "opus-high" || choice == "sol-medium")
-        );
-    }
-
-    #[test]
-    fn a_stopped_agent_without_history_can_choose_another_kind() {
-        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", true).collect();
-        assert_eq!(choices.len(), 35);
-        assert!(choices.iter().any(|choice| choice == "terra-xhigh"));
-        assert!(choices.iter().all(|choice| Runtime::parse(choice).is_ok()));
     }
 }

@@ -46,6 +46,12 @@ pub enum UiBlock {
     Reasoning {
         text: String,
     },
+    /// Where a workset's transcript turns from one agent's work to
+    /// another's: the blocks after it, up to the next, are this agent's.
+    /// Only a transcript that merges several agents has one.
+    AgentHeading {
+        agent: rho_agent_types::AgentId,
+    },
     /// Host-owned tentative outgoing text while its notebook cell has not sent.
     MessageDraft {
         /// The agent writing it.

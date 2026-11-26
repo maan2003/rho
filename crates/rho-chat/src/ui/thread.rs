@@ -26,7 +26,7 @@ use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage};
-use rho_frame::{Candidate, CardHere, Layout, Row, Subject, Surface, draft};
+use rho_frame::{CardHere, Layout, Row, Subject, Surface, draft};
 use rho_notes::NoteId;
 use rho_transcript::{BlockLine, BlockSpec, Item, Transcript};
 use rho_window::style::StyleClass;
@@ -34,7 +34,7 @@ use theme::ActiveTheme as _;
 
 use super::{ChatSystem, Event, Participant, ago};
 use crate::reading::body;
-use crate::{AgentRef, HostChat, ThreadId, cards};
+use crate::{HostChat, ThreadId, cards};
 
 actions!(rho_private_reply, [ReplyPrivately, KeepPrivateReply]);
 actions!(rho_chat, [GoToDraft, GoToOldestMessage]);
@@ -1760,12 +1760,7 @@ impl Surface for ThreadView {
         }))
     }
 
-    fn rows(
-        &mut self,
-        dealt: Option<Seen>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<Row> {
+    fn rows(&mut self, _: Option<Seen>, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
         if self.private_edit.is_some() {
             return Vec::new();
         }
@@ -1808,124 +1803,9 @@ impl Surface for ThreadView {
                 .bound_to(SendMessage),
             );
         }
+        // `look into the work` is the agents system's, on every screen.
         let cursor = self.cursor(cx);
-        let on_draft = self.on_draft(cx);
         let opens_inline = self.inline_open(cursor, cx).is_some();
-        let mail = if on_draft {
-            self.chosen_work(dealt, cx)
-        } else {
-            self.agent_mail(cursor.row, cx)
-        };
-        if let Some((agent, mail)) = mail {
-            // A vanished target cannot be inspected; do not silently
-            // substitute a different worker from the roster.
-            if !on_draft
-                || self
-                    .system
-                    .read(cx)
-                    .participant(self.thread.host, agent, cx)
-                    .is_some()
-            {
-                let mail = mail.clone();
-                let inspector = this.clone();
-                let key = if on_draft { "" } else { "enter" };
-                let look = Row::run(key, "look into the work", move |_, _, cx| {
-                    inspector.update(cx, |view, cx| view.inspect(agent, mail.clone(), cx));
-                });
-                rows.push(if !on_draft && !opens_inline {
-                    look.bound_to(OpenRow)
-                } else {
-                    look
-                });
-            }
-        } else {
-            let mut agents: Vec<_> = self.work_participants(cx).collect();
-            if let [(agent, _)] = agents.as_slice() {
-                let address = AgentRef(*agent).address();
-                rows.push(Row::run(
-                    "",
-                    "look into the work",
-                    move |frame, window, cx| {
-                        frame.open_inspection(
-                            address.clone(),
-                            frame.card_to_inspect(cx),
-                            window,
-                            cx,
-                        );
-                    },
-                ));
-            } else if !agents.is_empty() {
-                agents.sort_by_key(|(id, participant)| {
-                    (std::cmp::Reverse(participant.created_at), *id)
-                });
-                let choices: Vec<_> = agents
-                    .iter()
-                    .map(|(id, participant)| {
-                        let name = &participant.label;
-                        let value = if agents
-                            .iter()
-                            .filter(|(_, other)| other.label == *name)
-                            .count()
-                            > 1
-                        {
-                            format!("{name} · {}", id.encoded())
-                        } else {
-                            name.clone()
-                        };
-                        let description = participant
-                            .runtime
-                            .iter()
-                            .map(String::as_str)
-                            .chain(participant.doing.map(|doing| doing.activity.word()))
-                            .collect::<Vec<_>>()
-                            .join(" · ");
-                        (value, description, AgentRef(*id).address())
-                    })
-                    .collect();
-                rows.push(Row::run(
-                    "",
-                    "look into the work",
-                    move |frame, window, cx| {
-                        let suggestions = choices.clone();
-                        let choices = choices.clone();
-                        let card = frame.card_to_inspect(cx);
-                        frame.open_prompt(
-                            "look into the work:",
-                            Rc::new(move |_, query, _| {
-                                let query = query.to_lowercase();
-                                suggestions
-                                    .iter()
-                                    .filter(|(name, description, _)| {
-                                        name.to_lowercase().contains(&query)
-                                            || description.contains(&query)
-                                    })
-                                    .map(|(name, description, _)| Candidate {
-                                        value: name.clone(),
-                                        description: description.clone(),
-                                    })
-                                    .collect()
-                            }),
-                            Rc::new(move |frame, input, window, cx| {
-                                if let Some((_, _, address)) =
-                                    choices.iter().find(|(name, _, _)| name == input.trim())
-                                {
-                                    frame.open_inspection(
-                                        address.clone(),
-                                        card.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                } else {
-                                    frame.echo("no such agent", StyleClass::SystemInfo, cx);
-                                }
-                            }),
-                            window,
-                            cx,
-                        );
-                    },
-                ));
-            }
-        }
         // The thumb's Open action follows Enter at the point.
         if opens_inline
             || matches!(
@@ -2520,21 +2400,17 @@ mod tests {
             .unwrap();
 
         if matches!(check, CheckThread::WorkTarget) {
-            let look =
+            // The thread names who its draft steers; the agents system's
+            // commands, on every screen, act on that. The thread offers no
+            // `look into the work` of its own, so the palette has one.
+            let own_look =
                 |view: &mut ThreadView, window: &mut Window, cx: &mut Context<ThreadView>| {
-                    view.rows(None, window, cx)
-                        .into_iter()
-                        .find_map(|row| match row.pick {
-                            rho_frame::menu::Pick::Run { label, run }
-                                if label == "look into the work" =>
-                            {
-                                Some(run)
-                            }
-                            _ => None,
-                        })
-                        .expect("the thread draft should offer to look into the work")
+                    view.rows(None, window, cx).into_iter().any(|row| {
+                        matches!(row.pick, rho_frame::menu::Pick::Run { label, .. }
+                        if label == "look into the work")
+                    })
                 };
-            let sole = window
+            window
                 .update(cx, |view, window, cx| {
                     assert_eq!(
                         view.subject(None, cx),
@@ -2542,17 +2418,10 @@ mod tests {
                             worker: Some(worker)
                         }
                     );
-                    look(view, window, cx)
+                    assert!(!own_look(view, window, cx));
                 })
                 .unwrap();
             cx.update(|cx| {
-                frame.with(cx, move |frame, window, cx| {
-                    sole(frame, None, window, cx);
-                    assert!(
-                        frame.minibuffer_mut().is_none(),
-                        "one participant does not need an agent chooser"
-                    );
-                });
                 mail.update(cx, |system, cx| {
                     let log = system.logs.get_mut(&thread.host).unwrap();
                     log.tell(&ChatRecord {
@@ -2571,28 +2440,15 @@ mod tests {
                     cx.notify();
                 });
             });
-
-            let ambiguous = window
-                .update(cx, |view, window, cx| {
+            window
+                .update(cx, |view, _, cx| {
                     assert_eq!(
                         view.subject(None, cx),
                         Subject::Draft { worker: None },
                         "a draft with two participants must not guess a steering target"
                     );
-                    let ambiguous = look(view, window, cx);
-                    ambiguous
                 })
                 .unwrap();
-            cx.update(|cx| {
-                frame.with(cx, move |frame, window, cx| {
-                    ambiguous(frame, None, window, cx);
-                    assert_eq!(
-                        frame.minibuffer_mut().map(|prompt| prompt.prompt()),
-                        Some("look into the work:"),
-                        "two genuinely possible workers need a choice"
-                    );
-                });
-            });
             return;
         }
 

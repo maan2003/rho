@@ -1,34 +1,38 @@
 //! The agents, plugged into the frame.
 //!
-//! An agent has no list and no place of its own: its transcript opens from
-//! an `agent:` address, which a thread's participants and an agent's posts
-//! carry. The system holds the model thread's client, the directory, the
-//! transcripts it has open, and one [`AgentModel`] per opened agent; a
-//! surface observes its model. Starting an agent is a row on a thread
-//! surface: the message under the point is the agent's origin.
+//! Agents have no list and no place of their own: the work is looked into
+//! through its workset's transcript, `workset:<id>`, which merges the work
+//! of every agent in it; `agent:<id>` is the same transcript narrowed to
+//! one agent ([`Scope`]). The system holds the model thread's client, the
+//! directory, the transcripts it has open, and one [`AgentModel`] per
+//! opened scope; a surface observes its model. Starting an agent is a row
+//! on a thread surface: the message under the point is the agent's origin.
 //!
-//! An agent's terminals, its shell and its desktops hang under it
-//! ([`AgentAddress`]): the same system opens them, with the agent's host
-//! as their link, and offers the rows that start one from any surface of
-//! the agent.
+//! A workset's terminals, shells and desktops hang under the agents that
+//! started them ([`AgentAddress`]): the same system opens them, with the
+//! agent's host as their link, and finds every one that runs. Its commands
+//! ([`commands`]) are on every screen and act on what the screen is
+//! about.
 //! The system also opens the usage charts ([`crate::usage`]): it asks the
 //! hosts it reaches and keeps their answers, and a chart observes it.
 
 mod address;
+mod commands;
 mod start;
+mod steer;
 mod surface;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use address::{AgentAddress, Part};
+pub use address::{AgentAddress, Part, Scope, WorksetAddress};
 use futures::StreamExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::{Address as Party, AgentId, EndpointId, Message, MessageId};
+use rho_agent_types::{AgentId, EndpointId, MessageId, WorksetId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
 use rho_agents_client::protocol::{AgentCostDistribution, GlobalUsage, QuotaHistory, QuotaSeries};
@@ -43,13 +47,15 @@ use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
     Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks,
-    Opening, Point, Row, Subject, System,
+    Opening, Point, Row, System,
 };
 use rho_rpc::protocol::Call;
+use rho_shell_view::protocol::ShellInfo;
 use rho_shell_view::ui::ShellSurface;
+use rho_terminal::protocol::TerminalInfo;
 use rho_terminal::ui::TerminalSurface;
 use rho_window::style::StyleClass;
-use surface::AgentSurface;
+use surface::TranscriptSurface;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::render::{self, Label, Labels};
@@ -58,20 +64,23 @@ use crate::usage::{Request, Usage, UsageChart, UsageMoved, UsageSurface};
 
 /// Every kind the system opens: agents, and the usage charts
 /// (`SPEC-usage-addresses`).
-const KINDS: &[&str] = &[AgentRef::KIND, UsageChart::KIND];
+const KINDS: &[&str] = &[AgentRef::KIND, WorksetAddress::KIND, UsageChart::KIND];
 
 pub struct AgentsSystem {
     client: AgentsClient,
     registry: AgentMap,
     transcripts: Transcripts,
-    models: HashMap<AgentId, Entity<AgentModel>>,
-    /// The surfaces open on agents, weakly: one the frame dropped is one
-    /// less transcript to follow.
-    surfaces: HashMap<AgentId, WeakEntity<AgentSurface>>,
+    models: HashMap<Scope, Entity<AgentModel>>,
+    /// The transcripts open on screen, weakly: one the frame dropped is
+    /// less to follow.
+    surfaces: HashMap<Scope, WeakEntity<TranscriptSurface>>,
     links: HashMap<HostId, Link>,
     /// Each host's desktops stream, and the desktops it last said it runs.
     desktops: DesktopStreams,
     sessions: HashMap<HostId, Vec<DesktopSession>>,
+    /// The terminals and shells each host last said run, asked again
+    /// whenever the user moves: no stream tells of them.
+    running: HashMap<HostId, Running>,
     quotas: Quotas,
     /// What the hosts answered for the spend charts.
     usage: Usage,
@@ -121,7 +130,7 @@ impl AgentsSystem {
                 }
             }
         });
-        AgentSurface::bind_keys(cx);
+        TranscriptSurface::bind_keys(cx);
         UsageSurface::bind_keys(cx);
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
@@ -131,6 +140,7 @@ impl AgentsSystem {
                 client_id,
                 message,
             } => this.delivered(*endpoint, *client_id, *message, cx),
+            // The workset's transcript, at the step that wrote the mail.
             MailEvent::Inspect { agent, mail } => {
                 let agent = *agent;
                 let mail = mail.clone();
@@ -139,23 +149,24 @@ impl AgentsSystem {
                     let Some(system) = system.upgrade() else {
                         return;
                     };
-                    if system.read(cx).registry.mirrored(agent).is_none() {
+                    let Some(workset) = system.read(cx).registry.agent_workset(agent) else {
                         frame.echo(
                             "the agent's transcript is not available",
                             StyleClass::SystemInfo,
                             cx,
                         );
                         return;
-                    }
+                    };
+                    let scope = Scope::Workset(workset);
                     let card = frame.card_to_inspect(cx);
-                    frame.open_inspection(AgentRef(agent).address(), card, window, cx);
+                    frame.open_inspection(scope.address(), card, window, cx);
                     if let Some(surface) = system
                         .read(cx)
                         .surfaces
-                        .get(&agent)
+                        .get(&scope)
                         .and_then(WeakEntity::upgrade)
                     {
-                        surface.update(cx, |surface, cx| surface.inspect(mail, window, cx));
+                        surface.update(cx, |surface, cx| surface.inspect(agent, mail, window, cx));
                     }
                 });
             }
@@ -179,6 +190,7 @@ impl AgentsSystem {
             links: HashMap::new(),
             desktops,
             sessions: HashMap::new(),
+            running: HashMap::new(),
             quotas: Quotas::default(),
             usage: Usage::default(),
             mail,
@@ -271,6 +283,7 @@ impl AgentsSystem {
                 }
                 self.registry.reset_host(host);
                 self.registry.restore(agents);
+                self.refresh_views(cx);
                 self.note_open(cx);
                 self.changed(cx);
             }
@@ -279,6 +292,8 @@ impl AgentsSystem {
                 if changed.is_empty() {
                     return;
                 }
+                self.refresh_views(cx);
+                self.note_open(cx);
                 self.changed(cx);
             }
             ModelMsg::Deleted { agents } => self.deleted(agents, cx),
@@ -302,17 +317,25 @@ impl AgentsSystem {
                 if let Some(state) = self.transcripts.reread(agent_id, &rows) {
                     self.land(agent_id, TranscriptFrame::Fold(state), cx);
                 }
-                if let Some(mail) = inspection
-                    && let Some(surface) = self.surfaces.get(&agent_id).cloned()
-                {
-                    self.frame.with(cx, move |_, window, cx| {
-                        if let Some(surface) = surface.upgrade() {
-                            surface.update(cx, |surface, cx| {
-                                surface.read_inspection(mail, window, cx);
-                            });
-                        }
-                    });
-                }
+                let Some(mail) = inspection else {
+                    return;
+                };
+                let surfaces: Vec<_> = self
+                    .surfaces
+                    .iter()
+                    .filter(|(scope, _)| {
+                        self.scope_agents(**scope)
+                            .is_some_and(|(_, agents)| agents.contains(&agent_id))
+                    })
+                    .map(|(_, surface)| surface.clone())
+                    .collect();
+                self.frame.with(cx, move |_, window, cx| {
+                    for surface in surfaces.iter().filter_map(WeakEntity::upgrade) {
+                        surface.update(cx, |surface, cx| {
+                            surface.read_inspection(mail, window, cx);
+                        });
+                    }
+                });
             }
             ModelMsg::Runtime {
                 agent_id,
@@ -352,28 +375,84 @@ impl AgentsSystem {
         }
     }
 
-    /// Lands a frame on an agent's transcript and shows what moved.
+    /// The agents of a workset, the one it started with first.
+    fn workset_agents(&self, workset: WorksetId) -> Vec<AgentId> {
+        let mut agents: Vec<_> = self
+            .registry
+            .known_agents()
+            .copied()
+            .filter(|agent| self.registry.agent_workset(*agent) == Some(workset))
+            .filter_map(|agent| {
+                let created = self.registry.mirrored(agent)?.identity.entry.created_at;
+                Some((created, agent))
+            })
+            .collect();
+        agents.sort();
+        agents.into_iter().map(|(_, agent)| agent).collect()
+    }
+
+    /// The agent a workset is named after: the one it started with.
+    fn lead_of(&self, agent: AgentId) -> Option<AgentId> {
+        let workset = self.registry.agent_workset(agent)?;
+        self.workset_agents(workset).first().copied()
+    }
+
+    /// The agent a scope's transcript is headed by, and every agent it
+    /// shows, the lead first; `None` while none is known.
+    fn scope_agents(&self, scope: Scope) -> Option<(AgentId, Vec<AgentId>)> {
+        let agents = match scope {
+            Scope::Workset(workset) => self.workset_agents(workset),
+            Scope::Agent(agent) => self
+                .registry
+                .mirrored(agent)
+                .map(|_| vec![agent])
+                .unwrap_or_default(),
+        };
+        Some((*agents.first()?, agents))
+    }
+
+    fn scope_workset(&self, scope: Scope) -> Option<WorksetId> {
+        match scope {
+            Scope::Workset(workset) => Some(workset),
+            Scope::Agent(agent) => self.registry.agent_workset(agent),
+        }
+    }
+
+    /// Whom a transcript screen is named after.
+    fn scope_name(&self, scope: Scope) -> Option<ScopeName> {
+        let (shown, _) = self.scope_agents(scope)?;
+        let workset = self.lead_of(shown)?;
+        Some(ScopeName { workset, shown })
+    }
+
+    /// Lands a frame on an agent's transcript and shows what moved on
+    /// every screen of it.
     fn land(&mut self, agent: AgentId, frame: TranscriptFrame, cx: &mut Context<Self>) {
         let change = self.transcripts.apply(agent, frame);
         if change.was_live && self.registry.mark_live(agent) {
             cx.notify();
         }
-        self.sync(agent, change.summary, cx);
+        for (scope, summary) in change.views {
+            self.sync(scope, summary, cx);
+        }
         self.ensure_timer(cx);
     }
 
-    fn sync(&mut self, agent: AgentId, summary: FrameSummary, cx: &mut Context<Self>) {
-        let (Some(model), Some(state)) = (self.models.get(&agent), self.transcripts.state(&agent))
-        else {
+    fn sync(&mut self, scope: Scope, summary: FrameSummary, cx: &mut Context<Self>) {
+        let (Some(model), Some(state), Some((lead, _))) = (
+            self.models.get(&scope),
+            self.transcripts.view(&scope),
+            self.scope_agents(scope),
+        ) else {
             return;
         };
-        self.show_brief(agent, model, cx);
+        self.show_brief(lead, model, cx);
         model.update(cx, |model, cx| {
             model.sync(
                 state,
                 summary,
                 now_ms(),
-                &|needed, cx| self.labels(agent, needed, cx),
+                &|needed, cx| self.labels(lead, needed, cx),
                 cx,
             )
         });
@@ -443,39 +522,42 @@ impl AgentsSystem {
         let Some(host) = self.host_of(endpoint) else {
             return;
         };
-        for (agent, model) in &self.models {
-            if self.registry.host_of_agent(*agent) != Some(host)
-                || !self.surfaces.contains_key(agent)
+        for (scope, model) in &self.models {
+            let Some((lead, _)) = self.scope_agents(*scope) else {
+                continue;
+            };
+            if self.registry.host_of_agent(lead) != Some(host) || !self.surfaces.contains_key(scope)
             {
                 continue;
             }
-            self.refresh_mail_labels(*agent, model, cx);
-            self.show_brief(*agent, model, cx);
+            self.refresh_mail_labels(*scope, lead, model, cx);
+            self.show_brief(lead, model, cx);
         }
     }
 
-    /// The agent's brief is its origin message, which mail owns.
-    fn show_brief(&self, agent: AgentId, model: &Entity<AgentModel>, cx: &mut Context<Self>) {
-        let brief = self.brief(agent, cx);
+    /// The brief is the lead's origin message, which mail owns.
+    fn show_brief(&self, lead: AgentId, model: &Entity<AgentModel>, cx: &mut Context<Self>) {
+        let brief = self.brief(lead, cx);
         model.update(cx, |model, cx| model.set_brief(brief.as_deref(), cx));
     }
 
     fn refresh_mail_labels(
         &self,
-        agent: AgentId,
+        scope: Scope,
+        lead: AgentId,
         model: &Entity<AgentModel>,
         cx: &mut Context<Self>,
     ) {
         let unresolved = model.read(cx).unresolved_mail().collect::<Vec<_>>();
         let available = self.labels(
-            agent,
+            lead,
             unresolved.iter().map(|(_, label)| *label).collect(),
             cx,
         );
         if let Some(first) = unresolved
             .iter()
             .find_map(|(block, label)| available.contains_key(label).then_some(*block))
-            && let Some(state) = self.transcripts.state(&agent)
+            && let Some(state) = self.transcripts.view(&scope)
         {
             let summary = FrameSummary {
                 first_changed_block: Some(first),
@@ -492,7 +574,7 @@ impl AgentsSystem {
                             .filter(|name| !available.contains_key(name))
                             .collect();
                         let mut labels = available.clone();
-                        labels.extend(self.labels(agent, missing, cx));
+                        labels.extend(self.labels(lead, missing, cx));
                         labels
                     },
                     cx,
@@ -502,23 +584,43 @@ impl AgentsSystem {
     }
 
     /// A durable deletion removes host-owned history: the surfaces go too,
-    /// so history cannot show what the host no longer has.
+    /// so history cannot show what the host no longer has. A workset with
+    /// an agent left keeps its transcript, without the ones that went.
     fn deleted(&mut self, agents: BTreeSet<AgentId>, cx: &mut Context<Self>) {
         for agent in &agents {
             self.transcripts.forget(*agent);
-            self.models.remove(agent);
-            self.surfaces.remove(agent);
         }
-        // Every screen of theirs: the transcript, terminals, shells, and
+        let worksets: BTreeSet<WorksetId> = agents
+            .iter()
+            .filter_map(|agent| self.registry.agent_workset(*agent))
+            .collect();
+        self.registry.forget_agents(&agents);
+        let emptied: BTreeSet<WorksetId> = worksets
+            .into_iter()
+            .filter(|workset| self.workset_agents(*workset).is_empty())
+            .collect();
+        let gone = |scope: &Scope| match scope {
+            Scope::Agent(agent) => agents.contains(agent),
+            Scope::Workset(workset) => emptied.contains(workset),
+        };
+        let scopes: Vec<Scope> = self.models.keys().copied().filter(gone).collect();
+        for scope in scopes {
+            self.models.remove(&scope);
+            self.surfaces.remove(&scope);
+            self.transcripts.hide(&scope);
+        }
+        // Every screen of theirs: the transcripts, terminals, shells, and
         // desktops.
-        let gone = agents.clone();
+        let (agents, worksets) = (agents.clone(), emptied);
         self.frame.close_all(
             move |address| {
-                AgentAddress::from_address(address).is_some_and(|at| gone.contains(&at.agent))
+                AgentAddress::from_address(address).is_some_and(|at| agents.contains(&at.agent))
+                    || WorksetAddress::from_address(address)
+                        .is_some_and(|at| worksets.contains(&at.0))
             },
             cx,
         );
-        self.registry.forget_agents(&agents);
+        self.refresh_views(cx);
         self.note_open(cx);
         self.changed(cx);
     }
@@ -528,12 +630,35 @@ impl AgentsSystem {
         self.frame.changed(cx);
     }
 
+    /// A workset on screen shows every agent in it: one that joined is
+    /// merged in, one that left is taken out.
+    fn refresh_views(&mut self, cx: &mut Context<Self>) {
+        let scopes: Vec<Scope> = self.models.keys().copied().collect();
+        for scope in scopes {
+            let Some((lead, agents)) = self.scope_agents(scope) else {
+                continue;
+            };
+            for agent in &agents {
+                self.seed(*agent, cx);
+            }
+            let summary = self.transcripts.show(scope, lead, agents);
+            if summary.first_changed_block.is_some() {
+                self.sync(scope, summary, cx);
+            }
+        }
+    }
+
     /// Tells the model which transcripts to follow and every host which
-    /// agents to stream live: the ones with a surface open.
+    /// agents to stream live: those of the transcripts on screen.
     fn note_open(&mut self, _cx: &mut Context<Self>) {
         self.surfaces
             .retain(|_, surface| surface.upgrade().is_some());
-        let open: BTreeSet<AgentId> = self.surfaces.keys().copied().collect();
+        let open: BTreeSet<AgentId> = self
+            .surfaces
+            .keys()
+            .filter_map(|scope| self.scope_agents(*scope))
+            .flat_map(|(_, agents)| agents)
+            .collect();
         self.client.follow(open.clone());
         let hosts: Vec<HostId> = self.registry.hosts().map(|(host, _)| host).collect();
         for host in hosts {
@@ -563,66 +688,84 @@ impl AgentsSystem {
         true
     }
 
-    fn seed(&mut self, agent: AgentId) -> bool {
+    /// Opens an agent's transcript from the disk copy, with the runtime
+    /// state already heard, and shows it on the screens that show the
+    /// agent. An agent already open is left as it is.
+    fn seed(&mut self, agent: AgentId, cx: &mut Context<Self>) {
         if self.transcripts.is_open(&agent) || self.registry.agent_workset(agent).is_none() {
-            return false;
+            return;
         }
         let rows = self.client.read_transcript(agent);
-        if !self.transcripts.seed(agent, &rows) {
-            return false;
-        }
+        let Some(mut moved) = self.transcripts.seed(agent, &rows) else {
+            return;
+        };
         if let Some(heard) = self.registry.agent_facts(agent).runtime {
-            self.transcripts
-                .apply(agent, TranscriptFrame::Runtime(heard.state));
+            moved.extend(
+                self.transcripts
+                    .apply(agent, TranscriptFrame::Runtime(heard.state))
+                    .views,
+            );
         }
-        true
+        for (scope, summary) in moved {
+            self.sync(scope, summary, cx);
+        }
     }
 
-    fn model(&mut self, agent: AgentId, cx: &mut Context<Self>) -> Entity<AgentModel> {
-        if let Some(model) = self.models.get(&agent) {
+    fn model(&mut self, scope: Scope, cx: &mut Context<Self>) -> Entity<AgentModel> {
+        if let Some(model) = self.models.get(&scope) {
             return model.clone();
         }
-        let link = self.agents_for(agent).unwrap_or_else(AgentsLink::detached);
+        let link = self
+            .scope_agents(scope)
+            .and_then(|(lead, _)| self.agents_for(lead))
+            .unwrap_or_else(AgentsLink::detached);
         let model = cx.new(|cx| AgentModel::new(link, cx));
         self._subscriptions.push(cx.subscribe(
             &model,
             move |this, model, event: &AgentModelEvent, cx| {
                 if matches!(event, AgentModelEvent::Loaded)
-                    && this.models.get(&agent) == Some(&model)
+                    && this.models.get(&scope) == Some(&model)
                 {
-                    this.sync(agent, FrameSummary::nothing(), cx);
-                    this.refresh_mail_labels(agent, &model, cx);
+                    this.sync(scope, FrameSummary::nothing(), cx);
+                    if let Some((lead, _)) = this.scope_agents(scope) {
+                        this.refresh_mail_labels(scope, lead, &model, cx);
+                    }
                     this.ensure_timer(cx);
                 }
             },
         ));
-        self.models.insert(agent, model.clone());
+        self.models.insert(scope, model.clone());
         model
     }
 
-    /// The model of an agent, loaded: the transcript seeded from the disk
-    /// copy, the bulk load started, and what moved since shown.
-    fn loaded_model(&mut self, agent: AgentId, cx: &mut Context<Self>) -> Entity<AgentModel> {
-        let told = self.seed(agent);
-        let model = self.model(agent, cx);
+    /// The model of a scope, loaded: its agents' transcripts seeded from
+    /// the disk copy and merged, the bulk load started, and what moved
+    /// since shown.
+    fn loaded_model(&mut self, scope: Scope, cx: &mut Context<Self>) -> Entity<AgentModel> {
+        let model = self.model(scope, cx);
+        let Some((lead, agents)) = self.scope_agents(scope) else {
+            return model;
+        };
+        for agent in &agents {
+            self.seed(*agent, cx);
+        }
+        let summary = self.transcripts.show(scope, lead, agents);
         if !model.read(cx).initial_load_started()
-            && let Some(state) = self.transcripts.state(&agent).cloned()
+            && let Some(state) = self.transcripts.view(&scope).cloned()
         {
             let needed = state
                 .blocks
                 .iter()
                 .filter_map(|block| Label::for_block(block))
                 .collect();
-            let labels = self.labels(agent, needed, cx);
+            let labels = self.labels(lead, needed, cx);
             model.update(cx, |model, cx| {
                 model.start_initial_load(state, labels, now_ms(), cx)
             });
-        } else if told {
-            self.sync(agent, FrameSummary::everything(), cx);
-        } else if model.read(cx).initial_load_ready() {
-            self.sync(agent, FrameSummary::nothing(), cx);
+        } else {
+            self.sync(scope, summary, cx);
         }
-        self.show_brief(agent, &model, cx);
+        self.show_brief(lead, &model, cx);
         model
     }
 
@@ -782,6 +925,20 @@ impl AgentsSystem {
         ))
     }
 
+    /// Whether the agent's host is attached; the echo line says so when
+    /// it is not.
+    fn attached(&self, agent: AgentId, cx: &mut App) -> bool {
+        let attached = self.workset_of(agent).is_some();
+        if !attached {
+            self.frame.echo(
+                "the agent's host is not attached",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+        attached
+    }
+
     fn agent_thread(&self, agent: AgentId, cx: &App) -> Option<ThreadId> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;
@@ -806,74 +963,81 @@ impl AgentsSystem {
 
     fn open_transcript(
         &mut self,
-        agent: AgentId,
+        scope: Scope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnySurface {
-        let model = self.loaded_model(agent, cx);
+        let model = self.loaded_model(scope, cx);
         let system = cx.entity();
-        let surface = cx.new(|cx| AgentSurface::new(system, agent, model, window, cx));
-        self.surfaces.insert(agent, surface.downgrade());
+        let surface = cx.new(|cx| TranscriptSurface::new(system, scope, model, window, cx));
+        self.surfaces.insert(scope, surface.downgrade());
         self._subscriptions
             .push(cx.observe_release(&surface, move |this, _, cx| {
-                this.surfaces.remove(&agent);
+                this.surfaces.remove(&scope);
                 this.note_open(cx);
             }));
         self.note_open(cx);
         AnySurface::new(surface)
     }
 
-    /// The desktops an agent's workset runs, as its host last said.
-    fn desktops_of(&self, agent: AgentId) -> Vec<String> {
-        let id = agent.encoded();
-        self.registry
-            .host_of_agent(agent)
-            .and_then(|host| self.sessions.get(&host))
+    /// Who an id a host lists a tool under is, if it is an agent of that
+    /// host this window holds.
+    fn tool_owner(&self, host: HostId, encoded: &str) -> Option<AgentId> {
+        let agent = AgentId::from_encoded(encoded).ok()?;
+        (self.registry.host_of_agent(agent) == Some(host)).then_some(agent)
+    }
+
+    /// The desktops running in the agent's workset, as its host last said,
+    /// and under which agent each runs.
+    fn desktops_of(&self, agent: AgentId) -> Vec<(AgentId, String)> {
+        let (Some(host), Some(workset)) = (
+            self.registry.host_of_agent(agent),
+            self.registry.agent_workset(agent),
+        ) else {
+            return Vec::new();
+        };
+        self.sessions
+            .get(&host)
             .into_iter()
             .flatten()
-            .filter(|session| session.agent == id)
-            .map(|session| session.name.clone())
+            .filter_map(|session| {
+                let owner = self.tool_owner(host, &session.agent)?;
+                (self.registry.agent_workset(owner) == Some(workset))
+                    .then(|| (owner, session.name.clone()))
+            })
             .collect()
     }
 
-    /// The rows of an agent's surfaces: its terminals, shell and desktops,
-    /// from the transcript or from any of them.
-    fn agent_rows(&self, here: AgentAddress, cx: &mut Context<Self>) -> Vec<Row> {
-        let agent = here.agent;
-        if self.workset_of(agent).is_none() {
-            return Vec::new();
+    /// Asks every attached host which terminals and shells run, for the
+    /// palette to find them.
+    fn refresh_running(&mut self, cx: &mut Context<Self>) {
+        for (&host, link) in &self.links {
+            let terminals = rho_terminal::channel::list(link, None);
+            let shells = rho_shell_view::channel::list(link);
+            cx.spawn(async move |this, cx| {
+                let (terminals, shells) = futures::join!(terminals, shells);
+                this.update(cx, |this, _| {
+                    if !this.links.contains_key(&host) {
+                        return;
+                    }
+                    let running = this.running.entry(host).or_default();
+                    // A host that could not answer keeps what it said last.
+                    if let Ok(terminals) = terminals {
+                        running.terminals = terminals;
+                    }
+                    if let Ok(shells) = shells {
+                        running.shells = shells;
+                    }
+                })
+                .ok();
+            })
+            .detach();
         }
-        let this = cx.entity();
-        let mut rows = Vec::new();
-        for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
-        {
-            let this = this.clone();
-            rows.push(Row::run(key, description, move |frame, _, cx| {
-                let card = frame.card_to_inspect(cx);
-                this.update(cx, |this, cx| this.open_terminal(agent, new, card, cx));
-            }));
-        }
-        rows.push(Row::run("x", "shell", move |frame, window, cx| {
-            let card = frame.card_to_inspect(cx);
-            frame.open_inspection(AgentAddress::shell(agent).address(), card, window, cx);
-        }));
-        if here.part == Part::Shell {
-            let this = this.clone();
-            rows.push(Row::run("shift-x", "close shell", move |_, _, cx| {
-                this.update(cx, |this, cx| this.close_shell(agent, cx));
-            }));
-        }
-        if !self.desktops_of(agent).is_empty() {
-            rows.push(Row::run("d", "desktop…", move |frame, _, cx| {
-                let card = frame.card_to_inspect(cx);
-                this.update(cx, |this, cx| this.open_desktop(agent, card, cx));
-            }));
-        }
-        rows
     }
 
-    /// Opens a terminal of the agent: with `new` a fresh one, else the
-    /// first that runs, spawning one when none does.
+    /// Opens a terminal of the agent's workset: with `new` a fresh one
+    /// under the agent; else the one that runs, asking which when several
+    /// do, and starting one when none does.
     fn open_terminal(
         &mut self,
         agent: AgentId,
@@ -881,32 +1045,130 @@ impl AgentsSystem {
         card: Option<CardInspection>,
         cx: &mut Context<Self>,
     ) {
-        let Some((link, id, _)) = self.workset_of(agent) else {
+        if !self.attached(agent, cx) {
+            return;
+        }
+        let Some((link, _, _)) = self.workset_of(agent) else {
             return;
         };
-        let running = rho_terminal::channel::list(link, Some(id));
+        let running = rho_terminal::channel::list(link, None);
         cx.spawn(async move |this, cx| {
             let running = running.await;
-            let _ = this.update(cx, |this, cx| match running {
-                Ok(running) => {
-                    let terminal = rho_terminal::ui::pick_terminal(&running, new);
-                    let address = AgentAddress::terminal(agent, terminal).address();
-                    this.frame.with(cx, move |frame, window, cx| {
-                        frame.open_inspection(address, card, window, cx);
-                    });
-                }
-                Err(error) => {
-                    this.frame
-                        .echo(format!("terminal: {error:#}"), StyleClass::SystemInfo, cx)
+            let _ = this.update(cx, |this, cx| {
+                let running = match running {
+                    Ok(running) => running,
+                    Err(error) => {
+                        return this.frame.echo(
+                            format!("terminal: {error:#}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                };
+                let (Some(host), workset) = (
+                    this.registry.host_of_agent(agent),
+                    this.registry.agent_workset(agent),
+                ) else {
+                    return;
+                };
+                this.running.entry(host).or_default().terminals = running.clone();
+                let in_workset = running
+                    .into_iter()
+                    .filter_map(|info| {
+                        let owner = this.tool_owner(host, &info.agent)?;
+                        (this.registry.agent_workset(owner) == workset).then_some((owner, info))
+                    })
+                    .collect();
+                match commands::pick_terminal(agent, in_workset, new) {
+                    commands::TerminalPick::Start(terminal) => {
+                        this.open_tool(AgentAddress::terminal(agent, terminal), card, cx)
+                    }
+                    commands::TerminalPick::Open(owner, terminal) => {
+                        this.open_tool(AgentAddress::terminal(owner, terminal), card, cx)
+                    }
+                    commands::TerminalPick::Ask(running) => {
+                        let choices = running
+                            .into_iter()
+                            .map(|(owner, info)| {
+                                let address = AgentAddress::terminal(owner, info.terminal_id);
+                                let value = this.tool_title(&address);
+                                (value, info.title, address)
+                            })
+                            .collect();
+                        this.ask_tool("terminal:", choices, card, cx);
+                    }
                 }
             });
         })
         .detach();
     }
 
+    /// What a tool is called in the palette and the prompts that offer
+    /// it: its agent's label and the tool, `eng-q9tz · term 1`.
+    fn tool_title(&self, at: &AgentAddress) -> String {
+        format!("{} · {}", self.label(at.agent).0, at.part)
+    }
+
+    fn open_tool(&self, at: AgentAddress, card: Option<CardInspection>, cx: &mut App) {
+        let address = at.address();
+        self.frame.with(cx, move |frame, window, cx| {
+            frame.open_inspection(address, card, window, cx);
+        });
+    }
+
+    /// Asks which of several running tools to open: each by its title,
+    /// with a word on what it shows.
+    fn ask_tool(
+        &self,
+        question: &'static str,
+        choices: Vec<(String, String, AgentAddress)>,
+        card: Option<CardInspection>,
+        cx: &mut App,
+    ) {
+        let choices = Rc::new(choices);
+        self.frame.with(cx, move |frame, window, cx| {
+            let offered = choices.clone();
+            frame.open_prompt(
+                question,
+                Rc::new(move |_, input, _| {
+                    let needle = input.trim().to_lowercase();
+                    offered
+                        .iter()
+                        .filter(|(value, description, _)| {
+                            value.to_lowercase().contains(&needle)
+                                || description.to_lowercase().contains(&needle)
+                        })
+                        .map(|(value, description, _)| Candidate {
+                            value: value.clone(),
+                            description: description.clone(),
+                        })
+                        .collect()
+                }),
+                Rc::new(move |frame, input, window, cx| {
+                    let input = input.trim();
+                    match choices.iter().find(|(value, _, _)| value == input) {
+                        Some((_, _, at)) => {
+                            frame.open_inspection(at.address(), card.clone(), window, cx)
+                        }
+                        None => frame.echo(
+                            &format!("{question} none called {input:?}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
+                    }
+                }),
+                window,
+                cx,
+            );
+        });
+    }
+
     /// Stops the agent's shell on its host, and closes its surface once
     /// the host has.
     fn close_shell(&mut self, agent: AgentId, cx: &mut Context<Self>) {
+        if !self.attached(agent, cx) {
+            return;
+        }
         let Some((link, id, _)) = self.workset_of(agent) else {
             return;
         };
@@ -917,6 +1179,7 @@ impl AgentsSystem {
                 Ok(()) => {
                     this.frame.echo("shell closed", StyleClass::SystemInfo, cx);
                     this.frame.close(AgentAddress::shell(agent).address(), cx);
+                    this.refresh_running(cx);
                 }
                 Err(error) => this.frame.echo(
                     format!("close shell: {error:#}"),
@@ -928,74 +1191,29 @@ impl AgentsSystem {
         .detach();
     }
 
-    /// Opens the agent's one desktop, or asks which of its desktops.
+    /// Opens the workset's one desktop, or asks which of its desktops.
     fn open_desktop(
         &mut self,
         agent: AgentId,
         card: Option<CardInspection>,
         cx: &mut Context<Self>,
     ) {
-        let names = self.desktops_of(agent);
-        let addresses: Vec<(String, Address)> = names
+        let desktops: Vec<AgentAddress> = self
+            .desktops_of(agent)
             .into_iter()
-            .filter_map(|name| {
-                let address = AgentAddress::desktop(agent, name.clone())?.address();
-                Some((name, address))
-            })
+            .filter_map(|(owner, name)| AgentAddress::desktop(owner, name))
             .collect();
-        match addresses.as_slice() {
+        match desktops.as_slice() {
             [] => self
                 .frame
-                .echo("the agent runs no desktop", StyleClass::SystemInfo, cx),
-            [(_, address)] => {
-                let address = address.clone();
-                self.frame.with(cx, move |frame, window, cx| {
-                    frame.open_inspection(address, card, window, cx);
-                });
-            }
+                .echo("the workset runs no desktop", StyleClass::SystemInfo, cx),
+            [desktop] => self.open_tool(desktop.clone(), card, cx),
             _ => {
-                let candidates: Vec<Candidate> = addresses
-                    .iter()
-                    .map(|(name, _)| Candidate {
-                        value: name.clone(),
-                        description: "desktop".to_owned(),
-                    })
+                let choices = desktops
+                    .into_iter()
+                    .map(|at| (self.tool_title(&at), "desktop".to_owned(), at))
                     .collect();
-                self.frame.with(cx, move |frame, window, cx| {
-                    frame.open_prompt(
-                        "desktop:",
-                        Rc::new(move |_, input, _| {
-                            let needle = input.trim().to_lowercase();
-                            candidates
-                                .iter()
-                                .filter(|candidate| {
-                                    candidate.value.to_lowercase().contains(&needle)
-                                })
-                                .cloned()
-                                .collect()
-                        }),
-                        Rc::new(move |frame, input, window, cx| {
-                            let input = input.trim();
-                            match addresses.iter().find(|(name, _)| name == input) {
-                                Some((_, address)) => {
-                                    frame.open_inspection(
-                                        address.clone(),
-                                        card.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                                None => frame.echo(
-                                    &format!("desktop: none called {input:?}"),
-                                    StyleClass::SystemInfo,
-                                    cx,
-                                ),
-                            }
-                        }),
-                        window,
-                        cx,
-                    );
-                });
+                self.ask_tool("desktop:", choices, card, cx);
             }
         }
     }
@@ -1105,31 +1323,40 @@ impl System for AgentsSystem {
         KINDS
     }
 
-    /// An agent this window does not hold may be on a host that has not
-    /// yet listed its agents, and a desktop on one that has not yet said
-    /// which it runs: those wait. Only what a host that has said is
-    /// without is gone.
+    /// An agent or workset this window does not hold may be on a host
+    /// that has not yet listed its agents, and a desktop on one that has
+    /// not yet said which it runs: those wait. Only what a host that has
+    /// said is without is gone.
     fn open(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> Opening {
         if let Some(chart) = UsageChart::from_address(address) {
             let system = cx.entity();
             let surface = cx.new(|cx| UsageSurface::new(system, chart, window, cx));
             return Opening::Surface(AnySurface::new(surface));
         }
+        let unknown = || {
+            let unlisted = self.registry.unlisted_hosts();
+            match unlisted.is_empty() {
+                true => Opening::Gone,
+                false => Opening::Waiting(unlisted),
+            }
+        };
+        if let Some(scope @ Scope::Workset(_)) = Scope::from_address(address) {
+            return match self.scope_agents(scope) {
+                Some(_) => Opening::Surface(self.open_transcript(scope, window, cx)),
+                None => unknown(),
+            };
+        }
         let Some(AgentAddress { agent, part }) = AgentAddress::from_address(address) else {
             return Opening::Gone;
         };
         let Some(host) = self.registry.host_of_agent(agent) else {
-            let unlisted = self.registry.unlisted_hosts();
-            return match unlisted.is_empty() {
-                true => Opening::Gone,
-                false => Opening::Waiting(unlisted),
-            };
+            return unknown();
         };
         let Some((link, id, label)) = self.workset_of(agent) else {
             return Opening::Gone;
         };
         let surface = match part {
-            Part::Transcript => self.open_transcript(agent, window, cx),
+            Part::Transcript => self.open_transcript(Scope::Agent(agent), window, cx),
             Part::Terminal(terminal) => AnySurface::new(
                 cx.new(|cx| TerminalSurface::new(link, id, label, terminal, window, cx)),
             ),
@@ -1140,7 +1367,11 @@ impl System for AgentsSystem {
                 if !self.sessions.contains_key(&host) {
                     return Opening::Waiting(vec![host]);
                 }
-                if !self.desktops_of(agent).contains(&name) {
+                if !self
+                    .desktops_of(agent)
+                    .iter()
+                    .any(|(owner, held)| *owner == agent && *held == name)
+                {
                     return Opening::Gone;
                 }
                 AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
@@ -1149,10 +1380,13 @@ impl System for AgentsSystem {
         Opening::Surface(surface)
     }
 
+    /// Every move may have left a terminal or shell running that the
+    /// palette should find: the hosts are asked again.
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
         if let Some(chart) = address.and_then(UsageChart::from_address) {
             self.ask(chart, cx);
         }
+        self.refresh_running(cx);
     }
 
     fn streams(
@@ -1161,11 +1395,12 @@ impl System for AgentsSystem {
         name: &str,
         _endpoint: Option<EndpointId>,
         link: &Link,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
         self.links.insert(host, link.clone());
         self.registry.attach_host(host, name.to_owned());
         self.client.attach_host(host, name.to_owned());
+        self.refresh_running(cx);
         vec![self.client.stream(host), self.desktops.stream(host)]
     }
 
@@ -1173,6 +1408,7 @@ impl System for AgentsSystem {
         self.client.detach_host(host);
         self.links.remove(&host);
         self.sessions.remove(&host);
+        self.running.remove(&host);
         self.quotas.forget(host);
         self.usage.forget(host);
         cx.emit(UsageMoved::Host);
@@ -1180,75 +1416,19 @@ impl System for AgentsSystem {
         self.deleted(departed, cx);
     }
 
+    /// The commands about agents are on every screen once any host has
+    /// agents to act on; the screen says only which they act on.
     fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+        if self.registry.hosts().next().is_none() {
+            return Vec::new();
+        }
         let this = cx.entity();
-        if let Some(here) = AgentAddress::from_address(&point.surface) {
-            let mut rows = surface::steer_rows(this.clone(), here.agent);
-            rows.extend(self.agent_rows(here, cx));
-            return rows;
-        }
-        let mut rows = Vec::new();
-        // A thread draft can identify its worker without changing what
-        // mail, notes, and verdicts see as the subject. The `with` line
-        // already names an agent directly.
-        let steering = match &point.subject {
-            Subject::Draft { worker } => *worker,
-            _ => point
-                .subject()
-                .and_then(AgentAddress::from_address)
-                .and_then(|AgentAddress { agent, part }| {
-                    (part == Part::Transcript).then_some(agent)
-                }),
-        }
-        .filter(|agent| self.registry.mirrored(*agent).is_some());
-        if let Some(agent) = steering {
-            rows.extend(surface::steer_rows(this.clone(), agent));
-        }
+        let mut rows = commands::rows(this.clone(), self.here(point, cx));
         let Some(thread) = self.thread_at(point, cx) else {
             return rows;
         };
         if self.host_of(thread.host).is_none() {
             return rows;
-        }
-        let (desk, mail) = {
-            let system = self.mail.read(cx);
-            let here = system.thread_of(&point.surface);
-            let chat = system.host_chat(thread.host);
-            let desk = here.is_none();
-            let author = |mail: &Message| match mail.from {
-                Party::Agent(agent) | Party::System { agent, .. } => Some(agent),
-                _ => None,
-            };
-            let written = chat.and_then(|chat| {
-                let mail = if desk {
-                    std::iter::once(thread.message)
-                        .chain(chat.children(Some(thread.message)).iter().copied())
-                        .filter_map(|id| chat.message(id))
-                        .filter(|mail| author(mail).is_some() && !chat.agent_only(mail.id))
-                        .max_by_key(|mail| mail.version().0)
-                } else {
-                    chat.message(thread.message)
-                }?;
-                Some((author(mail)?, mail.clone()))
-            });
-            (desk, written)
-        };
-        if let Some((agent, mail)) = mail
-            && self.registry.mirrored(agent).is_some()
-        {
-            if desk {
-                let system = self.mail.clone();
-                rows.push(Row::run("", "look into the work", move |_, _, cx| {
-                    system.update(cx, |_, cx| {
-                        cx.emit(MailEvent::Inspect {
-                            agent,
-                            mail: mail.clone(),
-                        })
-                    });
-                }));
-            } else if steering.is_none() && !matches!(point.subject, Subject::Draft { .. }) {
-                rows.extend(surface::steer_rows(this.clone(), agent));
-            }
         }
         let draft = self
             .mail
@@ -1278,12 +1458,16 @@ impl System for AgentsSystem {
         if let Some(chart) = UsageChart::from_address(address) {
             return Some((chart.title(), "usage".to_owned()));
         }
-        let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
-        self.registry.mirrored(agent)?;
-        let (label, host) = self.label(agent);
-        Some(match part {
+        if let Some(scope @ Scope::Workset(_)) = Scope::from_address(address) {
+            let (lead, _) = self.scope_agents(scope)?;
+            return Some(self.label(lead));
+        }
+        let at = AgentAddress::from_address(address)?;
+        self.registry.mirrored(at.agent)?;
+        let (label, host) = self.label(at.agent);
+        Some(match at.part {
             Part::Transcript => (label, host),
-            part => (format!("{label} · {part}"), host),
+            _ => (self.tool_title(&at), host),
         })
     }
 
@@ -1292,47 +1476,96 @@ impl System for AgentsSystem {
         Some(self.label(agent).0)
     }
 
+    /// Every workset's transcript, by its lead, and every terminal, shell
+    /// and desktop that runs, by its agent: a running tool is a place.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
-        let agents = self.registry.known_agents().copied().map(|agent| {
-            let (title, host) = self.label(agent);
-            let facts = self.registry.agent_facts(agent);
-            Found {
-                address: AgentRef(agent).address(),
-                title,
-                description: match facts
-                    .runtime
-                    .as_ref()
-                    .map(|heard| heard.state.activity().word())
-                {
-                    Some(word) => format!("{host} · {word}"),
-                    None => host,
-                },
-                thread: None,
-                recency: self.registry.agent_last_active(agent).map_or(0, |at| at.0),
+        let mut worksets: HashMap<WorksetId, Vec<AgentId>> = HashMap::new();
+        for agent in self.registry.known_agents().copied() {
+            if let Some(workset) = self.registry.agent_workset(agent) {
+                worksets.entry(workset).or_default().push(agent);
             }
+        }
+        let transcripts = worksets.into_iter().filter_map(|(workset, agents)| {
+            let (lead, _) = self.scope_agents(Scope::Workset(workset))?;
+            let (title, host) = self.label(lead);
+            let mut description = vec![host];
+            description.extend(
+                self.registry
+                    .agent_facts(lead)
+                    .runtime
+                    .map(|heard| heard.state.activity().word().to_owned()),
+            );
+            if agents.len() > 1 {
+                description.push(format!("{} agents", agents.len()));
+            }
+            Some(Found {
+                address: Scope::Workset(workset).address(),
+                title,
+                description: description.join(" · "),
+                thread: None,
+                recency: agents
+                    .iter()
+                    .filter_map(|agent| self.registry.agent_last_active(*agent))
+                    .map(|at| at.0)
+                    .max()
+                    .unwrap_or(0),
+            })
         });
+        let attached = |host: &HostId| self.links.contains_key(host);
+        let terminals = self
+            .running
+            .iter()
+            .filter(|(host, _)| attached(host))
+            .flat_map(|(host, running)| {
+                running.terminals.iter().filter_map(move |info| {
+                    let owner = self.tool_owner(*host, &info.agent)?;
+                    Some((
+                        AgentAddress::terminal(owner, info.terminal_id),
+                        info.title.clone(),
+                    ))
+                })
+            });
+        let shells = self
+            .running
+            .iter()
+            .filter(|(host, _)| attached(host))
+            .flat_map(|(host, running)| {
+                running.shells.iter().filter_map(move |info| {
+                    Some((
+                        AgentAddress::shell(self.tool_owner(*host, &info.agent)?),
+                        String::new(),
+                    ))
+                })
+            });
         let desktops = self
             .sessions
             .iter()
-            .flat_map(|(host, sessions)| sessions.iter().map(move |session| (*host, session)))
-            .filter_map(|(host_id, session)| {
-                let agent = AgentId::from_encoded(&session.agent).ok()?;
-                if self.registry.host_of_agent(agent) != Some(host_id)
-                    || !self.links.contains_key(&host_id)
-                {
-                    return None;
-                }
-                let (title, host) = self.label(agent);
-                Some(Found {
-                    address: AgentAddress::desktop(agent, session.name.clone())?.address(),
-                    title: format!("{title} · desktop {}", session.name),
-                    description: host,
-                    thread: None,
-                    recency: 0,
+            .filter(|(host, _)| attached(host))
+            .flat_map(|(host, sessions)| {
+                sessions.iter().filter_map(move |session| {
+                    let owner = self.tool_owner(*host, &session.agent)?;
+                    Some((
+                        AgentAddress::desktop(owner, session.name.clone())?,
+                        String::new(),
+                    ))
                 })
             });
-        agents
-            .chain(desktops)
+        let tools = terminals.chain(shells).chain(desktops).map(|(at, shows)| {
+            let host = self.label(at.agent).1;
+            let mut title = self.tool_title(&at);
+            if !shows.is_empty() {
+                title = format!("{title} · {shows}");
+            }
+            Found {
+                address: at.address(),
+                title,
+                description: host,
+                thread: None,
+                recency: 0,
+            }
+        });
+        transcripts
+            .chain(tools)
             .chain(UsageChart::all().map(|chart| Found {
                 address: chart.address(),
                 title: format!("usage › {}", chart.title()),
@@ -1342,4 +1575,18 @@ impl System for AgentsSystem {
             }))
             .collect()
     }
+}
+
+/// The terminals and shells a host said run.
+#[derive(Default)]
+struct Running {
+    terminals: Vec<TerminalInfo>,
+    shells: Vec<ShellInfo>,
+}
+
+/// Whom a transcript screen is named after: its workset's lead, and the
+/// agent whose folder and runtime it shows.
+pub(super) struct ScopeName {
+    pub workset: AgentId,
+    pub shown: AgentId,
 }

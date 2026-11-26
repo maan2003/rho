@@ -1,8 +1,8 @@
 //! Terminals as the frame shows them.
 //!
 //! A terminal hangs under its agent: the agents system opens a
-//! [`TerminalSurface`] for `agent:<id>/term/<n>`, and offers the rows that
-//! start one. Terminals keep no stream to a host: each surface dials its
+//! [`TerminalSurface`] for `agent:<id>/term/<n>`, and its commands start
+//! or pick one. Terminals keep no stream to a host: each surface dials its
 //! terminal when it opens and drops the attachment when it closes, and the
 //! terminal keeps running on the host.
 
@@ -15,19 +15,7 @@ use rho_frame::keys::{self, GuestEscape, Live, Normal, SearchForward};
 use rho_frame::{CardHere, Mode, Surface};
 use theme::ActiveTheme as _;
 
-use crate::protocol::TerminalInfo;
 use crate::{TerminalModel, TerminalPaste, TerminalView, channel};
-
-/// Which of an agent's terminals to open, given the ones that run: with
-/// `new` a fresh id past them all, else the first that runs, or `0` when
-/// none does.
-pub fn pick_terminal(running: &[TerminalInfo], new: bool) -> u64 {
-    match (new, running.first()) {
-        (true, _) => channel::next_terminal_id(running),
-        (false, Some(info)) => info.terminal_id,
-        (false, None) => 0,
-    }
-}
 
 /// What a terminal surface stands on.
 enum State {
@@ -309,34 +297,5 @@ pub fn bind_keys(cx: &mut App) {
             KeyBinding::new("a", Live, Some(&context)),
             KeyBinding::new("enter", NoAction, Some(&context)),
         ]);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn info(agent: &str, terminal_id: u64) -> TerminalInfo {
-        TerminalInfo {
-            agent: agent.to_owned(),
-            terminal_id,
-            title: String::new(),
-            cols: 80,
-            rows: 24,
-            clients: 0,
-        }
-    }
-
-    #[test]
-    fn an_agent_opens_its_first_terminal_or_a_fresh_one() {
-        let running = [info("eng-ht08", 2), info("eng-ht08", 5)];
-        assert_eq!(pick_terminal(&running, false), 2, "the first running");
-        assert_eq!(
-            pick_terminal(&running, true),
-            6,
-            "one past the highest, not past the first"
-        );
-        assert_eq!(pick_terminal(&[], false), 0);
-        assert_eq!(pick_terminal(&[], true), 0);
     }
 }

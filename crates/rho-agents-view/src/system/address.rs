@@ -3,14 +3,63 @@
 
 use std::fmt;
 
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, WorksetId};
 use rho_chat::AgentRef;
-use rho_frame::Addressed;
+use rho_frame::{Address, Addressed};
+
+/// What a transcript screen shows: a workset's work, every agent of it
+/// merged, or the same work narrowed to one agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// `workset:<id>`.
+    Workset(WorksetId),
+    /// `agent:<id>`: the agent's workset, narrowed to it.
+    Agent(AgentId),
+}
+
+impl Scope {
+    pub fn address(self) -> Address {
+        match self {
+            Self::Workset(workset) => WorksetAddress(workset).address(),
+            Self::Agent(agent) => AgentAddress::transcript(agent).address(),
+        }
+    }
+
+    pub fn from_address(address: &Address) -> Option<Self> {
+        if let Some(WorksetAddress(workset)) = WorksetAddress::from_address(address) {
+            return Some(Self::Workset(workset));
+        }
+        match AgentAddress::from_address(address)? {
+            AgentAddress {
+                agent,
+                part: Part::Transcript,
+            } => Some(Self::Agent(agent)),
+            _ => None,
+        }
+    }
+}
+
+/// `workset:<id>`: a workset's transcript. A workset id is six random
+/// bytes, so like an agent's it names one workset across hosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WorksetAddress(pub WorksetId);
+
+impl Addressed for WorksetAddress {
+    const KIND: &'static str = "workset";
+
+    fn rest(&self) -> String {
+        self.0.to_string()
+    }
+
+    fn from_rest(rest: &str) -> Option<Self> {
+        rest.parse().ok().map(Self)
+    }
+}
 
 /// What of an agent an `agent:` address opens.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Part {
-    /// `agent:<id>`: the transcript.
+    /// `agent:<id>`: its workset's transcript, narrowed to the agent.
     Transcript,
     /// `agent:<id>/term/<n>`: terminal `n` of the agent's workset.
     Terminal(u64),
@@ -108,6 +157,26 @@ mod tests {
 
     fn agent() -> AgentId {
         AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(7)).unwrap()
+    }
+
+    #[test]
+    fn a_workset_and_its_narrowing_read_back_as_scopes() {
+        let workset: WorksetId = "0123456789ab".parse().unwrap();
+        let address = Scope::Workset(workset).address();
+        assert_eq!(address.key(), "workset:0123456789ab");
+        assert_eq!(Scope::from_address(&address), Some(Scope::Workset(workset)));
+        let narrowed = Scope::Agent(agent()).address();
+        assert_eq!(narrowed, AgentAddress::transcript(agent()).address());
+        assert_eq!(Scope::from_address(&narrowed), Some(Scope::Agent(agent())));
+        // A tool under an agent is no transcript.
+        assert_eq!(
+            Scope::from_address(&AgentAddress::shell(agent()).address()),
+            None
+        );
+        for bad in ["workset:0123456789", "workset:0123456789AB", "workset:"] {
+            let read = Address::parse(bad).and_then(|address| Scope::from_address(&address));
+            assert_eq!(read, None, "{bad}");
+        }
     }
 
     #[test]

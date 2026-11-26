@@ -1,19 +1,26 @@
 //! The transcripts this client holds open.
 //!
 //! An agent's transcript is two things joined: the fold of its workset rows
-//! and the runtime's live tail. Both land in one rendered state per agent,
-//! which is what a screen draws. Which agents are held open is the same
-//! question as which agents this client asks the model thread for rows
-//! about, so it is answered here.
+//! and the runtime's live tail. Both land in one rendered state per agent.
+//! A screen draws a [`Scope`]: a workset's agents, or one of them. Its
+//! blocks are its agents' merged in the order of the workset rows that
+//! told them, with a heading wherever the work turns from one agent to
+//! another. Which agents are held open is the same question as which
+//! agents this client asks the model thread for rows about, so it is
+//! answered here.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use rho_agent_types::{AgentId, Wpos};
 use rho_agents_client::TranscriptFold;
 use rho_agents_client::protocol::transcript::Draft;
 use rho_agents_client::protocol::worksets::LogEvent;
-use rho_agents_client::state::UiAgentState;
-use rho_agents_client::store::{AgentStore, FrameSummary};
+use rho_agents_client::state::{UiAgentState, UiAgentStatus, UiBlock};
+use rho_agents_client::store::{AgentStore, FrameSummary, IncrementalUpdate, summarize, turn_open};
+
+use crate::render::block_visible;
+use crate::system::Scope;
 
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
@@ -30,18 +37,180 @@ pub enum TranscriptFrame {
 
 /// What a frame did, for a caller deciding what to redraw.
 pub struct FrameChange {
-    pub summary: FrameSummary,
+    /// What moved in each view that shows the agent.
+    pub views: Vec<(Scope, FrameSummary)>,
     /// The frame came from the runtime, so the agent is live.
     pub was_live: bool,
 }
 
 #[derive(Default)]
 pub struct Transcripts {
-    /// The rendered state per agent: what a screen draws.
+    /// The rendered state per agent.
     store: AgentStore,
     /// The transcript fold of every agent held open, in memory, so a row
     /// folds into it without waiting on the disk copy.
     open: HashMap<AgentId, TranscriptFold>,
+    /// What each open screen draws.
+    views: HashMap<Scope, View>,
+}
+
+/// Where a block stands among the workset's rows. What the runtime is
+/// still saying comes after everything told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Order {
+    Told(Wpos),
+    Live,
+}
+
+/// A screen's blocks: its agents' transcripts, merged.
+struct View {
+    /// The agent whose work needs no heading: the one the screen is
+    /// named after and whose brief it shows.
+    lead: AgentId,
+    /// The agents merged; equal places go to the one listed first.
+    agents: Vec<AgentId>,
+    state: UiAgentState,
+    /// Where each block of each agent stands in `state.blocks`.
+    placed: HashMap<AgentId, Vec<usize>>,
+    /// Where each heading stands in `state.blocks`, and whose it is.
+    headings: Vec<(usize, AgentId)>,
+}
+
+impl View {
+    fn new(lead: AgentId, agents: Vec<AgentId>) -> Self {
+        Self {
+            lead,
+            placed: agents.iter().map(|agent| (*agent, Vec::new())).collect(),
+            agents,
+            state: UiAgentState {
+                blocks: Vec::new(),
+                status: UiAgentStatus::Idle,
+                runtime: None,
+                context_used: None,
+                usage: Default::default(),
+            },
+            headings: Vec::new(),
+        }
+    }
+
+    /// The first block that can move when `agent`'s blocks move from
+    /// `from` on: the one after its last block that did not. Every block
+    /// before it was placed without looking at the blocks that moved.
+    fn start_of(&self, agent: AgentId, from: usize) -> Option<usize> {
+        let placed = self.placed.get(&agent)?;
+        Some(match from.checked_sub(1) {
+            None => 0,
+            Some(kept) => placed
+                .get(kept)
+                .map_or(self.state.blocks.len(), |at| at + 1),
+        })
+    }
+
+    /// Merges again from block `from` on, keeping the blocks before it as
+    /// the pointers they are. Answers what moved.
+    fn merge_from(
+        &mut self,
+        from: usize,
+        store: &AgentStore,
+        folds: &HashMap<AgentId, TranscriptFold>,
+    ) -> FrameSummary {
+        let from = from.min(self.state.blocks.len());
+        let old_status = self.state.status;
+        let old_tail = self.state.blocks.split_off(from);
+        let kept = self.headings.partition_point(|(at, _)| *at < from);
+        self.headings.truncate(kept);
+        let mut speaker = self.headings.last().map_or(self.lead, |(_, agent)| *agent);
+        let sources: Vec<(AgentId, &[Arc<UiBlock>])> = self
+            .agents
+            .iter()
+            .map(|agent| {
+                let blocks = store.get(agent).map_or(&[][..], |state| &state.blocks[..]);
+                (*agent, blocks)
+            })
+            .collect();
+        let mut heads: Vec<usize> = sources
+            .iter()
+            .map(|(agent, _)| {
+                let placed = self.placed.entry(*agent).or_default();
+                let held = placed.partition_point(|at| *at < from);
+                placed.truncate(held);
+                held
+            })
+            .collect();
+        let order = |agent: &AgentId, index: usize| {
+            folds
+                .get(agent)
+                .and_then(|fold| fold.position(index))
+                .map_or(Order::Live, Order::Told)
+        };
+        let mut last = None;
+        loop {
+            let next = sources
+                .iter()
+                .enumerate()
+                .filter(|(rank, (_, blocks))| heads[*rank] < blocks.len())
+                .min_by_key(|(rank, (agent, _))| (order(agent, heads[*rank]), *rank))
+                .map(|(rank, _)| rank);
+            let Some(rank) = next else {
+                break;
+            };
+            let (agent, blocks) = sources[rank];
+            let block = &blocks[heads[rank]];
+            if agent != speaker && block_visible(block) {
+                self.headings.push((self.state.blocks.len(), agent));
+                self.state
+                    .blocks
+                    .push(Arc::new(UiBlock::AgentHeading { agent }));
+                speaker = agent;
+            }
+            if let Some(placed) = self.placed.get_mut(&agent) {
+                placed.push(self.state.blocks.len());
+            }
+            self.state.blocks.push(block.clone());
+            heads[rank] += 1;
+            last = Some(agent);
+        }
+        // The screen is as busy as whoever spoke last; with nothing said
+        // yet, as its lead.
+        let last = self
+            .agents
+            .iter()
+            .filter_map(|agent| Some((*self.placed.get(agent)?.last()?, *agent)))
+            .max()
+            .map(|(_, agent)| agent)
+            .or(last)
+            .unwrap_or(self.lead);
+        if let Some(state) = store.get(&last) {
+            self.state.status = state.status;
+            self.state.runtime = state.runtime.clone();
+            self.state.context_used = state.context_used;
+            self.state.usage = state.usage.clone();
+        } else {
+            self.state.status = UiAgentStatus::Idle;
+            self.state.runtime = None;
+        }
+        let mut summary = summarize(&old_tail, &self.state.blocks[from..]);
+        if let Some(index) = &mut summary.first_changed_block {
+            *index += from;
+        }
+        if let Some(
+            IncrementalUpdate::AssistantText { index }
+            | IncrementalUpdate::MessageDraft { index }
+            | IncrementalUpdate::ReasoningText { index }
+            | IncrementalUpdate::Tool { index },
+        ) = &mut summary.incremental
+        {
+            *index += from;
+        }
+        // Ending or opening a turn changes how its last block is drawn.
+        if turn_open(old_status) != turn_open(self.state.status) && !self.state.blocks.is_empty() {
+            summary = summary.merge(FrameSummary {
+                first_changed_block: Some(self.state.blocks.len() - 1),
+                incremental: None,
+            });
+        }
+        summary
+    }
 }
 
 impl Transcripts {
@@ -77,6 +246,40 @@ impl Transcripts {
             .retain(|agent_id| open.contains_key(&agent_id) || keep(agent_id));
     }
 
+    /// What the screen of `scope` draws, once [`Self::show`] made it.
+    pub fn view(&self, scope: &Scope) -> Option<&UiAgentState> {
+        self.views.get(scope).map(|view| &view.state)
+    }
+
+    /// Shows `scope` as the merge of `agents`, headed by `lead`, each
+    /// opened with [`Self::seed`] first. A view already showing them is
+    /// left as it is; one whose agents changed is merged again. Answers
+    /// what moved.
+    pub fn show(&mut self, scope: Scope, lead: AgentId, agents: Vec<AgentId>) -> FrameSummary {
+        if let Some(view) = self.views.get(&scope)
+            && view.lead == lead
+            && view.agents == agents
+        {
+            return FrameSummary::nothing();
+        }
+        let old = self
+            .views
+            .remove(&scope)
+            .map(|view| view.state.blocks)
+            .unwrap_or_default();
+        let mut view = View::new(lead, agents);
+        view.merge_from(0, &self.store, &self.open);
+        let summary = summarize(&old, &view.state.blocks);
+        self.views.insert(scope, view);
+        summary
+    }
+
+    /// Lets go of a screen's view; the agents it showed stay open until
+    /// [`Self::forget`].
+    pub fn hide(&mut self, scope: &Scope) {
+        self.views.remove(scope);
+    }
+
     /// Lets go of one agent's transcript, held state and all.
     pub fn forget(&mut self, agent_id: AgentId) {
         self.open.remove(&agent_id);
@@ -87,19 +290,25 @@ impl Transcripts {
     /// its rows. An agent with nothing read yet opens empty, so the rows
     /// that follow land in it. The live frame rides on its tail.
     ///
-    /// Answers whether it opened one; an agent already open is left as it
-    /// was.
-    pub fn seed(&mut self, agent_id: AgentId, rows: &[(Wpos, LogEvent)]) -> bool {
+    /// Answers what moved on each view that shows the agent when it
+    /// opened one, and `None` for an agent already open, which is left as
+    /// it was.
+    pub fn seed(
+        &mut self,
+        agent_id: AgentId,
+        rows: &[(Wpos, LogEvent)],
+    ) -> Option<Vec<(Scope, FrameSummary)>> {
         if self.open.contains_key(&agent_id) {
-            return false;
+            return None;
         }
         let mut fold = TranscriptFold::new(agent_id, rows);
+        fold.delta();
+        let state = fold.state();
+        // In before the views merge it: they order its blocks by the fold.
+        self.open.insert(agent_id, fold);
         // The one time a transcript is handed whole: nothing was here to
         // append to. Every telling after this hands the rows it moved.
-        self.store.set_fold(agent_id, fold.state());
-        fold.delta();
-        self.open.insert(agent_id, fold);
-        true
+        Some(self.apply(agent_id, TranscriptFrame::Fold(state)).views)
     }
 
     /// An open transcript folded again from everything read of it, when
@@ -141,7 +350,8 @@ impl Transcripts {
         self.store.disconnect(agent_id)
     }
 
-    /// Lands one frame on an agent's rendered state.
+    /// Lands one frame on an agent's rendered state, and on every view
+    /// that shows the agent.
     pub fn apply(&mut self, agent_id: AgentId, frame: TranscriptFrame) -> FrameChange {
         let (summary, was_live) = match frame {
             TranscriptFrame::Live(live) => (self.store.apply_live(agent_id, live), true),
@@ -149,7 +359,18 @@ impl Transcripts {
             TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
             TranscriptFrame::Runtime(state) => (self.store.set_runtime(agent_id, state), false),
         };
-        FrameChange { summary, was_live }
+        let views = match summary.first_changed_block {
+            None => Vec::new(),
+            Some(from) => self
+                .views
+                .iter_mut()
+                .filter_map(|(scope, view)| {
+                    let start = view.start_of(agent_id, from)?;
+                    Some((*scope, view.merge_from(start, &self.store, &self.open)))
+                })
+                .collect(),
+        };
+        FrameChange { views, was_live }
     }
 }
 
@@ -157,6 +378,7 @@ impl Transcripts {
 mod tests {
     use rho_agent_types::{ChatSeq, MessageId, Role, UnixMs};
     use rho_agents_client::protocol::worksets::{InputView, LogEvent};
+    use rho_agents_client::store::FrameSummary;
 
     use super::*;
 
@@ -214,7 +436,7 @@ mod tests {
         assert!(!transcripts.is_open(&agent_id));
 
         let opened = transcripts.seed(agent_id, &turn(0, 0, "first", 1));
-        assert!(opened);
+        assert!(opened.is_some());
         assert!(transcripts.is_open(&agent_id));
         assert_eq!(
             transcripts.open_agents(),
@@ -266,9 +488,14 @@ mod tests {
     fn a_transcript_is_handed_whole_once() {
         let mut transcripts = Transcripts::default();
         let agent_id = agent();
-        assert!(transcripts.seed(agent_id, &[]), "a fresh agent opens empty");
         assert!(
-            !transcripts.seed(agent_id, &turn(0, 0, "again", 1)),
+            transcripts.seed(agent_id, &[]).is_some(),
+            "a fresh agent opens empty"
+        );
+        assert!(
+            transcripts
+                .seed(agent_id, &turn(0, 0, "again", 1))
+                .is_none(),
             "already open"
         );
         let delta = transcripts
@@ -291,7 +518,7 @@ mod tests {
         let agent_id = agent();
         let first = turn(0, 0, "first", 1);
         let second = turn(1, 2, "second", 5);
-        assert!(transcripts.seed(agent_id, &[]));
+        assert!(transcripts.seed(agent_id, &[]).is_some());
         let delta = transcripts.refold(agent_id, &second).expect("rows land");
         transcripts.apply(agent_id, TranscriptFrame::Folded(delta));
         assert_eq!(texts(&transcripts), ["second"]);
@@ -317,5 +544,171 @@ mod tests {
                 .is_none()
         );
         assert!(transcripts.state(&agent()).is_none());
+    }
+    fn workset() -> Scope {
+        Scope::Workset("0123456789ab".parse().unwrap())
+    }
+
+    /// What `agent` said at `pos`: one reply of one text.
+    fn said(agent: AgentId, pos: u64, text: &str) -> (Wpos, LogEvent) {
+        (
+            Wpos(pos),
+            LogEvent::Replied {
+                agent,
+                items: vec![rho_agents_client::protocol::transcript::Item::Text {
+                    text: text.to_owned(),
+                    phase: None,
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(pos),
+            },
+        )
+    }
+
+    /// A view as lines: whose heading, or what was said.
+    fn lines(transcripts: &Transcripts, scope: &Scope) -> Vec<String> {
+        transcripts
+            .view(scope)
+            .expect("a shown view")
+            .blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                UiBlock::AgentHeading { agent } if *agent == self::agent() => {
+                    Some("# lead".to_owned())
+                }
+                UiBlock::AgentHeading { .. } => Some("# helper".to_owned()),
+                UiBlock::AssistantMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Lands what a telling moved, as the system does, and answers what
+    /// moved on `scope`.
+    fn tell(
+        transcripts: &mut Transcripts,
+        scope: &Scope,
+        agent: AgentId,
+        rows: &[(Wpos, LogEvent)],
+    ) -> FrameSummary {
+        let delta = transcripts.refold(agent, rows).expect("the rows are new");
+        transcripts
+            .apply(agent, TranscriptFrame::Folded(delta))
+            .views
+            .into_iter()
+            .find(|(moved, _)| moved == scope)
+            .map_or(FrameSummary::nothing(), |(_, summary)| summary)
+    }
+
+    /// A workset's transcript is one chronological log: the agents' work
+    /// interleaves by the row that told it, and a heading names whoever
+    /// takes over. Narrowed to one agent, it is that agent's alone.
+    #[test]
+    fn a_workset_merges_its_agents_in_the_order_they_worked() {
+        let (lead, helper) = (agent(), other());
+        let mut transcripts = Transcripts::default();
+        transcripts.seed(lead, &[said(lead, 0, "plan"), said(lead, 4, "review")]);
+        transcripts.seed(helper, &[said(helper, 2, "patch")]);
+        transcripts.show(workset(), lead, vec![lead, helper]);
+        transcripts.show(Scope::Agent(helper), helper, vec![helper]);
+        assert_eq!(
+            lines(&transcripts, &workset()),
+            ["plan", "# helper", "patch", "# lead", "review"]
+        );
+        assert_eq!(lines(&transcripts, &Scope::Agent(helper)), ["patch"]);
+
+        // The helper works on after the lead: appended, under its heading.
+        let moved = tell(
+            &mut transcripts,
+            &workset(),
+            helper,
+            &[said(helper, 6, "tested")],
+        );
+        assert_eq!(
+            lines(&transcripts, &workset()),
+            [
+                "plan", "# helper", "patch", "# lead", "review", "# helper", "tested"
+            ]
+        );
+        assert_eq!(
+            moved.first_changed_block,
+            Some(5),
+            "what stood before the helper's new work is not drawn again"
+        );
+        assert_eq!(
+            lines(&transcripts, &Scope::Agent(helper)),
+            ["patch", "tested"]
+        );
+    }
+
+    /// An agent's own transcript costs what its rows change, as before
+    /// worksets: appending a step re-merges nothing before it, and a
+    /// growing reply keeps its in-place update.
+    #[test]
+    fn one_agent_view_moves_only_what_its_agent_moved() {
+        let lead = agent();
+        let mut transcripts = Transcripts::default();
+        transcripts.seed(lead, &[said(lead, 0, "one"), said(lead, 1, "two")]);
+        let scope = Scope::Agent(lead);
+        let shown = transcripts.show(scope, lead, vec![lead]);
+        assert_eq!(
+            shown.first_changed_block,
+            Some(0),
+            "a new view is drawn whole"
+        );
+        let held = transcripts.view(&scope).unwrap().blocks.len();
+        assert_eq!(
+            transcripts.show(scope, lead, vec![lead]),
+            FrameSummary::nothing(),
+            "showing it again moves nothing"
+        );
+        let moved = tell(&mut transcripts, &scope, lead, &[said(lead, 2, "three")]);
+        assert_eq!(moved.first_changed_block, Some(held));
+        assert_eq!(lines(&transcripts, &scope), ["one", "two", "three"]);
+    }
+
+    /// A rewind takes back the helper's step from the merge and the
+    /// heading that only stood for it.
+    #[test]
+    fn a_rewind_takes_back_its_steps_and_their_heading() {
+        let (lead, helper) = (agent(), other());
+        let mut transcripts = Transcripts::default();
+        transcripts.seed(lead, &[said(lead, 0, "plan")]);
+        transcripts.seed(helper, &[said(helper, 2, "wrong turn")]);
+        transcripts.show(workset(), lead, vec![lead, helper]);
+        assert_eq!(
+            lines(&transcripts, &workset()),
+            ["plan", "# helper", "wrong turn"]
+        );
+        let rewound = (
+            Wpos(3),
+            LogEvent::Rewound {
+                agent: helper,
+                to: Wpos(2),
+                at: UnixMs(3),
+            },
+        );
+        let moved = tell(&mut transcripts, &workset(), helper, &[rewound]);
+        assert_eq!(lines(&transcripts, &workset()), ["plan"]);
+        assert!(moved.first_changed_block.is_some());
+    }
+
+    /// An agent that joins the workset is merged in where its work
+    /// stands, not appended after everything shown.
+    #[test]
+    fn an_agent_joining_is_merged_in_place() {
+        let (lead, helper) = (agent(), other());
+        let mut transcripts = Transcripts::default();
+        transcripts.seed(lead, &[said(lead, 0, "plan"), said(lead, 9, "merged")]);
+        transcripts.show(workset(), lead, vec![lead]);
+        transcripts.seed(helper, &[said(helper, 5, "patch")]);
+        let moved = transcripts.show(workset(), lead, vec![lead, helper]);
+        assert_eq!(
+            lines(&transcripts, &workset()),
+            ["plan", "# helper", "patch", "# lead", "merged"]
+        );
+        assert_eq!(moved.first_changed_block, Some(1));
     }
 }
