@@ -15,13 +15,14 @@ day: Know what wants them, and where they were.
 ## concept Desk
 purpose: show what wants the user, and where to put the next idea.
 principle: the user comes back after lunch, sees three things waiting, and deals the first.
-sees: `N wait` and up to seven `deal.Card` rows, in the deal’s order, each a subject and a project, with the thread's latest `chat.Flash` while it is fresh, then `and N more` for the rest.
+sees: `N wait` and up to seven `deal.Card` rows, in the deal's order, each a subject and a project, with the thread's latest `chat.Flash` while it is fresh, then `and N more` for the rest.
 does:
 - open `tab`: show the desk, as `window.Screen`
 - deal `space`: open the first waiting card
 - open a row `enter` or one tap: open the selected card; the waiting overflow opens the first hidden card
 - write an idea `i` on any row: open the idea draft, as `chat.Write an idea`
-- narrow: show only one `chat.Project`'s waiting rows, chosen by name, with where the project works, its mode and its runtime in the top line, such as `tide@lab · on tide · one agent · sol-high`; a project has no screen of its own
+rejected:
+- a narrowed Desk screen per `chat.Project` · 2026-11-26 · Desk is one global glance of what waits; filtering by project belongs in `window.Palette`
 
 ## screen Desk
 answers: what needs the user now?
@@ -42,6 +43,7 @@ keys:
 - `tab`: `window.Screen`
 - `:`: `window.Palette`, which leaves out what waits here, since it is already in view
 starts: `Glance at what waits`, `deal.Clear what waits`, `chat.Write an idea`, `window.Go to something by name`
+captures: [the desk on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
 rejected:
 - `asks · 2h` and `result · 8m` words and ages on the rows · 2026-11-20 · the Desk is a glance; the deal says why and since when, one card at a time
 - an unread mark on what changed since the last glance · 2026-11-20 · the same reason
@@ -49,39 +51,6 @@ rejected:
 - `moving`, up to ten threads that are not waiting with the project's latest words · 2026-11-21 · the owner reads what waits and nothing else at a glance; what moves is one name away in `window.Palette`, where a thread row still shows the project's latest words
 
 On the phone, rows keep their place while the Desk is on screen, so a row does not move under the thumb; a new order shows when the Desk opens again.
-
-Built renders: [the desk on the laptop](design/laptop-desk.png) and [on the phone](design/phone-desk.png).
-
-mock:
-```text
-desk                                                                        NOR
-
-15 wait
-Flaky clock test  tide@lab
-Release window  slack@harness
-reef@lab  6 failed
-Switch the model runtime  dune@lab
-Limit the retry window  mire@lab
-Rename the fixture  sand@lab
-Shoreline import  shoal@lab
-and 3 more · clock@lab
-```
-
-mock, phone:
-```text
-desk                               NOR
-15 wait
-Flaky clock test               tide@lab
-Release window            slack@harness
-reef@lab                       6 failed
-Switch the model runtime        dune@lab
-Limit the retry window         mire@lab
-Rename the fixture             sand@lab
-Shoreline import              shoal@lab
-and 3 more · clock@lab
-
-        menu        open        more
-```
 
 ## flow Glance at what waits
 runs: 30 a day
@@ -95,9 +64,6 @@ steps:
 system: counts and ranks waiting cards.
 user: what, if anything, to open.
 cases: nothing waits; more than seven cards; a cold return.
-reviewed: 2026-11-20 · laptop · reviewer · 1 finding
-
-The historical review was of Glance at what waits on Home.
 
 ## rule a cold return opens the desk
 when the user returns within ten minutes away, then their `window.Screen` is where they left it; after more than ten minutes away, the `Desk` is on screen. Away begins when the window loses the keyboard or the device goes idle.

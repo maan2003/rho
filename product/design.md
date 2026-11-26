@@ -55,12 +55,13 @@ looks: a single `top line` in `editor text` over the `reading surface`, with a `
 states:
 - ordinary: the screen's name in `reading text`, and the short mode word at the right; `INS` is in `keys in motion`.
 - card open: `waits` and the age sit beside the heading in `attention`.
+- working: `working` sits beside the heading in `quiet` while an agent runs and nothing waits.
 - attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing elsewhere is important enough.
 - host away: a named `lost connection` notice, or a count when more than one host is away.
 - unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
 - echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host warning keep their places.
-used on: `window.Screen`, including `desk.Desk`, `chat.Project`, `chat.Thread`, and `agents.Agent`.
-form: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [agent with its host, folder and activity](design/laptop-agent.png).
+used on: `window.Screen`, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `browser.Page`, `notes.Notes`, and `usage.Chart`.
+captures: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [transcript with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
 purpose: answer the action the user just took without opening anything.
@@ -69,18 +70,17 @@ states:
 - quiet: absent; the normal heading is in view.
 - answer or refusal: the first line of the latest notice appears in the same place and color, then goes; an open prompt clears it.
 used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
-form: [done echo back on Desk](design/laptop-echo.png).
+captures: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
 purpose: let the user pick a place, thread, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address; the project list can wrap its counts. The list uses `row air` before counts and centered dots between them. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
 states:
 - desk: a subject and a project address in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
-- project list: a thread name, with `emphasis` for unread, `attention` for mentions or a stopped agent, then mention, unread and reply counts, a status if present, and age.
 - prompt or palette: place rows use the Desk's columns with `row air` between them: subject, `attention` card words or the project's `quiet` latest words, and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. A command shows its name and its `quiet` key sequence, the name alone on a narrow window. Query matches use `marked`; the chosen row keeps its fill all the way across.
-- empty: Desk reads `0 wait` when no cards are due; the project list reads `no threads yet`; the palette shows `no match` when no row fits the query.
-used on: `desk.Desk`, `chat.Project`, and `window.Palette`.
-form: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), [narrow Desk](design/phone-project.png), and [matched palette row](design/laptop-prompt.png).
+- empty: Desk reads `0 wait` when no cards are due; the palette shows `no match` when no row fits the query.
+used on: `desk.Desk` and `window.Palette`.
+captures: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), and [matched palette row](design/laptop-prompt.png).
 
 ## part Message header
 purpose: identify who wrote the message and when, before the user reads its words.

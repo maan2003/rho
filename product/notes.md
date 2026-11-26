@@ -7,12 +7,12 @@ purpose: keep something the user wants to remember, in their own words, where no
 principle: the user thinks of something to check tomorrow; they run `new note` and type it; it is kept a moment after they stop typing; the next day they run `notes`, and it is at the top of the list.
 sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text.
 does:
-- new note, from the palette: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
+- new note, from `window.Palette`: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit
-- notes, from the palette: open `Notes`, which lists every note
+- notes, from `window.Palette`: open `Notes`, which lists every note
 - open `enter` on a note in `Notes`: open the note
 
-No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. A note left empty disappears from the list and the thread. While the note is still open, `u` restores the text and `shift-u` redoes the edit.
+No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. A note left empty disappears from the list and the thread. While the note is still open, `u` restores the text and `shift-u` redoes the edit. A standalone note is never a dealable `deal.Card`.
 
 While the user types a new note, the top line follows its first line as it is typed. A note is saved the moment the user leaves it.
 
@@ -21,7 +21,7 @@ purpose: let the user keep a remark on a `chat.Message` in its thread, where onl
 principle: a project messages a result the user doubts; they press `alt-r` on the message, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
 sees: directly under the message, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
 does:
-- reply privately `alt-r` on the message, or `reply privately` from the palette or phone menu: start writing beneath it; if the message already has a private reply, edit the latest one there
+- reply privately `alt-r` on the message, or `reply privately` from `window.Palette`: start writing beneath it; if the message already has a private reply, edit the latest one there
 - edit `enter` or a tap on an existing private reply: write in place; `escape`, or `keep` on the phone, returns to reading
 
 ## concept Find or start
@@ -29,7 +29,7 @@ purpose: find a `Note` by words the user remembers, or start one with those word
 principle: the user types `signed copy` and sees the note whose second line says to bring it; the words only become a new note if nothing matches and the user presses Enter.
 sees: `find or start:`, the words typed, and only the `Note` rows containing every word, in any order, anywhere in their text.
 does:
-- search `/` or tap: put the cursor in the line and type to narrow the list
+- search `/` or tap: put the cursor in the line and type to narrow the list, using standard `window.Prompt` editing keys (`ctrl-w`, `ctrl-u`, `ctrl-a`, `ctrl-n`, `ctrl-p`)
 - open `enter`: open the selected row; with no match, start a note with the typed text as its first line, in Insert
 - leave `escape`: move to the rows without opening either a match or a new note
 
@@ -44,29 +44,10 @@ states:
 - full: all nonempty notes, private replies too; on return from a note, the list picks that note if it is still there and shows all rows again
 keys:
 - `enter` or tap a row: open the picked note
-- `/` or tap `find or start:`: find by any words in a note
+- `/` or tap `find or start:`: find by any words in a note (with standard `window.Prompt` editing keys)
 - `down` and `up` in the query: pick a match
 - `o`, `i` with no notes, or `new` on the phone: start an empty note in Insert
 - `window.Screen.back`
-mock:
-```text
-notes                                                                      NOR
-find or start: words from a note
-  Ask Priya about the lease renewal  Bring the signed copy before Friday  · now
-  Check whether the brief was too vague  ↳ Could you clarify which behavior… · 4m
-```
-```text
-notes                              NOR
-find or start: words from a note
-  Ask Priya about the lease renewal
-  Bring the signed copy before Friday
-  · now
-  Check whether the brief was too
-  vague  ↳ Could you clarify which…
-  · 4m
-
-    back       desk       menu      new
-```
 starts: `Write something down`
 
 ## screen Note
@@ -84,19 +65,6 @@ keys:
 - `escape`: return to Normal
 - `u`, `shift-u`: undo and redo a text edit
 - `tab`, `window.Screen.back`: leave the note; the text is kept without a save step
-mock:
-```text
-Ask Priya about the lease renewal                                         INS
-Ask Priya about the lease renewal
-Bring the signed copy before Friday
-```
-```text
-Ask Priya about the lease renewal  INS
-Ask Priya about the lease renewal
-Bring the signed copy before Friday
-
-       back        desk        menu
-```
 starts: `Write something down`
 
 ## flow Write something down
@@ -112,8 +80,7 @@ steps:
 4. the user presses `tab` to leave; they find the note at the top the next time they open `Notes`
 system: keeps the text without a save step, and lists the note in `Notes` by when it was last written.
 user: every word of it.
-cases: the same note open on the laptop and the phone at once, where the newest text wins and text being typed is not replaced
-reviewed: 2026-11-20 · laptop · reviewer · 2 findings
+cases: the same note open on the laptop and the phone at once, where the newest text wins and text being typed is not replaced.
 
 ## flow Reply privately
 runs: 2 a week
@@ -127,7 +94,6 @@ steps:
 3. the user types the remark and presses `escape`; the remark stays under the message
 system: keeps the remark with the message on every device.
 user: the remark.
-reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## rule a note about nothing stays off the desk
 when a `Note` is about nothing, then it is listed in `Notes`, ordered by when it was last written, and is not on the `desk.Desk`.

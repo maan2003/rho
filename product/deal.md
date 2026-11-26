@@ -12,7 +12,7 @@ costs: the `desk.Desk` shows only the first cards; the rest are behind them.
 goal: the user clears what wants them and gets back to where they were.
 starts when: the user looks up after an hour in a terminal or a page.
 steps:
-1. the user sees what wants them and how much, `desk.Glance at what moves`
+1. the user sees what wants them and how much, `desk.Glance at what waits`
 2. the user clears it, `Clear what waits`
 3. the user goes back to where they were, as they left it, `window.Screen.back`
 done when: nothing waits and the user's place is on screen as they left it.
@@ -67,7 +67,6 @@ steps:
 system: orders cards from the message that pings and from stops; snoozed cards can come back.
 user: the reply or verdict, and the time for a snooze.
 cases: a result from days ago that has not been read; a stop reported as message; a snoozed card returns.
-reviewed: 2026-11-20 · laptop · reviewer · 4 findings
 
 ## rule a reply settles the card
 when the user replies to a `chat.Message` that waits, then its `Card` goes away. The reply is a message in the thread, read by every agent in it, and the card that goes is the one the user came from, which the deal remembers.

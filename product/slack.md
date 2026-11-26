@@ -32,14 +32,3 @@ does:
 - show chatter: show the latest chatter from starred channels as the project's latest words, a `chat.Flash`, not a waiting message
 
 The rest is Slack in a `browser.Page` under the user's own account. The user can return to it with a `browser.Bookmark`.
-
-Historical laptop walks of the signed-in Slack client, now superseded by the bot and the browser:
-
-Find something said in Slack:
-> reviewed: 2026-11-20 · laptop · reviewer · 2 findings
-
-Catch up after time away:
-> reviewed: 2026-11-20 · laptop · reviewer · 2 findings
-
-Connect a Slack workspace:
-> reviewed: 2026-11-20 · laptop · reviewer · 1 finding

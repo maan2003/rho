@@ -14,7 +14,7 @@ Ideas come to them anywhere, at the laptop or on the go. An idea must become an 
 
 The phone is the same window, smaller, used with one thumb and a bar of buttons along the bottom edge. They use it ten to twenty minutes a day. On a day away, it is all they have, and they keep working from it. They answer what wants them, read, and start new work. The phone is as powerful as the laptop. They never have to say they cannot do something from the phone. What is common is easy there. What is rare may take longer there.
 
-Both devices show the same places and the same hosts. Their verdicts, notes, and drafts are the same on both.
+Both devices show the same places and the same hosts. Their verdicts, notes, and bookmarks are the same on both. Unsent drafts stay on the device where they were written.
 
 One place fills the window. Two places side by side is an expert flow, used rarely and on purpose.
 

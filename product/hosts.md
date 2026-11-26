@@ -40,7 +40,7 @@ has:
 does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
 - detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its message comes back from the host when it is attached again; drafts and unsent message stay
-- status: the `hosts` menu lists each attached host with a number, such as `1 · rho · online`; picking one says its state on the echo line
+- status, from `window.Palette`: typing `hosts` lists each attached host with its state (`hosts › rho · online`); picking a disconnected or unenrolled host copies its enrollment command or triggers reconnect
 
 A host is reached in one of three ways:
 - on this machine, where being the same user on the same machine is the trust
@@ -74,7 +74,6 @@ steps:
 system: makes the phrase once, seals everything with it, refuses a phrase that does not open what the other devices wrote, and keeps no word of it in its history of prompts.
 user: keeping the phrase, and typing it once per device.
 cases: the user never pairs a device, and it keeps its own verdicts for good; the user puts the phrase away before writing it down, and `show my secret phrase` from the palette shows it again on any device that holds it
-reviewed: 2026-11-20 · laptop · reviewer · ok
 
 ## flow Attach a host
 runs: 1 a month
@@ -92,7 +91,6 @@ steps:
 system: remembers the host for the next start, reconnects by itself, and asks for the security key only once each time the window starts.
 user: the name, the touch of the key, and, without a link, the command on the host.
 cases: the phone, where typing the way to reach a host by thumb is long and a link saves it; a host on this machine, which needs no key
-reviewed: 2026-11-20 · laptop · reviewer · 2 findings
 
 ## flow Know my hosts are reachable
 runs: 1 a week
@@ -105,4 +103,3 @@ steps:
 2. if the user wants more, they type `hosts` in the palette; matching rows list each host and its state
 system: reconnects by itself, waiting up to ten seconds between tries, and shows how long it has been trying; says on the echo line once when a host drops, with the reason.
 user: nothing, unless a host needs attaching again.
-reviewed: 2026-11-20 · laptop · reviewer · 2 findings
