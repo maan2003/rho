@@ -1,11 +1,11 @@
 # design
 
-The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, the project list, message, and the agent transcript. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
+The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, threads, and workset transcripts. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
 
 ## token color
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
 - reading text · `oklch(70.9% 0.012 95)` · the name or words the user came to read.
-- quiet · `oklch(56.0% 0.012 100)` · context that can wait: ages, settled things, host tags, placeholders, and hints.
+- quiet · `oklch(56.0% 0.012 100)` · context that can wait: ages, settled things, host tags, calm offline host notes on Desk, placeholders, and hints.
 - attention · `oklch(63.1% 0.145 86.4)` · something to act on, here in the card's words or elsewhere as the lamp.
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach.
 - failed · `oklch(76.0% 0.140 25)` · a step that did not finish successfully.
@@ -55,7 +55,7 @@ looks: a single `top line` in `editor text` over the `reading surface`, with a `
 states:
 - ordinary: the screen's name in `reading text`, and the short mode word at the right; `INS` is in `keys in motion`.
 - card open: `waits` and the age sit beside the heading in `attention`.
-- working: `working` sits beside the heading in `quiet` while an agent runs and nothing waits.
+- working / stopped / stuck: `working` or `stopped by you` sits beside the heading in `quiet`, or `stuck` with retry age in `attention`, when nothing else waits.
 - attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing elsewhere is important enough.
 - host away: a named `lost connection` notice, or a count when more than one host is away.
 - unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
@@ -73,13 +73,14 @@ used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 captures: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
-purpose: let the user pick a place, thread, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+purpose: let the user pick a place, command, or answer by name and see just enough context beside it.
+looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count, with a fresh `chat.Flash` shown in `quiet` context when present. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face (adding any offline/connecting host note in `quiet`) and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
 states:
-- desk: a subject and a project address in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
-- prompt or palette: place rows use the Desk's columns with `row air` between them: subject, `attention` card words or the project's `quiet` latest words, and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. A command shows its name and its `quiet` key sequence, the name alone on a narrow window. Query matches use `marked`; the chosen row keeps its fill all the way across.
-- empty: Desk reads `0 wait` when no cards are due; the palette shows `no match` when no row fits the query.
-used on: `desk.Desk` and `window.Palette`.
+- desk: a subject, a project address in `quiet`, and any fresh `chat.Flash` in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
+- places (`window.Places`): place rows use `row air` between columns: subject/name, `attention` card words or the project's `quiet` latest words (or matched text snippet for full-text search), and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. Query matches use `marked`; the chosen row keeps its fill all the way across.
+- commands (`window.Commands`): flat verb-noun command name in `reading text`, live target and current value in `quiet` / `choice value` (or `pick …` when ambiguous), and `quiet` key sequence (name and target only on a narrow window). Query matches use `marked`.
+- empty: Desk reads `0 wait` (or `0 wait · lab offline` in `quiet`) when no cards are due; `Places` and `Commands` show `no match` when no row fits the query.
+used on: `desk.Desk`, `window.Places`, and `window.Commands`.
 captures: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), and [matched palette row](design/laptop-prompt.png).
 
 ## part Message header
@@ -89,7 +90,7 @@ states:
 - delivered: `you` or the project's address, and the time; an edited message adds `edited`.
 - sending: the header reads `you · sending…` in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
-used on: `agents.Agent`. In `chat.Thread` the voice is told by colour, see `Message`.
+used on: `agents.Transcript`. In `chat.Thread` the voice is told by colour, see `Message`.
 form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` for the separate thread form.
 
 ## part Message
@@ -108,7 +109,7 @@ looks: quoted Markdown keeps its `>` marker in the reading line. The words use `
 states:
 - plain: the body has no quote marker.
 - quoted: `>` starts the quoted line; a block of several lines starts folded to its first line and `…`. The reply can follow in ordinary text.
-used on: built host thread (`chat.Thread`) and transcript (`agents.Agent`) when the writer includes quoted Markdown.
+used on: built host thread (`chat.Thread`) and transcript (`agents.Transcript`) when the writer includes quoted Markdown.
 form:
 ```text
 > Fix the clock test that fails one run in five.
@@ -117,13 +118,13 @@ A separate clock per test should do it.
 
 ## part Draft
 purpose: let the user write the next message without leaving the buffer.
-looks: the user's words in `marked`, like their sent message, at the top of the thread, one blank line above the newest message, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the agent transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` message.
+looks: the user's words in `marked`, like their sent message, at the top of the thread, one blank line above the newest message, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the workset transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` message.
 states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
 - stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
 - addressing an idea: `on:` sits under `to:` above the words. The addressed project’s runtime appears in `quiet` until the user types or chooses a runtime. Changing `to:` updates the quiet value but keeps an explicit choice. Enter on `on:` opens the runtime choices.
-- after send: the words are the newest message, right below the draft, marked while on their way; the draft is empty with the point in it and nothing scrolls. For an idea the echo says where it went.
+- after send: in a thread, the words become the newest message right below the draft, marked while on their way, with the draft empty and nothing scrolling. For an idea, the draft clears immediately, the echo says where it went, and the screen before returns.
 used on: `chat.Thread` and the draft of `chat.Write an idea`.
 form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
@@ -135,7 +136,7 @@ states:
 - open: title, actions, keys, and any values; on the phone the sheet has `close` at the top and a full-width `cancel` at the bottom edge.
 - sub-menu: it takes the same place; the phone sheet adds `‹ back`.
 - empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
-used on: `window.Screen` wherever `window.Menu` opens, including verdicts in `chat.Thread` and `agents.Agent`. Desk does not offer verdicts.
+used on: `window.Screen` wherever the `space` leader `window.Menu` opens (`f` places and `u` undo everywhere in `NOR`; card verdicts added on `chat.Thread`, push action cards, and `agents.Transcript` of a waiting card).
 form: [laptop verdict grid](design/laptop-menu.png) and [phone verdict sheet](design/phone-menu.png).
 
 ## part Prompt
@@ -143,10 +144,10 @@ purpose: ask for a line of text and offer answers without a dialog.
 looks: `editor text` in the `command strip`, question and input first with a `reading inset`, then the candidate rows down the window. The input wraps below a long question on a narrow screen.
 states:
 - blank query: question and any initial answers.
-- typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`. The Palette shows the selected position and total in `quiet` at the right end of its prompt line.
+- typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`. `Places` and `Commands` show the selected position and total in `quiet` at the right end of their prompt line.
 - no match: `no match` below the input when a choice is required and none fits.
 - closed: the strip goes away and the keys return.
-used on: `window.Palette` and other questions over `window.Screen`, as in `hosts.Attach a host`.
+used on: `window.Places`, `window.Commands`, and other questions over `window.Screen`, as in `hosts.Attach a host`.
 form: [filtered laptop palette](design/laptop-prompt.png) and [blank phone palette](design/phone-prompt.png).
 
 ## part Phone bar
@@ -154,29 +155,29 @@ purpose: give the thumb the actions that the current place can use.
 looks: one `thumb target` band with a `seam` above and equally wide buttons; each `thumb icon` sits over its `thumb label`, both in `quiet`.
 states:
 - desk: menu, open, and more; open deals the top card and a tap on a row opens that row.
-- card open: back, menu, done, snooze, and more; while writing, undo and send take their place.
-- agent transcript for an open card: back, done, snooze, more, and menu. Verdicts land on the card.
-- reading elsewhere: back, desk, and menu; while writing, undo and send join.
+- card open: places, menu, done, snooze, and more; while writing, undo and send take their place.
+- workset transcript for an open card: places, done, snooze, more, and menu. Verdicts land on the card.
+- reading elsewhere: places, desk, and menu; while writing, undo and send join.
 - writing an idea: cancel, undo, and send.
 - prompt: only cancel and enter.
 - menu sheet: the sheet takes taps in front of the work, and its cancel target covers the bar.
-used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `chat.Thread`, `agents.Agent`, and `window.Palette`.
+used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `window.Places`, and `window.Commands`.
 form: [Desk](design/phone-desk.png), [card with send](design/phone-card.png), [transcript without send](design/phone-agent.png), and [palette](design/phone-prompt.png).
 
 ## part Card's words
 purpose: say how long something has waited for the user, or why the work stopped.
-looks: `waits`, or a stop's word, a centered dot, and the age in `attention`, beside the heading in the `Status line` and on a thread row in the `Palette`. On a phone the heading shortens before these words.
+looks: `waits`, or a stop's word, a centered dot, and the age in `attention`, beside the heading in the `Status line` and on a thread row in `window.Places`. On a phone the heading shortens before these words.
 states:
 - waiting or stopped: the word and the age, not just the color.
 - snoozed thread: it leaves the Desk waiting rows until it can be dealt again.
 - nothing waiting: no card words; ordinary row information remains.
 - echo: the words give way on the top line until the answer is gone.
-used on: `chat.Thread` when open as a card, and `window.Palette`; not on `desk.Desk`, which is a glance.
+used on: `chat.Thread` when open as a card, and `window.Places`; not on `desk.Desk`, which is a glance.
 form: [ask on the phone's top line](design/phone-card.png).
 
 ## part Allowance row
 purpose: say how much an account has left and when it resets without making the user read the picture.
-looks: one line of `editor text` per account above the picture, with `row air` before the share left and a centered dot before the reset time. The row uses its line's color, and `★` marks the GPT account the host is using.
+looks: one line of `editor text` per account above the picture, with `row air` before the share left and a centered dot before the reset time. The row uses its line's color, and `★` marks the active account the host is using (for GPT or Claude).
 states:
 - reported: `★ gpt/work  66% left · resets in 5.0d`.
 - no reset time: `gpt/home  18% left · reset time not reported`.

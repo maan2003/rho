@@ -1,18 +1,18 @@
 # notes
 
-Notes are the user's memory: text only they write and only their devices hold. They live apart from the work and can be found from the user's palette. A note is about nothing and listed in `Notes`, or about a `chat.Message` and also a private reply beside it.
+Notes are the user's memory: text only they write and only their devices hold. They live apart from the work and can be found from `window.Places`. A note is about nothing and listed in `Notes`, or about a `chat.Message` and also a private reply beside it.
 
 ## concept Note
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
-principle: the user thinks of something to check tomorrow; they run `new note` and type it; it is kept a moment after they stop typing; the next day they run `notes`, and it is at the top of the list.
+principle: the user thinks of something to check tomorrow; they run `new note` from `window.Commands` and type it; it is kept a moment after they stop typing; the next day they find it in `window.Places` or run `list notes`, and it is at the top of the list.
 sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text.
 does:
-- new note, from `window.Palette`: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
+- new note, from `window.Commands`: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit
-- notes, from `window.Palette`: open `Notes`, which lists every note
-- open `enter` on a note in `Notes`: open the note
+- list notes, from `window.Commands` (or `notes` in `window.Places`): open `Notes`, which lists every note
+- open `enter` on a note in `Notes` (or from `window.Places`, jumping to the matched line on full-text search): open the note
 
-No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. A note left empty disappears from the list and the thread. While the note is still open, `u` restores the text and `shift-u` redoes the edit. A standalone note is never a dealable `deal.Card`.
+No agent sees a note. A note's text passes between the user's devices through the hosts, sealed, the same way as verdicts: only between devices that hold the user's secret phrase; see `hosts.Pair this device`. A note left empty disappears from the list and the thread. While the note is still open, `u` restores the text and `shift-u` redoes the edit. A standalone note is never a dealable `deal.Card` (`space` in `NOR` offers `f` places and `u` undo only).
 
 While the user types a new note, the top line follows its first line as it is typed. A note is saved the moment the user leaves it.
 
@@ -21,7 +21,7 @@ purpose: let the user keep a remark on a `chat.Message` in its thread, where onl
 principle: a project messages a result the user doubts; they press `alt-r` on the message, type their doubt just beneath it and press `escape`. The remark stays there, dim, marked `🔒 you`.
 sees: directly under the message, `🔒 you · time` and the text, dim and slanted; while writing, a line says `── private · only you see this · escape keeps it`.
 does:
-- reply privately `alt-r` on the message, or `reply privately` from `window.Palette`: start writing beneath it; if the message already has a private reply, edit the latest one there
+- reply privately `alt-r` on the message, or `reply privately` from `window.Commands`: start writing beneath it; if the message already has a private reply, edit the latest one there
 - edit `enter` or a tap on an existing private reply: write in place; `escape`, or `keep` on the phone, returns to reading
 
 ## concept Find or start
@@ -47,7 +47,7 @@ keys:
 - `/` or tap `find or start:`: find by any words in a note (with standard `window.Prompt` editing keys)
 - `down` and `up` in the query: pick a match
 - `o`, `i` with no notes, or `new` on the phone: start an empty note in Insert
-- `window.Screen.back`
+- `space` (`f` places, `u` undo), `space-j` (`ctrl-j`), `tab`, `q`, `:`: `window.Screen`
 starts: `Write something down`
 
 ## screen Note
@@ -64,7 +64,7 @@ keys:
 - `i` or tap the text on the phone: edit at that point
 - `escape`: return to Normal
 - `u`, `shift-u`: undo and redo a text edit
-- `tab`, `window.Screen.back`: leave the note; the text is kept without a save step
+- `space` (`f` places, `u` undo), `space-j` (`ctrl-j`), `tab`, `q`, `:`: leave the note; the text is kept without a save step
 starts: `Write something down`
 
 ## flow Write something down
@@ -74,10 +74,10 @@ when: something comes to mind that the user must not forget
 want: write it down at once, without choosing where it goes
 so that: the user finds it again later, in `Notes`
 steps:
-1. the user chooses `new note`; an empty note opens in Insert
+1. the user chooses `new note` in `window.Commands`; an empty note opens in Insert
 2. the user types; the first line becomes its title
 3. the user presses `escape`
-4. the user presses `tab` to leave; they find the note at the top the next time they open `Notes`
+4. the user presses `tab` or `space` then `f` to leave; they find the note at the top the next time they open `Notes`
 system: keeps the text without a save step, and lists the note in `Notes` by when it was last written.
 user: every word of it.
 cases: the same note open on the laptop and the phone at once, where the newest text wins and text being typed is not replaced.

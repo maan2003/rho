@@ -1,6 +1,6 @@
 # hosts
 
-A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their projects and message together. A host also carries what the user says about cards, their notes, and their drafts between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
+A host is a machine where agents live and work: an always-on server, or the laptop itself. The window attaches to one or more hosts and shows their projects and message together. A host also carries what the user says about cards, their notes, and their bookmarks between the user's paired devices, each a `Device`, sealed so the host cannot read them; see `deal.Verdict`.
 
 ## bet Agents live on hosts, and the window attaches to many
 instead of: one server, or everything on the laptop.
@@ -9,7 +9,7 @@ because: agents must run when the laptop is shut, and the user has more than one
 costs: a host can be away, and the user must attach each host on each device.
 
 ## bet The user's own state lives on their devices, sealed
-instead of: the host keeping what the user said about each card, their notes, and their drafts.
+instead of: the host keeping what the user said about each card, their notes, and their bookmarks.
 serves: Know what wants them, and where they were.
 because: a host runs code the user did not write, and an agent on it must never read what the user decided or wrote for themselves; the hosts carry bytes they cannot open.
 costs: two devices agree only when both hold the user's secret phrase.
@@ -32,16 +32,16 @@ day: Turn ideas into work.
 
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
-principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with `@rho` added only to a name another attached host also has; when the connection drops, the top line says so in red until it is back.
+principle: the user attaches the server as `rho`; its projects are available by name in `window.Places`, with `@rho` added only to a name another attached host also has; when the connection drops, the top line says so in red until it is back.
 sees: its name, which the user chose, as the host part of a project address when two attached hosts share the project name; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `chat.Project` address.
 has:
 - many `chat.Project`
 - many `agents.Agent`
 does:
-- attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
-- detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its message comes back from the host when it is attached again; drafts and unsent message stay
-- status, from `window.Palette`: typing `hosts` lists each attached host with its state (`hosts › rho · online`); picking a disconnected or unenrolled host copies its enrollment command or triggers reconnect
-- gccp, from `window.Palette` anywhere: list, approve, or remove external-harness (`GCCP`) agents on an attached host (prompting for host when more than one is attached)
+- attach host, by opening a pairing link the host prints (which starts `rho://`), or from `window.Commands`: from a link, ask `name this host:` and attach the host under that name; from `window.Commands`, ask for a name and the way to reach the host, on one line, and show the form the line takes
+- detach host, from `window.Commands`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its message comes back from the host when it is attached again; drafts and unsent message stay
+- list hosts, from `window.Commands`: lists each attached host with its state (`rho · online`); picking a disconnected or unenrolled host copies its enrollment command or triggers reconnect
+- list gccp agents / approve gccp agent / remove gccp agent, from `window.Commands` anywhere: list, approve, or remove external-harness (`GCCP`) agents on an attached host (prompting for host when more than one is attached)
 
 A host is reached in one of three ways:
 - on this machine, where being the same user on the same machine is the trust
@@ -55,9 +55,9 @@ A pairing link saves typing where the host is. It works once, to make the host t
 A host on this machine shows no agent's desktop; see `agents.Desktop`.
 
 ## concept Device
-purpose: make each laptop or phone the user works on hold the same verdicts, notes, and drafts as the others, without any host being able to read them.
-principle: the user sets up a second laptop and types their twelve-word secret phrase once; the cards they put away on the first laptop are away here too, and their notes and drafts are here.
-sees: until it is paired, the echo line saying that its verdicts stay on this device.
+purpose: make each laptop or phone the user works on hold the same verdicts, notes, and bookmarks as the others, without any host being able to read them.
+principle: the user sets up a second laptop and types their twelve-word secret phrase once; the cards they put away on the first laptop are away here too, and their notes and bookmarks are here.
+sees: until it is paired, the status line saying that its verdicts stay on this device.
 
 A device is paired once it holds the user's secret phrase; see `Pair this device`. The first device ever makes the phrase.
 
@@ -66,15 +66,15 @@ runs: 1 a quarter
 day: Know what wants them, and where they were.
 when: the user sets up a new device, or their first one
 want: have this device hold the user's secret phrase
-so that: the user's verdicts, notes, and drafts are the same here as on their other devices
+so that: the user's verdicts, notes, and bookmarks are the same here as on their other devices
 steps:
 1. on the first device ever, when the first host answers that it holds nothing, the prompt line reads `write down your secret phrase · it pairs your other devices · enter:` with the twelve words under it; the user writes them down, and `enter` puts them away
 2. on any later device, the status line reads `verdicts stay on this device until it is paired`, in muted text, once it has seen that another device wrote
-3. the user opens the palette and chooses `pair this device`; the prompt `secret phrase:` completes each word; a word that is not a phrase word, a wrong count, or a phrase that opens nothing reopens the prompt with the reason and keeps the text
+3. the user opens `window.Commands` and chooses `pair device`; the prompt `secret phrase:` completes each word; a word that is not a phrase word, a wrong count, or a phrase that opens nothing reopens the prompt with the reason and keeps the text
 4. the echo line reads `paired: this device holds what your other devices said and wrote`, and the notice goes
 system: makes the phrase once, seals everything with it, refuses a phrase that does not open what the other devices wrote, and keeps no word of it in its history of prompts.
 user: keeping the phrase, and typing it once per device.
-cases: the user never pairs a device, and it keeps its own verdicts for good; the user puts the phrase away before writing it down, and `show my secret phrase` from the palette shows it again on any device that holds it
+cases: the user never pairs a device, and it keeps its own verdicts for good; the user puts the phrase away before writing it down, and `show secret phrase` from `window.Commands` shows it again on any device that holds it
 
 ## flow Attach a host
 runs: 1 a month
@@ -83,11 +83,11 @@ when: the user sets up a new device, or has a new host
 want: have the window reach the host and show its projects and their work
 so that: the user can work with the agents on it from this device
 steps:
-1. the user gets a pairing link on the host and opens it on the device, as `Host.attach`
-   - or the user opens the palette, chooses `hosts › attach`, and types the name and the way to reach the host
+1. the user gets a pairing link on the host and opens it on the device, as `Host.attach host`
+   - or the user opens `window.Commands`, chooses `attach host`, and types the name and the way to reach the host
 2. the user answers `name this host:` with a short name
 3. the user touches the security key when the desktop asks for it; the first time on a device it asks twice
-4. the host's projects are available by name
+4. the host's projects are available by name in `window.Places`
    - if the host does not trust this device yet, the top line reads `disconnected · enroll this rho on the host: …` with a command and a code; the user runs that command on the host, and the window tries again within half a minute
 system: remembers the host for the next start, reconnects by itself, and asks for the security key only once each time the window starts.
 user: the name, the touch of the key, and, without a link, the command on the host.
@@ -100,7 +100,7 @@ when: something seems quiet
 want: know whether a host has dropped
 so that: the user does not wait on agents they cannot reach
 steps:
-1. the user looks at the top line; a host that is not connected shows there in red, such as `disconnected · …`, or `2 of 3 hosts not connected`
-2. if the user wants more, they type `hosts` in the palette; matching rows list each host and its state
+1. the user looks at the top line (or the calm host note beside the count on `desk.Desk`); a host that is not connected shows in red on the status line, such as `disconnected · …`, or `2 of 3 hosts not connected`
+2. if the user wants more, they run `list hosts` in `window.Commands`; matching rows list each host and its state
 system: reconnects by itself, waiting up to ten seconds between tries, and shows how long it has been trying; says on the echo line once when a host drops, with the reason.
 user: nothing, unless a host needs attaching again.

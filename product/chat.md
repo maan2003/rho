@@ -21,7 +21,7 @@ goal: the user turns an idea into merged work.
 starts when: the user has an idea.
 steps:
 1. the user writes to the project from where they are, `Write an idea`
-2. the user sees the work start, in the thread row's `working` word in `window.Palette`, or by the project's next message
+2. the user sees the work start, in the thread row's `working` word in `window.Places`, or by the project's next message
 3. the user opens the project's ask when it needs something, `deal.Clear what waits`
 4. the user answers the ask in its thread, `Answer a message`
 5. the user opens the result, `deal.Clear what waits`
@@ -34,17 +34,17 @@ day: Turn ideas into work.
 ## concept Project
 purpose: give each project one address to write to, and one answer, asked once, to where, how, and on what model its agents work.
 principle: the user sends an idea to `tide` (or `tide@lab` when two attached hosts share the name `tide`); the project starts the work at its place, in its mode, on its runtime, and sends its asks and results from that address.
-sees: its name (such as `tide`, adding `@host` only when two attached hosts have a project of the same name); where it works, its mode, and its runtime when configuring it or filtering by it in `window.Palette`. A project has no screen of its own.
+sees: its name (such as `tide`, adding `@host` only when two attached hosts have a project of the same name); where it works, its mode, and its runtime when configuring it in `window.Commands` or filtering by it in `window.Places`. A project has no screen of its own.
 has:
 - many `Thread`
 does:
-- filter in `window.Palette`: choosing a project in `window.Palette` filters the palette to that project's threads
-- receive an idea: start the work at the project's place in its mode, on the project's runtime for a new agent unless the idea's `on:` line named another. `one agent`: the project's agent reads the idea in its new thread and keeps its runtime; it starts when none runs; an idea on another runtime switches it first, as `agents.Agent.set runtime` does. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
-- project › works on…, from `window.Palette` anywhere: uses the current thread's project when unambiguous, or asks `project:` first; then asks `<project> works on:` and changes where the next idea starts; agents already running stay where they are
-- project › agents…, from `window.Palette` anywhere: uses the current thread's project or asks `project:` first; changes between `one` and `per idea` for the next idea; agents already running stay as they are
-- project › runtime…, from `window.Palette` anywhere: uses the current thread's project or asks `project:` first; asks `<project> runtime (sol-high):` with the host's runtimes as answers; the next new agent starts on it; agents already running stay as they are
+- filter in `window.Places`: choosing a project in `window.Places` scopes the finder to that project's threads
+- receive an idea: start the work at the project's place in its mode, on the project's runtime for a new agent unless the idea's `on:` line named another. `one agent`: the project's agent reads the idea in its new thread and keeps its runtime; it starts when none runs; an idea on another runtime switches it first, as `agents.Agent.set agent runtime` does. `per idea`: a fresh agent starts in a fresh workset, a clone of the repository or the directory itself
+- set project place, from `window.Commands` anywhere (inline or prompt): uses the current thread's project when unambiguous, or asks `project:` first; then asks `<project> works on:` and changes where the next idea (or retried refused start) starts; agents already running stay where they are
+- set project mode, from `window.Commands` anywhere (inline or prompt): uses the current thread's project or asks `project:` first; changes between `one` and `per idea` for the next idea; agents already running stay as they are
+- set project runtime, from `window.Commands` anywhere (inline or prompt): uses the current thread's project or asks `project:` first; asks `<project> runtime (sol-high):` with the host's runtimes as answers; the next new agent starts on it; agents already running stay as they are
 rejected:
-- a narrowed `desk.Desk` screen per project · 2026-11-26 · Desk is one global glance of what waits; project filtering belongs in `window.Palette` and project commands work globally from `window.Palette`
+- a narrowed `desk.Desk` screen per project · 2026-11-26 · Desk is one global glance of what waits; project filtering belongs in `window.Places` and project commands work globally from `window.Commands`
 - the place read off the project's newest agent · 2026-11-21 · nothing could show it or change it
 - the kind of place deciding the mode, a repository per idea and a directory shared · 2026-11-21 · one standing agent on a repository is useful too
 - every project agent on `opus-high`, with the model chosen only through `start agent` · 2026-11-21 · that path asks the place again and never makes a project thread, so no project thread could start on another model
@@ -58,9 +58,9 @@ has:
 - many `Thread`, each a tangent under a message
 - one `Draft` at the top of the thread
 does:
-- open: from a `deal.Card` or by subject, open at the top of `Thread` (`Draft` and newest message); returning via `window.Screen.back` restores the view and point as left
+- open: from a `deal.Card` or by subject in `window.Places`, open at the top of `Thread` (`Draft` and newest message); opening from a full-text match in `window.Places` jumps directly to that matched message/line; revisiting an already-open thread keeps its view and point as left
 - reply: write in the `Draft` and send with `Message.reply`
-- rename, from `window.Palette` as `name this thread`: change the thread's subject
+- rename thread, from `window.Commands` (inline `:rename New title` or prompt): change the thread's subject
 - fork: take a tangent into a thread under its message; the prompt line says when to fork
 
 ## concept Message
@@ -69,9 +69,9 @@ principle: the project asks a question; the user reads it on top of the thread w
 sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else; a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes
 does:
 - ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
-- look into the work `enter` on the message: open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
-- reply: the user's words go into the thread, and every agent in it reads them; there is no addressee. With two asks open, the user names the agent in words or deals the next card
-- edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and keeps the card as it is
+- look into the work `enter` on the message (when no multi-char selection and cursor is not on a link): open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
+- reply: the user's words go into the thread, and every agent in it reads them; there is no addressee. With two asks open, the user names the agent in words. Replying in a thread whose agent is `stopped`, `failed`, or refused-to-start wakes or retries it (using the project's latest place and runtime)
+- edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and deals the thread again (with a recovered system stop as the one clearing exception, see `agents.a stuck agent asks`)
 - reply privately `alt-r`: write a remark directly beneath this message, as in `notes.Reply privately`
 rejected:
 - a required `## proof` section on every result message · 2026-11-26 · rigid templates fight different kinds of work; let agents back up results flexibly in prose, links, or captures, and use the workset transcript when deeper inspection is needed
@@ -83,7 +83,7 @@ rejected:
 - a header with the writer and the time above each message · 2026-11-20 · colour tells the voice, and the top line says how long the thread has waited
 - a status line kept apart from the messages, replaced rather than kept · 2026-11-20 · a `Flash`, replaced as the work moves, does the same job without a second surface
 
-Agents can search messages. A message written while the host is away waits on the device and goes out when the host is back. A submitted idea says `queued for` its project and can be found by name in `window.Palette` until the host's thread takes its place.
+Agents can search messages. A message written while the host is away waits on the device and goes out when the host is back. A submitted idea says `queued for` its project and enters `window.Places` MRU immediately (using its first line until titled) until the host's thread takes its place.
 
 ## concept Flash
 purpose: let an agent say what it is doing or about to do, for the user who happens to be there, without a card and without a trace.
@@ -107,7 +107,7 @@ principle: the user is halfway through an answer when a card that matters comes 
 sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest message; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
-- quote `enter` on a selection in one message: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
+- quote `enter` on a multi-char selection (`> 1` char) in one message: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal
 - send `ctrl-enter`, or `send` on the phone bar while writing: the words become the newest message, right below the empty draft; the point rests in the draft and nothing scrolls, then or when the project answers
 - undo `u`, redo `shift-u`: the editor's undo while writing; on the phone, `undo` on the bar
 rejected:
@@ -121,7 +121,7 @@ A thread has one draft on each device, not shared with other devices.
 ## screen Thread
 answers: what is this piece of work waiting for from the user?
 shows:
-- the `Thread` subject and `Project` address in the `window.Status line`, with the card's words (`waits · 2h`) while it waits, or `working` while an agent runs and nothing waits
+- the `Thread` subject and `Project` address in the `window.Status line`, with the card's words (`waits · 2h`) while it waits, or `working` / `stopped by you` / `stuck` when nothing waits
 - the `Draft` first, at the top of the document, or stuck to the top edge while the user reads history below
 - the `Message` newest first, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable; the user's own last message, in `design.marked`, is the line between what is new since they wrote and the history below
 - the fresh `Flash` of each agent in `design.quiet` with its age, in its place among the messages, with that agent's earlier fresh flashes folded under it
@@ -131,17 +131,16 @@ states:
 - loading: the thread's messages are not yet available; wording not agreed
 - partial: only the available messages; wording not agreed
 - error: the thread is unavailable; wording not agreed
-- full: whether opened by the deal or by name, the window starts at the top of the document: the `Draft`, with the point in it where it was left, then the newest message. Older message is one scroll down. Returning via `window.Screen.back` restores it as left.
+- full: opened by the deal or by subject, the window starts at the top of the document: the `Draft`, with the point in it where it was left, then the newest message. Opened from a full-text match in `window.Places`, the window jumps directly to that matched message/line. Older message is one scroll down. Revisiting an already-open thread keeps it as left.
 keys:
-- `enter` with no selection on a project's message: `Message.look into the work`
+- `enter` on a message follows strict precedence: (1) multi-char selection (`> 1` char) in one message → `Draft.quote`; (2) 1-char cursor on a link → `browser.Page.open`; (3) 1-char cursor anywhere else on a project message → `Message.look into the work`
 - `ctrl-u`, `ctrl-d`: scroll history by half a window without moving the point out of the `Draft`
 - `gg`: go to the draft; `G`: go to the oldest message; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
-- `enter` on a selection in one message: `Draft.quote`
 - `alt-r` on a message: `notes.Private reply.reply privately`
 - `u`, `shift-u` in the draft: undo and redo the last edit
-- `space`: `deal.Verdict`, anywhere in Normal mode
-- `:`: `window.Palette`
-- `ctrl-k`, `tab`, `q`: `window.Screen`
+- `space`: universal `window.Menu` leader (`f` places, `u` undo, plus `deal.Verdict` when waiting), anywhere in Normal mode
+- `:`: `window.Commands`
+- `space-j` (`ctrl-j`), `tab`, `q`: `window.Screen`
 starts: `Answer a message`, `agents.Look into the work`, `notes.Reply privately`
 captures: [asking message on the laptop](design/laptop-card.png) and [on the phone](design/phone-card.png), [an outcome with its proof](design/laptop-proof.png), [an older thread with history](design/laptop-reading.png), and [the notice in a stuck phone draft](design/phone-reading-notice.png).
 rejected:
@@ -166,10 +165,10 @@ steps:
 1. the user opens the thread by the deal or by name and reads what the project wrote since their last message
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
 2. the user writes and edits an answer in the `Draft` at the top of the thread
-3. the user sends the answer with `Message.reply`; the reply settles the waiting card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread, marked `not sent`; `write this reply again` in `window.Palette` takes it back into the empty `Draft` to change and send again.
-system: opens at the top with the point in the `Draft` and message below it, newest first. The user's last message separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves. The reply is a message in the thread that every agent in it reads.
+3. the user sends the answer with `Message.reply`; the reply settles the waiting card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread, marked `not sent`; `write reply again` in `window.Commands` takes it back into the empty `Draft` to change and send again.
+system: opens at the top with the point in the `Draft` and message below it, newest first. The user's last message separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves. The reply is a message in the thread that every agent in it reads, waking any stopped, failed, or refused-start agent.
 user: the words of the answer, or done when there are none.
-cases: a question answered after a day away, with the project's earlier words one glance below; a result with proof; a colleague reached through `slack.Bot`; replying after returning via `window.Screen.back` or `window.Palette`.
+cases: a question answered after a day away, with the project's earlier words one glance below; a result with proof; a colleague reached through `slack.Bot`; replying after returning via `window.Places`.
 
 ## flow Write an idea
 runs: 12 a day
@@ -178,14 +177,14 @@ when: the user has an idea, wherever they are in the window
 want: send it to the right project without losing their place
 so that: work starts and the user can carry on where they were
 steps:
-1. the user presses the idea key (`i` on a `desk.Desk` row, `ctrl-alt-m` globally, or `write an idea` from `window.Palette`); a `Draft` fills the window, with a `to:` line already addressed to the project picked from context, and an `on:` line with that project's runtime
+1. the user presses the idea key (`i` on a `desk.Desk` row, `ctrl-alt-m` globally, or `write idea` from `window.Commands`); a `Draft` fills the window, with a `to:` line already addressed to the project picked from context, and an `on:` line with that project's runtime
 2. the user writes, in the usual Helix modes (with keys isolated from the screen underneath)
    - if it is for a different project, the user edits the `to:` line with project completion, or `ctrl-t` asks for the project; a name with no match offers a `new project …` row, which is `Start a project`
    - if this one idea should think on another model, the user edits the `on:` line, with the host's runtimes as completions; `shift-tab` moves between the lines and the words; a runtime the host does not know is refused in the echo and the idea stays
-3. the user sends with `ctrl-enter` or `send`; the idea queues durably, the draft clears immediately so another idea can be written even while offline, the echo names the idea and the project, and the screen before is back
+3. the user sends with `ctrl-enter` or `send`; the idea queues durably, its thread enters `window.Places` MRU immediately (aging normally as other places are visited), the draft clears immediately so another idea can be written even while offline, the echo names the idea and the project, and the screen before is back
 system: picks the thread's project, or the last project the user wrote to; fills `on:` with that project's runtime, again when `to:` changes and the user has not touched `on:`; starts the work at that project's place, in its mode, on the `on:` runtime, as `Project.receive an idea`.
 user: the words and, if different from the automatic choice, the project and the runtime.
-cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; writing a second idea while the first is still queued offline; the idea comes while reading a page; the current thread belongs to a different project; an idea on another runtime to a `one agent` project whose agent cannot change kind, refused as `set runtime` refuses it, with the idea kept.
+cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; writing a second idea while the first is still queued offline; the idea comes while reading a page; the current thread belongs to a different project; an idea on another runtime to a `one agent` project whose agent cannot change kind, refused as `set agent runtime` refuses it, with the idea kept.
 captures: [empty idea with the project runtime](design/laptop-idea-empty.png), [address chooser on laptop](design/laptop-idea.png) and [on phone](design/phone-idea-runtime.png).
 rejected:
 - a one-line idea strip across every screen · 2026-11-20 · never agreed; a full window with the usual modes costs nothing when the window shows one place at a time
@@ -206,10 +205,10 @@ steps:
 3. `tide agents:` asks for the mode, `one` under the point and `per idea` below it
 4. `tide runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
 5. if the user started from Send, the idea sends and the work starts; if they were editing `to:` with `ctrl-t`, the new project fills that line and the draft stays open until they Send
-   - from `window.Palette` anywhere, `project › new` asks the same four lines
+   - from `window.Commands` anywhere, `new project` asks the same four lines
 system: the host keeps the project's name, place, mode and runtime, so every device sees the same answer; clones a repository from the host's mirror; takes the host from the address when more than one is attached, so no host question.
 user: the name, the place, the mode, and the runtime.
-cases: the host is offline; an older project with no known place says `no place set` until `project › works on…` is answered; an older project with a place but no runtime reads and runs `opus-high` until `project › runtime…` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves a message`; a second project on the same repository; a project created from `window.Palette` with no idea yet.
+cases: the host is offline; an older project with no known place says `no place set` until `set project place` is answered; an older project with a place but no runtime reads and runs `opus-high` until `set project runtime` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves a message`; a second project on the same repository; a project created from `window.Commands` with no idea yet.
 captures: [project mode prompt](design/laptop-project-mode.png) and [project runtime prompt](design/laptop-project-runtime.png).
 rejected:
 - a menu `where this project's agents work` with two rows and a prompt behind each · 2026-11-21 · three kinds of UI for one answer, and the place stayed invisible
@@ -219,7 +218,7 @@ rejected:
 - no runtime question, every project on `opus-high` · 2026-11-21 · a project thread could not start on another model at all
 
 ## rule the last message stays live
-when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user. Other agents can each send one message. A `Flash` never occupies the live message slot. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`. An unchanged ask does not deal again after `done`; changed words do. A reply is read by the thread's agents and settles the thread through the latest message visible when the user replied, freezing the messages already answered. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
+when a project agent has already sent a `Message` since the user's last message in the `Thread`, then rho refuses another from that agent, tells them which message to edit, and points them at `kind="flash"` for anything that does not need the user. Other agents can each send one message. A `Flash` never occupies the live message slot. A message that was deleted or taken back no longer occupies that place. A real edit reads `edited`. An unchanged ask does not deal again after `done`; changed words do (with a recovered system stop as the one clearing exception). A reply is read by the thread's agents and settles the thread through the latest message visible when the user replied, freezing the messages already answered. A different question forks under the message that raised it. A message to the user stays in the thread but does not wake its agents.
 why: a thread of ten messages that each supersede the last is a feed; each agent has one place for current words, and the flash is where the rest goes.
 rejected:
 - a second send merges in place · 2026-11-21 · the agent has to choose to edit its existing message; another send must not silently change it

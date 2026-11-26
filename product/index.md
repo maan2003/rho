@@ -61,8 +61,8 @@ A note holds only what the user typed. No agent reads it, and the machine never 
 test: After this change, is every word of every note still typed by the user, and still hidden from every agent?
 
 ## value Moving between places costs nothing
-The user changes place hundreds of times a day. Any place is one name away, and the way back is one key, with nothing lost in the place they left.
-test: Can the user reach this place by name from anywhere, and return in one key, with the place they left as it was?
+The user changes place hundreds of times a day. Any place is one name away, and the previous place is one gesture away, with nothing lost in the place they left.
+test: Can the user reach this place by name from anywhere, and return in one gesture, with the place they left as it was?
 
 ## value The phone is a full device
 Every flow is possible on the phone. Where the thumb makes a flow longer, that is a cost chosen on purpose and written down, never a flow that the phone cannot do.
