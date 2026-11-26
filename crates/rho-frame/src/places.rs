@@ -6,10 +6,11 @@ use std::cmp::Reverse;
 use std::ops::Range;
 
 use memchr::memmem::Finder;
+use rho_agent_types::ThreadWork;
 use rho_dealer::Card;
 
 use crate::matching::{Folded, Hit, best_hit, merge_marks, ordered_starts};
-use crate::system::{Found, FoundText};
+use crate::system::{Found, FoundText, FoundThread};
 use crate::text_search::{TextQuery, TextScope};
 
 // Eight rows are visible. Beyond this many results the user types more.
@@ -23,6 +24,36 @@ pub(crate) struct Place {
     pub visit: Option<usize>,
     pub visited_ms: Option<u64>,
     pub current: bool,
+    /// The states a state prefix finds it by.
+    pub states: Vec<PlaceState>,
+    /// `lab away`, when the host it lives on is away: said in place of
+    /// `working`, which the host can no longer vouch for.
+    pub away: Option<String>,
+}
+
+/// A state `Places` narrows to by a prefix (`window.Places`): the threads
+/// at work, those stopped or failed, and those the user muted or snoozed,
+/// so a muted thread is found again without its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceState {
+    Working,
+    Stopped,
+    Muted,
+    Snoozed,
+}
+
+impl PlaceState {
+    pub(crate) const ALL: [Self; 4] = [Self::Working, Self::Stopped, Self::Muted, Self::Snoozed];
+
+    /// What the query starts with to narrow to it.
+    pub(crate) fn prefix(self) -> &'static str {
+        match self {
+            Self::Working => "working:",
+            Self::Stopped => "stopped:",
+            Self::Muted => "muted:",
+            Self::Snoozed => "snoozed:",
+        }
+    }
 }
 
 pub(crate) enum Choice {
@@ -58,11 +89,17 @@ impl Choice {
     fn detail(&self) -> &str {
         match self {
             Self::Words(found) => &found.line,
-            Self::Place(place) => match &place.card {
-                Some(card) => &card.label,
-                None => place
-                    .found
-                    .thread
+            Self::Place(place) => match (&place.card, &place.away, &place.found.thread) {
+                (Some(card), _, _) => card.label.as_str(),
+                (
+                    None,
+                    Some(away),
+                    Some(FoundThread {
+                        work: Some(ThreadWork::Working),
+                        ..
+                    }),
+                ) => away.as_str(),
+                (None, _, thread) => thread
                     .as_ref()
                     .and_then(|thread| thread.status.as_deref())
                     .unwrap_or(""),
@@ -321,10 +358,44 @@ impl Listing {
     }
 
     pub fn rank_query(&self, query: &TextQuery<'_>) -> Vec<Matched> {
-        if matches!(query.scope, TextScope::Text(_)) {
-            return Vec::new();
+        let state = match query.scope {
+            TextScope::Text(_) => return Vec::new(),
+            TextScope::State(state) => Some(state),
+            TextScope::All => None,
+        };
+        let choices = || {
+            self.choices[..self.named.len()]
+                .iter()
+                .enumerate()
+                .filter(move |(_, choice)| {
+                    state.is_none_or(|state| match choice {
+                        Choice::Place(place) => place.states.contains(&state),
+                        Choice::Words(_) => false,
+                    })
+                })
+        };
+        if state.is_some() && query.terms.is_empty() {
+            // Every place in the state, what waits first, then the most
+            // recently active.
+            let mut rows: Vec<_> = choices()
+                .map(|(index, choice)| {
+                    let active = choice.activity().unwrap_or(match choice {
+                        Choice::Place(place) => place.found.recency,
+                        Choice::Words(_) => 0,
+                    });
+                    (!choice.attention(), Reverse(active), index)
+                })
+                .collect();
+            keep_best(&mut rows);
+            return rows
+                .into_iter()
+                .map(|(.., index)| Matched {
+                    index,
+                    group: Group::OtherPlace,
+                    marks: Default::default(),
+                })
+                .collect();
         }
-        let choices = || self.choices[..self.named.len()].iter().enumerate();
         if query.terms.is_empty() {
             let mut rows: Vec<_> = choices()
                 .filter_map(|(index, choice)| Some((choice.blank(self.desk)?, index)))
@@ -395,7 +466,7 @@ mod tests {
     use rho_dealer::Address;
 
     use super::*;
-    use crate::system::{FoundThread, SearchPoint};
+    use crate::system::SearchPoint;
 
     fn thread(
         title: &str,
@@ -412,6 +483,7 @@ mod tests {
                 description: project.into(),
                 thread: Some(FoundThread {
                     status: Some("Checking timing".into()),
+                    work: None,
                 }),
                 recency: 0,
                 also: Vec::new(),
@@ -430,6 +502,8 @@ mod tests {
             visit,
             visited_ms: visit.map(|rank| 100 - rank as u64),
             current,
+            states: Vec::new(),
+            away: None,
         }
     }
 
@@ -627,6 +701,8 @@ mod tests {
             visit,
             visited_ms: None,
             current: false,
+            states: Vec::new(),
+            away: None,
         };
         let mut listing = Listing::new(vec![
             chart("rate limit · 7d", None),
@@ -644,6 +720,145 @@ mod tests {
             [1, 0],
             "the chart's own name beats a prefix"
         );
+    }
+
+    /// A place in `states`, at work as `work` says.
+    fn stated(
+        title: &str,
+        project: &str,
+        work: Option<ThreadWork>,
+        states: &[PlaceState],
+        recency: u64,
+    ) -> Place {
+        let mut place = thread(title, project, None, false, None);
+        place.found.address = Address::new("thread", format!("{project}/{title}"));
+        place.found.thread = Some(FoundThread {
+            status: work.map(|work| work.words().to_owned()),
+            work,
+        });
+        place.found.recency = recency;
+        place.states = states.to_vec();
+        place
+    }
+
+    fn states_listing() -> Listing {
+        use PlaceState::{Muted, Snoozed, Stopped};
+        use ThreadWork::StoppedByYou;
+        const AT_WORK: Option<ThreadWork> = Some(ThreadWork::Working);
+        const WORKING: PlaceState = PlaceState::Working;
+        let mut note = stated("Call the plumber", "", None, &[Snoozed], 5);
+        note.found.thread = None;
+        Listing::new(vec![
+            stated("Flaky clock test", "tide", AT_WORK, &[WORKING], 10),
+            stated("Clock drift", "reef", AT_WORK, &[WORKING, Muted], 30),
+            stated("Retry window", "tide", Some(StoppedByYou), &[Stopped], 20),
+            stated("Lint the docs", "tide", None, &[Muted], 40),
+            stated("Old clock idea", "reef", None, &[Snoozed], 1),
+            note,
+            stated("Quiet one", "kelp", None, &[], 50),
+        ])
+    }
+
+    fn titles(listing: &Listing, query: &str) -> Vec<String> {
+        listing
+            .rank(query)
+            .into_iter()
+            .map(|row| listing.choices[row.index].name().to_owned())
+            .collect()
+    }
+
+    /// Each prefix alone lists every place in its state, the most
+    /// recently active first; nothing in another state.
+    #[test]
+    fn a_state_prefix_lists_the_places_in_that_state() {
+        let listing = states_listing();
+        assert_eq!(
+            titles(&listing, "working:"),
+            ["Clock drift", "Flaky clock test"]
+        );
+        assert_eq!(titles(&listing, "stopped:"), ["Retry window"]);
+        assert_eq!(
+            titles(&listing, "muted:"),
+            ["Lint the docs", "Clock drift"],
+            "a muted thread is found again without its name"
+        );
+        assert_eq!(
+            titles(&listing, "snoozed:"),
+            ["Call the plumber", "Old clock idea"],
+            "notes as well as threads"
+        );
+        assert_eq!(titles(&listing, " Muted:  "), titles(&listing, "muted:"));
+    }
+
+    /// Words after the prefix narrow its places as any query does, by
+    /// subject or by project.
+    #[test]
+    fn a_state_prefix_composes_with_words() {
+        let listing = states_listing();
+        assert_eq!(
+            titles(&listing, "working: clock"),
+            ["Clock drift", "Flaky clock test"]
+        );
+        assert_eq!(titles(&listing, "working: flaky"), ["Flaky clock test"]);
+        assert_eq!(titles(&listing, "working:tide"), ["Flaky clock test"]);
+        assert_eq!(titles(&listing, "muted: tide"), ["Lint the docs"]);
+        assert_eq!(titles(&listing, "muted: reef drift"), ["Clock drift"]);
+        assert_eq!(titles(&listing, "snoozed: clock"), ["Old clock idea"]);
+        assert_eq!(titles(&listing, "stopped: retry"), ["Retry window"]);
+        assert!(titles(&listing, "stopped: clock").is_empty());
+        assert!(titles(&listing, "muted: kelp").is_empty());
+        // Without the prefix, `clock` finds them all, whatever their state.
+        assert_eq!(titles(&listing, "clock").len(), 3);
+    }
+
+    /// A state is about places, not remembered words: no text search
+    /// runs behind it, and a prefix later in the line is ordinary words.
+    #[test]
+    fn a_state_prefix_searches_places_only() {
+        for typed in ["working:", "working: clock", "muted: tide", "snoozed:x"] {
+            let query = TextQuery::parse(typed);
+            assert!(!query.wants_text(), "{typed}");
+            assert!(matches!(query.scope, TextScope::State(_)), "{typed}");
+        }
+        assert!(TextQuery::parse("clock working:").wants_text());
+        assert!(matches!(
+            TextQuery::parse("/working: clock").scope,
+            TextScope::Text(None)
+        ));
+        assert!(titles(&states_listing(), "clock working:").is_empty());
+    }
+
+    /// A thread its host last said is at work reads `lab away` while that
+    /// host is away; its card's words, when it waits, still come first.
+    #[test]
+    fn work_on_an_away_host_reads_away() {
+        let mut working = stated(
+            "Flaky clock test",
+            "tide",
+            Some(ThreadWork::Working),
+            &[],
+            1,
+        );
+        working.away = Some("lab away".into());
+        let mut idle = stated("Lint the docs", "tide", None, &[], 1);
+        idle.found.thread = Some(FoundThread {
+            status: Some("Docs pass".into()),
+            work: None,
+        });
+        idle.away = Some("lab away".into());
+        let mut waiting = thread("Retry window", "tide", None, false, Some("waits · 2h"));
+        waiting.away = Some("lab away".into());
+        waiting.found.thread = Some(FoundThread {
+            status: Some("working".into()),
+            work: Some(ThreadWork::Working),
+        });
+        let listing = Listing::new(vec![working, idle, waiting]);
+        let details: Vec<&str> = listing
+            .choices
+            .iter()
+            .map(|choice| choice.fields()[1])
+            .collect();
+        assert_eq!(details, ["lab away", "Docs pass", "waits · 2h"]);
     }
 
     #[test]

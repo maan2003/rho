@@ -27,10 +27,12 @@
 //! to close back to the place before) and by the deal (`space-j`).
 
 pub mod attention;
+mod awake;
 pub mod command;
 mod commands;
 pub mod deal;
 mod desk;
+pub mod focus;
 pub mod frame;
 mod gccp;
 pub mod hosts;
@@ -78,6 +80,8 @@ pub static SPELLINGS: &[&Spelling] = &[
     &own::UNDO_VERDICT,
     &own::SNOOZE,
     &own::UNMUTE,
+    &focus::SET_DEALER_FOCUS,
+    &focus::CLEAR_DEALER_FOCUS,
     &own::PAIR_DEVICE,
     &own::SHOW_SECRET_PHRASE,
     &own::QUIT,

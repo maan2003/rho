@@ -17,7 +17,9 @@ use rho_dealer::{Address, Card, Claim};
 use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
+use crate::awake::Awake;
 use crate::desk::{HostsAway, desk_rows};
+use crate::focus::DealerFocus;
 use crate::frame::Frame;
 use crate::phone::Layout;
 use crate::system::Project;
@@ -39,6 +41,9 @@ pub(crate) struct Signals {
     /// a verdict read. Ranking asks every system for its claims and walks
     /// every host's chat, so it happens once per change, never per draw.
     pub hand: Hand,
+    /// When the window slept, so the chime counts only waiting the user
+    /// could have noticed.
+    pub(crate) awake: Awake,
 }
 
 impl Frame {
@@ -70,6 +75,18 @@ impl Frame {
             .find_map(|system| system.project(address, cx))
     }
 
+    /// The host `address` lives on, from the system that owns it.
+    pub(crate) fn host_of(
+        &self,
+        address: &Address,
+        cx: &gpui::App,
+    ) -> Option<rho_agent_hosts::HostId> {
+        self.systems
+            .iter()
+            .find(|system| system.opens(address, cx))
+            .and_then(|system| system.host(address, cx))
+    }
+
     /// The screen that shows `address` as one of its lines, from the
     /// system that owns it.
     pub fn shown_in(&self, address: &Address, cx: &gpui::App) -> Option<Address> {
@@ -99,6 +116,24 @@ impl Frame {
     fn rank(&self, cx: &gpui::App) -> Hand {
         let now = Zoned::now();
         self.with_sources(None, cx, |sources| rho_dealer::rank::rank(sources, &now))
+    }
+
+    /// The cards of `hand` that the dealer focus lets deal, in its order.
+    fn dealable(&self, hand: &Hand, cx: &gpui::App) -> Hand {
+        let now = Timestamp::now();
+        Hand {
+            cards: hand
+                .cards
+                .iter()
+                .filter(|card| {
+                    let project = self.project_of(&card.address, cx);
+                    self.dealer_focus
+                        .deals(project.as_ref().map(|project| &project.address), now)
+                })
+                .cloned()
+                .collect(),
+            next_change: hand.next_change,
+        }
     }
 
     /// The ranking as of the last change.
@@ -300,7 +335,7 @@ impl Frame {
         match self.deal_next(None, window, cx) {
             true => self.echo(&said, StyleClass::SystemInfo, cx),
             false => {
-                let nothing = self.nothing_waits();
+                let nothing = self.nothing_waits(cx);
                 let words = match empty_first {
                     true => format!("{nothing} · {said}"),
                     false => format!("{said} · {nothing}"),
@@ -348,7 +383,7 @@ impl Frame {
     /// it would only deal it again.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let in_view = self.card_in_view(cx);
-        let hand = self.rank(cx);
+        let hand = self.dealable(&self.rank(cx), cx);
         let held = in_view
             .as_ref()
             .and_then(|address| hand.cards.iter().find(|card| &card.address == address))
@@ -382,7 +417,7 @@ impl Frame {
         });
         let words = match self.deal_next(in_view, window, cx) {
             true => skipped.map(|called| format!("skipped: {called}")),
-            false => Some(self.nothing_waits()),
+            false => Some(self.nothing_waits(cx)),
         };
         if let Some(words) = words {
             self.echo(&words, StyleClass::SystemInfo, cx);
@@ -400,9 +435,10 @@ impl Frame {
         cx: &mut Context<Self>,
     ) -> bool {
         // A pull ranks afresh: the skip just said moves it on, and time
-        // has passed since the last change.
+        // has passed since the last change. Only what the focus lets deal
+        // is dealt; Desk keeps the whole hand.
         let hand = self.rank(cx);
-        let card = hand.top(in_view.as_ref()).cloned();
+        let card = self.dealable(&hand, cx).top(in_view.as_ref()).cloned();
         if card.is_none() {
             // Focus Desk against the empty deal, not the previous hand.
             self.refresh_desk(&hand, true, cx);
@@ -456,9 +492,41 @@ impl Frame {
     }
 
     fn evaluate_signals(&mut self, cx: &mut Context<Self>) {
-        let hand = self.rank(cx);
+        self.signals.awake.observe_now();
+        let now = Zoned::now();
+        let at = now.timestamp();
+        let claims = self.claims(None, cx);
+        let rank = |claims: &[Claim]| {
+            let sources = Sources {
+                claims,
+                marks: &self.attention.marks,
+                skips: &self.attention.skips,
+            };
+            rho_dealer::rank::rank(&sources, &now)
+        };
+        let hand = rank(&claims);
+        // The chime hears the hand as if the window had not slept: a card
+        // presses for the time it waited while the user could notice it.
+        let awake = &self.signals.awake;
+        let chime_hand = match awake.has_slept() {
+            false => hand.clone(),
+            true => rank(
+                &claims
+                    .iter()
+                    .cloned()
+                    .map(|mut claim| {
+                        claim.curve = claim.curve.awake(|since| awake.slept_since(since));
+                        claim
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        };
         self.refresh_desk(&hand, true, cx);
-        self.signals.next_change = hand.next_change.map(|at| {
+        let next_change = [hand.next_change, self.dealer_focus.next_change(at)]
+            .into_iter()
+            .flatten()
+            .min();
+        self.signals.next_change = next_change.map(|at| {
             // Ranked a moment ago, so a change already due is due now.
             let wait = std::time::Duration::try_from(Timestamp::now().duration_until(at))
                 .unwrap_or_default();
@@ -468,29 +536,39 @@ impl Frame {
             })
         });
         // The lamp and the chime signal a card only when it cannot already
-        // be read here. Desk is itself a view of the hand, including its
-        // overflow, so on Desk neither signals anything.
+        // be read here, and only one the dealer focus lets signal. Desk is
+        // itself a view of the hand, including its overflow, so on Desk
+        // neither signals anything.
         let in_view = self.card_in_view(cx);
         let on_desk = self.desk_in_view();
-        let elsewhere = || {
-            hand.cards
-                .iter()
-                .filter(|card| !on_desk && Some(&card.address) != in_view.as_ref())
-        };
-        let top = elsewhere().max_by(|a, b| a.priority.total_cmp(&b.priority));
+        let elsewhere: Vec<&Card> = hand
+            .cards
+            .iter()
+            .filter(|card| !on_desk && Some(&card.address) != in_view.as_ref())
+            .filter(|card| {
+                let project = self.project_of(&card.address, cx);
+                self.dealer_focus
+                    .signals(project.as_ref().map(|project| &project.address), at)
+            })
+            .collect();
+        let top = elsewhere
+            .iter()
+            .max_by(|a, b| a.priority.total_cmp(&b.priority));
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| journal_card(&card.address));
-        let above_chime: BTreeSet<Address> = hand
+        let above_chime: BTreeSet<Address> = chime_hand
             .cards
             .iter()
             .filter(|card| card.priority >= rho_dealer::curve::CHIME_THRESHOLD)
             .map(|card| card.address.clone())
             .collect();
         // Only a crossing rings. A card already above the line last time
-        // rings no more, even when it crossed on Desk or in view, and a card
-        // long above the line holds back no other card's crossing.
+        // rings no more, even when it crossed on Desk, in view, or out of
+        // focus, and a card long above the line holds back no other card's
+        // crossing.
         let crossed = self.signals.above_chime.as_ref().and_then(|before| {
-            elsewhere()
+            elsewhere
+                .iter()
                 .filter(|card| above_chime.contains(&card.address))
                 .filter(|card| !before.contains(&card.address))
                 .max_by(|a, b| a.priority.total_cmp(&b.priority))
@@ -527,8 +605,12 @@ impl Frame {
     /// What the echo line says when a pull finds nothing to deal: and,
     /// calmly, which hosts are away, so an empty deal is not taken for an
     /// empty desk.
-    fn nothing_waits(&self) -> String {
-        HostsAway::of(&self.hosts).nothing_waits()
+    fn nothing_waits(&self, cx: &gpui::App) -> String {
+        let focus = match self.dealer_focus() {
+            DealerFocus::Project(project) => Some(self.project_name(project, cx)),
+            DealerFocus::All | DealerFocus::QuietUntil(_) => None,
+        };
+        HostsAway::of(&self.hosts).nothing_waits(focus.as_deref())
     }
 
     pub(crate) fn refresh_desk(&mut self, hand: &Hand, hold: bool, cx: &mut Context<Self>) {

@@ -15,6 +15,7 @@ use rho_db::{RhoDb, Sen, SenValue};
 use rho_dealer::Address;
 use senax_encoder::{Decode, Encode};
 
+use crate::focus::DealerFocus;
 use crate::frame::ScreenEntry;
 use crate::recent::Recent;
 
@@ -22,6 +23,8 @@ const RECENT: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_
 const LAST_INPUT: TableDefinition<(), i64> = TableDefinition::new("gui_frame_last_input_v1");
 const COMMANDS: TableDefinition<(), Sen<SavedCommands>> =
     TableDefinition::new("gui_frame_recent_commands_v1");
+const FOCUS: TableDefinition<(), Sen<DealerFocus>> =
+    TableDefinition::new("gui_frame_dealer_focus_v1");
 
 /// `desk.a cold return opens the desk`: exactly ten minutes is still warm.
 pub(crate) const COLD_RETURN: std::time::Duration = std::time::Duration::from_secs(600);
@@ -199,10 +202,23 @@ pub(crate) fn recent_commands(db: &RhoDb) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The dealer focus this device was left with; all when none was set.
+pub(crate) fn dealer_focus(db: &RhoDb) -> DealerFocus {
+    let read = db.read();
+    if !read.has_table(FOCUS.name()) {
+        return DealerFocus::All;
+    }
+    read.open_table(FOCUS)
+        .get(())
+        .map(|saved| saved.value().into_owned())
+        .unwrap_or_default()
+}
+
 pub(crate) enum Write {
     Place(Saved),
     Input(Timestamp),
     Commands(SavedCommands),
+    Focus(DealerFocus),
 }
 
 /// Saves the most recent update of each kind without waiting for disk in
@@ -222,11 +238,13 @@ impl Writer {
                     let mut place = None;
                     let mut input = None;
                     let mut commands = None;
+                    let mut focus = None;
                     for write in std::iter::once(first).chain(receiver.try_iter()) {
                         match write {
                             Write::Place(value) => place = Some(value),
                             Write::Input(value) => input = Some(value),
                             Write::Commands(value) => commands = Some(value),
+                            Write::Focus(value) => focus = Some(value),
                         }
                     }
                     futures::executor::block_on(async {
@@ -245,6 +263,11 @@ impl Writer {
                             write
                                 .open_table(COMMANDS)
                                 .insert((), SenValue::borrowed(&commands));
+                        }
+                        if let Some(focus) = focus {
+                            write
+                                .open_table(FOCUS)
+                                .insert((), SenValue::borrowed(&focus));
                         }
                         write.commit();
                     })
@@ -418,5 +441,28 @@ mod tests {
         assert_eq!(last_input(&db), Some(at));
         assert_eq!(recent_commands(&db), ["stop agent", "quit"]);
         assert!(Saved::load(&db).is_none(), "typing did not move the order");
+    }
+
+    /// The focus comes back after a restart as it was set last, a quiet
+    /// with its end and a project by its address.
+    #[test]
+    fn the_dealer_focus_comes_back_as_it_was_last_set() {
+        let db = RhoDb::in_memory();
+        assert_eq!(dealer_focus(&db), DealerFocus::All, "nothing set yet");
+        let until: Timestamp = "2026-11-26T12:45:00Z".parse().unwrap();
+        let writer = Writer::spawn(db.clone());
+        writer.write(Write::Focus(DealerFocus::QuietUntil(until)));
+        drop(writer);
+        assert_eq!(dealer_focus(&db), DealerFocus::QuietUntil(until));
+        let tide = address("thread:lab/1");
+        let writer = Writer::spawn(db.clone());
+        writer.write(Write::Focus(DealerFocus::All));
+        writer.write(Write::Focus(DealerFocus::Project(tide.clone())));
+        drop(writer);
+        assert_eq!(
+            dealer_focus(&db),
+            DealerFocus::Project(tide),
+            "the last one said"
+        );
     }
 }

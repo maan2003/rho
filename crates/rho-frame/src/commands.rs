@@ -10,8 +10,10 @@
 
 use std::cmp::Reverse;
 use std::ops::Range;
+use std::rc::Rc;
 
 use memchr::memmem::Finder;
+use rho_dealer::Address;
 
 use crate::command::{Command, NAME_WEIGHT, Spelling};
 use crate::matching::{Folded, best_hit, merge_marks, ordered_starts};
@@ -25,8 +27,11 @@ enum Tier {
     Name,
     /// The start of the name: `set ag`.
     NamePrefix,
-    /// An alias, whole or begun: `kill`, `mod`.
+    /// A whole alias: `kill`.
     Alias,
+    /// The start of an alias: `mod`. An alias said outright beats one
+    /// begun, so `focus` is `focus`, not `focus off`.
+    AliasPrefix,
     /// The starts of the name's words, in order: `ag run`.
     NameWords,
     AliasWords,
@@ -70,19 +75,62 @@ impl Words {
     }
 }
 
-/// A command the line picks, and the argument the line gives it.
+/// The place words typed after a command name: what the command acts
+/// from instead of the place in view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Resolved {
+    pub address: Address,
+    /// What the row calls it: `Flaky clock test · tide`.
+    pub name: String,
+}
+
+/// Finds the place typed words name, as `Places` would rank it first.
+pub(crate) type FindPlace = Rc<dyn Fn(&str) -> Option<Resolved>>;
+
+/// What the line gives a command after the words that name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Inline {
+    /// A value, for a command that takes one: `sol-medium`.
+    Value(String),
+    /// A place to act from, for a command that acts on the place in view.
+    Place { words: String, place: Resolved },
+}
+
+impl Inline {
+    /// The words as typed, which the row shows apart from the name.
+    pub(crate) fn words(&self) -> &str {
+        match self {
+            Self::Value(words) | Self::Place { words, .. } => words,
+        }
+    }
+}
+
+/// A command the line picks, and what the line gives it.
 pub(crate) struct Matched {
     pub index: usize,
-    pub argument: Option<String>,
+    pub inline: Option<Inline>,
     /// Display bytes of the name the words matched.
     pub marks: Vec<Range<usize>>,
+    /// How many of the typed words name the command.
+    naming: usize,
     tier: Tier,
     weight: u8,
+}
+
+impl Matched {
+    pub(crate) fn argument(&self) -> Option<&str> {
+        match &self.inline {
+            Some(Inline::Value(value)) => Some(value),
+            Some(Inline::Place { .. }) | None => None,
+        }
+    }
 }
 
 pub(crate) struct Listing {
     pub entries: Vec<Entry>,
     words: Vec<Words>,
+    /// Where words after a command that acts on a place lead.
+    find_place: Option<FindPlace>,
 }
 
 /// What `Commands` lists for `input` among commands spelled `spellings`,
@@ -103,7 +151,10 @@ pub fn rank_spellings(
     listing
         .rank(input)
         .into_iter()
-        .map(|matched| (spellings[matched.index].name, matched.argument))
+        .map(|matched| {
+            let argument = matched.argument().map(str::to_owned);
+            (spellings[matched.index].name, argument)
+        })
         .collect()
 }
 
@@ -150,6 +201,16 @@ enum Reach {
 impl Listing {
     /// `recent` names the commands the user ran last, most recent first.
     pub fn new(commands: Vec<(Command, String)>, recent: &[String]) -> Self {
+        Self::finding_places(commands, recent, None)
+    }
+
+    /// As [`Self::new`], with `find_place` to read the words after a
+    /// command that acts on a place.
+    pub fn finding_places(
+        commands: Vec<(Command, String)>,
+        recent: &[String],
+        find_place: Option<FindPlace>,
+    ) -> Self {
         let entries: Vec<Entry> = commands
             .into_iter()
             .map(|(command, keys)| Entry {
@@ -162,7 +223,11 @@ impl Listing {
             .iter()
             .map(|entry| Words::new(&entry.command))
             .collect();
-        Self { entries, words }
+        Self {
+            entries,
+            words,
+            find_place,
+        }
     }
 
     /// The commands the line means, best first. Nothing typed lists the
@@ -182,8 +247,9 @@ impl Listing {
                 .into_iter()
                 .map(|index| Matched {
                     index,
-                    argument: None,
+                    inline: None,
                     marks: Vec::new(),
+                    naming: 0,
                     tier: Tier::Name,
                     weight: NAME_WEIGHT,
                 })
@@ -198,13 +264,16 @@ impl Listing {
             .iter()
             .enumerate()
             .filter_map(|(index, words)| {
-                let takes = self.entries[index].command.spelling().argument.is_some();
-                let searched =
-                    Self::searched(words, &terms).map(|(tier, weight)| (tier, weight, None));
-                // The most words that name it outright, then the argument.
-                // Abbreviated words name it less surely than whole ones,
-                // so `re ca` is a search before it is `rename` on `ca`.
-                let named = (takes && terms.len() > 1)
+                let command = &self.entries[index].command;
+                let takes_value = command.spelling().argument.is_some();
+                let find_place = self.find_place.as_ref().filter(|_| command.takes_place());
+                let searched = Self::searched(words, &terms)
+                    .map(|(tier, weight)| (tier, weight, terms.len(), None));
+                // The most words that name it outright, then what it is
+                // given: a value, or a place to act from that the words
+                // find. Abbreviated words name it less surely than whole
+                // ones, so `re ca` is a search before it is `rename` on `ca`.
+                let named = ((takes_value || find_place.is_some()) && terms.len() > 1)
                     .then(|| {
                         (1..terms.len()).rev().find_map(|used| {
                             let typed = &terms[..used];
@@ -223,37 +292,47 @@ impl Listing {
                                     })
                                     .min_by_key(|(tier, weight)| (*tier, Reverse(*weight)))?,
                             };
-                            let argument = input[tokens[used].0..].trim_end().to_owned();
-                            Some((tier, weight, Some((used, argument))))
+                            let words = input[tokens[used].0..].trim_end().to_owned();
+                            let inline = match find_place {
+                                Some(find_place) => Inline::Place {
+                                    place: find_place(&words)?,
+                                    words,
+                                },
+                                None => Inline::Value(words),
+                            };
+                            Some((tier, weight, used, Some(inline)))
                         })
                     })
                     .flatten();
-                let (tier, weight, argument) = [searched, named]
+                let (tier, weight, naming, inline) = [searched, named]
                     .into_iter()
                     .flatten()
-                    .min_by_key(|(tier, weight, _)| (*tier, Reverse(*weight)))?;
-                let named_terms = match &argument {
-                    Some((used, _)) => &terms[..*used],
-                    None => &terms[..],
-                };
+                    .min_by_key(|(tier, weight, ..)| (*tier, Reverse(*weight)))?;
                 let marks = match tier {
                     Tier::Name | Tier::NamePrefix | Tier::NameWords | Tier::InName => {
-                        Self::marks(&words.name, named_terms)
+                        Self::marks(&words.name, &terms[..naming])
                     }
-                    Tier::Alias | Tier::AliasWords | Tier::InAlias => Vec::new(),
+                    Tier::Alias | Tier::AliasPrefix | Tier::AliasWords | Tier::InAlias => {
+                        Vec::new()
+                    }
                 };
                 Some(Matched {
                     index,
-                    argument: argument.map(|(_, argument)| argument),
+                    inline,
                     marks,
+                    naming,
                     tier,
                     weight,
                 })
             })
             .collect();
+        // Command words first: the more of the line that names a command,
+        // the surer it is, so `open term clock` opens a terminal from the
+        // `clock` thread before it opens a page at `term clock`.
         rows.sort_by_key(|row| {
             let entry = &self.entries[row.index];
             (
+                Reverse(row.naming),
                 row.tier,
                 Reverse(row.weight),
                 entry.recent.unwrap_or(usize::MAX),
@@ -261,6 +340,25 @@ impl Listing {
             )
         });
         rows
+    }
+
+    /// What a row shows, in order: the command's name, the words typed
+    /// after it, kept apart from the name, and what it acts on, which is
+    /// the place those words found when they name one.
+    pub(crate) fn row_parts<'a>(
+        &'a self,
+        matched: &'a Matched,
+    ) -> (&'static str, Option<&'a str>, Option<&'a str>) {
+        let command = &self.entries[matched.index].command;
+        let target = match &matched.inline {
+            Some(Inline::Place { place, .. }) => Some(place.name.as_str()),
+            Some(Inline::Value(_)) | None => command.target_text(),
+        };
+        (
+            command.name(),
+            matched.inline.as_ref().map(Inline::words),
+            target,
+        )
     }
 
     /// How the whole line, as a search, reaches the name or an alias.
@@ -276,7 +374,8 @@ impl Listing {
         });
         let by_alias = words.aliases.iter().filter_map(|(alias, _, weight)| {
             let tier = match reach(alias, terms)? {
-                Reach::Whole | Reach::Start => Tier::Alias,
+                Reach::Whole => Tier::Alias,
+                Reach::Start => Tier::AliasPrefix,
                 Reach::WordStarts => Tier::AliasWords,
                 Reach::Inside => Tier::InAlias,
             };
@@ -374,7 +473,141 @@ mod tests {
 
     fn first(listing: &Listing, input: &str) -> (&'static str, Option<String>) {
         let row = listing.rank(input).into_iter().next().expect("a command");
-        (listing.entries[row.index].command.name(), row.argument)
+        let argument = row.argument().map(str::to_owned);
+        (listing.entries[row.index].command.name(), argument)
+    }
+
+    /// The catalogue, with the agent commands acting on the place in view,
+    /// and words after them finding a place among `places`.
+    fn placed() -> Listing {
+        let here = [
+            "stop agent",
+            "cancel agent request",
+            "open terminal",
+            "new terminal",
+        ];
+        let places = [
+            ("thread:lab/1", "Flaky clock test · tide"),
+            ("thread:lab/2", "Retry window · reef"),
+        ];
+        let find_place: FindPlace = Rc::new(move |words: &str| {
+            let words = words.to_lowercase();
+            places
+                .iter()
+                .find(|(_, name)| {
+                    words
+                        .split_whitespace()
+                        .all(|word| name.to_lowercase().contains(word))
+                })
+                .map(|(key, name)| Resolved {
+                    address: Address::parse(key).unwrap(),
+                    name: (*name).to_owned(),
+                })
+        });
+        Listing::finding_places(
+            catalogue()
+                .into_iter()
+                .map(|command| match here.contains(&command.name()) {
+                    true => command.acts_on("tide · Flaky clock test · working"),
+                    false => command,
+                })
+                .map(|command| (command, String::new()))
+                .collect(),
+            &[],
+            Some(find_place),
+        )
+    }
+
+    /// Each row: its name, and what the line gives it.
+    fn inlines(listing: &Listing, input: &str) -> Vec<(&'static str, Option<Inline>)> {
+        listing
+            .rank(input)
+            .into_iter()
+            .map(|row| (listing.entries[row.index].command.name(), row.inline))
+            .collect()
+    }
+
+    /// `stop agent clock` stops the agent of the thread `clock` finds,
+    /// whatever is in view: the words after the name are a place.
+    #[test]
+    fn words_after_a_command_on_a_place_name_the_place() {
+        let listing = placed();
+        let rows = inlines(&listing, "stop agent clock");
+        let Some(Inline::Place { words, place }) = &rows[0].1 else {
+            panic!("{rows:?}");
+        };
+        assert_eq!(rows[0].0, "stop agent");
+        assert_eq!(words, "clock");
+        assert_eq!(place.address, Address::parse("thread:lab/1").unwrap());
+        assert_eq!(place.name, "Flaky clock test · tide");
+        // Its words keep their case and inner spaces; an alias names it too.
+        let rows = inlines(&listing, "kill Retry  Window");
+        assert_eq!(
+            rows.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["stop agent", "cancel agent request"]
+        );
+        assert!(
+            matches!(&rows[0].1, Some(Inline::Place { words, place })
+                if words == "Retry  Window" && place.name == "Retry window · reef"),
+            "{rows:?}"
+        );
+        // With nothing after it, the place in view stays.
+        assert_eq!(inlines(&listing, "stop agent")[0], ("stop agent", None));
+    }
+
+    /// Words that find no place are no place: the line names no command,
+    /// rather than one acting on the place in view with words ignored.
+    #[test]
+    fn words_that_find_no_place_name_no_command() {
+        let listing = placed();
+        assert!(inlines(&listing, "stop agent zzz").is_empty());
+        // Without a way to find places, as without the frame, nothing does.
+        let bare = listing_with_targets_but_no_places();
+        assert!(names(&bare, "stop agent clock").is_empty());
+        // A command that acts on nothing in particular takes no place.
+        assert!(names(&listing, "quit clock").is_empty());
+        // A command that takes a value takes the words as its value, even
+        // where they would find a place.
+        assert_eq!(
+            inlines(&listing, "rename clock")[0],
+            ("rename thread", Some(Inline::Value("clock".into())))
+        );
+    }
+
+    fn listing_with_targets_but_no_places() -> Listing {
+        Listing::new(
+            catalogue()
+                .into_iter()
+                .map(|command| match command.name() {
+                    "stop agent" => command.acts_on("here"),
+                    _ => command,
+                })
+                .map(|command| (command, String::new()))
+                .collect(),
+            &[],
+        )
+    }
+
+    /// Command words match first: `open term clock` is a terminal opened
+    /// from the `clock` thread, and the page at `term clock` comes after,
+    /// its words shown apart as an address.
+    #[test]
+    fn command_words_match_before_inline_words() {
+        let listing = placed();
+        let rows = inlines(&listing, "open term clock");
+        assert_eq!(rows[0].0, "open terminal");
+        assert!(matches!(&rows[0].1, Some(Inline::Place { words, .. }) if words == "clock"));
+        let page = rows
+            .iter()
+            .find(|(name, _)| *name == "open page")
+            .expect("the page still lists");
+        assert_eq!(page.1, Some(Inline::Value("term clock".into())));
+        // The marks fall on the name's words, never on the place.
+        let row = &listing.rank("open term clock")[0];
+        assert_eq!(row.marks, [0..4, 5..9]);
+        assert_eq!(row.inline.as_ref().map(Inline::words), Some("clock"));
+        // `open term` alone is the terminal, from the place in view.
+        assert_eq!(inlines(&listing, "open term")[0], ("open terminal", None));
     }
 
     #[test]
@@ -525,7 +758,7 @@ mod tests {
             listing
                 .rank("set sol-high")
                 .iter()
-                .all(|row| row.argument.is_none())
+                .all(|row| row.inline.is_none())
         );
         // The whole line naming the command is no argument.
         assert_eq!(

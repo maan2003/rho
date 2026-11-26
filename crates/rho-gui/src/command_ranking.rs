@@ -97,6 +97,8 @@ fn every_name_is_its_own_and_plain() {
         "quit",
         "snooze",
         "unmute",
+        "set dealer focus",
+        "clear dealer focus",
     ] {
         assert!(seen.contains(named), "no command is called {named}");
     }
@@ -162,6 +164,14 @@ fn inline_arguments_reach_their_command() {
             "switch claude account",
             "work",
         ),
+        ("focus tide", "set dealer focus", "tide"),
+        ("quiet 45m", "set dealer focus", "45m"),
+        ("dnd 2h", "set dealer focus", "2h"),
+        (
+            "set dealer focus project reef",
+            "set dealer focus",
+            "project reef",
+        ),
     ] {
         assert_eq!(first(line), (command, Some(argument.to_owned())), "{line}");
     }
@@ -203,4 +213,16 @@ fn everyday_words_find_what_they_mean() {
     }
     // `undo turn` is the agent's rewind only when said outright.
     assert_eq!(first("undo turn").0, "rewind agent");
+}
+
+/// `focus` sets the dealer's focus and `focus off` clears it, though one
+/// begins the other.
+#[test]
+fn focus_sets_the_dealer_focus_and_focus_off_clears_it() {
+    for word in ["focus", "quiet", "dnd", "do not disturb"] {
+        assert_eq!(first(word), ("set dealer focus", None), "{word}");
+    }
+    for words in ["focus off", "unfocus", "clear dealer focus"] {
+        assert_eq!(first(words), ("clear dealer focus", None), "{words}");
+    }
 }

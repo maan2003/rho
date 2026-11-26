@@ -44,9 +44,21 @@ pub struct Command {
     /// What the command acts on and its current value, from the screen in
     /// view: `tide · Flaky clock test · working (opus-high)`, or
     /// `pick agent…` when the screen does not say.
-    pub(crate) target: Option<String>,
+    pub(crate) target: Option<Target>,
     pub(crate) shortcut: Option<Shortcut>,
     pub(crate) run: Run,
+}
+
+/// What a row says the command acts on.
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// Its current value, or what it acts on, which words typed after its
+    /// name never change: `lab · online`.
+    Shown(String),
+    /// What it acts on from the place in view. Words typed after its name
+    /// name another place to act from instead: `stop agent clock` stops
+    /// the agent of the thread `clock` finds, wherever the user is.
+    Here(String),
 }
 
 /// The keys that run a command without `Commands`.
@@ -97,7 +109,20 @@ impl Command {
 
     /// What it acts on and its current value, as the row shows it.
     pub fn target(mut self, target: impl Into<String>) -> Self {
-        self.target = Some(target.into());
+        self.target = Some(Target::Shown(target.into()));
+        self
+    }
+
+    /// What it acts on from the place in view, as the row shows it, for a
+    /// command that takes nothing after its name: words typed there name
+    /// the place to act from instead (`window.Commands`).
+    pub fn acts_on(mut self, target: impl Into<String>) -> Self {
+        debug_assert!(
+            self.spelling.argument.is_none(),
+            "{} takes an argument, so the words after it are not a place",
+            self.spelling.name
+        );
+        self.target = Some(Target::Here(target.into()));
         self
     }
 
@@ -122,7 +147,14 @@ impl Command {
     }
 
     pub fn target_text(&self) -> Option<&str> {
-        self.target.as_deref()
+        match self.target.as_ref()? {
+            Target::Shown(text) | Target::Here(text) => Some(text),
+        }
+    }
+
+    /// Whether words typed after its name name a place to act from.
+    pub(crate) fn takes_place(&self) -> bool {
+        matches!(self.target, Some(Target::Here(_)))
     }
 
     /// Runs it, as `enter` on its row does.

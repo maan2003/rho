@@ -54,6 +54,94 @@ pub(crate) static LIST_HOSTS: Spelling = Spelling {
     argument: None,
 };
 
+/// How the window shows a host (`hosts.Host`). An away host is an
+/// everyday state the window says calmly; only a host that needs the
+/// user's hand, or an away one the screen in view needs, is an alarm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    Online,
+    /// Dialling, before the host first answers.
+    Connecting,
+    /// Dropped or gone quiet; the window dials again by itself.
+    Away,
+    /// It will not answer until the user does something: enrol this device.
+    NeedsYou,
+}
+
+impl Reach {
+    pub(crate) fn of(status: &HostStatus) -> Self {
+        match status {
+            HostStatus::Online => Self::Online,
+            HostStatus::Connecting => Self::Connecting,
+            HostStatus::Recovering(_) | HostStatus::Disconnected(_) => Self::Away,
+            HostStatus::Unenrolled(_) => Self::NeedsYou,
+        }
+    }
+}
+
+/// A host's state in the user's words, with why when it is away or needs
+/// them: `online`, `away · connection lost`, `needs you · enroll this
+/// device on the host: rho enroll …`. Never how long, so nothing ticks.
+pub(crate) fn status_words(status: &HostStatus) -> String {
+    match status {
+        HostStatus::Online => "online".to_owned(),
+        HostStatus::Connecting => "connecting".to_owned(),
+        HostStatus::Recovering(_) => "away · reconnecting".to_owned(),
+        HostStatus::Disconnected(reason) => format!("away · {reason}"),
+        HostStatus::Unenrolled(command) => {
+            format!("needs you · enroll this device on the host: {command}")
+        }
+    }
+}
+
+/// One part of the status line's host notice, and whether it is an alarm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Notice {
+    pub words: String,
+    pub alarm: bool,
+}
+
+/// The status line's notice of the hosts that do not answer
+/// (`window.Status line`): hosts that need the user, as an alarm; an away
+/// host the screen in view lives on (`needed`), as an alarm; the rest away
+/// or connecting, calmly. Nothing while every host answers.
+pub(crate) fn notice<'a>(
+    hosts: impl IntoIterator<Item = (&'a str, Reach)>,
+    needed: Option<&str>,
+) -> Vec<Notice> {
+    let mut needs_you = Vec::new();
+    let mut away = Vec::new();
+    let mut connecting = Vec::new();
+    let mut alarm = None;
+    for (name, reach) in hosts {
+        match reach {
+            Reach::Online => {}
+            Reach::NeedsYou => needs_you.push(name),
+            Reach::Away if needed == Some(name) => alarm = Some(name),
+            Reach::Away => away.push(name),
+            Reach::Connecting => connecting.push(name),
+        }
+    }
+    let group = |names: &[&str], one: &str, many: &str| match names {
+        [] => None,
+        [name] => Some(format!("{name} {one}")),
+        names => Some(format!("{} hosts {many}", names.len())),
+    };
+    let calm: Vec<String> = group(&away, "away", "away")
+        .into_iter()
+        .chain(group(&connecting, "connecting", "connecting"))
+        .collect();
+    group(&needs_you, "needs you", "need you")
+        .into_iter()
+        .chain(alarm.map(|name| format!("{name} away")))
+        .map(|words| Notice { words, alarm: true })
+        .chain((!calm.is_empty()).then(|| Notice {
+            words: calm.join(" · "),
+            alarm: false,
+        }))
+        .collect()
+}
+
 /// What attaching a host asks, and what its answer reads as.
 const ATTACH_QUESTION: &str = "attach host · name=local (this machine), \
      name=iroh:<id>@<ssh host> (ssh), or name=iroh:<id> (security key):";
@@ -68,7 +156,7 @@ pub(crate) fn commands(frame: &Frame) -> Vec<Command> {
     };
     let listed = match hosts.worst_status() {
         None => "no host attached".to_owned(),
-        Some((name, status)) if hosts.len() == 1 => format!("{name} · {}", status.label()),
+        Some((name, status)) if hosts.len() == 1 => format!("{name} · {}", status_words(&status)),
         Some(_) => format!("{} attached", hosts.len()),
     };
     vec![
@@ -155,7 +243,7 @@ fn host_candidates(frame: &Frame, needle: &str) -> Vec<Candidate> {
         .filter(|host| host.name.contains(needle.trim()))
         .map(|host| Candidate {
             value: host.name.clone(),
-            description: host.status.label(),
+            description: status_words(&host.status),
         })
         .collect()
 }
@@ -275,9 +363,10 @@ impl Frame {
                 self.hosts.set_status(host, HostStatus::Recovering(elapsed));
             }
             ConnEvent::Disconnected(reason) => {
+                // Away is an everyday state: said once, calmly.
                 self.echo(
-                    &format!("{name}: disconnected · {reason}"),
-                    StyleClass::Disconnect,
+                    &format!("{name} away · {reason}"),
+                    StyleClass::SystemInfo,
                     cx,
                 );
                 self.hosts
@@ -286,7 +375,7 @@ impl Frame {
             ConnEvent::Unenrolled { command } => {
                 let status = HostStatus::Unenrolled(command);
                 self.echo(
-                    &format!("{name}: {}", status.label()),
+                    &format!("{name}: {}", status_words(&status)),
                     StyleClass::Disconnect,
                     cx,
                 );
@@ -412,7 +501,7 @@ impl Frame {
                 format!("{name}: dialing again")
             }
             status @ (HostStatus::Online | HostStatus::Connecting) => {
-                format!("{name}: {}", status.label())
+                format!("{name}: {}", status_words(status))
             }
         };
         self.echo(&said, StyleClass::SystemInfo, cx);
@@ -421,3 +510,103 @@ impl Frame {
 
 /// What a host command does once it knows which host it means.
 pub type OnHost = Rc<dyn Fn(&mut Frame, HostId, &mut Window, &mut Context<Frame>)>;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn notice_of(hosts: &[(&str, Reach)], needed: Option<&str>) -> Vec<(String, bool)> {
+        notice(hosts.iter().copied(), needed)
+            .into_iter()
+            .map(|notice| (notice.words, notice.alarm))
+            .collect()
+    }
+
+    fn calm(words: &str) -> (String, bool) {
+        (words.to_owned(), false)
+    }
+
+    fn alarm(words: &str) -> (String, bool) {
+        (words.to_owned(), true)
+    }
+
+    /// Dropped, gone quiet, or never enrolled: four states, in words that
+    /// never count seconds.
+    #[test]
+    fn every_status_is_one_of_four_states_in_still_words() {
+        for (status, reach, words) in [
+            (HostStatus::Online, Reach::Online, "online"),
+            (HostStatus::Connecting, Reach::Connecting, "connecting"),
+            (
+                HostStatus::Recovering(Duration::from_secs(12)),
+                Reach::Away,
+                "away · reconnecting",
+            ),
+            (
+                HostStatus::Disconnected("connection lost".into()),
+                Reach::Away,
+                "away · connection lost",
+            ),
+            (
+                HostStatus::Unenrolled("rho enroll 7f3".into()),
+                Reach::NeedsYou,
+                "needs you · enroll this device on the host: rho enroll 7f3",
+            ),
+        ] {
+            assert_eq!(Reach::of(&status), reach, "{status:?}");
+            assert_eq!(status_words(&status), words);
+        }
+        assert_eq!(
+            status_words(&HostStatus::Recovering(Duration::from_secs(13))),
+            status_words(&HostStatus::Recovering(Duration::from_secs(12))),
+            "nothing ticks"
+        );
+    }
+
+    /// An away host is everyday: a calm note on every screen, never red.
+    #[test]
+    fn an_away_host_is_a_calm_note() {
+        assert!(notice_of(&[("lab", Reach::Online)], None).is_empty());
+        assert_eq!(
+            notice_of(&[("lab", Reach::Away), ("reef", Reach::Online)], None),
+            [calm("lab away")]
+        );
+        assert_eq!(
+            notice_of(
+                &[
+                    ("lab", Reach::Away),
+                    ("reef", Reach::Away),
+                    ("sea", Reach::Connecting)
+                ],
+                Some("kelp")
+            ),
+            [calm("2 hosts away · sea connecting")],
+            "a screen on another host needs none of them"
+        );
+    }
+
+    /// Red only for a host the screen in view needs, and for one that
+    /// needs the user's hand, wherever they are.
+    #[test]
+    fn red_is_for_the_host_in_view_and_for_one_that_needs_you() {
+        assert_eq!(
+            notice_of(&[("lab", Reach::Away), ("reef", Reach::Away)], Some("lab")),
+            [alarm("lab away"), calm("reef away")]
+        );
+        assert_eq!(
+            notice_of(&[("lab", Reach::Connecting)], Some("lab")),
+            [calm("lab connecting")],
+            "dialling is not away"
+        );
+        assert_eq!(
+            notice_of(&[("lab", Reach::NeedsYou), ("reef", Reach::Away)], None),
+            [alarm("lab needs you"), calm("reef away")]
+        );
+        assert_eq!(
+            notice_of(&[("lab", Reach::NeedsYou), ("reef", Reach::NeedsYou)], None),
+            [alarm("2 hosts need you")]
+        );
+    }
+}

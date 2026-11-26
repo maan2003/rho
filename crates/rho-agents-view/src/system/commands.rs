@@ -563,14 +563,14 @@ impl AgentsSystem {
                     Rc::new(move |_| reached(act.clone())),
                 ),
             )
-            .target(steer_target.clone())
+            .acts_on(steer_target.clone())
         };
         let working = |spelling: &'static Spelling, act: Then| {
             Command::new(
                 spelling,
                 on(&here.work, Ask::Workset, Rc::new(move |_| act.clone())),
             )
-            .target(work_target.clone())
+            .acts_on(work_target.clone())
         };
         let mut commands = vec![
             Command::new(
@@ -708,7 +708,7 @@ impl AgentsSystem {
                             .update(cx, |_, cx| cx.emit(MailEvent::Inspect { agent, mail }))
                     });
                 })
-                .target(self.label(agent, cx).0);
+                .acts_on(self.label(agent, cx).0);
                 match under_point {
                     true => command.bound_to(rho_frame::thread::OpenRow),
                     false => command,

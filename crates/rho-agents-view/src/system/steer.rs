@@ -17,8 +17,8 @@ use super::AgentsSystem;
 
 /// The agent's host was detached, or never attached.
 pub(super) const NOT_ATTACHED: &str = "the agent's host is not attached";
-/// The agent's host is attached but does not answer now.
-pub(super) const DISCONNECTED: &str = "the agent's host is disconnected";
+/// The agent's host is attached but away now: it comes back by itself.
+pub(super) const AWAY: &str = "the agent's host is away";
 
 /// What the echo line says when an agent's host cannot take a command now,
 /// given how the frame last heard the host: `None` when it is not attached.
@@ -33,7 +33,7 @@ pub(super) fn unreachable(status: Option<&HostStatus>) -> Option<&'static str> {
             | HostStatus::Recovering(_)
             | HostStatus::Disconnected(_)
             | HostStatus::Unenrolled(_),
-        ) => Some(DISCONNECTED),
+        ) => Some(AWAY),
     }
 }
 
@@ -295,7 +295,7 @@ mod tests {
     /// A host that is attached but away is told apart from one that is not
     /// attached: the first comes back by itself, the second needs the user.
     #[test]
-    fn an_away_host_is_disconnected_and_a_missing_one_is_not_attached() {
+    fn an_attached_host_that_does_not_answer_is_away_and_a_missing_one_is_not_attached() {
         assert_eq!(unreachable(None), Some(NOT_ATTACHED));
         assert_eq!(unreachable(Some(&HostStatus::Online)), None);
         for away in [
@@ -304,9 +304,9 @@ mod tests {
             HostStatus::Disconnected("timed out".into()),
             HostStatus::Unenrolled("rho enroll …".into()),
         ] {
-            assert_eq!(unreachable(Some(&away)), Some(DISCONNECTED), "{away:?}");
+            assert_eq!(unreachable(Some(&away)), Some(AWAY), "{away:?}");
         }
-        assert_ne!(NOT_ATTACHED, DISCONNECTED);
+        assert_ne!(NOT_ATTACHED, AWAY);
     }
 
     #[test]

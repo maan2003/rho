@@ -106,6 +106,21 @@ impl Curve {
         }
     }
 
+    /// The curve as if the time the window slept through had not passed:
+    /// waiting starts later by what `slept` says was slept through since
+    /// it began. The chime hears waiting the user could have noticed, so a
+    /// night asleep does not ring the moment the window wakes; a deadline
+    /// is a time on the clock, sleep or not.
+    pub fn awake(self, slept: impl FnOnce(Timestamp) -> SignedDuration) -> Self {
+        match self {
+            Self::Waiting { head_start, since } => Self::Waiting {
+                head_start,
+                since: since + slept(since).max(SignedDuration::ZERO),
+            },
+            deadline @ Self::Deadline { .. } => deadline,
+        }
+    }
+
     /// The moments at which this curve jumps rather than slides: a
     /// deadline coming into view or passing.
     pub(crate) fn steps(&self) -> Vec<Timestamp> {
@@ -234,6 +249,36 @@ mod tests {
             since: ago(1.0 / 24.0),
         };
         assert!((hour_ago.priority(noon()) - (AGENT_BLOCKED_HEAD_START + 0.5)).abs() < 1e-9);
+    }
+
+    /// Time slept through does not press: an ask that waited an hour, half
+    /// of it with the window asleep, presses as half an hour awake does.
+    /// What the window was asleep for is asked from when the wait began,
+    /// and a deadline keeps its clock.
+    #[test]
+    fn waiting_slept_through_does_not_press() {
+        let waiting = Curve::Waiting {
+            head_start: AGENT_BLOCKED_HEAD_START,
+            since: ago(1.0 / 24.0),
+        };
+        let asked = std::cell::Cell::new(None);
+        let awake = waiting.awake(|since| {
+            asked.set(Some(since));
+            SignedDuration::from_mins(30)
+        });
+        assert_eq!(asked.get(), Some(ago(1.0 / 24.0)));
+        let half_hour = AGENT_BLOCKED_HEAD_START + WAITING_SLOPE_PER_DAY / 48.0;
+        assert!((awake.priority(noon()) - half_hour).abs() < 1e-9);
+        assert_eq!(
+            waiting.awake(|_| SignedDuration::from_mins(-5)),
+            waiting,
+            "a clock set back sleeps no time"
+        );
+        let deadline = Curve::Deadline {
+            by: ago(-1.0),
+            lead_days: 3,
+        };
+        assert_eq!(deadline.awake(|_| SignedDuration::from_hours(9)), deadline);
     }
 
     #[test]

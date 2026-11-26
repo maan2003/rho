@@ -13,7 +13,7 @@ use gpui::{
     div, px,
 };
 use jiff::Timestamp;
-use rho_agent_hosts::hosts::{HostStatus, Hosts};
+use rho_agent_hosts::hosts::Hosts;
 use rho_agent_hosts::{HostEvent, HostId, HostSpec};
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
@@ -25,6 +25,7 @@ use crate::attention::{Attention, Verdict};
 use crate::command::{Command, Shortcut};
 use crate::deal::Signals;
 use crate::desk::DeskView;
+use crate::hosts::Reach;
 use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
     Answer, CancelHandler, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
@@ -126,6 +127,8 @@ pub struct Frame {
     chrome_editor: Entity<Editor>,
     mode_indicator: Entity<vim::ModeIndicator>,
     pub(crate) signals: Signals,
+    /// What the deal, the lamp and the chime answer to, kept on this device.
+    pub(crate) dealer_focus: crate::focus::DealerFocus,
     pub(crate) chime: Rc<dyn Fn()>,
     /// The last `/` or `?`, which `n` and `N` repeat in any surface.
     pub(crate) search: Option<Search>,
@@ -233,6 +236,7 @@ impl Frame {
             chrome_editor,
             mode_indicator,
             signals: Signals::default(),
+            dealer_focus: place::dealer_focus(&db),
             chime,
             search: None,
             phone: Phone::default(),
@@ -1061,6 +1065,21 @@ impl Frame {
 
     /// `Places`, or with `scope` only the places in that project.
     fn open_places(&mut self, scope: Option<Project>, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.place_rows(scope.as_ref(), cx);
+        let mut listing = places::Listing::new(rows);
+        listing.desk = self.desk_in_view();
+        let prompt = match &scope {
+            Some(project) => format!("places · {}:", project.name),
+            None => "places:".to_owned(),
+        };
+        let scope = scope.map(|project| project.address);
+        self.open_minibuffer(prompt, Answer::places(listing, scope), None, window, cx);
+    }
+
+    /// Every place `Places` lists, or with `scope` only those in that
+    /// project: what the systems list, what the user visited, and what
+    /// waits, each with its card and its states.
+    fn place_rows(&self, scope: Option<&Project>, cx: &App) -> Vec<places::Place> {
         let desk = Self::desk_address();
         let in_scope = |frame: &Self, address: &Address| {
             *address != desk
@@ -1131,24 +1150,59 @@ impl Frame {
             .enumerate()
             .map(|(rank, address)| (address, rank))
             .collect();
-        let rows = found
+        let now = Timestamp::now();
+        found
             .into_iter()
-            .map(|found| places::Place {
-                visit: visits.get(&found.address).copied(),
-                visited_ms: self.recent.visited_ms(&found.address),
-                current: self.current_address() == &found.address,
-                card: cards.get(&found.address).map(|(_, card)| (*card).clone()),
-                found,
+            .map(|found| {
+                let card = cards.get(&found.address).map(|(_, card)| (*card).clone());
+                let away = self
+                    .away_host(&found.address, cx)
+                    .map(|host| format!("{} away", host.name));
+                let states = self.place_states(&found, card.as_ref(), away.is_some(), now);
+                places::Place {
+                    visit: visits.get(&found.address).copied(),
+                    visited_ms: self.recent.visited_ms(&found.address),
+                    current: self.current_address() == &found.address,
+                    card,
+                    found,
+                    states,
+                    away,
+                }
             })
-            .collect();
-        let mut listing = places::Listing::new(rows);
-        listing.desk = self.desk_in_view();
-        let prompt = match &scope {
-            Some(project) => format!("places · {}:", project.name),
-            None => "places:".to_owned(),
-        };
-        let scope = scope.map(|project| project.address);
-        self.open_minibuffer(prompt, Answer::places(listing, scope), None, window, cx);
+            .collect()
+    }
+
+    /// The states `Places` finds a place under (`working:`, `stopped:`,
+    /// `muted:`, `snoozed:`): what its host last said its agents do, unless
+    /// that host is `away`, what the deal holds of it, and what the user
+    /// said about it.
+    fn place_states(
+        &self,
+        found: &Found,
+        card: Option<&Card>,
+        away: bool,
+        now: Timestamp,
+    ) -> Vec<places::PlaceState> {
+        use places::PlaceState;
+        let work = found.thread.as_ref().and_then(|thread| thread.work);
+        let facts = self.attention.marks.get(&found.address).facts();
+        let stopped = work == Some(rho_agent_types::ThreadWork::StoppedByYou)
+            || card.is_some_and(|card| matches!(card.kind, rho_dealer::rank::CardKind::Stop(_)));
+        [
+            (
+                PlaceState::Working,
+                work == Some(rho_agent_types::ThreadWork::Working) && !away,
+            ),
+            (PlaceState::Stopped, stopped),
+            (PlaceState::Muted, facts.muted()),
+            (
+                PlaceState::Snoozed,
+                facts.snooze().is_some_and(|snooze| now < snooze.until),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(state, holds)| holds.then_some(state))
+        .collect()
     }
 
     /// What choosing a place in `Places` does. A project has no screen of
@@ -1281,7 +1335,27 @@ impl Frame {
                 (command, keys.unwrap_or_default())
             })
             .collect();
-        let listing = commands::Listing::new(entries, &self.recent_commands);
+        // Words after a command that acts on a place find the place as
+        // `Places` would rank it first.
+        let places = places::Listing::new(self.place_rows(None, cx));
+        let find_place: commands::FindPlace = Rc::new(move |words| {
+            let query = words.trim().to_lowercase();
+            let query = crate::text_search::TextQuery::parse(&query);
+            let row = places.rank_query(&query).into_iter().next()?;
+            let places::Choice::Place(place) = &places.choices[row.index] else {
+                return None;
+            };
+            let found = &place.found;
+            Some(commands::Resolved {
+                address: found.address.clone(),
+                name: match found.description.is_empty() {
+                    true => found.title.clone(),
+                    false => format!("{} · {}", found.title, found.description),
+                },
+            })
+        });
+        let listing =
+            commands::Listing::finding_places(entries, &self.recent_commands, Some(find_place));
         self.open_minibuffer(":", Answer::commands(listing), None, window, cx);
     }
 
@@ -1291,6 +1365,7 @@ impl Frame {
     fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Command> {
         let point = self.point(cx);
         let mut commands = crate::own::commands(self, cx);
+        commands.extend(crate::focus::commands(self, cx));
         commands.extend(crate::hosts::commands(self));
         commands.extend(crate::gccp::commands());
         let surface = self.current_surface().clone();
@@ -1306,6 +1381,50 @@ impl Frame {
             },
             "two commands share a name"
         );
+        commands
+    }
+
+    /// Runs `command` as if from `place`: the command of the same name
+    /// that the systems offer there, so `stop agent clock` stops the agent
+    /// of the `clock` thread wherever the user is (`window.Commands`).
+    pub(crate) fn run_command_at(
+        &mut self,
+        command: &Command,
+        place: commands::Resolved,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let point = Point {
+            surface: place.address.clone(),
+            subject: Subject::Own,
+            card: None,
+        };
+        let there = self
+            .commands_at(&point, window, cx)
+            .into_iter()
+            .find(|there| there.name() == command.name() && there.takes_place());
+        match there {
+            Some(there) => self.run_command(&there, None, window, cx),
+            None => self.echo(
+                &format!("{}: nothing to act on at {}", command.name(), place.name),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
+    }
+
+    /// The commands every system offers at `point`, a place that need not
+    /// be in view.
+    fn commands_at(
+        &mut self,
+        point: &Point,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
+        let mut commands = Vec::new();
+        for system in self.systems.clone() {
+            commands.extend(system.commands(point, window, cx));
+        }
         commands
     }
 
@@ -1561,13 +1680,17 @@ impl Frame {
         // Signal evaluation is deferred. Desk must not paint the lamp
         // from the previous screen while that update is still pending.
         let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
-        let unwell = self.unwell_hosts();
+        let (screen_host, notices) = self.host_notices(cx);
+        let focus = self.focus_note(Timestamp::now(), cx);
         let surface = self.current_surface();
         let phone_titles = match layout {
             Layout::Phone => Some(surface.phone_titles(cx)),
             Layout::Desktop => None,
         };
-        let surface_status = surface.status(cx).unwrap_or_default();
+        let surface_status = match &screen_host {
+            Some(name) => format!("{name} away"),
+            None => surface.status(cx).unwrap_or_default(),
+        };
         let measured = crate::phone::measure(text_style, window);
         // The pairing hint is secondary to a surface that has already
         // shed everything but the name of the work and its condition.
@@ -1576,7 +1699,8 @@ impl Frame {
                 || titles.last().is_none_or(|title| {
                     let reserve = lamp
                         .into_iter()
-                        .chain(unwell.as_deref())
+                        .chain(focus.as_deref())
+                        .chain(notices.iter().map(|notice| notice.words.as_str()))
                         .chain(["unpaired", mode.as_str()])
                         .map(|words| measured(words) + px(12.))
                         .fold(px(0.), |sum, width| sum + width);
@@ -1600,7 +1724,8 @@ impl Frame {
         // cut by length there would push the card's state off the edge.
         let right_words = lamp
             .into_iter()
-            .chain(unwell.as_deref())
+            .chain(focus.as_deref())
+            .chain(notices.iter().map(|notice| notice.words.as_str()))
             .chain(unpaired)
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
@@ -1669,7 +1794,8 @@ impl Frame {
             )
             .into_any_element();
         // A host that is away outranks the notice, which is cut first when
-        // the line is short.
+        // the line is short. Only a host that needs the user, or one the
+        // screen in view needs, is red; the rest and the focus are quiet.
         let right = div()
             .flex()
             .flex_row()
@@ -1677,7 +1803,18 @@ impl Frame {
             .items_center()
             .gap_3()
             .children(lamp.map(|lamp| div().flex_none().text_color(status.warning).child(lamp)))
-            .children(unwell.map(|text| div().flex_none().text_color(status.error).child(text)))
+            .children(
+                focus.map(|focus| div().flex_none().text_color(colors.text_muted).child(focus)),
+            )
+            .children(notices.into_iter().map(|notice| {
+                div()
+                    .flex_none()
+                    .text_color(match notice.alarm {
+                        true => status.error,
+                        false => colors.text_muted,
+                    })
+                    .child(notice.words)
+            }))
             .children(unpaired.map(|text| {
                 div()
                     .min_w_0()
@@ -1717,6 +1854,34 @@ impl Frame {
             .into_any_element()
     }
 
+    /// The host the screen in view lives on when it is away, and the
+    /// status line's notice of every host that does not answer. What an
+    /// away host's screen says it is doing is only what it last said, so
+    /// the host's name says why instead, and its notice is an alarm.
+    pub(crate) fn host_notices(&self, cx: &App) -> (Option<String>, Vec<crate::hosts::Notice>) {
+        let screen_host = self
+            .away_host(self.current_address(), cx)
+            .map(|host| host.name.clone());
+        let notices = crate::hosts::notice(
+            self.hosts
+                .iter()
+                .map(|host| (host.name.as_str(), Reach::of(&host.status))),
+            screen_host.as_deref(),
+        );
+        (screen_host, notices)
+    }
+
+    /// The host `address` lives on, while it is away or needs the user.
+    pub(crate) fn away_host(
+        &self,
+        address: &Address,
+        cx: &App,
+    ) -> Option<&rho_agent_hosts::hosts::Host> {
+        self.host_of(address, cx)
+            .and_then(|host| self.hosts.get(host))
+            .filter(|host| matches!(Reach::of(&host.status), Reach::Away | Reach::NeedsYou))
+    }
+
     /// The mode the keys are in: a surface's own while it has the keys,
     /// such as a raw place taking live input; else the minibuffer's or the
     /// surface editor's, as vim reads it.
@@ -1745,27 +1910,6 @@ impl Frame {
             .read(cx)
             .plain_mode(cx)
             .unwrap_or_else(|| "normal".to_owned())
-    }
-
-    fn unwell_hosts(&self) -> Option<String> {
-        let (name, status) = self.hosts.worst_status()?;
-        let unwell = self
-            .hosts
-            .iter()
-            .filter(|host| host.status != HostStatus::Online)
-            .count();
-        if unwell > 1 {
-            return Some(format!(
-                "{unwell} of {} hosts not connected",
-                self.hosts.len()
-            ));
-        }
-        // Named even when it is the only host: `reconnecting` alone does
-        // not say what is away.
-        match status {
-            HostStatus::Online => None,
-            status => Some(format!("{name} · {}", status.label())),
-        }
     }
 }
 
@@ -1974,6 +2118,8 @@ impl Render for Frame {
 mod tests {
     use super::*;
     use crate::desk::desk_rows;
+
+    mod focus_and_hosts;
 
     struct OpenCard(gpui::FocusHandle);
 

@@ -557,9 +557,9 @@ impl Minibuffer {
                     return;
                 };
                 let command = &listing.entries[row.index].command;
-                let value = match command.spelling().argument {
-                    Some(_) => format!("{} ", command.name()),
-                    None => command.name().to_owned(),
+                let value = match command.spelling().argument.is_some() || command.takes_place() {
+                    true => format!("{} ", command.name()),
+                    false => command.name().to_owned(),
                 };
                 self.completed_selection = Some(Completed::Row {
                     index: row.index,
@@ -605,6 +605,25 @@ impl Minibuffer {
             Answer::Text { rows, .. } => rows,
             Answer::Places { .. } | Answer::Commands { .. } => &[],
         }
+    }
+
+    /// Each `Commands` row as it shows: its name, the words typed after
+    /// it, and what it acts on.
+    #[cfg(test)]
+    pub(crate) fn command_rows(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        let Answer::Commands { listing, rows } = &self.answer else {
+            return Vec::new();
+        };
+        rows.iter()
+            .map(|row| {
+                let (name, inline, target) = listing.row_parts(row);
+                (
+                    name.to_owned(),
+                    inline.map(str::to_owned),
+                    target.map(str::to_owned),
+                )
+            })
+            .collect()
     }
 
     /// The rows as listed: names in `Places` and `Commands`, values in a
@@ -693,8 +712,15 @@ impl Minibuffer {
             Answer::Commands { listing, mut rows } => {
                 let matched = rows.swap_remove(self.selected);
                 let command = listing.entries[matched.index].command.clone();
-                let argument = matched.argument;
-                Box::new(move |frame, window, cx| frame.run_command(&command, argument, window, cx))
+                Box::new(move |frame, window, cx| match matched.inline {
+                    Some(commands::Inline::Place { place, .. }) => {
+                        frame.run_command_at(&command, place, window, cx)
+                    }
+                    Some(commands::Inline::Value(value)) => {
+                        frame.run_command(&command, Some(value), window, cx)
+                    }
+                    None => frame.run_command(&command, None, window, cx),
+                })
             }
         };
         (input, submission)
@@ -858,11 +884,13 @@ impl Minibuffer {
                         }
                     }
                 } else if let Answer::Commands { listing, rows } = &self.answer {
-                    // The name, what it acts on, and its keys; a narrow
-                    // window shows the name and what it acts on.
+                    // The name, the words typed after it apart from it,
+                    // what it acts on, and its keys; a narrow window shows
+                    // the name and what it acts on. Typed place words say
+                    // the place they found in place of the one in view.
                     let matched = &rows[index];
                     let entry = &listing.entries[matched.index];
-                    let name = entry.command.name();
+                    let (name, inline, target) = listing.row_parts(matched);
                     let marks = matched.marks.iter().map(|range| accent(range, name.len()));
                     row = row
                         .child(
@@ -870,7 +898,15 @@ impl Minibuffer {
                                 .flex_none()
                                 .child(StyledText::new(name).with_highlights(marks)),
                         )
-                        .children(entry.command.target_text().map(|target| {
+                        .children(inline.map(|words| {
+                            div()
+                                .flex_none()
+                                .max_w(px(320.))
+                                .truncate()
+                                .text_color(colors.terminal_ansi_green)
+                                .child(words.to_owned())
+                        }))
+                        .children(target.map(|target| {
                             div()
                                 .min_w_0()
                                 .flex_1()

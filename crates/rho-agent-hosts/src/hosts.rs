@@ -33,20 +33,6 @@ impl HostStatus {
     pub fn is_online(&self) -> bool {
         matches!(self, Self::Online | Self::Recovering(_))
     }
-
-    /// The state in the user's words, for wherever the host's name
-    /// carries the subject: `online`, `reconnecting · 12s`.
-    pub fn label(&self) -> String {
-        match self {
-            Self::Connecting => "connecting".to_owned(),
-            Self::Online => "online".to_owned(),
-            Self::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
-            Self::Disconnected(reason) => format!("disconnected · {reason}"),
-            Self::Unenrolled(command) => {
-                format!("disconnected · enroll this rho on the host: {command}")
-            }
-        }
-    }
 }
 
 pub struct Host {

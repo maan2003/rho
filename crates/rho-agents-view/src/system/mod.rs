@@ -1458,6 +1458,16 @@ impl System for AgentsSystem {
         Some(self.label(agent, cx).0)
     }
 
+    /// A transcript, and every tool under an agent, lives on the agent's
+    /// host; a workset's on its lead's.
+    fn host(&self, address: &Address, _cx: &App) -> Option<HostId> {
+        let agent = match Scope::from_address(address) {
+            Some(scope) => self.scope_agents(scope)?.0,
+            None => AgentAddress::from_address(address)?.agent,
+        };
+        self.registry.host_of_agent(agent)
+    }
+
     /// The usage charts, each found by `usage` too. Transcripts and the
     /// tools under them are places once visited ([`rho_frame::Frame`]
     /// remembers them), so an unvisited one is not listed.

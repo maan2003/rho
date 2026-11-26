@@ -23,6 +23,7 @@ use text::{Bias, ToOffset as _, ToPoint as _};
 use theme::ActiveTheme as _;
 
 use crate::frame::Frame;
+use crate::hosts::Reach;
 use crate::keys;
 use crate::phone::Layout;
 use crate::surface::{CardHere, Subject, Surface};
@@ -99,7 +100,7 @@ impl DeskRows {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostsAway {
     attached: usize,
-    offline: Vec<String>,
+    away: Vec<String>,
     connecting: Vec<String>,
 }
 
@@ -108,62 +109,72 @@ impl HostsAway {
         Self::from_statuses(hosts.iter().map(|host| (host.name.as_str(), &host.status)))
     }
 
-    /// A host that is dropped, gone quiet, or does not trust this device
-    /// is offline; one dialling for the first time is connecting.
+    /// A host that dropped, has gone quiet, or needs the user's hand is
+    /// away; one dialling for the first time is connecting.
     fn from_statuses<'a>(
         hosts: impl IntoIterator<Item = (&'a str, &'a rho_agent_hosts::hosts::HostStatus)>,
     ) -> Self {
-        use rho_agent_hosts::hosts::HostStatus;
         let mut away = Self::default();
         for (name, status) in hosts {
             away.attached += 1;
-            match status {
-                HostStatus::Online => {}
-                HostStatus::Connecting => away.connecting.push(name.to_owned()),
-                HostStatus::Recovering(_)
-                | HostStatus::Disconnected(_)
-                | HostStatus::Unenrolled(_) => away.offline.push(name.to_owned()),
+            match Reach::of(status) {
+                Reach::Online => {}
+                Reach::Connecting => away.connecting.push(name.to_owned()),
+                Reach::Away | Reach::NeedsYou => away.away.push(name.to_owned()),
             }
         }
         away
     }
 
-    /// `lab offline`, `2 hosts offline · lab connecting`; nothing while
-    /// every host answers.
-    fn note(&self) -> Option<String> {
+    /// `lab away`, `2 hosts away · lab connecting`; nothing while every
+    /// host answers.
+    pub(crate) fn note(&self) -> Option<String> {
         let group = |names: &[String], state: &str| match names {
             [] => None,
             [name] => Some(format!("{name} {state}")),
             many => Some(format!("{} hosts {state}", many.len())),
         };
-        let parts: Vec<String> = group(&self.offline, "offline")
+        let parts: Vec<String> = group(&self.away, "away")
             .into_iter()
             .chain(group(&self.connecting, "connecting"))
             .collect();
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// The Desk's count. While every host is still connecting there is
-    /// no count to give, so it never reads a false `0 wait`.
-    pub(crate) fn count(&self, waiting: usize) -> String {
-        if self.attached > 0 && self.connecting.len() == self.attached {
-            return match self.connecting.as_slice() {
-                [name] => format!("connecting to {name}…"),
-                many => format!("connecting to {} hosts…", many.len()),
-            };
-        }
-        let count = format!("{waiting} wait");
-        match self.note() {
-            Some(note) => format!("{count} · {note}"),
+    /// The Desk's count of everything that waits, cached cards from a host
+    /// away among them, with the hosts and the dealer focus (`focus`, such
+    /// as `focus tide`) noted after it. While every host is still
+    /// connecting and nothing cached waits there is no count to give, so it
+    /// never reads a false `0 wait`.
+    pub(crate) fn count(&self, waiting: usize, focus: Option<&str>) -> String {
+        let connecting = self.attached > 0 && self.connecting.len() == self.attached;
+        let count = match self.connecting.as_slice() {
+            [name] if connecting && waiting == 0 => format!("connecting to {name}…"),
+            many if connecting && waiting == 0 => format!("connecting to {} hosts…", many.len()),
+            _ => {
+                let count = format!("{waiting} wait");
+                match self.note() {
+                    Some(note) => format!("{count} · {note}"),
+                    None => count,
+                }
+            }
+        };
+        match focus {
+            Some(focus) => format!("{count} · {focus}"),
             None => count,
         }
     }
 
-    /// What the echo line says when a deal finds nothing.
-    pub(crate) fn nothing_waits(&self) -> String {
-        match self.note() {
-            Some(note) => format!("nothing waits · {note}"),
+    /// What the echo line says when a deal finds nothing: in the project
+    /// the deal is focused on, when it is.
+    pub(crate) fn nothing_waits(&self, in_project: Option<&str>) -> String {
+        let nothing = match in_project {
+            Some(project) => format!("nothing waits in {project}"),
             None => "nothing waits".to_owned(),
+        };
+        match self.note() {
+            Some(note) => format!("{nothing} · {note}"),
+            None => nothing,
         }
     }
 }
@@ -800,10 +811,16 @@ impl Render for DeskView {
             .editor
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         let colors = cx.theme().colors();
-        let away = self
+        let (away, focus) = self
             .frame
             .upgrade()
-            .map(|frame| HostsAway::of(frame.read(cx).hosts()))
+            .map(|frame| {
+                let frame = frame.read(cx);
+                (
+                    HostsAway::of(frame.hosts()),
+                    frame.focus_note(jiff::Timestamp::now(), cx),
+                )
+            })
             .unwrap_or_default();
         div()
             .key_context("RhoDesk")
@@ -836,9 +853,10 @@ impl Render for DeskView {
                     .font(text.font())
                     .text_size(text.font_size)
                     .line_height(text.line_height)
-                    // `quiet`, the host notes too: a host away is no alarm.
+                    // `quiet`, the host and focus notes too: a host away is
+                    // no alarm, and a focus narrows the deal, not the Desk.
                     .text_color(colors.text_muted)
-                    .child(away.count(self.rows.wait_count)),
+                    .child(away.count(self.rows.wait_count, focus.as_deref())),
             )
             .child(div().flex_1().min_h_0().w_full().child(self.editor.clone()))
     }
@@ -862,40 +880,59 @@ mod tests {
             vec![("lab", HostStatus::Online), ("reef", HostStatus::Online)],
         ] {
             let away = away(&hosts);
-            assert_eq!(away.count(0), "0 wait");
-            assert_eq!(away.count(3), "3 wait");
-            assert_eq!(away.nothing_waits(), "nothing waits");
+            assert_eq!(away.count(0, None), "0 wait");
+            assert_eq!(away.count(3, None), "3 wait");
+            assert_eq!(away.nothing_waits(None), "nothing waits");
         }
     }
 
     #[test]
     fn a_host_still_connecting_never_shows_a_bare_zero() {
         let one = away(&[("lab", HostStatus::Connecting)]);
-        assert_eq!(one.count(0), "connecting to lab…");
-        assert_eq!(one.nothing_waits(), "nothing waits · lab connecting");
+        assert_eq!(one.count(0, None), "connecting to lab…");
+        assert_eq!(one.nothing_waits(None), "nothing waits · lab connecting");
         let both = away(&[
             ("lab", HostStatus::Connecting),
             ("reef", HostStatus::Connecting),
         ]);
-        assert_eq!(both.count(0), "connecting to 2 hosts…");
-        assert_eq!(both.nothing_waits(), "nothing waits · 2 hosts connecting");
+        assert_eq!(both.count(0, None), "connecting to 2 hosts…");
+        assert_eq!(
+            both.nothing_waits(None),
+            "nothing waits · 2 hosts connecting"
+        );
         let some = away(&[
             ("lab", HostStatus::Connecting),
             ("reef", HostStatus::Online),
         ]);
-        assert_eq!(some.count(0), "0 wait · lab connecting");
-        assert_eq!(some.count(3), "3 wait · lab connecting");
+        assert_eq!(some.count(0, None), "0 wait · lab connecting");
+        assert_eq!(some.count(3, None), "3 wait · lab connecting");
     }
 
+    /// Cards this device kept from before the restart count while every
+    /// host is still connecting: they wait whether or not the host is back.
+    #[test]
+    fn cached_cards_count_while_every_host_connects() {
+        let one = away(&[("lab", HostStatus::Connecting)]);
+        assert_eq!(one.count(3, None), "3 wait · lab connecting");
+        let both = away(&[
+            ("lab", HostStatus::Connecting),
+            ("reef", HostStatus::Connecting),
+        ]);
+        assert_eq!(both.count(1, None), "1 wait · 2 hosts connecting");
+    }
+
+    /// An away host is an everyday state, whatever kept it away: a drop, a
+    /// connection gone quiet, or a host that needs the user's hand. The
+    /// Desk names it calmly beside the count and never says how long.
     #[test]
     fn hosts_away_are_noted_beside_the_count() {
         let lab_away = away(&[
             ("lab", HostStatus::Disconnected("refused".into())),
             ("reef", HostStatus::Online),
         ]);
-        assert_eq!(lab_away.count(0), "0 wait · lab offline");
-        assert_eq!(lab_away.count(3), "3 wait · lab offline");
-        assert_eq!(lab_away.nothing_waits(), "nothing waits · lab offline");
+        assert_eq!(lab_away.count(0, None), "0 wait · lab away");
+        assert_eq!(lab_away.count(3, None), "3 wait · lab away");
+        assert_eq!(lab_away.nothing_waits(None), "nothing waits · lab away");
         let all_away = away(&[
             (
                 "lab",
@@ -903,18 +940,42 @@ mod tests {
             ),
             ("reef", HostStatus::Unenrolled("rho enroll".into())),
         ]);
-        assert_eq!(all_away.count(3), "3 wait · 2 hosts offline");
-        assert_eq!(all_away.count(0), "0 wait · 2 hosts offline");
-        assert_eq!(all_away.nothing_waits(), "nothing waits · 2 hosts offline");
+        assert_eq!(all_away.count(3, None), "3 wait · 2 hosts away");
+        assert_eq!(all_away.count(0, None), "0 wait · 2 hosts away");
+        assert_eq!(all_away.nothing_waits(None), "nothing waits · 2 hosts away");
         let mixed = away(&[
             ("lab", HostStatus::Disconnected("refused".into())),
             ("reef", HostStatus::Connecting),
             ("sea", HostStatus::Online),
         ]);
-        assert_eq!(mixed.count(0), "0 wait · lab offline · reef connecting");
+        assert_eq!(mixed.count(0, None), "0 wait · lab away · reef connecting");
         assert_eq!(
-            mixed.nothing_waits(),
-            "nothing waits · lab offline · reef connecting"
+            mixed.nothing_waits(None),
+            "nothing waits · lab away · reef connecting"
+        );
+        assert!(
+            !mixed.count(0, None).contains("12s") && !all_away.count(0, None).contains("12s"),
+            "no ticking counter"
+        );
+    }
+
+    /// The count stays global under a dealer focus, with the focus noted
+    /// last; an empty focused deal names the project it looked in.
+    #[test]
+    fn the_dealer_focus_is_noted_after_the_global_count() {
+        let lab_away = away(&[("lab", HostStatus::Disconnected("refused".into()))]);
+        assert_eq!(
+            lab_away.count(3, Some("focus tide")),
+            "3 wait · lab away · focus tide"
+        );
+        assert_eq!(away(&[]).count(5, Some("quiet 45m")), "5 wait · quiet 45m");
+        assert_eq!(
+            lab_away.nothing_waits(Some("tide")),
+            "nothing waits in tide · lab away"
+        );
+        assert_eq!(
+            away(&[]).nothing_waits(Some("tide")),
+            "nothing waits in tide"
         );
     }
 

@@ -74,6 +74,9 @@ pub struct Project {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoundThread {
     pub status: Option<String>,
+    /// What its agents are doing, as its host last said: `Places` finds
+    /// it under `working:` or `stopped:`.
+    pub work: Option<rho_agent_types::ThreadWork>,
 }
 
 /// An exact location in the owning surface, not a separate place.
@@ -189,6 +192,13 @@ pub trait System: Sized + 'static {
         None
     }
 
+    /// The host `address` lives on, when it lives on one: a thread, a
+    /// transcript. While that host is away the window says so where the
+    /// address would say what it is doing.
+    fn host(&self, _address: &Address, _cx: &App) -> Option<HostId> {
+        None
+    }
+
     /// The project `address` is in, or is: Desk keeps a project's stops
     /// on one row, and choosing a project in `Places` narrows `Places` to
     /// its threads.
@@ -246,6 +256,7 @@ trait SystemHandle {
 
     fn desk_context(&self, address: &Address, cx: &App) -> Option<String>;
 
+    fn host(&self, address: &Address, cx: &App) -> Option<HostId>;
     fn project(&self, address: &Address, cx: &App) -> Option<Project>;
     fn find(&self, marks: &Marks, cx: &App) -> Vec<Found>;
     fn marks_moved(&self, touched: &BTreeSet<Address>, cx: &mut App);
@@ -323,6 +334,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn desk_context(&self, address: &Address, cx: &App) -> Option<String> {
         self.read(cx).desk_context(address, cx)
+    }
+
+    fn host(&self, address: &Address, cx: &App) -> Option<HostId> {
+        self.read(cx).host(address, cx)
     }
 
     fn project(&self, address: &Address, cx: &App) -> Option<Project> {
@@ -422,6 +437,10 @@ impl AnySystem {
 
     pub(crate) fn desk_context(&self, address: &Address, cx: &App) -> Option<String> {
         self.0.desk_context(address, cx)
+    }
+
+    pub(crate) fn host(&self, address: &Address, cx: &App) -> Option<HostId> {
+        self.0.host(address, cx)
     }
 
     pub(crate) fn project(&self, address: &Address, cx: &App) -> Option<Project> {

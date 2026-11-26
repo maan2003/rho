@@ -11,6 +11,7 @@ use rho_dealer::Address;
 use sum_tree::TreeMap;
 
 use crate::matching::{best_hit, text_marks};
+use crate::places::PlaceState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextKind {
@@ -22,6 +23,8 @@ pub enum TextKind {
 pub(crate) enum TextScope {
     All,
     Text(Option<TextKind>),
+    /// Places only, in one state: `working:`, `muted:`.
+    State(PlaceState),
 }
 
 pub struct TextQuery<'a> {
@@ -35,10 +38,16 @@ impl<'a> TextQuery<'a> {
     pub fn parse(input: &'a str) -> Self {
         let body = input.strip_prefix('/');
         let text = body.unwrap_or(input).trim_start();
+        let state = PlaceState::ALL.into_iter().find_map(|state| {
+            let words = input.strip_prefix(state.prefix())?;
+            Some((TextScope::State(state), words))
+        });
         let (scope, text) = if let Some(words) = text.strip_prefix("chat:") {
             (TextScope::Text(Some(TextKind::Chat)), words)
         } else if let Some(words) = text.strip_prefix("note:") {
             (TextScope::Text(Some(TextKind::Note)), words)
+        } else if let Some(state) = state.filter(|_| body.is_none()) {
+            state
         } else if body.is_some() {
             (TextScope::Text(None), text)
         } else {
@@ -53,7 +62,7 @@ impl<'a> TextQuery<'a> {
     }
 
     pub(crate) fn wants_text(&self) -> bool {
-        !self.terms.is_empty()
+        !self.terms.is_empty() && !matches!(self.scope, TextScope::State(_))
     }
 
     fn includes(&self, kind: TextKind) -> bool {
@@ -61,6 +70,7 @@ impl<'a> TextQuery<'a> {
             && match self.scope {
                 TextScope::All | TextScope::Text(None) => true,
                 TextScope::Text(Some(only)) => only == kind,
+                TextScope::State(_) => false,
             }
     }
 }

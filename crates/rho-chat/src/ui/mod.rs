@@ -1225,6 +1225,15 @@ impl System for ChatSystem {
             .map(rho_agent_types::Message::headline)
     }
 
+    /// A thread lives on the host whose log holds it.
+    fn host(&self, address: &Address, _cx: &App) -> Option<HostId> {
+        let thread = self.thread_of(address)?;
+        self.hosts
+            .iter()
+            .find(|(_, slot)| slot.endpoint == Some(thread.host))
+            .map(|(host, _)| *host)
+    }
+
     fn project(&self, address: &Address, _cx: &App) -> Option<Project> {
         let project = self.idea_project_of(address)?;
         Some(Project {
@@ -1339,6 +1348,7 @@ impl System for ChatSystem {
                 description: project,
                 thread: Some(FoundThread {
                     status: Some(pending::status(&outgoing.state).to_owned()),
+                    work: None,
                 }),
                 recency: outgoing.at.0,
                 also: Vec::new(),
@@ -1381,7 +1391,10 @@ impl System for ChatSystem {
                 } else {
                     let (words, latest) = chat.thread_activity(id);
                     (
-                        Some(FoundThread { status: words }),
+                        Some(FoundThread {
+                            status: words,
+                            work: chat.work(id),
+                        }),
                         latest.map_or(0, |at| at.0),
                     )
                 };
