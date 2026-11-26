@@ -53,13 +53,13 @@ The built window puts the work in one editor. The top line tells the user where 
 purpose: tell the user what fills the window, where the keys go, and whether anything needs attention elsewhere.
 looks: a single `top line` in `editor text` over the `reading surface`, with a `seam` below. The name and any card words share the left; the lamp, host connection, pairing notice, and mode sit to the right with the `same band gap`.
 states:
-- ordinary: the screen's name in `reading text`, and the short mode word at the right; `INS` is in `keys in motion`.
-- card open: `waits` and the age sit beside the heading in `attention`.
-- working / stopped / stuck: `working` or `stopped by you` sits beside the heading in `quiet`, or `stuck` with retry age in `attention`, when nothing else waits.
-- attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing elsewhere is important enough.
-- host away: a named `lost connection` notice, or a count when more than one host is away.
+- ordinary: the screen's name in `reading text`, any active dealer focus (`focus tide`, `quiet 45m`) in `quiet`, and the short mode word at the right; `INS` is in `keys in motion`.
+- card open: `waits` (or `approve push`) and the age sit beside the heading in `attention`.
+- working / stopped / stuck / away: `working`, `stopped by you`, or `<host> away` sits beside the heading in `quiet`, or `stuck` with retry age in `attention`, when nothing else waits.
+- attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing within active dealer focus waits.
+- host state: an `away` host is normal and stays calm (`quiet` on `desk.Desk` and on affected threads, never a ticking red counter across every screen); `lost connection` red is reserved for a host in `needs you` state (key touch / enroll) or an `away` host needed by the screen currently in view.
 - unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
-- echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host warning keep their places.
+- echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host notice keep their places.
 used on: `window.Screen`, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `browser.Page`, `notes.Notes`, and `usage.Chart`.
 captures: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [transcript with its host, folder and activity](design/laptop-agent.png).
 
@@ -78,8 +78,8 @@ looks: one row of `editor text`; name first in `reading text`, then the quieter 
 states:
 - desk: a subject, a project address in `quiet`, and any fresh `chat.Flash` in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
 - places (`window.Places`): place rows use `row air` between columns: subject/name, `attention` card words or the project's `quiet` latest words (or matched text snippet for full-text search), and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. Query matches use `marked`; the chosen row keeps its fill all the way across.
-- commands (`window.Commands`): flat verb-noun command name in `reading text`, live target and current value in `quiet` / `choice value` (or `pick …` when ambiguous), and `quiet` key sequence (name and target only on a narrow window). Query matches use `marked`.
-- empty: Desk reads `0 wait` (or `0 wait · lab offline` in `quiet`) when no cards are due; `Places` and `Commands` show `no match` when no row fits the query.
+- commands (`window.Commands`): flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument when typed, live target and current value in `quiet` / `choice value` (or `pick …` when ambiguous), and `quiet` key sequence (name and target only on a narrow window). Query matches use `marked`.
+- empty: Desk reads `0 wait` (or `0 wait · lab away` in `quiet`) when no cards are due; `Places` and `Commands` show `no match` when no row fits the query.
 used on: `desk.Desk`, `window.Places`, and `window.Commands`.
 captures: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), and [matched palette row](design/laptop-prompt.png).
 
@@ -123,7 +123,7 @@ states:
 - empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
 - stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
 - writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
-- addressing an idea: `on:` sits under `to:` above the words. The addressed project’s runtime appears in `quiet` until the user types or chooses a runtime. Changing `to:` updates the quiet value but keeps an explicit choice. Enter on `on:` opens the runtime choices.
+- addressing an idea: `in:` (`one` or `new`) and `on:` (runtime) sit under `to:` above the words. The addressed project’s mode and runtime appear in `quiet` until the user edits or chooses them. Changing `to:` updates untouched quiet values but keeps explicit choices. Enter on `in:` or `on:` opens the choices.
 - after send: in a thread, the words become the newest message right below the draft, marked while on their way, with the draft empty and nothing scrolling. For an idea, the draft clears immediately, the echo says where it went, and the screen before returns.
 used on: `chat.Thread` and the draft of `chat.Write an idea`.
 form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
@@ -136,7 +136,7 @@ states:
 - open: title, actions, keys, and any values; on the phone the sheet has `close` at the top and a full-width `cancel` at the bottom edge.
 - sub-menu: it takes the same place; the phone sheet adds `‹ back`.
 - empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
-used on: `window.Screen` wherever the `space` leader `window.Menu` opens (`f` places and `u` undo everywhere in `NOR`; card verdicts added on `chat.Thread`, push action cards, and `agents.Transcript` of a waiting card).
+used on: `window.Screen` wherever the `space` leader `window.Menu` opens (`f` places and `u` undo everywhere in `NOR`; `s` snooze reminder on `notes.Note`; card verdicts — or `a` approve / `x` deny / `s` snooze for a pending push — added on `chat.Thread` and `agents.Transcript` of a waiting card).
 form: [laptop verdict grid](design/laptop-menu.png) and [phone verdict sheet](design/phone-menu.png).
 
 ## part Prompt
