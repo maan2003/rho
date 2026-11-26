@@ -1,40 +1,46 @@
 # design
 
-The built window puts the work in one editor. The top line tells the user where they are and what needs attention; questions and choices sit at the bottom. This is the built form of Desk, threads, and workset transcripts. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
+The built window puts the work in one editor with sharp `0 px` square corners throughout (no rounded pills or cards), tuned primarily for a fullscreen 13" laptop display (`MacBook Air M2`, Asahi Linux + Niri, with a physical top-center camera notch). The top strip splits across the notch into a borderless **Left Ear** (belonging to the open page/card), a **square black center notch mask**, and a full-width framed **Right Ear** (the global status bar). Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
 
 ## token color
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
-- reading text · `oklch(70.9% 0.012 95)` · the name or words the user came to read.
-- quiet · `oklch(56.0% 0.012 100)` · context that can wait: ages, settled things, host tags, calm offline host notes on Desk, placeholders, and hints.
-- attention · `oklch(63.1% 0.145 86.4)` · something to act on, here in the card's words or elsewhere as the lamp.
-- lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach.
-- failed · `oklch(76.0% 0.140 25)` · a step that did not finish successfully.
-- answer · `oklch(63.1% 0.195 244.8)` · a short explanation, including the answer to the last key.
-- marked · `oklch(72.0% 0.110 105)` · text picked out from the reading line: the user's own message in a thread, a link, a search match, or the key for a choice.
-- keys in motion · `oklch(78.0% 0.120 185)` · a visible key or mode that tells the user how the keyboard will act, including `INS`.
+- global status surface · `oklch(20.6% 0.016 150)` · the subtle recessed field of the framed Right Ear global status bar.
+- notch mask · `#000000` · solid square black rectangle framing the physical top-center notch so it reads as crisp square geometry.
+- unread text · `oklch(89.5% 0.008 95)` · the newest unread agent turn and active page title.
+- reading text · `oklch(83.5% 0.010 95)` · primary readable body text (`oklch(73.5% 0.010 95)` for already-read history).
+- quiet · `oklch(56.0% 0.012 110)` · context that can wait: read ages, settled things, host tags, calm offline host notes on Desk, `NOR` mode, and hints.
+- attention · `oklch(79.5% 0.145 78)` · something to act on: unread message age, pending push approval, or the waiting lamp.
+- lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach (`needs you`, or an `away` host required by the open screen).
+- failed · `oklch(75.0% 0.145 25)` · a step that did not finish successfully.
+- answer · `oklch(78.0% 0.105 230)` · links and short explanatory notices (`oklch(74.0% 0.130 145)` for positive echoes).
+- marked · `oklch(81.0% 0.065 185)` text with `oklch(68.0% 0.095 185)` `2 px` left gutter bar · muted teal marking the user's own Draft and messages in a thread, plus search matches and choice keys.
+- keys in motion · `oklch(82.0% 0.125 185)` · font color only (never a background pill) for `INS` mode and active keyboard hints.
 - choice value · `oklch(66.0% 0.120 135)` · the value attached to a choice, not its name or key.
 - point · `oklch(78.0% 0.012 95)` · where the user's attention is in the editor, and marks that guide the eye through text.
 - current answer · `oklch(35.5% 0.022 150)` · the prompt row that Enter would take.
-- seam · `oklch(30.5% 0.020 150)` · a quiet boundary between reading and controls, softened to 60% on the top line.
-- command strip · reading surface with HSL lightness raised by `0.04` on the dark appearance · the bottom area that takes a question or a choice.
+- seam · `oklch(32.0% 0.018 150)` · a crisp `1 px` square boundary (`oklch(27.8% 0.016 150)` for soft internal dividers).
+- command strip · reading surface lifted slightly (`oklch(25.4% 0.019 150)`) · the area that takes a question, choice, or stuck draft.
 - behind the sheet · black at `35%` opacity · the screen is still there but the phone menu is taking the tap.
 
 ## token type
-- editor text · Rho Font, `15 px`, weight `400` · one voice from the work to the prompt and top line.
-- reading rhythm · `1.4` times the editor text size · next line visible without crowding the one in view.
-- emphasis · weight `700` · make the speaker, unread name, menu title, or attached value findable without making it larger.
+- editor text · Rho Font (monospace), `15 px`, weight `400` · one crisp grid from the work to the prompt and top ears.
+- reading rhythm · `1.54` times the editor text size (`Balanced`) · comfortable breathing room for reading long threads.
+- emphasis · weight `650–700` · make the page title, unread name, `INS` mode, or menu title findable without making it larger.
 - private aside · italic · the user's own remark rather than a turn in the exchange.
 - thumb icon · `18 px` · recognize the action before reading its word.
 - thumb label · `11 px` · confirm which action the icon will take.
 
 ## token space
-- top line · `26 px` · keep the heading and mode in a shallow fixed band.
-- same band gap · `12 px` · separate the heading from its card words and separate the notices at the right.
-- reading inset · `8 px` · keep the edge of window controls off the frame.
-- seam width · `1 px` · divide the top line and phone controls without adding a panel.
+- corner radius · `0 px` · sharp square corners on every bar, border, notch mask, code block, table, and callout.
+- top line · `32–36 px` · three-part notch-native band: borderless Left Ear (`1fr`), square black center notch mask (`~210 px`), and framed Right Ear global status bar (`1fr`).
+- sheet measure · `128 ch` centered · gives a calm side margin on a 13"–14" display while keeping Draft, prose, gutter bars, code blocks, diffs, tables, and images on one straight left vertical edge.
+- prose measure · `80 ch` · wraps conversational prose, quotes, and private replies inside the `128 ch` sheet while letting code blocks, diffs, markdown tables, push cards, and images flow to the full `128 ch` sheet width.
+- same band gap · `12 px` · separate items inside each top ear.
+- reading inset · `24–28 px` · calm side breathing room from the window edge.
+- seam width · `1 px` · crisp square boundary for the Right Ear global status bar and soft internal dividers.
 - command strip breath · `2 px` above and below · keep prompt and menu close to the text rhythm.
 - stuck draft shadow · `4 px` down, `12 px` blur, black at `35%` · separate the draft from the history below its seam without dimming the draft.
-- draft gutter stroke · `1 px` beside each inline line of a thread draft, `2 px` continuous when stuck · keep the left edge fixed while marking the whole stuck draft.
+- draft gutter stroke · `2 px` teal left gutter bar beside every line of the thread draft and user messages · keeps the left edge fixed while distinguishing user voice from agent voice.
 - thumb target · `56 px` high · an action the thumb can hit at the bottom edge or in a menu sheet.
 - narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop menu grid.
 - row air · two text spaces · leave space between a row name and its words.
@@ -50,25 +56,29 @@ The built window puts the work in one editor. The top line tells the user where 
 - thumb settle · `180 ms` · finish the phone page move or return it to where it was.
 
 ## part Status line
-purpose: tell the user what fills the window, where the keys go, and whether anything needs attention elsewhere.
-looks: a single `top line` in `editor text` over the `reading surface`, with a `seam` below. The name and any card words share the left; the lamp, host connection, pairing notice, and mode sit to the right with the `same band gap`.
+decided: 2026-11-26 · notch-native 3-part top row: borderless Left Ear owns page/card identity and page markers (no model name, no waits·age on Thread); center paints a square `#000` notch mask; full-width square-bordered Right Ear is the global status bar (echo, host exceptions, waiting lamp, quiet NOR / font-color-only teal INS with no pill)
+purpose: separate what page/card is open from what rho is saying globally, using the two ears flanking the laptop's physical notch without spending vertical pixels below it.
+looks: one `top line` (`32–36 px`, `0 px` radius) split into three columns:
+- **Left Ear (page/card):** borderless on `reading surface`, visually part of the open buffer; holds the page title in `unread text` with `emphasis`, quiet project/context name (truncating title with ellipsis well before the center notch), and page-level markers (`pinned`, `approve push`, `working`, `stopped by you`, `stuck`, or active dealer focus on `desk.Desk`). Never shows the agent's model name on `chat.Thread` (model belongs in `agents.Transcript` and `:switch model`), and never repeats `waits · 4m` on `chat.Thread` (the newest unread message right below already displays its age).
+- **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle framing the physical top-center camera notch so it reads with crisp `0 px` square corners.
+- **Right Ear (global status bar):** fills the full right ear from the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line`, exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
 states:
-- ordinary: the screen's name in `reading text`, any active dealer focus (`focus tide`, `quiet 45m`) in `quiet`, and the short mode word at the right; `INS` is in `keys in motion`.
-- card open: `waits` (or `approve push`) and the age sit beside the heading in `attention`.
-- working / stopped / stuck / away: `working`, `stopped by you`, or `<host> away` sits beside the heading in `quiet`, or `stuck` with retry age in `attention`, when nothing else waits.
-- attention elsewhere: a steady `attention` dot before the notices and mode; no dot when nothing within active dealer focus waits.
-- host state: an `away` host is normal and stays calm (`quiet` on `desk.Desk` and on affected threads, never a ticking red counter across every screen); `lost connection` red is reserved for a host in `needs you` state (key touch / enroll) or an `away` host needed by the screen currently in view.
-- unpaired: a `quiet` notice that verdicts stay on this device. On the phone it says `unpaired`, leaving the reason and age in view before the heading.
-- echo: the card's words give way to the `Echo line`; the heading, mode, lamp, and host notice keep their places.
+- ordinary: Left Ear shows the screen/thread title and project; Right Ear shows the waiting lamp (when other cards wait) and `NOR` (`INS` while typing or in live raw places).
+- page exception: `pinned`, `approve push` (in `attention`), `working`, `stopped by you`, or `stuck` appear in the Left Ear beside the title/project.
+- attention elsewhere: a steady `attention` dot `●` in the Right Ear before the mode; absent when nothing within active dealer focus waits.
+- host state: silent when all hosts are online; an `away` host shows calmly in `quiet` in the Right Ear (turning `lost connection` red only when a host is in `needs you` state or when an `away` host is required by the screen currently in view).
+- unpaired: a `quiet` notice in the Right Ear that verdicts stay on this device.
+- echo: the `Echo line` appears inside the framed Right Ear without disturbing the Left Ear's page title or the mode word.
 used on: `window.Screen`, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `browser.Page`, `notes.Notes`, and `usage.Chart`.
 captures: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [transcript with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
-purpose: answer the action the user just took without opening anything.
-looks: one line of `answer` in `editor text`, after the heading in the `Status line`, where the card's words were.
+decided: 2026-11-26 · lives inside the framed Right Ear global status bar; leaves the Left Ear page title untouched
+purpose: answer the action the user just took without opening anything or shifting the page title.
+looks: one line in `editor text` inside the framed Right Ear global status bar (`answer` / positive green for confirmations, `failed` for refusals), truncating cleanly if needed before the lamp and mode.
 states:
-- quiet: absent; the normal heading is in view.
-- answer or refusal: the first line of the latest notice appears in the same place and color, then goes; an open prompt clears it.
+- quiet: absent; the Right Ear stays calm with only exception notices, lamp, and mode.
+- answer or refusal: the first line of the latest notice appears in the Right Ear, then clears after `echo life` or on the next prompt/key.
 used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 captures: [done echo back on Desk](design/laptop-echo.png).
 
@@ -94,10 +104,11 @@ used on: `agents.Transcript`. In `chat.Thread` the voice is told by colour, see 
 form: `you · 2m` or `clock@lab · 1m · edited` above the words; see `Message` for the separate thread form.
 
 ## part Message
-purpose: let the user read an exchange and know who said what, with nothing between the messages but a blank line.
-looks: the words in `editor text` on the `reading surface`; the user's own message in `marked`, with a thin `marked` bar in the left gutter beside every line; the project's message in `reading text` with no bar; one blank line between messages; a `quiet` name line above a message from a third voice; a `quiet` tag at the end of the first line, such as `· edited` or `· taken back`.
+decided: 2026-11-26 · agent is primary unmarked reading voice (bright unread, softer read); user is muted teal with 2px left gutter bar; right-aligned ages (amber unread, quiet older); 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images; no date separators, no history folding
+purpose: let the user read an exchange and know who said what immediately, with nothing between messages but clean space.
+looks: laid out inside the `sheet measure` (`128 ch` centered). Prose paragraphs, quotes, and private replies wrap at `prose measure` (`80 ch`); code blocks, diffs, markdown tables, push cards, and images expand across the full `128 ch` sheet on the same straight left edge (`0 px` corners). The project/agent's message is the primary unmarked reading voice (`unread text` when unread since the user's last reply, softer `reading text` once read) with no bar; the user's own message uses muted teal (`marked`) with a `2 px` teal bar in the left gutter beside every line. Each turn's relative age sits flush-right on its first line (`attention` amber on unread turns, `quiet` on older turns). No date separator rows and no collapsed history folds. A `quiet` name line appears above a message from a third voice (or agent short code when multiple agents speak live); `· edited` or `· taken back` sits in `quiet` at the end of the prose.
 states:
-- flash: a `chat.Flash` in `quiet`, its age in `quiet` at the end of its first line, `3m`, or `1h` while it is the thread's newest item; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
+- flash: a `chat.Flash` in `quiet`, its age in `quiet` flush-right on its first line; an agent's earlier fresh flashes fold to one `quiet` line, `+2 earlier`.
 - sending: the user's words in `quiet` until the host has the message.
 - private reply: `🔒 you ·` and time in `quiet` with `private aside`, like the words below it.
 used on: `chat.Thread`.
@@ -117,14 +128,15 @@ A separate clock per test should do it.
 ```
 
 ## part Draft
+decided: 2026-11-26 · row 1 of Thread directly below the top ears, 2px teal left gutter bar, zero `reply` placeholder text, 80ch prose wrap inside the 128ch sheet
 purpose: let the user write the next message without leaving the buffer.
-looks: the user's words in `marked`, like their sent message, at the top of the thread, one blank line above the newest message, on the same `reading surface`, with a thin `marked` bar in the left gutter beside every draft line (the `draft gutter stroke` in a thread), as the workset transcript draws the user's messages; nothing marks where the history begins but the user's own `marked` message.
+looks: the user's words in muted teal (`marked`), matching their sent messages, on row 1 at the top of the `128 ch` sheet (wrapping at `80 ch`), separated from the newest message below by a soft `1 px` horizontal hairline seam, with a `2 px` teal bar (`draft gutter stroke`) in the left gutter beside every draft line.
 states:
-- empty: a `quiet` placeholder where the words will go, `reply` in a thread and `idea` in a new draft, drawn in the text itself directly at the cursor with no gap, the way the old agent view drew `Write a message…`; the gutter bar is on that line too.
-- stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface. Below the last line only, leave half a `reading rhythm` plus `2 px` of air, then a `seam width` of `seam` and the `stuck draft shadow`. The `draft gutter stroke` runs through the air to the bottom of the seam. The band counts toward the half-window cap; `↑ new` appears in the reserved air, right-aligned in `quiet`, without moving the draft or history.
-- writing: the cursor sits in the draft and the mode word says `INS`; on return to `NOR`, the cursor remains in the draft.
+- empty: in a `chat.Thread`, no `reply` placeholder text — just the `2 px` teal left gutter bar and the editor cursor on a clean empty line (the user already knows row 1 is the reply draft). In `chat.Write an idea`, the header lines (`to:`, `in:`, `on:`) establish the empty idea buffer.
+- stuck in a thread: the same text and gutter origin at the top edge, on the `command strip` surface, with a soft `seam` and `stuck draft shadow` below; `↑ new` appears right-aligned in `attention` when unseen messages arrive while scrolled, without moving the draft or history.
+- writing: the cursor sits in the draft and the Right Ear mode word says `INS` in teal font color (no pill); on return to `NOR`, the cursor remains in the draft.
 - addressing an idea: `in:` (`one` or `new`) and `on:` (runtime) sit under `to:` above the words. The addressed project’s mode and runtime appear in `quiet` until the user edits or chooses them. Changing `to:` updates untouched quiet values but keeps explicit choices. Enter on `in:` or `on:` opens the choices.
-- after send: in a thread, the words become the newest message right below the draft, marked while on their way, with the draft empty and nothing scrolling. For an idea, the draft clears immediately, the echo says where it went, and the screen before returns.
+- after send: in a thread, the words become the newest message right below the draft, marked while on their way, with the draft empty and nothing scrolling. For an idea, the draft clears immediately, the echo says where it went in the Right Ear, and the screen before returns.
 used on: `chat.Thread` and the draft of `chat.Write an idea`.
 form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
@@ -210,8 +222,8 @@ lasts: `cut` on open, replacement, or close; otherwise `while needed`.
 means: a flick either turns the page or gives it back; the brief slide shows which happened.
 lasts: `thumb settle`.
 
-## rule the echo takes the card's words' place
-when the `Echo line` answers, then the `Status line` gives up its `Card's words` and pairing notice; its heading, lamp, connection warning, and mode stay.
+## rule the echo lives in the right ear
+when the `Echo line` answers, then it appears inside the framed Right Ear global status bar beside the lamp and mode without displacing the Left Ear's page title or page markers.
 
 ## rule a prompt takes the phone bar
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.

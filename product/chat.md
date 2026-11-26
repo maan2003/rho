@@ -66,9 +66,10 @@ does:
 - fork thread, from `window.Commands` on a message: start a tangent `Thread` under that message, quoting it in the new draft
 
 ## concept Message
+decided: 2026-11-26 · agent is primary unmarked reading voice (bright unread, softer read), user is muted teal with 2px left gutter bar, right-aligned relative ages (amber unread, quiet older), no date separators, no history folding
 purpose: carry an idea, an ask, or a result in the voice of the project, keep it as the record of the work, and let the user answer in the thread.
 principle: the project asks a question; the user reads it on top of the thread with the project's earlier words one glance below, and replies without needing to know the writer's name.
-sees: the words, with the voice told by colour alone: the user's own message in `design.marked`, the project's in reading text; a quiet name line above a message from anyone else (or a quiet agent short code when more than one agent has a live message in the same thread); a quiet tag at the end of the first line, such as `edited` or `taken back`; what the message quotes
+sees: the words, with the voice told by colour and gutter alone: the project's message as the unmarked primary reading voice (bright when unread, softer once read), the user's own message in muted teal (`design.marked`) with a `2 px` teal left gutter bar; a flush-right relative age on the first line (`attention` amber on unread turns, `quiet` on older turns); a quiet name line above a message from anyone else (or a quiet agent short code when more than one agent has a live message in the same thread); a quiet tag at the end of the text, such as `edited` or `taken back`; what the message quotes. Never inserts date separator lines or collapses older history.
 does:
 - ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on a project message or `Flash` (when cursor is not on a private reply or link): open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
@@ -105,9 +106,10 @@ rejected:
 - a kept message that does not ping, for progress · 2026-11-21 · see `Message`
 
 ## concept Draft
+decided: 2026-11-26 · empty thread draft has zero placeholder text (just the 2px teal left gutter bar and cursor on row 1)
 purpose: keep what the user wrote in a thread and has not sent, so leaving the thread loses nothing.
 principle: the user is halfway through an answer when a card that matters comes in; they deal it and answer it; later, on the same device, they open the first thread, and the half-written answer is still at the top of the thread, even after a restart.
-sees: the unsent text in `design.marked`, the user's own colour, with a thin bar of that colour in the left gutter, as the first lines of the thread, one blank line above the newest message; when empty, a quiet `reply` right at the cursor where the words will go. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lighter surface; on the phone it is in the half above the keyboard.
+sees: the unsent text in muted teal (`design.marked`), with a `2 px` teal bar in the left gutter, on row 1 at the top of the thread above a soft horizontal hairline seam; when empty in a thread, shows no placeholder word at all — just the teal left gutter bar and cursor on a clean empty line. When its last line is above the window, the draft becomes a `window.Edge-stuck excerpt` at the top edge, on a lifted surface; on the phone it is in the half above the keyboard.
 does:
 - edit `i`, `A`, `o`, or a tap on the draft: write in place; `escape` returns to Normal with the cursor still in the draft
 - quote `>` on a selection in one read-only message: insert those lines with `> ` in front, just above the last draft cursor; resume beneath the quote in Normal (inside the editable `Draft`, `>` stays normal Helix indent)
@@ -123,13 +125,15 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
+decided: 2026-11-26 · title & project in borderless Left Ear (no model name, no waits·age), Draft on row 1 with no placeholder, 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images, Mono + Balanced, 0px square corners
 answers: what is this piece of work waiting for from the user?
 shows:
-- the `Thread` subject and `Project` address in the `window.Status line`, with the card's words (`waits · 2h` or `approve push · 4m`) while it waits, or `working` / `stopped by you` / `stuck` / `<host> away` when nothing waits
-- the `Draft` first, at the top of the document, or stuck to the top edge while the user reads history below
+- the `Thread` subject, `Project` address, and any page-level marker (`pinned`, `approve push`, `working`, `stopped by you`, `stuck`) in the borderless Left Ear of `window.Status line` (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
+- inside a `128 ch` centered sheet (`80 ch` wrap for prose/quotes/private replies; full `128 ch` width for code blocks, diffs, markdown tables, push cards, and images):
+- the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, soft hairline below), or stuck to the top edge while the user reads history below
 - any pending staged push/fetch approval right below the draft (naming repo, refs, force-push dropped count, commits, bounded diff, and `space a approves · space x denies (with draft reply) · space s snoozes`)
-- the `Message` newest first, one blank line between them, readable and copyable with the same motions and search as the `Draft`, but not editable; the user's own last message, in `design.marked`, is the line between what is new since they wrote and the history below
-- the fresh `Flash` of each agent in `design.quiet` with its age, in its place among the messages, with that agent's earlier fresh flashes folded under it
+- the `Message` newest first, readable and copyable with the same motions and search as the `Draft`, but not editable; agent messages are the unmarked primary voice (bright unread, softer read), user messages are muted teal with a `2 px` left gutter bar, and relative ages sit flush-right (amber unread, quiet older); no date separators and no collapsed history
+- the fresh `Flash` of each agent in `design.quiet` with its age flush-right, in its place among the messages, with that agent's earlier fresh flashes folded under it
 - a `notes.Private reply` below its message, editable there; tangents appear as a quiet `↳ N tangents` line below their parent message and open as their own `Thread`
 states:
 - empty: the empty draft, then the opening message; a thread begins with a message
