@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use rho_agent::store::{MailWrite, NewMessage, StoreWrite};
 use rho_agent_types::{
-    Address, AgentId, AgentIdDomain, ContentPart, Mention, MessageId, UnixMs, WorksetId,
-    WorksetKind,
+    Address, AgentId, AgentIdDomain, ContentPart, MessageId, ProjectConfig, ProjectId, ProjectMode,
+    ProjectPlace, RuntimeLabel, UnixMs, Voice, WorksetId, WorksetKind,
 };
 use rho_agents_client::protocol::worksets::{CreateWorkset, Eval};
 use rho_rpc::protocol::RuntimePaths;
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
                 &paths,
                 workset,
                 format!(
-                    "from rho.tools import Mail\nMail({agent:?}).edit({message}, {})",
+                    "from rho.tools import Chat\nChat({agent:?}).edit({message}, {})",
                     serde_json::to_string(&text)?
                 ),
             )
@@ -76,11 +76,20 @@ async fn seed(path: PathBuf, flash_lead: Option<u64>) -> anyhow::Result<()> {
     let today = UnixMs(UnixMs::now().0 - 13 * 60_000);
     let opening = "Check the long clock history.";
     let (project, thread) = {
-        let mut post = |at: UnixMs, parent: Option<MessageId>, from, text: String, ping| {
-            tx.post(at, parent, message(from, text, ping), None)
+        let project = tx.post(old, None, message(Address::User, "clock".into()), None)?;
+        tx.set_project(
+            old,
+            ProjectId(project),
+            ProjectConfig {
+                place: ProjectPlace::parse("~/src/clock").map_err(anyhow::Error::msg)?,
+                mode: ProjectMode::One,
+                runtime: RuntimeLabel::default(),
+            },
+        );
+        let mut post = |at: UnixMs, parent: Option<MessageId>, from, text: String| {
+            tx.post(at, parent, message(from, text), None)
         };
-        let project = post(old, None, Address::User, "clock".into(), false)?;
-        let thread = post(old, Some(project), Address::User, opening.into(), false)?;
+        let thread = post(old, Some(project), Address::User, opening.into())?;
         for n in 1..=10 {
             post(
                 old,
@@ -89,17 +98,15 @@ async fn seed(path: PathBuf, flash_lead: Option<u64>) -> anyhow::Result<()> {
                 format!(
                     "March note {n}: retain this reading position.\n\nThe reference clock stays as it was."
                 ),
-                false,
             )?;
         }
         post(today, Some(thread), Address::Agent(worker),
-            "The latest run uses a steady clock.\n\nToday: we only changed the timer, not the retry policy.".into(), false)?;
+            "The latest run uses a steady clock.\n\nToday: we only changed the timer, not the retry policy.".into())?;
         post(
             UnixMs(today.0 + 60_000),
             Some(thread),
             Address::User,
             "Go ahead with the steady clock.".into(),
-            false,
         )?;
         (project, thread)
     };
@@ -136,7 +143,6 @@ async fn seed(path: PathBuf, flash_lead: Option<u64>) -> anyhow::Result<()> {
         message(
             Address::Agent(worker),
             "Does the steady clock cover both clocks?".into(),
-            true,
         ),
         None,
     )?;
@@ -146,15 +152,10 @@ async fn seed(path: PathBuf, flash_lead: Option<u64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn message(from: Address, text: String, ping: bool) -> NewMessage {
+fn message(from: Address, text: String) -> NewMessage {
     NewMessage {
         from,
-        reply_to: None,
-        mentions: if ping {
-            vec![Mention::User { ping: true }]
-        } else {
-            vec![]
-        },
+        voice: Voice::Message,
         content: vec![ContentPart::Text { text }],
     }
 }
@@ -183,15 +184,10 @@ async fn send(
     let agent = agent.encoded();
     let workset = created.workset;
     let words = serde_json::to_string(words)?;
-    let code = if flash {
-        format!(
-            "from rho.tools import Chat\nprint(int(Chat({agent:?}).send({words}, 'flash', thread={thread})))"
-        )
-    } else {
-        format!(
-            "from rho.tools import Mail\nprint(int(Mail({agent:?}).send('user', {words}, thread={thread}, ping=False)))"
-        )
-    };
+    let kind = if flash { "flash" } else { "message" };
+    let code = format!(
+        "from rho.tools import Chat\nprint(int(Chat({agent:?}).send({words}, {kind:?}, thread={thread})))"
+    );
     let result = eval(paths, workset, code).await?;
     let message: u64 = result.lines().last().context("fixture mail ID")?.parse()?;
     println!("{workset} {agent} {message}");

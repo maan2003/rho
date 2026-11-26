@@ -16,7 +16,7 @@ use rho_agents_client::protocol::transcript::Live;
 use rho_agents_client::protocol::worksets::{
     AgentEntry, AgentLog, AgentLogPage, Cancel, ClientFrame, CreateWorkset, CreatedWorkset,
     DeleteWorksets, Eval, EvalResult, LogNext, Open, Request, RestartWorkset, RewindAgent,
-    RewoundAgent, ServerFrame, StopAgent, WorksetEntry,
+    RewoundAgent, ServerFrame, StopAgent, TellAgent, WorksetEntry,
 };
 use rho_agents_client::protocol::{
     AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, GlobalUsage, QuotaHistory,
@@ -598,6 +598,18 @@ where
             respond(writer, call, |RestartWorkset { agent }| async move {
                 services.pool.restart_agent_workset(agent).await
             })
+            .await
+        }
+        Request::TellAgent(call) => {
+            respond(
+                writer,
+                call,
+                |TellAgent {
+                     agent,
+                     parent,
+                     text,
+                 }| async move { services.pool.tell_agent(agent, parent, text).await },
+            )
             .await
         }
         Request::DeleteWorksets(call) => {

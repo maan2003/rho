@@ -79,15 +79,6 @@ fn python_runtime(runtime: &Runtime) -> String {
     }
 }
 
-/// The picker's next choice after `current`.
-pub fn cycle_runtime(current: &str) -> &'static str {
-    let current = parse_runtime(current).map(|runtime| runtime.label());
-    let at = RUNTIMES
-        .iter()
-        .position(|runtime| Ok(*runtime) == current.as_deref());
-    RUNTIMES[at.map_or(0, |at| (at + 1) % RUNTIMES.len())]
-}
-
 /// The first agent of a new isolated workset, on a clone of `repo` at
 /// `rev` (empty: the remote's default branch).
 pub fn new_agent_on(
@@ -201,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_parse_and_cycle() {
+    fn runtimes_parse() {
         assert_eq!(parse_runtime("").unwrap().as_str(), "opus-high");
         assert_eq!(
             Runtime::parse(" Opus-High ").unwrap().kind(),
@@ -217,9 +208,6 @@ mod tests {
         assert_eq!((haiku.model(), haiku.effort()), ("haiku", "medium"));
         assert!(Runtime::parse("med-eng").is_err());
         assert!(Runtime::parse("sol").is_err());
-        assert_eq!(cycle_runtime("sol-medium"), "sol-high");
-        assert_eq!(cycle_runtime("astra-high"), "hydrogen-high");
-        assert_eq!(cycle_runtime("hydrogen-high"), "neon-high");
         for effort in ["low", "medium", "high", "xhigh"] {
             let runtime = Runtime::parse(&format!("neon-{effort}")).unwrap();
             assert_eq!(runtime.kind(), RuntimeKind::Rho);
@@ -231,12 +219,6 @@ mod tests {
         assert_eq!(
             Runtime::parse("hydrogen-high").unwrap().kind(),
             RuntimeKind::Rho
-        );
-        assert_eq!(cycle_runtime(RUNTIMES[RUNTIMES.len() - 1]), RUNTIMES[0]);
-        assert_eq!(
-            cycle_runtime("terra-xhigh"),
-            RUNTIMES[0],
-            "off the list starts it"
         );
     }
 

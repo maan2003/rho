@@ -1,4 +1,4 @@
-//! The mail part of the agent host ([`rho_chat::protocol`]): a session
+//! The chat part of the agent host ([`rho_chat::protocol`]): a session
 //! carries the host's log from where a client holds it; what the user does
 //! in the chat is a call on a stream of its own.
 
@@ -22,7 +22,7 @@ use crate::{Services, prepare_image_content};
 /// a cold copy goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
 
-/// Serves one mail stream, whichever kind its opening frame asked for.
+/// Serves one chat stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
     services: Arc<Services>,
     open: Open,
@@ -66,6 +66,7 @@ where
     let _ = outgoing_tx.send(ServerFrame::Hello {
         head,
         host: services.endpoint,
+        runtimes: rho_agent_types::RuntimeCatalogue::host(),
     });
     let (follow_tx, follow_rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(
@@ -103,8 +104,6 @@ async fn follow(
 ) {
     let mut sent: Option<ChatSeq> = None;
     let mut work_changed = services.pool.watch_thread_work();
-    let mut projects_changed = services.pool.watch_projects();
-    let mut send_projects = true;
     let mut send_work = true;
     let mut last_work = None;
     loop {
@@ -129,22 +128,7 @@ async fn follow(
             }
             send_work = false;
         }
-        if sent.is_some() && send_projects {
-            projects_changed.borrow_and_update();
-            let configured = services.db.read().configured_projects();
-            if outgoing_tx
-                .send(ServerFrame::Projects { configured })
-                .is_err()
-            {
-                return;
-            }
-            send_projects = false;
-        }
         tokio::select! {
-            changed = projects_changed.changed() => {
-                if changed.is_err() { return; }
-                send_projects = true;
-            }
             changed = work_changed.changed() => {
                 if changed.is_err() {
                     return;
@@ -199,7 +183,7 @@ where
     write_frame(writer, &Answer::from(reply)).await
 }
 
-/// One mail request.
+/// One chat request.
 async fn serve_call<W>(
     services: &Arc<Services>,
     request: Request,
@@ -215,9 +199,11 @@ where
                 anyhow::ensure!(!name.is_empty(), "a project needs a name");
                 let read = services.db.read();
                 Ok(read.project_named(&name).and_then(|root| {
+                    let id = rho_agent_types::ProjectId(root);
                     Some(Project {
-                        root,
+                        id,
                         name: read.thread(root)?.name,
+                        config: read.project(id)?,
                     })
                 }))
             })
@@ -330,13 +316,12 @@ where
                      client_id,
                      parent,
                      settles,
-                     mentions,
                      mut content,
                  }| async move {
                     prepare_image_content(&mut content).await?;
                     services
                         .pool
-                        .post_user(client_id, parent, settles, mentions, content)
+                        .post_user(client_id, parent, settles, content)
                         .await
                 },
             )

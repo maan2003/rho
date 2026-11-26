@@ -1,4 +1,4 @@
-//! The host's mail ([`rho_agent_types::ChatEvent`]): one log, dense from
+//! The host's chat ([`rho_agent_types::ChatEvent`]): one log, dense from
 //! one, and the indexes folded from it in the commit of every append.
 //!
 //! The log holds a forest of messages. Each message keeps its parent now
@@ -6,19 +6,20 @@
 //! read as a range and a move rewrites two rows. Membership is explicit per
 //! thread ([`MEMBERS`]) and read up the chain of parents: the nearest
 //! record for an agent decides, so a join on a root is a bot in a channel
-//! and a leave on a subthread cuts that branch. User-facing mail is readable
-//! in its thread but never delivered to agents. Other mail goes to its
-//! recipients' inboxes when written, so delivery reads only its own inbox.
+//! and a leave on a subthread cuts that branch. The project's words to the
+//! user are readable in their thread but never delivered to agents. The
+//! user's words and one agent's words to another go to their recipients'
+//! inboxes when written, so delivery reads only its own inbox.
 
 use redb::TableDefinition;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, FLASH_LIFETIME, Mention,
-    Message, MessageId, MessageKind, Revision, UnixMs,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, ContentPart, FLASH_LIFETIME, Message,
+    MessageId, ProjectPlace, Revision, UnixMs, Voice,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
-use super::{Appended, tell};
+use super::{Appended, ProjectRead as _, ProjectWrite as _, tell};
 
 // Table names are stable on disk across the mail protocol rename.
 const MAIL_LOG: TableDefinition<u64, Sen<ChatRecord>> = TableDefinition::new("chat_log");
@@ -45,6 +46,361 @@ const REVISIONS: TableDefinition<u64, u64> = TableDefinition::new("chat_revision
 
 const AGENT_MAIL_PROJECT: &str = "Agent mail";
 
+/// The log as hosts wrote it before a post had one voice (format
+/// `7c2a5f9d`). Only the one-hop store migration reads it; remove it with
+/// that hop.
+mod prior_voice {
+    use rho_agent_types::ThreadReply;
+
+    use super::{Address, AgentId, ChatSeq, ContentPart, Decode, Encode, MessageId, UnixMs};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+    pub(super) enum Mention {
+        User { ping: bool },
+        Agent(AgentId),
+        Direct(AgentId),
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+    pub(super) enum MessageKind {
+        #[default]
+        Kept,
+        Flash,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub(super) enum ChatEvent {
+        Posted {
+            parent: Option<MessageId>,
+            reply_to: Option<MessageId>,
+            thread_reply: Option<ThreadReply>,
+            from: Address,
+            #[senax(default)]
+            kind: MessageKind,
+            mentions: Vec<Mention>,
+            content: Vec<ContentPart>,
+        },
+        Reparented {
+            message: MessageId,
+            parent: Option<MessageId>,
+        },
+        Joined {
+            thread: MessageId,
+            agent: AgentId,
+        },
+        Left {
+            thread: MessageId,
+            agent: AgentId,
+        },
+        Named {
+            thread: MessageId,
+            name: String,
+        },
+        Edited {
+            message: MessageId,
+            content: Vec<ContentPart>,
+        },
+        Deleted {
+            message: MessageId,
+        },
+        Revised {
+            message: MessageId,
+            author: AgentId,
+            content: Vec<ContentPart>,
+            ping: Option<bool>,
+        },
+        TakenBack {
+            message: MessageId,
+            version: ChatSeq,
+            author: AgentId,
+        },
+        Recovered {
+            message: MessageId,
+            content: Vec<ContentPart>,
+        },
+    }
+
+    // Sen's table type name is the unqualified Rust name; this opens the
+    // same table with the old row shape.
+    #[derive(Clone, Debug, Encode, Decode)]
+    pub(super) struct ChatRecord {
+        pub seq: ChatSeq,
+        pub at: UnixMs,
+        pub event: ChatEvent,
+    }
+
+    /// The project settings as hosts kept them beside the log.
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub(super) struct ProjectSettings {
+        pub place: rho_agent_types::ProjectPlace,
+        pub routing: Routing,
+        #[senax(default)]
+        pub runtime: rho_agent_types::RuntimeLabel,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub(super) enum Routing {
+        One { agent: Option<AgentId> },
+        PerIdea,
+    }
+}
+
+/// One hop, `7c2a5f9d` to the voiced log: every post gets the one voice its
+/// mentions and ping meant, and each project's settings move from the
+/// sidecar `mail_projects` table into the log as a [`ChatEvent::Project`].
+///
+/// A message that ended kept but silent (`ping: false`, the shape
+/// `product/chat.md` rejected) becomes a flash, which expires as any old
+/// flash does, unless it anchors something: a root, or a thread right under
+/// one, stays a message so the work under it keeps its head. A root that
+/// had no settings and is not the peer container becomes a project at the
+/// place of the agent that made it or first worked under it, else `~`.
+pub(crate) fn migrate_voices(
+    write: &mut WriteTxn,
+    place_of: impl Fn(AgentId) -> Option<ProjectPlace>,
+) {
+    use prior_voice::{ChatEvent as Old, Mention as OldMention, MessageKind as OldKind};
+    use redb::TableHandle as _;
+    let old = TableDefinition::<u64, Sen<prior_voice::ChatRecord>>::new(MAIL_LOG.name());
+    let rows: Vec<prior_voice::ChatRecord> = write
+        .open_table(old)
+        .iter()
+        .map(|(_, row)| row.value().into_owned())
+        .collect();
+    // The ping each message ended with, after its revisions.
+    let mut pinging = std::collections::HashMap::new();
+    let mut parents = std::collections::HashMap::new();
+    let mut has_children = std::collections::HashSet::new();
+    let mut start_failures = std::collections::HashSet::new();
+    // Roots the old rule kept out of the projects: addressed ones.
+    let mut addressed = std::collections::HashSet::new();
+    for row in &rows {
+        match &row.event {
+            Old::Posted {
+                parent,
+                from,
+                mentions,
+                ..
+            } => {
+                let ping = mentions
+                    .iter()
+                    .any(|m| *m == OldMention::User { ping: true });
+                pinging.insert(row.seq, ping);
+                parents.insert(row.seq, *parent);
+                if let Some(parent) = parent {
+                    has_children.insert(parent.0);
+                }
+                if *from == Address::StartFailed {
+                    start_failures.insert(row.seq);
+                }
+                if parent.is_none() && !mentions.is_empty() {
+                    addressed.insert(row.seq.0);
+                }
+            }
+            Old::Revised {
+                message,
+                ping: Some(ping),
+                ..
+            } => {
+                pinging.insert(message.0, *ping);
+            }
+            _ => {}
+        }
+    }
+    let anchors = |seq: ChatSeq| {
+        has_children.contains(&seq)
+            || match parents.get(&seq).copied().flatten() {
+                None => true,
+                Some(parent) => parents.get(&parent.0).copied().flatten().is_none(),
+            }
+    };
+    let mut table = write.open_table(MAIL_LOG);
+    for row in rows {
+        let event = match row.event {
+            Old::Posted {
+                parent,
+                reply_to,
+                thread_reply,
+                from,
+                kind,
+                mentions,
+                content,
+            } => {
+                let direct = mentions.iter().find_map(|mention| match mention {
+                    OldMention::Direct(agent) | OldMention::Agent(agent) => Some(*agent),
+                    OldMention::User { .. } => None,
+                });
+                let voice = match (from, kind, direct) {
+                    (_, OldKind::Flash, _) => Voice::Flash,
+                    (Address::Agent(_), OldKind::Kept, Some(to)) => Voice::ToAgent(to),
+                    (Address::Agent(_), OldKind::Kept, None)
+                        if !pinging[&row.seq] && !anchors(row.seq) =>
+                    {
+                        Voice::Flash
+                    }
+                    _ => Voice::Message,
+                };
+                // A user's reply that named one message settled exactly
+                // that version; a retry of a failed start keeps its target.
+                let (retry_of, thread_reply) = match (from, reply_to, thread_reply) {
+                    (Address::User, Some(target), None) if start_failures.contains(&target.0) => {
+                        (Some(target), None)
+                    }
+                    (Address::User, Some(target), None) => (
+                        None,
+                        Some(rho_agent_types::ThreadReply {
+                            settles: Some(rho_agent_types::MessageVersion {
+                                message: target,
+                                version: row.seq,
+                            }),
+                        }),
+                    ),
+                    (_, _, thread_reply) => (None, thread_reply),
+                };
+                ChatEvent::Posted {
+                    parent,
+                    retry_of,
+                    thread_reply,
+                    from,
+                    voice,
+                    content,
+                }
+            }
+            Old::Reparented { message, parent } => ChatEvent::Reparented { message, parent },
+            Old::Joined { thread, agent } => ChatEvent::Joined { thread, agent },
+            Old::Left { thread, agent } => ChatEvent::Left { thread, agent },
+            Old::Named { thread, name } => ChatEvent::Named { thread, name },
+            Old::Edited { message, content } => ChatEvent::Edited { message, content },
+            Old::Deleted { message } => ChatEvent::Deleted { message },
+            Old::Revised {
+                message,
+                author,
+                content,
+                ..
+            } => ChatEvent::Revised {
+                message,
+                author,
+                content,
+            },
+            Old::TakenBack {
+                message,
+                version,
+                author,
+            } => ChatEvent::TakenBack {
+                message,
+                version,
+                author,
+            },
+            Old::Recovered { message, content } => ChatEvent::Recovered { message, content },
+        };
+        table.insert(
+            row.seq.0,
+            SenValue::borrowed(&ChatRecord {
+                seq: row.seq,
+                at: row.at,
+                event,
+            }),
+        );
+    }
+    drop(table);
+
+    // Settings: the sidecar table's rows, then every other root the old
+    // rule called a project.
+    const OLD_PROJECTS: &str = "mail_projects";
+    let settings: Vec<(u64, prior_voice::ProjectSettings)> = {
+        let old = TableDefinition::<u64, Sen<prior_voice::ProjectSettings>>::new(OLD_PROJECTS);
+        let rows = write
+            .open_table(old)
+            .iter()
+            .map(|(id, row)| (id.value(), row.value().into_owned()))
+            .collect();
+        write.delete_table(old.name());
+        rows
+    };
+    let at = UnixMs::now();
+    let mut configured = std::collections::HashSet::new();
+    for (root, settings) in settings {
+        let project = rho_agent_types::ProjectId(MessageId(ChatSeq(root)));
+        if !is_message(write, project.0) {
+            continue;
+        }
+        let mode = match settings.routing {
+            prior_voice::Routing::One { agent } => {
+                if let Some(agent) = agent {
+                    write.set_standing_agent(project, agent);
+                }
+                rho_agent_types::ProjectMode::One
+            }
+            prior_voice::Routing::PerIdea => rho_agent_types::ProjectMode::PerIdea,
+        };
+        configured.insert(root);
+        write.set_project(
+            at,
+            project,
+            rho_agent_types::ProjectConfig {
+                place: settings.place,
+                mode,
+                runtime: settings.runtime,
+            },
+        );
+    }
+    let roots: Vec<u64> = write
+        .open_table(CHILDREN)
+        .range((ROOT, 0)..=(ROOT, u64::MAX))
+        .map(|(key, _)| key.value().1)
+        .collect();
+    let first_joined: Vec<(AgentId, u64)> = write
+        .open_table(FIRST_THREAD)
+        .iter()
+        .map(|(agent, thread)| (agent.value(), thread.value()))
+        .collect();
+    for root in roots {
+        let id = MessageId(ChatSeq(root));
+        if configured.contains(&root) {
+            continue;
+        }
+        let Some(anchor) = current_message(write, id) else {
+            continue;
+        };
+        let named = write.open_table(NAMES).get(root).map(|name| name.value());
+        if anchor.revision == Revision::Deleted
+            || addressed.contains(&root)
+            || named.unwrap_or_else(|| anchor.headline()) == AGENT_MAIL_PROJECT
+        {
+            continue;
+        }
+        let creator = match anchor.from {
+            Address::Agent(agent) => Some(agent),
+            _ => None,
+        };
+        let worker = first_joined
+            .iter()
+            .filter(|(_, thread)| root_of_write(write, MessageId(ChatSeq(*thread))) == id)
+            .map(|(agent, _)| *agent);
+        let place = creator
+            .into_iter()
+            .chain(worker)
+            .find_map(&place_of)
+            .unwrap_or_else(|| ProjectPlace::parse("~").expect("a place"));
+        write.set_project(
+            at,
+            rho_agent_types::ProjectId(id),
+            rho_agent_types::ProjectConfig {
+                place,
+                mode: rho_agent_types::ProjectMode::One,
+                runtime: rho_agent_types::RuntimeLabel::default(),
+            },
+        );
+    }
+}
+
+fn root_of_write(write: &mut WriteTxn, mut message: MessageId) -> MessageId {
+    while let Some(parent) = parent_now(write, message) {
+        message = parent;
+    }
+    message
+}
+
 /// The root of the forest in the children index.
 const ROOT: u64 = 0;
 
@@ -52,8 +408,7 @@ const ROOT: u64 = 0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMessage {
     pub from: Address,
-    pub reply_to: Option<MessageId>,
-    pub mentions: Vec<Mention>,
+    pub voice: Voice,
     pub content: Vec<ContentPart>,
 }
 
@@ -108,7 +463,7 @@ pub trait MailRead {
     fn recipients_of(&self, message: &Message) -> Vec<AgentId>;
     /// The enclosing root for any mail.
     fn root_of(&self, message: MessageId) -> Option<MessageId>;
-    /// The host's newest channel with this name.
+    /// The host's newest project with this name.
     fn project_named(&self, name: &str) -> Option<MessageId>;
     fn posted_by_client(&self, client_id: u64) -> Option<MessageId>;
     fn search_mail(
@@ -237,14 +592,15 @@ impl MailRead for ReadTxn {
             })
             .filter(|message| {
                 !matches!(message.revision, Revision::Deleted | Revision::TakenBack { .. })
-                    // Older inbox indexes can still contain project mail.
-                    && !user_facing(message.from, &message.mentions)
+                    // Older inbox indexes can still contain the project's
+                    // words to the user.
+                    && !user_facing(message.from, message.voice)
             })
             .collect()
     }
 
     fn recipients_of(&self, message: &Message) -> Vec<AgentId> {
-        recipients(message.from, &message.mentions, || {
+        recipients(message.from, message.voice, || {
             self.members_under(message.parent)
         })
     }
@@ -265,7 +621,7 @@ impl MailRead for ReadTxn {
             .rev()
             .find(|root| {
                 root.revision != Revision::Deleted
-                    && root.mentions.is_empty()
+                    && self.project(rho_agent_types::ProjectId(root.id)).is_some()
                     && names
                         .get(root.id.0.0)
                         .map(|name| name.value())
@@ -373,7 +729,7 @@ impl MailRead for ReadTxn {
                 if !matches!(
                     record.event,
                     ChatEvent::Posted {
-                        kind: MessageKind::Flash,
+                        voice: Voice::Flash,
                         ..
                     }
                 ) {
@@ -414,49 +770,36 @@ impl MailRead for ReadTxn {
     }
 }
 
-/// Project mail speaks to the user, not to every agent reading the thread.
-fn user_facing(sender: Address, mentions: &[Mention]) -> bool {
-    matches!(sender, Address::System { .. } | Address::StartFailed)
-        || matches!(sender, Address::Agent(_))
-            && mentions
-                .iter()
-                .any(|mention| matches!(mention, Mention::User { .. }))
+/// The project's words speak to the user, not to every agent reading the
+/// thread.
+fn user_facing(sender: Address, voice: Voice) -> bool {
+    match sender {
+        Address::System { .. } | Address::StartFailed => true,
+        Address::Agent(_) => !matches!(voice, Voice::ToAgent(_)),
+        Address::User => false,
+    }
 }
 
 /// Delivery is fixed by the record, not by which process happens to be
-/// running. Directed mail never fans out to inherited thread members.
+/// running: the user's words reach the thread's members, and an agent's
+/// words to another reach that agent alone.
 fn recipients(
     sender: Address,
-    mentions: &[Mention],
+    voice: Voice,
     members: impl FnOnce() -> Vec<AgentId>,
 ) -> Vec<AgentId> {
-    if user_facing(sender, mentions) {
-        return Vec::new();
+    match (sender, voice) {
+        (Address::User, _) => members(),
+        (Address::Agent(from), Voice::ToAgent(to)) if from != to => vec![to],
+        _ => Vec::new(),
     }
-    let mut agents = if mentions.iter().any(|m| matches!(m, Mention::Direct(_))) {
-        Vec::new()
-    } else {
-        members()
-    };
-    for mention in mentions {
-        if let Some(agent) = mention.agent()
-            && sender != Address::Agent(agent)
-            && !agents.contains(&agent)
-        {
-            agents.push(agent);
-        }
-    }
-    if let Address::Agent(sender) = sender {
-        agents.retain(|agent| *agent != sender);
-    }
-    agents
 }
 
-fn peer_pair(from: Address, mentions: &[Mention]) -> Option<[AgentId; 2]> {
-    let (Address::Agent(from), [Mention::Direct(to)]) = (from, mentions) else {
+fn peer_pair(from: Address, voice: Voice) -> Option<[AgentId; 2]> {
+    let (Address::Agent(from), Voice::ToAgent(to)) = (from, voice) else {
         return None;
     };
-    let mut pair = [from, *to];
+    let mut pair = [from, to];
     pair.sort_unstable();
     Some(pair)
 }
@@ -515,7 +858,16 @@ pub trait MailWrite {
         at: UnixMs,
         parent: Option<MessageId>,
         reply: rho_agent_types::ThreadReply,
-        mentions: Vec<Mention>,
+        content: Vec<ContentPart>,
+        client_id: u64,
+    ) -> anyhow::Result<MessageId>;
+    /// An idea the user writes under a project: a message, logged once per
+    /// `client_id`, and a retry of a failed start when it names one.
+    fn post_idea(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        retry_of: Option<MessageId>,
         content: Vec<ContentPart>,
         client_id: u64,
     ) -> anyhow::Result<MessageId>;
@@ -528,18 +880,19 @@ pub trait MailWrite {
     ) -> anyhow::Result<MessageId>;
     /// Apply the original post's deadline even after edits or a host restart.
     fn expire_flash(&mut self, at: UnixMs, id: MessageId) -> bool;
-    /// The trial reply already exists when a retry creates its recipient.
-    /// Its words and position do not change when it reaches the new agent.
-    fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId);
-    /// A direct conversation under a project. Its first mail is the
-    /// anchor; later mail between the same pair goes under that anchor.
+    /// The host hands an existing message to an agent it did not reach when
+    /// posted: a project's standing agent, or the agent a retry started.
+    /// Its words and position do not change.
+    fn deliver(&mut self, agent: AgentId, message: MessageId);
+    /// One agent's words to another, under a project. Their first message
+    /// is the anchor; later messages between the same pair go under it.
     fn post_peer(
         &mut self,
         at: UnixMs,
         project: Option<MessageId>,
         message: NewMessage,
     ) -> anyhow::Result<MessageId>;
-    /// The agent's live mail in this thread since the user's last mail.
+    /// The agent's live message in this thread since the user's last one.
     fn live_project_mail(&mut self, thread: MessageId, agent: AgentId) -> Option<MessageId>;
     fn mail_version(&mut self, mail: MessageId) -> Option<ChatSeq>;
     /// Mark a still-current version taken back, without erasing its words.
@@ -553,15 +906,14 @@ pub trait MailWrite {
     /// Settle a stuck streak's durable stop when the model answered again.
     fn recover_stuck(&mut self, at: UnixMs, author: AgentId, since: UnixMs);
 
-    /// Change an agent's own posted mail, except mail the user answered.
-    /// `ping` turns the ping of mail to the user on or off; `None` keeps it.
+    /// Change an agent's own words, except a message the user answered.
+    /// The voice stays as it was posted.
     fn edit(
         &mut self,
         at: UnixMs,
         agent: AgentId,
         message: MessageId,
         content: Vec<ContentPart>,
-        ping: Option<bool>,
     ) -> anyhow::Result<()>;
     fn delete(&mut self, at: UnixMs, agent: AgentId, message: MessageId) -> anyhow::Result<()>;
     /// A stop is logged at most once for a particular agent and start time.
@@ -594,6 +946,14 @@ pub trait MailWrite {
     /// gave it. Whether the thread was named now.
     fn name_unnamed(&mut self, at: UnixMs, thread: MessageId, name: String)
     -> anyhow::Result<bool>;
+    /// Makes a root a project, or changes its settings. Logs nothing when
+    /// they are what the project already has.
+    fn set_project(
+        &mut self,
+        at: UnixMs,
+        project: rho_agent_types::ProjectId,
+        config: rho_agent_types::ProjectConfig,
+    );
     /// Replays one event into the indexes: what [`MailWrite::post`] and the
     /// others do after they append. The migration rebuilds the indexes
     /// with it.
@@ -660,10 +1020,10 @@ fn is_above_or_self(write: &mut WriteTxn, ancestor: MessageId, message: MessageI
 
 fn direct_pair_at(write: &mut WriteTxn, id: MessageId) -> Option<[AgentId; 2]> {
     let row = write.open_table(MAIL_LOG).get(id.0.0)?.value().into_owned();
-    let ChatEvent::Posted { from, mentions, .. } = row.event else {
+    let ChatEvent::Posted { from, voice, .. } = row.event else {
         return None;
     };
-    peer_pair(from, &mentions)
+    peer_pair(from, voice)
 }
 
 /// A direct conversation may be read one level down, but it cannot
@@ -710,8 +1070,7 @@ fn unscoped_peer_project(
         None,
         NewMessage {
             from,
-            reply_to: None,
-            mentions: Vec::new(),
+            voice: Voice::Message,
             content: vec![ContentPart::Text {
                 text: AGENT_MAIL_PROJECT.into(),
             }],
@@ -730,7 +1089,7 @@ fn has_user_reply(write: &mut WriteTxn, mail: &Message) -> bool {
             let ChatEvent::Posted {
                 from: Address::User,
                 parent,
-                reply_to,
+                retry_of,
                 thread_reply,
                 ..
             } = row.value().into_owned().event
@@ -741,7 +1100,7 @@ fn has_user_reply(write: &mut WriteTxn, mail: &Message) -> bool {
                 Some(reply) => reply.settles.is_some_and(|seen| {
                     seen.message == mail.id && seen.version >= mail.version().0
                 }),
-                None => reply_to.or(parent) == Some(mail.id),
+                None => retry_of.or(parent) == Some(mail.id),
             }
         })
 }
@@ -791,45 +1150,38 @@ fn check_revision(write: &mut WriteTxn, agent: AgentId, id: MessageId) -> anyhow
         current_message(write, id).ok_or_else(|| anyhow::anyhow!("no message #{}", id.0.0))?;
     anyhow::ensure!(
         mail.from == Address::Agent(agent),
-        "you can only change your own mail"
+        "you can only change your own words"
     );
     anyhow::ensure!(
         !matches!(
             mail.revision,
             Revision::Deleted | Revision::TakenBack { .. }
         ),
-        "mail #{} was deleted or taken back",
+        "#{} was deleted or taken back",
         id.0.0
     );
     anyhow::ensure!(
-        mail.kind == MessageKind::Flash || !has_user_reply(write, &mail),
-        "you cannot change mail #{}: the user already answered it",
+        mail.voice == Voice::Flash || !has_user_reply(write, &mail),
+        "you cannot change #{}: the user already answered it",
         id.0.0
     );
     Ok(mail)
 }
 
-/// Only the latest revision of a mail is read back, so a revision of mail
-/// to the user says its ping whether or not it changes it.
 fn revise(
     write: &mut WriteTxn,
     at: UnixMs,
     mail: &Message,
     author: AgentId,
     content: Vec<ContentPart>,
-    ping: Option<bool>,
 ) {
-    let ping = mail
-        .to_user()
-        .then(|| ping.unwrap_or_else(|| mail.pings_user()));
-    if mail.content == content && ping.is_none_or(|ping| ping == mail.pings_user()) {
+    if mail.content == content {
         return;
     }
     let event = ChatEvent::Revised {
         message: mail.id,
         author,
         content,
-        ping,
     };
     let seq = append(write, at, event.clone());
     write.index_mail_event(seq, &event);
@@ -840,8 +1192,8 @@ fn post_kind(
     at: UnixMs,
     parent: Option<MessageId>,
     message: NewMessage,
-    kind: MessageKind,
     client_id: Option<u64>,
+    retry_of: Option<MessageId>,
     thread_reply: Option<rho_agent_types::ThreadReply>,
 ) -> anyhow::Result<MessageId> {
     if let Some(seq) = sent_before(write, client_id) {
@@ -853,29 +1205,27 @@ fn post_kind(
     anyhow::ensure!(has_content(&message.content), "a message needs content");
     let NewMessage {
         from,
-        reply_to,
-        mentions,
+        voice,
         content,
     } = message;
-    if let Some(reply_to) = reply_to {
-        anyhow::ensure!(is_message(write, reply_to), "no mail #{}", reply_to.0.0);
+    if let Some(retry_of) = retry_of {
+        anyhow::ensure!(is_message(write, retry_of), "no message #{}", retry_of.0.0);
     }
     if let Some(parent) = parent
         && let Some((_, pair)) = peer_thread(write, parent)
         && let Address::Agent(agent) = from
     {
         anyhow::ensure!(
-            peer_pair(from, &mentions) == Some(pair) && pair.contains(&agent),
-            "address the other agent to reply in a direct conversation"
+            peer_pair(from, voice) == Some(pair) && pair.contains(&agent),
+            "write to the other agent to reply in a conversation between agents"
         );
     }
     let event = ChatEvent::Posted {
         parent,
-        reply_to,
+        retry_of,
         thread_reply,
         from,
-        kind,
-        mentions,
+        voice,
         content,
     };
     let seq = append(write, at, event.clone());
@@ -950,15 +1300,7 @@ impl MailWrite for WriteTxn {
         message: NewMessage,
         client_id: Option<u64>,
     ) -> anyhow::Result<MessageId> {
-        post_kind(
-            self,
-            at,
-            parent,
-            message,
-            MessageKind::Kept,
-            client_id,
-            None,
-        )
+        post_kind(self, at, parent, message, client_id, None, None)
     }
 
     fn post_user_reply(
@@ -966,7 +1308,6 @@ impl MailWrite for WriteTxn {
         at: UnixMs,
         parent: Option<MessageId>,
         reply: rho_agent_types::ThreadReply,
-        mentions: Vec<Mention>,
         content: Vec<ContentPart>,
         client_id: u64,
     ) -> anyhow::Result<MessageId> {
@@ -976,13 +1317,35 @@ impl MailWrite for WriteTxn {
             parent,
             NewMessage {
                 from: Address::User,
-                reply_to: None,
-                mentions,
+                voice: Voice::Message,
                 content,
             },
-            MessageKind::Kept,
             Some(client_id),
+            None,
             Some(reply),
+        )
+    }
+
+    fn post_idea(
+        &mut self,
+        at: UnixMs,
+        thread: MessageId,
+        retry_of: Option<MessageId>,
+        content: Vec<ContentPart>,
+        client_id: u64,
+    ) -> anyhow::Result<MessageId> {
+        post_kind(
+            self,
+            at,
+            Some(thread),
+            NewMessage {
+                from: Address::User,
+                voice: Voice::Message,
+                content,
+            },
+            Some(client_id),
+            retry_of,
+            None,
         )
     }
 
@@ -995,27 +1358,18 @@ impl MailWrite for WriteTxn {
     ) -> anyhow::Result<MessageId> {
         anyhow::ensure!(
             current_message(self, thread).is_some_and(|anchor| {
-                anchor.kind == MessageKind::Kept
-                    && (anchor.parent.is_some() || anchor.to_user())
+                anchor.voice == Voice::Message
+                    && anchor.parent.is_some()
                     && anchor.revision != Revision::Deleted
             }),
             "a flash needs a thread"
         );
         let message = NewMessage {
             from: Address::Agent(author),
-            reply_to: None,
-            mentions: vec![Mention::User { ping: false }],
+            voice: Voice::Flash,
             content,
         };
-        post_kind(
-            self,
-            at,
-            Some(thread),
-            message,
-            MessageKind::Flash,
-            None,
-            None,
-        )
+        post_kind(self, at, Some(thread), message, None, None, None)
     }
 
     fn expire_flash(&mut self, at: UnixMs, id: MessageId) -> bool {
@@ -1028,7 +1382,7 @@ impl MailWrite for WriteTxn {
         false
     }
 
-    fn deliver_project_retry(&mut self, agent: AgentId, message: MessageId) {
+    fn deliver(&mut self, agent: AgentId, message: MessageId) {
         self.open_table(INBOX).insert((agent, message.0.0), ());
         // The sequence did not move, but the workset can read new inbox mail.
         tell(self, Appended::Mail(message.0));
@@ -1040,20 +1394,10 @@ impl MailWrite for WriteTxn {
         project: Option<MessageId>,
         message: NewMessage,
     ) -> anyhow::Result<MessageId> {
-        let pair = peer_pair(message.from, &message.mentions)
+        let pair = peer_pair(message.from, message.voice)
             .filter(|pair| pair[0] != pair[1])
-            .ok_or_else(|| anyhow::anyhow!("direct mail needs two different agents"))?;
-        if let Some(reply_to) = message.reply_to {
-            anyhow::ensure!(is_message(self, reply_to), "no mail #{}", reply_to.0.0);
-            if let Some((thread, addressed_pair)) = peer_thread(self, reply_to) {
-                anyhow::ensure!(
-                    pair == addressed_pair,
-                    "address the same pair to reply to direct mail"
-                );
-                return self.post(at, Some(thread), message, None);
-            }
-        }
-        // Standalone agents (e.g. from the CLI) still have durable mail.
+            .ok_or_else(|| anyhow::anyhow!("a word to an agent needs two different agents"))?;
+        // Standalone agents (e.g. from the CLI) still keep their words.
         // Keep their conversations together rather than making each a project.
         let project = match project {
             Some(project) => project,
@@ -1084,11 +1428,11 @@ impl MailWrite for WriteTxn {
 
     fn live_project_mail(&mut self, thread: MessageId, agent: AgentId) -> Option<MessageId> {
         // SPEC-live-project-mail: the same transaction checks the writer's
-        // slot and appends the new mail. Thread membership is the current
-        // parent, but a top-level thread starts with its opening mail.
+        // slot and appends the new message. Thread membership is the current
+        // parent, but a top-level thread starts with its opening message.
         let anchor = current_message(self, thread)?;
-        if anchor.parent.is_none() && !anchor.to_user() {
-            return None; // a project directory, not an exchange
+        if anchor.parent.is_none() {
+            return None; // a project, not an exchange
         }
         let mut candidates: Vec<_> = self
             .open_table(CHILDREN)
@@ -1108,15 +1452,11 @@ impl MailWrite for WriteTxn {
                 break;
             }
             if mail.from == Address::Agent(agent)
-                && mail.kind == MessageKind::Kept
+                && mail.voice == Voice::Message
                 && !matches!(
                     mail.revision,
                     Revision::Deleted | Revision::TakenBack { .. }
                 )
-                && !mail
-                    .mentions
-                    .iter()
-                    .any(|m| matches!(m, Mention::Direct(_)))
                 && !has_user_reply(self, &mail)
             {
                 return Some(id);
@@ -1193,18 +1533,10 @@ impl MailWrite for WriteTxn {
         agent: AgentId,
         message: MessageId,
         content: Vec<ContentPart>,
-        ping: Option<bool>,
     ) -> anyhow::Result<()> {
         let mail = check_revision(self, agent, message)?;
         anyhow::ensure!(has_content(&content), "a message needs content");
-        if mail.kind == MessageKind::Flash {
-            anyhow::ensure!(ping != Some(true), "a flash cannot ping");
-        }
-        anyhow::ensure!(
-            ping.is_none() || mail.to_user(),
-            "only mail to the user pings"
-        );
-        revise(self, at, &mail, agent, content, ping);
+        revise(self, at, &mail, agent, content);
         Ok(())
     }
 
@@ -1242,8 +1574,7 @@ impl MailWrite for WriteTxn {
             Some(thread),
             NewMessage {
                 from: sender,
-                reply_to: None,
-                mentions: vec![Mention::User { ping: true }],
+                voice: Voice::Message,
                 content: vec![ContentPart::Text { text }],
             },
             None,
@@ -1348,15 +1679,29 @@ impl MailWrite for WriteTxn {
         Ok(true)
     }
 
+    fn set_project(
+        &mut self,
+        at: UnixMs,
+        project: rho_agent_types::ProjectId,
+        config: rho_agent_types::ProjectConfig,
+    ) {
+        if self.held_project(project).as_ref() == Some(&config) {
+            return;
+        }
+        let event = ChatEvent::Project { project, config };
+        let seq = append(self, at, event.clone());
+        self.index_mail_event(seq, &event);
+    }
+
     fn index_mail_event(&mut self, seq: ChatSeq, event: &ChatEvent) {
         match event {
             ChatEvent::Posted {
                 parent,
                 from,
-                mentions,
+                voice,
                 ..
             } => {
-                let receivers = recipients(*from, mentions, || members_under_write(self, *parent));
+                let receivers = recipients(*from, *voice, || members_under_write(self, *parent));
                 self.open_table(PARENT).insert(seq.0, seq_of(*parent));
                 self.open_table(CHILDREN)
                     .insert((seq_of(*parent), seq.0), ());
@@ -1390,6 +1735,9 @@ impl MailWrite for WriteTxn {
             | ChatEvent::Deleted { message } => {
                 self.open_table(REVISIONS).insert(message.0.0, seq.0);
             }
+            ChatEvent::Project { project, config } => {
+                self.index_project(*project, config);
+            }
             ChatEvent::Named { thread, name } => {
                 let mut names = self.open_table(NAMES);
                 if name.is_empty() {
@@ -1406,5 +1754,303 @@ fn index_first_join(write: &mut WriteTxn, agent: AgentId, thread: MessageId) {
     let mut first = write.open_table(FIRST_THREAD);
     if first.get(agent).is_none() {
         first.insert(agent, thread.0.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod voice_migration_tests {
+    use rho_agent_types::{
+        AgentIdDomain, MessageVersion, ProjectConfig, ProjectId, ProjectMode, RuntimeLabel,
+        ThreadReply,
+    };
+
+    use super::prior_voice::{
+        ChatEvent as Old, ChatRecord as OldRecord, Mention as OldMention, MessageKind as OldKind,
+        ProjectSettings, Routing,
+    };
+    use super::*;
+    use crate::store::StoreWrite as _;
+    use crate::store::projects::ProjectRead as _;
+
+    fn words(text: &str) -> Vec<ContentPart> {
+        vec![ContentPart::Text { text: text.into() }]
+    }
+
+    /// A post the old way: indexes built by today's `post`, and the log
+    /// row in the old shape, which [`old_rows`] writes once every post is
+    /// in.
+    struct OldPost {
+        parent: Option<u64>,
+        reply_to: Option<u64>,
+        from: Address,
+        kind: OldKind,
+        mentions: Vec<OldMention>,
+        text: &'static str,
+    }
+
+    fn old_post(write: &mut WriteTxn, rows: &mut Vec<(ChatSeq, Old)>, post: OldPost) -> u64 {
+        let id = write
+            .post(
+                UnixMs(1),
+                post.parent.map(|parent| MessageId(ChatSeq(parent))),
+                NewMessage {
+                    from: post.from,
+                    voice: Voice::Message,
+                    content: words(post.text),
+                },
+                None,
+            )
+            .unwrap();
+        rows.push((
+            id.0,
+            Old::Posted {
+                parent: post.parent.map(|parent| MessageId(ChatSeq(parent))),
+                reply_to: post.reply_to.map(|target| MessageId(ChatSeq(target))),
+                thread_reply: None,
+                from: post.from,
+                kind: post.kind,
+                mentions: post.mentions,
+                content: words(post.text),
+            },
+        ));
+        id.0.0
+    }
+
+    fn old_rows(write: &mut WriteTxn, rows: Vec<(ChatSeq, Old)>) {
+        let table = TableDefinition::<u64, Sen<OldRecord>>::new("chat_log");
+        let mut table = write.open_table(table);
+        for (seq, event) in rows {
+            table.insert(
+                seq.0,
+                SenValue::borrowed(&OldRecord {
+                    seq,
+                    at: UnixMs(1),
+                    event,
+                }),
+            );
+        }
+    }
+
+    /// A root written as a build before voices wrote it, for the store's
+    /// own upgrade test.
+    pub(crate) fn old_root(write: &mut WriteTxn, from: Address, text: &'static str) -> MessageId {
+        let mut rows = Vec::new();
+        let root = old_post(
+            write,
+            &mut rows,
+            OldPost {
+                parent: None,
+                reply_to: None,
+                from,
+                kind: OldKind::Kept,
+                mentions: Vec::new(),
+                text,
+            },
+        );
+        old_rows(write, rows);
+        MessageId(ChatSeq(root))
+    }
+
+    /// Every way an old post maps to one voice, the reply fields, and the
+    /// projects: settings from the sidecar table, a settingless root at
+    /// the place of the agent that made it or at `~`, and no project for
+    /// the peer container or an addressed root.
+    #[tokio::test]
+    async fn the_hop_gives_each_post_one_voice_and_each_project_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let (a, b) = (
+            AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+            AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
+        );
+        let user = |parent, text| OldPost {
+            parent,
+            reply_to: None,
+            from: Address::User,
+            kind: OldKind::Kept,
+            mentions: Vec::new(),
+            text,
+        };
+        let from_a = |parent, kind, mentions, text| OldPost {
+            parent,
+            reply_to: None,
+            from: Address::Agent(a),
+            kind,
+            mentions,
+            text,
+        };
+        let ping = |ping| vec![OldMention::User { ping }];
+        let mut write = db.write().await;
+        write.init_store_tables();
+        let mut rows = Vec::new();
+        let rho = old_post(&mut write, &mut rows, user(None, "rho"));
+        let thread = old_post(&mut write, &mut rows, user(Some(rho), "Fix the clock"));
+        let asked = old_post(
+            &mut write,
+            &mut rows,
+            from_a(Some(thread), OldKind::Kept, ping(true), "Ask"),
+        );
+        let quiet = old_post(
+            &mut write,
+            &mut rows,
+            from_a(Some(thread), OldKind::Kept, ping(false), "fyi"),
+        );
+        let flash = old_post(
+            &mut write,
+            &mut rows,
+            from_a(Some(thread), OldKind::Flash, ping(false), "busy"),
+        );
+        let peer = old_post(
+            &mut write,
+            &mut rows,
+            from_a(
+                Some(thread),
+                OldKind::Kept,
+                vec![OldMention::Direct(b)],
+                "b, help",
+            ),
+        );
+        let answer = old_post(
+            &mut write,
+            &mut rows,
+            OldPost {
+                reply_to: Some(asked),
+                ..user(Some(thread), "Yes")
+            },
+        );
+        let lab = old_post(
+            &mut write,
+            &mut rows,
+            from_a(None, OldKind::Kept, Vec::new(), "Clock lab"),
+        );
+        let lab_thread = old_post(
+            &mut write,
+            &mut rows,
+            from_a(Some(lab), OldKind::Kept, ping(false), "Bench"),
+        );
+        let failed = old_post(
+            &mut write,
+            &mut rows,
+            OldPost {
+                from: Address::StartFailed,
+                ..from_a(Some(thread), OldKind::Kept, ping(true), "Could not start")
+            },
+        );
+        let retry = old_post(
+            &mut write,
+            &mut rows,
+            OldPost {
+                reply_to: Some(failed),
+                ..user(Some(thread), "Try again")
+            },
+        );
+        let peers = old_post(&mut write, &mut rows, user(None, AGENT_MAIL_PROJECT));
+        let addressed = old_post(
+            &mut write,
+            &mut rows,
+            OldPost {
+                mentions: vec![OldMention::Agent(a)],
+                ..user(None, "Restart fixture")
+            },
+        );
+        let ops = old_post(&mut write, &mut rows, user(None, "ops"));
+        // The ask's last revision stopped its ping: it ends a quiet fyi.
+        rows.push((
+            ChatSeq(ops + 1),
+            Old::Revised {
+                message: MessageId(ChatSeq(asked)),
+                author: a,
+                content: words("Ask, settled"),
+                ping: Some(false),
+            },
+        ));
+        write.open_table(REVISIONS).insert(asked, ops + 1);
+        old_rows(&mut write, rows);
+        let settings = TableDefinition::<u64, Sen<ProjectSettings>>::new("mail_projects");
+        write.open_table(settings).insert(
+            rho,
+            SenValue::borrowed(&ProjectSettings {
+                place: ProjectPlace::parse("~/src/rho").unwrap(),
+                routing: Routing::One { agent: Some(b) },
+                runtime: RuntimeLabel::parse("sol-high").unwrap(),
+            }),
+        );
+
+        migrate_voices(&mut write, |agent| {
+            (agent == a).then(|| ProjectPlace::parse("~/src/clock").unwrap())
+        });
+        write.commit();
+
+        let read = db.read();
+        let voice = |seq: u64| read.message(MessageId(ChatSeq(seq))).unwrap().voice;
+        assert_eq!(voice(rho), Voice::Message);
+        assert_eq!(voice(asked), Voice::Flash, "its last ping was false");
+        assert_eq!(voice(quiet), Voice::Flash);
+        assert_eq!(voice(flash), Voice::Flash);
+        assert_eq!(voice(peer), Voice::ToAgent(b));
+        assert_eq!(voice(lab), Voice::Message, "a root anchors its project");
+        assert_eq!(
+            voice(lab_thread),
+            Voice::Message,
+            "a thread anchors its work"
+        );
+        assert_eq!(voice(failed), Voice::Message);
+        let message = |seq: u64| read.message(MessageId(ChatSeq(seq))).unwrap();
+        assert_eq!(
+            (message(answer).retry_of, message(answer).thread_reply),
+            (
+                None,
+                Some(ThreadReply {
+                    settles: Some(MessageVersion {
+                        message: MessageId(ChatSeq(asked)),
+                        version: ChatSeq(answer),
+                    }),
+                }),
+            )
+        );
+        assert_eq!(
+            (message(retry).retry_of, message(retry).thread_reply),
+            (Some(MessageId(ChatSeq(failed))), None)
+        );
+        assert_eq!(message(asked).text(), "Ask, settled");
+
+        let project = |seq: u64| read.project(ProjectId(MessageId(ChatSeq(seq))));
+        let config = |place: &str, mode, runtime: &str| ProjectConfig {
+            place: ProjectPlace::parse(place).unwrap(),
+            mode,
+            runtime: RuntimeLabel::parse(runtime).unwrap(),
+        };
+        let usual = RuntimeLabel::default();
+        assert_eq!(
+            project(rho),
+            Some(config("~/src/rho", ProjectMode::One, "sol-high"))
+        );
+        assert_eq!(
+            read.standing_agent(ProjectId(MessageId(ChatSeq(rho)))),
+            Some(b)
+        );
+        assert_eq!(
+            project(lab),
+            Some(config("~/src/clock", ProjectMode::One, usual.as_str()))
+        );
+        assert_eq!(
+            project(ops),
+            Some(config("~", ProjectMode::One, usual.as_str()))
+        );
+        assert_eq!(project(peers), None);
+        assert_eq!(project(addressed), None);
+        assert_eq!(project(thread), None);
+        // The settings live in the log now, once each.
+        let logged = read
+            .mail_since(ChatSeq::ZERO, usize::MAX)
+            .into_iter()
+            .filter(|record| matches!(record.event, ChatEvent::Project { .. }))
+            .count();
+        assert_eq!(logged, 3);
+        let mut write = db.write().await;
+        assert!(
+            !write.delete_table("mail_projects"),
+            "the sidecar table is gone"
+        );
     }
 }

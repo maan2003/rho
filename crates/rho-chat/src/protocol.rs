@@ -8,8 +8,8 @@
 //! only how it crosses the wire.
 
 use rho_agent_types::{
-    AgentId, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ProjectChange, ProjectConfig,
-    ProjectId, ProjectName, RuntimeLabel, ThreadWork,
+    ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, ProjectChange, ProjectConfig,
+    ProjectId, ProjectName, RuntimeCatalogue, RuntimeLabel, ThreadWork,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -55,9 +55,6 @@ pub struct Post {
     pub parent: Option<MessageId>,
     /// The card seen when the user opened the thread, not a recipient.
     pub settles: Option<rho_agent_types::MessageVersion>,
-    /// Agents the message reaches whether or not they are members. It
-    /// does not make them members.
-    pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
 }
 
@@ -112,13 +109,14 @@ pub struct ResolveProject {
     pub name: String,
 }
 
-/// A project's root anchors its threads. Its address combines its name with the
-/// client's alias for the host, not the host's machine or endpoint name.
+/// A project: its anchor's id, its name (the anchor's thread name), and
+/// its settings. Its address combines its name with the client's alias for
+/// the host, not the host's machine or endpoint name.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Project {
-    #[senax(rename = "channel")]
-    pub root: MessageId,
+    pub id: ProjectId,
     pub name: String,
+    pub config: ProjectConfig,
 }
 
 impl Project {
@@ -138,10 +136,14 @@ pub enum ClientFrame {
 /// What a host says on its session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ServerFrame {
-    /// The first frame: the newest event on the host, and the host's iroh
+    /// The first frame: the newest event on the host, the host's iroh
     /// identity, which names its log and its threads wherever a copy is
-    /// held.
-    Hello { head: ChatSeq, host: EndpointId },
+    /// held, and the runtimes the host offers.
+    Hello {
+        head: ChatSeq,
+        host: EndpointId,
+        runtimes: RuntimeCatalogue,
+    },
     /// Events in log order: the answer to `Follow`, paged, then each new
     /// one.
     Messages { records: Vec<ChatRecord> },
@@ -151,16 +153,11 @@ pub enum ServerFrame {
     Work {
         threads: Vec<(MessageId, ThreadWork)>,
     },
-    /// The host's project settings, replacing the previous snapshot. A
-    /// legacy project without a known place has no entry yet.
-    Projects {
-        configured: Vec<(ProjectId, ProjectConfig)>,
-    },
 }
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{Address, AgentIdDomain, ChatEvent, Mention, Stop, UnixMs};
+    use rho_agent_types::{Address, AgentId, AgentIdDomain, ChatEvent, Stop, UnixMs, Voice};
 
     use super::*;
 
@@ -184,13 +181,10 @@ mod tests {
             mode: rho_agent_types::ProjectMode::PerIdea,
             runtime: RuntimeLabel::parse("haiku-xhigh").unwrap(),
         };
-        round_trips(ServerFrame::Projects {
-            configured: vec![(project, config.clone())],
-        });
         round_trips(Open::Request(
             CreateProject {
                 name: ProjectName::parse("reef").unwrap(),
-                config,
+                config: config.clone(),
             }
             .into(),
         ));
@@ -229,12 +223,14 @@ mod tests {
             .into(),
         ));
         round_trips(rho_rpc::protocol::Answer::Done(Some(Project {
-            root: MessageId(ChatSeq(2)),
+            id: project,
             name: "tide".into(),
+            config: config.clone(),
         })));
         round_trips(ServerFrame::Hello {
             head: ChatSeq(2),
             host: EndpointId([7; 32]),
+            runtimes: RuntimeCatalogue::host(),
         });
         round_trips(ServerFrame::Messages {
             records: vec![
@@ -242,12 +238,11 @@ mod tests {
                     seq: ChatSeq(4),
                     at: UnixMs(5),
                     event: ChatEvent::Posted {
-                        kind: rho_agent_types::MessageKind::Kept,
+                        voice: Voice::ToAgent(agent),
                         parent: Some(MessageId(ChatSeq(2))),
-                        reply_to: None,
+                        retry_of: None,
                         thread_reply: None,
                         from: Address::Agent(agent),
-                        mentions: vec![Mention::User { ping: true }],
                         content: vec![ContentPart::Text { text: "hi".into() }],
                     },
                 },
@@ -289,26 +284,32 @@ mod tests {
                         content: vec![ContentPart::Text {
                             text: "Clock B?".into(),
                         }],
-                        ping: Some(true),
                     },
                 },
                 ChatRecord {
                     seq: ChatSeq(11),
                     at: UnixMs(29),
                     event: ChatEvent::Posted {
-                        kind: rho_agent_types::MessageKind::Kept,
+                        voice: Voice::Message,
                         parent: Some(MessageId(ChatSeq(7))),
-                        reply_to: None,
+                        retry_of: Some(MessageId(ChatSeq(6))),
                         thread_reply: None,
                         from: Address::System {
                             agent,
                             stop: Stop::Stuck,
                             since: UnixMs(23),
                         },
-                        mentions: vec![Mention::User { ping: true }],
                         content: vec![ContentPart::Text {
                             text: "stuck · retries".into(),
                         }],
+                    },
+                },
+                ChatRecord {
+                    seq: ChatSeq(12),
+                    at: UnixMs(30),
+                    event: ChatEvent::Project {
+                        project,
+                        config: config.clone(),
                     },
                 },
             ],
@@ -321,7 +322,6 @@ mod tests {
                     message: MessageId(ChatSeq(4)),
                     version: ChatSeq(8),
                 }),
-                mentions: vec![agent],
                 content: vec![ContentPart::Text {
                     text: "root".into(),
                 }],

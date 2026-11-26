@@ -66,23 +66,25 @@ async fn run_e2e(root: &Path) -> anyhow::Result<()> {
     std::fs::write(
         policy_dir.join("init.py"),
         r#"
-import _rho
 from rho import hooks
 from rho.default import on_notebook as _default_on_notebook
 
-class _MailCompat:
-    def __init__(self, agent_id):
-        self._agent = agent_id
+class _FlashFirst:
+    """Sends a flash before each post, so the test sees both kinds."""
 
-    def send(self, to, text, *, thread=None, reply_to=None, ping=None, replace_last=False):
-        _rho.send_chat(self._agent, int(thread), "working...", "flash")
-        return _rho.send_chat(self._agent, int(thread), str(text).strip(), "message")
+    def __init__(self, chat):
+        self._chat = chat
+
+    def send(self, text, kind, *, thread):
+        self._chat.send("working...", "flash", thread=thread)
+        return self._chat.send(text, kind, thread=thread)
+
+    def __getattr__(self, name):
+        return getattr(self._chat, name)
 
 def _on_notebook(agent, ns):
     _default_on_notebook(agent, ns)
-    # The fake model answers through `mail.send`. Replace whatever `mail`
-    # the defaults gave, so every answer posts a flash and then a message.
-    ns["mail"] = _MailCompat(agent.id)
+    ns["chat"] = _FlashFirst(ns["chat"])
 
 hooks.on_notebook = _on_notebook
 "#,

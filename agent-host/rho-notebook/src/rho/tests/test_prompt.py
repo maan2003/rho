@@ -102,9 +102,10 @@ class Templates(unittest.TestCase):
     def test_advisor_prompt_has_only_its_capabilities(self):
         text = gpt("advisor", "TEAM_SENTINEL\n\n")
         self.assertIn("## Working with other agents\n\nTEAM_SENTINEL\n\n", text)
-        self.assertIn("focused result with mail.send", text)
-        self.assertIn("mail.send(agent, text, *, reply_to=None) → int", text)
-        self.assertIn("Use `mail.send` when a known agent has context", text)
+        self.assertIn("focused result with agents.message", text)
+        self.assertIn("agents.message(*, agent_id, message) → Awaitable[str]    Write to another agent on this host.", text)
+        self.assertIn("Use `agents.message` when a known agent has context", text)
+        self.assertNotIn("mail.", text)
         for forbidden in ["spawn_new_advisor", "spawn_new_engineer", "agents.cancel(*", "human.",
                           "archive()", "## Diagrams", "chat.direct"]:
             self.assertNotIn(forbidden, text)
@@ -118,7 +119,8 @@ class Templates(unittest.TestCase):
             "## How time works", "## The notebook", "## Working with other agents",
             "## Reporting to your parent",
         ])
-        self.assertIn("Your parent agent sees only what you\nsend it with mail.send, not your code", text)
+        self.assertIn("Your parent agent sees only what you\nsend it with agents.message, not your code", text)
+        self.assertNotIn("mail.", text)
         for forbidden in ["human.", "archive()", "spawn_new_advisor", "spawn_new_engineer", "chat.direct"]:
             self.assertNotIn(forbidden, text)
 
@@ -245,7 +247,8 @@ class Instructions(unittest.TestCase):
         for runtime in [native(), claude()]:
             child = self.agent(runtime, preset="child", parent=parent.id)
             text = prompt.instructions(child)
-            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with mail.send('eng-{parent.id}', text).", text)
+            self.assertIn(f"Your agent id is eng-{child.id}; your parent agent is eng-{parent.id}.\n\nMessages from your parent define your task. Report to your parent with agents.message(agent_id='eng-{parent.id}', message=text).", text)
+            self.assertNotIn("mail.", text)
             self.assertIn("You were spawned by another Engineer. Own the bounded assignment in the parent message.", text)
             for forbidden in ["human.", "archive()", "agents.spawn_new_engineer(*", "## Diagrams",
                               "agents.spawn_user_owned_engineer", "Engineers the user manages"]:
@@ -259,13 +262,14 @@ class Instructions(unittest.TestCase):
             self.assertIn(
                 f"Your agent id is adv-{advisor.id}; your parent agent is eng-{parent.id}."
                 "\n\nMessages from your parent define your task. Report to your parent with "
-                f"mail.send('eng-{parent.id}', text)."
-                f"\n\nComplete your independent analysis and send it to your parent with mail.send('eng-{parent.id}', text). "
+                f"agents.message(agent_id='eng-{parent.id}', message=text)."
+                f"\n\nComplete your independent analysis and send it to your parent with agents.message(agent_id='eng-{parent.id}', message=text). "
                 "Ask a known agent for context the same way, and end your turn when blocked on a reply.\n",
                 text,
             )
             self.assertIn("[message from <agent id>]", text)
-            self.assertEqual(text.count("the user can read it one level down and never gets a card from it."), 1)
+            self.assertIn("Reply with `agents.message(agent_id=sender, message=text)`", text)
+            self.assertNotIn("mail.", text)
             self.assertNotIn("agents.spawn_user_owned_engineer", text)
 
     def test_only_agents_the_user_manages_may_start_engineers_for_the_user(self):

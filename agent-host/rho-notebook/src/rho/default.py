@@ -9,7 +9,7 @@ import traceback
 
 import _rho
 
-from . import agents, hooks, mail, prompt, skills, tools, workset
+from . import agents, chat, hooks, prompt, skills, tools, workset
 
 #: Seconds before a failed delivery is tried again.
 RETRY_SECONDS = 5
@@ -23,7 +23,7 @@ def install() -> None:
     hooks.deliver = deliver
     workset.namespace["rho"] = sys.modules["rho"]
     workset.namespace["new_agent"] = new_agent
-    workset.namespace["join"] = mail.join
+    workset.namespace["join"] = chat.join
 
 
 def on_notebook(agent, ns) -> None:
@@ -44,7 +44,7 @@ def on_turn_end(agent, outcome) -> None:
     it has to say it sends itself."""
     parent = agent.props.get("parent")
     if outcome["reason"] == "failed" and parent is not None:
-        mail.send(agent.id, prompt.label(parent), f"Agent hit an error and stopped: {outcome['error']}")
+        chat.message_agent(agent.id, parent, f"Agent hit an error and stopped: {outcome['error']}")
 
 
 async def deliver(agent) -> None:
@@ -60,12 +60,12 @@ async def deliver(agent) -> None:
         try:
             if after is None:
                 after = _rho.delivered(agent.id)
-            if after == 0 and (origin := mail.origin_message(agent.props)) is not None:
-                record = mail.message(origin)
+            if after == 0 and (origin := chat.origin_message(agent.props)) is not None:
+                record = chat.message(origin)
                 await hand(agent, record)
                 after = record["id"]
             while True:
-                for record in await mail.inbox(agent.id, after):
+                for record in await chat.inbox(agent.id, after):
                     await hand(agent, record)
                     after = record["id"]
         except Exception:
@@ -76,40 +76,38 @@ async def deliver(agent) -> None:
 
 async def hand(agent, record: dict) -> None:
     """Hand one message to the agent. It first joins the message's thread if
-    the mail is its origin, or if the user addressed it. Direct agent mail
-    is tool input and does not join the recipient to a thread."""
-    origin = record["id"] == mail.origin_message(agent.props)
-    by_user = record["sender"] == mail.USER and any(address == agent.id for address, _ in record["mentions"])
-    if origin or by_user:
-        mail.join(mail.thread_of(record), agent.id)
-    role = "user" if record["sender"] == mail.USER else "tool"
+    the message is its origin. Another agent's words are tool input and do
+    not join the recipient to a thread."""
+    if record["id"] == chat.origin_message(agent.props):
+        chat.join(chat.thread_of(record), agent.id)
+    role = "user" if record["sender"] == chat.USER else "tool"
     await asyncio.to_thread(agent.input, render(record), role=role, message=record["id"])
 
 
 def render(record: dict) -> str:
     """A message as an agent reads it: where it is first, so the model knows
     where to answer."""
-    head = mail.thread(mail.thread_of(record))
+    head = chat.thread(chat.thread_of(record))
     sender = record["sender"]
-    who = "the user" if sender == mail.USER else ("the system bot" if sender == "system" else prompt.label(sender))
-    if any(kind == "direct" for _, kind in record["mentions"]):
-        return f"[message from {who}]\n{record['text']}\n\n{tools.where(head)} · mail #{record['id']}"
-    return f"{tools.where(head)} Mail from {who}:\n{record['text']}"
+    who = "the user" if sender == chat.USER else ("the system bot" if sender == "system" else prompt.label(sender))
+    if record["voice"] == "agent":
+        return f"[message from {who}]\n{record['text']}\n\n{tools.where(head)} · message #{record['id']}"
+    return f"{tools.where(head)} Message from {who}:\n{record['text']}"
 
 
 def new_agent(*, repo: str | None = None, rev: str = "", cwd: str | None = None, runtime: dict, preset: str = "engineer", origin: str | None = None) -> str:
     """Create an agent the user manages; returns its id. With `repo`, clone
     it at `rev` into the workset as the directory its URL names, and work
     there; otherwise work in `cwd`, or the workset's root. With `origin`,
-    the agent joins that mail's thread and starts
+    the agent joins that message's thread and starts
     from it."""
     if preset not in ("engineer", "advisor"):
         raise ValueError(f'preset is "engineer" or "advisor", not {preset!r}')
     props = {"preset": preset}
     if origin is not None:
-        props[mail.ORIGIN] = origin
-        message = mail.origin_message(props)
-        if mail.message(message) is None:
+        props[chat.ORIGIN] = origin
+        message = chat.origin_message(props)
+        if chat.message(message) is None:
             raise ValueError(f"no message {message} for origin {origin}")
     if repo is not None:
         if cwd is not None:

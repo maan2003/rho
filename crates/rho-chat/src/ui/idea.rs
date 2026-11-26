@@ -27,7 +27,7 @@ use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use super::ChatSystem;
-use super::projects::{NewProject, ProjectCreated, runtime_candidates};
+use super::projects::{NewProject, ProjectCreated, runtime_choices};
 use crate::ThreadId;
 use crate::cache::IdeaDraft;
 
@@ -485,12 +485,25 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
         choose_project(chat, Intent::Send, frame, window, cx);
         return;
     };
-    let runtime = match runtime.as_deref().map(RuntimeLabel::parse).transpose() {
-        Ok(runtime) => runtime,
-        Err(reason) => {
-            frame.echo(&reason, StyleClass::SystemImportant, cx);
-            return;
+    let runtime = match runtime.as_deref() {
+        Some(text) => {
+            let Some(catalogue) = chat.read(cx).runtime_catalogue(project.thread.host) else {
+                frame.echo(
+                    "the project's host is not attached",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            };
+            match catalogue.label(text) {
+                Ok(runtime) => Some(runtime),
+                Err(reason) => {
+                    frame.echo(&reason, StyleClass::SystemImportant, cx);
+                    return;
+                }
+            }
         }
+        None => None,
     };
     let echo = format!("queued for {}: {}", project.name, first_line(&text));
     chat.update(cx, |chat, cx| {
@@ -553,17 +566,34 @@ fn choose_runtime(
     if !in_view(frame) {
         return;
     }
-    let project = chat
-        .read(cx)
-        .resolved_idea_project()
-        .and_then(|project| project.runtime);
+    let (catalogue, project) = {
+        let chat = chat.read(cx);
+        let Some(resolved) = chat.resolved_idea_project() else {
+            frame.echo("to: choose a project first", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let Some(catalogue) = chat.runtime_catalogue(resolved.thread.host) else {
+            frame.echo(
+                "the project's host is not attached",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        (catalogue, resolved.runtime)
+    };
+    let choices = catalogue.clone();
     frame.open_prompt(
         "on:",
         Rc::new(move |_, needle, _| {
-            runtime_candidates(needle, project.as_ref().map(|label| (label, "project")))
+            runtime_choices(
+                &choices,
+                needle,
+                project.as_ref().map(|label| (label, "project")),
+            )
         }),
         Rc::new(
-            move |frame, input, window, cx| match RuntimeLabel::parse(&input) {
+            move |frame, input, window, cx| match catalogue.label(&input) {
                 Ok(runtime) => set_runtime(&chat, runtime, window, cx),
                 Err(reason) => frame.echo(&reason, StyleClass::SystemImportant, cx),
             },
@@ -832,12 +862,11 @@ impl Render for IdeaView {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use rho_agent_hosts::{HostId, Link};
     use rho_agent_types::{
         Address as Party, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId,
-        MessageKind, ProjectConfig, ProjectId, ProjectMode, ProjectPlace, UnixMs,
+        ProjectConfig, ProjectId, ProjectMode, ProjectPlace, RuntimeCatalogue, RuntimeChoice,
+        RuntimeKind, UnixMs, Voice,
     };
     use rho_frame::System as _;
 
@@ -852,12 +881,11 @@ mod tests {
             seq: ChatSeq(seq),
             at: UnixMs(seq),
             event: ChatEvent::Posted {
-                kind: MessageKind::Kept,
                 parent: parent.map(|parent| MessageId(ChatSeq(parent))),
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from: Party::User,
-                mentions: Vec::new(),
+                voice: Voice::Message,
                 content: vec![ContentPart::Text { text: text.into() }],
             },
         }
@@ -884,24 +912,37 @@ mod tests {
         log
     }
 
-    fn attach(chat: &Entity<ChatSystem>, projects: &[(u64, &str)], cx: &mut App) {
-        let settings: HashMap<_, _> = projects
-            .iter()
-            .map(|&(root, runtime)| {
-                (
-                    ProjectId(MessageId(ChatSeq(root))),
-                    ProjectConfig {
-                        place: ProjectPlace::parse("/srv/lab").unwrap(),
-                        mode: ProjectMode::One,
-                        runtime: RuntimeLabel::parse(runtime).unwrap(),
-                    },
-                )
-            })
-            .collect();
+    fn attach_with(
+        chat: &Entity<ChatSystem>,
+        projects: &[(u64, &str)],
+        runtimes: RuntimeCatalogue,
+        cx: &mut App,
+    ) {
         chat.update(cx, |chat, cx| {
             chat.streams(HostId(0), "lab", Some(LAB), &Link::detached(), cx);
-            chat.settings.insert(LAB, settings);
+            chat.runtimes.insert(LAB, runtimes);
+            let log = chat.logs.entry(LAB).or_default();
+            let mut seq = log.head.0;
+            for &(root, runtime) in projects {
+                seq += 1;
+                log.tell(&ChatRecord {
+                    seq: ChatSeq(seq),
+                    at: UnixMs(seq),
+                    event: ChatEvent::Project {
+                        project: ProjectId(MessageId(ChatSeq(root))),
+                        config: ProjectConfig {
+                            place: ProjectPlace::parse("/srv/lab").unwrap(),
+                            mode: ProjectMode::One,
+                            runtime: RuntimeLabel::parse(runtime).unwrap(),
+                        },
+                    },
+                });
+            }
         });
+    }
+
+    fn attach(chat: &Entity<ChatSystem>, projects: &[(u64, &str)], cx: &mut App) {
+        attach_with(chat, projects, RuntimeCatalogue::host(), cx);
     }
 
     fn init(
@@ -1208,7 +1249,7 @@ mod tests {
     fn creating_a_project_keeps_the_intent_of_the_address_prompt(cx: &mut gpui::TestAppContext) {
         let (window, chat, _db) = init(cx);
         let text = "Half a thought, not ready";
-        for (intent, root, name) in [(Intent::Address, 4, "skiff"), (Intent::Send, 5, "stern")] {
+        for (intent, name) in [(Intent::Address, "skiff"), (Intent::Send, "stern")] {
             let new = format!("{name}@lab");
             cx.dispatch_action(window.into(), keys::PromptIdea);
             cx.run_until_parked();
@@ -1248,7 +1289,8 @@ mod tests {
             cx.run_until_parked();
 
             // The host makes the project; what was waiting for it runs.
-            cx.update(|cx| {
+            let root = cx.update(|cx| {
+                let root = chat.read(cx).host_chat(LAB).unwrap().head.0 + 1;
                 let created = when_created(chat.clone(), intent, cx);
                 chat.update(cx, |chat, _| {
                     chat.logs
@@ -1257,10 +1299,9 @@ mod tests {
                         .tell(&posted(root, None, name));
                     chat.creating_projects.push((thread(root), Some(created)));
                 });
-                let mut projects: Vec<_> = (1..=root).map(|root| (root, "haiku-max")).collect();
-                projects.retain(|&(root, _)| root != 3);
-                attach(&chat, &projects, cx);
+                attach(&chat, &[(root, "haiku-max")], cx);
                 chat.update(cx, |chat, cx| chat.finish_project_creation(cx));
+                root
             });
             cx.run_until_parked();
             window
@@ -1291,5 +1332,112 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[gpui::test]
+    fn the_on_line_offers_and_accepts_only_the_hosts_runtimes(cx: &mut gpui::TestAppContext) {
+        let mut catalogue = RuntimeCatalogue::host();
+        catalogue
+            .choices
+            .retain(|choice| choice.label.as_str() != "sol-low");
+        let packed = senax_encoder::pack(&"nova-high".to_owned()).unwrap();
+        let host_only = senax_encoder::unpack::<RuntimeLabel>(&mut packed.as_ref()).unwrap();
+        catalogue.choices.push(RuntimeChoice {
+            label: host_only.clone(),
+            kind: RuntimeKind::Rho,
+            usual: false,
+        });
+        let db = rho_db::RhoDb::in_memory();
+        let (window, chat) = fixture_on(cx, lab(), db);
+        cx.update(|cx| attach_with(&chat, &[(1, "haiku-max")], catalogue, cx));
+
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread(3).address(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                let runtime = view(&chat, cx).read(cx).runtime.focus_handle(cx);
+                window.focus(&runtime, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), ChooseRuntime);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, window, cx| {
+                let prompt = frame.minibuffer_mut().expect("on: is asked");
+                assert_eq!(prompt.prompt(), "on:");
+                assert_eq!(
+                    prompt
+                        .selected_candidate()
+                        .map(|(candidate, _)| (candidate.value, candidate.description)),
+                    Some(("haiku-max".into(), "project".into()))
+                );
+                prompt.set_input("sol-low".into(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, window, cx| {
+                let prompt = frame.minibuffer_mut().expect("on: is asked");
+                assert_eq!(prompt.selected_candidate(), None);
+                prompt.set_input("nova-".into(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, _| {
+                let prompt = frame.minibuffer_mut().expect("on: is asked");
+                assert_eq!(
+                    prompt
+                        .selected_candidate()
+                        .map(|(candidate, _)| candidate.value),
+                    Some("nova-high".into())
+                );
+            })
+            .unwrap();
+        cx.dispatch_action(window.into(), keys::MinibufferConfirm);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(chat.read(cx).idea.runtime.as_deref(), Some("nova-high"));
+        });
+
+        // A runtime absent from the host's catalogue is refused on send.
+        window
+            .update(cx, |_, window, cx| {
+                let runtime = view(&chat, cx).read(cx).runtime.clone();
+                runtime.update(cx, |line, cx| line.set_text("sol-low", window, cx));
+                write(&chat, "Test host-only catalogue", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), SendIdea);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, cx| {
+                assert_eq!(frame.current_address(), &address());
+                assert!(chat.read(cx).outbox.ideas().next().is_none());
+            })
+            .unwrap();
+
+        // The host-only runtime is accepted on send.
+        window
+            .update(cx, |_, window, cx| {
+                let runtime = view(&chat, cx).read(cx).runtime.clone();
+                runtime.update(cx, |line, cx| line.set_text("nova-high", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), SendIdea);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let (_, _, sent) = chat.read(cx).outbox.ideas().next().expect("idea queued");
+            assert_eq!(sent.runtime, Some(host_only));
+        });
     }
 }

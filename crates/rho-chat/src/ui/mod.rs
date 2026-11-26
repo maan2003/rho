@@ -29,7 +29,7 @@ use projects::ProjectCreated;
 use rho_agent_hosts::{HostId, HostStream, Link};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
-    MessageVersion, ProjectConfig, ProjectId, ThreadWork, UnixMs,
+    MessageVersion, ProjectId, ThreadWork, UnixMs,
 };
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
@@ -109,7 +109,8 @@ pub struct ChatSystem {
     outbox: Outbox,
     /// Each project being created, and the idea waiting to address it.
     creating_projects: Vec<(ThreadId, Option<ProjectCreated>)>,
-    settings: HashMap<EndpointId, HashMap<ProjectId, ProjectConfig>>,
+    /// The runtimes each host offers, as its last session said.
+    runtimes: HashMap<EndpointId, rho_agent_types::RuntimeCatalogue>,
     known_places: projects::KnownPlaces,
     last_project: Option<ThreadId>,
     drafts: TextIndex<(EndpointId, Option<MessageId>)>,
@@ -186,7 +187,7 @@ impl ChatSystem {
             cursors: Cursors::new(loaded.cursors),
             outbox,
             creating_projects: Vec::new(),
-            settings: HashMap::new(),
+            runtimes: HashMap::new(),
             known_places: Rc::new(|_, _| Vec::new()),
             last_project: loaded.last_project,
             drafts,
@@ -288,13 +289,15 @@ impl ChatSystem {
             };
             let current = match mail.revision {
                 Revision::Original => version.unwrap_or(id.0) == id.0,
-                Revision::Edited { seq, .. } => version == Some(seq),
+                Revision::Edited { seq, .. } | Revision::Recovered { seq, .. } => {
+                    version == Some(seq)
+                }
                 Revision::TakenBack { .. } | Revision::Deleted => false,
             };
             if current {
                 result.insert(
                     (id, version),
-                    WrittenMail::from_content(mail.from, &mail.mentions, &mail.content),
+                    WrittenMail::from_content(mail.from, mail.voice, &mail.content),
                 );
             } else if let Some(version) = version {
                 historical.insert((id, version));
@@ -369,13 +372,14 @@ impl ChatSystem {
                 host,
                 endpoint,
                 fresh,
+                runtimes,
                 ..
             } => {
                 if let Some(slot) = self.hosts.get_mut(&host) {
                     slot.endpoint = Some(endpoint);
                 }
+                self.runtimes.insert(endpoint, runtimes);
                 if fresh {
-                    self.settings.remove(&endpoint);
                     self.cache.reset(endpoint);
                     self.logs.insert(endpoint, HostChat::default());
                 }
@@ -402,14 +406,6 @@ impl ChatSystem {
             MailEvent::Work { host, threads } => {
                 if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
                     self.logs.entry(endpoint).or_default().set_work(threads);
-                    self.changed(endpoint, cx);
-                }
-            }
-            MailEvent::Projects { host, configured } => {
-                if let Some(endpoint) = self.hosts.get(&host).and_then(|slot| slot.endpoint) {
-                    self.settings
-                        .insert(endpoint, configured.into_iter().collect());
-                    self.finish_project_creation(cx);
                     self.changed(endpoint, cx);
                 }
             }
@@ -468,7 +464,7 @@ impl ChatSystem {
                 None => chat
                     .reading_order(thread.message)
                     .filter(|mail| {
-                        mail.kind == rho_agent_types::MessageKind::Kept
+                        mail.voice == rho_agent_types::Voice::Message
                             && mail.revision != rho_agent_types::Revision::Deleted
                     })
                     .last(),
@@ -508,7 +504,6 @@ impl ChatSystem {
                 parent,
                 failed_start,
                 settles,
-                mentions: Vec::new(),
                 content: vec![ContentPart::Text { text }],
                 delivery,
                 runtime: None,
@@ -561,9 +556,7 @@ impl ChatSystem {
         Some(IdeaProject {
             thread: project,
             name,
-            runtime: self
-                .project_config(project)
-                .map(|config| config.runtime.clone()),
+            runtime: self.project_config(project).map(|config| config.runtime),
         })
     }
 
@@ -629,7 +622,6 @@ impl ChatSystem {
             parent: Some(project.message),
             failed_start: None,
             settles: None,
-            mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: mail.text.trim().to_owned(),
             }],
@@ -709,7 +701,6 @@ impl ChatSystem {
                         client_id,
                         parent: outgoing.parent,
                         settles: outgoing.settles,
-                        mentions: outgoing.mentions,
                         content: outgoing.content,
                     },
                 )
@@ -906,7 +897,7 @@ impl System for ChatSystem {
             return;
         };
         self.logs.remove(&endpoint);
-        self.settings.remove(&endpoint);
+        self.runtimes.remove(&endpoint);
         self.creating_projects
             .retain(|(creation, _)| creation.host != endpoint);
         self.cursors.reset(endpoint);
@@ -1211,6 +1202,8 @@ pub(crate) fn ago(at_ms: u64, now: Timestamp) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::Voice;
+
     use super::*;
 
     #[gpui::test]
@@ -1222,17 +1215,17 @@ mod tests {
             seq: project.0,
             at: UnixMs(1),
             event: rho_agent_types::ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from: Party::User,
-                mentions: vec![],
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: "tide".into(),
                 }],
             },
         });
+        log.tell(&project_record(ChatSeq(2), project));
         let (_, mail, _db) = search_bench::fixture(cx, log);
         let title = "Test the thermocouple offline.";
         cx.update(|cx| {
@@ -1280,12 +1273,11 @@ mod tests {
                         seq: posted.0,
                         at: UnixMs(12),
                         event: rho_agent_types::ChatEvent::Posted {
-                            kind: rho_agent_types::MessageKind::Kept,
                             parent: Some(project),
-                            reply_to: None,
+                            retry_of: None,
                             thread_reply: None,
                             from: Party::User,
-                            mentions: vec![],
+                            voice: Voice::Message,
                             content: post.content,
                         },
                     });
@@ -1316,17 +1308,17 @@ mod tests {
             seq: project.0,
             at: UnixMs(1),
             event: rho_agent_types::ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from: Party::User,
-                mentions: vec![],
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: "tide".into(),
                 }],
             },
         });
+        log.tell(&project_record(ChatSeq(2), project));
         let (_, mail, _db) = search_bench::fixture(cx, log);
         let title = "Test the thermocouple on sol-high.";
         let id = PendingIdeaId(78);
@@ -1375,7 +1367,7 @@ mod tests {
     fn queuing_a_reply_settles_the_thread_through_what_it_saw_on_this_device(
         cx: &mut gpui::TestAppContext,
     ) {
-        use rho_agent_types::{ChatEvent, ChatRecord, Mention};
+        use rho_agent_types::{ChatEvent, ChatRecord};
         let host = EndpointId([3; 32]);
         let thread = ThreadId {
             host,
@@ -1390,44 +1382,30 @@ mod tests {
         };
         let third = MessageId(ChatSeq(6));
         let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let record = |id: MessageId, from: Party, parent, thread_reply, mentions| ChatRecord {
+        let record = |id: MessageId, from: Party, parent, thread_reply| ChatRecord {
             seq: id.0,
             at: UnixMs(id.0.0),
             event: ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent,
-                reply_to: None,
+                retry_of: None,
                 thread_reply,
                 from,
-                mentions,
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: format!("Mail #{}", id.0.0),
                 }],
             },
         };
         let mut log = HostChat::default();
-        log.tell(&record(
-            MessageId(ChatSeq(1)),
-            Party::User,
-            None,
-            None,
-            vec![],
-        ));
+        log.tell(&record(MessageId(ChatSeq(1)), Party::User, None, None));
         log.tell(&record(
             thread.message,
             Party::User,
             Some(MessageId(ChatSeq(1))),
             None,
-            vec![],
         ));
         for id in [first, second] {
-            log.tell(&record(
-                id,
-                Party::Agent(agent),
-                Some(thread.message),
-                None,
-                vec![Mention::User { ping: true }],
-            ));
+            log.tell(&record(id, Party::Agent(agent), Some(thread.message), None));
         }
         let (_, mail, _db) = search_bench::fixture(cx, log);
         cx.update(|cx| {
@@ -1480,7 +1458,6 @@ mod tests {
                     Some(rho_agent_types::ThreadReply {
                         settles: Some(read),
                     }),
-                    vec![],
                 ));
                 mail.finish_posted(host, cx);
                 assert_eq!(dealt(mail, cx), None);
@@ -1491,7 +1468,6 @@ mod tests {
                     Party::Agent(agent),
                     Some(thread.message),
                     None,
-                    vec![Mention::User { ping: true }],
                 ));
                 assert_eq!(
                     dealt(mail, cx),
@@ -1499,6 +1475,21 @@ mod tests {
                 );
             })
         });
+    }
+
+    fn project_record(seq: ChatSeq, root: MessageId) -> rho_agent_types::ChatRecord {
+        rho_agent_types::ChatRecord {
+            seq,
+            at: UnixMs(seq.0),
+            event: rho_agent_types::ChatEvent::Project {
+                project: rho_agent_types::ProjectId(root),
+                config: rho_agent_types::ProjectConfig {
+                    place: rho_agent_types::ProjectPlace::parse("~/src/tide").unwrap(),
+                    mode: rho_agent_types::ProjectMode::One,
+                    runtime: rho_agent_types::RuntimeLabel::default(),
+                },
+            },
+        }
     }
 
     #[test]

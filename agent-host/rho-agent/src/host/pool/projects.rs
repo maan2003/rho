@@ -8,22 +8,20 @@ use std::sync::Arc;
 use anyhow::{Context as _, anyhow, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent_types::{
-    Address, ContentPart, Mention, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
-    ProjectName, ProjectPlace, RuntimeLabel, UnixMs, WorksetKind, one_line,
+    Address, AgentId, ContentPart, MessageId, ProjectChange, ProjectConfig, ProjectId, ProjectMode,
+    ProjectName, ProjectPlace, RuntimeLabel, UnixMs, Voice, WorksetKind, one_line,
 };
 use rho_agents_client::protocol::snippets::{self, Function};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 
 use super::AgentPool;
 use crate::store::{
-    MailRead as _, MailWrite as _, NewMessage, ProjectRead as _, ProjectSettings,
-    ProjectWrite as _, Routing, StoreRead as _,
+    MailRead as _, MailWrite as _, NewMessage, ProjectRead as _, ProjectWrite as _, StoreRead as _,
 };
 
 #[derive(Default)]
 pub(super) struct Projects {
     gates: std::sync::Mutex<HashMap<ProjectId, Arc<Mutex<()>>>>,
-    changed: watch::Sender<()>,
 }
 
 impl Projects {
@@ -55,132 +53,75 @@ pub struct ProjectIdea {
 }
 
 impl AgentPool {
-    pub fn watch_projects(&self) -> watch::Receiver<()> {
-        self.projects.changed.subscribe()
-    }
-
-    /// One-time conversion of the old rule, using the newest agent only
-    /// here. A place no running or persisted agent can tell us is left
-    /// unconfigured, so a device can import the former answer or the user
-    /// can give one. Neither mail nor agent state is rewritten.
-    pub(super) async fn init_projects(&self) {
-        let read = self.db.read();
-        if read.has_project_settings() {
-            return;
-        }
-        let mut latest = HashMap::new();
-        let agents = read.agents();
-        let repositories: HashMap<_, _> = agents
-            .iter()
-            .filter_map(|(_, head)| {
-                let cwd = head.spec.props.get("cwd")?;
-                let repo = head.spec.props.get("repo")?;
-                Some(((head.workset, cwd.as_str()), repo.as_str()))
-            })
-            .collect();
-        for (agent, head) in &agents {
-            let Some((project, place)) = (|| {
-                let origin = head
-                    .spec
-                    .props
-                    .get("origin")?
-                    .strip_prefix("chat:")?
-                    .parse()
-                    .ok()?;
-                let project = ProjectId(read.root_of(MessageId(rho_agent_types::ChatSeq(origin)))?);
-                if !read.is_project(project) {
-                    return None;
-                }
-                let workset = read.workset(head.workset)?;
-                let place = match workset.kind {
-                    WorksetKind::Host { cwd } => ProjectPlace::parse(
-                        head.spec
-                            .props
-                            .get("cwd")
-                            .map_or(cwd.as_str(), String::as_str),
-                    )
-                    .ok(),
-                    // Relative host paths cannot be reconstructed; preserve
-                    // their old workset rather than invent a new target.
-                    WorksetKind::Isolated => {
-                        let repo =
-                            head.spec
-                                .props
-                                .get("repo")
-                                .map(String::as_str)
-                                .or_else(|| {
-                                    head.spec.props.get("cwd").and_then(|cwd| {
-                                        repositories.get(&(head.workset, cwd.as_str())).copied()
-                                    })
-                                })?;
-                        let place = ProjectPlace::parse(repo).ok()?;
-                        if place.is_repository() {
-                            Some(place)
-                        } else if Utf8Path::new(repo).is_absolute() {
-                            // A legacy 'repository (url or path)' can be
-                            // described losslessly
-                            // by a file URL, not as a working directory.
-                            let url = url::Url::from_file_path(repo).ok()?;
-                            ProjectPlace::parse(url.as_str()).ok()
-                        } else {
-                            None
-                        }
-                    }
-                }?;
-                Some((project, place))
-            })() else {
-                continue;
-            };
-            latest
-                .entry(project)
-                .and_modify(|held: &mut (_, _, _)| {
-                    if (head.created_at, *agent) > (held.0, held.1) {
-                        *held = (head.created_at, *agent, place.clone());
-                    }
-                })
-                .or_insert((head.created_at, *agent, place));
-        }
-        drop(read);
-        let mut write = self.db.write().await;
-        write.init_project_tables();
-        for (project, (_, agent, place)) in latest {
-            write.set_project_settings(
-                project,
-                &ProjectSettings {
-                    place,
-                    routing: Routing::One { agent: Some(agent) },
-                    runtime: RuntimeLabel::default(),
-                },
-            );
-        }
-        write.commit();
-    }
-
+    /// A project the user names, at a place, in a mode and on a runtime.
+    /// Asking again for the same project with the same settings is the
+    /// same project.
     pub async fn create_project(
         &self,
         name: ProjectName,
         config: ProjectConfig,
+    ) -> anyhow::Result<ProjectId> {
+        let id = self
+            .make_project(Address::User, name, config, |held, config| held == config)
+            .await?;
+        Ok(id)
+    }
+
+    /// A project an agent starts a thread in. It works where the agent
+    /// works, so it is never without a place; an existing project of that
+    /// name is that project.
+    pub(super) async fn agent_project(
+        &self,
+        agent: AgentId,
+        name: ProjectName,
+    ) -> anyhow::Result<ProjectId> {
+        let head = self.db.read().agent(agent).context("agent was deleted")?;
+        let props = &head.spec.props;
+        let place = props
+            .get("repo")
+            .or_else(|| props.get("cwd"))
+            .context("the agent has no place to give its project")?;
+        let runtime = RuntimeLabel::parse(&format!(
+            "{}-{}",
+            head.spec.runtime.model_name(),
+            head.spec.runtime.effort_name()
+        ))
+        .unwrap_or_default();
+        let config = ProjectConfig {
+            place: ProjectPlace::parse(place).map_err(|error| anyhow!("{error}"))?,
+            mode: ProjectMode::One,
+            runtime,
+        };
+        self.make_project(Address::Agent(agent), name, config, |_, _| true)
+            .await
+    }
+
+    async fn make_project(
+        &self,
+        from: Address,
+        name: ProjectName,
+        config: ProjectConfig,
+        same: impl FnOnce(&ProjectConfig, &ProjectConfig) -> bool,
     ) -> anyhow::Result<ProjectId> {
         let mut write = self.db.write().await;
         let read = self.db.read();
         if let Some(root) = read.project_named(name.as_str()) {
             let id = ProjectId(root);
             ensure!(
-                read.project_settings(id)
-                    .is_some_and(|held| held.config() == config),
+                read.project(id).is_some_and(|held| same(&held, &config)),
                 "project {} already exists",
                 name.as_str()
             );
             return Ok(id);
         }
         drop(read);
+        let at = UnixMs::now();
         let root = write.post(
-            UnixMs::now(),
+            at,
             None,
             NewMessage {
-                from: Address::User,
-                reply_to: None,
-                mentions: Vec::new(),
+                from,
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: name.as_str().to_owned(),
                 }],
@@ -188,59 +129,48 @@ impl AgentPool {
             None,
         )?;
         let id = ProjectId(root);
-        write.set_project_settings(id, &ProjectSettings::new(config));
+        write.set_project(at, id, config);
         write.commit();
-        self.projects.changed.send_replace(());
         Ok(id)
     }
 
-    /// Does not overwrite a host-owned setting with an old device copy.
     pub async fn change_project(&self, id: ProjectId, change: ProjectChange) -> anyhow::Result<()> {
         let _gate = self.projects.lock(id).await;
         let mut write = self.db.write().await;
-        let read = self.db.read();
-        ensure!(read.is_project(id), "no such project on this host");
-        let held = read.project_settings(id);
-        let settings = match (change, held.as_ref()) {
-            (ProjectChange::Place(place), Some(held)) => {
-                if held.place == place {
-                    return Ok(());
-                }
-                ProjectSettings::new(ProjectConfig {
+        let held = self
+            .db
+            .read()
+            .project(id)
+            .context("no such project on this host")?;
+        let config = match change {
+            // A new place or mode needs a new agent; the runtime is a
+            // default for the next new agent, not a change to one running.
+            ProjectChange::Place(place) => {
+                write.clear_standing_agent(id);
+                ProjectConfig {
                     place,
-                    ..held.config()
-                })
-            }
-            // The legacy workflow had one shared destination. Setting its
-            // previously unknown place is the only missing answer.
-            (ProjectChange::Place(place), None) => ProjectSettings::new(ProjectConfig {
-                place,
-                mode: ProjectMode::One,
-                runtime: RuntimeLabel::default(),
-            }),
-            (ProjectChange::Mode(mode), Some(held)) => {
-                let config = held.config();
-                if config.mode == mode {
-                    return Ok(());
-                }
-                ProjectSettings::new(ProjectConfig { mode, ..config })
-            }
-            (ProjectChange::Runtime(runtime), Some(held)) => {
-                if held.runtime == runtime {
-                    return Ok(());
-                }
-                // This is a default for new agents, not a change to the
-                // running agent or the project's standing identity.
-                ProjectSettings {
-                    runtime,
                     ..held.clone()
                 }
             }
-            (_, None) => anyhow::bail!("set where this project works first"),
+            ProjectChange::Mode(mode) => {
+                if mode != held.mode {
+                    write.clear_standing_agent(id);
+                }
+                ProjectConfig {
+                    mode,
+                    ..held.clone()
+                }
+            }
+            ProjectChange::Runtime(runtime) => ProjectConfig {
+                runtime,
+                ..held.clone()
+            },
         };
-        write.set_project_settings(id, &settings);
+        if config == held {
+            return Ok(());
+        }
+        write.set_project(UnixMs::now(), id, config);
         write.commit();
-        self.projects.changed.send_replace(());
         Ok(())
     }
 
@@ -249,38 +179,37 @@ impl AgentPool {
         idea: ProjectIdea,
     ) -> anyhow::Result<ProjectIdeaResult> {
         let _gate = self.projects.lock(idea.project).await;
-        let (settings, posted, standing) = {
+        let (config, posted, standing) = {
             let read = self.db.read();
-            ensure!(
-                read.is_project(idea.project),
-                "no such project on this host"
-            );
+            let config = read
+                .project(idea.project)
+                .context("no such project on this host")?;
             ensure!(
                 read.root_of(idea.parent) == Some(idea.project.0),
                 "idea is not under this project"
             );
             if let Some(target) = idea.failed_start {
                 ensure!(
-                    read.message(target).is_some_and(|mail| {
-                        mail.from == Address::StartFailed && read.mail_thread(&mail) == idea.parent
+                    read.message(target).is_some_and(|failed| {
+                        failed.from == Address::StartFailed
+                            && read.mail_thread(&failed) == idea.parent
                     }),
-                    "the mail being retried is not a failed start in this thread"
+                    "the message being retried is not a failed start in this thread"
                 );
             }
-            let settings = read.project_settings(idea.project);
             let posted = read.posted_by_client(idea.client_id);
             if let Some(message) = posted
                 && read.project_start_complete(message)
             {
                 return Ok(ProjectIdeaResult::Posted(message));
             }
-            let standing = match settings.as_ref().map(|s| &s.routing) {
-                Some(Routing::One { agent: Some(agent) }) if posted.is_none() => {
-                    read.agent(*agent).map(|head| (*agent, head))
-                }
+            let standing = match config.mode {
+                ProjectMode::One if posted.is_none() => read
+                    .standing_agent(idea.project)
+                    .and_then(|agent| read.agent(agent).map(|head| (agent, head))),
                 _ => None,
             };
-            (settings, posted, standing)
+            (config, posted, standing)
         };
         if let (Some((agent, head)), Some(runtime)) = (&standing, &idea.runtime)
             && (
@@ -309,20 +238,24 @@ impl AgentPool {
             message
         } else {
             let mut write = self.db.write().await;
-            let message = write.post(
-                UnixMs::now(),
-                Some(idea.parent),
-                NewMessage {
-                    from: Address::User,
-                    reply_to: idea.failed_start,
-                    // Direct routing wakes only the standing agent. The idea
-                    // is still human-authored project mail.
-                    mentions: standing.into_iter().map(Mention::Direct).collect(),
-                    content: idea.content,
-                },
-                Some(idea.client_id),
+            let at = UnixMs::now();
+            let message = write.post_idea(
+                at,
+                idea.parent,
+                idea.failed_start,
+                idea.content,
+                idea.client_id,
             )?;
-            if standing.is_some() {
+            if let Some(agent) = standing {
+                // The standing agent works in the idea's thread from now
+                // on, and reads the idea that started it.
+                let thread = if idea.failed_start.is_some() {
+                    idea.parent
+                } else {
+                    message
+                };
+                write.join(at, thread, agent)?;
+                write.deliver(agent, message);
                 write.complete_project_start(message);
             }
             write.commit();
@@ -344,28 +277,22 @@ impl AgentPool {
         // first, then the words of the retry; neither is rewritten.
         let origin = idea.failed_start.map_or(message, |_| idea.parent);
         let result = self
-            .start_project_agent(origin, settings.as_ref(), idea.runtime.as_ref(), resumed)
+            .start_project_agent(origin, &config, idea.runtime.as_ref(), resumed)
             .await;
         let mut write = self.db.write().await;
         match result {
             Ok(agent) => {
                 if origin != message {
-                    write.deliver_project_retry(agent, message);
+                    write.deliver(agent, message);
                 }
-                if let Some(mut settings) = settings
-                    && matches!(settings.routing, Routing::One { .. })
-                {
-                    settings.routing = Routing::One { agent: Some(agent) };
-                    write.set_project_settings(idea.project, &settings);
+                if config.mode == ProjectMode::One {
+                    write.set_standing_agent(idea.project, agent);
                 }
             }
             Err(error) => {
-                let place = settings
-                    .as_ref()
-                    .map_or("no place set", |s| s.place.as_str());
                 self.write_start_failure(&mut write, message, format!(
-                    "failed · did not start · {place} on {}: {}\n\nreply to retry, or change where it works from the project's palette.",
-                    one_line(&idea.host_label), one_line(&format!("{error:#}")),
+                    "failed · did not start · {} on {}: {}\n\nreply to retry, or change where it works from the project's palette.",
+                    config.place.as_str(), one_line(&idea.host_label), one_line(&format!("{error:#}")),
                 ))?;
             }
         }
@@ -377,7 +304,7 @@ impl AgentPool {
     async fn start_project_agent(
         self: &Arc<Self>,
         message: MessageId,
-        settings: Option<&ProjectSettings>,
+        config: &ProjectConfig,
         runtime: Option<&RuntimeLabel>,
         resumed: bool,
     ) -> anyhow::Result<rho_agent_types::AgentId> {
@@ -394,10 +321,9 @@ impl AgentPool {
         {
             return Ok(agent);
         }
-        let settings = settings.context("the project does not have a place")?;
-        let place = &settings.place;
+        let place = &config.place;
         let function = Function::default();
-        let runtime = runtime.unwrap_or(&settings.runtime);
+        let runtime = runtime.unwrap_or(&config.runtime);
         let (kind, code) = if place.is_repository() {
             (
                 WorksetKind::Isolated,

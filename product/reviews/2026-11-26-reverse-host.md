@@ -17,7 +17,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 1. Agents still get the retired `mail` API, beside `chat`
 - **Kind:** code (zombie)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed on `loop2/wc2-kill-mail-wire-project`: no `mail` in the notebook, the IPC, the prompts or the fake model
 - **Where:** `chat.Message` (`ping`), `chat.Flash`, `chat.the last message stays live`; agent-facing Python and prompts
 - **Evidence:**
   - `agent-host/rho-notebook/src/rho/tools.py:526` gives every agent `{"mail": Mail(...), "chat": Chat(...)}`. `Chat` subclasses `Mail` (`tools.py:267`).
@@ -33,7 +33,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 2. The message model still represents the kinds the product rejected
 - **Kind:** code (structural)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed on `loop2/wc2-kill-mail-wire-project`: one `Voice` per post, `retry_of`, one-hop log migration
 - **Where:** `chat.Message`, `chat.Flash`; `rho_agent_types::chat`, `rho_chat::protocol::Post`
 - **Evidence:**
   - Whether a message deals is two fields that must agree: `MessageKind::{Kept, Flash}` and `Mention::User { ping: bool }` (`crates/rho-agent-types/src/chat.rs:78-88`, `pings_user` at `:373`). `Revised { ping: Option<bool> }` (`:168`) and `PyRequest::Edit { ping }` can switch a kept message's ping on or off. `chat.md` says "every message from the project pings the user".
@@ -60,7 +60,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 4. A project is a root message of the chat forest, and its settings live elsewhere
 - **Kind:** code (structural)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed on `loop2/wc2-kill-mail-wire-project`: `ChatEvent::Project` holds the settings; agent projects get a place
 - **Where:** `chat.Project`, `chat.Start a project`
 - **Evidence:** `ProjectId(pub MessageId)` (`project.rs:12`). `store/projects.rs:1-2` says "Names and identity still belong to the roots of the mail forest". The name is a `Named` event on the root, and place, mode and runtime are in a separate `mail_projects` table. `rho_chat::protocol::Project.root` is still `#[senax(rename = "channel")]`. Agents create projects as bare roots with no settings (`Chat.start` → `mail.make_project`, `tools.py:293`). Peer mail with no project falls back to an `Agent mail` root (`store/mail.rs:46,943`). `ImportProject` (`protocol.rs:43`) is a temp migration of device-only places from `173807e3b` (2026-11-21).
 - **Cost:** `Start a project` (1 a week) and every `Write an idea` (12 a day). Projects that an agent creates fall into the "older project … says `no place set`" case. This contradicts `chat.Project` purpose: "one answer, asked once".
@@ -87,7 +87,7 @@ The host's protocol split is clean: each protocol lives in its client crate, the
 ### 7. The runtime catalogue is compiled into both sides, not asked of the host
 - **Kind:** code (structural)
 - **Level:** high-level
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 `loop2/wc2-kill-mail-wire-project` + integration: the host sends its `RuntimeCatalogue` in `Hello`, and `project › runtime…`, `set runtime`, and the idea composer (`crates/rho-chat/src/ui/idea.rs`) all offer and validate against it)
 - **Where:** `agents.Agent.set runtime`, `chat.Project.project › runtime…`, `chat.Write an idea` (`on:`)
 - **Evidence:** `NATIVE_MODELS`, `CLAUDE_MODELS` and `RUNTIMES` are constants in `crates/rho-agent-types/src/project.rs:92-114`, "as `_rho.pyi` lists them". No client protocol call returns the host's runtimes. `PyRequest::Models` serves only agents. The product says "with the host's runtimes as answers". `snippets::cycle_runtime` (`snippets.rs:83`) has no caller.
 - **Cost:** each new model needs a GUI release on every device. A GUI built before `neon` refuses `neon-high` on a host that has it, and a newer GUI offers it to an older host. Finding 3c is the symptom in tests.

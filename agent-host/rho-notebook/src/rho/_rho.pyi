@@ -3,7 +3,8 @@
 This module is built into the workset process. The `rho` package wraps it;
 policy code imports `rho`, not `_rho`. Every function runs in the workset
 process and acts on its own workset only. Agent ids are their encoded text
-(for example "x4cvbixbtifu"); a mail address is "user" or an agent id.
+(for example "x4cvbixbtifu"); a message's sender is "user", "system" or an
+agent id.
 
 Blocking calls release the GIL. Calls marked async return awaitables that
 run on the asyncio loop of the caller's thread.
@@ -30,17 +31,21 @@ class Spec(TypedDict):
     runtime: Runtime
     props: dict[str, str]
 
-# How a mention reaches: mail to the user pings or is quiet; an agent is
-# reached as a member would be, or directly, without the thread's members.
-MentionKind = Literal["ping", "quiet", "member", "direct"]
+# Whom the words are for: a message to the user pings, a flash does not,
+# and "agent" is one agent's words to the agent in `to`.
+Voice = Literal["message", "flash", "agent"]
 
 class MessageRecord(TypedDict):
     id: int
     at: int  # unix ms
     parent: int | None  # the message it hangs under; None for a root
-    sender: str  # "user" or an agent id
-    mentions: list[tuple[str, MentionKind]]  # (address, kind)
+    retry_of: int | None  # the failed start the user's message retries
+    sender: str  # "user", "system" or an agent id
+    voice: Voice
+    to: str | None  # the agent, for voice "agent"
     text: str
+    edited: bool
+    deleted: bool
 
 class ThreadRecord(TypedDict):
     id: int  # the message the thread hangs under
@@ -108,9 +113,9 @@ def set_spec(agent: str, spec: Spec) -> bool:
 def input(agent: str, text: str, *, role: Role, message: int | None = None) -> None:
     """Give the agent an input: it waits in memory until a request can carry
     it, and that request's row holds it. This returns once the agent has it. A
-    crash loses it unless it is a mail, which is handed again. `role`
+    crash loses it unless it is a chat message, which is handed again. `role`
     says who speaks: "user" for what a person typed, "tool" for anything else.
-    `message` names the mail it hands over."""
+    `message` names the chat message it hands over."""
 def delivered(agent: str) -> int:
     """The newest message id a request carried to the agent, or 0. What waits
     in the agent is not counted."""
@@ -122,44 +127,39 @@ def rewind(agent: str, turns: int) -> None:
 def new_cache_key(agent: str) -> None:
     """Give a native agent a fresh prompt cache key (an `AgentChanged`)."""
 
-# -- mail --------------------------------------------------------------------
+# -- chat --------------------------------------------------------------------
 #
-# The host's mail: a forest of messages. Every id is the position of the
-# event that made it in the host's mail log; a thread's id is its message's.
-# A message reaches the members of the thread it is posted in and of the
-# threads above it, and every agent it mentions, never its sender. An agent
-# joins or leaves a thread; its nearest record up the chain decides, so a
-# join above and a leave below cut that branch. Neither posting nor a
-# mention joins. Messages from the user come only from the GUI, so Python
-# cannot forge them. Direct agent mail reaches only its addressed recipient.
+# The host's chat: a forest of messages. Every id is the position of the
+# event that made it in the host's chat log; a thread's id is its message's.
+# The user's message reaches the members of the thread it is posted in and
+# of the threads above it. An agent's message or flash speaks to the user
+# and reaches no agent; its words to one agent reach only that agent. An
+# agent joins or leaves a thread; its nearest record up the chain decides,
+# so a join above and a leave below cut that branch. Posting does not join.
+# Messages from the user come only from the GUI, so Python cannot forge
+# them.
 
-class MailHit(TypedDict):
+class Hit(TypedDict):
     project: int
     thread: int
     message: int
     subject: str
     excerpt: str
 
-def edit_message(agent: str, id: int, text: str, *, ping: bool | None = None) -> None:
-    """Change your own mail. `ping` turns the ping of mail to the user on or
-    off; None keeps it."""
+def send_chat(sender: str, thread: int, text: str, kind: Literal["message", "flash"]) -> int:
+    """Speak to the user in `thread` and return the post's id. A message
+    pings and must pass the STE check; a flash does not ping. Refused while
+    the sender has a live message in the thread: edit that one."""
+def message_agent(sender: str, to: str, text: str) -> int:
+    """`sender`'s words to agent `to`, under the sender's project in the
+    pair's thread, and return their id. They never reach the user's deal."""
+def start_project(agent: str, name: str) -> int:
+    """The id of the project named `name`; a new one is made at the place
+    `agent` works."""
+def edit_message(agent: str, id: int, text: str) -> None:
+    """Change your own message or flash; its voice stays."""
 def delete_message(agent: str, id: int) -> None: ...
-def search_mail(query: str, project: int | None, limit: int) -> list[MailHit]: ...
-
-def send_mail(
-    sender: str,
-    parent: int | None,
-    text: str,
-    *,
-    to: str | None = None,
-    ping: bool | None = None,
-    reply_to: int | None = None,
-    replace_last: bool = False,
-) -> int:
-    """Send durable mail as `sender` and return its id. With an agent in `to`, the host
-    chooses the conversation. `replace_last` edits the sender's live project
-    mail when present and returns that id. Only mail to "user" can ping or
-    must pass the STE check."""
+def search(query: str, project: int | None, limit: int) -> list[Hit]: ...
 def agent_handle(agent: str) -> str | None: ...
 def resolve_agent(prefix: str) -> str:
     """The id of the one agent of the host, in any workset, whose id starts

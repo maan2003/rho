@@ -516,8 +516,7 @@ impl AgentsSystem {
                 let verb = match written.audience {
                     MailAudience::System => "reported",
                     MailAudience::User => "wrote to you",
-                    MailAudience::Direct => "wrote direct mail",
-                    MailAudience::Project => "wrote to the project",
+                    MailAudience::Agent => "wrote to an agent",
                 };
                 let words = render::preview(&written.words);
                 let caption = if words.is_empty() {

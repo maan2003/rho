@@ -99,8 +99,8 @@ enum DebugCommand {
         runtime_dir: Option<PathBuf>,
         /// Python run once in the new workset's namespace.
         code: String,
-        /// The user's first message, a new root thread mentioning the
-        /// first agent `code` creates.
+        /// The user's first message, a new root thread that the first
+        /// agent `code` creates joins.
         message: Option<String>,
     },
     /// Post in a thread, as the user would, on a running agent host.
@@ -111,14 +111,10 @@ enum DebugCommand {
         /// then the user's agent host.
         #[arg(long = "runtime-dir")]
         runtime_dir: Option<PathBuf>,
-        /// An agent the message reaches though it is not a member.
-        #[arg(long)]
-        mention: Vec<String>,
         text: String,
     },
     /// Wake an agent with a message from the user, a new root thread that
-    /// mentions it, so it joins the thread and answers there. Needs no
-    /// thread id.
+    /// it joins and answers in. Needs no thread id.
     SendMessage {
         /// Full agent id, as in `$RHO_AGENT_ID`.
         agent: String,
@@ -206,21 +202,12 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Post {
             thread,
             runtime_dir,
-            mention,
             text,
         } => {
-            let mentions = mention
-                .iter()
-                .map(|agent| {
-                    rho_agent_types::parse_full_handle(agent)
-                        .with_context(|| format!("agent id {agent}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
             let call = rho_chat::protocol::Post {
                 client_id: uuid::Uuid::new_v4().as_u64_pair().0,
                 parent: Some(rho_agent_types::MessageId(rho_agent_types::ChatSeq(thread))),
                 settles: None,
-                mentions,
                 content: vec![rho_agent_types::ContentPart::Text { text }],
             };
             let id = rho_rpc::protocol::client::call(&host_paths(runtime_dir)?, call).await?;
@@ -253,19 +240,17 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     }
 }
 
-/// A root thread of the user's whose message is `text` and mentions
-/// `agent`.
+/// A root thread of the user's whose message is `text` and that `agent`
+/// joins.
 async fn start_debug_thread(
     paths: &rho_rpc::protocol::RuntimePaths,
     agent: rho_agent_types::AgentId,
     text: String,
 ) -> anyhow::Result<rho_agent_types::MessageId> {
-    let call = rho_chat::protocol::Post {
-        client_id: uuid::Uuid::new_v4().as_u64_pair().0,
+    let call = rho_agents_client::protocol::worksets::TellAgent {
+        agent,
         parent: None,
-        settles: None,
-        mentions: vec![agent],
-        content: vec![rho_agent_types::ContentPart::Text { text }],
+        text,
     };
     rho_rpc::protocol::client::call(paths, call).await
 }

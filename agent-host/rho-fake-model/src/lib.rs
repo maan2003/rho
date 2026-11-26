@@ -57,9 +57,9 @@ pub enum Scenario {
     FortyToolCalls,
     /// Emit encrypted reasoning followed by a compaction item.
     ReasoningCompaction,
-    /// Ask a question through mail and await the user.
+    /// Ask a question in chat and await the user.
     ClarifyingQuestion,
-    /// Spawn a child, exchange direct mail, and ask the user for a reply.
+    /// Spawn a child, exchange agent messages, and ask the user for a reply.
     MailChain,
 }
 
@@ -801,7 +801,7 @@ fn openai_turn(
     events
 }
 
-/// This fixture reads only incoming mail, not text in its own earlier
+/// This fixture reads only incoming messages, not text in its own earlier
 /// tool calls. An initial peer brief appears only after the first exec.
 fn mail_chain(request: &OpenAiRequest, topic: u64) -> String {
     for item in request.input.iter().rev() {
@@ -819,20 +819,20 @@ fn mail_chain(request: &OpenAiRequest, topic: u64) -> String {
         if let Some(output) = item.get("output") {
             let output = output.to_string();
             if output.contains("MAIL-RIG-PEER-RESULT") {
-                return "mail.send('user', 'Can I use the test clock?', thread=mail_rig_thread)\nend_turn()".into();
+                return "chat.send('Can I use the test clock?', 'message', thread=mail_rig_thread)\nend_turn()".into();
             }
-            if let Some(brief) = output.rsplit_once("· mail #").and_then(|(_, tail)| {
-                let id = tail.split(|c: char| !c.is_ascii_digit()).next()?;
-                id.parse::<u64>().ok()
+            if let Some(sender) = output.rsplit_once("[message from ").and_then(|(_, tail)| {
+                let label = tail.split_once(']')?.0;
+                (!label.is_empty() && !label.contains(['\'', '\\'])).then_some(label)
             }) && output.contains("MAIL-RIG-CHILD-BRIEF")
             {
                 return format!(
-                    "mail.send(None, 'MAIL-RIG-PEER-RESULT', reply_to={brief})\nend_turn()"
+                    "agents.message(agent_id='{sender}', message='MAIL-RIG-PEER-RESULT')\nend_turn()"
                 );
             }
         }
     }
-    "print('Reading mail.')".into()
+    "print('Reading messages.')".into()
 }
 
 /// The topic of the newest message in the request's own input: policy heads
@@ -887,7 +887,7 @@ fn append_finish(
 ) {
     if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
         let text = scenario_text(state, request_number, request);
-        let source = format!("mail.send(\"user\", {text:?}, thread={topic})\nend_turn()");
+        let source = format!("chat.send({text:?}, \"message\", thread={topic})\nend_turn()");
         append_tool_call(
             events,
             state,

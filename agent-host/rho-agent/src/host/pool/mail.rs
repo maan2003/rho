@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use rho_agent_types::{
-    Activity, Address, AgentId, ContentPart, Doing, FLASH_LIFETIME, Mention, Message, MessageId,
-    Stop, ThreadWork, UnixMs, WorksetId,
+    Activity, Address, AgentId, ContentPart, Doing, FLASH_LIFETIME, Message, MessageId, Stop,
+    ThreadWork, UnixMs, Voice, WorksetId,
 };
 use tokio::sync::watch;
 
@@ -35,26 +35,8 @@ impl Mail {
     }
 }
 
-/// Unlike a fresh send, replacing live mail keeps its existing recipients.
-pub(super) fn check_agent_text(
-    content: &[ContentPart],
-    mentions: &[Mention],
-) -> anyhow::Result<()> {
-    if mentions
-        .iter()
-        .any(|mention| matches!(mention, Mention::User { .. }))
-    {
-        for part in content {
-            if let ContentPart::Text { text } = part {
-                crate::worker::ste::check_mail(text)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 impl AgentPool {
-    pub(super) fn revise_agent_mail(
+    pub(super) fn revise_agent_words(
         self: &Arc<Self>,
         mut write: rho_db::WriteTxn,
         workset: rho_agent_types::WorksetId,
@@ -62,10 +44,9 @@ impl AgentPool {
         agent: AgentId,
         message: MessageId,
         content: Vec<ContentPart>,
-        ping: Option<bool>,
     ) -> anyhow::Result<()> {
         let before = write.mail_version(message);
-        write.edit(at, agent, message, content, ping)?;
+        write.edit(at, agent, message, content)?;
         let version = write.mail_version(message);
         if version != before {
             write.append(
@@ -102,8 +83,7 @@ impl AgentPool {
             Some(thread),
             NewMessage {
                 from: Address::StartFailed,
-                reply_to: Some(origin),
-                mentions: vec![Mention::User { ping: true }],
+                voice: Voice::Message,
                 content: vec![ContentPart::Text { text }],
             },
             None,
@@ -173,9 +153,8 @@ impl AgentPool {
         self.mail.work_changed.send_replace(());
     }
 
-    /// Use the project the sender works in; children and advisors inherit
-    /// their spawner's project. A reply to direct mail stays with that
-    /// conversation, including when the two agents work in different places.
+    /// The project the sender works in; children and advisors inherit
+    /// their spawner's project.
     pub(super) fn mail_project(&self, mut agent: AgentId) -> Option<MessageId> {
         let read = self.db.read();
         let mut seen = std::collections::HashSet::new();
@@ -198,72 +177,68 @@ impl AgentPool {
         None
     }
 
-    pub(super) async fn send_agent_message(
+    /// The project's message to the user in `thread`: one live message per
+    /// agent since the user last wrote there, which the agent edits.
+    pub(super) async fn send_chat_message(
         self: &Arc<Self>,
         workset: WorksetId,
-        parent: Option<MessageId>,
-        message: NewMessage,
-        replace: Option<Option<bool>>,
-        api: &str,
+        sender: AgentId,
+        thread: MessageId,
+        content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
-        let Address::Agent(sender) = message.from else {
-            unreachable!("agent messages have an agent author");
-        };
         self.own_agent(workset, sender)?;
-        self.known_mentions(&message.mentions)?;
-        let direct = message
-            .mentions
-            .iter()
-            .any(|mention| matches!(mention, Mention::Direct(_)));
-        let project = if direct {
-            anyhow::ensure!(
-                parent.is_none(),
-                "direct mail chooses its own thread; address the agent"
-            );
-            self.mail_project(sender)
-        } else {
-            None
-        };
         let mut write = self.db.write().await;
         let at = UnixMs::now();
-        if !direct
-            && let Some(thread) = parent
-            && let Some(live) = write.live_project_mail(thread, sender)
-        {
-            if let Some(ping) = replace {
-                use anyhow::Context as _;
-                let current = self.db.read().message(live).context("no live message")?;
-                check_agent_text(&message.content, &current.mentions)?;
-                self.revise_agent_mail(write, workset, at, sender, live, message.content, ping)?;
-                return Ok(live);
-            }
-            if api == "mail" {
-                anyhow::bail!(
-                    "mail.send refused: you already sent mail #{} since the user's last mail in this thread. Use mail.edit({}, text) instead.",
-                    live.0.0,
-                    live.0.0,
-                );
-            }
+        if let Some(live) = write.live_project_mail(thread, sender) {
             anyhow::bail!(
                 "chat.send refused: you already sent message #{} since the user's last message in this thread. Use chat.edit({}, text), or use kind=\"flash\" for anything that does not need the user.",
                 live.0.0,
                 live.0.0,
             );
         }
-        if replace.is_some() {
-            check_agent_text(&message.content, &message.mentions)?;
-        }
-        let id = if direct {
-            write.post_peer(at, project, message)?
-        } else {
-            write.post(at, parent, message, None)?
-        };
+        let id = write.post(
+            at,
+            Some(thread),
+            NewMessage {
+                from: Address::Agent(sender),
+                voice: Voice::Message,
+                content,
+            },
+            None,
+        )?;
+        record_agent_post(&mut write, workset, at, sender, id)?;
+        write.commit();
+        self.consider_naming(id);
+        Ok(id)
+    }
+
+    /// One agent's words to another, under the sender's project; the user
+    /// can read them there and is never dealt them.
+    pub(super) async fn message_agent(
+        self: &Arc<Self>,
+        workset: WorksetId,
+        sender: AgentId,
+        to: AgentId,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<MessageId> {
+        self.own_agent(workset, sender)?;
+        self.workset_of(to)?;
+        anyhow::ensure!(sender != to, "cannot message yourself");
+        let project = self.mail_project(sender);
+        let mut write = self.db.write().await;
+        let at = UnixMs::now();
+        let id = write.post_peer(
+            at,
+            project,
+            NewMessage {
+                from: Address::Agent(sender),
+                voice: Voice::ToAgent(to),
+                content,
+            },
+        )?;
         record_agent_post(&mut write, workset, at, sender, id)?;
         write.commit();
         self.wake_receivers(id, Some(workset));
-        if !direct {
-            self.consider_naming(id);
-        }
         Ok(id)
     }
 

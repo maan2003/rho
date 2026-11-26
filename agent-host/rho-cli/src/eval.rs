@@ -275,17 +275,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     )?;
     // Subscribed before the prompt goes, so its work is seen starting.
     let mut statuses = agent.statuses();
-    let client_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos() as u64;
-    pool.post_user(
-        client_id,
-        None,
-        None,
-        vec![id],
-        vec![ContentPart::Text { text: prompt }],
-    )
-    .await?;
+    pool.tell_agent(id, None, prompt).await?;
     let mut watch = Watch {
         args: &args,
         db: &db,

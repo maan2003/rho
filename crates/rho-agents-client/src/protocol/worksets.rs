@@ -43,6 +43,10 @@ rho_rpc::calls! {
         /// End everything in the agent's shared workset, replace its worker
         /// with the host's current build, and reload the agent.
         RestartWorkset(RestartWorkset) -> ();
+        /// The user's words to one agent, under `parent` or as a new root;
+        /// the agent joins the message's thread. Answered with the
+        /// message's id. For tools such as `rho-deploy` and `rho agent`.
+        TellAgent(TellAgent) -> MessageId;
         DeleteWorksets(DeleteWorksets) -> ();
         /// Bulk: one agent's rows from `from`, a page at a time.
         AgentLog(AgentLog) -> AgentLogPage, priority None;
@@ -142,6 +146,13 @@ pub enum CancelResult {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct RestartWorkset {
     pub agent: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct TellAgent {
+    pub agent: AgentId,
+    pub parent: Option<MessageId>,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -496,6 +507,14 @@ mod tests {
             .into(),
         ));
         round_trips(Open::Request(Cancel { agent }.into()));
+        round_trips(Open::Request(
+            TellAgent {
+                agent,
+                parent: Some(MessageId(rho_agent_types::ChatSeq(4))),
+                text: "deploy".into(),
+            }
+            .into(),
+        ));
         round_trips(Open::Request(
             AgentLog {
                 agent,

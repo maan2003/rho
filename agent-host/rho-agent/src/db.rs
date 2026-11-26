@@ -51,14 +51,31 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
 /// The stamp of the workset store
 /// ([ARCH-agent-host](../../specs/ARCH-agent-host.md)).
-const CURRENT_AGENT_DB_FORMAT: &str = "7c2a5f9d";
+const CURRENT_AGENT_DB_FORMAT: &str = "3e9d51b7";
 /// One hop: from a format, to the next, by this rewrite.
 type Migration = (&'static str, &'static str, fn(&mut WriteTxn));
 /// The hops a store takes to the current format, one build at a time,
 /// each from a savepoint `rho debug rollback` can put it back to. Oldest
-/// first. Existing records retain their layout; seed the new projection and
-/// gate downgrade before older hosts encounter new event variants.
-const MIGRATIONS: &[Migration] = &[];
+/// first. Older stores open with this build's predecessor first.
+const MIGRATIONS: &[Migration] = &[
+    // Each post gets one voice and project settings move into the log. An
+    // older host cannot decode the voiced log.
+    ("7c2a5f9d", CURRENT_AGENT_DB_FORMAT, migrate_voices),
+];
+
+/// The place an agent works: its repository for a clone, else its directory.
+fn migrate_voices(write: &mut WriteTxn) {
+    use crate::store::ProjectWrite as _;
+    write.init_project_tables();
+    let heads: std::collections::HashMap<_, _> =
+        crate::store::agent_heads_in(write).into_iter().collect();
+    crate::store::migrate_voices(write, |agent| {
+        let props = &heads.get(&agent)?.spec.props;
+        let place = props.get("repo").or_else(|| props.get("cwd"))?;
+        rho_agent_types::ProjectPlace::parse(place).ok()
+    });
+}
+
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -555,6 +572,65 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store at the format before voices takes the one hop, behind a
+    /// savepoint, and reads a project's place from the agent that made it.
+    #[tokio::test]
+    async fn the_voice_hop_runs_once_and_finds_a_place_in_the_agents_props() {
+        use rho_agent_types::{Address, ProjectId};
+
+        use crate::store::{ProjectRead as _, StoreWrite as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(dir.path().join("db"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let workset = rho_agent_types::WorksetId([1; 6]);
+        write.create_workset(
+            workset,
+            UnixMs(1),
+            rho_agent_types::WorksetKind::Isolated,
+            String::new(),
+        );
+        write.init_store_tables();
+        let agent = write.alloc_agent_id();
+        let spec = crate::record::AgentSpec {
+            runtime: crate::record::Runtime::Native {
+                model: crate::inference::config::InferenceModel::Sol,
+                profile: crate::inference::config::InferenceProfile {
+                    effort: crate::inference::config::ReasoningEffort::High,
+                    fast_mode: false,
+                },
+                cache_key: crate::inference::PromptCacheKey::generate(),
+            },
+            props: [("repo".to_owned(), "github.com/example/clock".to_owned())].into(),
+        };
+        write
+            .append(
+                workset,
+                &crate::record::Record {
+                    at: UnixMs(2),
+                    event: crate::record::Event::AgentCreated { agent, spec },
+                },
+            )
+            .unwrap();
+        let root = crate::store::old_root(&mut write, Address::Agent(agent), "Clock lab");
+        write.open_table(FORMAT).insert((), "7c2a5f9d".to_owned());
+        write.commit();
+
+        prepare(&db).await;
+        let read = db.read();
+        assert_eq!(
+            read.project(ProjectId(root)).map(|config| config.place),
+            Some(rho_agent_types::ProjectPlace::parse("github.com/example/clock").unwrap())
+        );
+        let hops: Vec<_> = savepoints(&db)
+            .await
+            .into_iter()
+            .map(|(_, hop)| hop.unwrap())
+            .collect();
+        assert_eq!(hops, [format!("7c2a5f9d->{CURRENT_AGENT_DB_FORMAT}")]);
+    }
 
     /// A savepoint recorded for a hop this build does not know goes when
     /// the store is prepared: nothing could roll back to it.

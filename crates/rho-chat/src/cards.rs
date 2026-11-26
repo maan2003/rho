@@ -270,7 +270,8 @@ mod tests {
 
     use jiff::{SignedDuration, Zoned};
     use rho_agent_types::{
-        AgentIdDomain, ChatEvent, ChatRecord, ContentPart, Mention, Stop, UnixMs,
+        AgentIdDomain, ChatEvent, ChatRecord, ContentPart, ProjectConfig, ProjectId, Stop, UnixMs,
+        Voice,
     };
     use rho_dealer::curve::*;
     use rho_dealer::facts::{Device, Entry, EntryId, Fact};
@@ -337,16 +338,15 @@ mod tests {
             &mut self,
             parent: Option<MessageId>,
             from: Party,
-            mentions: Vec<Mention>,
+            voice: Voice,
             text: &str,
         ) -> MessageId {
             self.record(ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent,
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from,
-                mentions,
+                voice,
                 content: vec![ContentPart::Text { text: text.into() }],
             })
         }
@@ -359,7 +359,18 @@ mod tests {
                 .find(|id| self.chat.is_project(**id))
             {
                 Some(root) => *root,
-                None => self.post(None, Party::User, Vec::new(), "rho"),
+                None => {
+                    let root = self.post(None, Party::User, Voice::Message, "rho");
+                    self.record(ChatEvent::Project {
+                        project: ProjectId(root),
+                        config: ProjectConfig {
+                            place: rho_agent_types::ProjectPlace::parse("~/src/rho").unwrap(),
+                            mode: rho_agent_types::ProjectMode::One,
+                            runtime: rho_agent_types::RuntimeLabel::default(),
+                        },
+                    });
+                    root
+                }
             }
         }
 
@@ -368,11 +379,16 @@ mod tests {
         fn agent_under(&mut self, name: &str, parent: Option<MessageId>) -> MessageId {
             self.made += 1;
             let agent = AgentId::from_counter(self.made, &AgentIdDomain(0)).unwrap();
-            let (from, under) = match parent {
-                Some(parent) => (Party::Agent(self.agents[&parent]), parent),
-                None => (Party::User, self.root()),
+            // An agent briefs the agent it made; the user writes an idea.
+            let (from, under, voice) = match parent {
+                Some(parent) => (
+                    Party::Agent(self.agents[&parent]),
+                    parent,
+                    Voice::ToAgent(agent),
+                ),
+                None => (Party::User, self.root(), Voice::Message),
             };
-            let thread = self.post(Some(under), from, Vec::new(), name);
+            let thread = self.post(Some(under), from, voice, name);
             self.record(ChatEvent::Joined { thread, agent });
             self.agents.insert(thread, agent);
             thread
@@ -395,8 +411,8 @@ mod tests {
             .address()
         }
 
-        /// The thread's agent mentions the user, in the thread or under
-        /// `reply`.
+        /// The thread's agent writes to the user, in the thread or under
+        /// `reply`: a message, or a flash without `ping`.
         fn sends_under(
             &mut self,
             thread: MessageId,
@@ -407,7 +423,7 @@ mod tests {
             self.post(
                 Some(reply.unwrap_or(thread)),
                 from,
-                vec![Mention::User { ping }],
+                if ping { Voice::Message } else { Voice::Flash },
                 "update",
             )
         }
@@ -424,24 +440,30 @@ mod tests {
             self.sends(thread, true)
         }
 
-        /// Says what it is doing, mentioning nobody.
+        /// Says what it is doing in a flash.
         fn works(&mut self, thread: MessageId) {
             let from = Party::Agent(self.agents[&thread]);
-            self.post(Some(thread), from, Vec::new(), "working");
+            self.post(Some(thread), from, Voice::Flash, "working");
         }
 
         fn writes_to(&mut self, thread: MessageId) {
-            self.post(Some(thread), Party::User, Vec::new(), "go on");
+            self.post(Some(thread), Party::User, Voice::Message, "go on");
         }
 
+        /// The user's reply from the card of `mail`.
         fn answers(&mut self, thread: MessageId, mail: MessageId) {
+            let version = ChatSeq(self.seq + 1);
             self.record(ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: Some(thread),
-                reply_to: Some(mail),
-                thread_reply: None,
+                retry_of: None,
+                thread_reply: Some(rho_agent_types::ThreadReply {
+                    settles: Some(MessageVersion {
+                        message: mail,
+                        version,
+                    }),
+                }),
                 from: Party::User,
-                mentions: Vec::new(),
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: "answer".into(),
                 }],
@@ -513,7 +535,7 @@ mod tests {
                     stop,
                     since: UnixMs(self.ms()),
                 },
-                vec![Mention::User { ping: true }],
+                Voice::Message,
                 "lost connection",
             )
         }
@@ -584,36 +606,18 @@ mod tests {
         MessageId(ChatSeq(mail.parse().unwrap()))
     }
 
-    /// A card is a thread's: a mention in the root message itself is the
-    /// root's card, and a mention in a thread under it is that thread's,
-    /// never counted twice.
+    /// Words at a root are no card: a root is a project, or the
+    /// container of agents outside every project.
     #[test]
-    fn a_mention_in_the_root_itself_is_the_roots_card_alone() {
+    fn an_agents_message_at_a_root_is_no_card() {
         let mut w = world();
         let agent = AgentId::from_counter(99, &AgentIdDomain(0)).unwrap();
-        let root = w.post(
-            None,
-            Party::Agent(agent),
-            vec![Mention::User { ping: true }],
-            "root asks",
-        );
+        let root = w.post(None, Party::Agent(agent), Voice::Message, "root asks");
         let a = w.agent("a");
         let ask = w.asks(a);
-        let cards = w.deal().cards;
-        let trigger = |thread: MessageId| {
-            cards
-                .iter()
-                .find(|card| card.address == w.address(thread))
-                .map(unread_from)
-        };
-        assert_eq!(trigger(root), Some(root));
-        assert_eq!(trigger(a), Some(ask));
-        w.writes_to(root);
-        assert_eq!(
-            w.hand(),
-            "rho@lab › a · waits · now",
-            "the reply settles the standalone ask without clearing an unrelated thread"
-        );
+        assert!(!w.chat.message(root).unwrap().pings_user());
+        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(unread_from(&w.deal().cards[0]), ask);
     }
 
     /// A reply reads the whole thread through how far it records the
@@ -628,11 +632,10 @@ mod tests {
         let say = |w: &mut World, settles| {
             w.record(ChatEvent::Posted {
                 parent: Some(thread),
-                reply_to: None,
+                retry_of: None,
                 thread_reply: Some(rho_agent_types::ThreadReply { settles }),
                 from: Party::User,
-                kind: rho_agent_types::MessageKind::Kept,
-                mentions: Vec::new(),
+                voice: Voice::Message,
                 content: vec![ContentPart::Text {
                     text: "Try the second clock.".into(),
                 }],
@@ -661,7 +664,6 @@ mod tests {
         let edit = w.record(ChatEvent::Revised {
             message: early,
             author: w.agents[&thread],
-            ping: None,
             content: vec![ContentPart::Text {
                 text: "Use the monotonic clock instead?".into(),
             }],
@@ -806,7 +808,7 @@ mod tests {
         let b = w.agent("b");
         w.works(a);
         let from = Party::Agent(w.agents[&a]);
-        w.post(Some(a), from, vec![Mention::Agent(w.agents[&b])], "b, help");
+        w.post(Some(a), from, Voice::ToAgent(w.agents[&b]), "b, help");
         assert_eq!(w.hand(), "");
         w.finishes(a);
         w.works(a);
@@ -901,35 +903,23 @@ mod tests {
     }
 
     #[test]
-    fn editing_while_it_waits_preserves_the_card_but_toggling_ping_starts_a_new_wait() {
+    fn editing_while_it_waits_preserves_the_card() {
         let mut w = world();
         let a = w.agent("a");
         let ask = w.asks(a);
         let original = w.deal().cards[0].cursor.clone();
         w.pass(mins(7));
-        for ping in [None, Some(false), Some(true)] {
-            w.record(ChatEvent::Revised {
-                message: ask,
-                author: w.agents[&a],
-                ping,
-                content: vec![ContentPart::Text {
-                    text: "Clock clarification.".into(),
-                }],
-            });
-            let hand = w.deal();
-            match ping {
-                None => {
-                    assert_eq!(hand.cards[0].cursor, original);
-                    assert_eq!(hand.cards[0].label, "waits · 7m");
-                }
-                Some(false) => assert!(hand.cards.is_empty()),
-                Some(true) => {
-                    assert_ne!(hand.cards[0].cursor, original);
-                    assert_eq!(hand.cards[0].label, "waits · now");
-                    assert_eq!(unread_from(&hand.cards[0]), ask);
-                }
-            }
-        }
+        w.record(ChatEvent::Revised {
+            message: ask,
+            author: w.agents[&a],
+            content: vec![ContentPart::Text {
+                text: "Clock clarification.".into(),
+            }],
+        });
+        let hand = w.deal();
+        assert_eq!(hand.cards[0].cursor, original);
+        assert_eq!(hand.cards[0].label, "waits · 7m");
+        assert_eq!(unread_from(&hand.cards[0]), ask);
     }
 
     #[test]
@@ -945,7 +935,6 @@ mod tests {
         w.record(ChatEvent::Revised {
             message: ask,
             author: w.agents[&a],
-            ping: None,
             content: vec![ContentPart::Text {
                 text: "I need a monotonic clock.".into(),
             }],
@@ -995,7 +984,7 @@ mod tests {
         let failure = w.post(
             Some(thread),
             Party::StartFailed,
-            vec![Mention::User { ping: true }],
+            Voice::Message,
             "Could not start.",
         );
         let hand = w.deal();
@@ -1091,7 +1080,7 @@ mod tests {
         w.post(
             Some(parent),
             from,
-            vec![Mention::Agent(w.agents[&parent])],
+            Voice::ToAgent(w.agents[&parent]),
             "done, parent",
         );
         assert_eq!(w.hand(), "");
@@ -1155,7 +1144,6 @@ mod tests {
         w.record(ChatEvent::Revised {
             message: first,
             author: w.agents[&thread],
-            ping: None,
             content: vec![ContentPart::Text {
                 text: "A different question about the same clock.".into(),
             }],
@@ -1203,7 +1191,6 @@ mod tests {
         let edit = w.record(ChatEvent::Revised {
             message: first,
             author: w.agents[&thread],
-            ping: None,
             content: vec![ContentPart::Text {
                 text: "A different question about the same clock.".into(),
             }],
@@ -1266,12 +1253,7 @@ mod tests {
         // A message right under the root is a thread of its own.
         let root = w.root();
         let from = Party::Agent(w.agents[&a]);
-        w.post(
-            Some(root),
-            from,
-            vec![Mention::User { ping: true }],
-            "at the root",
-        );
+        w.post(Some(root), from, Voice::Message, "at the root");
         let hand = w.deal();
         assert!(
             hand.cards

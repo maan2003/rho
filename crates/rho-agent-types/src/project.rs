@@ -1,11 +1,12 @@
-//! The settings owned by a project on its mail host.
+//! The settings owned by a project on its host.
 
 use bytes::{Buf, BytesMut};
 use senax_encoder::{Decode, Decoder, Encode, Encoder, Pack, Packer, Unpack, Unpacker};
 
 use crate::{MessageId, one_line};
 
-/// The root mail of a project, in its host's log.
+/// A project, named by its anchor: the root of its host's chat that a
+/// [`ChatEvent::Project`](crate::ChatEvent::Project) made a project.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
 )]
@@ -77,7 +78,7 @@ impl ProjectMode {
 }
 
 /// Which runtime an agent runs on (and whose transcript it produces).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum RuntimeKind {
     Rho,
     Claude,
@@ -87,8 +88,9 @@ pub enum RuntimeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeLabel(String);
 
-/// The models each runtime kind offers, and the efforts each takes, as
-/// `_rho.pyi` lists them.
+/// The models each runtime kind offers on this build's host, and the
+/// efforts each takes, as `_rho.pyi` lists them. A client never reads these:
+/// it offers what its host says in [`RuntimeCatalogue`].
 const NATIVE_MODELS: [&str; 5] = ["sol", "terra", "astra", "hydrogen", "neon"];
 const NATIVE_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
@@ -114,6 +116,18 @@ pub const RUNTIMES: [&str; 8] = [
 pub const DEFAULT_RUNTIME: &str = RUNTIMES[0];
 
 impl RuntimeLabel {
+    /// A `<model>-<effort>` as it crossed the wire: its shape is checked,
+    /// not whether this build knows it, so a newer host's runtime still
+    /// reads. Whether a host offers it is its catalogue's answer.
+    fn read(text: &str) -> Result<Self, String> {
+        let text = text.trim().to_ascii_lowercase();
+        let part = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric());
+        match text.split_once('-') {
+            Some((model, effort)) if part(model) && part(effort) => Ok(Self(text)),
+            _ => Err(format!("`{text}` is not <model>-<effort>")),
+        }
+    }
+
     /// Reads a supported `<model>-<effort>`; a missing label is not a label.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim().to_ascii_lowercase();
@@ -199,7 +213,7 @@ impl Encoder for RuntimeLabel {
 
 impl Decoder for RuntimeLabel {
     fn decode(reader: &mut impl Buf) -> senax_encoder::Result<Self> {
-        Self::parse(&String::decode(reader)?).map_err(senax_encoder::EncoderError::Decode)
+        Self::read(&String::decode(reader)?).map_err(senax_encoder::EncoderError::Decode)
     }
 }
 
@@ -211,7 +225,82 @@ impl Packer for RuntimeLabel {
 
 impl Unpacker for RuntimeLabel {
     fn unpack(reader: &mut impl Buf) -> senax_encoder::Result<Self> {
-        Self::parse(&String::unpack(reader)?).map_err(senax_encoder::EncoderError::Decode)
+        Self::read(&String::unpack(reader)?).map_err(senax_encoder::EncoderError::Decode)
+    }
+}
+
+/// One runtime a host offers.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct RuntimeChoice {
+    pub label: RuntimeLabel,
+    pub kind: RuntimeKind,
+    /// Offered first, before every other pair of its kind.
+    pub usual: bool,
+}
+
+/// The runtimes a host offers, in its order: the usual ones first, its
+/// default first of all. The host says it to every client in its chat
+/// session's `Hello`, so a client offers and accepts the host's runtimes,
+/// not the ones it was built with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct RuntimeCatalogue {
+    pub choices: Vec<RuntimeChoice>,
+}
+
+impl RuntimeCatalogue {
+    /// What this build's host offers.
+    pub fn host() -> Self {
+        let usual = RUNTIMES.iter().map(|label| RuntimeChoice {
+            label: RuntimeLabel::parse(label).expect("a usual runtime is supported"),
+            kind: RuntimeLabel::parse(label).expect("supported").kind(),
+            usual: true,
+        });
+        let rest = [RuntimeKind::Rho, RuntimeKind::Claude]
+            .into_iter()
+            .flat_map(|kind| {
+                RuntimeLabel::choices(kind)
+                    .filter(|label| !RUNTIMES.contains(&label.as_str()))
+                    .map(move |label| RuntimeChoice {
+                        label: RuntimeLabel(label),
+                        kind,
+                        usual: false,
+                    })
+            });
+        Self {
+            choices: usual.chain(rest).collect(),
+        }
+    }
+
+    /// The host's default: its first runtime.
+    pub fn default_runtime(&self) -> Option<&RuntimeLabel> {
+        self.choices.first().map(|choice| &choice.label)
+    }
+
+    /// What the user typed, if the host offers it.
+    pub fn label(&self, text: &str) -> Result<RuntimeLabel, String> {
+        let label = RuntimeLabel::read(text)?;
+        self.choice(&label)
+            .map(|choice| choice.label.clone())
+            .ok_or_else(|| {
+                let usual: Vec<_> = self
+                    .choices
+                    .iter()
+                    .filter(|choice| choice.usual)
+                    .map(|choice| choice.label.as_str())
+                    .collect();
+                format!(
+                    "the host has no model `{label}`; write <model>-<effort>, like {}",
+                    usual.join(", ")
+                )
+            })
+    }
+
+    pub fn choice(&self, label: &RuntimeLabel) -> Option<&RuntimeChoice> {
+        self.choices.iter().find(|choice| choice.label == *label)
+    }
+
+    pub fn kind(&self, label: &RuntimeLabel) -> Option<RuntimeKind> {
+        self.choice(label).map(|choice| choice.kind)
     }
 }
 
@@ -257,10 +346,42 @@ mod tests {
         assert_eq!((sol.as_str(), sol.kind()), ("sol-xhigh", RuntimeKind::Rho));
         for invalid in ["", "sol-max", "astra", "unknown-high"] {
             assert!(RuntimeLabel::parse(invalid).is_err());
-            let packed = senax_encoder::pack(&invalid.to_owned()).unwrap();
+        }
+        for malformed in ["", "astra", "sol-"] {
+            let packed = senax_encoder::pack(&malformed.to_owned()).unwrap();
             assert!(senax_encoder::unpack::<RuntimeLabel>(&mut packed.as_ref()).is_err());
         }
         assert_eq!(RuntimeLabel::default().as_str(), "opus-high");
+    }
+
+    /// A client reads a runtime its own build does not know, and asks the
+    /// host's catalogue whether it is offered.
+    #[test]
+    fn a_runtime_the_client_does_not_know_still_reads_and_the_hosts_catalogue_decides() {
+        let packed = senax_encoder::pack(&"nova-high".to_owned()).unwrap();
+        let newer = senax_encoder::unpack::<RuntimeLabel>(&mut packed.as_ref()).unwrap();
+        assert_eq!(newer.as_str(), "nova-high");
+        assert!(RuntimeLabel::parse("nova-high").is_err());
+        let packed = senax_encoder::pack(&"no label".to_owned()).unwrap();
+        assert!(senax_encoder::unpack::<RuntimeLabel>(&mut packed.as_ref()).is_err());
+
+        let mut catalogue = RuntimeCatalogue::host();
+        assert_eq!(catalogue.default_runtime().unwrap().as_str(), "opus-high");
+        assert!(catalogue.label("nova-high").is_err());
+        assert_eq!(catalogue.label(" SOL-low ").unwrap().as_str(), "sol-low");
+        catalogue.choices.push(RuntimeChoice {
+            label: newer.clone(),
+            kind: RuntimeKind::Rho,
+            usual: false,
+        });
+        assert_eq!(catalogue.label("nova-high"), Ok(newer.clone()));
+        assert_eq!(catalogue.kind(&newer), Some(RuntimeKind::Rho));
+        let usual = catalogue
+            .choices
+            .iter()
+            .take_while(|choice| choice.usual)
+            .count();
+        assert_eq!(usual, RUNTIMES.len());
     }
 
     #[test]

@@ -36,7 +36,7 @@ def render(template: str, team: str, user_owned: str, context: str) -> str:
 
 def label(agent_id: str) -> str:
     """The agent's address, whether or not it works here. Deleted agents
-    have no address, but keep their id in existing mail."""
+    have no address, but keep their id in existing messages."""
     return _rho.agent_handle(agent_id) or agent_id
 
 
@@ -54,11 +54,7 @@ def team(agent_id: str, props: dict) -> str:
     parent = props.get("parent")
     parent_address = label(parent) if parent is not None else None
     if parent_address is not None:
-        report = (
-            f"agents.message(agent_id={parent_address!r}, message=text)"
-            if preset == "engineer"
-            else f"mail.send({parent_address!r}, text)"
-        )
+        report = f"agents.message(agent_id={parent_address!r}, message=text)"
         identity = (
             "You are an agent in a team of agents collaborating to complete a task. Your "
             f"agent id is {me}; your parent agent is {parent_address}.\n\nMessages from your "
@@ -73,11 +69,11 @@ def team(agent_id: str, props: dict) -> str:
     started_by = props.get("started_by")
     if preset == "advisor":
         if parent_address is None:
-            ownership = "An Engineer has not asked you a question yet; wait for mail."
+            ownership = "An Engineer has not asked you a question yet; wait for a message."
         else:
             ownership = (
                 "Complete your independent analysis and send it to your parent with "
-                f"mail.send({parent_address!r}, text). Ask a known agent for context the same way, "
+                f"{report}. Ask a known agent for context the same way, "
                 "and end your turn when blocked on a reply."
             )
     elif preset == "child":
@@ -91,17 +87,10 @@ def team(agent_id: str, props: dict) -> str:
         ownership = f"{started_by_note(label(started_by))} You own the user's technical outcome."
     else:
         ownership = "You were started directly and own the user's technical outcome."
-    if preset == "engineer":
-        reply = (
-            "Reply with `agents.message(agent_id=sender, message=text)`, "
-            "where `sender` is the agent ID from the header."
-        )
-    else:
-        reply = (
-            "Answer with `mail.send(None, text, reply_to=mail_id)` using the mail ID in its footer. "
-            "An agent writes to another agent by mail in a thread under the project; "
-            "the user can read it one level down and never gets a card from it."
-        )
+    reply = (
+        "Reply with `agents.message(agent_id=sender, message=text)`, "
+        "where `sender` is the agent ID from the header."
+    )
     return f"""{identity}
 
 {ownership}

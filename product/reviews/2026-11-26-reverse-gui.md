@@ -54,7 +54,7 @@ Tags: **zombie** = leftover from a retired design (`Kind: code`, delete). **undo
 ### 4. Chat is still a "forest of mail": a project is inferred from message shape, and the wire can say states that `product/` rejected (structure)
 - **Kind:** code
 - **Level:** high-level (reverse)
-- **Status:** open
+- **Status:** fixed on `loop2/wc2-kill-mail-wire-project` (see reverse-host 2 and 4)
 - **Where:** `chat.Project`, `chat.Thread`, `chat.Message.ping`, `chat.Flash`
 - **Evidence:**
   - **The project has no type of its own.** `HostChat::is_project` holds when *"a root message with no mentions"*, and *"a root that was itself addressed to the user is mail, not a project"* (`crates/rho-chat/src/fold.rs:258-263`). "Thread" has three definitions: `thread_of`, `subthread_of` and `root_of` (`fold.rs:299-344`, with comments *"a root is a stream"*). `ThreadId` names projects, threads and messages alike, so every caller re-checks `is_project` (`ui/mod.rs:820, 981, 1125, 1195`).

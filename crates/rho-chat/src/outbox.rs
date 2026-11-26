@@ -10,9 +10,7 @@
 
 use std::collections::HashMap;
 
-use rho_agent_types::{
-    AgentId, ContentPart, EndpointId, MessageId, MessageVersion, RuntimeLabel, UnixMs,
-};
+use rho_agent_types::{ContentPart, EndpointId, MessageId, MessageVersion, RuntimeLabel, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 /// One message on disk until its host takes it.
@@ -26,8 +24,6 @@ pub struct Outgoing {
     #[senax(rename = "reply_to")]
     pub failed_start: Option<MessageId>,
     pub settles: Option<MessageVersion>,
-    /// Agents that receive it without being members of its thread.
-    pub mentions: Vec<AgentId>,
     pub content: Vec<ContentPart>,
     #[senax(default)]
     pub delivery: Delivery,
@@ -253,7 +249,6 @@ mod tests {
             parent,
             failed_start: None,
             settles: None,
-            mentions: Vec::new(),
             content: text(words),
             delivery: Delivery::Mail,
             runtime: None,
@@ -333,6 +328,7 @@ mod tests {
 
     #[test]
     fn mail_queued_before_reply_addresses_keeps_the_original_text() {
+        use rho_agent_types::AgentId;
         #[derive(Encode)]
         struct OldOutgoing {
             at: UnixMs,
@@ -344,7 +340,7 @@ mod tests {
         let bytes = senax_encoder::encode(&OldOutgoing {
             at: UnixMs(9),
             parent: Some(MessageId(ChatSeq(4))),
-            mentions: Vec::new(),
+            mentions: vec![AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(0)).unwrap()],
             content: content.clone(),
         })
         .unwrap();
@@ -357,6 +353,7 @@ mod tests {
 
     #[test]
     fn an_old_addressed_post_becomes_a_thread_reply_but_a_retry_keeps_its_failed_start() {
+        use rho_agent_types::AgentId;
         #[derive(Encode)]
         struct AddressedOutgoing {
             at: UnixMs,
@@ -412,7 +409,6 @@ mod tests {
             parent: Some(MessageId(ChatSeq(75))),
             failed_start: None,
             settles: None,
-            mentions: Vec::new(),
             content: text("explicit choice"),
             delivery: Delivery::Idea,
             runtime: Some(label.clone()),
@@ -438,13 +434,11 @@ mod tests {
 
     #[test]
     fn what_was_left_unsent_goes_in_the_order_written() {
-        let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let outgoing = |at: u64, text: &str| Outgoing {
             at: UnixMs(at),
             parent: None,
             failed_start: None,
             settles: None,
-            mentions: vec![agent],
             content: vec![ContentPart::Text { text: text.into() }],
             delivery: Delivery::Mail,
             runtime: None,

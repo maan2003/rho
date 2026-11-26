@@ -179,7 +179,6 @@ where
                                 uuid::Uuid::new_v4().as_u64_pair().0,
                                 Some(thread),
                                 None,
-                                Vec::new(),
                                 vec![ContentPart::Text { text: message }],
                             )
                             .await;

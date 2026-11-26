@@ -396,8 +396,6 @@ impl Services {
                 })
             }
             Request::ClaudeAccount => Reply::ClaudeAccount(self.db.read().claude_account()),
-            // An adopted worker on epoch 35 can still ask this.
-            Request::ColdNotice { .. } => Reply::ColdNotice(None),
         };
         Ok(reply)
     }

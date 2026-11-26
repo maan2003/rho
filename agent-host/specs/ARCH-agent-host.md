@@ -94,22 +94,24 @@ uses a different transport. The log lives on the host because the GUI is often o
 mail crosses worksets, and it survives workset deletion.
 
 Mail and agents are separate hierarchies. They meet only through
-membership and through mentions. A user's reply also records the version
-of the card it answers (`thread_reply`), independently of parentage, and
-goes to the whole thread like any other message there.
+membership and through each message's one voice. A user's reply also records
+the version of the card it answers (`thread_reply`), independently of parentage,
+so a move does not undo the answer, and goes to the whole thread like any other
+message there.
 Membership is per thread and covers the
 subtree: the nearest `Joined` or `Left` up the chain of parents decides, so
 an agent joined to a root receives the whole channel, like a bot, and a
-leave on a subthread cuts that branch. Mail to the user stays readable in
-the thread but does not enter agents' inboxes. Other thread mail reaches
-every member and every agent it mentions, never its sender; the host
-writes the inbox rows with the post, so a later member can read older
-messages but does not receive them.
-Only Python joins agents to threads (`rho.mail.join`), so the host never
-joins anyone on its own: the default delivery (`rho.hooks.deliver`) joins an
-agent to the thread it was started from and to a thread where the user
-mentions it. A policy with other rules replaces the whole delivery, not one
-rule of it.
+leave on a subthread cuts that branch. An agent's `Message` or `Flash`
+speaks to the user: it stays readable in the thread but enters no agent's
+inbox. An agent's `ToAgent` reaches only its addressee. The user's words
+reach every member, never the sender. The host writes the inbox rows with
+the post, so a later member can read older messages but does not receive
+them.
+Python joins agents to threads (`rho.chat.join`). The host joins an agent
+only when a caller hands it the user's words (`TellAgent`, which `rho agent`
+and `rho debug send-message` use). The default delivery
+(`rho.hooks.deliver`) joins an agent to the thread it was started from. A
+policy with other rules replaces the whole delivery, not one rule of it.
 
 A move is a parent change (`Reparented`) and the subtree follows; a message
 is read in the thread it is in now, so `#41` always leads to it. Without a name the GUI shows the first line of the thread's message.
@@ -120,13 +122,13 @@ Search uses the current bodies
 and subjects, not the original text of edited or deleted mail. The host names a thread under a root once, when its
 second message arrives and nothing has named it, from a model's reading of
 those two messages; a name anyone gives wins over it, before or after. Nothing resolves a thread: an agent says done with a
-`result` mention, and the user says so in the ledger, which is theirs
+message, and the user says so in the ledger, which is theirs
 ([rho2](../../docs/rho2.md)). What the user has read is the user's, not the
 host's: it lives with the dealer's marks in the GUI's synced ledger.
 The host derives replies from the original `Posted` events: a move does
-not undo an answer. If the latest project ask is still live, the host
-reuses its mail ID and records a revision only for different content.
-Replies reach the writer of the current words, even across agents. The
+not undo an answer. While an agent's message in a thread is live, the host
+refuses another and names the one to edit
+([SPEC-live-project-mail](../rho-agent/specs/SPEC-live-project-mail.md)). The
 client compares the revision's log position with the user's verdict;
 the host cannot see the verdict.
 
@@ -140,14 +142,19 @@ A stop produces durable system mail in the agent's thread, not another
 kind of card. When a start from mail is refused before there is an agent,
 the host writes the stop in the idea's thread instead. Neither is agent input.
 
-A project's root owns its name; its host stores its place and mode beside
-the mail log and sends them to every device. The host alone chooses what
+A project is a root with a `Project` event in the log, which holds its
+place, mode and runtime; the latest event wins, so every device folds the
+same settings. A root without one, such as the root of agents' direct
+messages, is no project, and the GUI shows it as the agents'. The host says
+the runtimes it offers in its chat `Hello` (`RuntimeCatalogue`); the GUI
+offers and checks those, not its own build's list. The host alone chooses what
 an idea starts (see [SPEC-project-delivery](../../crates/rho-chat/specs/SPEC-project-delivery.md)).
 The settings and standing agent do not move when another agent starts in
 that project through explicit options.
 
-Direct mail between two agents on a host uses the same log and inbox.
-The first mail between a pair starts a thread under the writer's project;
+Direct messages between two agents on a host (`agents.message`, voice
+`ToAgent`) use the same log and inbox.
+The first message between a pair starts a thread under the writer's project;
 an answer stays in that conversation even if the agents work in different
 projects. Children and Advisors inherit their spawner's project. Only the
 addressed agent gets the mail as tool input, even if others follow the
@@ -177,9 +184,9 @@ send again. The user sees approved harnesses and
 acceptances with `rho gccp list`, and takes them back with `rho iroh revoke`
 and `rho gccp remove`.
 
-A mention of the user, which pings or not, is the only way a message asks
-for the user's attention, so a message has no kind of its own. Other
-mentions name the agents a message reaches.
+A message's voice is the only way it asks for the user's attention: an
+agent's `Message` under a root pings, and a `Flash` never does
+([SPEC-chat-flash](../rho-agent/specs/SPEC-chat-flash.md)).
 
 The message comes first and the agent second. The GUI posts an idea under a
 project (`PostIdea`), and the host starts the work by the project's place,
@@ -188,7 +195,8 @@ mode and runtime, or hands it to the project's standing agent. The agent's
 so other origins such as Slack can follow. The default policy then joins the
 agent to that message's thread and hands it that message first.
 
-Agents send with `chat.send`, as a message or a flash. Policy Python
+Agents speak to the user with `chat.send` and to another agent with
+`agents.message`. Policy Python
 reads each agent's inbox and hands each message to the agent as an input that
 names it. The delivery position is derived from the `Request` rows that carried
 them, so the mail log keeps no cursors. Slack is separate from project mail: agents reach it through the host's

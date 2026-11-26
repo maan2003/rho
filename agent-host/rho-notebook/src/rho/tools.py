@@ -1,6 +1,6 @@
-"""The tools the default policy puts in an agent's notebook: `mail`,
-`agents` and `skills`. Rust adds `web`, `view_image`, `papercut`,
-`end_turn` and `archive`.
+"""The tools the default policy puts in an agent's notebook: `chat`,
+`agents` and `skills`. Rust adds `web`, `view_image`,
+`papercut`, `end_turn` and `archive`.
 
 A tool runs on the notebook thread of the agent that calls it. What it
 reports, it prints, so the model sees it with its cell. A host call runs
@@ -13,7 +13,7 @@ import os
 import _rho
 
 from . import agents as rho_agents
-from . import mail as rho_mail
+from . import chat as rho_chat
 from . import skills as rho_skills
 from . import workset
 from .prompt import label
@@ -36,7 +36,7 @@ class _MessageId(int):
         yield
 
 
-class _MailHits(list):
+class _Hits(list):
     def __await__(self):
         return list(self)
         yield
@@ -90,112 +90,96 @@ def _spawner_of(props: dict) -> str | None:
     return props.get("parent") or props.get("started_by")
 
 
-class Mail:
-    """Mail to projects, the user and agents on this host."""
+class Chat:
+    """The user's chat in project threads on this host."""
 
     def __init__(self, agent: str):
         self._agent = agent
 
-    def send(self, to, text, *, thread=None, reply_to=None, ping=None, replace_last: bool = False):
-        """Send to a local project, #thread, agent handle, or "user".
-        With reply_to=#id, you can pass None to address the writer.
-        Mail to "user" needs a thread or reply_to. New mail pings by default.
-        Set replace_last=True to update your live mail in the thread, or
-        send if you have none. An update keeps its ping unless you set ping.
-        """
-        message = rho_mail.send(
-            self._agent, to, text, thread=thread, reply_to=reply_to,
-            ping=ping, replace_last=replace_last,
-        )
-        if to != rho_mail.USER:
-            print(f"Sent mail #{message}.")
-        return message
+    def send(self, text, kind, *, thread):
+        """Speak to the user in a thread. Name the kind: "message" pings;
+        "flash" shows without a card. Returns the id of the post."""
+        return rho_chat.send_chat(self._agent, text, kind, thread=thread)
 
-    def edit(self, message, text, *, ping=None):
-        """Replace the body of your mail #message; answered mail is fixed.
-        ping=True deals mail to the user as a card, ping=False stops it
-        pinging; by default it pings as it did."""
-        if ping is not None and type(ping) is not bool:
-            raise ValueError(f"ping is True, False or None, not {ping!r}")
-        _host(_rho.edit_message, self._agent, rho_mail.ident(message), _text(text), ping=ping)
+    def edit(self, message, text):
+        """Change the words of your message or flash without changing its
+        kind; a message the user answered is fixed."""
+        _host(_rho.edit_message, self._agent, rho_chat.ident(message), _text(text))
         return _DONE
 
     def delete(self, message):
-        """Remove your mail #message; answered mail is fixed."""
-        _host(_rho.delete_message, self._agent, rho_mail.ident(message))
+        """Remove your message or flash; a message the user answered is fixed."""
+        _host(_rho.delete_message, self._agent, rho_chat.ident(message))
         return _DONE
 
     def search(self, query, *, project=None, limit=20):
-        """Find mail by words in subjects and bodies, newest first. Set
+        """Find messages by words in subjects and bodies, newest first. Set
         `project` to a root id to scope it; omit for the whole host. Returns
-        hits with thread and message ids for `mail.read` or `mail.send`."""
-        results = _host(_rho.search_mail, _text(query), None if project is None else rho_mail.ident(project), int(limit))
+        hits with thread and message ids for `chat.read`."""
+        results = _host(_rho.search, _text(query), None if project is None else rho_chat.ident(project), int(limit))
         for hit in results:
-            print(f"#{hit['thread']} {_label_text(hit['subject'])} · mail #{hit['message']} · {hit['excerpt']}")
+            print(f"#{hit['thread']} {_label_text(hit['subject'])} · message #{hit['message']} · {hit['excerpt']}")
         if not results:
-            print("No mail found.")
-        return _MailHits(results)
+            print("Nothing found.")
+        return _Hits(results)
 
-    def fork(self, message, text):
-        """Start a tangent under mail #message and follow it. Returns
-        the thread id; use it for follow-ups."""
-        thread = rho_mail.ident(message)
-        self.send(thread, text)
-        rho_mail.join(thread, self._agent)
+    def fork(self, message, text, kind):
+        """Start a tangent under the given message and follow it."""
+        thread = rho_chat.ident(message)
+        self.send(text, kind, thread=thread)
+        rho_chat.join(thread, self._agent)
         return _MessageId(thread)
 
-    def start(self, project, text):
-        """Start and follow a thread in a local project, creating the
-        project if it is new. Returns the thread id."""
-        project = _text(project)
-        root = rho_mail.root(project)
-        if root is None:
-            root = rho_mail.make_project(self._agent, project)
-        thread = rho_mail.send(self._agent, root, text)
-        rho_mail.join(thread, self._agent)
+    def start(self, project, text, kind):
+        """Start and follow a thread with a message in a project, which is
+        made where you work if it is new."""
+        if kind != "message":
+            raise ValueError("a thread starts with a message; post a flash in an existing thread")
+        root = rho_chat.start_project(self._agent, _text(project))
+        thread = self.send(text, kind, thread=root)
+        rho_chat.join(thread, self._agent)
         print(f"Started #{thread}.")
         return _MessageId(thread)
 
     def roots(self):
         """The projects, oldest first, each with its id."""
         lines = [
-            f"#{record['id']} {_label_text(rho_mail.thread(record['id'])['name'])}"
-            for record in rho_mail.read(None, 1 << 31)
+            f"#{record['id']} {_label_text(rho_chat.thread(record['id'])['name'])}"
+            for record in rho_chat.read(None, 1 << 31)
         ]
         return report("\n".join(lines) if lines else "No threads yet.")
 
     def join(self, thread):
-        """Follow later mail in `thread` and under it. Direct mail is
-        delivered only to its addressee."""
+        """Follow later messages in `thread` and under it."""
         self._thread(thread)
-        rho_mail.join(int(thread), self._agent)
+        rho_chat.join(int(thread), self._agent)
         return report(f"Joined #{int(thread)}.")
 
     def leave(self, thread):
-        """Stop receiving `thread`'s messages; a mention still reaches you."""
+        """Stop receiving `thread`'s messages."""
         self._thread(thread)
-        rho_mail.leave(int(thread), self._agent)
+        rho_chat.leave(int(thread), self._agent)
         return report(f"Left #{int(thread)}.")
 
     def name(self, thread, name):
         """Give a thread you are in a name."""
         self._member(thread)
-        rho_mail.name(self._agent, int(thread), str(name))
+        rho_chat.name(self._agent, int(thread), str(name))
         return report(f"Named #{int(thread)}.")
 
     def move(self, message, to):
         """Move a message of a thread you are in, and the thread under it,
         into thread `to`."""
-        record = rho_mail.message(int(message))
+        record = rho_chat.message(int(message))
         if record is None:
             raise ValueError(f"no message #{int(message)}")
-        self._member(rho_mail.thread_of(record))
+        self._member(rho_chat.thread_of(record))
         self._thread(to)
-        rho_mail.reparent(self._agent, int(message), int(to))
+        rho_chat.reparent(self._agent, int(message), int(to))
         return report(f"Moved #{int(message)} to #{int(to)}.")
 
     def _thread(self, thread):
-        head = rho_mail.thread(int(thread))
+        head = rho_chat.thread(int(thread))
         if head is None:
             raise ValueError(f"no thread #{int(thread)}")
         return head
@@ -209,31 +193,36 @@ class Mail:
     def read(self, id, last=20):
         """Show what `#id` names: a thread's `last` newest messages, or a
         message among the `last` around it."""
-        id, last = rho_mail.ident(id), int(last)
-        head = rho_mail.thread(id)
+        id, last = rho_chat.ident(id), int(last)
+        head = rho_chat.thread(id)
         if head is None:
             raise ValueError(f"#{id} names no message")
-        under = rho_mail.read(id, last)
+        under = rho_chat.read(id, last)
         if under:
-            thread, records = id, [rho_mail.message(id), *under]
+            thread, records = id, [rho_chat.message(id), *under]
         else:
-            thread = rho_mail.thread_of(rho_mail.message(id))
-            head = rho_mail.thread(thread)
-            records = _around([rho_mail.message(thread), *rho_mail.read(thread, 1 << 31)], id, last)
+            thread = rho_chat.thread_of(rho_chat.message(id))
+            head = rho_chat.thread(thread)
+            records = _around([rho_chat.message(thread), *rho_chat.read(thread, 1 << 31)], id, last)
         lines = [where(head)]
         for record in records:
             sender = record["sender"]
-            sender = sender if sender in (rho_mail.USER, "system") else label(sender)
+            sender = sender if sender in (rho_chat.USER, "system") else label(sender)
             mark = "→ " if record["id"] == id and thread != id else ""
             edited = " (edited)" if record.get("edited") else ""
             text = "[deleted]" if record.get("deleted") else record["text"]
-            target = record["reply_to"]
-            reply = f" (reply to #{target})" if target is not None else ""
-            lines.append(f"{mark}#{record['id']} {sender}{edited}{reply}: {text}")
+            if record["voice"] == "agent":
+                voice = f" (to {label(record['to'])})"
+            elif record["voice"] == "flash":
+                voice = " (flash)"
+            else:
+                voice = ""
+            retry = f" (retry of #{record['retry_of']})" if record["retry_of"] is not None else ""
+            lines.append(f"{mark}#{record['id']} {sender}{edited}{voice}{retry}: {text}")
         return report("\n".join(lines))
 
     def __repr__(self):
-        return "<mail>"
+        return "<chat>"
 
 
 def _text(text):
@@ -261,41 +250,6 @@ def _label_text(name):
     short line that cannot close the header."""
     text = " ".join(name.split()).replace("[", "(").replace("]", ")")
     return text if len(text) <= 80 else text[:79] + "…"
-
-
-
-class Chat(Mail):
-    """Chat in project threads and with agents on this host."""
-
-    def send(self, text, kind, *, thread):
-        """Speak to the user in a thread. Name the kind: "message" pings;
-        "flash" shows without a card. Returns the id of the post."""
-        return rho_mail.send_chat(self._agent, text, kind, thread=thread)
-
-    def edit(self, message, text):
-        """Change the words of your message or flash without changing its kind."""
-        return super().edit(message, text)
-
-    def fork(self, message, text, kind):
-        """Start a tangent under the given message and follow it."""
-        thread = rho_mail.ident(message)
-        self.send(text, kind, thread=thread)
-        rho_mail.join(thread, self._agent)
-        return _MessageId(thread)
-
-    def start(self, project, text, kind):
-        """Start and follow a thread with a message."""
-        if kind != "message":
-            raise ValueError("a thread starts with a message; post a flash in an existing thread")
-        project = _text(project)
-        root = rho_mail.root(project)
-        if root is None:
-            root = rho_mail.make_project(self._agent, project)
-        thread = self.send(text, kind, thread=root)
-        rho_mail.join(thread, self._agent)
-        print(f"Started #{thread}.")
-        return _MessageId(thread)
-
 
 
 
@@ -365,16 +319,15 @@ class Messages:
         other = rho_agents.resolve(str(agent_id))
         if other == self._agent:
             raise ValueError("cannot message yourself")
-        address = label(other)
-        rho_mail.send(self._agent, address, _text(message))
-        return report(f"Sent to {address}.")
+        rho_chat.message_agent(self._agent, other, _text(message))
+        return report(f"Sent to {label(other)}.")
 
 
 class Agents(Messages):
     """Talking to, starting and stopping other agents."""
 
-    # Cross-host mail keeps its existing addressed transport until peers
-    # on two hosts share the mail record.
+    # Cross-host messages keep their addressed transport until peers on
+    # two hosts share the chat record.
     @property
     def external(self):
         """Agents on other hosts: `address`, `accept`, `send`, `contacts`."""
@@ -397,7 +350,7 @@ class Agents(Messages):
         the same way."""
         self._check_depth()
         agent = rho_agents.create(runtime, props)
-        rho_mail.send(self._agent, label(agent.id), prompt)
+        rho_chat.message_agent(self._agent, agent.id, prompt)
         return agent
 
     def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
@@ -410,8 +363,8 @@ class Agents(Messages):
         child = self._spawn(engineer_runtime(me.runtime), props, str(prompt))
         return report(
             f'Spawned agent {label(child.id)} for task "{task_name}". It is working now; its '
-            f"results will arrive by mail. It works in {cwd}. Follow up with "
-            f"mail.send({label(child.id)!r}, text)."
+            f"results will arrive as messages. It works in {cwd}. Follow up with "
+            f"agents.message(agent_id={label(child.id)!r}, message=text)."
         )
 
     def spawn_new_advisor(self, msg):
@@ -424,7 +377,7 @@ class Agents(Messages):
         advisor = self._spawn(advisor_runtime(me.runtime), props, str(msg))
         return report(
             f"Advisor {label(advisor.id)} is considering the question. Its answer will arrive "
-            f"by mail."
+            f"as a message."
         )
 
     def cancel(self, *, agent_id):
@@ -455,8 +408,8 @@ class UserAgents(Agents):
     def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None, thread=None):
         """Start an Engineer the user manages; it reports to the user, not to
         you. Its brief is the first message of a new thread named
-        `task_name`, in `thread`, or beside the thread you were started in,
-        and mentions the user."""
+        `task_name`, in `thread`, or beside the thread you were started in:
+        a message to the user."""
         if not str(prompt).strip():
             raise ValueError("prompt must not be empty")
         me = self._me()
@@ -465,17 +418,17 @@ class UserAgents(Agents):
             thread = _origin_root(me.props)
             if thread is None:
                 raise ValueError("you were not started from a thread; pass thread=")
-        elif rho_mail.thread(int(thread)) is None:
+        elif rho_chat.thread(int(thread)) is None:
             raise ValueError(f"no thread #{int(thread)}")
         self._check_depth()
-        message = rho_mail.send(me.id, rho_mail.USER, str(prompt), thread=thread, ping=False)
-        rho_mail.name(me.id, message, str(task_name))
+        message = rho_chat.send_chat(me.id, str(prompt), "message", thread=thread)
+        rho_chat.name(me.id, message, str(task_name))
         props = {
             "name": task_name,
             "preset": "engineer",
             "started_by": me.id,
             "cwd": cwd,
-            rho_mail.ORIGIN: rho_mail.origin(message),
+            rho_chat.ORIGIN: rho_chat.origin(message),
         }
         agent = rho_agents.create(engineer_runtime(me.runtime), props)
         return report(
@@ -486,10 +439,10 @@ class UserAgents(Agents):
 
 def _origin_root(props):
     """The root of the thread an agent was started from, if any."""
-    message = rho_mail.origin_message(props)
+    message = rho_chat.origin_message(props)
     if message is None:
         return None
-    head = rho_mail.thread(rho_mail.thread_of(rho_mail.message(message)))
+    head = rho_chat.thread(rho_chat.thread_of(rho_chat.message(message)))
     return head["path"][0][0]
 
 
@@ -521,9 +474,9 @@ class Skills:
 
 
 def exports(agent) -> dict:
-    """Advisors have mail and skills, but do not start other agents."""
+    """Advisors have chat and skills, but do not start other agents."""
     preset = agent.props["preset"]
-    tools = {"mail": Mail(agent.id), "chat": Chat(agent.id), "skills": Skills(agent.id)}
+    tools = {"chat": Chat(agent.id), "skills": Skills(agent.id)}
     if preset == "engineer":
         tools["agents"] = UserAgents(agent.id)
     elif preset == "child":

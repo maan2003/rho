@@ -17,6 +17,7 @@ class State:
         self.elsewhere = set()  # agents of the host's other worksets
         self.events = 0  # the chat log's newest seq
         self.messages = []  # MessageRecord, in order, with `_to`: who receives it
+        self.projects = set()  # the roots the host made projects
         self.send_error = None
         self.members = {}  # (thread, agent) -> joined (True) or left
         self.names = {}  # thread -> name
@@ -170,22 +171,28 @@ def _members_under(parent):
     return [agent for agent, joined in decided.items() if joined]
 
 
-def _post(sender, parent, text, mentions, reply_to=None):
+def _post(sender, parent, text, voice="message", to=None, retry_of=None):
     """With the lock held. Who receives a message is fixed when it is
-    posted, as the host's inbox index fixes it."""
+    posted, as the host's inbox index fixes it: the user's message reaches
+    the members, one agent's words to another reach that agent, and the
+    project's words to the user reach no agent."""
     if parent is not None and _message(parent) is None:
         raise ValueError(f"no message {parent}")
     if not text.strip():
         raise ValueError("a message needs text")
-    for address, kind in mentions:
-        assert (type(kind) is bool if address == "user" else kind in ("ask", "fyi", "direct")), kind
-        assert address == "user" or address in STATE.agents or address in STATE.elsewhere, address
-    members = [] if any(kind == "direct" for _, kind in mentions) else _members_under(parent)
-    to = [agent for agent in members + [address for address, _ in mentions] if agent not in ("user", sender)]
+    assert voice in ("message", "flash", "agent"), voice
+    assert (voice == "agent") == (to is not None), (voice, to)
+    if sender == "user":
+        receivers = [agent for agent in _members_under(parent)]
+    elif voice == "agent":
+        receivers = [to] if to != sender else []
+    else:
+        receivers = []
     id = _event()
     STATE.messages.append({
-        "id": id, "at": 0, "parent": parent, "sender": sender, "mentions": list(mentions),
-        "text": text, "reply_to": reply_to, "_to": set(to),
+        "id": id, "at": 0, "parent": parent, "retry_of": retry_of, "sender": sender,
+        "voice": voice, "to": to, "text": text, "edited": False, "deleted": False,
+        "_to": set(receivers),
     })
     return id
 
@@ -194,62 +201,72 @@ def _public(message):
     return {key: value for key, value in copy.deepcopy(message).items() if not key.startswith("_")}
 
 
-def post(sender, parent, text, *, mentions=None):
+def post(sender, parent, text, *, voice="message", to=None):
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        return _post(sender, parent, text, mentions or [])
+        return _post(sender, parent, text, voice, to)
 
 
 def send_chat(sender, thread, text, kind):
-    return send_mail(sender, thread, text, to="user", ping=(kind == "message"))
-
-
-def send_mail(sender, parent, text, *, to=None, ping=None, reply_to=None, replace_last=False):
+    assert kind in ("message", "flash"), kind
     with STATE.lock:
         if sender not in STATE.agents:
             raise ValueError(f"{sender} is not an agent of this workset")
-        if to in (None, "user"):
-            mentions = [] if to is None else [(to, True if ping is None else ping)]
-            if STATE.send_error:
-                raise RuntimeError(STATE.send_error)
-            return _post(sender, parent, text, mentions, reply_to)
+        if STATE.send_error:
+            raise RuntimeError(STATE.send_error)
+        return _post(sender, thread, text, kind)
+
+
+def _root_of(id):
+    record = _message(id)
+    while record and record["parent"] is not None:
+        record = _message(record["parent"])
+    return record["id"] if record else None
+
+
+def message_agent(sender, to, text):
+    """As the host keeps it: under the project of the sender, or of the
+    agent that started it, in the pair's thread."""
+    with STATE.lock:
+        if sender not in STATE.agents:
+            raise ValueError(f"{sender} is not an agent of this workset")
         if to not in STATE.agents and to not in STATE.elsewhere:
             raise ValueError("agent was deleted or does not exist")
         if sender == to:
-            raise ValueError("an agent does not mail itself")
-
-        def root_of(id):
-            record = _message(id)
-            while record and record["parent"] is not None:
-                record = _message(record["parent"])
-            return record["id"] if record else None
-
-        peer_reply = _message(reply_to) if reply_to is not None else None
-        if peer_reply and any(k == "direct" for _, k in peer_reply["mentions"]):
-            project = root_of(reply_to)
-        else:
-            who = sender
-            project = None
-            while who in STATE.agents:
-                props = STATE.agents[who]["props"]
-                if props.get("origin"):
-                    project = root_of(int(props["origin"].split(":")[1]))
-                elif joined := next((thread for thread, name in STATE.members if name == who), None):
-                    project = root_of(joined)
-                if project:
-                    break
-                who = props.get("parent") or props.get("started_by")
+            raise ValueError("an agent does not message itself")
+        who, project = sender, None
+        while who in STATE.agents:
+            props = STATE.agents[who]["props"]
+            if props.get("origin"):
+                project = _root_of(int(props["origin"].split(":")[1]))
+            elif joined := next((thread for thread, name in STATE.members if name == who), None):
+                project = _root_of(joined)
+            if project:
+                break
+            who = props.get("parent") or props.get("started_by")
         if project is None:
             project = next((m["id"] for m in STATE.messages if m["parent"] is None and m["text"] == "Agent mail"), None)
             if project is None:
-                project = _post(sender, None, "Agent mail", [])
+                project = _post(sender, None, "Agent mail")
         pair = {sender, to}
         thread = next((m["id"] for m in STATE.messages
-            if m["parent"] == project and any(k == "direct" and {m["sender"], peer} == pair for peer, k in m["mentions"])), None)
-        id = _post(sender, thread or project, text, [(to, "direct")], reply_to)
+            if m["parent"] == project and m["voice"] == "agent" and {m["sender"], m["to"]} == pair), None)
+        id = _post(sender, thread or project, text, "agent", to)
         if thread is None:
             STATE.names[id] = " ↔ ".join(sorted(pair))
+        return id
+
+
+def start_project(agent, name):
+    with STATE.lock:
+        assert agent in STATE.agents, agent
+    found = project_named(name)
+    if found is not None:
+        return found
+    with STATE.lock:
+        id = _post(agent, None, name)
+        STATE.projects.add(id)
         return id
 
 
@@ -406,10 +423,10 @@ def project_named(name):
         )
 
 
-def post_user(parent, text, mentions=()):
-    """What the host does with the GUI's Post: the user's mentions ask."""
+def post_user(parent, text):
+    """What the host does with the GUI's Post."""
     with STATE.lock:
-        return _post("user", parent, text, [(agent, "ask") for agent in mentions])
+        return _post("user", parent, text)
 
 
 async def inbox(agent, after):

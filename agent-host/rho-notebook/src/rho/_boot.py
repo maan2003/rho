@@ -128,7 +128,7 @@ def _announce(agent_id: str) -> None:
 
 
 def redeliver_soon(agent_id: str) -> None:
-    """After replacing its loop, reread mail from the durable cursor."""
+    """After replacing its loop, reread messages from the durable cursor."""
     def restart():
         if (old := _announced.pop(agent_id, None)) is not None:
             old.cancel()

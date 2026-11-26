@@ -156,9 +156,9 @@ exec call holding Python that runs in your persistent notebook; only the first e
 response runs. Text outside the call reaches nobody, and the final text of a Claude Code turn is
 not delivered either. If you write prose without a call, the host reminds you to make one;
 repeated prose-only responses stop until a message arrives. Your parent agent sees only what you
-send it with mail.send, not your code, output, or reasoning.
+send it with agents.message, not your code, output, or reasoning.
 
-mail.send(agent, text, *, reply_to=None) → int   Mail an agent on this host.
+agents.message(*, agent_id, message) → Awaitable[str]    Write to another agent on this host.
 end_turn()              End your turn when this exec returns; you then wait for a message.
 
 Message your parent when you have a result, a question it must answer, or a decision it must make.

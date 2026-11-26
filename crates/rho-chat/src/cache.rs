@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle as _};
 use rho_agent_types::{
-    Address, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, Mention, MessageId,
+    Address, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId, Voice,
     content_text,
 };
 use rho_db::{RhoDb, Sen, SenValue};
@@ -26,9 +26,9 @@ use crate::outbox::{Kept, Outgoing};
 type Host = [u8; 32];
 
 /// Every record, by the host and position.
-const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("mail6_log");
+const LOG: TableDefinition<(Host, u64), Sen<ChatRecord>> = TableDefinition::new("chat7_log");
 /// Where this client stands in each host's log.
-const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("mail6_cursor");
+const CURSOR: TableDefinition<Host, u64> = TableDefinition::new("chat7_cursor");
 /// What the user wrote that no host has taken yet, by host and client id.
 const OUTBOX: TableDefinition<(Host, u64), Sen<Outgoing>> = TableDefinition::new("chat3_outbox");
 /// What the user is writing under each parent and has not sent, by host
@@ -107,7 +107,7 @@ pub struct Cache {
     writer: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Which person the transcript should say this mail reached, and its words at
+/// Whom the transcript should say these words reached, and the words at
 /// the writing step. These are read from the existing log, not stored again.
 pub struct WrittenMail {
     pub audience: MailAudience,
@@ -115,32 +115,19 @@ pub struct WrittenMail {
 }
 
 pub enum MailAudience {
+    /// A message or a flash to the user.
     User,
-    Direct,
-    Project,
+    /// One agent's words to another.
+    Agent,
     System,
 }
 
 impl WrittenMail {
-    pub(crate) fn from_content(
-        from: Address,
-        mentions: &[Mention],
-        content: &[ContentPart],
-    ) -> Self {
-        let audience = if matches!(from, Address::System { .. } | Address::StartFailed) {
-            MailAudience::System
-        } else if mentions
-            .iter()
-            .any(|mention| matches!(mention, Mention::User { .. }))
-        {
-            MailAudience::User
-        } else if mentions
-            .iter()
-            .any(|mention| matches!(mention, Mention::Direct(_)))
-        {
-            MailAudience::Direct
-        } else {
-            MailAudience::Project
+    pub(crate) fn from_content(from: Address, voice: Voice, content: &[ContentPart]) -> Self {
+        let audience = match (from, voice) {
+            (Address::System { .. } | Address::StartFailed, _) => MailAudience::System,
+            (_, Voice::ToAgent(_)) => MailAudience::Agent,
+            _ => MailAudience::User,
         };
         Self {
             audience,
@@ -158,13 +145,12 @@ impl Cache {
         let frame_idea = frame_idea_draft(&db);
         runtime.block_on(async {
             let mut write = db.write().await;
-            // Older clients cannot decode live revisions or the new stop.
-            // Give the new copy its own tables. Drafts and unsent mail
-            // are user state and keep their existing tables.
-            write.delete_table("chat3_log");
-            write.delete_table("mail5_log");
-            write.delete_table("chat3_cursor");
-            write.delete_table("mail5_cursor");
+            // Older copies hold posts before each had one voice. The host
+            // still has them: read the log again into new tables. Drafts and
+            // unsent mail are user state and keep their existing
+            // tables.
+            write.delete_table("mail6_log");
+            write.delete_table("mail6_cursor");
             open_or_rebuild(&mut write, LOG);
             open_or_rebuild(&mut write, CURSOR);
             write.open_table(OUTBOX);
@@ -264,7 +250,7 @@ impl Cache {
                 };
                 let ChatEvent::Posted {
                     from,
-                    mentions,
+                    voice,
                     content,
                     ..
                 } = record(message.0)?.event
@@ -284,7 +270,7 @@ impl Cache {
                 };
                 Some((
                     (message, version),
-                    WrittenMail::from_content(from, &mentions, &words),
+                    WrittenMail::from_content(from, voice, &words),
                 ))
             })
             .collect()
@@ -489,12 +475,11 @@ mod tests {
             seq: ChatSeq(seq),
             at: UnixMs(seq),
             event: ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: None,
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from: Address::User,
-                mentions: Vec::new(),
+                voice: rho_agent_types::Voice::Message,
                 content: vec![ContentPart::Text {
                     text: format!("m{seq}"),
                 }],
@@ -545,7 +530,6 @@ mod tests {
             parent: Some(MessageId(ChatSeq(2))),
             failed_start: None,
             settles: None,
-            mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "unsent".into(),
             }],
@@ -560,11 +544,11 @@ mod tests {
                 let mut write = db.write().await;
                 write
                     .open_table(TableDefinition::<(Host, u64), Sen<ChatRecord>>::new(
-                        "chat3_log",
+                        "mail6_log",
                     ))
                     .insert((H1.0, 2), SenValue::borrowed(&record(2)));
                 write
-                    .open_table(TableDefinition::<Host, u64>::new("chat3_cursor"))
+                    .open_table(TableDefinition::<Host, u64>::new("mail6_cursor"))
                     .insert(H1.0, 2);
                 write
                     .open_table(OUTBOX)
@@ -651,7 +635,6 @@ mod tests {
             parent: Some(MessageId(ChatSeq(2))),
             failed_start: Some(MessageId(ChatSeq(1))),
             settles: None,
-            mentions: Vec::new(),
             content: vec![ContentPart::Text { text: "hi".into() }],
             delivery: crate::outbox::Delivery::Retry,
             runtime: None,

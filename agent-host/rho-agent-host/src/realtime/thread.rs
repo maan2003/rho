@@ -217,7 +217,7 @@ fn escape_bounded(text: &str, retain: Retain) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{AgentIdDomain, ChatSeq, ContentPart, Mention, MessageId, UnixMs};
+    use rho_agent_types::{AgentIdDomain, ChatSeq, ContentPart, MessageId, UnixMs, Voice};
 
     use super::*;
 
@@ -225,27 +225,24 @@ mod tests {
         AgentId::from_counter(counter, &AgentIdDomain(0)).unwrap()
     }
 
-    fn message(from: Address, mentions: Vec<Mention>, text: &str) -> Message {
+    fn message(from: Address, voice: Voice, text: &str) -> Message {
         Message {
-            kind: rho_agent_types::MessageKind::Kept,
             id: MessageId(ChatSeq(3)),
             at: UnixMs(1),
             parent: Some(MessageId(ChatSeq(2))),
-            reply_to: None,
+            retry_of: None,
+            thread_reply: None,
             from,
-            mentions,
+            voice,
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
             revision: rho_agent_types::Revision::Original,
-            ping_started: None,
-            thread_reply: None,
         }
     }
 
-    fn sent(ping: Option<bool>, text: &str) -> Message {
-        let mentions = ping.map_or_else(Vec::new, |ping| vec![Mention::User { ping }]);
-        message(Address::Agent(agent(1)), mentions, text)
+    fn sent(voice: Voice, text: &str) -> Message {
+        message(Address::Agent(agent(1)), voice, text)
     }
 
     fn channel_name(channel: ContextChannel) -> &'static str {
@@ -328,10 +325,8 @@ mod tests {
     #[test]
     fn the_mention_of_the_user_picks_the_channel_and_whether_the_request_is_done() {
         let cases = [
-            (None, "commentary", "[STATUS] looking", false),
-            (Some(false), "commentary", "[STATUS] looking", false),
-            (Some(true), "speakable", "[COMPLETE] looking", true),
-            (Some(true), "speakable", "[COMPLETE] looking", true),
+            (Voice::Flash, "commentary", "[STATUS] looking", false),
+            (Voice::Message, "speakable", "[COMPLETE] looking", true),
         ];
         for (kind, channel, text, complete) in cases {
             let (got_channel, got_text, got_complete) =
@@ -344,16 +339,12 @@ mod tests {
         }
         // A result that mentions another agent, not the user, does not end
         // the request; another agent's message is not this agent's answer.
-        let to_agent = message(
-            Address::Agent(agent(1)),
-            vec![Mention::Direct(agent(7))],
-            "x",
-        );
+        let to_agent = message(Address::Agent(agent(1)), Voice::ToAgent(agent(7)), "x");
         assert_eq!(
             reply(&to_agent, agent(1)).map(|(_, _, done)| done),
             Some(false)
         );
-        assert_eq!(reply(&sent(Some(true), "x"), agent(7)), None);
+        assert_eq!(reply(&sent(Voice::Message, "x"), agent(7)), None);
         let (channel, text, complete) = stopped("quota");
         assert_eq!(
             (channel_name(channel), text.as_str(), complete),
@@ -365,20 +356,23 @@ mod tests {
     fn the_conversation_is_the_users_messages_and_this_agents() {
         let other = Address::Agent(agent(2));
         assert_eq!(
-            Said::of(&message(Address::User, vec![], "ask"), agent(1)),
+            Said::of(&message(Address::User, Voice::Message, "ask"), agent(1)),
             Some(Said::User("ask".to_owned()))
         );
         assert_eq!(
-            Said::of(&sent(Some(true), "done"), agent(1)),
+            Said::of(&sent(Voice::Message, "done"), agent(1)),
             Some(Said::Agent("done".to_owned()))
         );
-        assert_eq!(Said::of(&message(other, vec![], "x"), agent(1)), None);
+        assert_eq!(
+            Said::of(&message(other, Voice::Message, "x"), agent(1)),
+            None
+        );
     }
 
     #[test]
     fn a_long_reply_is_cut_to_two_thousand_tokens() {
         let text = format!("HEAD{}TAIL", "ü".repeat(20_000));
-        let (_, reply, _) = reply(&sent(Some(true), &text), agent(1)).unwrap();
+        let (_, reply, _) = reply(&sent(Voice::Message, &text), agent(1)).unwrap();
         assert!(reply.starts_with("[COMPLETE] HEAD") && reply.ends_with("TAIL"));
         assert!(reply.len() <= REPLY_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN + 20);
     }

@@ -19,8 +19,7 @@ use jiff::Timestamp;
 use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
-    Address as Party, AgentId, ChatSeq, EndpointId, Mention, Message, MessageId, MessageKind,
-    Revision, UnixMs,
+    Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, Revision, UnixMs, Voice,
 };
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
@@ -251,7 +250,7 @@ fn latest_project_activity(system: &ChatSystem, thread: ThreadId) -> Option<Chat
     let mut project_post = None;
     for mail in chat
         .reading_order(thread.message)
-        .filter(|mail| mail.kind == MessageKind::Kept)
+        .filter(|mail| mail.voice != Voice::Flash)
     {
         if matches!(
             mail.revision,
@@ -716,17 +715,10 @@ fn history_items(
         .unwrap_or_default();
     let now = Timestamp::now();
     let mail_item = |message: &Message| {
-        let voice = match message.from {
-            Party::Agent(agent)
-                if message
-                    .mentions
-                    .iter()
-                    .any(|m| matches!(m, Mention::Direct(_))) =>
-            {
-                system
-                    .agent_label(host, agent, cx)
-                    .or_else(|| Some(agent.encoded()))
-            }
+        let voice = match (message.from, message.voice) {
+            (Party::Agent(agent), Voice::ToAgent(_)) => system
+                .agent_label(host, agent, cx)
+                .or_else(|| Some(agent.encoded())),
             _ => None,
         };
         message_item(message, voice.as_deref(), &expanded.quotes, now)
@@ -1547,11 +1539,11 @@ fn message_item(
 ) -> Option<Item<Key, Class, Meta>> {
     let edited = match message.revision {
         Revision::Original => "",
-        Revision::Edited { .. } => " · edited",
+        Revision::Edited { .. } | Revision::Recovered { .. } => " · edited",
         Revision::TakenBack { .. } => " · taken back",
         Revision::Deleted => return None,
     };
-    let flash = message.kind == MessageKind::Flash;
+    let flash = message.voice == Voice::Flash;
     let tag = if flash {
         format!("{edited} · {}", ago(message.at.0, now))
     } else {
@@ -1938,20 +1930,13 @@ mod tests {
             message: MessageId(ChatSeq(2)),
         };
         let mut log = HostChat::default();
-        let ask = |words: &'static str| {
-            (
-                Party::Agent(a),
-                words,
-                vec![Mention::User { ping: true }],
-                None,
-            )
-        };
+        let ask = |words: &'static str| (Party::Agent(a), words, Voice::Message, None);
         let mut posts = vec![
-            (1, None, (Party::User, "Clock", Vec::new(), None)),
+            (1, None, (Party::User, "Clock", Voice::Message, None)),
             (
                 2,
                 Some(root),
-                (Party::User, "Check the clocks.", Vec::new(), None),
+                (Party::User, "Check the clocks.", Voice::Message, None),
             ),
             (3, Some(thread.message), ask("Use clock A?")),
             (
@@ -1960,7 +1945,7 @@ mod tests {
                 (
                     Party::User,
                     "Yes, clock A.",
-                    Vec::new(),
+                    Voice::Message,
                     Some(ThreadReply {
                         settles: Some(MessageVersion {
                             message: MessageId(ChatSeq(3)),
@@ -1973,17 +1958,16 @@ mod tests {
         if asked_again {
             posts.push((5, Some(thread.message), ask("Widen the retry window?")));
         }
-        for (id, parent, (from, words, mentions, thread_reply)) in posts {
+        for (id, parent, (from, words, voice, thread_reply)) in posts {
             log.tell(&ChatRecord {
                 seq: ChatSeq(id),
                 at: UnixMs(id),
                 event: ChatEvent::Posted {
                     parent,
                     from,
-                    mentions,
-                    reply_to: None,
+                    voice,
+                    retry_of: None,
                     thread_reply,
-                    kind: MessageKind::Kept,
                     content: vec![ContentPart::Text { text: words.into() }],
                 },
             });
@@ -2080,10 +2064,9 @@ mod tests {
                         event: ChatEvent::Posted {
                             parent: Some(thread.message),
                             from: Party::Agent(agent),
-                            mentions: vec![Mention::User { ping: true }],
-                            reply_to: None,
+                            voice: Voice::Message,
+                            retry_of: None,
                             thread_reply: None,
-                            kind: MessageKind::Kept,
                             content: vec![ContentPart::Text {
                                 text: "Widen the retry window?".into(),
                             }],
@@ -2132,12 +2115,11 @@ mod tests {
                 seq: ChatSeq(seq),
                 at: UnixMs(seq),
                 event: ChatEvent::Posted {
-                    kind: MessageKind::Kept,
                     parent: parent.map(|id| MessageId(ChatSeq(id))),
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from,
-                    mentions: Vec::new(),
+                    voice: Voice::Message,
                     content: vec![ContentPart::Text { text }],
                 },
             });
@@ -2282,12 +2264,11 @@ mod tests {
                 seq: ChatSeq(seq),
                 at: UnixMs(1_760_000_000_000 + seq),
                 event: ChatEvent::Posted {
-                    kind: rho_agent_types::MessageKind::Kept,
                     parent: parent.map(|id| MessageId(ChatSeq(id))),
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from,
-                    mentions: Vec::new(),
+                    voice: Voice::Message,
                     content: vec![ContentPart::Text { text: text.into() }],
                 },
             }
@@ -2343,13 +2324,7 @@ mod tests {
                     Party::User,
                     "My preceding answer.\n\n> The earlier question.",
                 ));
-                let mut latest = post(4, Some(2), agent, "The latest question.");
-                if matches!(check, CheckThread::ThreadReply)
-                    && let ChatEvent::Posted { mentions, .. } = &mut latest.event
-                {
-                    mentions.push(Mention::User { ping: true });
-                }
-                log.tell(&latest);
+                log.tell(&post(4, Some(2), agent, "The latest question."));
                 if matches!(check, CheckThread::WorkTarget) {
                     log.tell(&ChatRecord {
                         seq: ChatSeq(5),
@@ -2434,11 +2409,7 @@ mod tests {
                             agent: other,
                         },
                     });
-                    let mut latest = post(7, Some(2), Party::Agent(other), "Another question.");
-                    if let ChatEvent::Posted { mentions, .. } = &mut latest.event {
-                        mentions.push(Mention::User { ping: true });
-                    }
-                    log.tell(&latest);
+                    log.tell(&post(7, Some(2), Party::Agent(other), "Another question."));
                     cx.notify();
                 });
             });
@@ -2737,19 +2708,17 @@ mod tests {
 
     fn mail(from: Party, revision: Revision, text: &str) -> Message {
         Message {
-            kind: rho_agent_types::MessageKind::Kept,
             id: MessageId(rho_agent_types::ChatSeq(13)),
             parent: None,
-            reply_to: None,
+            retry_of: None,
             thread_reply: None,
             at: rho_agent_types::UnixMs(1_760_000_000_000),
             from,
-            mentions: Vec::new(),
+            voice: Voice::Message,
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
             revision,
-            ping_started: None,
         }
     }
 
@@ -2804,8 +2773,8 @@ mod tests {
             },
             "## recap\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.",
         );
-        result.mentions = vec![Mention::User { ping: true }];
-        result.ping_started = Some((result.id.0, result.at));
+        // A message in a thread: words at a root never ping.
+        result.parent = Some(MessageId(ChatSeq(2)));
         let item = message_item(&result, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
         assert_eq!(
             item.text,
@@ -2826,7 +2795,7 @@ mod tests {
         let b = AgentId::from_counter(2, &domain).unwrap();
         let flash = |id, agent, revision| Message {
             id: MessageId(ChatSeq(id)),
-            kind: MessageKind::Flash,
+            voice: Voice::Flash,
             at: UnixMs(100_000),
             ..mail(
                 Party::Agent(agent),

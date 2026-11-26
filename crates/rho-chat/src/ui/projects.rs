@@ -7,7 +7,7 @@ use std::rc::Rc;
 use gpui::{App, Context, Entity, Window};
 use rho_agent_types::{
     EndpointId, ProjectChange, ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace,
-    RUNTIMES, RuntimeKind, RuntimeLabel,
+    RuntimeCatalogue, RuntimeLabel,
 };
 use rho_frame::{Candidate, Frame, Point, Row, Rows};
 use rho_window::style::StyleClass;
@@ -29,64 +29,32 @@ pub(super) struct NewProject {
 /// What waits for a project being made: the idea that named it.
 pub(super) type ProjectCreated = Rc<dyn Fn(IdeaProject, &mut App)>;
 
-/// The runtimes the project and idea prompts offer, with `first` and what
-/// it is said to be at the top.
-pub(super) fn runtime_candidates(
-    needle: &str,
-    first: Option<(&RuntimeLabel, &str)>,
-) -> Vec<Candidate> {
-    let needle = needle.trim().to_ascii_lowercase();
-    let mut candidates: Vec<_> = RUNTIMES
-        .into_iter()
-        .map(str::to_owned)
-        .chain(
-            [RuntimeKind::Rho, RuntimeKind::Claude]
-                .into_iter()
-                .flat_map(RuntimeLabel::choices)
-                .filter(|label| !RUNTIMES.contains(&label.as_str())),
-        )
-        .filter(|label| label.contains(&needle))
-        .map(|value| {
-            let description = first
-                .filter(|(label, _)| label.as_str() == value)
-                .map_or("", |(_, description)| description)
-                .to_owned();
-            Candidate { value, description }
-        })
-        .collect();
-    if let Some((label, _)) = first {
-        candidates.sort_by_key(|candidate| candidate.value != label.as_str());
-    }
-    candidates
-}
-
 impl ChatSystem {
     pub fn set_known_places(&mut self, places: KnownPlaces) {
         self.known_places = places;
     }
 
-    pub(super) fn project_config(&self, thread: ThreadId) -> Option<&ProjectConfig> {
-        self.settings
-            .get(&thread.host)?
-            .get(&ProjectId(thread.message))
+    /// A project's settings, as the host's log says them.
+    pub(super) fn project_config(&self, thread: ThreadId) -> Option<ProjectConfig> {
+        Some(self.host_chat(thread.host)?.project(thread.message)?.config)
     }
 
     pub(super) fn project_details(&self, project: ThreadId) -> Option<String> {
-        if let Some(config) = self.project_config(project) {
-            let mode = match config.mode {
-                ProjectMode::One => "one agent",
-                ProjectMode::PerIdea => "per idea",
-            };
-            Some(format!(
-                "on {} · {mode} · {}",
-                config.place.label(),
-                config.runtime
-            ))
-        } else if self.settings.contains_key(&project.host) {
-            Some("no place set".into())
-        } else {
-            None
-        }
+        let config = self.project_config(project)?;
+        let mode = match config.mode {
+            ProjectMode::One => "one agent",
+            ProjectMode::PerIdea => "per idea",
+        };
+        Some(format!(
+            "on {} · {mode} · {}",
+            config.place.label(),
+            config.runtime
+        ))
+    }
+
+    /// The runtimes the host offers, once its session has said them.
+    pub fn runtime_catalogue(&self, host: EndpointId) -> Option<RuntimeCatalogue> {
+        self.runtimes.get(&host).cloned()
     }
 
     /// The project commands work from anywhere: on the current thread's
@@ -115,7 +83,7 @@ impl ChatSystem {
                     let current = this
                         .read(cx)
                         .project_config(project)
-                        .map(|config| config.place.clone());
+                        .map(|config| config.place);
                     let change = this.clone();
                     Self::prompt_place(
                         &this,
@@ -145,7 +113,7 @@ impl ChatSystem {
                 here,
                 Rc::new(move |frame, project, address, window, cx| {
                     let Some(config) = this.read(cx).project_config(project) else {
-                        return no_place(frame, &address, cx);
+                        return no_project(frame, &address, cx);
                     };
                     let change = this.clone();
                     prompt_mode(
@@ -173,12 +141,16 @@ impl ChatSystem {
                 here,
                 Rc::new(move |frame, project, address, window, cx| {
                     let Some(config) = runtime.read(cx).project_config(project) else {
-                        return no_place(frame, &address, cx);
+                        return no_project(frame, &address, cx);
                     };
-                    let current = config.runtime.clone();
+                    let Some(catalogue) = runtime.read(cx).runtime_catalogue(project.host) else {
+                        return host_away(frame, cx);
+                    };
+                    let current = config.runtime;
                     let change = runtime.clone();
                     prompt_runtime(
                         format!("{address} runtime ({current}):"),
+                        catalogue,
                         current,
                         "current",
                         Rc::new(move |_, runtime, _, cx| {
@@ -313,6 +285,16 @@ impl ChatSystem {
             project.name.as_str(),
             this.read(cx).host_name(project.host)
         );
+        let Some(catalogue) = this.read(cx).runtime_catalogue(project.host) else {
+            return host_away(frame, cx);
+        };
+        let Some(default) = catalogue.default_runtime().cloned() else {
+            return frame.echo(
+                "new project: the host offers no runtime",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        };
         let created = Rc::new(created);
         Self::prompt_place(
             &this.clone(),
@@ -324,6 +306,8 @@ impl ChatSystem {
                 let project = project.clone();
                 let created = created.clone();
                 let prompt = format!("{address} runtime:");
+                let catalogue = catalogue.clone();
+                let default = default.clone();
                 prompt_mode(
                     &address,
                     ProjectMode::One,
@@ -334,7 +318,8 @@ impl ChatSystem {
                         let place = place.clone();
                         prompt_runtime(
                             prompt.clone(),
-                            RuntimeLabel::default(),
+                            catalogue.clone(),
+                            default.clone(),
                             "default",
                             Rc::new(move |_, runtime, _, cx| {
                                 this.update(cx, |mail, cx| {
@@ -508,9 +493,17 @@ fn prompt_mode(
 
 type ProjectAnswer = Rc<dyn Fn(&mut Frame, ThreadId, String, &mut Window, &mut Context<Frame>)>;
 
-fn no_place(frame: &mut Frame, address: &str, cx: &mut Context<Frame>) {
+fn no_project(frame: &mut Frame, address: &str, cx: &mut Context<Frame>) {
     frame.echo(
-        &format!("{address}: no place set · answer project › works on… first"),
+        &format!("{address}: no such project on its host"),
+        StyleClass::SystemInfo,
+        cx,
+    );
+}
+
+fn host_away(frame: &mut Frame, cx: &mut Context<Frame>) {
+    frame.echo(
+        "the project's host is not attached",
         StyleClass::SystemInfo,
         cx,
     );
@@ -518,8 +511,11 @@ fn no_place(frame: &mut Frame, address: &str, cx: &mut Context<Frame>) {
 
 type RuntimeAnswer = Rc<dyn Fn(&mut Frame, RuntimeLabel, &mut Window, &mut Context<Frame>)>;
 
+/// Offers the host's runtimes, `first` first, and accepts only what the
+/// host offers.
 fn prompt_runtime(
     title: String,
+    catalogue: RuntimeCatalogue,
     first: RuntimeLabel,
     description: &'static str,
     accept: RuntimeAnswer,
@@ -527,11 +523,12 @@ fn prompt_runtime(
     window: &mut Window,
     cx: &mut Context<Frame>,
 ) {
+    let choices = catalogue.clone();
     frame.open_prompt(
         title,
-        Rc::new(move |_, needle, _| runtime_candidates(needle, Some((&first, description)))),
+        Rc::new(move |_, needle, _| runtime_choices(&choices, needle, Some((&first, description)))),
         Rc::new(
-            move |frame, input, window, cx| match RuntimeLabel::parse(&input) {
+            move |frame, input, window, cx| match catalogue.label(&input) {
                 Ok(runtime) => accept(frame, runtime, window, cx),
                 Err(reason) => frame.echo(&reason, StyleClass::SystemInfo, cx),
             },
@@ -539,6 +536,30 @@ fn prompt_runtime(
         window,
         cx,
     );
+}
+
+/// The host's runtimes that start with what was typed: `first` described,
+/// then the usual ones, then every other.
+pub(super) fn runtime_choices(
+    catalogue: &RuntimeCatalogue,
+    needle: &str,
+    first: Option<(&RuntimeLabel, &str)>,
+) -> Vec<Candidate> {
+    let needle = needle.trim().to_ascii_lowercase();
+    let mut choices: Vec<_> = catalogue.choices.iter().collect();
+    let first_label = first.map(|(label, _)| label);
+    choices.sort_by_key(|choice| (first_label != Some(&choice.label), !choice.usual));
+    choices
+        .into_iter()
+        .filter(|choice| choice.label.as_str().starts_with(&needle))
+        .map(|choice| Candidate {
+            value: choice.label.to_string(),
+            description: first
+                .filter(|(label, _)| **label == choice.label)
+                .map_or("", |(_, description)| description)
+                .to_owned(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -642,22 +663,39 @@ mod tests {
         }
     }
 
+    /// The runtime prompt offers what the host said, not what this build
+    /// knows: a runtime only the host has is offered, and the current one
+    /// comes first.
     #[test]
-    fn runtime_choices_rank_the_project_without_losing_unfeatured_pairs() {
-        let current = RuntimeLabel::parse("haiku-max").unwrap();
-        let rows = runtime_candidates("", Some((&current, "project")));
-        assert_eq!(
-            (&*rows[0].value, &*rows[0].description),
-            ("haiku-max", "project")
-        );
-        assert_eq!(rows[1].value, "opus-high");
-        assert_eq!(rows.iter().filter(|row| row.value == "sol-high").count(), 1);
+    fn the_runtime_prompt_offers_the_hosts_catalogue() {
+        let mut catalogue = RuntimeCatalogue::host();
+        let newer = rho_agent_types::RuntimeChoice {
+            label: catalogue.label("sol-high").unwrap(),
+            kind: rho_agent_types::RuntimeKind::Rho,
+            usual: false,
+        };
+        catalogue
+            .choices
+            .retain(|choice| choice.label.model() != "sol");
+        catalogue.choices.push(newer.clone());
+        let current = catalogue.label("haiku-low").unwrap();
+        let offered = runtime_choices(&catalogue, "", Some((&current, "current")));
+        assert_eq!(offered[0].value, "haiku-low");
+        assert_eq!(offered[0].description, "current");
         assert!(
-            rows.iter()
-                .all(|row| RuntimeLabel::parse(&row.value).is_ok())
+            offered
+                .iter()
+                .any(|candidate| candidate.value == "sol-high")
         );
-        let filtered = runtime_candidates(" XHigH ", None);
-        assert!(filtered.iter().any(|row| row.value == "astra-xhigh"));
-        assert!(!filtered.iter().any(|row| row.value == "opus-high"));
+        assert!(!offered.iter().any(|candidate| candidate.value == "sol-low"));
+        assert!(catalogue.label("sol-low").is_err());
+        let sol = runtime_choices(&catalogue, "SO", Some((&current, "current")));
+        assert_eq!(
+            sol.iter()
+                .map(|candidate| candidate.value.as_str())
+                .filter(|value| value.starts_with("sol-"))
+                .collect::<Vec<_>>(),
+            ["sol-high"]
+        );
     }
 }

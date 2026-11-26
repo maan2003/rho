@@ -1,8 +1,8 @@
 //! The store's folds, against a disposable database.
 
 use rho_agent_types::{
-    Address, ChatEvent, ChatSeq, ContentPart, Mention, MessageId, Revision, Role, UnixMs,
-    WorksetId, WorksetKind, Wpos,
+    Address, ChatEvent, ChatSeq, ContentPart, MessageId, Revision, Role, UnixMs, Voice, WorksetId,
+    WorksetKind, Wpos,
 };
 use rho_db::RhoDb;
 
@@ -285,8 +285,7 @@ async fn compaction_starts_the_context_after_the_request_it_answered() {
 fn said(from: Address, text: &str) -> NewMessage {
     NewMessage {
         from,
-        reply_to: None,
-        mentions: Vec::new(),
+        voice: Voice::Message,
         content: vec![ContentPart::Text { text: text.into() }],
     }
 }
@@ -302,13 +301,15 @@ fn ids(messages: &[rho_agent_types::Message]) -> Vec<MessageId> {
     messages.iter().map(|message| message.id).collect()
 }
 
+/// One agent's words to another go under the pair's thread in the
+/// project the sender names, reach only the addressee, and a thread moved
+/// out of the project no longer collects the pair's words there.
 #[tokio::test]
-async fn direct_mail_keeps_the_original_conversation_and_only_reaches_its_addressee() {
+async fn words_to_an_agent_keep_the_pairs_thread_and_only_reach_the_addressee() {
     let (_dir, db) = db().await;
     let (a, b, follower) = (agent(1), agent(2), agent(3));
-    let direct = |from, to, reply_to, text| NewMessage {
-        mentions: vec![Mention::Direct(to)],
-        reply_to,
+    let to = |from, to, text| NewMessage {
+        voice: Voice::ToAgent(to),
         ..said(Address::Agent(from), text)
     };
     let mut write = db.write().await;
@@ -328,62 +329,55 @@ async fn direct_mail_keeps_the_original_conversation_and_only_reaches_its_addres
         .unwrap();
     write.join(UnixMs(4), project_a, follower).unwrap();
     let first = write
-        .post_peer(
-            UnixMs(5),
-            Some(project_a),
-            direct(a, b, None, "First brief"),
-        )
+        .post_peer(UnixMs(5), Some(project_a), to(a, b, "First brief"))
         .unwrap();
     let followup = write
-        .post_peer(
-            UnixMs(6),
-            Some(project_a),
-            direct(a, b, None, "Longer brief"),
-        )
+        .post_peer(UnixMs(6), Some(project_a), to(a, b, "Longer brief"))
         .unwrap();
-    write.delete(UnixMs(7), a, first).unwrap();
-    write.reparent(UnixMs(8), first, Some(topic)).unwrap();
     let elsewhere = write
-        .post_peer(
-            UnixMs(9),
-            Some(project_b),
-            direct(b, a, None, "Different job"),
-        )
+        .post_peer(UnixMs(7), Some(project_b), to(b, a, "Different job"))
         .unwrap();
     let answer = write
         .post_peer(
-            UnixMs(10),
+            UnixMs(8),
             Some(project_b),
-            direct(b, a, Some(followup), "Read your second brief"),
+            to(b, a, "Read your second brief"),
         )
         .unwrap();
-    assert!(
-        write
-            .post_peer(
-                UnixMs(11),
-                Some(project_a),
-                direct(follower, b, Some(followup), "Wrong sender"),
-            )
-            .is_err()
-    );
+    write.delete(UnixMs(9), a, first).unwrap();
+    write.reparent(UnixMs(10), first, Some(topic)).unwrap();
+    let again = write
+        .post_peer(UnixMs(11), Some(project_a), to(a, b, "Third brief"))
+        .unwrap();
+    for refused in [to(a, a, "Myself"), said(Address::Agent(a), "Nobody")] {
+        assert!(
+            write
+                .post_peer(UnixMs(12), Some(project_a), refused)
+                .is_err()
+        );
+    }
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.message(answer).unwrap().parent, Some(first));
-    assert_eq!(read.message(answer).unwrap().reply_to, Some(followup));
-    assert_eq!(read.root_of(answer), Some(project_a));
+    assert_eq!(read.message(followup).unwrap().parent, Some(first));
     assert_eq!(read.message(elsewhere).unwrap().parent, Some(project_b));
+    assert_eq!(read.message(answer).unwrap().parent, Some(elsewhere));
+    assert_eq!(read.message(again).unwrap().parent, Some(project_a));
+    assert_eq!(read.root_of(followup), Some(project_a));
     assert_eq!(read.recipients_of(&read.message(answer).unwrap()), [a]);
     assert_eq!(received(&read, a, 0), [elsewhere.0.0, answer.0.0]);
-    assert_eq!(received(&read, b, 0), [followup.0.0]);
-    assert!(received(&read, follower, 0).is_empty());
+    assert_eq!(received(&read, b, 0), [followup.0.0, again.0.0]);
+    assert!(
+        received(&read, follower, 0).is_empty(),
+        "a member of the project does not hear words to another agent"
+    );
 }
 
 /// A message reaches the members of the thread it is posted in and of the
-/// threads above it, by the nearest record for each agent, and whom it
-/// mentions, never its sender. A resend under a client id is one message.
+/// threads above it, by the nearest record for each agent, never its
+/// sender. A resend under a client id is one message.
 #[tokio::test]
-async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender() {
+async fn chat_delivers_down_the_tree_but_never_to_the_sender() {
     let (_dir, db) = db().await;
     let ws = WorksetId([4; 6]);
     let (a, b, c) = (agent(1), agent(2), agent(3));
@@ -409,7 +403,7 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
             .unwrap();
     }
     // A new store's chat is empty: the first root is its first event. A
-    // root reaches nobody but whom it mentions.
+    // root reaches nobody.
     let rho = write
         .post(UnixMs(3), None, said(Address::User, "rho"), None)
         .unwrap();
@@ -444,12 +438,24 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     let both = write
         .post(UnixMs(6), Some(work), said(Address::User, "both"), None)
         .unwrap();
-    // `b` replies: `a` hears it through the root, `b` is the sender.
+    // `b` writes to `a`, who hears it; `b` is the sender.
     let reply = write
         .post(
             UnixMs(7),
             Some(work),
-            said(Address::Agent(b), "me too"),
+            NewMessage {
+                voice: Voice::ToAgent(a),
+                ..said(Address::Agent(b), "me too")
+            },
+            None,
+        )
+        .unwrap();
+    // The project's words to the user reach no agent.
+    let to_user = write
+        .post(
+            UnixMs(7),
+            Some(work),
+            said(Address::Agent(b), "for the user"),
             None,
         )
         .unwrap();
@@ -461,19 +467,6 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     write.leave(UnixMs(9), reply, b).unwrap();
     let after_leave = write
         .post(UnixMs(10), Some(reply), said(Address::User, "b gone"), None)
-        .unwrap();
-    // But a mention reaches it, and reaches `c`, who is nowhere, without
-    // joining either.
-    let mention = write
-        .post(
-            UnixMs(11),
-            Some(reply),
-            NewMessage {
-                mentions: vec![Mention::Agent(b), Mention::Agent(c)],
-                ..said(Address::User, "b, c, look")
-            },
-            None,
-        )
         .unwrap();
     // Leaving where nothing made you a member logs nothing; where a join
     // above did, it does.
@@ -505,24 +498,25 @@ async fn chat_delivers_down_the_tree_and_to_the_mentioned_but_never_the_sender()
     assert_eq!(read.mail_head(), ChatSeq(seqs));
     assert_eq!(
         received(&read, a, 0),
-        [both, reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
+        [both, reply, deeper, after_leave, elsewhere].map(|id| id.0.0)
     );
-    assert_eq!(
-        received(&read, b, 0),
-        [both, deeper, mention].map(|id| id.0.0)
-    );
-    assert_eq!(received(&read, c, 0), [mention.0.0]);
+    assert_eq!(received(&read, b, 0), [both, deeper].map(|id| id.0.0));
+    assert!(received(&read, c, 0).is_empty());
     assert_eq!(
         received(&read, a, both.0.0),
-        [reply, deeper, after_leave, mention, elsewhere].map(|id| id.0.0)
+        [reply, deeper, after_leave, elsewhere].map(|id| id.0.0)
+    );
+    assert!(
+        read.recipients_of(&read.message(to_user).unwrap())
+            .is_empty()
     );
     // The tree as it stands.
     assert_eq!(ids(&read.thread_messages(None, 10)), [rho]);
     assert_eq!(ids(&read.thread_messages(Some(rho), 10)), [work, elsewhere]);
-    assert_eq!(ids(&read.thread_messages(Some(work), 1)), [reply]);
+    assert_eq!(ids(&read.thread_messages(Some(work), 1)), [to_user]);
     assert_eq!(
         ids(&read.thread_messages(Some(reply), 10)),
-        [deeper, after_leave, mention]
+        [deeper, after_leave]
     );
     assert_eq!(read.message(deeper).unwrap().parent, Some(reply));
     // Members as a new message under each would see them: the root's `a`
@@ -573,7 +567,10 @@ async fn chat_moves_subtrees_and_names_threads() {
         .post(
             UnixMs(5),
             Some(kept),
-            said(Address::Agent(b), "an aside"),
+            NewMessage {
+                voice: Voice::ToAgent(a),
+                ..said(Address::Agent(b), "an aside")
+            },
             None,
         )
         .unwrap();
@@ -771,8 +768,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     let other = write
         .post(at, Some(channel), said(Address::User, "Other idea"), None)
         .unwrap();
-    let mut asked = said(Address::Agent(a), "Which clock?");
-    asked.mentions.push(Mention::User { ping: true });
+    let asked = said(Address::Agent(a), "Which clock?");
     let ask = write.post(at, Some(thread), asked.clone(), None).unwrap();
     let spare_ask = write.post(at, Some(thread), asked, None).unwrap();
     let revised = said(Address::Agent(a), "Which monotonic clock?").content;
@@ -786,34 +782,38 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
         .unwrap();
     assert!(
         write
-            .edit(at, b, ask, revised.clone(), None)
+            .edit(at, b, ask, revised.clone())
             .unwrap_err()
             .to_string()
-            .contains("own mail")
+            .contains("own words")
     );
-    write.edit(at, a, ask, revised.clone(), None).unwrap();
+    write.edit(at, a, ask, revised.clone()).unwrap();
     write
         .post(at, Some(thread), said(Address::User, "I'm back"), None)
         .unwrap();
+    let settles = rho_agent_types::MessageVersion {
+        message: ask,
+        version: write.mail_version(ask).unwrap(),
+    };
     let answer = write
-        .post(
+        .post_user_reply(
             at,
             Some(thread),
-            NewMessage {
-                reply_to: Some(ask),
-                ..said(Address::User, "Use mock time")
+            rho_agent_types::ThreadReply {
+                settles: Some(settles),
             },
-            None,
+            said(Address::User, "Use mock time").content,
+            91,
         )
         .unwrap();
     write.reparent(at, answer, Some(other)).unwrap();
     write.reparent(at, ask, Some(other)).unwrap();
     let err = write
-        .edit(at, a, ask, said(Address::Agent(a), "Ship it").content, None)
+        .edit(at, a, ask, said(Address::Agent(a), "Ship it").content)
         .unwrap_err();
     assert!(err.to_string().contains("already answered"));
     // Another ask by the same writer in the same thread is still editable.
-    write.edit(at, a, spare_ask, revised.clone(), None).unwrap();
+    write.edit(at, a, spare_ask, revised.clone()).unwrap();
     assert!(
         write
             .delete(at, a, ask)
@@ -841,7 +841,7 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     write.delete(at, a, note).unwrap();
     assert!(
         write
-            .edit(at, a, note, revised, None)
+            .edit(at, a, note, revised)
             .unwrap_err()
             .to_string()
             .contains("deleted")
@@ -851,7 +851,10 @@ async fn an_answered_ask_keeps_its_body_even_if_its_answer_moves() {
     let read = db.read();
     let ask = read.message(ask).unwrap();
     let answer = read.message(answer).unwrap();
-    assert_eq!(answer.reply_to, Some(ask.id));
+    assert_eq!(
+        answer.thread_reply.and_then(|reply| reply.settles),
+        Some(settles)
+    );
     assert_eq!(answer.parent, Some(other));
     assert_eq!(ask.text(), "Which monotonic clock?");
     assert!(matches!(ask.revision, Revision::Edited { .. }));
@@ -886,12 +889,9 @@ async fn live_project_mail_tracks_each_writer_until_the_next_user_post() {
         "top-level anchor"
     );
 
-    let words = |agent, ping, text| NewMessage {
-        mentions: vec![Mention::User { ping }],
-        ..said(Address::Agent(agent), text)
-    };
+    let words = |agent, text| said(Address::Agent(agent), text);
     let quiet = write
-        .post(at, Some(thread), words(b, false, "Checking offsets"), None)
+        .post(at, Some(thread), words(b, "Checking offsets"), None)
         .unwrap();
     assert_eq!(write.live_project_mail(thread, a), Some(thread));
     assert_eq!(write.live_project_mail(thread, b), Some(quiet));
@@ -912,7 +912,7 @@ async fn live_project_mail_tracks_each_writer_until_the_next_user_post() {
     assert_eq!(write.live_project_mail(thread, a), None);
     assert_eq!(write.live_project_mail(thread, b), None);
     let current = write
-        .post(at, Some(thread), words(b, true, "Which timezone?"), None)
+        .post(at, Some(thread), words(b, "Which timezone?"), None)
         .unwrap();
     assert_eq!(write.live_project_mail(thread, b), Some(current));
     write.delete(at, b, current).unwrap();
@@ -927,7 +927,7 @@ async fn live_project_mail_tracks_each_writer_until_the_next_user_post() {
 
 #[tokio::test]
 async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_thread() {
-    use rho_agent_types::{FLASH_LIFETIME, MessageKind};
+    use rho_agent_types::FLASH_LIFETIME;
     let (_dir, db) = db().await;
     let (a, b) = (agent(1), agent(2));
     let mut write = db.write().await;
@@ -978,18 +978,12 @@ async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_t
         .unwrap();
     let edited_at = UnixMs(deadline.0 - 1);
     let edited = said(Address::Agent(a), "trying the overflow case").content;
-    assert!(
-        write
-            .edit(edited_at, a, first, edited.clone(), Some(true))
-            .is_err(),
-        "a flash cannot ping"
-    );
-    write.edit(edited_at, a, first, edited, None).unwrap();
+    write.edit(edited_at, a, first, edited).unwrap();
     assert!(!write.expire_flash(edited_at, first));
     write.commit();
     let read = db.read();
     let decoded = read.message(first).unwrap();
-    assert_eq!(decoded.kind, MessageKind::Flash);
+    assert_eq!(decoded.voice, Voice::Flash);
     assert_eq!(decoded.at, posted);
     assert_eq!(decoded.version().1, edited_at);
     assert_eq!(decoded.flash_deadline(), Some(deadline));
@@ -1029,10 +1023,7 @@ async fn a_flash_needs_both_its_original_deadline_and_a_newer_item_in_the_same_t
         .post(
             UnixMs(later.0 + 1),
             Some(thread),
-            NewMessage {
-                reply_to: Some(second),
-                ..said(Address::User, "Try a second clock")
-            },
+            said(Address::User, "Try a second clock"),
             None,
         )
         .unwrap();
@@ -1083,10 +1074,7 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
     let thread = write
         .post(at, Some(root), said(Address::User, "Clocks"), None)
         .unwrap();
-    let send = |writer, text| NewMessage {
-        mentions: vec![Mention::User { ping: true }],
-        ..said(Address::Agent(writer), text)
-    };
+    let send = |writer, text| said(Address::Agent(writer), text);
     let log_mail = |write: &mut rho_db::WriteTxn, message: MessageId| {
         let version = write.mail_version(message);
         write
@@ -1116,7 +1104,7 @@ async fn a_rewind_takes_back_only_the_current_words_its_turn_wrote() {
         .unwrap();
     log_mail(&mut write, later);
     write
-        .edit(at, a, later, send(a, "Which local timezone?").content, None)
+        .edit(at, a, later, send(a, "Which local timezone?").content)
         .unwrap();
     log_mail(&mut write, later);
     write
@@ -1265,6 +1253,15 @@ async fn mail_search_sees_the_current_subject_and_body_only_inside_scope() {
     let reef = write
         .post(at, None, said(Address::User, "reef"), None)
         .unwrap();
+    write.set_project(
+        at,
+        rho_agent_types::ProjectId(tide),
+        rho_agent_types::ProjectConfig {
+            place: rho_agent_types::ProjectPlace::parse("~/src/tide").unwrap(),
+            mode: rho_agent_types::ProjectMode::One,
+            runtime: rho_agent_types::RuntimeLabel::default(),
+        },
+    );
     let topic = write
         .post(at, Some(tide), said(Address::User, "Set it up"), None)
         .unwrap();
@@ -1293,7 +1290,6 @@ async fn mail_search_sees_the_current_subject_and_body_only_inside_scope() {
             a,
             reply,
             said(Address::Agent(a), "Use a native NAPI socket.").content,
-            None,
         )
         .unwrap();
     write.delete(at, a, removed).unwrap();

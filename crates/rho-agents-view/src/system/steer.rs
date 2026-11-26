@@ -5,10 +5,10 @@
 use std::rc::Rc;
 
 use gpui::{Context, Entity, Window};
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, RuntimeCatalogue};
 use rho_agents_client::protocol::transcript::RuntimeKind;
 use rho_agents_client::protocol::worksets::{Cancel, CancelResult, RewindAgent, StopAgent};
-use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
+use rho_agents_client::snippets;
 use rho_frame::{Candidate, Frame};
 use rho_window::style::StyleClass;
 
@@ -81,8 +81,8 @@ pub(super) fn new_cache_key(
     });
 }
 
-/// Asks which runtime the agent changes to, offering the host's others
-/// of its kind, then changes it.
+/// Asks which runtime the agent changes to, offering what its host's
+/// catalogue has of the agent's kind, then changes it.
 pub(super) fn set_runtime(
     system: &Entity<AgentsSystem>,
     agent: AgentId,
@@ -90,11 +90,23 @@ pub(super) fn set_runtime(
     window: &mut Window,
     cx: &mut Context<Frame>,
 ) {
-    let (current, choices) = {
+    let (current, catalogue, choices) = {
         let system = system.read(cx);
         let registry = system.registry();
         let Some(spec) = registry.agent_spec(agent) else {
             frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let Some(catalogue) = registry
+            .host_of_agent(agent)
+            .and_then(|host| registry.host_endpoint(host))
+            .and_then(|endpoint| system.mail.read(cx).runtime_catalogue(endpoint))
+        else {
+            frame.echo(
+                "the agent's host has not said its runtimes",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         };
         let current = spec.runtime_label();
@@ -102,8 +114,8 @@ pub(super) fn set_runtime(
             .agent_facts(agent)
             .runtime
             .is_some_and(|heard| heard.state.may_change_runtime_kind);
-        let choices = switchable(spec.runtime, &current, can_change_kind).collect::<Vec<_>>();
-        (current, choices)
+        let choices = switchable(&catalogue, spec.runtime, &current, can_change_kind);
+        (current, catalogue, choices)
     };
     let system = system.clone();
     frame.open_prompt(
@@ -124,7 +136,7 @@ pub(super) fn set_runtime(
                 frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
                 return;
             }
-            match snippets::parse_runtime(&input) {
+            match catalogue.label(&input) {
                 Ok(runtime) => system.update(cx, |system, cx| {
                     system.eval(
                         agent,
@@ -206,33 +218,22 @@ pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Con
 }
 
 /// The other kind is offered only where no conversation would be lost.
-/// The runtime already in use is not a change.
+/// The runtime already in use is not a change. The host's order puts its
+/// usual runtimes first.
 fn switchable(
+    catalogue: &RuntimeCatalogue,
     kind: RuntimeKind,
     current: &str,
     can_change_kind: bool,
-) -> impl Iterator<Item = String> {
-    let other = match kind {
-        RuntimeKind::Claude => RuntimeKind::Rho,
-        RuntimeKind::Rho => RuntimeKind::Claude,
-    };
-    // Keep the usual start choices visible without scrolling, then include
-    // every other supported model and effort.
-    let usual = RUNTIMES.into_iter().filter(move |choice| {
-        Runtime::parse(choice).is_ok_and(|runtime| runtime.kind() == kind || can_change_kind)
-    });
-    let all = Runtime::choices(kind)
-        .chain(
-            can_change_kind
-                .then_some(other)
-                .into_iter()
-                .flat_map(Runtime::choices),
-        )
-        .filter(|choice| !RUNTIMES.contains(&choice.as_str()));
-    usual
+) -> Vec<String> {
+    catalogue
+        .choices
+        .iter()
+        .filter(|choice| choice.kind == kind || can_change_kind)
+        .map(|choice| choice.label.as_str())
+        .filter(|label| *label != current)
         .map(str::to_owned)
-        .chain(all)
-        .filter(move |choice| choice != current)
+        .collect()
 }
 
 /// What the echo says once `turns` of the turns of the agent called `label`
@@ -258,8 +259,6 @@ fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
 
     #[test]
@@ -275,52 +274,40 @@ mod tests {
         );
     }
 
-    /// The catalogue's pairs of `kinds`, without `current`: what a prompt
-    /// should offer, worked out apart from its order.
-    fn expected(kinds: &[RuntimeKind], current: &str) -> BTreeSet<String> {
-        kinds
-            .iter()
-            .flat_map(|kind| Runtime::choices(*kind))
-            .filter(|choice| choice != current)
-            .collect()
-    }
-
-    /// Each choice once, the usual ones of `kinds` first, in their order.
-    fn assert_offered(choices: &[String], kinds: &[RuntimeKind], current: &str) {
-        let offered: BTreeSet<String> = choices.iter().cloned().collect();
-        assert_eq!(offered.len(), choices.len(), "no choice twice: {choices:?}");
-        assert_eq!(offered, expected(kinds, current));
-        let usual: Vec<&str> = RUNTIMES
-            .into_iter()
-            .filter(|choice| *choice != current)
-            .filter(|choice| kinds.contains(&Runtime::parse(choice).unwrap().kind()))
-            .collect();
-        assert_eq!(&choices[..usual.len()], usual.as_slice());
+    fn catalogue() -> RuntimeCatalogue {
+        let choice = |label: &str, kind, usual| rho_agent_types::RuntimeChoice {
+            label: rho_agent_types::RuntimeLabel::parse(label).unwrap(),
+            kind,
+            usual,
+        };
+        // Not this build's list: the prompt offers what the host said.
+        RuntimeCatalogue {
+            choices: vec![
+                choice("sol-high", RuntimeKind::Rho, true),
+                choice("opus-high", RuntimeKind::Claude, true),
+                choice("sol-low", RuntimeKind::Rho, false),
+                choice("sonnet-low", RuntimeKind::Claude, false),
+            ],
+        }
     }
 
     #[test]
-    fn runtime_prompt_lists_every_supported_effort_and_model_of_the_current_kind() {
-        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", false).collect();
-        assert_offered(&choices, &[RuntimeKind::Claude], "opus-high");
-        for choice in ["fable-max", "opus-medium", "sonnet-low", "haiku-xhigh"] {
-            assert!(choices.iter().any(|offered| offered == choice), "{choice}");
-        }
-        assert!(
-            !choices
-                .iter()
-                .any(|choice| choice == "opus-high" || choice == "sol-medium")
+    fn the_runtime_prompt_offers_the_hosts_runtimes_of_the_agents_kind() {
+        assert_eq!(
+            switchable(&catalogue(), RuntimeKind::Claude, "opus-high", false),
+            ["sonnet-low"]
+        );
+        assert_eq!(
+            switchable(&catalogue(), RuntimeKind::Rho, "sol-low", false),
+            ["sol-high"]
         );
     }
 
     #[test]
     fn a_stopped_agent_without_history_can_choose_another_kind() {
-        let choices: Vec<_> = switchable(RuntimeKind::Claude, "opus-high", true).collect();
-        assert_offered(
-            &choices,
-            &[RuntimeKind::Claude, RuntimeKind::Rho],
-            "opus-high",
+        assert_eq!(
+            switchable(&catalogue(), RuntimeKind::Claude, "opus-high", true),
+            ["sol-high", "sol-low", "sonnet-low"]
         );
-        assert!(choices.iter().any(|choice| choice == "terra-xhigh"));
-        assert!(choices.iter().all(|choice| Runtime::parse(choice).is_ok()));
     }
 }

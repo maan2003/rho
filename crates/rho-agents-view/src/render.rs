@@ -473,7 +473,10 @@ fn delivered_mail(text: &str) -> (Option<&str>, &str) {
     let Some((head, body)) = text.split_once('\n') else {
         return (None, text);
     };
-    if let Some((where_, sender)) = head.split_once(" Mail from ")
+    // Copies from before chat say `Mail from` and `· mail #`.
+    if let Some((where_, sender)) = head
+        .split_once(" Message from ")
+        .or_else(|| head.split_once(" Mail from "))
         && numbered(where_)
         && let Some(sender) = sender.strip_suffix(':')
     {
@@ -486,7 +489,9 @@ fn delivered_mail(text: &str) -> (Option<&str>, &str) {
         .strip_prefix("[message from ")
         .and_then(|head| head.strip_suffix(']'))
         && let Some((body, where_)) = body.rsplit_once("\n\n")
-        && let Some((where_, id)) = where_.split_once(" · mail #")
+        && let Some((where_, id)) = where_
+            .split_once(" · message #")
+            .or_else(|| where_.split_once(" · mail #"))
         && !id.is_empty()
         && id.bytes().all(|b| b.is_ascii_digit())
         && numbered(where_)
@@ -879,8 +884,10 @@ fn unnumber(text: &str) -> Option<&str> {
 fn chat_output_line(source: &str, line: &str) -> String {
     let call = chat_call(source);
     if call == Some("search")
-        && let Some((subject, result)) =
-            unnumber(line).and_then(|line| line.split_once(" · mail #"))
+        && let Some((subject, result)) = unnumber(line).and_then(|line| {
+            line.split_once(" · message #")
+                .or_else(|| line.split_once(" · mail #"))
+        })
         && let Some((id, excerpt)) = result.split_once(" · ")
         && number(id)
     {
@@ -901,17 +908,16 @@ fn chat_output_line(source: &str, line: &str) -> String {
         if let Some((writer, body)) =
             unnumber(line_without_arrow).and_then(|line| line.split_once(": "))
         {
-            let writer = match writer.rsplit_once(" (reply to #") {
-                Some((writer, tail)) if tail.strip_suffix(')').is_some_and(number) => writer,
-                _ => writer,
-            };
-            let label = writer.strip_suffix(" (edited)").unwrap_or(writer);
+            let (label, marks) = read_writer(writer);
             if label == "user"
                 || label == "system"
                 || label.starts_with("eng-")
                 || label.starts_with("adv-")
             {
-                let writer = writer.replacen("user", "you", usize::from(label == "user"));
+                let mut writer = if label == "user" { "you" } else { label }.to_owned();
+                for mark in marks {
+                    writer.push_str(&format!(" ({mark})"));
+                }
                 let marker = if line_without_arrow == line {
                     ""
                 } else {
@@ -922,6 +928,35 @@ fn chat_output_line(source: &str, line: &str) -> String {
         }
     }
     chat_receipt(line).to_owned()
+}
+
+/// Split the marks `chat.read` puts after a writer's label: `(edited)`,
+/// `(flash)`, `(to eng-x)`, and `(retry of #3)` or the older
+/// `(reply to #3)`. Returns the label and the marks a reader needs, which
+/// leave out the machine id of a retry.
+fn read_writer(writer: &str) -> (&str, Vec<&str>) {
+    let mut label = writer;
+    let mut marks = Vec::new();
+    while let Some((rest, mark)) = label
+        .strip_suffix(')')
+        .and_then(|label| label.rsplit_once(" ("))
+    {
+        if mark == "edited"
+            || mark == "flash"
+            || mark.strip_prefix("to ").is_some_and(|to| !to.is_empty())
+        {
+            marks.push(mark);
+        } else if !mark
+            .strip_prefix("retry of #")
+            .or_else(|| mark.strip_prefix("reply to #"))
+            .is_some_and(number)
+        {
+            break;
+        }
+        label = rest;
+    }
+    marks.reverse();
+    (label, marks)
 }
 
 // These fixed receipts are useful to the model with their machine ids,
@@ -1418,11 +1453,21 @@ mod tests {
         assert_eq!(shown.spans[0].class, StyleClass::MailSpeaker);
         assert_eq!(shown.spans[1].class, StyleClass::Time);
         assert_eq!(shown.spans[2].class, StyleClass::Default);
+        for footer in ["message", "mail"] {
+            assert_eq!(
+                delivered_mail(&format!(
+                    "[message from eng-source]\nTiming note\n\n[#31 tide › Slow clock] · {footer} #46"
+                )),
+                (Some("eng-source"), "Timing note")
+            );
+        }
         assert_eq!(
-            delivered_mail(
-                "[message from eng-source]\nTiming note\n\n[#31 tide › Slow clock] · mail #46"
-            ),
-            (Some("eng-source"), "Timing note")
+            delivered_mail("[#219 tide › Clock] Message from eng-ab:\nDone."),
+            (Some("eng-ab"), "Done.")
+        );
+        assert_eq!(
+            delivered_mail("[#219 tide › Clock] Message from the user:\nGo."),
+            (Some("you"), "Go.")
         );
         assert_eq!(
             delivered_mail("[#12] is my code's literal\nkeep it"),
@@ -1537,6 +1582,31 @@ mod tests {
                 chat_output_line(&format!("{api}.read(14)"), "#31 in the human continuation"),
                 "#31 in the human continuation"
             );
+        }
+        assert_eq!(
+            chat_output_line(
+                "chat.search('race')",
+                "#14 Race on clock · message #77 · Check #31 in the fixture"
+            ),
+            "Race on clock · Check #31 in the fixture"
+        );
+        for (line, shown) in [
+            (
+                "#78 user (edited) (retry of #77): Keep the clock",
+                "you (edited): Keep the clock",
+            ),
+            (
+                "→ #79 eng-ab (flash): Trying a seed",
+                "→ eng-ab (flash): Trying a seed",
+            ),
+            (
+                "#80 adv-cd (edited) (to eng-ab): Look at the boundary",
+                "adv-cd (edited) (to eng-ab): Look at the boundary",
+            ),
+            // An unknown mark leaves the line as the tool printed it.
+            ("#81 user (draft): Hi", "#81 user (draft): Hi"),
+        ] {
+            assert_eq!(chat_output_line("chat.read(14)", line), shown);
         }
     }
 

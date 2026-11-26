@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, Revision, ThreadWork,
-    UnixMs, one_line,
+    Address, AgentId, ChatEvent, ChatRecord, ChatSeq, Message, MessageId, ProjectConfig, ProjectId,
+    Revision, ThreadWork, UnixMs, Voice, one_line,
 };
 
 /// What one record changed.
@@ -55,6 +55,8 @@ pub struct HostChat {
     /// Each message's children in log order; `None` holds the roots.
     children: BTreeMap<Option<MessageId>, Vec<MessageId>>,
     names: HashMap<MessageId, String>,
+    /// Each project's newest settings, by its anchor.
+    projects: BTreeMap<MessageId, ProjectConfig>,
     work: BTreeMap<MessageId, ThreadWork>,
     /// What each agent last said about each thread: joined or left.
     members: BTreeMap<(MessageId, AgentId), bool>,
@@ -105,6 +107,21 @@ impl HostChat {
                     from,
                     to: *parent,
                 }
+            }
+            ChatEvent::Project { project, config } => {
+                if !self.messages.contains_key(&project.0) {
+                    return Told::Nothing;
+                }
+                // A root that becomes a project comes into the catalogue
+                // with what hangs under it.
+                let was = self.projects.insert(project.0, config.clone());
+                #[cfg(feature = "ui")]
+                if was.is_none() {
+                    self.refresh_text_tree(project.0, true);
+                }
+                #[cfg(not(feature = "ui"))]
+                let _ = was;
+                Told::Thread(project.0)
             }
             ChatEvent::Joined { thread, agent } => {
                 self.members.insert((*thread, *agent), true);
@@ -189,7 +206,7 @@ impl HostChat {
     #[cfg(feature = "ui")]
     pub(crate) fn latest_flash(&self, thread: MessageId) -> Option<&Message> {
         self.reading_order(thread)
-            .filter(|mail| mail.to_user() && mail.flash_deadline().is_some())
+            .filter(|mail| mail.flash_deadline().is_some())
             .max_by_key(|mail| mail.id)
     }
 
@@ -210,6 +227,8 @@ impl HostChat {
             if mail.from == Address::User {
                 latest_user = Some(mail);
             } else if mail.to_user() {
+                // The project's words: a message or a flash, never one
+                // agent's words to another.
                 project_at = project_at.max(Some(mail.version().1));
                 if latest.is_none_or(|old: &Message| old.version().0 < mail.version().0) {
                     latest = Some(mail);
@@ -244,37 +263,39 @@ impl HostChat {
         self.work.get(&thread).copied()
     }
 
-    /// One root channel by id, with the name used in a project address.
+    /// A project by its anchor, with the name used in its address.
     pub fn project(&self, root: MessageId) -> Option<crate::protocol::Project> {
         if !self.is_project(root) {
             return None;
         }
         Some(crate::protocol::Project {
-            root,
+            id: ProjectId(root),
             name: self.name(root)?,
+            config: self.projects.get(&root)?.clone(),
         })
     }
 
-    /// A root that was itself addressed to the user is mail, not a project.
+    /// Every live project, oldest first.
+    pub fn projects(&self) -> impl Iterator<Item = crate::protocol::Project> + '_ {
+        self.projects.keys().filter_map(|root| self.project(*root))
+    }
+
+    /// A root the log made a project, and did not delete.
     pub fn is_project(&self, id: MessageId) -> bool {
-        self.message(id).is_some_and(|root| {
-            root.parent.is_none() && root.revision != Revision::Deleted && root.mentions.is_empty()
-        })
+        self.projects.contains_key(&id)
+            && self
+                .message(id)
+                .is_some_and(|root| root.parent.is_none() && root.revision != Revision::Deleted)
     }
 
-    /// Agent maintenance roots and peer mail aren't in the user's
-    /// catalogue. Direct delivery of a user's idea does not make it peer
-    /// mail: it tells the host to wake only the project's standing worker.
+    /// What the user does not see in the catalogue: one agent's words to
+    /// another, and any root that is not a project, such as the container
+    /// of agents that work outside every project.
     pub fn agent_only(&self, id: MessageId) -> bool {
         let Some(mail) = self.message(id) else {
             return false;
         };
-        (mail.parent.is_none() && !mail.mentions.is_empty() && !mail.to_user())
-            || matches!(mail.from, Address::Agent(_))
-                && mail
-                    .mentions
-                    .iter()
-                    .any(|mention| matches!(mention, rho_agent_types::Mention::Direct(_)))
+        matches!(mail.voice, Voice::ToAgent(_)) || (mail.parent.is_none() && !self.is_project(id))
     }
 
     pub fn message(&self, id: MessageId) -> Option<&Message> {
@@ -464,30 +485,16 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn thread_row_prefers_the_newest_flash_then_falls_back_after_its_tombstone() {
-        use rho_agent_types::{Mention, MessageKind};
-
         let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "project"));
+        make_project(&mut log, 1);
         log.tell(&posted(2, Some(1), Address::User, "idea"));
-        let project_words = |seq, words, kind| {
-            let mut item = posted(seq, Some(2), Address::Agent(agent(3)), words);
-            let ChatEvent::Posted {
-                kind: event_kind,
-                mentions,
-                ..
-            } = &mut item.event
-            else {
-                unreachable!()
-            };
-            *event_kind = kind;
-            mentions.push(Mention::User {
-                ping: kind == MessageKind::Kept,
-            });
-            item
+        let project_words = |seq, words, voice| {
+            voiced(posted(seq, Some(2), Address::Agent(agent(3)), words), voice)
         };
-        log.tell(&project_words(3, "First update", MessageKind::Flash));
-        log.tell(&project_words(4, "Second update", MessageKind::Flash));
-        log.tell(&project_words(5, "A later kept result", MessageKind::Kept));
+        log.tell(&project_words(3, "First update", Voice::Flash));
+        log.tell(&project_words(4, "Second update", Voice::Flash));
+        log.tell(&project_words(5, "A later kept result", Voice::Message));
         log.tell(&record(
             6,
             ChatEvent::Edited {
@@ -518,10 +525,9 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn text_projection_follows_edits_deletion_and_moves_into_or_out_of_private_roots() {
-        use rho_agent_types::Mention;
-
         let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "visible project"));
+        make_project(&mut log, 1);
         log.tell(&posted(
             2,
             Some(1),
@@ -529,12 +535,10 @@ mod tests {
             "Clock report",
         ));
         log.tell(&posted(3, Some(2), Address::User, "loose winding"));
-        let mut direct = posted(4, None, Address::Agent(agent(3)), "private root");
-        let ChatEvent::Posted { mentions, .. } = &mut direct.event else {
-            unreachable!()
-        };
-        mentions.push(Mention::Direct(agent(7)));
-        log.tell(&direct);
+        log.tell(&voiced(
+            posted(4, None, Address::Agent(agent(3)), "private root"),
+            Voice::ToAgent(agent(7)),
+        ));
         assert_eq!(log.text.body(&id(1)), None);
         assert_eq!(log.text.body(&id(2)), Some("Clock report"));
         assert_eq!(log.text.body(&id(3)), Some("loose winding"));
@@ -573,26 +577,25 @@ mod tests {
 
     #[cfg(feature = "ui")]
     #[test]
-    fn a_human_idea_routed_to_one_worker_is_catalogued_but_private_agent_mail_is_not() {
-        use rho_agent_types::Mention;
-
+    fn a_human_idea_is_catalogued_but_one_agents_words_to_another_are_not() {
         let mut log = HostChat::default();
         log.tell(&posted(1, None, Address::User, "tide"));
+        make_project(&mut log, 1);
         log.tell(&posted(2, Some(1), Address::User, "Measure clock jitter."));
-        let directed = |seq, parent, from, text| {
-            let mut event = posted(seq, Some(parent), from, text);
-            let ChatEvent::Posted { mentions, .. } = &mut event.event else {
-                unreachable!()
-            };
-            mentions.push(Mention::Direct(agent(7)));
-            event
-        };
-        log.tell(&directed(3, 1, Address::User, "Inspect tide B for drift."));
-        log.tell(&directed(
-            4,
-            1,
-            Address::Agent(agent(3)),
-            "Private clock comparison.",
+        log.tell(&posted(
+            3,
+            Some(1),
+            Address::User,
+            "Inspect tide B for drift.",
+        ));
+        log.tell(&voiced(
+            posted(
+                4,
+                Some(1),
+                Address::Agent(agent(3)),
+                "Private clock comparison.",
+            ),
+            Voice::ToAgent(agent(7)),
         ));
         assert_eq!(log.text.body(&id(2)), Some("Measure clock jitter."));
         assert!(
@@ -624,32 +627,85 @@ mod tests {
         record(
             seq,
             ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: parent.map(id),
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from,
-                mentions: Vec::new(),
+                voice: Voice::Message,
                 content: vec![ContentPart::Text { text: text.into() }],
             },
         )
     }
 
-    #[test]
-    fn an_addressed_maintenance_root_is_not_a_project() {
-        let mut mail = HostChat::default();
-        let mut maintenance = posted(1, None, Address::User, "Restart fixture");
-        let ChatEvent::Posted { mentions, .. } = &mut maintenance.event else {
-            unreachable!()
+    fn voiced(mut record: ChatRecord, voice: Voice) -> ChatRecord {
+        let ChatEvent::Posted { voice: told, .. } = &mut record.event else {
+            unreachable!("only a post has a voice")
         };
-        mentions.push(rho_agent_types::Mention::Agent(agent(1)));
-        mail.tell(&maintenance);
+        *told = voice;
+        record
+    }
+
+    fn config() -> ProjectConfig {
+        ProjectConfig {
+            place: rho_agent_types::ProjectPlace::parse("~/src/tide").unwrap(),
+            mode: rho_agent_types::ProjectMode::One,
+            runtime: rho_agent_types::RuntimeLabel::default(),
+        }
+    }
+
+    /// Makes `root` a project the way a host log does, but with no seq of
+    /// its own, so a test keeps message ids equal to seqs.
+    fn make_project(log: &mut HostChat, root: u64) {
+        log.projects.insert(id(root), config());
+    }
+
+    #[test]
+    fn a_root_is_a_project_only_once_the_host_says_so() {
+        let mut mail = HostChat::default();
+        mail.tell(&posted(1, None, Address::User, "Restart fixture"));
         mail.tell(&posted(2, Some(1), Address::Agent(agent(1)), "Restarted"));
         mail.tell(&posted(3, None, Address::User, "Calendar repairs"));
+        mail.tell(&posted(4, Some(3), Address::User, "Fix the leap day"));
+        assert!(mail.agent_only(id(3)));
+        assert_eq!(mail.root_named("Calendar repairs"), None);
+        #[cfg(feature = "ui")]
+        assert_eq!(mail.text.body(&id(4)), None);
+
+        assert_eq!(
+            mail.tell(&record(
+                5,
+                ChatEvent::Project {
+                    project: ProjectId(id(3)),
+                    config: config(),
+                }
+            )),
+            Told::Thread(id(3))
+        );
         assert!(!mail.is_project(id(1)));
         assert!(mail.agent_only(id(1)));
         assert!(mail.root_named("Restart fixture").is_none());
         assert_eq!(mail.root_named("Calendar repairs"), Some(id(3)));
+        assert!(!mail.agent_only(id(3)));
+        assert_eq!(
+            mail.project(id(3)).map(|project| project.config),
+            Some(config())
+        );
+        #[cfg(feature = "ui")]
+        assert_eq!(mail.text.body(&id(4)), Some("Fix the leap day"));
+
+        // A project event for a message the fold does not know changes
+        // nothing.
+        assert_eq!(
+            mail.tell(&record(
+                6,
+                ChatEvent::Project {
+                    project: ProjectId(id(40)),
+                    config: config(),
+                }
+            )),
+            Told::Nothing
+        );
+        assert!(!mail.is_project(id(40)));
     }
 
     #[test]
@@ -699,6 +755,7 @@ mod tests {
                 thread: id(1)
             }
         );
+        make_project(&mut mail, 1);
         assert_eq!(
             mail.tell(&posted(2, Some(1), Address::User, "Fix it\nmore")),
             Told::Posted {

@@ -34,16 +34,27 @@ fn corpus() -> HostChat {
             seq: ChatSeq(seq),
             at: UnixMs(1_760_000_000_000 + seq),
             event: ChatEvent::Posted {
-                kind: rho_agent_types::MessageKind::Kept,
                 parent: parent.map(|id| MessageId(ChatSeq(id))),
-                reply_to: None,
+                retry_of: None,
                 thread_reply: None,
                 from: if seq == 1 { Party::User } else { agent },
-                mentions: Vec::new(),
+                voice: rho_agent_types::Voice::Message,
                 content: vec![ContentPart::Text { text }],
             },
         });
     }
+    log.tell(&ChatRecord {
+        seq: ChatSeq(10_002),
+        at: UnixMs(1_760_000_010_002),
+        event: ChatEvent::Project {
+            project: ProjectId(MessageId(ChatSeq(1))),
+            config: rho_agent_types::ProjectConfig {
+                place: rho_agent_types::ProjectPlace::parse("~/src/clock").unwrap(),
+                mode: rho_agent_types::ProjectMode::PerIdea,
+                runtime: rho_agent_types::RuntimeLabel::default(),
+            },
+        },
+    });
     log
 }
 

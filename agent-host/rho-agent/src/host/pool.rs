@@ -18,10 +18,7 @@ pub use gccp::{
     Envelope, MAX_BODY_LEN, MessageResult, RETRY_WAITS, Reason, Transport, WIRE_MAX_BODY_LEN,
 };
 pub use projects::{ProjectIdea, ProjectIdeaResult};
-use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, Message, MessageId, MessageKind, UnixMs,
-    WorksetKind,
-};
+use rho_agent_types::{AgentId, ChatSeq, ContentPart, Message, MessageId, UnixMs, WorksetKind};
 use rho_db::RhoDb;
 use rho_fs_view::{Layout, WorksetId, Worksets};
 use tokio::sync::Mutex;
@@ -30,11 +27,11 @@ use super::AgentClient;
 use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use crate::inference::Accounts;
 use crate::ipc::protocol::Control;
-use crate::ipc::workset::{PyReply, PyRequest};
+use crate::ipc::workset::{ChatKind, PyReply, PyRequest};
 use crate::log::{AGENT_USAGE_BUCKET_MS, AgentUsageBucket};
 use crate::record::{AgentSpec, Event, Record, Runtime};
 use crate::store::{
-    GccpWrite as _, MailRead as _, MailWrite as _, NewMessage, StoreRead as _, StoreWrite as _,
+    GccpWrite as _, MailRead as _, MailWrite as _, StoreRead as _, StoreWrite as _,
 };
 use crate::{AgentStatus, InferenceState, RuntimeState};
 
@@ -264,7 +261,6 @@ impl AgentPool {
             first_agent: std::sync::Mutex::default(),
             handing: tokio::sync::watch::Sender::new(false),
         });
-        pool.init_projects().await;
         pool.restore_flash_expiry().await;
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -1020,7 +1016,6 @@ impl AgentPool {
         client_id: u64,
         parent: Option<MessageId>,
         settles: Option<rho_agent_types::MessageVersion>,
-        mentions: Vec<AgentId>,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<MessageId> {
         let mut write = self.db.write().await;
@@ -1028,10 +1023,44 @@ impl AgentPool {
             UnixMs::now(),
             parent,
             rho_agent_types::ThreadReply { settles },
-            self.user_mentions(mentions),
             content,
             client_id,
         )?;
+        write.commit();
+        self.wake_receivers(id, None);
+        self.consider_naming(id);
+        Ok(id)
+    }
+
+    /// The user's `text` to `agent`, posted under `parent` or as a new
+    /// root. The agent joins the message's thread in the same transaction,
+    /// so the message reaches it.
+    pub async fn tell_agent(
+        self: &Arc<Self>,
+        agent: AgentId,
+        parent: Option<MessageId>,
+        text: String,
+    ) -> anyhow::Result<MessageId> {
+        // The thread is the parent when the parent is in a thread, else
+        // the new message, as in `MailRead::mail_thread`.
+        let in_thread = {
+            let read = self.db.read();
+            anyhow::ensure!(read.agent(agent).is_some(), "no agent {}", agent.encoded());
+            parent.filter(|parent| read.message(*parent).is_some_and(|m| m.parent.is_some()))
+        };
+        let mut write = self.db.write().await;
+        let at = UnixMs::now();
+        let id = write.post_user_reply(
+            at,
+            parent,
+            rho_agent_types::ThreadReply { settles: None },
+            vec![ContentPart::Text { text }],
+            uuid::Uuid::new_v4().as_u64_pair().0,
+        )?;
+        // The post reached the members it had; the agent joins after it,
+        // so it is handed this message as well.
+        write.join(at, in_thread.unwrap_or(id), agent)?;
+        write.deliver(agent, id);
         write.commit();
         self.wake_receivers(id, None);
         self.consider_naming(id);
@@ -1044,18 +1073,6 @@ impl AgentPool {
         write.name(UnixMs::now(), thread, name)?;
         write.commit();
         Ok(())
-    }
-
-    /// Debug callers may add recipients outside the thread without
-    /// excluding any member that would otherwise receive the user's words.
-    fn user_mentions(&self, agents: Vec<AgentId>) -> Vec<Mention> {
-        let read = self.db.read();
-        let mut seen = HashSet::new();
-        agents
-            .into_iter()
-            .filter(|agent| seen.insert(*agent) && read.agent(*agent).is_some())
-            .map(Mention::Agent)
-            .collect()
     }
 
     /// Start the process of every workset with an agent that receives
@@ -1309,15 +1326,6 @@ impl AgentPool {
         workset: WorksetId,
         request: PyRequest,
     ) -> anyhow::Result<PyReply> {
-        let legacy_send = matches!(request, PyRequest::SendMail { .. });
-        let replacement = match &request {
-            PyRequest::SendMail2 {
-                replace_last: true,
-                ping,
-                ..
-            } => Some(*ping),
-            _ => None,
-        };
         Ok(match request {
             PyRequest::CreateAgent(spec) => {
                 let mut write = self.db.write().await;
@@ -1432,44 +1440,6 @@ impl AgentPool {
                         .delivered,
                 )
             }
-            PyRequest::SendMail {
-                sender,
-                parent,
-                reply_to,
-                mentions,
-                content,
-            }
-            | PyRequest::SendMail2 {
-                sender,
-                parent,
-                reply_to,
-                mentions,
-                content,
-                ..
-            } => {
-                let id = self
-                    .send_agent_message(
-                        workset,
-                        parent,
-                        NewMessage {
-                            from: Address::Agent(sender),
-                            reply_to,
-                            mentions,
-                            content,
-                        },
-                        replacement,
-                        "mail",
-                    )
-                    .await?;
-                if legacy_send {
-                    PyReply::SentMail {
-                        id,
-                        unanswered: None,
-                    }
-                } else {
-                    PyReply::Seq(id.0)
-                }
-            }
             PyRequest::SendChat {
                 sender,
                 thread,
@@ -1477,40 +1447,38 @@ impl AgentPool {
                 kind,
             } => {
                 let id = match kind {
-                    MessageKind::Kept => {
-                        self.send_agent_message(
-                            workset,
-                            Some(thread),
-                            NewMessage {
-                                from: Address::Agent(sender),
-                                reply_to: None,
-                                mentions: vec![Mention::User { ping: true }],
-                                content,
-                            },
-                            None,
-                            "chat",
-                        )
-                        .await?
+                    ChatKind::Message => {
+                        self.send_chat_message(workset, sender, thread, content)
+                            .await?
                     }
-                    MessageKind::Flash => self.send_flash(workset, sender, thread, content).await?,
+                    ChatKind::Flash => self.send_flash(workset, sender, thread, content).await?,
                 };
                 PyReply::Seq(id.0)
+            }
+            PyRequest::MessageAgent {
+                sender,
+                to,
+                content,
+            } => PyReply::Seq(self.message_agent(workset, sender, to, content).await?.0),
+            PyRequest::StartProject { agent, name } => {
+                self.own_agent(workset, agent)?;
+                let name = rho_agent_types::ProjectName::parse(&name)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                PyReply::Project(Some(self.agent_project(agent, name).await?.0))
             }
             PyRequest::Edit {
                 agent,
                 message,
                 content,
-                ping,
             } => {
                 self.own_agent(workset, agent)?;
-                self.revise_agent_mail(
+                self.revise_agent_words(
                     self.db.write().await,
                     workset,
                     UnixMs::now(),
                     agent,
                     message,
                     content,
-                    ping,
                 )?;
                 PyReply::Done
             }
@@ -1640,14 +1608,6 @@ impl AgentPool {
                 PyReply::ExternalContacts(contacts)
             }
         })
-    }
-
-    /// Fails unless every agent `mentions` names is on this host.
-    fn known_mentions(&self, mentions: &[rho_agent_types::Mention]) -> anyhow::Result<()> {
-        for agent in mentions.iter().filter_map(|mention| mention.agent()) {
-            self.workset_of(agent)?;
-        }
-        Ok(())
     }
 
     /// What `agent` receives after `after`, waiting up to [`INBOX_WAIT`]

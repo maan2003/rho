@@ -9,7 +9,7 @@ the user reads and directs it from then on. Its responses go to the user, not to
 ask you for more context. Returns its identity.
 
 The prompt is the first message of a new thread named task_name, in `thread`, or beside the thread
-you were started in. The message mentions the user, so write it as you write to the user.
+you were started in. The message speaks to the user, so write it as you write to the user.
 
 Give it its own checkout: create a git worktree in the workset with `git worktree add` and pass it
 as workdir, so its edits do not collide with yours or other Engineers'.

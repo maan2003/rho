@@ -30,16 +30,16 @@ A card is titled by the thread's subject and the project's address.
 |---|---|---|
 | A1 | Unseen pinging mail | `waits`, rises |
 | A2 | A result that pings | `waits` just like a question, stays until answered |
-| A3 | Unseen non-pinging mail | no card; it does not hide pinging mail |
-| A4 | A message that mentions nobody, or another agent | nothing, and it hides nothing |
+| A3 | An unseen flash | no card; it does not hide pinging mail |
+| A4 | An agent's message at a root, or its words to another agent | nothing, and it hides nothing |
 | A5 | Several unseen pings | one card, waiting from the oldest |
 | A6 | Seen | nothing until newer pinging mail |
-| A7 | The user wrote in the thread within the hour before the mention | a bonus worth three hours of waiting, fading over the hour: it deals ahead of mail that waited less, and chimes at once |
-| A8 | An older device said done through a message before the mention | the mention still deals |
+| A7 | The user wrote in the thread within the hour before the ping | a bonus worth three hours of waiting, fading over the hour: it deals ahead of mail that waited less, and chimes at once |
+| A8 | An older device said done through a message before the ping | the ping still deals |
 | A15 | Done | the thread is read through its newest mail in view: every ping in it goes, and only a newer ping or edit deals it again; undo brings the card back as it was |
 | A16 | A reply, logged or still queued on this device | the thread is read through the newest mail in view when it was sent; mail after that deals |
-| A10 | Another agent's message in the thread, mentioning the thread's agent | context, never unread; the thread deals by mentions of the user |
-| A11 | An agent made by another agent | deals only by mentioning the user, like any other |
+| A10 | Another agent's words in the thread to the thread's agent | context, never unread; the thread deals by messages to the user |
+| A11 | An agent made by another agent | deals only by its messages to the user, like any other |
 | A12 | Its agents' runtimes running, waiting, idle, stopped on an error, or retrying | changes nothing: the runtime is not mail |
 | A13 | The thread muted | nothing |
 | A14 | A stop mailed by the system bot | one card, with the stop’s reason; stays until answered or recovered |

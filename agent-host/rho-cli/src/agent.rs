@@ -12,19 +12,20 @@ use camino::Utf8PathBuf;
 use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_types::{
     Address, AgentId, AgentIdDomain, AgentRole, ChatEvent, ChatRecord, ChatSeq, ContentPart,
-    EndpointId, Message, MessageId, MessageKind, Revision, RuntimeLabel, ThreadWork, UnixMs,
-    WorksetId, WorksetKind, Wpos, agent_cwd,
+    EndpointId, Message, MessageId, ProjectConfig, ProjectMode, ProjectName, ProjectPlace,
+    Revision, RuntimeCatalogue, RuntimeLabel, ThreadWork, UnixMs, Voice, WorksetId, WorksetKind,
+    Wpos, agent_cwd,
 };
 use rho_agents_client::protocol::snippets::{self, Function};
 use rho_agents_client::protocol::transcript::{InferenceState, Item, RuntimeState, Speaker};
 use rho_agents_client::protocol::worksets::{
     self, AgentEntry, AgentLog, AgentLogPage, Cancel, CancelResult, CreateWorkset, Eval, LogEvent,
-    LogNext, StopAgent, WorksetEntry,
+    LogNext, StopAgent, TellAgent, WorksetEntry,
 };
 use rho_chat::ThreadId;
 use rho_chat::protocol::{
-    self as chat, ClientFrame as ChatClientFrame, Name as NameThread, Post, ResolveProject,
-    ServerFrame as ChatServerFrame,
+    self as chat, ClientFrame as ChatClientFrame, CreateProject, Name as NameThread, Post,
+    ResolveProject, ServerFrame as ChatServerFrame,
 };
 use rho_rpc::protocol::RuntimePaths;
 use rho_rpc::protocol::client::{self, Client};
@@ -437,7 +438,7 @@ async fn run_spawn(paths: &RuntimePaths, json: bool, args: SpawnArgs) -> Result<
     };
 
     let project_root = ensure_project_root(paths, &args.project).await?;
-    let posted = post_message(paths, Some(project_root), vec![agent_id], prompt_text).await?;
+    let posted = post_message(paths, Some(project_root), Some(agent_id), prompt_text).await?;
     if let Some(name) = &args.name {
         client::call(
             paths,
@@ -554,8 +555,7 @@ async fn run_send(paths: &RuntimePaths, json: bool, args: SendArgs) -> Result<()
         (None, None) => unreachable!("clap enforces --thread or --agent"),
     };
 
-    let mentions = target_agent.into_iter().collect::<Vec<_>>();
-    let posted = post_message(paths, Some(parent_for_post), mentions, text).await?;
+    let posted = post_message(paths, Some(parent_for_post), target_agent, text).await?;
     let effective_thread = if created_new_thread {
         if let Some(name) = &args.name {
             client::call(
@@ -764,7 +764,7 @@ async fn run_read(paths: &RuntimePaths, json: bool, args: ReadArgs) -> Result<()
         .values()
         .filter(|msg| msg.revision != Revision::Deleted)
         .filter(|msg| msg.id == thread || chat.thread_of(msg.id) == thread)
-        .filter(|msg| args.include_flashes || msg.kind != MessageKind::Flash)
+        .filter(|msg| args.include_flashes || msg.voice != Voice::Flash)
         .filter(|msg| {
             let seq = chat.effective_seq(msg);
             seq > after
@@ -1194,6 +1194,7 @@ impl ChatState {
                     self.names.insert(*thread, name.clone());
                 }
             }
+            ChatEvent::Project { .. } => {}
         }
     }
 
@@ -1268,12 +1269,11 @@ impl ChatState {
                     }
                 }
                 Address::User => {
-                    let mentioned = msg.mentions.iter().any(|m| m.agent() == Some(agent));
                     let joined = self
                         .joined
                         .get(&agent)
                         .is_some_and(|threads| threads.contains(&self.thread_of(msg.id)));
-                    if !mentioned && !joined {
+                    if !joined {
                         return false;
                     }
                 }
@@ -1423,7 +1423,7 @@ async fn catch_up_chat(paths: &RuntimePaths) -> Result<(ChatState, Client)> {
     client.open(&chat::Open::Session).await?;
 
     let mut state = ChatState::default();
-    let ChatServerFrame::Hello { head: _, host } = client.recv::<ChatServerFrame>().await? else {
+    let ChatServerFrame::Hello { host, .. } = client.recv::<ChatServerFrame>().await? else {
         anyhow::bail!("chat session did not start with Hello");
     };
     state.host = Some(host);
@@ -1444,7 +1444,7 @@ async fn catch_up_chat(paths: &RuntimePaths) -> Result<(ChatState, Client)> {
                 state.work = threads.into_iter().collect();
                 break;
             }
-            ChatServerFrame::Projects { .. } | ChatServerFrame::Hello { .. } => {}
+            ChatServerFrame::Hello { .. } => {}
         }
     }
     Ok((state, client))
@@ -1575,7 +1575,7 @@ async fn wait_for_reply_loop(
                         }
                         chat.work = next_work;
                     }
-                    ChatServerFrame::Projects { .. } | ChatServerFrame::Hello { .. } => {}
+                    ChatServerFrame::Hello { .. } => {}
                 }
             }
             frame = worksets_client.recv::<worksets::ServerFrame>() => {
@@ -1735,7 +1735,7 @@ fn emit_follow_message(
     json: bool,
 ) -> Result<()> {
     let thread = chat.thread_of(msg.id);
-    if msg.kind == MessageKind::Flash
+    if msg.voice == Voice::Flash
         || (matches!(msg.from, Address::Agent(_)) && msg.to_user() && !msg.pings_user())
     {
         if !include_flashes {
@@ -1782,7 +1782,7 @@ fn classify_message(
     let thread = chat.thread_of(msg.id).0.0;
     match msg.from {
         Address::Agent(agent_id) => {
-            if msg.kind == MessageKind::Flash || (msg.to_user() && !msg.pings_user()) {
+            if msg.voice == Voice::Flash || (msg.to_user() && !msg.pings_user()) {
                 let flash = flash_view(snapshot, msg, seq);
                 if include_flashes {
                     if !json {
@@ -1827,7 +1827,7 @@ fn classify_message(
 }
 
 fn flash_view(snapshot: &DirectorySnapshot, msg: &Message, seq: ChatSeq) -> FlashView {
-    let kind = if msg.kind == MessageKind::Flash {
+    let kind = if msg.voice == Voice::Flash {
         "flash"
     } else {
         "status"
@@ -1860,7 +1860,7 @@ fn message_view(
     };
     let kind = match msg.from {
         Address::System { .. } | Address::StartFailed => "stop",
-        _ if msg.kind == MessageKind::Flash => "flash",
+        _ if msg.voice == Voice::Flash => "flash",
         Address::Agent(_) if msg.to_user() && !msg.pings_user() => "status",
         _ => "message",
     };
@@ -1897,35 +1897,60 @@ fn format_address(snapshot: &DirectorySnapshot, from: Address) -> String {
     }
 }
 
+/// The project named `name`, created at the caller's directory when the
+/// host has none by that name.
 async fn ensure_project_root(paths: &RuntimePaths, name: &str) -> Result<MessageId> {
-    let clean = rho_agent_types::one_line(name);
-    anyhow::ensure!(!clean.is_empty(), "project name must not be empty");
+    let name = ProjectName::parse(name).map_err(anyhow::Error::msg)?;
     if let Some(project) = client::call(
         paths,
         ResolveProject {
-            name: clean.clone(),
+            name: name.as_str().to_owned(),
         },
     )
     .await?
     {
-        return Ok(project.root);
+        return Ok(project.id.0);
     }
-    post_message(paths, None, Vec::new(), clean).await
+    let cwd = std::env::current_dir().context("the current directory")?;
+    let place = ProjectPlace::parse(&cwd.to_string_lossy()).map_err(anyhow::Error::msg)?;
+    let runtime = RuntimeCatalogue::host()
+        .default_runtime()
+        .context("the host offers no runtime")?
+        .clone();
+    let config = ProjectConfig {
+        place,
+        mode: ProjectMode::One,
+        runtime,
+    };
+    let project = client::call(paths, CreateProject { name, config }).await?;
+    Ok(project.0)
 }
 
+/// The user's `text` under `parent`. With `agent`, the agent joins the
+/// message's thread, so the message reaches it.
 async fn post_message(
     paths: &RuntimePaths,
     parent: Option<MessageId>,
-    mentions: Vec<AgentId>,
+    agent: Option<AgentId>,
     text: String,
 ) -> Result<MessageId> {
+    if let Some(agent) = agent {
+        return client::call(
+            paths,
+            TellAgent {
+                agent,
+                parent,
+                text,
+            },
+        )
+        .await;
+    }
     client::call(
         paths,
         Post {
             client_id: uuid::Uuid::new_v4().as_u64_pair().0,
             parent,
             settles: None,
-            mentions,
             content: vec![ContentPart::Text { text }],
         },
     )
@@ -2388,8 +2413,6 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::Mention;
-
     use super::*;
     use crate::{Args, Command};
 
@@ -2605,19 +2628,18 @@ mod tests {
             statuses: HashMap::new(),
         };
         let mut chat = ChatState::default();
-        // Root #1 ("cli"), thread #2 (user prompt), flash #3, quiet status #4,
-        // revised to ping #5
+        // Root #1 ("cli"), thread #2 (user prompt), flash #3, message #4,
+        // revised #5, the agent joined to #2 at #6
         let records = [
             ChatRecord {
                 seq: ChatSeq(1),
                 at: UnixMs(10),
                 event: ChatEvent::Posted {
                     parent: None,
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from: Address::User,
-                    kind: MessageKind::Kept,
-                    mentions: vec![],
+                    voice: Voice::Message,
                     content: vec![ContentPart::Text { text: "cli".into() }],
                 },
             },
@@ -2626,11 +2648,10 @@ mod tests {
                 at: UnixMs(20),
                 event: ChatEvent::Posted {
                     parent: Some(MessageId(ChatSeq(1))),
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from: Address::User,
-                    kind: MessageKind::Kept,
-                    mentions: vec![Mention::Agent(agent)],
+                    voice: Voice::Message,
                     content: vec![ContentPart::Text {
                         text: "check clock".into(),
                     }],
@@ -2641,11 +2662,10 @@ mod tests {
                 at: UnixMs(30),
                 event: ChatEvent::Posted {
                     parent: Some(MessageId(ChatSeq(2))),
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from: Address::Agent(agent),
-                    kind: MessageKind::Flash,
-                    mentions: vec![Mention::User { ping: false }],
+                    voice: Voice::Flash,
                     content: vec![ContentPart::Text {
                         text: "reading files".into(),
                     }],
@@ -2656,11 +2676,10 @@ mod tests {
                 at: UnixMs(40),
                 event: ChatEvent::Posted {
                     parent: Some(MessageId(ChatSeq(2))),
-                    reply_to: None,
+                    retry_of: None,
                     thread_reply: None,
                     from: Address::Agent(agent),
-                    kind: MessageKind::Kept,
-                    mentions: vec![Mention::User { ping: false }],
+                    voice: Voice::Message,
                     content: vec![ContentPart::Text {
                         text: "working".into(),
                     }],
@@ -2675,7 +2694,15 @@ mod tests {
                     content: vec![ContentPart::Text {
                         text: "done!".into(),
                     }],
-                    ping: Some(true),
+                },
+            },
+            // `TellAgent` joins the agent to the thread of the user's words.
+            ChatRecord {
+                seq: ChatSeq(6),
+                at: UnixMs(60),
+                event: ChatEvent::Joined {
+                    thread: MessageId(ChatSeq(2)),
+                    agent,
                 },
             },
         ];

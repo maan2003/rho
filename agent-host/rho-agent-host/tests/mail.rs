@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rho_agent_types::{
-    Address, AgentId, ChatEvent, ChatRecord, ContentPart, Mention, MessageId, MessageKind,
-    ProjectChange, ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace, Role,
-    RuntimeLabel, Stop, WorksetKind, Wpos,
+    Address, AgentId, ChatEvent, ChatRecord, ContentPart, MessageId, ProjectChange, ProjectConfig,
+    ProjectId, ProjectMode, ProjectName, ProjectPlace, Role, RuntimeLabel, Stop, Voice,
+    WorksetKind, Wpos,
 };
 use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
@@ -212,7 +212,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     };
     write_frame(&mut first_device, &ClientFrame::Follow { since: head }).await?;
     assert_eq!(
-        read_projects(&mut first_device).await?,
+        read_projects(paths).await?,
         vec![
             (one, one_config.clone()),
             (each, each_config.clone()),
@@ -252,7 +252,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         .context("the second idea must be logged as mail")?;
     assert_eq!(continuing.from, Address::User);
     assert_eq!(continuing.parent, Some(one.0));
-    assert_eq!(continuing.mentions, [Mention::Direct(standing)]);
+    assert_eq!(continuing.voice, Voice::Message);
     wait_for_delivery(paths, standing, a).await?;
     wait_for_delivery(paths, standing, b).await?;
     assert_eq!(
@@ -302,7 +302,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     )
     .await?;
     assert_eq!(
-        read_projects(&mut first_device).await?[0],
+        read_projects(paths).await?[0],
         (
             one,
             ProjectConfig {
@@ -342,7 +342,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     .await?;
     let failure = wait_for_mail(&mut first_device, |row| {
         matches!(row.event, ChatEvent::Posted {
-        from: Address::StartFailed, reply_to: Some(idea), ..
+        from: Address::StartFailed, parent: Some(idea), ..
     } if idea == failed)
     })
     .await?;
@@ -374,7 +374,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         },
     )
     .await?;
-    let changed = read_projects(&mut first_device).await?;
+    let changed = read_projects(paths).await?;
     assert_eq!(
         changed[0],
         (
@@ -448,15 +448,9 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     assert_ne!(fresh, next_agent);
     assert_ne!(fresh, standing);
     wait_for_delivery(paths, fresh, per_idea).await?;
-    // A new session, with no previous settings, sees the host's existing
-    // choices.
-    let mut second_device = connect_chat(paths).await?;
-    let ServerFrame::Hello { head, .. } = read_frame(&mut second_device).await? else {
-        anyhow::bail!("no new device hello");
-    };
-    write_frame(&mut second_device, &ClientFrame::Follow { since: head }).await?;
+    // A new session sees the host's settings.
     assert_eq!(
-        read_projects(&mut second_device).await?,
+        read_projects(paths).await?,
         vec![
             (
                 one,
@@ -589,14 +583,38 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     ))
 }
 
-async fn read_projects(
-    stream: &mut rho_rpc::Stream,
-) -> anyhow::Result<Vec<(ProjectId, ProjectConfig)>> {
-    loop {
-        if let ServerFrame::Projects { configured } = read_frame(stream).await? {
-            return Ok(configured);
+/// Each project's settings as a new session folds them from the log: the
+/// latest `Project` event of each root, in the order the roots became
+/// projects.
+async fn read_projects(paths: &RuntimePaths) -> anyhow::Result<Vec<(ProjectId, ProjectConfig)>> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no chat hello");
+    };
+    write_frame(
+        &mut stream,
+        &ClientFrame::Follow {
+            since: rho_agent_types::ChatSeq::ZERO,
+        },
+    )
+    .await?;
+    let mut projects: Vec<(ProjectId, ProjectConfig)> = Vec::new();
+    let mut seen = rho_agent_types::ChatSeq::ZERO;
+    while seen < head {
+        let ServerFrame::Messages { records } = read_frame(&mut stream).await? else {
+            continue;
+        };
+        for record in records {
+            seen = seen.max(record.seq);
+            if let ChatEvent::Project { project, config } = record.event {
+                match projects.iter_mut().find(|(id, _)| *id == project) {
+                    Some((_, held)) => *held = config,
+                    None => projects.push((project, config)),
+                }
+            }
         }
     }
+    Ok(projects)
 }
 
 async fn idea_agent(paths: &RuntimePaths, thread: MessageId) -> anyhow::Result<AgentId> {
@@ -683,7 +701,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         eval(
             workset,
             format!(
-                "from rho import mail\nmail.join({}, {:?})",
+                "from rho import chat\nchat.join({}, {:?})",
                 thread.0.0,
                 agent.encoded()
             ),
@@ -710,41 +728,20 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         let flash_id = sent.trim().parse::<u64>()?;
         let posted = wait_for_mail(&mut stream, |row| row.seq.0 == flash_id).await?;
         let flash = rho_agent_types::Message::from_record(&posted).context("not a post")?;
-        assert_eq!(flash.kind, MessageKind::Flash);
+        assert_eq!(flash.voice, Voice::Flash);
         assert_eq!(flash.parent, Some(thread));
         assert_eq!(flash.text(), words);
         assert!(!flash.pings_user());
     }
-    let send = |workset, agent: AgentId, words: &str| {
-        eval(
-            workset,
-            format!(
-                "from rho import mail\nprint(int(mail.send({:?}, 'user', {:?}, thread={})))",
-                agent.encoded(),
-                words,
-                thread.0.0
-            ),
-        )
-    };
-    let first = eval(
-        aw,
-        format!(
-            "from rho import mail\nprint(int(mail.send({:?}, 'user', 'Use polling for this check.', thread={}, ping=False)))",
-            a.encoded(), thread.0.0
-        ),
-    )
-    .await?;
+    let first = chat(aw, a, "Use polling for this check.", "message").await?;
     let first: u64 = first.trim().parse()?;
+    let posted = wait_for_mail(&mut stream, |row| row.seq.0 == first).await?;
+    let posted = rho_agent_types::Message::from_record(&posted).context("not a post")?;
+    assert_eq!(posted.voice, Voice::Message);
+    assert!(posted.pings_user());
     let independent = chat(bw, b, "Can I use clock B?", "message").await?;
     let id = MessageId(rho_agent_types::ChatSeq(independent.trim().parse()?));
-    assert_ne!(first, id.0.0, "each agent owns its own mail");
-    let refused = send(aw, a, "Can I use clock A?").await.unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains(&format!("mail.edit({first}, text)")),
-        "{refused:#}"
-    );
+    assert_ne!(first, id.0.0, "each agent owns its own message");
     let refused = chat(aw, a, "Can I use clock A?", "message")
         .await
         .unwrap_err();
@@ -762,54 +759,38 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         paths,
         Eval {
             workset: aw,
-            code: format!("print(mail.message({first})['text'])"),
+            code: format!("from rho import chat\nprint(chat.message({first})['text'])"),
         },
     )
     .await?;
     assert_eq!(first_before.output.trim(), "Use polling for this check.");
-    // With a live slot, replacing chooses the caller's own mail rather
-    // than the other agent's, and omission must not turn a quiet mail on.
-    let replace = |workset, agent: AgentId, words: &str, ping| {
-        let ping = match ping {
-            Some(true) => ", ping=True",
-            Some(false) => ", ping=False",
-            None => "",
-        };
+    let edit = |workset, agent: AgentId, message: u64, words: &str| {
         eval(
             workset,
             format!(
-                "from rho.tools import Mail\nprint(int(Mail({:?}).send('user', {:?}, thread={}, replace_last=True{ping})))",
+                "from rho.tools import Chat\nChat({:?}).edit({message}, {:?})",
                 agent.encoded(),
-                words,
-                thread.0.0
+                words
             ),
         )
     };
-    for (text, ping, expected_ping) in [
-        ("Use clock A for this check.", None, false),
-        ("Can I use clock A for both?", Some(true), true),
-        ("Use clock A for both.", Some(false), false),
-    ] {
-        let replaced = replace(aw, a, text, ping).await?;
-        assert_eq!(replaced.trim().parse::<u64>()?, first);
+    // An agent updates its live message by editing it.
+    for text in ["Use clock A for this check.", "Use clock A for both."] {
+        edit(aw, a, first, text).await?;
         let row = wait_for_mail(&mut stream, |row| {
             matches!(row.event, ChatEvent::Revised { message, author, .. } if message.0.0 == first && author == a)
         }).await?;
-        let ChatEvent::Revised { content, ping, .. } = row.event else {
+        let ChatEvent::Revised { content, .. } = row.event else {
             unreachable!()
         };
         assert_eq!(content, [ContentPart::Text { text: text.into() }]);
-        assert_eq!(ping, Some(expected_ping));
     }
-    eval(
-        bw,
-        format!(
-            "from rho.tools import Mail\nMail({:?}).edit({}, 'Can I use a monotonic clock?')",
-            b.encoded(),
-            id.0.0
-        ),
-    )
-    .await?;
+    let not_its_own = edit(aw, a, id.0.0, "Use clock A.").await.unwrap_err();
+    assert!(
+        not_its_own.to_string().contains("own words"),
+        "{not_its_own:#}"
+    );
+    edit(bw, b, id.0.0, "Can I use a monotonic clock?").await?;
     let revision = wait_for_mail(&mut stream, |row|
         matches!(row.event, ChatEvent::Revised { message, author, .. } if message == id && author == b)
     ).await?;
@@ -851,7 +832,6 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             client_id: 112,
             parent: Some(thread),
             settles: Some(seen),
-            mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "Use clock B.".into(),
             }],
@@ -860,39 +840,29 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     .await?;
     let answer_post = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
     let reply = rho_agent_types::Message::from_record(&answer_post).context("not a post")?;
-    assert!(reply.mentions.is_empty());
-    assert_eq!(reply.reply_to, None);
+    assert_eq!(reply.voice, Voice::Message);
+    assert_eq!(reply.retry_of, None);
     assert_eq!(reply.thread_reply.unwrap().settles, Some(seen));
     for agent in [a, b] {
         wait_for_delivery(paths, agent, answer).await?;
     }
     // There is still no user answer tied to A's older words.
-    eval(
-        aw,
-        format!(
-            "from rho.tools import Mail\nMail({:?}).edit({first}, 'A was not settled.')",
-            a.encoded()
-        ),
-    )
+    edit(aw, a, first, "A was not settled.").await?;
+    // The user's reply ends B's live message, so the message B's model
+    // sends in answer is new, not a revision of the answered one.
+    let row = wait_for_mail(&mut stream, |row| {
+        row.seq > answer.0
+            && matches!(row.event, ChatEvent::Posted { from: Address::Agent(from), .. } if from == b)
+    })
     .await?;
-    let fresh = replace(bw, b, "I will use clock B.", None).await?;
-    let fresh = fresh.trim().parse::<u64>()?;
-    assert_ne!(id.0.0, fresh);
-    let row = wait_for_mail(&mut stream, |row| row.seq.0 == fresh).await?;
-    let ChatEvent::Posted { mentions, .. } = row.event else {
-        anyhow::bail!("with no live slot replace_last must post a new mail");
-    };
-    assert!(mentions.contains(&Mention::User { ping: true }));
-    let frozen = eval(
-        bw,
-        format!(
-            "from rho.tools import Mail\nMail({:?}).edit({}, 'I will use clock B.')",
-            b.encoded(),
-            id.0.0
-        ),
-    )
-    .await
-    .unwrap_err();
+    let fresh = rho_agent_types::Message::from_record(&row).context("not a post")?;
+    assert_ne!(fresh.id, id);
+    assert_eq!(fresh.parent, Some(thread));
+    assert_eq!(fresh.voice, Voice::Message);
+    assert!(fresh.pings_user());
+    let frozen = edit(bw, b, id.0.0, "I will use clock B.")
+        .await
+        .unwrap_err();
     assert!(
         frozen.to_string().contains("already answered"),
         "{frozen:#}"
@@ -909,7 +879,7 @@ async fn run_live_ask(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         }
     }
     Ok(format!(
-        "two flashes did not ping or consume the live slot; old and new APIs both sent; repeat refused; replacement preserved/toggled ping; thread reply reached both workers, froze only the dealt version; new mail #{}",
+        "two flashes did not ping or consume the live slot; repeat refused; edits kept the live slot; thread reply reached both workers, froze only the dealt version; new message #{}",
         id.0.0
     ))
 }
@@ -920,7 +890,20 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         anyhow::bail!("no chat hello");
     };
     write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
-    let project = post(paths, 7, None, "tide").await?;
+    let config = ProjectConfig {
+        place: ProjectPlace::parse(root.to_str().unwrap()).unwrap(),
+        mode: ProjectMode::One,
+        runtime: RuntimeLabel::default(),
+    };
+    let id = call(
+        paths,
+        CreateProject {
+            name: ProjectName::parse("tide").unwrap(),
+            config: config.clone(),
+        },
+    )
+    .await?;
+    let project = id.0;
     let thread = post(paths, 8, Some(project), "Check the real mail path.").await?;
     let address = call(
         paths,
@@ -932,8 +915,9 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
     assert_eq!(
         address,
         Some(Project {
+            id,
             name: "tide".to_owned(),
-            root: project
+            config,
         })
     );
 
@@ -950,20 +934,16 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("agent not created: {:?}", created.result.error))?;
     call(
         paths,
-        Post {
-            client_id: 9,
+        worksets::TellAgent {
+            agent,
             parent: Some(thread),
-            settles: None,
-            mentions: vec![agent],
-            content: vec![ContentPart::Text {
-                text: "Please run the check.".into(),
-            }],
+            text: "Please run the check.".into(),
         },
     )
     .await?;
     let origin_result = wait_for_mail(&mut stream, |row| matches!(&row.event,
-        ChatEvent::Posted { parent: Some(parent), from: Address::Agent(from), mentions, .. }
-        if *parent == thread && *from == agent && mentions.iter().any(|m| matches!(m, rho_agent_types::Mention::User { ping: true }))
+        ChatEvent::Posted { parent: Some(parent), from: Address::Agent(from), voice: Voice::Message, .. }
+        if *parent == thread && *from == agent
     )).await?;
     let tool_thread = post(paths, 90, Some(project), "Check the interface.").await?;
     let EvalResult { output, error, .. } = call(
@@ -973,15 +953,15 @@ async fn run(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
             code: format!(
                 r#"
 import os
-from rho.tools import Mail
-mail = Mail("{}")
-note = await mail.send("user", "Use polling for this check.", thread={}, ping=False)
+from rho.tools import Chat
+chat = Chat("{}")
+note = await chat.send("Use polling for this check.", "message", thread={})
 assert isinstance(note, int)
-mail.edit(note, "Use sockets for this check.", ping=True)
-hits = await mail.search("sockets", project={})
+chat.edit(note, "Use sockets for this check.")
+hits = await chat.search("sockets", project={})
 assert [row["message"] for row in hits] == [note]
-mail.delete(note)
-assert not mail.search("sockets", project={})
+chat.delete(note)
+assert not chat.search("sockets", project={})
 print(f"worker:{{os.getpid()}} note:{{note}}")
 "#,
                 agent.encoded(),
@@ -1007,15 +987,11 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     let mut deleted = false;
     while !(edited && deleted) {
         match read_frame(&mut stream).await? {
-            ServerFrame::Work { .. } | ServerFrame::Projects { .. } => {}
+            ServerFrame::Work { .. } => {}
             ServerFrame::Messages { records } => {
                 for row in records {
                     match row.event {
-                        ChatEvent::Revised {
-                            message,
-                            ping: Some(true),
-                            ..
-                        } if message == note => edited = true,
+                        ChatEvent::Revised { message, .. } if message == note => edited = true,
                         ChatEvent::Deleted { message } if message == note => deleted = true,
                         _ => {}
                     }
@@ -1033,7 +1009,7 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                     records.into_iter().find(|row| {
                         matches!(
                             row.event, ChatEvent::Posted {
-                                kind: rho_agent_types::MessageKind::Kept,
+                                voice: Voice::Message,
                                 parent: Some(parent),
                                 from: Address::System { agent: stopped, stop: Stop::Lost, .. },
                                 ..
@@ -1042,25 +1018,16 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
                     })
                 });
             }
-            ServerFrame::Work { .. } | ServerFrame::Projects { .. } => {}
+            ServerFrame::Work { .. } => {}
             ServerFrame::Hello { .. } => {}
         }
         if let Some(mail) = stop_mail.take() {
             break mail;
         }
     };
-    let ChatEvent::Posted {
-        mentions, content, ..
-    } = stopped.event
-    else {
-        unreachable!()
-    };
-    assert!(
-        mentions
-            .iter()
-            .any(|m| matches!(m, rho_agent_types::Mention::User { ping: true }))
-    );
-    let text = rho_agent_types::content_text(&content);
+    let stop = rho_agent_types::Message::from_record(&stopped).context("not a post")?;
+    assert!(stop.pings_user());
+    let text = stop.text();
     assert!(text.starts_with("lost · "), "{text}");
     assert!(text.contains("Last transcript lines:"), "{text}");
 
@@ -1077,7 +1044,6 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
             client_id: 10,
             parent: Some(thread),
             settles: Some(seen),
-            mentions: vec![],
             content: vec![ContentPart::Text {
                 text: "Thanks for checking.".into(),
             }],
@@ -1086,8 +1052,8 @@ print(f"worker:{{os.getpid()}} note:{{note}}")
     .await?;
     let received = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
     let reply = rho_agent_types::Message::from_record(&received).context("not a post")?;
-    assert_eq!((reply.parent, reply.reply_to), (Some(thread), None));
-    assert!(reply.mentions.is_empty());
+    assert_eq!((reply.parent, reply.retry_of), (Some(thread), None));
+    assert_eq!(reply.voice, Voice::Message);
     assert_eq!(reply.thread_reply.unwrap().settles, Some(seen));
     Ok(format!(
         "mail wire: project {}, fake model result #{}, edit/delete #{}, lost stop #{}, and thread-wide reply #{}",
@@ -1162,7 +1128,6 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
                 client_id,
                 parent: Some(thread),
                 settles,
-                mentions: Vec::new(),
                 content: vec![ContentPart::Text { text: text.into() }],
             },
         )
@@ -1286,7 +1251,7 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
 
 async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
     let mut stream = connect_chat(paths).await?;
-    let ServerFrame::Hello { head, host } = read_frame(&mut stream).await? else {
+    let ServerFrame::Hello { head, host, .. } = read_frame(&mut stream).await? else {
         anyhow::bail!("no mail hello");
     };
     write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
@@ -1325,20 +1290,16 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                     "MAIL-RIG-CHILD-BRIEF" => {
                         assert_eq!(mail.parent, Some(project));
                         assert_eq!(mail.from, Address::Agent(leader));
-                        let [mention] = &mail.mentions[..] else {
-                            anyhow::bail!("bad child address")
-                        };
-                        let rho_agent_types::Mention::Direct(child) = *mention else {
-                            anyhow::bail!("not a child")
+                        let Voice::ToAgent(child) = mail.voice else {
+                            anyhow::bail!("the brief is not to the child")
                         };
                         brief = Some((mail.id, child));
                     }
                     "MAIL-RIG-PEER-RESULT" => {
                         let (brief, child) = brief.context("child sent before brief")?;
                         assert_eq!(mail.parent, Some(brief));
-                        assert_eq!(mail.reply_to, Some(brief));
                         assert_eq!(mail.from, Address::Agent(child));
-                        assert_eq!(mail.mentions, [rho_agent_types::Mention::Direct(leader)]);
+                        assert_eq!(mail.voice, Voice::ToAgent(leader));
                         let claims = cards::claims(
                             &cards::Host {
                                 endpoint: host,
@@ -1350,7 +1311,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                             None,
                             [],
                         );
-                        assert!(claims.is_empty(), "peer mail made a card");
+                        assert!(claims.is_empty(), "a message to an agent made a card");
                         peer = Some(mail.id);
                     }
                     "Can I use the test clock?" => {
@@ -1377,7 +1338,6 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
                 message: ask,
                 version: ask.0,
             }),
-            mentions: Vec::new(),
             content: vec![ContentPart::Text {
                 text: "MAIL-RIG-USER-ANSWER".into(),
             }],
@@ -1387,7 +1347,7 @@ async fn run_peer_chain(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Str
     let row = wait_for_mail(&mut stream, |row| row.seq == answer.0).await?;
     let answer_msg = rho_agent_types::Message::from_record(&row).unwrap();
     assert_eq!(
-        (answer_msg.parent, answer_msg.reply_to, answer_msg.from),
+        (answer_msg.parent, answer_msg.retry_of, answer_msg.from),
         (Some(work), None, Address::User)
     );
     assert_eq!(
@@ -1527,7 +1487,6 @@ async fn post(
             client_id,
             parent,
             settles: None,
-            mentions: vec![],
             content: vec![ContentPart::Text { text: text.into() }],
         },
     )

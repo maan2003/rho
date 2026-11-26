@@ -15,16 +15,14 @@ use std::time::Duration;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
-use rho_agent_types::{
-    Address, AgentId, ChatSeq, ContentPart, Mention, MessageId, Role, WorksetId,
-};
+use rho_agent_types::{Address, AgentId, ChatSeq, ContentPart, MessageId, Role, Voice, WorksetId};
 use tokio::sync::oneshot;
 
 use crate::inference::PromptCacheKey;
 use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::ipc::protocol::Control;
 use crate::ipc::transport::{Port, Sender};
-use crate::ipc::workset::{Message, PyReply, PyRequest, encode};
+use crate::ipc::workset::{ChatKind, Message, PyReply, PyRequest, encode};
 use crate::record::{AgentSpec, Runtime};
 use crate::worker::permissions::{self, PERMISSIONS, Permissions};
 use crate::worker::slack::{self, Routes};
@@ -368,11 +366,12 @@ fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     module.add_function(pyo3::wrap_pyfunction!(compact, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(rewind, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(new_cache_key, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(send_mail, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(send_chat, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(message_agent, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(start_project, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(edit_message, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(delete_message, &module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(search_mail, &module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(project_named, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(join, &module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(leave, &module)?)?;
@@ -722,79 +721,26 @@ fn new_cache_key(py: Python<'_>, agent: &str) -> PyResult<()> {
     control(py, agent, Control::CacheKey)
 }
 
-fn recipient(to: Option<&str>, ping: Option<bool>) -> PyResult<Vec<Mention>> {
-    let mention = match (to, ping) {
-        (None, None) => return Ok(Vec::new()),
-        (Some("user"), Some(ping)) => Mention::User { ping },
-        (Some("user"), None) => {
-            return Err(PyValueError::new_err(
-                "mail to the user needs ping: True or False",
-            ));
-        }
-        (Some(agent), None) => Mention::Direct(agent_id(agent)?),
-        _ => return Err(PyValueError::new_err("only mail to the user pings")),
-    };
-    Ok(vec![mention])
-}
-
-/// The content of an agent's message, refused when it mentions the user in
-/// other than Simplified Technical English.
-fn message_content(text: String, mentions: &[Mention]) -> PyResult<Vec<ContentPart>> {
+/// The content of an agent's words, refused when they are a message to
+/// the user in other than Simplified Technical English.
+fn agent_content(text: String, message: bool) -> PyResult<Vec<ContentPart>> {
     if text.trim().is_empty() {
         return Err(PyValueError::new_err("a message needs text"));
     }
-    if mentions
-        .iter()
-        .any(|mention| matches!(mention, Mention::User { .. }))
-    {
+    if message {
         crate::worker::ste::check_mail(&text)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
     }
     Ok(vec![ContentPart::Text { text }])
 }
 
-/// Put mail in its project or thread. For a directed agent, the host
-/// determines the conversation; `parent` must be unset.
-#[pyfunction]
-#[pyo3(signature = (sender, parent, text, *, to = None, ping = None, reply_to = None, replace_last = false))]
-fn send_mail(
-    py: Python<'_>,
-    sender: &str,
-    parent: Option<u64>,
-    text: String,
-    to: Option<&str>,
-    ping: Option<bool>,
-    reply_to: Option<u64>,
-    replace_last: bool,
-) -> PyResult<u64> {
-    let sender = agent_id(sender)?;
-    let mentions = recipient(to, ping.or_else(|| (to == Some("user")).then_some(true)))?;
-    // For an opt-in replacement, the host checks text against the live
-    // mail's actual recipients under the same lock that selects the mail.
-    let content = message_content(text, if replace_last { &[] } else { &mentions })?;
-    let request = PyRequest::SendMail2 {
-        sender,
-        parent: parent.map(|seq| MessageId(ChatSeq(seq))),
-        reply_to: reply_to.map(|seq| MessageId(ChatSeq(seq))),
-        mentions,
-        content,
-        replace_last,
-        ping,
-    };
-    match PyHost::block(py, request)? {
-        PyReply::Seq(id) => Ok(id.0),
-        _ => Err(unexpected()),
-    }
-}
-
-/// Both kinds speak to the user. The wire carries no recipient or ping.
+/// Speaks to the user in a thread; `kind` is "message" or "flash".
 #[pyfunction]
 #[pyo3(signature = (sender, thread, text, kind))]
 fn send_chat(py: Python<'_>, sender: &str, thread: u64, text: String, kind: &str) -> PyResult<u64> {
-    use rho_agent_types::MessageKind;
-    let (kind, mentions) = match kind {
-        "message" => (MessageKind::Kept, &[Mention::User { ping: true }][..]),
-        "flash" => (MessageKind::Flash, &[][..]),
+    let kind = match kind {
+        "message" => ChatKind::Message,
+        "flash" => ChatKind::Flash,
         _ => return Err(PyValueError::new_err("kind is 'message' or 'flash'")),
     };
     match PyHost::block(
@@ -802,7 +748,7 @@ fn send_chat(py: Python<'_>, sender: &str, thread: u64, text: String, kind: &str
         PyRequest::SendChat {
             sender: agent_id(sender)?,
             thread: MessageId(ChatSeq(thread)),
-            content: message_content(text, mentions)?,
+            content: agent_content(text, kind == ChatKind::Message)?,
             kind,
         },
     )? {
@@ -811,15 +757,41 @@ fn send_chat(py: Python<'_>, sender: &str, thread: u64, text: String, kind: &str
     }
 }
 
+/// One agent's words to another; the host chooses the thread under the
+/// sender's project.
 #[pyfunction]
-#[pyo3(signature = (agent, id, text, *, ping = None))]
-fn edit_message(
-    py: Python<'_>,
-    agent: &str,
-    id: u64,
-    text: String,
-    ping: Option<bool>,
-) -> PyResult<()> {
+fn message_agent(py: Python<'_>, sender: &str, to: &str, text: String) -> PyResult<u64> {
+    match PyHost::block(
+        py,
+        PyRequest::MessageAgent {
+            sender: agent_id(sender)?,
+            to: agent_id(to)?,
+            content: agent_content(text, false)?,
+        },
+    )? {
+        PyReply::Seq(id) => Ok(id.0),
+        _ => Err(unexpected()),
+    }
+}
+
+/// The project of this name; a new one works where `agent` works.
+#[pyfunction]
+fn start_project(py: Python<'_>, agent: &str, name: String) -> PyResult<u64> {
+    match PyHost::block(
+        py,
+        PyRequest::StartProject {
+            agent: agent_id(agent)?,
+            name,
+        },
+    )? {
+        PyReply::Project(Some(id)) => Ok(id.0.0),
+        _ => Err(unexpected()),
+    }
+}
+
+/// Changes the words of the agent's own message or flash; its kind stays.
+#[pyfunction]
+fn edit_message(py: Python<'_>, agent: &str, id: u64, text: String) -> PyResult<()> {
     let message = MessageId(ChatSeq(id));
     let agent = agent_id(agent)?;
     let PyReply::Messages(existing) = PyHost::block(py, PyRequest::Message(message))? else {
@@ -829,21 +801,15 @@ fn edit_message(
         .first()
         .ok_or_else(|| PyValueError::new_err(format!("no message #{id}")))?;
     if existing.from != Address::Agent(agent) {
-        return Err(PyValueError::new_err("you can only change your own mail"));
+        return Err(PyValueError::new_err("you can only change your own words"));
     }
-    let mentions = if existing.kind == rho_agent_types::MessageKind::Flash {
-        &[][..]
-    } else {
-        &existing.mentions
-    };
-    let content = message_content(text, mentions)?;
+    let content = agent_content(text, existing.voice == Voice::Message)?;
     match PyHost::block(
         py,
         PyRequest::Edit {
             agent,
             message,
             content,
-            ping,
         },
     )? {
         PyReply::Done => Ok(()),
@@ -866,12 +832,7 @@ fn delete_message(py: Python<'_>, agent: &str, id: u64) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn search_mail(
-    py: Python<'_>,
-    query: String,
-    project: Option<u64>,
-    limit: u64,
-) -> PyResult<Py<PyAny>> {
+fn search(py: Python<'_>, query: String, project: Option<u64>, limit: u64) -> PyResult<Py<PyAny>> {
     match PyHost::block(
         py,
         PyRequest::Search {
@@ -1108,18 +1069,15 @@ fn message_to_py<'py>(
     out.set_item("id", message.id.0.0)?;
     out.set_item("at", message.at.0)?;
     out.set_item("parent", message.parent.map(|parent| parent.0.0))?;
-    out.set_item("reply_to", message.reply_to.map(|id| id.0.0))?;
+    out.set_item("retry_of", message.retry_of.map(|id| id.0.0))?;
     out.set_item("sender", address_text(message.from))?;
-    let mentions = message
-        .mentions
-        .iter()
-        .map(|mention| match *mention {
-            Mention::User { ping } => ("user".to_owned(), if ping { "ping" } else { "quiet" }),
-            Mention::Agent(agent) => (address_text(Address::Agent(agent)), "member"),
-            Mention::Direct(agent) => (address_text(Address::Agent(agent)), "direct"),
-        })
-        .collect::<Vec<_>>();
-    out.set_item("mentions", mentions)?;
+    let (voice, to) = match message.voice {
+        Voice::Message => ("message", None),
+        Voice::Flash => ("flash", None),
+        Voice::ToAgent(agent) => ("agent", Some(address_text(Address::Agent(agent)))),
+    };
+    out.set_item("voice", voice)?;
+    out.set_item("to", to)?;
     out.set_item("text", text(&message.content))?;
     out.set_item(
         "edited",

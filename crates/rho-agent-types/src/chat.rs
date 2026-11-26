@@ -5,14 +5,16 @@
 //! named by the position of the `Posted` event that made it, and the thread
 //! under a message is named by the message: conversation `41` is every
 //! message whose parent is `#41`. A message with no parent is a root, which
-//! the GUI shows as a stream. Children are derived by the fold, never
-//! stored, so a move is a parent change and the subtree follows.
+//! a project's anchor when a [`ChatEvent::Project`] names it. Children are
+//! derived by the fold, never stored, so a move is a parent change and the
+//! subtree follows.
 //!
 //! Chat and the agents are two hierarchies that meet only here: an agent
-//! receives a message because it is a member of the thread it was posted
-//! in, or of a thread above it, or because the message mentions it. A
-//! client holds the whole log and folds it; the host folds the same events
-//! into its indexes in the commit that appends them.
+//! receives the user's words because it is a member of the thread they
+//! were posted in, or of a thread above it, and another agent's words
+//! because they were written to it ([`Voice::ToAgent`]). A client holds the
+//! whole log and folds it; the host folds the same events into its indexes
+//! in the commit that appends them.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -70,38 +72,20 @@ pub enum Address {
     StartFailed,
 }
 
-/// Who a message reaches beyond the members of its thread. A mention of
-/// the user is mail to the user, which never goes to the thread's agents;
-/// whether it pings decides whether it waits for them as a card
-/// (`rho-dealer`).
+/// How a post stands with the user, fixed when it is posted
+/// (`product/chat.md`: a message is the record, a flash is the now).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum Mention {
-    /// Mail to the user. A mail that pings is dealt; one that does not is
-    /// how the project says what it is doing, edited in place as it works.
-    User { ping: bool },
-    /// Reaches the agent whether or not it is a member, as well as the
-    /// members.
-    Agent(AgentId),
-    /// Mail to this agent alone, without delivery to thread members.
-    Direct(AgentId),
-}
-
-impl Mention {
-    /// The agent the mention reaches, if it names one.
-    pub fn agent(self) -> Option<AgentId> {
-        match self {
-            Self::Agent(agent) | Self::Direct(agent) => Some(agent),
-            Self::User { .. } => None,
-        }
-    }
-}
-
-/// Whether a post is part of the record or only a flash for the user.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum MessageKind {
-    #[default]
-    Kept,
+pub enum Voice {
+    /// Kept in the record. A message in a thread from the project (an
+    /// agent, a stop or a failed start) pings the user and is dealt; the
+    /// user's own words are messages that every member of the thread reads.
+    Message,
+    /// Shown to the user for twenty minutes from its post, then gone. It
+    /// never pings and no agent receives it.
     Flash,
+    /// One agent's words to another, kept under the project. Only that
+    /// agent receives it, the user can read it, and it never pings.
+    ToAgent(AgentId),
 }
 
 pub const FLASH_LIFETIME: std::time::Duration = std::time::Duration::from_secs(20 * 60);
@@ -109,22 +93,26 @@ pub const FLASH_LIFETIME: std::time::Duration = std::time::Duration::from_secs(2
 /// One change to a host's chat.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ChatEvent {
-    /// A message under `parent`, or a root.
-    /// Every member of the thread it is posted in, or of a thread above,
-    /// receives it, and so does each agent it mentions, never its sender.
-    /// Neither posting nor a mention makes anyone a member.
+    /// A message under `parent`, or a root. The user's words reach every
+    /// member of the thread it is posted in, or of a thread above; the
+    /// project's words reach the user; [`Voice::ToAgent`] reaches its agent.
+    /// Posting never makes anyone a member.
     Posted {
         parent: Option<MessageId>,
-        /// The original failed start on retry, or a historical addressee.
-        reply_to: Option<MessageId>,
+        /// The failed start this user post retries.
+        retry_of: Option<MessageId>,
         /// Absent on older posts. A present reply never implicitly settles
         /// earlier cards in the thread.
         thread_reply: Option<ThreadReply>,
         from: Address,
-        #[senax(default)]
-        kind: MessageKind,
-        mentions: Vec<Mention>,
+        voice: Voice,
         content: Vec<ContentPart>,
+    },
+    /// A root becomes a project, or its settings change: where, how and on
+    /// what model its next idea starts. The latest event for a root wins.
+    Project {
+        project: crate::ProjectId,
+        config: crate::ProjectConfig,
     },
     /// A message now under `parent`, or a root, wherever it was. Its
     /// thread goes with it. A move delivers nothing again: who received a
@@ -134,13 +122,14 @@ pub enum ChatEvent {
         parent: Option<MessageId>,
     },
     /// An agent becomes a member of a thread: it receives every later
-    /// message in it and in the threads below it, until it leaves one.
+    /// message the user writes in it and in the threads below it, until it
+    /// leaves one.
     Joined {
         thread: MessageId,
         agent: AgentId,
     },
     /// An agent stops being a member of a thread and of the threads below
-    /// it: it receives only the messages that mention it from here on.
+    /// it.
     Left {
         thread: MessageId,
         agent: AgentId,
@@ -158,14 +147,12 @@ pub enum ChatEvent {
     Deleted {
         message: MessageId,
     },
-    /// The project replaces the live mail without making a new mail.
-    /// Replies to it go to the writer of these words. `ping` turns the
-    /// mail's ping to the user on or off; `None` leaves it as it was.
+    /// An agent replaces the words of a message without making a new one;
+    /// its voice stays as it was posted.
     Revised {
         message: MessageId,
         author: AgentId,
         content: Vec<ContentPart>,
-        ping: Option<bool>,
     },
     /// The turn that wrote this version was rewound. Keep its words readable.
     TakenBack {
@@ -180,8 +167,8 @@ pub enum ChatEvent {
     },
 }
 
-/// What a thread's agents are doing beside its mail, for as long as it is
-/// true. It is never logged: the mail is the history.
+/// What a thread's agents are doing beside its messages, for as long as it
+/// is true. It is never logged: the messages are the history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ThreadWork {
     /// An agent works in the thread now.
@@ -235,15 +222,11 @@ pub struct Message {
     /// Its parent now: a later `Reparented` moved it from where it was
     /// posted.
     pub parent: Option<MessageId>,
-    pub reply_to: Option<MessageId>,
+    pub retry_of: Option<MessageId>,
     pub thread_reply: Option<ThreadReply>,
     pub from: Address,
-    #[senax(default)]
-    pub kind: MessageKind,
-    pub mentions: Vec<Mention>,
+    pub voice: Voice,
     pub content: Vec<ContentPart>,
-    /// A revision that started the current ping, rather than the original mail.
-    pub ping_started: Option<(ChatSeq, UnixMs)>,
     pub revision: Revision,
 }
 
@@ -254,9 +237,16 @@ pub enum Revision {
         seq: ChatSeq,
         at: UnixMs,
     },
-    /// Retains the anchor for replies and old references, but no visible mail.
+    /// Retains the anchor for replies and old references, but no visible
+    /// words.
     Deleted,
     TakenBack {
+        seq: ChatSeq,
+        at: UnixMs,
+    },
+    /// A stop whose agent worked again: its words say so, and it no
+    /// longer waits for the user.
+    Recovered {
         seq: ChatSeq,
         at: UnixMs,
     },
@@ -268,11 +258,10 @@ impl Message {
     pub fn from_record(record: &ChatRecord) -> Option<Self> {
         let ChatEvent::Posted {
             parent,
-            reply_to,
+            retry_of,
             thread_reply,
             from,
-            kind,
-            mentions,
+            voice,
             content,
         } = &record.event
         else {
@@ -282,13 +271,11 @@ impl Message {
             id: MessageId(record.seq),
             at: record.at,
             parent: *parent,
-            reply_to: *reply_to,
+            retry_of: *retry_of,
             thread_reply: *thread_reply,
             from: *from,
-            kind: *kind,
-            mentions: mentions.clone(),
+            voice: *voice,
             content: content.clone(),
-            ping_started: None,
             revision: Revision::Original,
         })
     }
@@ -296,7 +283,7 @@ impl Message {
     pub fn apply_revision(&mut self, record: &ChatRecord) {
         let (content, writer, seq, at) = match &record.event {
             // Old edits changed the words on screen but were never part of
-            // the verdict cursor. Do not reopen historical mail on upgrade.
+            // the verdict cursor. Do not reopen historical messages.
             ChatEvent::Edited { message, content } if *message == self.id => {
                 (content, None, self.id.0, self.at)
             }
@@ -304,32 +291,22 @@ impl Message {
                 message,
                 author,
                 content,
-                ping,
-            } if *message == self.id => {
-                if let Some(ping) = *ping {
-                    if ping && !self.pings_user() {
-                        self.ping_started = Some((record.seq, record.at));
-                    }
-                    if !ping {
-                        self.ping_started = None;
-                    }
-                    self.set_ping(ping);
-                }
-                (content, Some(*author), record.seq, record.at)
-            }
+            } if *message == self.id => (content, Some(*author), record.seq, record.at),
             ChatEvent::TakenBack { message, .. } if *message == self.id => {
-                self.set_ping(false);
                 let (seq, at) = self.version();
                 self.revision = Revision::TakenBack { seq, at };
                 return;
             }
             ChatEvent::Recovered { message, content } if *message == self.id => {
-                self.set_ping(false);
-                (content, None, record.seq, record.at)
+                self.content.clone_from(content);
+                self.revision = Revision::Recovered {
+                    seq: record.seq,
+                    at: record.at,
+                };
+                return;
             }
             ChatEvent::Deleted { message } if *message == self.id => {
                 self.content.clear();
-                self.mentions.clear();
                 self.revision = Revision::Deleted;
                 return;
             }
@@ -342,10 +319,13 @@ impl Message {
         self.revision = Revision::Edited { seq, at };
     }
 
-    /// The position and time of the words now shown, not of the mail's anchor.
+    /// The position and time of the words now shown, not of the message's
+    /// anchor.
     pub fn version(&self) -> (ChatSeq, UnixMs) {
         match self.revision {
-            Revision::Edited { seq, at } | Revision::TakenBack { seq, at } => (seq, at),
+            Revision::Edited { seq, at }
+            | Revision::TakenBack { seq, at }
+            | Revision::Recovered { seq, at } => (seq, at),
             _ => (self.id.0, self.at),
         }
     }
@@ -353,38 +333,37 @@ impl Message {
     /// When the current wait began. An edit before a verdict keeps that
     /// clock; a version after a verdict can begin another wait.
     pub fn ping_since(&self, seen: Option<ChatSeq>) -> (ChatSeq, UnixMs) {
-        let began = self.ping_started.unwrap_or((self.id.0, self.at));
-        if seen.is_some_and(|seen| began.0 <= seen) {
+        if seen.is_some_and(|seen| self.id.0 <= seen) {
             self.version()
         } else {
-            began
+            (self.id.0, self.at)
         }
     }
 
-    /// Whether the mail is to the user, pinging or not.
+    /// Whether the project wrote it: an agent or the host, not the user.
+    pub fn from_project(&self) -> bool {
+        self.from != Address::User
+    }
+
+    /// Whether the user reads it as the project's words or their own: a
+    /// message or a flash, never one agent's words to another.
     pub fn to_user(&self) -> bool {
-        self.mentions
-            .iter()
-            .any(|mention| matches!(mention, Mention::User { .. }))
+        !matches!(self.voice, Voice::ToAgent(_))
     }
 
-    /// Whether the mail waits for the user as a card.
+    /// Whether it waits for the user as a card: the project's message in a
+    /// thread, until it is taken back, recovered or deleted. A root names a
+    /// project and is never dealt.
     pub fn pings_user(&self) -> bool {
-        self.kind == MessageKind::Kept && self.mentions.contains(&Mention::User { ping: true })
-    }
-
-    /// Mail to the user pings or stops pinging; other mail stays as it is.
-    fn set_ping(&mut self, ping: bool) {
-        for mention in &mut self.mentions {
-            if let Mention::User { ping: was } = mention {
-                *was = ping;
-            }
-        }
+        self.voice == Voice::Message
+            && self.from_project()
+            && self.parent.is_some()
+            && matches!(self.revision, Revision::Original | Revision::Edited { .. })
     }
 
     /// The first post starts the clock; `version()` may change independently.
     pub fn flash_deadline(&self) -> Option<UnixMs> {
-        (self.kind == MessageKind::Flash && self.revision != Revision::Deleted)
+        (self.voice == Voice::Flash && self.revision != Revision::Deleted)
             .then(|| self.at + FLASH_LIFETIME)
     }
 
@@ -397,7 +376,7 @@ impl Message {
     /// its first line.
     pub fn headline(&self) -> String {
         // A thread's name only needs its first nonempty line. Do not
-        // concatenate (or even walk) the rest of a long mail to name it.
+        // concatenate (or even walk) the rest of a long message to name it.
         first_line(text_parts(&self.content).flat_map(str::lines))
     }
 }
@@ -437,103 +416,112 @@ fn first_line<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 mod tests {
     use super::*;
 
+    fn agent(n: u64) -> AgentId {
+        AgentId::from_counter(n, &crate::AgentIdDomain(7)).unwrap()
+    }
+
+    fn posted(seq: u64, parent: Option<u64>, from: Address, voice: Voice) -> ChatRecord {
+        ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(seq),
+            event: ChatEvent::Posted {
+                parent: parent.map(|parent| MessageId(ChatSeq(parent))),
+                retry_of: None,
+                thread_reply: None,
+                from,
+                voice,
+                content: vec![ContentPart::Text {
+                    text: "words".into(),
+                }],
+            },
+        }
+    }
+
     #[test]
     fn headline_takes_the_first_nonempty_line_across_parts() {
-        let message = Message {
-            id: MessageId(ChatSeq(1)),
-            at: UnixMs(1),
-            parent: None,
-            reply_to: None,
-            thread_reply: None,
-            from: Address::User,
-            kind: MessageKind::Kept,
-            mentions: Vec::new(),
-            content: vec![
-                ContentPart::Text {
-                    text: "\n \t\r".into(),
-                },
-                ContentPart::Text {
-                    text: "\n  Réparer\t l’horloge\r\nfollow-ups".into(),
-                },
-                ContentPart::Text {
-                    text: "unrelated later part".into(),
-                },
-            ],
-            ping_started: None,
-            revision: Revision::Original,
-        };
+        let mut message =
+            Message::from_record(&posted(1, None, Address::User, Voice::Message)).unwrap();
+        message.content = vec![
+            ContentPart::Text {
+                text: "\n \t\r".into(),
+            },
+            ContentPart::Text {
+                text: "\n  Réparer\t l’horloge\r\nfollow-ups".into(),
+            },
+            ContentPart::Text {
+                text: "unrelated later part".into(),
+            },
+        ];
         assert_eq!(message.headline(), "Réparer l’horloge");
         assert_eq!(message.headline(), one_line(&message.text()));
     }
 
+    /// Only the project's message in a thread pings: never a flash, a word
+    /// to another agent, the user's own words, or a root.
     #[test]
-    fn a_post_written_before_reply_addresses_still_decodes() {
-        #[derive(Debug, PartialEq, Eq, Encode, Decode)]
-        enum OldChatEvent {
-            Posted {
-                parent: Option<MessageId>,
-                from: Address,
-                mentions: Vec<Mention>,
-                content: Vec<ContentPart>,
-            },
+    fn only_the_projects_message_in_a_thread_pings() {
+        let a = Address::Agent(agent(1));
+        let stop = Address::System {
+            agent: agent(1),
+            stop: crate::Stop::Failed,
+            since: UnixMs(1),
+        };
+        for (record, pings) in [
+            (posted(3, Some(2), a, Voice::Message), true),
+            (posted(3, Some(2), stop, Voice::Message), true),
+            (
+                posted(3, Some(2), Address::StartFailed, Voice::Message),
+                true,
+            ),
+            (posted(3, Some(2), a, Voice::Flash), false),
+            (posted(3, Some(2), a, Voice::ToAgent(agent(2))), false),
+            (posted(3, Some(2), Address::User, Voice::Message), false),
+            (posted(3, None, a, Voice::Message), false),
+        ] {
+            let message = Message::from_record(&record).unwrap();
+            assert_eq!(message.pings_user(), pings, "{record:?}");
         }
-        let parent = Some(MessageId(ChatSeq(3)));
-        let content = vec![ContentPart::Text {
-            text: "still here".into(),
-        }];
-        let bytes = senax_encoder::encode(&OldChatEvent::Posted {
-            parent,
-            from: Address::User,
-            mentions: Vec::new(),
-            content: content.clone(),
-        })
-        .unwrap();
-        assert_eq!(
-            senax_encoder::decode::<ChatEvent>(&mut bytes.as_ref()).unwrap(),
-            ChatEvent::Posted {
-                parent,
-                reply_to: None,
-                thread_reply: None,
-                from: Address::User,
-                kind: MessageKind::Kept,
-                mentions: Vec::new(),
-                content
-            }
-        );
     }
 
     #[test]
-    fn a_flash_does_not_break_an_old_workers_message_decoder() {
-        #[derive(Decode)]
-        struct OldMessage {
-            id: MessageId,
-            from: Address,
-            mentions: Vec<Mention>,
-        }
-        let agent = AgentId::from_counter(81, &crate::AgentIdDomain(7)).unwrap();
-        let record = ChatRecord {
-            seq: ChatSeq(15),
-            at: UnixMs(742),
-            event: ChatEvent::Posted {
-                parent: Some(MessageId(ChatSeq(11))),
-                reply_to: None,
-                thread_reply: None,
-                from: Address::Agent(agent),
-                kind: MessageKind::Flash,
-                mentions: vec![Mention::User { ping: false }],
+    fn a_take_back_or_recovery_settles_the_ping_and_an_edit_keeps_it() {
+        let a = agent(4);
+        let mut message =
+            Message::from_record(&posted(5, Some(2), Address::Agent(a), Voice::Message)).unwrap();
+        message.apply_revision(&ChatRecord {
+            seq: ChatSeq(6),
+            at: UnixMs(6),
+            event: ChatEvent::Revised {
+                message: message.id,
+                author: a,
+                content: Vec::new(),
+            },
+        });
+        assert!(message.pings_user());
+        assert_eq!(message.version(), (ChatSeq(6), UnixMs(6)));
+        let mut taken = message.clone();
+        taken.apply_revision(&ChatRecord {
+            seq: ChatSeq(7),
+            at: UnixMs(7),
+            event: ChatEvent::TakenBack {
+                message: message.id,
+                version: ChatSeq(6),
+                author: a,
+            },
+        });
+        assert!(!taken.pings_user());
+        message.apply_revision(&ChatRecord {
+            seq: ChatSeq(8),
+            at: UnixMs(8),
+            event: ChatEvent::Recovered {
+                message: message.id,
                 content: vec![ContentPart::Text {
-                    text: "Checking now".into(),
+                    text: "carried on".into(),
                 }],
             },
-        };
-        let flash = Message::from_record(&record).unwrap();
-        let bytes = senax_encoder::encode(&flash).unwrap();
-        let old = senax_encoder::decode::<OldMessage>(&mut bytes.as_ref()).unwrap();
-        assert_eq!(
-            (old.id, old.from),
-            (MessageId(ChatSeq(15)), Address::Agent(agent))
-        );
-        assert_eq!(old.mentions, [Mention::User { ping: false }]);
+        });
+        assert!(!message.pings_user());
+        assert_eq!(message.text(), "carried on");
     }
 
     #[test]
@@ -547,64 +535,20 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_turns_the_ping_on_or_leaves_it() {
-        let agent = AgentId::from_counter(4, &crate::AgentIdDomain(7)).unwrap();
-        let posted = ChatRecord {
-            seq: ChatSeq(5),
-            at: UnixMs(1),
-            event: ChatEvent::Posted {
-                kind: MessageKind::Kept,
-                parent: Some(MessageId(ChatSeq(2))),
-                reply_to: None,
-                thread_reply: None,
-                from: Address::Agent(agent),
-                mentions: vec![Mention::User { ping: false }],
-                content: Vec::new(),
-            },
-        };
-        let mut mail = Message::from_record(&posted).unwrap();
-        assert!(mail.to_user() && !mail.pings_user());
-        let revised = |seq, ping| ChatRecord {
-            seq: ChatSeq(seq),
-            at: UnixMs(seq),
-            event: ChatEvent::Revised {
-                message: MessageId(ChatSeq(5)),
-                author: agent,
-                content: Vec::new(),
-                ping,
-            },
-        };
-        mail.apply_revision(&revised(6, None));
-        assert!(!mail.pings_user());
-        mail.apply_revision(&revised(7, Some(true)));
-        assert!(mail.pings_user());
-        mail.apply_revision(&revised(8, None));
-        assert!(mail.pings_user());
-    }
-
-    #[test]
     fn a_message_is_shown_by_its_first_line() {
-        let record = ChatRecord {
-            seq: ChatSeq(3),
-            at: UnixMs(1),
-            event: ChatEvent::Posted {
-                parent: Some(MessageId(ChatSeq(1))),
-                reply_to: None,
-                thread_reply: None,
-                from: Address::User,
-                kind: MessageKind::Kept,
-                mentions: Vec::new(),
-                content: vec![
-                    ContentPart::Image {
-                        media_type: "image/png".into(),
-                        data: vec![1],
-                    },
-                    ContentPart::Text {
-                        text: "\n\n  Fix   the test \nmore".into(),
-                    },
-                ],
-            },
+        let mut record = posted(3, Some(1), Address::User, Voice::Message);
+        let ChatEvent::Posted { content, .. } = &mut record.event else {
+            unreachable!()
         };
+        *content = vec![
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                data: vec![1],
+            },
+            ContentPart::Text {
+                text: "\n\n  Fix   the test \nmore".into(),
+            },
+        ];
         let message = Message::from_record(&record).unwrap();
         assert_eq!(message.id, MessageId(ChatSeq(3)));
         assert_eq!(message.parent, Some(MessageId(ChatSeq(1))));
@@ -615,7 +559,7 @@ mod tests {
             at: UnixMs(1),
             event: ChatEvent::Joined {
                 thread: MessageId(ChatSeq(3)),
-                agent: AgentId::from_counter(1, &crate::AgentIdDomain(7)).unwrap(),
+                agent: agent(1),
             },
         };
         assert!(Message::from_record(&joined).is_none());

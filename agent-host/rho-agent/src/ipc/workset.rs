@@ -66,24 +66,23 @@ pub(crate) enum PyRequest {
         control: crate::ipc::protocol::Control,
     },
     Delivered(rho_agent_types::AgentId),
-    // Legacy pair with `SentMail`; remove both at the next necessary epoch bump.
-    SendMail {
+    /// Speaks to the user in `thread`, as the project.
+    SendChat {
         sender: rho_agent_types::AgentId,
-        parent: Option<rho_agent_types::MessageId>,
-        reply_to: Option<rho_agent_types::MessageId>,
-        mentions: Vec<rho_agent_types::Mention>,
+        thread: rho_agent_types::MessageId,
+        content: Vec<rho_agent_types::ContentPart>,
+        kind: ChatKind,
+    },
+    /// One agent's words to another, kept under the sender's project.
+    MessageAgent {
+        sender: rho_agent_types::AgentId,
+        to: rho_agent_types::AgentId,
         content: Vec<rho_agent_types::ContentPart>,
     },
-    /// A message from an agent, under `parent` or as a root, replied to with
-    /// `Seq`.
-    SendMail2 {
-        sender: rho_agent_types::AgentId,
-        parent: Option<rho_agent_types::MessageId>,
-        reply_to: Option<rho_agent_types::MessageId>,
-        mentions: Vec<rho_agent_types::Mention>,
-        content: Vec<rho_agent_types::ContentPart>,
-        replace_last: bool,
-        ping: Option<bool>,
+    /// The project of this name, made at the agent's place if it is new.
+    StartProject {
+        agent: rho_agent_types::AgentId,
+        name: String,
     },
     Join {
         thread: rho_agent_types::MessageId,
@@ -149,12 +148,11 @@ pub(crate) enum PyRequest {
     },
     /// The addresses the agent accepted.
     ExternalContacts(rho_agent_types::AgentId),
-    /// `ping` turns the ping of mail to the user on or off; `None` keeps it.
+    /// Changes the words of the agent's own message or flash.
     Edit {
         agent: rho_agent_types::AgentId,
         message: rho_agent_types::MessageId,
         content: Vec<rho_agent_types::ContentPart>,
-        ping: Option<bool>,
     },
     Delete {
         agent: rho_agent_types::AgentId,
@@ -166,14 +164,6 @@ pub(crate) enum PyRequest {
         limit: u64,
     },
     ProjectNamed(String),
-    /// New chat API. Leave the SendMail/SendMail2 request and reply shapes
-    /// alone so a running workset can still be adopted without restarting.
-    SendChat {
-        sender: rho_agent_types::AgentId,
-        thread: rho_agent_types::MessageId,
-        content: Vec<rho_agent_types::ContentPart>,
-        kind: rho_agent_types::MessageKind,
-    },
 }
 
 #[derive(Encode, Decode)]
@@ -191,11 +181,15 @@ pub(crate) enum PyReply {
     Search(Vec<crate::store::MailHit>),
     Project(Option<rho_agent_types::MessageId>),
     Handle(Option<String>),
-    // Legacy `SendMail` reply; `unanswered` is always `None`.
-    SentMail {
-        id: rho_agent_types::MessageId,
-        unanswered: Option<(rho_agent_types::MessageId, rho_agent_types::AgentId)>,
-    },
+}
+
+/// What an agent says to the user names its kind each time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum ChatKind {
+    /// Kept, and dealt to the user as a card.
+    Message,
+    /// Seen for twenty minutes, never dealt.
+    Flash,
 }
 
 #[derive(Encode, Decode)]

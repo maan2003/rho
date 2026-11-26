@@ -340,6 +340,7 @@ impl StoreWrite for WriteTxn {
         self.open_table(WORKSET_HEADS);
         self.open_table(AGENT_HEADS);
         self.init_mail_tables();
+        self.init_project_tables();
         self.init_gccp_tables();
         agent_rows::init(self);
     }
@@ -554,6 +555,15 @@ fn rebuild_native(write: &mut WriteTxn, agent: AgentId) {
         .insert(agent, SenValue::borrowed(&head));
 }
 
+/// Every agent's head, read inside a write: what a migration reads.
+pub(crate) fn agent_heads_in(write: &mut WriteTxn) -> Vec<(AgentId, AgentHead)> {
+    write
+        .open_table(AGENT_HEADS)
+        .iter()
+        .map(|(agent, head)| (agent.value(), head.value().into_owned()))
+        .collect()
+}
+
 /// The role of an input from `from`.
 pub fn role_of(from: Address) -> Role {
     match from {
@@ -567,6 +577,9 @@ pub mod gccp;
 pub mod mail;
 mod projects;
 pub use gccp::{GccpContact, GccpRead, GccpWrite};
+pub(crate) use mail::migrate_voices;
+#[cfg(test)]
+pub(crate) use mail::voice_migration_tests::old_root;
 pub use mail::{MailHit, MailRead, MailWrite, NewMessage, ThreadHead};
 pub use projects::*;
 #[cfg(test)]

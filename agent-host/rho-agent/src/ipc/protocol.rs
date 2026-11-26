@@ -8,7 +8,7 @@ use crate::log::AgentUsageBucket;
 use crate::record::Record;
 use crate::store::{AgentHead, NativeCursor};
 
-pub(crate) const VERSION: u32 = 35;
+pub(crate) const VERSION: u32 = 36;
 
 /// The worker's second connection, inherited at this fd. It carries only the
 /// requests the worker makes of the agent host and their answers, so a host
@@ -65,9 +65,6 @@ pub(crate) enum Request<'a> {
     Append(Record<'a>),
     AppendBatch(Vec<Record<'static>>),
     ClaudeAccount,
-    ColdNotice {
-        incoming: Option<MessageId>,
-    },
 }
 
 #[derive(Encode, Decode)]
@@ -88,7 +85,6 @@ pub(crate) enum Reply {
     Usage(AgentUsageBucket),
     Error(String),
     Done,
-    ColdNotice(Option<(MessageId, u64)>),
 }
 
 #[derive(Encode, Decode)]
