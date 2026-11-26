@@ -32,8 +32,8 @@ day: Turn ideas into work.
 
 ## concept Host
 purpose: be a place where the user's agents run, which the window can reach from the laptop or the phone.
-principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with addresses ending in `@rho`; when the connection drops, the top line says so in red until it is back.
-sees: its name, which the user chose, as the host part of its projects' addresses; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `chat.Project` address.
+principle: the user attaches the server as `rho`; its projects are available by name in `window.Palette`, with `@rho` added only to a name another attached host also has; when the connection drops, the top line says so in red until it is back.
+sees: its name, which the user chose, as the host part of a project address when two attached hosts share the project name; whether it is `online`, `connecting`, or `reconnecting · 12s`, with why on the echo line when it drops, `connection lost` or `cannot reach the host`; in a thread, as part of the `chat.Project` address.
 has:
 - many `chat.Project`
 - many `agents.Agent`
@@ -87,7 +87,7 @@ steps:
    - or the user opens the palette, chooses `hosts › attach`, and types the name and the way to reach the host
 2. the user answers `name this host:` with a short name
 3. the user touches the security key when the desktop asks for it; the first time on a device it asks twice
-4. the host's projects are available by name, with addresses ending in the host's name
+4. the host's projects are available by name
    - if the host does not trust this device yet, the top line reads `disconnected · enroll this rho on the host: …` with a command and a code; the user runs that command on the host, and the window tries again within half a minute
 system: remembers the host for the next start, reconnects by itself, and asks for the security key only once each time the window starts.
 user: the name, the touch of the key, and, without a link, the command on the host.

@@ -1631,7 +1631,7 @@ fn message_item(
 impl Surface for ThreadView {
     fn title(&self, cx: &App) -> String {
         let system = self.system.read(cx);
-        let project = system.project_of(self.thread);
+        let project = system.project_of(self.thread, cx);
         let subject = system
             .host_chat(self.thread.host)
             .and_then(|chat| chat.name(self.thread.message))

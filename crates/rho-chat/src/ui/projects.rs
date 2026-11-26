@@ -14,8 +14,8 @@ use rho_window::style::StyleClass;
 
 use super::ChatSystem;
 use super::idea::IdeaProject;
-use crate::ThreadId;
 use crate::protocol::{ChangeProject, CreateProject};
+use crate::{ThreadId, names};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
@@ -32,6 +32,17 @@ pub(super) type ProjectCreated = Rc<dyn Fn(IdeaProject, &mut App)>;
 impl ChatSystem {
     pub fn set_known_places(&mut self, places: KnownPlaces) {
         self.known_places = places;
+    }
+
+    /// What a project being made is called: its name alone while the
+    /// window holds one host, else with the host, which the user chose.
+    pub(super) fn new_project_address(&self, project: &NewProject) -> String {
+        let name = project.name.as_str();
+        if self.hosts().len() == 1 {
+            name.to_owned()
+        } else {
+            names::qualified(name, &self.host_name(project.host))
+        }
     }
 
     /// A project's settings, as the host's log says them.
@@ -191,10 +202,10 @@ impl ChatSystem {
             "project:",
             Rc::new(move |_, needle, cx| {
                 let mail = names.read(cx);
-                let needle = needle.trim();
+                let needle = needle.trim().to_lowercase();
                 mail.idea_projects()
                     .into_iter()
-                    .filter(|project| project.name.contains(needle))
+                    .filter(|project| project.contains(&needle))
                     .map(|project| Candidate {
                         description: mail.project_details(project.thread).unwrap_or_default(),
                         value: project.name,
@@ -202,9 +213,12 @@ impl ChatSystem {
                     .collect()
             }),
             Rc::new(move |frame, input, window, cx| {
-                let input = input.trim();
-                match this.read(cx).project_named(input) {
-                    Some(project) => then(frame, project, input.to_owned(), window, cx),
+                let mail = this.read(cx);
+                match mail
+                    .project_named(&input)
+                    .and_then(|project| Some((project, mail.project_address(project)?)))
+                {
+                    Some((project, address)) => then(frame, project, address, window, cx),
                     None => frame.echo("project: no such project", StyleClass::SystemInfo, cx),
                 }
             }),
@@ -223,31 +237,40 @@ impl ChatSystem {
         frame.open_prompt(
             "new project:",
             Rc::new(move |_, input, cx| {
-                let (name, alias) = input.rsplit_once('@').unwrap_or((input, ""));
+                let (name, alias) = names::split(input);
+                let alias = alias.unwrap_or_default().to_lowercase();
                 let Ok(name) = ProjectName::parse(name) else {
                     return Vec::new();
                 };
-                choices
-                    .read(cx)
-                    .hosts()
+                let mail = choices.read(cx);
+                mail.hosts()
                     .into_iter()
-                    .filter(|(_, host)| host.to_lowercase().starts_with(&alias.to_lowercase()))
-                    .map(|(_, host)| Candidate {
-                        value: format!("{}@{host}", name.as_str()),
+                    .filter(|(_, host)| host.to_lowercase().starts_with(&alias))
+                    .map(|(host, _)| Candidate {
+                        value: mail.new_project_address(&NewProject {
+                            host,
+                            name: name.clone(),
+                        }),
                         description: String::new(),
                     })
                     .collect()
             }),
             Rc::new(move |frame, input, window, cx| {
                 let hosts = this.read(cx).hosts();
-                let Some((name, alias)) = input.rsplit_once('@') else {
-                    frame.echo("new project: enter name@host", StyleClass::SystemInfo, cx);
-                    return;
+                let (name, alias) = names::split(&input);
+                // With one host, the name alone says where.
+                let host = match (alias, hosts.as_slice()) {
+                    (None, [(host, _)]) => Some(*host),
+                    (None, _) => {
+                        frame.echo("new project: enter name@host", StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                    (Some(alias), _) => hosts
+                        .iter()
+                        .find(|(_, host)| host.eq_ignore_ascii_case(alias))
+                        .map(|(host, _)| *host),
                 };
-                let Some((host, _)) = hosts
-                    .into_iter()
-                    .find(|(_, host)| host.eq_ignore_ascii_case(alias))
-                else {
+                let Some(host) = host else {
                     frame.echo("new project: no such host", StyleClass::SystemInfo, cx);
                     return;
                 };
@@ -280,11 +303,7 @@ impl ChatSystem {
         window: &mut Window,
         cx: &mut Context<Frame>,
     ) {
-        let address = format!(
-            "{}@{}",
-            project.name.as_str(),
-            this.read(cx).host_name(project.host)
-        );
+        let address = this.read(cx).new_project_address(&project);
         let Some(catalogue) = this.read(cx).runtime_catalogue(project.host) else {
             return host_away(frame, cx);
         };
@@ -622,6 +641,68 @@ mod tests {
             cx.dispatch_action(*window, rho_frame::keys::MinibufferConfirm);
             assert_eq!(picked.borrow_mut().take().unwrap().as_str(), expected);
         }
+    }
+
+    /// `project › new` takes a bare name while the window holds one host,
+    /// and with two offers the name on each host, so the address says
+    /// which host makes it.
+    #[gpui::test]
+    fn project_new_asks_for_a_host_only_among_two(cx: &mut gpui::TestAppContext) {
+        use super::super::idea::tests::{attach_box, init};
+        let (window, mail, _db) = init(cx);
+        let ask = |typed: &str, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, window, cx| {
+                    ChatSystem::prompt_project_address(mail.clone(), frame, window, cx);
+                    let prompt = frame.minibuffer_mut().unwrap();
+                    assert_eq!(prompt.prompt(), "new project:");
+                    prompt.set_input(typed.into(), window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let offered = window
+                .update(cx, |frame, _, _| {
+                    let prompt = frame.minibuffer_mut().unwrap();
+                    let first = prompt.selected_candidate().map(|(row, _)| row.value);
+                    prompt.select_by_delta(1);
+                    let second = prompt.selected_candidate().map(|(row, _)| row.value);
+                    prompt.select_by_delta(-1);
+                    [first, second]
+                })
+                .unwrap();
+            cx.dispatch_action(window.into(), rho_frame::keys::MinibufferConfirm);
+            cx.run_until_parked();
+            let asked = window
+                .update(cx, |frame, _, _| {
+                    frame
+                        .minibuffer_mut()
+                        .map(|prompt| prompt.prompt().to_owned())
+                })
+                .unwrap();
+            cx.dispatch_action(window.into(), rho_frame::keys::MinibufferCancel);
+            cx.run_until_parked();
+            (offered, asked)
+        };
+        let one = |value: &str| Some(value.to_owned());
+        assert_eq!(
+            ask("kelp", cx),
+            ([one("kelp"), one("kelp")], one("kelp works on:"))
+        );
+        cx.update(|cx| attach_box(&mail, cx));
+        assert_eq!(
+            ask("kelp", cx),
+            (
+                [one("kelp@box"), one("kelp@lab")],
+                one("kelp@box works on:")
+            )
+        );
+        assert_eq!(
+            ask("kelp@l", cx),
+            (
+                [one("kelp@lab"), one("kelp@lab")],
+                one("kelp@lab works on:")
+            )
+        );
     }
 
     /// Every project command is in the palette, from Desk and from a

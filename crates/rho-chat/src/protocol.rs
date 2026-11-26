@@ -110,19 +110,13 @@ pub struct ResolveProject {
 }
 
 /// A project: its anchor's id, its name (the anchor's thread name), and
-/// its settings. Its address combines its name with the client's alias for
-/// the host, not the host's machine or endpoint name.
+/// its settings. A client shows its name alone, or with its own alias for
+/// the host when two hosts have a project of that name (`names`).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub config: ProjectConfig,
-}
-
-impl Project {
-    pub fn address(&self, host_alias: &str) -> String {
-        format!("{}@{host_alias}", self.name)
-    }
 }
 
 /// What a client says on its session.

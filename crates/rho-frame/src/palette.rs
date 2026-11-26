@@ -122,7 +122,8 @@ impl Choice {
     fn aliases(&self) -> &[String] {
         match self {
             Self::Command(entry) => &entry.also,
-            Self::Place(_) | Self::Words(_) => &[],
+            Self::Place(place) => &place.found.also,
+            Self::Words(_) => &[],
         }
     }
 
@@ -656,6 +657,7 @@ mod tests {
                     status: Some("Checking timing".into()),
                 }),
                 recency: 0,
+                also: Vec::new(),
             },
             card: card.map(|words| Card {
                 address,
@@ -715,6 +717,29 @@ mod tests {
         assert_eq!(ids(&listing, "ave flaky asks"), [1]);
         assert!(ids(&listing, "asks ice").is_empty());
         assert_eq!(ids(&listing, "timing ice"), [0]);
+    }
+
+    /// A project shown as `tide`, and its threads, are still found by the
+    /// address with the host, without it shown.
+    #[test]
+    fn a_place_is_found_by_words_it_does_not_show() {
+        let mut quiet = thread("Flaky clock", "tide", None, false, None);
+        quiet.found.also = vec!["tide@lab".into()];
+        let listing = Listing::new(
+            vec![],
+            vec![quiet, thread("Clock drift", "tide@box", None, false, None)],
+        );
+        assert_eq!(ids(&listing, "tide@lab"), [0]);
+        assert_eq!(ids(&listing, "tide@box"), [1]);
+        assert_eq!(ids(&listing, "lab"), [0]);
+        let mut both = ids(&listing, "tide");
+        both.sort();
+        assert_eq!(both, [0, 1]);
+        let rows = listing.rank("tide@lab");
+        assert!(
+            rows[0].marks.iter().all(Vec::is_empty),
+            "nothing shown matched"
+        );
     }
 
     #[test]
@@ -927,6 +952,7 @@ mod tests {
                 description: String::new(),
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             },
             card: None,
             visit,
@@ -957,6 +983,7 @@ mod tests {
                 description: String::new(),
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             },
             card: None,
             visit: None,

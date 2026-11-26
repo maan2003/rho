@@ -32,7 +32,6 @@ done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
 ## concept Project
-status: currently addresses still always show `@host` even when project names are unique across attached hosts.
 purpose: give each project one address to write to, and one answer, asked once, to where, how, and on what model its agents work.
 principle: the user sends an idea to `tide` (or `tide@lab` when two attached hosts share the name `tide`); the project starts the work at its place, in its mode, on its runtime, and sends its asks and results from that address.
 sees: its name (such as `tide`, adding `@host` only when two attached hosts have a project of the same name); where it works, its mode, and its runtime when configuring it or filtering by it in `window.Palette`. A project has no screen of its own.
@@ -52,7 +51,7 @@ rejected:
 
 ## concept Thread
 purpose: keep one piece of work and the whole exchange about it together.
-principle: the user writes to `tide@lab` about a flaky test; the project asks about the test and later sends the result in the same thread, whatever agents did the work.
+principle: the user writes to `tide` about a flaky test; the project asks about the test and later sends the result in the same thread, whatever agents did the work.
 sees: its subject and project; on a row, what waits, or the project's latest words when nothing waits; open, the `Draft` first, then its messages newest first, oldest last
 has:
 - many `Message`
@@ -202,13 +201,13 @@ when: the user has an idea for work that no project holds yet
 want: name the project and say once where, how, and on what model its agents work
 so that: the idea starts now, and every later idea to that address starts with no question
 steps:
-1. in an idea, the user writes `to: tide@lab`; a name with no match offers `new project tide@lab`, and `enter` takes it
-2. `tide@lab works on:` asks for the place, with the host's known repositories and directories as completions; Enter takes the place as typed unless the user chooses a completion. A URL or a `git@` address is a repository, a path is a directory on `lab`
-3. `tide@lab agents:` asks for the mode, `one` under the point and `per idea` below it
-4. `tide@lab runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
+1. in an idea, the user writes `to: tide`; a name with no match offers `new project tide`, or, with more than one host attached, a row per host such as `new project tide@lab`, and `enter` takes it; `to: tide@lab` offers only that host
+2. `tide works on:` asks for the place, with the host's known repositories and directories as completions; Enter takes the place as typed unless the user chooses a completion. A URL or a `git@` address is a repository, a path is a directory on `lab`
+3. `tide agents:` asks for the mode, `one` under the point and `per idea` below it
+4. `tide runtime:` asks for the model and effort, `opus-high` under the point and the host's other runtimes below it
 5. if the user started from Send, the idea sends and the work starts; if they were editing `to:` with `ctrl-t`, the new project fills that line and the draft stays open until they Send
    - from `window.Palette` anywhere, `project › new` asks the same four lines
-system: the host keeps the project's name, place, mode and runtime, so every device sees the same answer; clones a repository from the host's mirror; names the project after the host in the address, so no host question.
+system: the host keeps the project's name, place, mode and runtime, so every device sees the same answer; clones a repository from the host's mirror; takes the host from the address when more than one is attached, so no host question.
 user: the name, the place, the mode, and the runtime.
 cases: the host is offline; an older project with no known place says `no place set` until `project › works on…` is answered; an older project with a place but no runtime reads and runs `opus-high` until `project › runtime…` is answered; the directory does not exist, so the thread keeps a `failed` stop as `agents.a refused start leaves a message`; a second project on the same repository; a project created from `window.Palette` with no idea yet.
 captures: [project mode prompt](design/laptop-project-mode.png) and [project runtime prompt](design/laptop-project-runtime.png).

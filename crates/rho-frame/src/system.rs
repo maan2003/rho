@@ -54,6 +54,9 @@ pub struct Found {
     /// When it last moved, for ordering unvisited places; zero when nothing
     /// says.
     pub recency: u64,
+    /// Other words that find it and are not shown, such as `tide@lab` for
+    /// a project shown as `tide`.
+    pub also: Vec<String>,
 }
 
 /// A project as the window shows it beside the places under it.
@@ -61,7 +64,8 @@ pub struct Found {
 pub struct Project {
     /// The project's own address, as the palette lists it.
     pub address: Address,
-    /// What the user calls it, such as `tide@lab`.
+    /// What the user calls it, such as `tide`, or `tide@lab` when two
+    /// hosts have a `tide`.
     pub name: String,
 }
 

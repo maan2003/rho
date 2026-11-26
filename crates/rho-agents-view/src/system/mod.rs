@@ -1453,6 +1453,7 @@ impl System for AgentsSystem {
                     .map(|at| at.0)
                     .max()
                     .unwrap_or(0),
+                also: Vec::new(),
             })
         });
         let attached = |host: &HostId| self.links.contains_key(host);
@@ -1506,6 +1507,7 @@ impl System for AgentsSystem {
                 description: host,
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             }
         });
         transcripts
@@ -1516,6 +1518,7 @@ impl System for AgentsSystem {
                 description: String::new(),
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             }))
             .collect()
     }

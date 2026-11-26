@@ -1044,6 +1044,7 @@ impl Frame {
                     description,
                     thread: None,
                     recency: 0,
+                    also: Vec::new(),
                 });
             }
         }
@@ -1056,6 +1057,7 @@ impl Frame {
                     description: card.context.clone(),
                     thread: None,
                     recency: 0,
+                    also: Vec::new(),
                 });
             }
         }
@@ -2295,6 +2297,7 @@ mod tests {
                 description: "on /srv/tide · one agent · opus-high".into(),
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             }]
         }
     }

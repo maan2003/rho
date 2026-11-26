@@ -5,8 +5,9 @@
 //! a client holds it: each host's log folded into its forest ([`fold`]),
 //! the disk copy a client starts from ([`cache`]), what the user wrote
 //! that no host has taken yet ([`outbox`]), the session that carries a
-//! host's log in ([`stream`]), and what the mail claims of the user's
-//! attention ([`cards`]). Nothing here draws.
+//! host's log in ([`stream`]), what the window calls each project
+//! ([`names`]), and what the mail claims of the user's attention
+//! ([`cards`]). Nothing here draws.
 
 pub mod protocol;
 
@@ -16,6 +17,8 @@ pub mod cache;
 pub mod cards;
 #[cfg(feature = "client")]
 pub mod fold;
+#[cfg(feature = "client")]
+pub mod names;
 #[cfg(feature = "client")]
 pub mod outbox;
 #[cfg(feature = "client")]

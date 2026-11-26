@@ -216,6 +216,7 @@ fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
                 },
                 thread: None,
                 recency: held.written_ms.or(held.created_ms).unwrap_or(0).max(0) as u64,
+                also: Vec::new(),
             })
         })
         .collect()

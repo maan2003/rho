@@ -16,6 +16,7 @@ use rho_dealer::rank::{CardKind, Trace};
 use rho_dealer::{Addressed, Claim, Marks};
 
 use crate::fold::HostChat;
+use crate::names::ProjectNames;
 use crate::{AgentRef, ThreadId};
 
 impl Addressed for ThreadId {
@@ -48,6 +49,8 @@ pub struct Host<'a> {
     pub chat: &'a HostChat,
     /// The device's name for the host, used in the project address.
     pub name: &'a str,
+    /// Which project names other hosts share, so the address needs `name`.
+    pub names: &'a ProjectNames,
 }
 
 fn unix(ms: u64) -> Timestamp {
@@ -168,7 +171,7 @@ pub fn claims(
                 .expect("the thread has unread mail"),
         );
         claim.title = chat.name(thread).unwrap_or_default();
-        claim.context = context(host.chat, thread, host.name);
+        claim.context = context(host, thread);
         if let Some(wrote) = user_wrote {
             let spoke = unix(wrote.at.0);
             claim.bonus = curve::recency_bonus(spoke, now);
@@ -203,18 +206,19 @@ pub fn answered(chat: &HostChat, thread: MessageId, seen: Seen) -> Option<Messag
 /// of its project.
 pub fn name(host: &Host<'_>, thread: MessageId) -> Option<(String, String)> {
     let title = host.chat.name(thread)?;
-    Some((title, context(host.chat, thread, host.name)))
+    Some((title, context(host, thread)))
 }
 
-/// Where a thread is: the address of the project above it.
-pub(crate) fn context(chat: &HostChat, thread: MessageId, host_name: &str) -> String {
-    context_at_root(chat, chat.root_of(thread), host_name)
+/// Where a thread is: the address of the project above it, or the host
+/// for a thread in no project.
+pub(crate) fn context(host: &Host<'_>, thread: MessageId) -> String {
+    context_at_root(host, host.chat.root_of(thread))
 }
 
-pub(crate) fn context_at_root(chat: &HostChat, root: MessageId, host_name: &str) -> String {
-    chat.project(root).map_or_else(
-        || host_name.to_owned(),
-        |project| project.address(host_name),
+pub(crate) fn context_at_root(host: &Host<'_>, root: MessageId) -> String {
+    host.chat.project(root).map_or_else(
+        || host.name.to_owned(),
+        |project| host.names.address(&project.name, host.name),
     )
 }
 
@@ -290,6 +294,8 @@ mod tests {
         marks: Marks,
         skips: Skips,
         now: Zoned,
+        /// The logs of the window's other hosts, which only name projects.
+        others: Vec<HostChat>,
     }
 
     fn mins(n: i64) -> SignedDuration {
@@ -308,6 +314,7 @@ mod tests {
             agents: HashMap::new(),
             marks: Marks::default(),
             skips: Skips::default(),
+            others: Vec::new(),
             now: "2026-11-23T09:00:00Z"
                 .parse::<Timestamp>()
                 .unwrap()
@@ -547,10 +554,12 @@ mod tests {
         /// The hand with replies this device has queued and the host has
         /// not logged.
         fn deal_with(&self, local_answers: impl IntoIterator<Item = MessageVersion>) -> Hand {
+            let names = ProjectNames::new(std::iter::once(&self.chat).chain(&self.others));
             let host = Host {
                 endpoint: EndpointId([0; 32]),
                 chat: &self.chat,
                 name: "lab",
+                names: &names,
             };
             let claims = claims(
                 &host,
@@ -616,7 +625,7 @@ mod tests {
         let a = w.agent("a");
         let ask = w.asks(a);
         assert!(!w.chat.message(root).unwrap().pings_user());
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
         assert_eq!(unread_from(&w.deal().cards[0]), ask);
     }
 
@@ -644,7 +653,7 @@ mod tests {
         say(&mut w, None);
         assert_eq!(
             w.hand(),
-            "rho@lab › Clock · waits · 2m",
+            "rho › Clock · waits · 2m",
             "a reply that saw nothing waiting settles nothing"
         );
         say(
@@ -656,7 +665,7 @@ mod tests {
         );
         assert_eq!(
             w.hand(),
-            "rho@lab › Clock · waits · now",
+            "rho › Clock · waits · now",
             "the later ask was not in view, though the reply came after it"
         );
         assert_eq!(unread_from(&w.deal().cards[0]), later);
@@ -683,7 +692,7 @@ mod tests {
         );
         assert_eq!(w.hand(), "");
         w.asks(thread);
-        assert_eq!(w.hand(), "rho@lab › Clock · waits · now");
+        assert_eq!(w.hand(), "rho › Clock · waits · now");
     }
 
     /// What a reply tells the host it answers: the newest ping in the
@@ -753,7 +762,7 @@ mod tests {
         w.answers(a, second);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
     }
 
     #[test]
@@ -761,7 +770,7 @@ mod tests {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
         let first = w.priority(a).unwrap();
         assert!(first >= AGENT_BLOCKED_HEAD_START);
         w.pass(hours(1));
@@ -787,7 +796,7 @@ mod tests {
         assert_eq!(card.label, "waits · 6.0d");
         assert_eq!(unread_from(card), result);
         w.writes_to(a);
-        assert_eq!(w.hand(), "rho@lab › b · waits · 6.0d");
+        assert_eq!(w.hand(), "rho › b · waits · 6.0d");
     }
 
     #[test]
@@ -798,7 +807,7 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.asks(a);
         w.sends(a, false);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now", "an fyi hides no ask");
+        assert_eq!(w.hand(), "rho › a · waits · now", "an fyi hides no ask");
     }
 
     #[test]
@@ -812,11 +821,7 @@ mod tests {
         assert_eq!(w.hand(), "");
         w.finishes(a);
         w.works(a);
-        assert_eq!(
-            w.hand(),
-            "rho@lab › a · waits · now",
-            "and it hides nothing"
-        );
+        assert_eq!(w.hand(), "rho › a · waits · now", "and it hides nothing");
     }
 
     /// Mail and stops deal by priority: older waits first, and the answer
@@ -872,7 +877,7 @@ mod tests {
         w.asks(a);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · waits · 30m",
+            "rho › a · waits · 30m",
             "from the first unseen ping"
         );
         w.finishes(b);
@@ -880,7 +885,7 @@ mod tests {
         w.finishes(b);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · waits · 1.0h\nrho@lab › b · waits · 30m",
+            "rho › a · waits · 1.0h\nrho › b · waits · 30m",
             "both threads deal from their first ping"
         );
     }
@@ -895,11 +900,11 @@ mod tests {
         w.works(a);
         assert_eq!(w.hand(), "");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
         w.writes_to(a);
         assert_eq!(w.hand(), "", "the user's own words see the thread");
         w.finishes(a);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
     }
 
     #[test]
@@ -965,7 +970,7 @@ mod tests {
             version: ask.0,
             author: w.agents[&a],
         });
-        assert_eq!(w.hand(), "rho@lab › b · stuck · now");
+        assert_eq!(w.hand(), "rho › b · stuck · now");
         w.record(ChatEvent::Recovered {
             message: stop,
             content: vec![ContentPart::Text {
@@ -1005,10 +1010,7 @@ mod tests {
         w.writes_to(a);
         w.pass(mins(5));
         w.finishes(a);
-        assert_eq!(
-            w.hand(),
-            "rho@lab › a · waits · now\nrho@lab › b · waits · 5m"
-        );
+        assert_eq!(w.hand(), "rho › a · waits · now\nrho › b · waits · 5m");
         assert!(w.priority(a).unwrap() >= CHIME_THRESHOLD);
         assert!(w.priority(b).unwrap() < CHIME_THRESHOLD);
         // Through a snooze said before the user wrote.
@@ -1043,7 +1045,7 @@ mod tests {
         w.done_through(a, result);
         assert_eq!(
             w.hand(),
-            "rho@lab › a · waits · now",
+            "rho › a · waits · now",
             "the ask came after the done"
         );
         w.done(a);
@@ -1085,7 +1087,7 @@ mod tests {
         );
         assert_eq!(w.hand(), "");
         w.asks(parent);
-        assert_eq!(w.hand(), "rho@lab › parent · waits · now");
+        assert_eq!(w.hand(), "rho › parent · waits · now");
     }
 
     #[test]
@@ -1098,7 +1100,7 @@ mod tests {
         w.asks(child);
         let hand = w.deal();
         assert_eq!(hand.cards[0].address, w.address(child));
-        assert_eq!(w.hand(), "rho@lab › child · waits · now");
+        assert_eq!(w.hand(), "rho › child · waits · now");
     }
 
     #[test]
@@ -1109,10 +1111,7 @@ mod tests {
         let first = w.stop(a, Stop::Failed);
         w.pass(mins(2));
         w.stop(b, Stop::Lost);
-        assert_eq!(
-            w.hand(),
-            "rho@lab › a · failed · 2m\nrho@lab › b · lost · now"
-        );
+        assert_eq!(w.hand(), "rho › a · failed · 2m\nrho › b · lost · now");
         let card = &w.deal().cards[0];
         assert_eq!(unread_from(card), first);
         w.done(a);
@@ -1121,7 +1120,7 @@ mod tests {
         w.pass(mins(1));
         let second = w.stop(a, Stop::Stuck);
         w.done_through(a, Seen::Topic(first.0.0));
-        assert_eq!(w.hand(), "rho@lab › a · stuck · now");
+        assert_eq!(w.hand(), "rho › a · stuck · now");
         assert_eq!(unread_from(&w.deal().cards[0]), second);
     }
 
@@ -1148,7 +1147,7 @@ mod tests {
                 text: "A different question about the same clock.".into(),
             }],
         });
-        assert_eq!(w.hand(), "rho@lab › two asks · waits · now");
+        assert_eq!(w.hand(), "rho › two asks · waits · now");
         w.done(thread);
         assert_eq!(w.hand(), "");
         w.pass(mins(1));
@@ -1170,7 +1169,7 @@ mod tests {
         w.pass(mins(3));
         w.asks(thread);
         let before = w.hand();
-        assert_eq!(before, "rho@lab › two asks · waits · 3m");
+        assert_eq!(before, "rho › two asks · waits · 3m");
         let done = w.done(thread);
         assert_eq!(w.hand(), "");
         w.tell(Fact::Retract { of: done });
@@ -1244,12 +1243,15 @@ mod tests {
         assert_eq!(w.hand(), "");
     }
 
+    /// `chat.Project`: a project name no other host has reads bare, even
+    /// with a second host attached; once that host has a project of the
+    /// same name, the card names the host.
     #[test]
-    fn even_a_single_host_card_names_the_project_address() {
+    fn a_card_names_the_host_only_when_another_host_shares_the_project_name() {
         let mut w = world();
         let a = w.agent("a");
         w.asks(a);
-        assert_eq!(w.hand(), "rho@lab › a · waits · now");
+        assert_eq!(w.hand(), "rho › a · waits · now");
         // A message right under the root is a thread of its own.
         let root = w.root();
         let from = Party::Agent(w.agents[&a]);
@@ -1258,9 +1260,26 @@ mod tests {
         assert!(
             hand.cards
                 .iter()
-                .any(|card| card.heading() == "rho@lab › at the root"),
+                .any(|card| card.heading() == "rho › at the root"),
             "{hand:?}"
         );
+        let mut other = world();
+        let tide = other.post(None, Party::User, Voice::Message, "tide");
+        other.record(ChatEvent::Project {
+            project: ProjectId(tide),
+            config: ProjectConfig {
+                place: rho_agent_types::ProjectPlace::parse("~/src/tide").unwrap(),
+                mode: rho_agent_types::ProjectMode::One,
+                runtime: rho_agent_types::RuntimeLabel::default(),
+            },
+        });
+        w.others.push(other.chat);
+        let first = |w: &World| w.hand().lines().next().unwrap().to_owned();
+        assert_eq!(first(&w), "rho › a · waits · now", "tide is no clash");
+        let mut other = world();
+        other.root();
+        w.others.push(other.chat);
+        assert_eq!(first(&w), "rho@lab › a · waits · now");
     }
 
     #[test]

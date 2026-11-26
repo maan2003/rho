@@ -44,6 +44,7 @@ pub use thread::ThreadView;
 use crate::cache::Cache;
 pub use crate::cache::{MailAudience, WrittenMail};
 use crate::fold::HostChat;
+use crate::names::{self, ProjectNames};
 use crate::outbox::{Delivery, Kept, Outbox, Outgoing, OutgoingState};
 use crate::protocol::{Name, Post, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
@@ -238,34 +239,47 @@ impl ChatSystem {
 
     /// A mail thread's subject and project address for a row elsewhere.
     pub fn thread_name(&self, thread: ThreadId, cx: &App) -> Option<(String, String)> {
-        self.with_host(thread.host, cx, |host| cards::name(host, thread.message))?
+        let names = self.project_names();
+        self.with_host(thread.host, &names, cx, |host| {
+            cards::name(host, thread.message)
+        })?
     }
 
+    /// Which project names two held hosts share, as their logs say now.
+    fn project_names(&self) -> ProjectNames {
+        ProjectNames::new(self.logs.values())
+    }
+
+    /// A project's address as the window shows it, on an attached host.
     pub fn project_address(&self, channel: ThreadId) -> Option<String> {
-        let alias = &self
-            .hosts
-            .values()
-            .find(|slot| slot.endpoint == Some(channel.host))?
-            .name;
+        self.project_address_in(&self.project_names(), channel)
+    }
+
+    fn project_address_in(&self, names: &ProjectNames, channel: ThreadId) -> Option<String> {
+        let alias = self.attached_alias(channel.host)?;
         self.host_chat(channel.host)?
             .project(channel.message)
-            .map(|project| project.address(alias))
+            .map(|project| names.address(&project.name, alias))
     }
 
-    /// Resolves a project address against aliases this device owns and the
-    /// projects the host has sent us.
+    /// The project an address names: `tide@lab` on the host this device
+    /// calls `lab`, or a bare `tide` while one host alone has a project of
+    /// that name.
     pub fn project_named(&self, address: &str) -> Option<ThreadId> {
-        let (project, host_alias) = address.rsplit_once('@')?;
-        let endpoint = self
-            .hosts
-            .values()
-            .find(|slot| slot.name == host_alias)?
-            .endpoint?;
-        let message = self.host_chat(endpoint)?.root_named(project)?;
-        Some(ThreadId {
-            host: endpoint,
-            message,
-        })
+        let (name, alias) = names::split(address.trim());
+        if alias.is_none() && self.project_names().is_shared(name) {
+            return None;
+        }
+        let mut found = self.hosts.values().filter_map(|slot| {
+            if alias.is_some_and(|alias| !slot.name.eq_ignore_ascii_case(alias)) {
+                return None;
+            }
+            let host = slot.endpoint?;
+            let message = self.host_chat(host)?.root_named(name)?;
+            Some(ThreadId { host, message })
+        });
+        let project = found.next()?;
+        found.next().is_none().then_some(project)
     }
 
     pub fn host_chat(&self, endpoint: EndpointId) -> Option<&HostChat> {
@@ -336,12 +350,12 @@ impl ChatSystem {
             .map_or_else(|| endpoint.to_string(), str::to_owned)
     }
 
-    fn project_of(&self, thread: ThreadId) -> String {
-        let host = self.host_name(thread.host);
-        self.host_chat(thread.host).map_or_else(
-            || host.clone(),
-            |chat| cards::context(chat, thread.message, &host),
-        )
+    fn project_of(&self, thread: ThreadId, cx: &App) -> String {
+        let names = self.project_names();
+        self.with_host(thread.host, &names, cx, |host| {
+            cards::context(host, thread.message)
+        })
+        .unwrap_or_else(|| self.host_name(thread.host))
     }
 
     pub fn draft(&self, endpoint: EndpointId, parent: Option<MessageId>) -> &str {
@@ -549,14 +563,19 @@ impl ChatSystem {
     }
 
     fn idea_project_at(&self, project: ThreadId) -> Option<IdeaProject> {
-        let name = self.project_address(project)?;
+        self.idea_project_in(&self.project_names(), project)
+    }
+
+    fn idea_project_in(&self, names: &ProjectNames, project: ThreadId) -> Option<IdeaProject> {
         // The project must be on an attached host. Its cached address and
         // outbox stay usable while the connection is interrupted.
-        self.link_for(project.host)?;
+        let alias = self.attached_alias(project.host)?;
+        let held = self.host_chat(project.host)?.project(project.message)?;
         Some(IdeaProject {
             thread: project,
-            name,
-            runtime: self.project_config(project).map(|config| config.runtime),
+            name: names.address(&held.name, alias),
+            qualified: names::qualified(&held.name, alias),
+            runtime: Some(held.config.runtime),
         })
     }
 
@@ -795,6 +814,7 @@ impl ChatSystem {
     fn with_host<R>(
         &self,
         endpoint: EndpointId,
+        names: &ProjectNames,
         _cx: &App,
         read: impl FnOnce(&cards::Host<'_>) -> R,
     ) -> Option<R> {
@@ -804,6 +824,7 @@ impl ChatSystem {
             endpoint,
             chat,
             name: &name,
+            names,
         };
         Some(read(&host))
     }
@@ -811,13 +832,15 @@ impl ChatSystem {
 
 impl ChatSystem {
     fn pending_ideas(&self) -> impl Iterator<Item = (PendingIdeaId, String, &Outgoing)> {
-        self.outbox.ideas().filter_map(|(host, id, outgoing)| {
+        let names = self.project_names();
+        self.outbox.ideas().filter_map(move |(host, id, outgoing)| {
             let project = outgoing.parent?;
             let chat = self.host_chat(host)?;
             let alias = self.host_name(host);
+            let project = chat.project(project)?;
             Some((
                 PendingIdeaId(id),
-                chat.project(project)?.address(&alias),
+                names.address(&project.name, &alias),
                 outgoing,
             ))
         })
@@ -972,11 +995,12 @@ impl System for ChatSystem {
         cx: &App,
     ) -> Vec<Claim> {
         let mut claims = Vec::new();
+        let names = self.project_names();
         let mut seeds: Vec<EndpointId> = self.logs.keys().copied().collect();
         seeds.sort_unstable();
         for seed in seeds {
             claims.extend(
-                self.with_host(seed, cx, |host| {
+                self.with_host(seed, &names, cx, |host| {
                     cards::claims(
                         host,
                         marks,
@@ -1061,6 +1085,7 @@ impl System for ChatSystem {
         let mut hosts = HashMap::new();
         let mut threads = HashMap::new();
         let mut projects = HashMap::new();
+        let names = self.project_names();
         Some(Box::new(move |hit| {
             let id = match &hit.target {
                 TextTarget::Draft(address) => {
@@ -1106,7 +1131,15 @@ impl System for ChatSystem {
                             message: root,
                             ..id
                         })
-                        .or_insert_with(|| cards::context_at_root(chat, root, host_alias));
+                        .or_insert_with(|| {
+                            let host = cards::Host {
+                                endpoint: id.host,
+                                chat,
+                                name: host_alias,
+                                names: &names,
+                            };
+                            cards::context_at_root(&host, root)
+                        });
                     let title = if project.is_empty() {
                         format!("Message · {subject}")
                     } else {
@@ -1138,11 +1171,19 @@ impl System for ChatSystem {
                     status: Some(pending::status(&outgoing.state).to_owned()),
                 }),
                 recency: outgoing.at.0,
+                also: Vec::new(),
             })
             .collect::<Vec<_>>();
+        let names = self.project_names();
         for (host, alias) in self.hosts() {
             let Some(chat) = self.logs.get(&host) else {
                 continue;
+            };
+            let place = cards::Host {
+                endpoint: host,
+                chat,
+                name: &alias,
+                names: &names,
             };
             let mut seen = BTreeSet::new();
             let ids = chat.roots().iter().flat_map(|&root| {
@@ -1158,7 +1199,12 @@ impl System for ChatSystem {
                 let Some(subject) = chat.name(id) else {
                     continue;
                 };
-                let project = cards::context(chat, id, &alias);
+                let project = cards::context(&place, id);
+                // `tide@lab` finds what shows as `tide`.
+                let qualified = chat
+                    .project(chat.root_of(id))
+                    .map(|held| names::qualified(&held.name, &alias))
+                    .filter(|qualified| *qualified != project);
                 let is_project = chat.is_project(id);
                 let (thread, recency) = if is_project {
                     (None, 0)
@@ -1181,6 +1227,7 @@ impl System for ChatSystem {
                     title: if is_project { project } else { subject },
                     thread,
                     recency,
+                    also: qualified.into_iter().collect(),
                 });
             }
         }

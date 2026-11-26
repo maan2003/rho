@@ -28,8 +28,8 @@ use theme::ActiveTheme as _;
 
 use super::ChatSystem;
 use super::projects::{NewProject, ProjectCreated, runtime_choices};
-use crate::ThreadId;
 use crate::cache::IdeaDraft;
+use crate::{ThreadId, names};
 
 actions!(
     rho_idea,
@@ -71,8 +71,26 @@ pub(super) fn bind(cx: &mut App) {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct IdeaProject {
     pub(super) thread: ThreadId,
+    /// Its address as the window shows it: `tide`, or `tide@lab` while
+    /// another host has a `tide` too.
     pub(super) name: String,
+    /// Its address with its host, `tide@lab`, which always names it.
+    pub(super) qualified: String,
     pub(super) runtime: Option<RuntimeLabel>,
+}
+
+impl IdeaProject {
+    /// Whether the typed address names this project, in either form.
+    fn answers(&self, typed: &str) -> bool {
+        self.name.eq_ignore_ascii_case(typed) || self.qualified.eq_ignore_ascii_case(typed)
+    }
+
+    /// Whether either form of its address holds the lowercase `needle`.
+    pub(super) fn contains(&self, needle: &str) -> bool {
+        [&self.name, &self.qualified]
+            .into_iter()
+            .any(|address| address.to_lowercase().contains(needle))
+    }
 }
 
 /// A durable idea submission. Repeating it after a lost receipt uses the
@@ -135,13 +153,15 @@ impl ChatSystem {
     /// Every project an idea can go to. Of roots with the same address,
     /// only the newest; a contextual default knows its exact id.
     pub(super) fn idea_projects(&self) -> Vec<IdeaProject> {
+        let names = self.project_names();
+        let names = &names;
         self.logs
             .iter()
             .flat_map(|(&host, chat)| {
                 chat.roots().iter().filter_map(move |&message| {
                     let thread = ThreadId { host, message };
-                    let project = self.idea_project_at(thread)?;
-                    (self.project_named(&project.name) == Some(thread)).then_some(project)
+                    let project = self.idea_project_in(names, thread)?;
+                    (self.project_named(&project.qualified) == Some(thread)).then_some(project)
                 })
             })
             .collect()
@@ -153,20 +173,21 @@ impl ChatSystem {
     }
 
     /// The project the `to:` line names: the one chosen for it while the
-    /// line still names it, or else the project of that name.
+    /// line still names it, or else the project of that name. A bare name
+    /// two hosts share names neither.
     fn resolved_idea_project(&self) -> Option<IdeaProject> {
         let typed = self.idea.recipient.trim();
         if let Some(project) = self
             .idea
             .project
             .and_then(|project| self.idea_project_at(project))
-            && project.name.eq_ignore_ascii_case(typed)
+            && project.answers(typed)
         {
             return Some(project);
         }
         self.idea_projects()
             .into_iter()
-            .find(|project| project.name.eq_ignore_ascii_case(typed))
+            .find(|project| project.answers(typed))
     }
 
     fn save_idea(&self, cx: &App) {
@@ -241,10 +262,24 @@ impl ChatSystem {
             .idea_projects()
             .into_iter()
             .filter(|project| {
-                default.is_none_or(|default| !project.name.eq_ignore_ascii_case(&default.name))
+                default.is_none_or(|default| {
+                    !project.qualified.eq_ignore_ascii_case(&default.qualified)
+                })
             })
             .chain(default.cloned())
-            .filter(|project| project.name.to_lowercase().contains(&needle))
+            .filter(|project| project.contains(&needle))
+            .collect();
+        rows.sort_by(|a, b| {
+            let key = |project: &IdeaProject| {
+                (
+                    !project.answers(&input),
+                    default.is_none_or(|default| default.thread != project.thread),
+                )
+            };
+            (key(a), &a.name).cmp(&(key(b), &b.name))
+        });
+        let mut rows: Vec<_> = rows
+            .into_iter()
             .map(|project| {
                 (
                     Candidate {
@@ -255,50 +290,31 @@ impl ChatSystem {
                 )
             })
             .collect();
-        rows.sort_by(|(a, _), (b, _)| {
-            let key = |row: &Candidate| {
-                (
-                    !row.value.eq_ignore_ascii_case(&input),
-                    default.is_none_or(|project| project.name != row.value),
-                )
-            };
-            (key(a), &a.value).cmp(&(key(b), &b.value))
-        });
         if input.is_empty() || !rows.is_empty() {
             return rows;
         }
-        let (name, requested_host) = input
-            .rsplit_once('@')
-            .map_or((input.as_str(), None), |(name, host)| {
-                (name.trim_end(), Some(host))
-            });
+        let (name, requested_host) = names::split(&input);
         let Ok(name) = ProjectName::parse(name) else {
             return rows;
         };
-        let host_hint = requested_host.or_else(|| {
-            default.and_then(|project| project.name.rsplit_once('@').map(|(_, host)| host))
-        });
-        let mut new: Vec<_> = self
-            .hosts()
-            .into_iter()
+        let host_hint = requested_host
+            .or_else(|| default.and_then(|project| names::split(&project.qualified).1));
+        let hosts = self.hosts();
+        let mut new: Vec<_> = hosts
+            .iter()
             .filter(|(_, alias)| host_hint.is_none_or(|host| alias.eq_ignore_ascii_case(host)))
-            .filter_map(|(host, alias)| {
-                let value = format!("{}@{alias}", name.as_str());
-                (!rows
-                    .iter()
-                    .any(|(row, _)| row.value.eq_ignore_ascii_case(&value)))
-                .then(|| {
-                    (
-                        Candidate {
-                            value,
-                            description: NEW_PROJECT.into(),
-                        },
-                        ProjectChoice::New(NewProject {
-                            host,
-                            name: name.clone(),
-                        }),
-                    )
-                })
+            .map(|&(host, _)| {
+                let project = NewProject {
+                    host,
+                    name: name.clone(),
+                };
+                (
+                    Candidate {
+                        value: self.new_project_address(&project),
+                        description: NEW_PROJECT.into(),
+                    },
+                    ProjectChoice::New(project),
+                )
             })
             .collect();
         new.sort_by(|(a, _), (b, _)| a.value.cmp(&b.value));
@@ -861,7 +877,7 @@ impl Render for IdeaView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use rho_agent_hosts::{HostId, Link};
     use rho_agent_types::{
         Address as Party, ChatEvent, ChatRecord, ChatSeq, ContentPart, EndpointId, MessageId,
@@ -945,7 +961,41 @@ mod tests {
         attach_with(chat, projects, RuntimeCatalogue::host(), cx);
     }
 
-    fn init(
+    /// The second host's identity, which the user calls `box`.
+    pub(in crate::ui) const BOX: EndpointId = EndpointId([4; 32]);
+
+    /// Attaches `box`, with a `tide` (1) of its own and a `skiff` (2) no
+    /// other host has, and a thread (3) in its `tide`.
+    pub(in crate::ui) fn attach_box(chat: &Entity<ChatSystem>, cx: &mut App) {
+        chat.update(cx, |chat, cx| {
+            chat.streams(HostId(1), "box", Some(BOX), &Link::detached(), cx);
+            chat.runtimes.insert(BOX, RuntimeCatalogue::host());
+            let log = chat.logs.entry(BOX).or_default();
+            for record in [
+                posted(1, None, "tide"),
+                posted(2, None, "skiff"),
+                posted(3, Some(1), "Tune the tide"),
+            ] {
+                log.tell(&record);
+            }
+            for (seq, root) in [(4, 1), (5, 2)] {
+                log.tell(&ChatRecord {
+                    seq: ChatSeq(seq),
+                    at: UnixMs(seq),
+                    event: ChatEvent::Project {
+                        project: ProjectId(MessageId(ChatSeq(root))),
+                        config: ProjectConfig {
+                            place: ProjectPlace::parse("/srv/box").unwrap(),
+                            mode: ProjectMode::One,
+                            runtime: RuntimeLabel::default(),
+                        },
+                    },
+                });
+            }
+        });
+    }
+
+    pub(in crate::ui) fn init(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::WindowHandle<Frame>, Entity<ChatSystem>, rho_db::RhoDb) {
         let db = rho_db::RhoDb::in_memory();
@@ -995,7 +1045,7 @@ mod tests {
             .update(cx, |frame, _, cx| {
                 assert_eq!(frame.current_address(), &address());
                 let view = view(&chat, cx);
-                assert_eq!(line(&view.read(cx).address, cx), "tide@lab");
+                assert_eq!(line(&view.read(cx).address, cx), "tide");
                 assert_eq!(line(&view.read(cx).runtime, cx), "");
                 assert_eq!(hint(&view, cx).as_deref(), Some("haiku-max"));
             })
@@ -1119,7 +1169,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let chat = chat.read(cx);
-            assert_eq!(chat.idea.recipient, "reef@lab");
+            assert_eq!(chat.idea.recipient, "reef");
             assert_eq!(chat.idea.project, Some(thread(2)));
         });
     }
@@ -1233,10 +1283,10 @@ mod tests {
                 assert_eq!(frame.current_address(), &address());
                 let idea = &chat.read(cx).idea;
                 assert_eq!(idea.text.read(cx).text(), "Check the tide");
-                assert_eq!(idea.recipient, "tide@lab");
+                assert_eq!(idea.recipient, "tide");
                 assert_eq!(idea.runtime.as_deref(), Some("sol-high"));
                 let view = view(&chat, cx);
-                assert_eq!(line(&view.read(cx).address, cx), "tide@lab");
+                assert_eq!(line(&view.read(cx).address, cx), "tide");
                 assert_eq!(line(&view.read(cx).runtime, cx), "sol-high");
             })
             .unwrap();
@@ -1244,13 +1294,17 @@ mod tests {
 
     /// A name no project has offers to make it. Making it asks where the
     /// project works, and the idea then goes to it as the `to:` prompt
-    /// meant: addressed, or sent when sending asked for the project.
+    /// meant: addressed, or sent when sending asked for the project. With
+    /// one host the new project needs no host, typed or not.
     #[gpui::test]
     fn creating_a_project_keeps_the_intent_of_the_address_prompt(cx: &mut gpui::TestAppContext) {
         let (window, chat, _db) = init(cx);
         let text = "Half a thought, not ready";
-        for (intent, name) in [(Intent::Address, "skiff"), (Intent::Send, "stern")] {
-            let new = format!("{name}@lab");
+        for (intent, name, typed) in [
+            (Intent::Address, "skiff", "skiff@lab"),
+            (Intent::Send, "stern", "stern"),
+        ] {
+            let new = name.to_owned();
             cx.dispatch_action(window.into(), keys::PromptIdea);
             cx.run_until_parked();
             cx.update(|cx| write(&chat, text, cx));
@@ -1262,7 +1316,7 @@ mod tests {
                     }
                     let prompt = frame.minibuffer_mut().expect("to: is asked");
                     assert_eq!(prompt.prompt(), "to:");
-                    prompt.set_input(new.clone(), window, cx);
+                    prompt.set_input(typed.into(), window, cx);
                 })
                 .unwrap();
             cx.run_until_parked();
@@ -1332,6 +1386,196 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    fn on_box(seq: u64) -> ThreadId {
+        ThreadId {
+            host: BOX,
+            message: MessageId(ChatSeq(seq)),
+        }
+    }
+
+    /// `chat.Project`: a project shows its bare name until a second host
+    /// has a project of the same name; then both name their host on the
+    /// Desk, in the thread, and in the palette, while names one host alone
+    /// has stay bare.
+    #[gpui::test]
+    fn only_a_name_two_hosts_share_shows_its_host(cx: &mut gpui::TestAppContext) {
+        let (_window, chat, _db) = init(cx);
+        let tide_thread = thread(3);
+        cx.update(|cx| {
+            let chat = chat.read(cx);
+            assert_eq!(
+                chat.thread_name(tide_thread, cx),
+                Some(("Check the clock".into(), "tide".into()))
+            );
+            assert_eq!(chat.project_of(tide_thread, cx), "tide");
+            let desk = chat.project(&tide_thread.address(), cx).unwrap();
+            assert_eq!(desk.name, "tide");
+        });
+        cx.update(|cx| attach_box(&chat, cx));
+        cx.update(|cx| {
+            let chat = chat.read(cx);
+            let mut shown: Vec<_> = chat
+                .idea_projects()
+                .into_iter()
+                .map(|project| project.name)
+                .collect();
+            shown.sort();
+            assert_eq!(shown, ["reef", "skiff", "tide@box", "tide@lab"]);
+            // The Desk: a card's context and a row's project.
+            assert_eq!(chat.thread_name(tide_thread, cx).unwrap().1, "tide@lab");
+            assert_eq!(chat.thread_name(on_box(3), cx).unwrap().1, "tide@box");
+            let desk = chat.project(&tide_thread.address(), cx).unwrap();
+            assert_eq!(desk.name, "tide@lab");
+            // The thread's status line.
+            assert_eq!(chat.project_of(on_box(3), cx), "tide@box");
+            // The palette: what it shows, and what finds it unshown.
+            let found = chat.find(&rho_dealer::Marks::default(), cx);
+            let row = |title: &str| {
+                found
+                    .iter()
+                    .find(|row| row.title == title)
+                    .unwrap_or_else(|| panic!("{title} in {found:?}"))
+            };
+            assert!(row("tide@lab").also.is_empty());
+            assert_eq!(row("reef").also, ["reef@lab"]);
+            assert_eq!(row("skiff").also, ["skiff@box"]);
+            assert_eq!(row("Check the clock").description, "tide@lab");
+            assert!(row("Check the clock").also.is_empty());
+            // Typed addresses: a bare shared name names neither.
+            assert_eq!(chat.project_named("tide"), None);
+            assert_eq!(chat.project_named("tide@box"), Some(on_box(1)));
+            assert_eq!(chat.project_named("tide@lab"), Some(thread(1)));
+            assert_eq!(chat.project_named("reef"), Some(thread(2)));
+            assert_eq!(chat.project_named("reef@lab"), Some(thread(2)));
+            assert_eq!(chat.project_named("reef@box"), None);
+            assert_eq!(chat.project_named("skiff"), Some(on_box(2)));
+        });
+    }
+
+    /// `chat.Write an idea`: with two tides, `to: tide` names neither, so
+    /// sending asks `to:` with both; `tide@lab`, and a bare name one host
+    /// alone has, send at once.
+    #[gpui::test]
+    fn a_bare_shared_name_asks_which_host(cx: &mut gpui::TestAppContext) {
+        let (window, chat, _db) = init(cx);
+        cx.update(|cx| attach_box(&chat, cx));
+        let write_to = |to: &'static str, words: &'static str, cx: &mut gpui::TestAppContext| {
+            cx.dispatch_action(window.into(), keys::PromptIdea);
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, cx| {
+                    let view = view(&chat, cx);
+                    let address = view.read(cx).address.clone();
+                    address.update(cx, |line, cx| line.set_text(to, window, cx));
+                    write(&chat, words, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.dispatch_action(window.into(), SendIdea);
+            cx.run_until_parked();
+        };
+        write_to("tide", "Which tide?", cx);
+        window
+            .update(cx, |frame, _, cx| {
+                assert!(chat.read(cx).outbox.ideas().next().is_none());
+                let prompt = frame.minibuffer_mut().expect("to: is asked");
+                assert_eq!(prompt.prompt(), "to:");
+                let first = prompt.selected_candidate().unwrap().0;
+                prompt.select_by_delta(1);
+                let second = prompt.selected_candidate().unwrap().0;
+                prompt.select_by_delta(1);
+                let third = prompt.selected_candidate().unwrap().0;
+                assert_eq!(
+                    [first.value.as_str(), second.value.as_str()],
+                    ["tide@box", "tide@lab"]
+                );
+                assert_eq!(first.description, "project");
+                assert_eq!(third, first, "no new project, and nothing else");
+                prompt.select_by_delta(1);
+            })
+            .unwrap();
+        cx.dispatch_action(window.into(), keys::MinibufferConfirm);
+        cx.run_until_parked();
+        write_to("tide@lab", "This tide.", cx);
+        write_to("skiff", "The only skiff.", cx);
+        cx.update(|cx| {
+            let sent: Vec<_> = chat
+                .read(cx)
+                .outbox
+                .ideas()
+                .map(|(host, _, outgoing)| {
+                    (
+                        host,
+                        outgoing.parent.unwrap(),
+                        rho_agent_types::content_text(&outgoing.content),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    (LAB, MessageId(ChatSeq(1)), "Which tide?".to_owned()),
+                    (LAB, MessageId(ChatSeq(1)), "This tide.".to_owned()),
+                    (BOX, MessageId(ChatSeq(2)), "The only skiff.".to_owned()),
+                ]
+            );
+        });
+    }
+
+    /// `chat.Start a project`: the `to:` line takes `reef@lab` for the one
+    /// `reef` rather than offering to make another. With two hosts a new
+    /// name offers one row per host, and the address names the host while
+    /// the project is asked about.
+    #[gpui::test]
+    fn a_new_project_names_its_host_only_among_two(cx: &mut gpui::TestAppContext) {
+        let (window, chat, _db) = init(cx);
+        let offered = |chat: &Entity<ChatSystem>, input: &str, cx: &App| {
+            chat.read(cx)
+                .project_choices(input, None)
+                .into_iter()
+                .map(|(row, choice)| {
+                    let new = matches!(choice, ProjectChoice::New(_));
+                    (row.value, new)
+                })
+                .collect::<Vec<_>>()
+        };
+        cx.update(|cx| {
+            assert_eq!(offered(&chat, "reef@lab", cx), [("reef".into(), false)]);
+            assert_eq!(offered(&chat, "kelp", cx), [("kelp".into(), true)]);
+            assert_eq!(offered(&chat, "kelp@lab", cx), [("kelp".into(), true)]);
+        });
+        cx.update(|cx| attach_box(&chat, cx));
+        cx.update(|cx| {
+            assert_eq!(
+                offered(&chat, "kelp", cx),
+                [("kelp@box".into(), true), ("kelp@lab".into(), true)]
+            );
+            assert_eq!(offered(&chat, "kelp@box", cx), [("kelp@box".into(), true)]);
+            assert_eq!(offered(&chat, "reef@lab", cx), [("reef".into(), false)]);
+            assert_eq!(offered(&chat, "reef@box", cx), [("reef@box".into(), true)]);
+            assert_eq!(offered(&chat, "tide@box", cx), [("tide@box".into(), false)]);
+        });
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), keys::PromptIdea);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, window, cx| {
+                let prompt = frame.minibuffer_mut().expect("to: is asked");
+                prompt.set_input("kelp@box".into(), window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.dispatch_action(window.into(), keys::MinibufferConfirm);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, _| {
+                let prompt = frame.minibuffer_mut().expect("making it asks where");
+                assert_eq!(prompt.prompt(), "kelp@box works on:");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

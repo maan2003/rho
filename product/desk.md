@@ -29,7 +29,7 @@ rejected:
 answers: what needs the user now?
 shows:
 - `Desk`: the count of everything that waits
-- `deal.Card`: up to seven waiting rows, in deal order, each its subject and project, plus the thread's latest flash as quiet context while it is fresh; nothing on a row says why or since when, the deal says that when it opens the card. Repeated stops in one project share a row at the first stop's place. The overflow names what it hides, such as `and 2 more · clock@lab`
+- `deal.Card`: up to seven waiting rows, in deal order, each its subject and project, plus the thread's latest flash as quiet context while it is fresh; nothing on a row says why or since when, the deal says that when it opens the card. Repeated stops in one project share a row at the first stop's place. The overflow names what it hides, such as `and 2 more · clock`
 states:
 - empty: `0 wait`; no rows
 - loading: not agreed

@@ -447,6 +447,7 @@ impl rho_frame::System for PageSystem {
                 description: format!("web · {}", metadata.url),
                 thread: None,
                 recency: metadata.last_accessed_ms,
+                also: Vec::new(),
             })
             .chain(bookmarks::named(marks).into_iter().map(|bookmark| Found {
                 address: bookmark.id.address(),
@@ -454,6 +455,7 @@ impl rho_frame::System for PageSystem {
                 description: format!("bookmark · {}", bookmark.url.host_str().unwrap_or_default()),
                 thread: None,
                 recency: 0,
+                also: Vec::new(),
             }))
             .collect()
     }
