@@ -26,7 +26,7 @@ has:
 - one `chat.Thread` (or a staged privileged action from `agents.Approve a push or a fetch`)
 - one `chat.Message` that pings the user, reports a stop, or asks approval for a staged push/fetch
 does:
-- deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last
+- deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last, and the echo says `skipped: Flaky clock test`. When the card in view is the only one waiting, it stays, nothing goes behind, and the echo says `only waiting card: Flaky clock test`
 
 The highest-priority card deals first: waiting cards rise steadily with age (`+0.5/h`), and a thread the user wrote in within the last hour gets a recency boost so answers to active work jump to the front; `desk.Desk` follows the same order, and every deal re-evaluates to pull the top card at that moment. Nothing addressed to the user disappears unread. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 rejected:
@@ -44,11 +44,11 @@ principle: the user replies if they have words; otherwise they say done. If they
 sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
 does:
 - reply: send the user's words and settle the thread through its latest message in view, as in `chat.Answer a message`; the thread stays on screen, and the next card waits for `Card.deal`
-- done `space` then `d`, or `done` on the phone: the user has read through the thread's current latest message and has nothing more to say; put the thread's card away (only a newer message or edit deals it again), and if it was on screen, open the next card
+- done `space` then `d`, or `done` on the phone: the user has read through the latest message they had in view at the top of the thread and has nothing more to say; put the thread's card away (only a newer message or edit deals it again), and if it was on screen, open the next card. A message or edit that came while the draft was stuck and the user read the history below is not read: it still waits and deals
 - mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user until it is unmuted; put the card away, and if it was on screen, open the next one
 - unmute: reopen the thread by name; its heading says `muted` and its verdict menu and palette offer `unmute`. Restore any message that still waits without leaving the thread.
 - snooze `space` then `s` then a unit, with an optional count first: hide the card until then (except that a reply arriving within one hour of the user's own message breaks through an active snooze); each row names when that is, such as `1 hour · 17:26`, `tomorrow · 09:00`, or `next week · Mon 09:00`; a count typed first multiplies the row; the rows are the same on both devices, and there is no one-minute row
-- next `space` then `n`: open the next card; `nothing waits` comes only when the `desk.Desk` would read `0 wait`, and then the Desk opens
+- next `space` then `n`: open the next card, as `Card.deal`; `nothing waits` comes only when the `desk.Desk` would read `0 wait`, and then the Desk opens. On a Desk that reads `0 wait`, the menu does not offer it
 - undo `space` then `u`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
 
 What the user says about a card is kept on their own devices. Between devices that hold the user's twelve-word secret phrase, it passes through the hosts, sealed, so no host and no agent can read it; see `hosts.Device` and `hosts.Pair this device`. A device without the phrase keeps its verdicts to itself, and its status line says so.

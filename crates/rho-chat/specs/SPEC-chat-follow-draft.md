@@ -6,6 +6,6 @@ The chat fold knows which messages arrived or was edited; only the editor knows 
 
 ## Contract
 
-The newest message appears below the draft. A viewport at the top stays there. When the draft is stuck, the history viewport preserves its place, subject to document bounds, and a muted `↑ new` marks kept project messages until the draft is inline again. The user's own pending and logged messages never mark the notice. A send clears the draft and puts point in the new draft without following messages.
+The newest message appears below the draft. A viewport at the top stays there. When the draft is stuck, the history viewport preserves its place, subject to document bounds, and a muted `↑ new` marks kept project messages until the draft is inline again. The user's own pending and logged messages never mark the notice. A send clears the draft and puts point in the new draft without following messages. A send from an inline draft, even one scrolled part way out of the window, leaves the window at the top of the document; a send from a stuck draft keeps the history viewport's place. Kept mail that arrives while the draft is stuck is unseen until the draft is inline again.
 
 This implements [new messages land below the draft](../../../product/chat.md#rule-new-messages-land-below-the-draft).

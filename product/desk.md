@@ -37,7 +37,7 @@ states:
 - error: not agreed
 - full: the waiting rows and the overflow
 keys:
-- `space`: deal the first card, `Desk.deal`; with no card waiting and a verdict to take back, open `deal.Verdict`
+- `space`: deal the first card, `Desk.deal`; with no card waiting and a verdict to take back, open `deal.Verdict`, which offers `undo` and no `next card`
 - `enter`: open the selected row, `Desk.open a row`
 - `j` and `k`: move between waiting and overflow rows, skipping labels and blank lines; `gg`: first row; `G`: last row
 - `i`: `chat.Write an idea`

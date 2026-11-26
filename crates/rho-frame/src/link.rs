@@ -59,7 +59,7 @@ impl FrameLink {
         cx: &mut App,
         f: impl FnOnce(Option<rho_dealer::facts::Seen>, &mut App) + 'static,
     ) {
-        self.with(cx, move |frame, _, cx| f(frame.card_seen(&address), cx));
+        self.with(cx, move |frame, _, cx| f(frame.card_seen(&address, cx), cx));
     }
 
     pub fn open(&self, address: Address, cx: &mut App) {

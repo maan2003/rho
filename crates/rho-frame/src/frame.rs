@@ -442,7 +442,7 @@ impl Frame {
     pub fn point(&self, cx: &App) -> Point {
         let surface = self.current_address().clone();
         let current = self.current_surface();
-        let subject = current.subject(self.card_seen(&surface), cx);
+        let subject = current.subject(self.card_seen(&surface, cx), cx);
         let card = match current.card(cx) {
             CardHere::Itself => Some(surface.clone()),
             CardHere::Row(row) => row,
@@ -493,20 +493,28 @@ impl Frame {
 
     /// What the reader has seen of the card at `address`, while it waits.
     /// Looking into its work, the card as it stood when they stepped down,
-    /// since mail that came after is out of sight. Anywhere else, the card
-    /// as the hand holds it: a thread shows its mail live, however it was
-    /// reached, so a reply or a verdict settles what is on screen.
-    pub(crate) fn card_seen(&self, address: &Address) -> Option<Seen> {
+    /// since mail that came after is out of sight. On its own screen, the
+    /// card as the hand holds it, as far as the screen has had it in view:
+    /// a thread shows its mail live, however it was reached, so a reply or
+    /// a verdict settles what is on screen and nothing that came while the
+    /// reader was in the history below. Anywhere else, the card as the
+    /// hand holds it.
+    pub(crate) fn card_seen(&self, address: &Address, cx: &App) -> Option<Seen> {
         if let ScreenEntry::Inspection(inspection) = self.history.current()
             && &inspection.address == address
         {
             return Some(inspection.seen);
         }
-        self.hand()
+        let held = self
+            .hand()
             .cards
             .iter()
             .find(|card| &card.address == address)
-            .map(|card| card.seen)
+            .map(|card| card.seen)?;
+        Some(match address == self.current_address() {
+            true => self.current_surface().seen(held, cx),
+            false => held,
+        })
     }
 
     /// Capture the card under the reader, keeping its observation while
@@ -516,7 +524,7 @@ impl Frame {
             return Some(inspection.clone());
         }
         let address = self.card_target(cx)?;
-        let seen = self.card_seen(&address)?;
+        let seen = self.card_seen(&address, cx)?;
         Some(CardInspection { address, seen })
     }
 
@@ -1235,7 +1243,7 @@ impl Frame {
         rows.push(phrase.window_wide());
         rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
         let surface = self.current_surface().clone();
-        rows.extend(surface.rows(self.card_seen(self.current_address()), window, cx));
+        rows.extend(surface.rows(self.card_seen(self.current_address(), cx), window, cx));
         for system in self.systems.clone() {
             rows.extend(system.rows(&point, window, cx));
         }
@@ -1341,7 +1349,7 @@ impl Frame {
             // With no card here there is nothing to judge, but the deal
             // still goes on: `n` is how the user asks what waits.
             let mut rows = Rows::new("no card here").counted();
-            push_deal_rows(&mut rows);
+            self.push_deal_rows(&mut rows);
             return rows;
         };
         let card = self.card_for(&target, cx);
@@ -1359,8 +1367,23 @@ impl Frame {
             rows.extend(verdict_rows(target.clone()));
             rows.push(Row::menu("s", snooze_rows(&target)));
         }
-        push_deal_rows(&mut rows);
+        self.push_deal_rows(&mut rows);
         rows
+    }
+
+    /// The verdict menu's rows that need no card: take back the last
+    /// verdict, and deal the next card. On a Desk that reads `0 wait` a
+    /// pull would deal nothing and stay, so it is not offered there.
+    fn push_deal_rows(&self, rows: &mut Rows) {
+        rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
+            frame.undo_verdict(window, cx)
+        }));
+        if self.desk_in_view() && self.hand().cards.is_empty() {
+            return;
+        }
+        rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
+            frame.pull_card(window, cx)
+        }));
     }
 
     pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1746,17 +1769,6 @@ impl Frame {
             status => Some(format!("{name} · {}", status.label())),
         }
     }
-}
-
-/// The verdict menu's rows that need no card: take back the last verdict,
-/// and deal the next card.
-fn push_deal_rows(rows: &mut Rows) {
-    rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-        frame.undo_verdict(window, cx)
-    }));
-    rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
-        frame.pull_card(window, cx)
-    }));
 }
 
 /// How long `target` sleeps: a unit, and the count typed before it.
@@ -2467,7 +2479,7 @@ mod tests {
                     version: 14,
                 };
                 frame.signals.hand.cards = vec![card.clone()];
-                assert_eq!(frame.card_seen(&thread), Some(card.seen));
+                assert_eq!(frame.card_seen(&thread, cx), Some(card.seen));
                 frame.verdict(&thread, Verdict::Done, "done".to_owned(), window, cx);
                 assert_eq!(
                     frame
@@ -2484,9 +2496,13 @@ mod tests {
                 let view = AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle())));
                 frame.surfaces.insert(thread.clone(), view);
                 frame.history.show(thread.clone(), ScreenEntry::Opened);
-                assert_eq!(frame.card_seen(&thread), Some(card.seen));
+                assert_eq!(frame.card_seen(&thread, cx), Some(card.seen));
                 frame.signals.hand.cards.clear();
-                assert_eq!(frame.card_seen(&thread), None, "nothing waits to settle");
+                assert_eq!(
+                    frame.card_seen(&thread, cx),
+                    None,
+                    "nothing waits to settle"
+                );
                 assert_eq!(
                     frame.card_target(cx),
                     Some(thread),
@@ -2536,6 +2552,99 @@ mod tests {
             claim.bonus = rho_dealer::curve::recency_bonus(since, Timestamp::now());
         }
         claim
+    }
+
+    /// A frame over [`Wants`], with the claims the test sets.
+    fn wanting_frame(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Frame>,
+        Rc<std::cell::RefCell<Vec<rho_dealer::Claim>>>,
+    ) {
+        let wants = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let system = wants.clone();
+        let frame = test_frame_with(cx, rho_db::RhoDb::in_memory(), move |cx| {
+            vec![AnySystem::new(cx.new(|_| Wants(system)))]
+        });
+        (frame, wants)
+    }
+
+    fn titled(mut claim: rho_dealer::Claim, title: &str) -> rho_dealer::Claim {
+        claim.title = title.into();
+        claim
+    }
+
+    #[gpui::test]
+    fn a_pull_from_the_sole_waiting_card_stays_and_skips_nothing(cx: &mut gpui::TestAppContext) {
+        let (frame, wants) = wanting_frame(cx);
+        let sole = Address::new("thread", "lab/1");
+        let other = Address::new("thread", "lab/2");
+        let hours = jiff::SignedDuration::from_hours;
+        wants
+            .borrow_mut()
+            .push(titled(asks(&sole, hours(2), false), "Clock drift"));
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.systems_changed(cx);
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &sole);
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &sole, "nothing else waits");
+                assert!(
+                    !frame.attention.skips.contains(&sole),
+                    "no skip for a card that would deal again at once"
+                );
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("only waiting card: Clock drift")
+                );
+            })
+            .unwrap();
+
+        // With a second card waiting, the pull passes over the first and
+        // says so.
+        wants
+            .borrow_mut()
+            .push(titled(asks(&other, hours(1), false), "Retry window"));
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.systems_changed(cx);
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &other);
+                assert!(frame.attention.skips.contains(&sole));
+                assert_eq!(echo_of(frame).as_deref(), Some("skipped: Clock drift"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_empty_desk_offers_undo_but_no_next_card(cx: &mut gpui::TestAppContext) {
+        let (frame, wants) = wanting_frame(cx);
+        let thread = Address::new("thread", "lab/1");
+        wants.borrow_mut().push(titled(
+            asks(&thread, jiff::SignedDuration::from_hours(2), false),
+            "Clock drift",
+        ));
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.systems_changed(cx);
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &thread);
+                // Away from Desk, nothing waiting still deals: it opens Desk.
+                wants.borrow_mut().clear();
+                frame.systems_changed(cx);
+                assert_eq!(
+                    labels(&frame.verdict_rows(cx)),
+                    ["done", "mute", "snooze", "undo", "next card"]
+                );
+                frame.verdict(&thread, Verdict::Done, "done".to_owned(), window, cx);
+                assert!(frame.desk_in_view());
+                assert!(frame.attention.can_undo());
+                frame.desk_space(window, cx);
+                let menu = &frame.menu.as_ref().expect("space offers undo").rows;
+                assert_eq!(labels(menu), ["undo"], "0 wait: no next card on Desk");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

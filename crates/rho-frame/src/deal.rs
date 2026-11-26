@@ -200,8 +200,8 @@ impl Frame {
     /// What a verdict settles: what the reader has seen of the card, or
     /// the whole of a card that does not wait, such as a thread muted
     /// before it asks.
-    fn seen(&self, address: &Address) -> Seen {
-        self.card_seen(address).unwrap_or(Seen::Whole)
+    fn seen(&self, address: &Address, cx: &gpui::App) -> Seen {
+        self.card_seen(address, cx).unwrap_or(Seen::Whole)
     }
 
     /// Says `writes`, and returns what takes them back.
@@ -237,7 +237,7 @@ impl Frame {
     ) {
         tracing::debug!(address = %address, ?verdict, "verdict");
         let called = self.called(address, cx);
-        let seen = self.seen(address);
+        let seen = self.seen(address, cx);
         let fact = crate::attention::Attention::fact(address, &verdict, seen);
         let takeback = self.write_marks(vec![Write::Fact(fact)], cx);
         let journal = verdict.journal();
@@ -312,10 +312,49 @@ impl Frame {
     /// One pull: rank everything, pass over the card in view, and open
     /// the most important of the rest. Nothing is retained, so two pulls
     /// in a row see the same world and the skip is what moves them on.
-    /// With nothing to deal, Desk opens and the echo line says so.
+    /// With nothing to deal, Desk opens and the echo line says so. The
+    /// card in view that is all that waits stays, unskipped: passing over
+    /// it would only deal it again.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.deal_next(self.card_in_view(cx), window, cx) {
-            self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
+        let in_view = self.card_in_view(cx);
+        let hand = self.rank(cx);
+        let held = in_view
+            .as_ref()
+            .and_then(|address| hand.cards.iter().find(|card| &card.address == address))
+            .cloned();
+        if let Some(held) = &held
+            && hand.top(Some(&held.address)).is_none()
+        {
+            let called = self.called(&held.address, cx);
+            self.echo(
+                &format!("only waiting card: {called}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        // Reading a card and pulling again is what a skip is: the card is
+        // still owed, it is just not what to look at next.
+        let skipped = held.map(|held| {
+            let now = Timestamp::now();
+            self.attention
+                .skips
+                .skip(held.address.clone(), held.cursor.clone(), now);
+            rho_journal::record(rho_journal::Event::Dealer {
+                card: journal_card(&held.address),
+                kind: journal_kind(&held.address),
+                verdict: rho_journal::DealerVerdict::Skip,
+                occurred_at: now.to_string(),
+                skip_until: Some((now + rho_dealer::curve::SKIP_HOLD).to_string()),
+            });
+            self.called(&held.address, cx)
+        });
+        let words = match self.deal_next(in_view, window, cx) {
+            true => skipped.map(|called| format!("skipped: {called}")),
+            false => Some(NOTHING_WAITS.to_owned()),
+        };
+        if let Some(words) = words {
+            self.echo(&words, StyleClass::SystemInfo, cx);
         }
     }
 
@@ -331,44 +370,20 @@ impl Frame {
         }
     }
 
-    /// Whether a card opened. An explicit pull passes over its open card;
-    /// a verdict already put that card away and passes over nothing else.
-    /// Empty lands on Desk, since there is nothing to deal.
+    /// Whether a card opened. An explicit pull passes over its open card,
+    /// which it has already skipped; a verdict already put that card away
+    /// and passes over nothing else. Empty lands on Desk, since there is
+    /// nothing to deal.
     fn deal_next(
         &mut self,
         in_view: Option<Address>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let now = Timestamp::now();
-        // Reading a card and pulling again is what a skip is: the card is
-        // still owed, it is just not what to look at next.
-        if let Some(address) = &in_view
-            && let Some(held) = self
-                .hand()
-                .cards
-                .iter()
-                .find(|held| &held.address == address)
-                .cloned()
-        {
-            self.attention
-                .skips
-                .skip(held.address.clone(), held.cursor.clone(), now);
-            rho_journal::record(rho_journal::Event::Dealer {
-                card: journal_card(address),
-                kind: journal_kind(address),
-                verdict: rho_journal::DealerVerdict::Skip,
-                occurred_at: now.to_string(),
-                skip_until: Some((now + rho_dealer::curve::SKIP_HOLD).to_string()),
-            });
-        }
         // A pull ranks afresh: the skip just said moves it on, and time
         // has passed since the last change.
         let hand = self.rank(cx);
-        let card = hand
-            .top(in_view.as_ref())
-            .or_else(|| hand.cards.first())
-            .cloned();
+        let card = hand.top(in_view.as_ref()).cloned();
         if card.is_none() {
             // Focus Desk against the empty deal, not the previous hand.
             self.refresh_desk(&hand, true, cx);

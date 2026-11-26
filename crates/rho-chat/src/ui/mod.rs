@@ -691,13 +691,28 @@ impl ChatSystem {
 
     /// The draft took the refused idea back: it leaves the outbox.
     fn withdraw_refused_idea(&mut self, id: PendingIdeaId, cx: &mut Context<Self>) {
-        let Some((endpoint, kept)) = self.outbox.withdraw_refused(id.0) else {
-            return;
+        if self.withdraw_refused(id.0, cx) {
+            let pending = id.address();
+            self.frame.close_all(move |address| address == &pending, cx);
+        }
+    }
+
+    /// The newest reply in `thread` that its host refused, as the thread's
+    /// draft takes it back: its client id and its words.
+    fn refused_reply(&self, thread: ThreadId) -> Option<(u64, String)> {
+        let (id, outgoing) = self.outbox.refused_reply(thread.host, thread.message)?;
+        Some((id, rho_agent_types::content_text(&outgoing.content)))
+    }
+
+    /// A draft took a refused idea or reply back to write it again: it
+    /// leaves the outbox, and the thread no longer shows it as not sent.
+    fn withdraw_refused(&mut self, client_id: u64, cx: &mut Context<Self>) -> bool {
+        let Some((endpoint, kept)) = self.outbox.withdraw_refused(client_id) else {
+            return false;
         };
         self.cache.write_outbox(endpoint, kept, None);
         self.changed(endpoint, cx);
-        let pending = id.address();
-        self.frame.close_all(move |address| address == &pending, cx);
+        true
     }
 
     /// Posts the host's oldest unsent message, unless one is on its way.

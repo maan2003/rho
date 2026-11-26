@@ -135,6 +135,14 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         CardHere::None
     }
 
+    /// What the reader has had in view of the card the surface stands
+    /// for, given `card`, what the hand holds of it: by default all of it,
+    /// since the surface shows its card live. A verdict or a reply settles
+    /// this much.
+    fn seen(&self, card: Seen, _cx: &App) -> Seen {
+        card
+    }
+
     /// Whether the point is in the surface's writable text rather than on
     /// the reading side. Only there does the frame redo an editor edit.
     fn edits_at_point(&self, _cx: &App) -> bool {
@@ -212,6 +220,7 @@ trait SurfaceHandle {
     fn subject(&self, card: Option<Seen>, cx: &App) -> Subject;
     fn mode(&self, window: &Window, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> CardHere;
+    fn seen(&self, card: Seen, cx: &App) -> Seen;
     fn edits_at_point(&self, cx: &App) -> bool;
     fn heading(&self, cx: &App) -> Option<String>;
     fn opened(&self, window: &mut Window, cx: &mut App);
@@ -265,6 +274,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn card(&self, cx: &App) -> CardHere {
         self.read(cx).card(cx)
+    }
+
+    fn seen(&self, card: Seen, cx: &App) -> Seen {
+        self.read(cx).seen(card, cx)
     }
 
     fn edits_at_point(&self, cx: &App) -> bool {
@@ -358,6 +371,10 @@ impl AnySurface {
 
     pub fn card(&self, cx: &App) -> CardHere {
         self.0.card(cx)
+    }
+
+    pub(crate) fn seen(&self, card: Seen, cx: &App) -> Seen {
+        self.0.seen(card, cx)
     }
 
     pub(crate) fn edits_at_point(&self, cx: &App) -> bool {

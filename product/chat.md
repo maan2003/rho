@@ -166,7 +166,7 @@ steps:
 1. the user opens the thread by the deal or by name and reads what the project wrote since their last message
    - when there is nothing to say, the user gives `deal.Verdict.done` and stops here
 2. the user writes and edits an answer in the `Draft` at the top of the thread
-3. the user sends the answer with `Message.reply`; the reply settles the waiting card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread.
+3. the user sends the answer with `Message.reply`; the reply settles the waiting card on this device even while it waits to be delivered. If the host refuses it, the card returns and the unsent answer stays in the thread, marked `not sent`; `write this reply again` in `window.Palette` takes it back into the empty `Draft` to change and send again.
 system: opens at the top with the point in the `Draft` and message below it, newest first. The user's last message separates what arrived since they wrote from earlier history. The thread keeps the draft if the user leaves. The reply is a message in the thread that every agent in it reads.
 user: the words of the answer, or done when there are none.
 cases: a question answered after a day away, with the project's earlier words one glance below; a result with proof; a colleague reached through `slack.Bot`; replying after returning via `window.Screen.back` or `window.Palette`.
@@ -226,6 +226,6 @@ rejected:
 - a cold message carries a `## recap`, and rho reminds the project when it does not · 2026-11-21 · see `Message`
 
 ## rule new messages land below the draft
-when new `Message` arrives, the user's own or the project's, or the newest message is edited, then it takes its place right below the `Draft` and the point does not move. With the window at the top, the user sees it at once and older messages move down. With the draft stuck to the top edge, the view stays where it is, and for a project message the stuck draft shows a quiet `↑ new` at its right end until the user scrolls back to the top.
+when new `Message` arrives, the user's own or the project's, or the newest message is edited, then it takes its place right below the `Draft` and the point does not move. With the window at the top, the user sees it at once and older messages move down. With the draft stuck to the top edge, the view stays where it is, and for a project message the stuck draft shows a quiet `↑ new` at its right end until the user scrolls back to the top. Until then the user has not seen it: a reply or `deal.Verdict.done` leaves it waiting.
 rejected:
 - history pushes up to keep the draft in place at the tail, `↓ new` for a project message when stuck at the bottom · 2026-11-21 · the mirror of this rule for the oldest-first order

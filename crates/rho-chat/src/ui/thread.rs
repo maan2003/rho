@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use editor::display_map::ToDisplayPoint as _;
 use editor::scroll::Autoscroll;
 use editor::{
     Anchor, Editor, EditorEvent, EditorMode, HighlightKey, SelectionEffects, SizingBehavior,
@@ -223,6 +224,11 @@ pub struct ThreadView {
     private_edit: Option<PrivateEdit>,
     draft_subscription: Subscription,
     latest_project_activity: Option<ChatSeq>,
+    /// How far the reader has read the thread: the newest log position of
+    /// its messages the last time its top was in view. A verdict or a
+    /// reply settles through this, never through what came while the
+    /// reader was in the history below.
+    seen_in_view: Option<ChatSeq>,
     /// Resolve against the new transcript before inferring motion direction.
     last_point: Anchor,
     expanded: Expanded,
@@ -262,6 +268,16 @@ fn latest_project_activity(system: &ChatSystem, thread: ThreadId) -> Option<Chat
         .filter(|mail| mail.from != Party::User)
         .map(|mail| mail.version().0)
         .or(project_post)
+}
+
+/// The newest log position among the thread's messages: every message
+/// and edit at or before it is in the document.
+fn newest_version(system: &ChatSystem, thread: ThreadId) -> Option<ChatSeq> {
+    system
+        .host_chat(thread.host)?
+        .reading_order(thread.message)
+        .map(|mail| mail.version().0)
+        .max()
 }
 
 const MINUTE_MS: u64 = 60_000;
@@ -375,6 +391,8 @@ impl ThreadView {
                     if row != previous {
                         cx.notify();
                     }
+                } else if matches!(event, EditorEvent::ScrollPositionChanged { .. }) {
+                    this.note_top(cx);
                 } else if matches!(event, EditorEvent::EditBlockedByReadOnly) {
                     this.system.read(cx).frame.clone().echo(
                         "this message cannot be edited · write in the draft",
@@ -400,6 +418,8 @@ impl ThreadView {
             private_edit: None,
             draft_subscription,
             latest_project_activity: latest_project_activity(system, thread),
+            // A new view starts at the top of the thread.
+            seen_in_view: newest_version(system, thread),
             last_point: Anchor::Min,
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
@@ -438,11 +458,34 @@ impl ThreadView {
         let newest = latest_project_activity(self.system.read(cx), self.thread);
         let arrived = newest > self.latest_project_activity;
         self.latest_project_activity = newest;
-        if arrived && self.editor.read(cx).stuck_excerpt_is_visible() {
+        if arrived && !self.top_in_view(cx) {
             self.editor
                 .update(cx, |editor, cx| editor.mark_stuck_excerpt(cx));
         }
         self.refresh(cx);
+        self.note_top(cx);
+    }
+
+    /// Whether the top of the thread is in view: the draft inline rather
+    /// than stuck to the top edge, so new mail lands where the reader sees
+    /// it. Read from the scroll position, which moves before the next
+    /// layout says whether the draft is stuck.
+    fn top_in_view(&self, cx: &mut App) -> bool {
+        self.editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            let last = draft::range(display.buffer_snapshot())
+                .end
+                .to_display_point(&display)
+                .row();
+            editor.scroll_position(cx).y < f64::from(last.0 + 1)
+        })
+    }
+
+    /// With the top in view, the reader has seen everything in the thread.
+    fn note_top(&mut self, cx: &mut Context<Self>) {
+        if self.top_in_view(cx) {
+            self.seen_in_view = newest_version(self.system.read(cx), self.thread);
+        }
     }
 
     /// The draft is the first excerpt; a history edit cannot move it.
@@ -604,7 +647,13 @@ impl ThreadView {
         }
     }
 
+    /// The sent words leave the draft. A draft that was inline, even with
+    /// its first lines above the window, shrinks to one line: the view
+    /// stays at the top of the thread, with the empty draft and the sent
+    /// message below it, rather than wherever the shrinking left the
+    /// scroll. A stuck draft keeps the history row the reader was on.
     fn finish_send(&mut self, cx: &mut Context<Self>) {
+        let inline = self.top_in_view(cx);
         self.clear_draft(cx);
         self.refresh(cx);
 
@@ -614,6 +663,9 @@ impl ThreadView {
             editor.selections.change_with(&display, |selections| {
                 selections.select_anchor_ranges([start..start]);
             });
+            if inline {
+                editor.request_autoscroll(Autoscroll::top().for_anchor(Anchor::Min), cx);
+            }
             let point = editor.selections.newest_anchor().head();
             cx.notify();
             point
@@ -642,6 +694,7 @@ impl ThreadView {
         });
         self.last_point = point;
         self.draft_point = Some(point);
+        self.seen_in_view = newest_version(self.system.read(cx), self.thread);
     }
 }
 
@@ -933,6 +986,39 @@ impl ThreadView {
 
     fn has_draft(&self, cx: &App) -> bool {
         !self.draft.read(cx).text().trim().is_empty()
+    }
+
+    /// Takes the reply the host refused back into the empty draft, to
+    /// change and send again, as `write this idea again` does for an idea.
+    /// A draft being written stays, and the refused reply with it.
+    fn write_reply_again(&mut self, cx: &mut Context<Self>) {
+        let Some((id, text)) = self.system.read(cx).refused_reply(self.thread) else {
+            return;
+        };
+        if self.has_draft(cx) {
+            self.system.read(cx).frame.clone().echo(
+                "reply: send or clear the draft first",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        self.draft.update(cx, |draft, cx| draft.set_text(text, cx));
+        self.system
+            .update(cx, |system, cx| system.withdraw_refused(id, cx));
+        self.style_draft(cx);
+        let end = self.editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            let end = draft::range(display.buffer_snapshot()).end;
+            editor.selections.change_with(&display, |selections| {
+                selections.select_anchor_ranges([end..end]);
+            });
+            editor.request_autoscroll(Autoscroll::top().for_anchor(Anchor::Min), cx);
+            cx.notify();
+            editor.selections.newest_anchor().head()
+        });
+        self.last_point = end;
+        self.draft_point = Some(end);
     }
 
     fn echo_empty_draft(&self, cx: &mut App) {
@@ -1706,6 +1792,15 @@ impl Surface for ThreadView {
         CardHere::Itself
     }
 
+    /// The card as far as the reader has had the top of the thread in
+    /// view: mail that came while they read the history below waits on.
+    fn seen(&self, card: Seen, _cx: &App) -> Seen {
+        match (card, self.seen_in_view) {
+            (Seen::Topic(through), Some(seen)) => Seen::Topic(through.min(seen.0)),
+            (card, _) => card,
+        }
+    }
+
     /// What the thread's agents do while nothing in it waits.
     fn status(&self, cx: &App) -> Option<String> {
         let work = self.system.read(cx).work(self.thread)?;
@@ -1776,6 +1871,12 @@ impl Surface for ThreadView {
                         .unwrap_or(row..=row);
                     view.quote(lines, window, cx);
                 });
+            }));
+        }
+        if self.system.read(cx).refused_reply(self.thread).is_some() {
+            let view = this.clone();
+            rows.push(Row::run("", "write this reply again", move |_, _, cx| {
+                view.update(cx, |view, cx| view.write_reply_again(cx));
             }));
         }
         if has_draft {
@@ -1868,10 +1969,413 @@ impl Render for ThreadView {
 #[cfg(test)]
 mod tests {
     use editor::Bias;
-    use editor::display_map::{DisplayPoint, DisplayRow, ToDisplayPoint as _};
+    use editor::display_map::{DisplayPoint, DisplayRow};
     use rho_agent_types::{AgentId, ChatSeq, ContentPart, UnixMs};
 
     use super::*;
+
+    /// A long thread where agent `1` asked 3 to `last` in turn, opened by
+    /// name in a frame, with `draft` written.
+    fn long_thread(
+        cx: &mut gpui::TestAppContext,
+        last: u64,
+        draft: &str,
+    ) -> (
+        gpui::WindowHandle<rho_frame::Frame>,
+        Entity<ChatSystem>,
+        tempfile::TempDir,
+        ThreadId,
+    ) {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+
+        let host = EndpointId([3; 32]);
+        let agent =
+            Party::Agent(AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap());
+        let thread = ThreadId {
+            host,
+            message: MessageId(ChatSeq(2)),
+        };
+        let mut log = HostChat::default();
+        for seq in 1..=last {
+            let (parent, from, text) = match seq {
+                1 => (None, Party::User, "Clock".to_owned()),
+                2 => (Some(1), Party::User, "Check the clocks.".to_owned()),
+                n => (
+                    Some(2),
+                    agent,
+                    format!("Reading {n}.\n\nThe clock drifted."),
+                ),
+            };
+            log.tell(&ChatRecord {
+                seq: ChatSeq(seq),
+                at: UnixMs(seq),
+                event: ChatEvent::Posted {
+                    parent: parent.map(|id| MessageId(ChatSeq(id))),
+                    retry_of: None,
+                    thread_reply: None,
+                    from,
+                    voice: Voice::Message,
+                    content: vec![ContentPart::Text { text }],
+                },
+            });
+        }
+        let (window, mail, db) = super::super::search_bench::fixture(cx, log);
+        cx.update(|cx| {
+            mail.update(cx, |system, _| {
+                system.set_draft(host, Some(thread.message), draft.into());
+            });
+        });
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.draw_window(window.into());
+        (window, mail, db, thread)
+    }
+
+    /// Where the point is, how far the thread is scrolled, and whether
+    /// the draft is stuck to the top edge, as drawn.
+    fn drawn(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+    ) -> (Point, f64, bool) {
+        cx.run_until_parked();
+        cx.draw_window(window.into());
+        window
+            .update(cx, |frame, _, cx| {
+                let editor = frame.current_surface().editor(cx).unwrap();
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let head = editor.selections.newest_anchor().head().to_point(&snapshot);
+                    (
+                        head,
+                        editor.scroll_position(cx).y,
+                        editor.stuck_excerpt_is_visible(),
+                    )
+                })
+            })
+            .unwrap()
+    }
+
+    fn scroll_to(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+        row: f64,
+    ) {
+        window
+            .update(cx, |frame, window, cx| {
+                let editor = frame.current_surface().editor(cx).unwrap();
+                editor.update(cx, |editor, cx| {
+                    editor.set_scroll_position(gpui::point(0., row), window, cx)
+                });
+            })
+            .unwrap();
+    }
+
+    /// The thread's card in the hand, by the mail it waits from.
+    fn waits_from(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+        thread: ThreadId,
+    ) -> Option<String> {
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .read(cx)
+                .unwrap()
+                .hand()
+                .cards
+                .iter()
+                .find(|card| card.address == thread.address())
+                .map(|card| card.cursor.clone())
+        })
+    }
+
+    fn done(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+        thread: ThreadId,
+    ) {
+        window
+            .update(cx, |frame, window, cx| {
+                frame.verdict(
+                    &thread.address(),
+                    rho_frame::attention::Verdict::Done,
+                    "done".to_owned(),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+    }
+
+    /// A draft taller than the scroll it was written at shrinks to one
+    /// line when sent. The view stays at the top, with the sent words
+    /// right below the empty draft, rather than wherever the shrink left
+    /// the scroll, where the stuck draft covered the sent words.
+    #[gpui::test]
+    fn sending_a_tall_draft_in_a_long_thread_keeps_the_top_in_view(cx: &mut gpui::TestAppContext) {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+
+        let draft = (1..=8)
+            .map(|n| format!("Line {n} of the answer."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (window, mail, _db, thread) = long_thread(cx, 40, &draft);
+        // Writing scrolled the window into the draft, part way into a
+        // line; it is still inline.
+        scroll_to(cx, window, 5.5);
+        let (_, scroll, stuck) = drawn(cx, window);
+        assert_eq!((scroll, stuck), (5.5, false));
+
+        cx.dispatch_action(window.into(), SendMessage);
+        let sending = drawn(cx, window);
+        assert_eq!(sending, (Point::new(0, 0), 0., false), "while sending");
+        let doc = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, _, cx| {
+                    let editor = frame.current_surface().editor(cx).unwrap();
+                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
+                })
+                .unwrap()
+        };
+        assert!(
+            doc(cx).starts_with("\n\nLine 1 of the answer. · sending…\n"),
+            "{}",
+            doc(cx)
+        );
+
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system.outbox.next(thread.host).unwrap();
+                system.outbox.answered(thread.host).unwrap();
+                system
+                    .logs
+                    .get_mut(&thread.host)
+                    .unwrap()
+                    .tell(&ChatRecord {
+                        seq: ChatSeq(41),
+                        at: UnixMs(41),
+                        event: ChatEvent::Posted {
+                            parent: Some(thread.message),
+                            retry_of: None,
+                            thread_reply: None,
+                            from: Party::User,
+                            voice: Voice::Message,
+                            content: vec![ContentPart::Text {
+                                text: draft.clone(),
+                            }],
+                        },
+                    });
+                system.changed(thread.host, cx);
+            })
+        });
+        assert_eq!(drawn(cx, window), sending, "when the sent mail lands");
+        assert!(doc(cx).starts_with("\n\nLine 1 of the answer.\n"));
+    }
+
+    /// Mail that lands at the top while the reader is in the history
+    /// below, a new ask or an edit of the newest, is out of sight: done
+    /// settles what the reader had in view, and the arrival deals again.
+    #[gpui::test]
+    fn done_while_reading_history_leaves_what_came_meanwhile(cx: &mut gpui::TestAppContext) {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+
+        let (window, mail, _db, thread) = long_thread(cx, 30, "");
+        let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        assert!(waits_from(cx, window, thread).is_some());
+        let arrive = |cx: &mut gpui::TestAppContext, event: ChatEvent, seq: u64| {
+            cx.update(|cx| {
+                mail.update(cx, |system, cx| {
+                    system
+                        .logs
+                        .get_mut(&thread.host)
+                        .unwrap()
+                        .tell(&ChatRecord {
+                            seq: ChatSeq(seq),
+                            at: UnixMs(seq),
+                            event,
+                        });
+                    system.changed(thread.host, cx);
+                })
+            });
+        };
+        let ask = |text: &str| ChatEvent::Posted {
+            parent: Some(thread.message),
+            retry_of: None,
+            thread_reply: None,
+            from: Party::Agent(agent),
+            voice: Voice::Message,
+            content: vec![ContentPart::Text { text: text.into() }],
+        };
+
+        // A new ask while the reader is below.
+        scroll_to(cx, window, 30.);
+        assert!(drawn(cx, window).2, "the draft is stuck while reading");
+        arrive(cx, ask("Widen the retry window?"), 31);
+        assert!(drawn(cx, window).2);
+        done(cx, window, thread);
+        let waiting = waits_from(cx, window, thread).expect("the new ask still waits");
+        assert!(waiting.ends_with("/31"), "{waiting}");
+        // The deal opens it again, at the top: now it is seen.
+        assert_eq!(
+            cx.update(|cx| window.read(cx).unwrap().current_address().clone()),
+            thread.address()
+        );
+        assert_eq!(drawn(cx, window).1, 0.);
+        done(cx, window, thread);
+        assert_eq!(waits_from(cx, window, thread), None);
+
+        // An edit of the newest ask while the reader is below.
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        drawn(cx, window);
+        scroll_to(cx, window, 30.);
+        assert!(drawn(cx, window).2);
+        arrive(
+            cx,
+            ChatEvent::Revised {
+                message: MessageId(ChatSeq(31)),
+                author: agent,
+                content: vec![ContentPart::Text {
+                    text: "Widen the retry window to a minute?".into(),
+                }],
+            },
+            32,
+        );
+        assert!(
+            waits_from(cx, window, thread).is_some(),
+            "changed words deal"
+        );
+        done(cx, window, thread);
+        assert!(
+            waits_from(cx, window, thread).is_some(),
+            "the edit came out of sight"
+        );
+
+        // Back at the top, the reader has seen it, and done settles it.
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        scroll_to(cx, window, 30.);
+        drawn(cx, window);
+        cx.dispatch_action(window.into(), GoToDraft);
+        assert_eq!(drawn(cx, window).1, 0.);
+        scroll_to(cx, window, 30.);
+        drawn(cx, window);
+        done(cx, window, thread);
+        assert_eq!(waits_from(cx, window, thread), None);
+    }
+
+    /// A reply the host refused goes back into the empty draft to change
+    /// and send again, as a refused idea does, and leaves the outbox. A
+    /// draft being written is never overwritten.
+    #[gpui::test]
+    fn a_refused_reply_can_be_written_again(cx: &mut gpui::TestAppContext) {
+        let (window, mail, _db, thread) = answered_then_asked_again(cx, true);
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        sent_settles(cx, window, &mail, thread);
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system.refuse_reply(thread.host, "the thread moved".into(), cx)
+            })
+        });
+        cx.run_until_parked();
+        const AGAIN: &str = "write this reply again";
+        let doc = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, _, cx| {
+                    let editor = frame.current_surface().editor(cx).unwrap();
+                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
+                })
+                .unwrap()
+        };
+        let write_draft = |cx: &mut gpui::TestAppContext, text: &str| {
+            window
+                .update(cx, |frame, _, cx| {
+                    let editor = frame.current_surface().editor(cx).unwrap();
+                    editor.update(cx, |editor, cx| {
+                        let doc = editor.buffer().read(cx).snapshot(cx);
+                        let draft = draft::range(&doc);
+                        let draft = draft.start.to_point(&doc)..draft.end.to_point(&doc);
+                        editor
+                            .buffer()
+                            .update(cx, |doc, cx| doc.edit([(draft, text.to_owned())], None, cx));
+                    });
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        // Runs the palette row, when the thread offers it.
+        let again = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, window, cx| {
+                    let rows = frame.current_surface().rows(None, window, cx);
+                    let run = rows.into_iter().find_map(|row| match row.pick {
+                        rho_frame::menu::Pick::Run { label, run, .. } if label == AGAIN => {
+                            Some(run)
+                        }
+                        _ => None,
+                    })?;
+                    run(frame, None, window, cx);
+                    Some(())
+                })
+                .unwrap()
+        };
+        let refused = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                mail.read(cx)
+                    .local_under(thread.host, Some(thread.message))
+                    .iter()
+                    .map(|outgoing| rho_agent_types::content_text(&outgoing.content))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let saved = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                mail.read(cx)
+                    .draft(thread.host, Some(thread.message))
+                    .to_owned()
+            })
+        };
+        assert!(
+            doc(cx).starts_with("\n\nWiden it. · not sent: the thread moved\n"),
+            "{}",
+            doc(cx)
+        );
+
+        write_draft(cx, "Another thought.");
+        assert_eq!(again(cx), Some(()));
+        assert_eq!(
+            saved(cx),
+            "Another thought.",
+            "the draft being written stays"
+        );
+        assert_eq!(refused(cx), ["Widen it."], "and so does the refused reply");
+
+        write_draft(cx, "");
+        assert_eq!(again(cx), Some(()));
+        assert_eq!(saved(cx), "Widen it.");
+        assert_eq!(refused(cx), Vec::<String>::new(), "it left the outbox");
+        assert!(
+            doc(cx).starts_with("Widen it.\n\nWiden the retry window?\n"),
+            "{}",
+            doc(cx)
+        );
+        assert_eq!(drawn(cx, window).0, Point::new(0, "Widen it.".len() as u32));
+        assert_eq!(again(cx), None, "nothing else to write again");
+    }
 
     #[gpui::test]
     fn sending_an_inline_reply_keeps_point_at_the_top_and_shows_the_newest_mail(
@@ -2055,9 +2559,7 @@ mod tests {
                             }],
                         },
                     });
-                cx.emit(Event::Changed {
-                    endpoint: thread.host,
-                });
+                system.changed(thread.host, cx);
             })
         });
         assert_eq!(

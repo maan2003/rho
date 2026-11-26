@@ -186,6 +186,25 @@ impl Outbox {
         Some((host, Kept::Gone(id)))
     }
 
+    /// The newest reply into `parent` on `endpoint` that its host refused,
+    /// for the user to write it again.
+    pub(crate) fn refused_reply(
+        &self,
+        endpoint: EndpointId,
+        parent: MessageId,
+    ) -> Option<(u64, &Outgoing)> {
+        self.waiting
+            .iter()
+            .rev()
+            .find(|(host, _, outgoing)| {
+                *host == endpoint
+                    && outgoing.parent == Some(parent)
+                    && outgoing.delivery != Delivery::Idea
+                    && matches!(outgoing.state, OutgoingState::Refused { .. })
+            })
+            .map(|(_, id, outgoing)| (*id, outgoing))
+    }
+
     pub(crate) fn settlements(&self, endpoint: EndpointId) -> impl Iterator<Item = MessageVersion> {
         self.waiting.iter().filter_map(move |(host, _, outgoing)| {
             if *host != endpoint || outgoing.state != OutgoingState::Queued {
