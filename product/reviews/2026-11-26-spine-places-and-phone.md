@@ -145,7 +145,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 8. `Terminal`, `Shell`, and `Desktop` have asymmetric discoverability and orphan running terminals
 - **Kind:** product
 - **Level:** high-level
-- **Status:** decided (2026-11-26: flat peers with `Thread` + workset-centric transcript with agent filter + global Palette commands + `Shell` marked experimental; code rewrite queued for Loop 2)
+- **Status:** fixed (2026-11-26, Loop 2 Wave B C5 `b76c9b234`: flat peers with `Thread`, workset-centric transcript with agent filter, global Palette commands, running terminals/shells in `find`, `Shell` marked experimental)
 - **Where:** `agents.Work beside an agent`, `agents.Terminal`, `agents.Shell`, `agents.Desktop`, `window.Palette`
 - **Evidence:**
   - **Product state:** `window.Palette` is supposed to make any place *"one name away"* (`Moving between places costs nothing`), and `agents.md` treats an agent's `Terminal`, `Shell`, and `Desktop` as peer tools for working beside an agent. In the built app:

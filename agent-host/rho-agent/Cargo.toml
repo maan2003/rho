@@ -38,7 +38,13 @@ rho-rpc.workspace = true
 rho-tool-shell.workspace = true
 rho-watch.workspace = true
 rho-web-search.workspace = true
-rustix = { version = "1", features = ["event", "fs", "net", "process", "stdio"] }
+rustix = { version = "1", features = [
+  "event",
+  "fs",
+  "net",
+  "process",
+  "stdio",
+] }
 rustix-openpty.workspace = true
 rustls.workspace = true
 senax-encoder = { workspace = true, features = ["raw_value", "uuid"] }
@@ -50,8 +56,8 @@ tikv-jemalloc-ctl = "0.7"
 tokio = { workspace = true, features = ["signal"] }
 tree-sitter = "0.27"
 tree-sitter-python = "0.25"
-uuid.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 rho-shell.workspace = true
 rho-shell-view.workspace = true

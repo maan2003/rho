@@ -27,7 +27,6 @@ done when: the user sees the project's result.
 day: Keep the work moving.
 
 ## concept Workset
-status: currently transcripts open per individual agent rather than per workset with an agent filter.
 purpose: group the work, its transcript, and its tools (`Shell`, `Terminal`, `Desktop`) into one inspectable unit alongside the `chat.Thread`.
 principle: one or more agents work on a flaky test inside a workset; the user opens the workset transcript as a flat peer of the thread, reads the chronological log across the workset (filtering to one agent when needed), or jumps straight to its shell or desktop.
 sees: its name, host, folder on the host, active agents and their states (`working`, `waiting`, `idle`, `failed`, `retrying`, or `archived`), and its full chronological transcript.

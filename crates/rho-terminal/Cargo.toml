@@ -23,7 +23,14 @@ client = [
 ]
 
 # The terminals as the frame shows them: the surface and its keys.
-ui = ["client", "dep:editor", "dep:language", "dep:multi_buffer", "dep:rho-frame", "dep:rho-window"]
+ui = [
+  "client",
+  "dep:editor",
+  "dep:language",
+  "dep:multi_buffer",
+  "dep:rho-frame",
+  "dep:rho-window",
+]
 
 [dependencies]
 bytes.workspace = true
@@ -31,16 +38,18 @@ rho-rpc.workspace = true
 senax-encoder.workspace = true
 
 anyhow = { workspace = true, optional = true }
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"], optional = true }
-language = { path = "../../vendor/zed/crates/language", optional = true }
-multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
-rho-window = { workspace = true, optional = true }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = [
+  "native",
+], optional = true }
 futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "wayland",
 ], optional = true }
+language = { path = "../../vendor/zed/crates/language", optional = true }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-frame = { workspace = true, optional = true }
+rho-window = { workspace = true, optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = true }
