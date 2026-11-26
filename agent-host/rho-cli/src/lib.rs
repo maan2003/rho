@@ -15,6 +15,7 @@ use rho_inference::{AuthArgs, run_auth_cli};
 use rho_rpc::protocol::client::Client as UiClient;
 use rho_rpc::protocol::{Answer, Call, client};
 
+mod agent;
 mod eval;
 mod github;
 mod google;
@@ -58,6 +59,7 @@ pub fn main() -> Result<()> {
 async fn run(command: Command) -> Result<()> {
     match command {
         Command::Auth(_) => unreachable!("auth runs before the shared async runtime"),
+        Command::Agent(args) => agent::run(args).await,
         Command::ClaudeAccount(args) => run_claude_account(args).await,
         Command::Debug(args) => {
             rho_agent_host::debug::run(args).await?;
@@ -231,6 +233,7 @@ struct Args {
 #[derive(Clone)]
 enum Command {
     Auth(AuthArgs),
+    Agent(agent::AgentArgs),
     ClaudeAccount(ClaudeAccountArgs),
     Debug(DebugArgs),
     /// Run a headless agent evaluation; JSONL output, temporary state, real
@@ -265,6 +268,8 @@ enum CliCommand {
         #[command(subcommand)]
         command: AuthArgs,
     },
+    /// Spawn, message, inspect, and receive replies from agents on a host.
+    Agent(agent::AgentArgs),
     /// Manage the Claude accounts agents run on.
     ClaudeAccount(ClaudeAccountArgs),
     Debug(DebugArgs),
@@ -534,6 +539,7 @@ impl Args {
         let command = match command {
             CliCommand::Share(args) => Command::Share(args),
             CliCommand::Auth { command } => Command::Auth(command),
+            CliCommand::Agent(args) => Command::Agent(args),
             CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),

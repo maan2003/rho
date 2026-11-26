@@ -43,6 +43,7 @@ tempfile.workspace = true
 text.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
+uuid.workspace = true
 
 # The driver's pointer: a headless seat has no pointer device, so `click`
 # creates one over `zwlr_virtual_pointer_v1` the way `wtype` creates a virtual
@@ -52,6 +53,11 @@ wayland-client = "0.31"
 
 [dev-dependencies]
 rho-desktop-media = { workspace = true, features = ["decoder", "encoder"] }
+rho-fake-model.workspace = true
+
+[[test]]
+name = "agent_e2e"
+harness = false
 
 [[bin]]
 name = "rho"

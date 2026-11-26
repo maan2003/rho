@@ -14007,6 +14007,7 @@ dependencies = [
  "rho-desktop-client",
  "rho-desktop-media",
  "rho-desktop-proto",
+ "rho-fake-model",
  "rho-files",
  "rho-fs-view",
  "rho-inference",
@@ -14022,6 +14023,7 @@ dependencies = [
  "text",
  "tokio",
  "tracing",
+ "uuid",
  "wayland-client",
 ]
 
