@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use gpui::{App, AppContext as _, WindowOptions};
 use rho_agent_hosts::HostSpec;
-use rho_frame::{AnySystem, Frame, FrameLink};
+use rho_frame::{AnySystem, Frame, FrameLink, System as _};
 use rho_gui::rho_assets::RhoAssets;
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use tracing_subscriber::EnvFilter;
@@ -267,10 +267,22 @@ fn run() -> Result<()> {
                         cx,
                     )
                 });
+                // A push or fetch that waits for the user's ssh login names
+                // the agent that asks as the agents system calls it.
+                let named = agents.downgrade();
+                let git = cx.new(|cx| {
+                    rho_agents_view::GitApprovals::new(
+                        rho_agent_hosts::git::GitStreams::new(),
+                        Rc::new(move |agent, cx| named.upgrade()?.read(cx).agent_name(agent, cx)),
+                        frame.clone(),
+                        cx,
+                    )
+                });
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
+                    AnySystem::new(git),
                     AnySystem::new(browser),
                     AnySystem::new(notes),
                     AnySystem::new(telemetry),

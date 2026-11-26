@@ -259,8 +259,6 @@ pub struct Minibuffer {
     completed_selection: Option<Completed>,
     /// What is typed here is a credential: the journal keeps none of it.
     secret: bool,
-    /// The host's question this prompt asks, while it asks one.
-    pub(crate) question: Option<crate::hosts::QuestionKey>,
     _edits: Subscription,
 }
 
@@ -331,7 +329,6 @@ impl Minibuffer {
             moved_selection: false,
             completed_selection: None,
             secret: false,
-            question: None,
             _edits: edits,
         }
     }

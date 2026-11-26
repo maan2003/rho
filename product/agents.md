@@ -173,7 +173,7 @@ cases: more than one running terminal; the host is on this machine, where deskto
 when the user sends a `chat.Message` as a new idea to a `chat.Project`, then the work starts in the `chat.Thread` for that idea and the agent reads the idea first. In `one agent` mode it is the project's agent, started when none runs; in `per idea` mode it is a fresh agent in its own workset, as `chat.Project.receive an idea`.
 
 ## flow Approve a push or a fetch
-status: currently still implemented as a synchronous 60-second queued prompt over the active window rather than an asynchronous `deal.Card`.
+status: the card names the refs a push changes, not yet the commits or diff it carries.
 runs: 3 a day
 day: Keep the work moving.
 when: an agent pushes to `main` or `master`, or pushes to / fetches from a repository that needs the user's ssh login
@@ -181,8 +181,8 @@ want: see exactly which agent asks, where it goes, and what it pushes, and say y
 so that: no agent pushes to a protected branch or uses the user's ssh login without their word, and background work does not time out while the user is busy or away
 steps:
 1. the host stages the exact push or fetch intent (requesting agent, target repository, branches/tags, and commits/diff) and raises an asynchronous action `deal.Card` (signaling only via `window.Status line` lamp — never popping a modal over what the user is typing)
-2. when the user deals the card, they inspect the target repository, refs, and summary, and explicitly confirm `approve` (or `deny` to refuse)
-system: keeps the user uninterrupted; holds the staged push asynchronously with no 60-second timeout; executes using the user's ssh login once approved. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
+2. when the user deals the card, they inspect the target repository, refs, and summary, and explicitly confirm `approve` (`space` then `a`) or `deny` to refuse (`space` then `d`); the card takes these in place of done and mute, and on the phone `done` offers them
+system: keeps the user uninterrupted; holds the staged push asynchronously with no 60-second timeout, also while no window is open; executes using the user's ssh login once approved; takes the card away when the agent's git goes away, such as when the agent is stopped. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
 user: the approve or deny verdict.
 cases: two agents request protected pushes at once (two cards in the deal); a push requested while the user is typing in a terminal or while the laptop is shut; a push to a repository the user does not recognise.
 rejected:

@@ -9,7 +9,7 @@ use std::future::Future;
 use std::rc::Rc;
 
 use gpui::{Context, Window};
-use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
+use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostId, HostSpec};
 use rho_window::style::StyleClass;
@@ -108,7 +108,6 @@ impl Frame {
         &mut self,
         host: HostId,
         event: ConnEvent,
-        window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
         let name = self.hosts.host_label(host);
@@ -118,7 +117,7 @@ impl Frame {
             }
             ConnEvent::Many(events) => {
                 for event in events {
-                    self.host_event(host, event, window, cx);
+                    self.host_event(host, event, cx);
                 }
                 return;
             }
@@ -149,49 +148,6 @@ impl Frame {
                     cx,
                 );
                 self.hosts.set_status(host, status);
-            }
-            ConnEvent::GitTransportApproval {
-                request_id,
-                agent,
-                asks,
-                response,
-            } => {
-                let who = match agent {
-                    Some(agent) => self
-                        .agent_name(agent, cx)
-                        .unwrap_or_else(|| format!("agent {} on {name}", agent.encoded())),
-                    None => name,
-                };
-                self.questions.push_back(HostQuestion {
-                    key: QuestionKey {
-                        host,
-                        request: request_id,
-                    },
-                    prompt: format!("{who} · git asks: {asks} · allow or deny:"),
-                    response,
-                });
-                if !self.ask_next(window, cx) {
-                    self.echo(
-                        &format!("{who} asks to use your ssh login · after this prompt"),
-                        StyleClass::SystemImportant,
-                        cx,
-                    );
-                }
-            }
-            ConnEvent::GitTransportDone { request_id } => {
-                // Answered, here or on another device, or timed out.
-                let key = QuestionKey {
-                    host,
-                    request: request_id,
-                };
-                self.questions.retain(|question| question.key != key);
-                if self
-                    .minibuffer
-                    .as_ref()
-                    .is_some_and(|prompt| prompt.question == Some(key))
-                {
-                    self.minibuffer_cancel(window, cx);
-                }
             }
         }
         cx.notify();
@@ -329,90 +285,7 @@ impl Frame {
         };
         self.echo(&said, StyleClass::SystemInfo, cx);
     }
-
-    /// Asks the oldest question a host waits on, unless a prompt or a menu
-    /// has the keys: then it waits for them to close. Says whether the
-    /// question is now asked.
-    pub(crate) fn ask_next(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> bool {
-        if self.is_asking() {
-            return false;
-        }
-        // A host that stopped waiting has nobody to answer.
-        self.questions
-            .retain(|question| !question.response.is_closed());
-        let Some(question) = self.questions.front() else {
-            return false;
-        };
-        let key = question.key;
-        self.open_prompt_cancellable(
-            question.prompt.clone(),
-            Rc::new(|_, _, _| {
-                vec![
-                    Candidate {
-                        value: ALLOW.to_owned(),
-                        description: "let it use your ssh login".to_owned(),
-                    },
-                    Candidate {
-                        value: DENY.to_owned(),
-                        description: "refuse".to_owned(),
-                    },
-                ]
-            }),
-            Rc::new(move |frame, answer, _, _| {
-                let decision = match answer.trim() {
-                    ALLOW => GitApprovalDecision::Allow,
-                    _ => GitApprovalDecision::Deny,
-                };
-                frame.answer_question(key, decision);
-            }),
-            Some(Rc::new(move |frame, _, _| {
-                frame.answer_question(key, GitApprovalDecision::Deny)
-            })),
-            window,
-            cx,
-        );
-        let prompt = self.minibuffer.as_mut().expect("the prompt opened");
-        prompt.question = Some(key);
-        // Enter takes only a word the user typed or a row they chose, so a
-        // stray `y` and enter, typed for the screen under it, answer nothing.
-        prompt.complete_only_when_chosen();
-        prompt.validate(|answer| {
-            (![ALLOW, DENY].contains(&answer.trim())).then_some("type allow or deny")
-        });
-        true
-    }
-
-    fn answer_question(&mut self, key: QuestionKey, decision: GitApprovalDecision) {
-        let Some(index) = self
-            .questions
-            .iter()
-            .position(|question| question.key == key)
-        else {
-            return;
-        };
-        let question = self.questions.remove(index).expect("the question is here");
-        let _ = question.response.send(decision);
-    }
 }
 
 /// What a host command does once it knows which host it means.
 pub type OnHost = Rc<dyn Fn(&mut Frame, HostId, &mut Window, &mut Context<Frame>)>;
-
-const ALLOW: &str = "allow";
-const DENY: &str = "deny";
-
-/// Which question: a host's request, as the host numbers them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct QuestionKey {
-    host: HostId,
-    request: u64,
-}
-
-/// A host's question for the user, which waits its turn for the prompt:
-/// the oldest is asked first, and none is asked over a prompt the user
-/// opened. Answered once, then gone; dropping it refuses.
-pub(crate) struct HostQuestion {
-    key: QuestionKey,
-    prompt: String,
-    response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
-}

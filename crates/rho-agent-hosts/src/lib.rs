@@ -1,12 +1,13 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached agent host, the handshake that brings it up, and
-//! the streams it carries. The host's own stream, Git transport, reports
-//! to one reader ([`HostSink`]); every other long-lived stream belongs to
-//! a client that hands the host a [`HostStream`] to run, the agents
-//! client's, the desk's and the desktops' among them. The crate holds no agent
-//! state, no desk state and no window state: what it knows is which machines
-//! exist, whether they are answering, and how to reach one of them.
+//! the streams it carries. How the connection fares reports to one reader
+//! ([`HostSink`]); every long-lived stream belongs to a client that hands
+//! the host a [`HostStream`] to run, the agents client's, the desk's, the
+//! desktops' and the user's ssh login for Git ([`git`]) among them. The crate
+//! holds no agent state, no desk state and no window state: what it knows is
+//! which machines exist, whether they are answering, and how to reach one of
+//! them.
 //!
 //! [`protocol`] is what a client and a host say about the machine itself;
 //! the host uses it alone, without the `client` feature.
@@ -17,6 +18,8 @@ pub mod protocol;
 pub mod connection;
 #[cfg(feature = "client")]
 pub mod fido;
+#[cfg(feature = "client")]
+pub mod git;
 #[cfg(feature = "client")]
 pub mod hosts;
 #[cfg(feature = "client")]

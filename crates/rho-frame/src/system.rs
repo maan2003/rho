@@ -133,6 +133,13 @@ pub trait System: Sized + 'static {
         Vec::new()
     }
 
+    /// The answers a card of this system's takes in place of done and
+    /// mute, when it has its own: a push the user approves or denies. A
+    /// row that answers puts the card away with [`crate::Frame::answered`].
+    fn verdicts(&mut self, _address: &Address, _cx: &mut Context<Self>) -> Option<Vec<Row>> {
+        None
+    }
+
     /// What of this system's wants the user right now.
     fn claims(
         &self,
@@ -215,6 +222,7 @@ trait SystemHandle {
     ) -> Vec<Arc<dyn HostStream>>;
     fn detached(&self, host: HostId, cx: &mut App);
     fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>>;
     fn claims(
         &self,
         marks: &Marks,
@@ -272,6 +280,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row> {
         self.update(cx, |system, cx| system.rows(point, window, cx))
+    }
+
+    fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>> {
+        self.update(cx, |system, cx| system.verdicts(address, cx))
     }
 
     fn claims(
@@ -363,6 +375,10 @@ impl AnySystem {
 
     pub fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row> {
         self.0.rows(point, window, cx)
+    }
+
+    pub(crate) fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>> {
+        self.0.verdicts(address, cx)
     }
 
     pub fn claims(

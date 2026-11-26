@@ -39,6 +39,13 @@ pub const ZSTD_WINDOW_LOG: u32 = 17;
 pub const ZSTD_LEVEL: i32 = 3;
 const PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a local peer may go silent before its connection is over. It
+/// sends a keep-alive every five seconds, so silence this long means its
+/// process is gone: killed processes send no close over the IPC datagram
+/// socket, and what waits on their streams ends here, not after
+/// `AUTHENTICATED_IDLE_TIMEOUT`, which leaves roaming peers room to come back.
+#[cfg(feature = "server")]
+const LOCAL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(feature = "server")]
 const IROH_SERVER_SECRET: redb::TableDefinition<(), &[u8; 32]> =
     redb::TableDefinition::new("rho_agent_host_iroh_secret_v1");
@@ -442,6 +449,9 @@ async fn authenticate_incoming_iroh(
     match authenticate_iroh_server(&auth, &connection, preapproved).await {
         Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
             connection.set_max_concurrent_bi_streams(approved_bi_streams.into());
+            if local {
+                connection.set_max_idle_timeout(Some(LOCAL_IDLE_TIMEOUT));
+            }
             drop(enrollment_permit);
             Ok(Some(Accepted::Client(connection)))
         }

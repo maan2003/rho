@@ -274,7 +274,7 @@ pub(crate) struct Phone {
 
 /// One button on the bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Button {
+pub(crate) enum Button {
     Back,
     Desk,
     Menu,
@@ -737,6 +737,17 @@ impl Frame {
         })
     }
 
+    /// A tap on `button`, as a test makes it.
+    #[cfg(test)]
+    pub(crate) fn press_phone_button(
+        &mut self,
+        button: Button,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.press(button, None, window, cx);
+    }
+
     fn press(
         &mut self,
         button: Button,
@@ -756,8 +767,14 @@ impl Frame {
             Button::Open => self.pull_card(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
-                    record_verdict(PhoneVerdict::Done);
-                    self.verdict(target, Verdict::Done, "done".to_owned(), window, cx);
+                    if self.own_verdicts(target, cx).is_some() {
+                        // A card answered in its own words, such as a push
+                        // to approve or deny, is never just done.
+                        self.verdict_menu(window, cx);
+                    } else {
+                        record_verdict(PhoneVerdict::Done);
+                        self.verdict(target, Verdict::Done, "done".to_owned(), window, cx);
+                    }
                 }
             }
             // How long is a question, the one the snooze menu asks.

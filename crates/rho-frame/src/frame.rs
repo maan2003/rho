@@ -1,6 +1,6 @@
 //! The frame entity: the window's root view.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,6 @@ use theme::ActiveTheme as _;
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::desk::DeskView;
-use crate::hosts::HostQuestion;
 use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
     Answer, CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler,
@@ -107,8 +106,6 @@ pub struct Frame {
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
     pub(crate) minibuffer: Option<Minibuffer>,
-    /// What hosts ask the user, oldest first, waiting for the prompt.
-    pub(crate) questions: VecDeque<HostQuestion>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
@@ -216,7 +213,6 @@ impl Frame {
             surfaces,
             desk,
             minibuffer: None,
-            questions: VecDeque::new(),
             menu: None,
             menu_focus: cx.focus_handle(),
             overlay_return: None,
@@ -254,9 +250,7 @@ impl Frame {
             let mut events = host_events;
             while let Some(HostEvent { host, event }) = events.next().await {
                 if this
-                    .update_in(cx, |this, window, cx| {
-                        this.host_event(host, event, window, cx)
-                    })
+                    .update(cx, |this, cx| this.host_event(host, event, cx))
                     .is_err()
                 {
                     break;
@@ -832,36 +826,15 @@ impl Frame {
             Some(handle) => window.focus(&handle, cx),
             None => self.focus_surface(window, cx),
         }
-        self.ask_after(window, cx);
         cx.notify();
     }
 
     fn close_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        if self
-            .minibuffer
-            .as_ref()
-            .is_some_and(|prompt| prompt.question.is_some())
-        {
-            // A host's question is not the user's to lose by moving: it
-            // stays in line and is asked again.
-            self.minibuffer = None;
-        }
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
         self.overlay_return = None;
-        self.ask_after(window, cx);
-    }
-
-    /// Asks the next host question once this update has run its course:
-    /// a prompt's answer may open another prompt, which goes first.
-    fn ask_after(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.questions.is_empty() {
-            cx.defer_in(window, |frame, window, cx| {
-                frame.ask_next(window, cx);
-            });
-        }
     }
 
     /// Draws `rows` under the point and gives them the keyboard.
@@ -1344,7 +1317,7 @@ impl Frame {
         self.open_menu(self.verdict_rows(cx), window, cx);
     }
 
-    fn verdict_rows(&self, cx: &App) -> Rows {
+    fn verdict_rows(&self, cx: &mut App) -> Rows {
         let Some(target) = self.card_target(cx) else {
             // With no card here there is nothing to judge, but the deal
             // still goes on: `n` is how the user asks what waits.
@@ -1359,7 +1332,12 @@ impl Frame {
             card.heading()
         })
         .counted();
-        if self.marks().get(&target).facts().muted() {
+        if let Some(own) = self.own_verdicts(&target, cx) {
+            // A card its system answers is never muted: it ends when it is
+            // answered, and until then it can only wait.
+            rows.extend(own);
+            rows.push(Row::menu("s", snooze_rows(&target)));
+        } else if self.marks().get(&target).facts().muted() {
             rows.push(Row::run("m", "unmute", move |frame, window, cx| {
                 frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
             }));
@@ -1369,6 +1347,16 @@ impl Frame {
         }
         self.push_deal_rows(&mut rows);
         rows
+    }
+
+    /// The answers the system that owns `address` gives its cards in place
+    /// of done and mute, when it has its own.
+    pub(crate) fn own_verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>> {
+        self.systems
+            .iter()
+            .find(|system| system.opens(address, cx))
+            .cloned()
+            .and_then(|system| system.verdicts(address, cx))
     }
 
     /// The verdict menu's rows that need no card: take back the last
@@ -1385,7 +1373,6 @@ impl Frame {
             frame.pull_card(window, cx)
         }));
     }
-
     pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.desk_in_view() {
             true => self.back(window, cx),
@@ -1978,8 +1965,6 @@ impl Render for Frame {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
-
     use super::*;
     use crate::desk::desk_rows;
 
@@ -2781,31 +2766,6 @@ mod tests {
             })
             .unwrap();
     }
-    type Answered = tokio::sync::oneshot::Receiver<GitApprovalDecision>;
-
-    /// A host asks, as its connection says it: request `request`, for the
-    /// test system's agent.
-    fn git_asks(
-        frame: &mut Frame,
-        request: u64,
-        window: &mut Window,
-        cx: &mut Context<Frame>,
-    ) -> Answered {
-        let (response, answered) = tokio::sync::oneshot::channel();
-        frame.host_event(
-            HostId(0),
-            ConnEvent::GitTransportApproval {
-                request_id: request,
-                agent: Some(HostBacked::asker()),
-                asks: format!("push to ssh://github.com:22/acme/repo: branch b{request}"),
-                response,
-            },
-            window,
-            cx,
-        );
-        answered
-    }
-
     fn prompt_of(frame: &Frame) -> Option<String> {
         frame
             .minibuffer
@@ -2823,41 +2783,113 @@ mod tests {
         frame.minibuffer_confirm(window, cx);
     }
 
-    #[gpui::test]
-    fn a_second_push_waits_for_the_first(cx: &mut gpui::TestAppContext) {
-        let (frame, _) = host_backed_frame(cx);
-        let (mut first, mut second) = frame
-            .update(cx, |frame, window, cx| {
-                let first = git_asks(frame, 1, window, cx);
-                let second = git_asks(frame, 2, window, cx);
-                assert_eq!(
-                    prompt_of(frame).as_deref(),
-                    Some(
-                        "eng-b8os · git asks: push to ssh://github.com:22/acme/repo: branch b1 \
-                         · allow or deny:"
-                    ),
-                    "the agent is named, and the first question is asked first"
-                );
-                answer(frame, "allow", window, cx);
-                (first, second)
-            })
-            .unwrap();
-        assert_eq!(first.try_recv(), Ok(GitApprovalDecision::Allow));
-        assert!(second.try_recv().is_err(), "the second still waits");
-        frame
-            .update(cx, |frame, window, cx| {
-                assert!(prompt_of(frame).unwrap().contains("branch b2"));
-                frame.minibuffer_cancel(window, cx);
-            })
-            .unwrap();
-        assert_eq!(second.try_recv(), Ok(GitApprovalDecision::Deny));
+    /// A system whose cards are answered in its own words, as a push the
+    /// user approves or denies: the test sets what waits, and each answer
+    /// takes its card away, as the host's would.
+    struct Answers(Rc<std::cell::RefCell<Vec<rho_dealer::Claim>>>);
+
+    impl crate::System for Answers {
+        fn kinds(&self) -> &'static [&'static str] {
+            &["git"]
+        }
+
+        fn open(&mut self, _: &Address, _: &mut Window, cx: &mut Context<Self>) -> Opening {
+            Opening::Surface(AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle()))))
+        }
+
+        fn claims(
+            &self,
+            _: &rho_dealer::Marks,
+            _: Timestamp,
+            _: Option<&mut rho_dealer::rank::Trace>,
+            _: &App,
+        ) -> Vec<rho_dealer::Claim> {
+            self.0.borrow().clone()
+        }
+
+        fn verdicts(&mut self, address: &Address, _: &mut Context<Self>) -> Option<Vec<Row>> {
+            let waiting = self.0.clone();
+            let address = address.clone();
+            Some(vec![Row::run("a", "approve", move |frame, window, cx| {
+                waiting
+                    .borrow_mut()
+                    .retain(|claim| claim.address != address);
+                frame.answered(&address, "approved: push".to_owned(), window, cx);
+            })])
+        }
     }
 
+    fn answers_frame(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Frame>,
+        Rc<std::cell::RefCell<Vec<rho_dealer::Claim>>>,
+    ) {
+        let waiting = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let system = waiting.clone();
+        let frame = test_frame_with(cx, rho_db::RhoDb::in_memory(), move |cx| {
+            vec![AnySystem::new(cx.new(|_| Answers(system)))]
+        });
+        (frame, waiting)
+    }
+
+    /// A push that waits is answered with approve, never done or mute;
+    /// answering it puts it away and deals the next push, and the last one
+    /// leaves the deal empty.
     #[gpui::test]
-    fn a_question_waits_for_the_users_prompt(cx: &mut gpui::TestAppContext) {
-        let (frame, _) = host_backed_frame(cx);
-        let mut asked = frame
+    fn a_card_its_system_answers_is_answered_in_its_words(cx: &mut gpui::TestAppContext) {
+        let (frame, waiting) = answers_frame(cx);
+        let first = Address::new("git", "1");
+        let second = Address::new("git", "2");
+        waiting.borrow_mut().extend([
+            asks(&first, jiff::SignedDuration::from_mins(5), false),
+            asks(&second, jiff::SignedDuration::from_mins(1), false),
+        ]);
+        let approve = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
+            let rows = frame.verdict_rows(cx);
+            assert_eq!(
+                labels(&rows)[..2],
+                ["approve".to_owned(), "snooze".to_owned()],
+                "its own words, and a snooze, in place of done and mute"
+            );
+            assert!(
+                !labels(&rows)
+                    .iter()
+                    .any(|label| label == "done" || label == "mute")
+            );
+            let Pick::Run { run, .. } = rows.rows[0].pick.clone() else {
+                panic!("approve runs");
+            };
+            run(frame, None, window, cx);
+        };
+        frame
             .update(cx, |frame, window, cx| {
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &first, "the older push first");
+                approve(frame, window, cx);
+                assert_eq!(frame.current_address(), &second, "the next push is dealt");
+                approve(frame, window, cx);
+                assert!(frame.desk_in_view(), "nothing waits");
+                assert!(
+                    frame.marks().get(&first).facts.is_empty(),
+                    "an answer is the host's, not a verdict in the ledger"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A push that comes while the user types in a prompt lights the lamp
+    /// and takes nothing: the prompt, its words and the screen under it
+    /// stay as they were.
+    #[gpui::test]
+    fn a_push_that_comes_while_the_user_types_only_lights_the_lamp(cx: &mut gpui::TestAppContext) {
+        let (frame, waiting) = answers_frame(cx);
+        let page = Address::new("page", "7");
+        frame
+            .update(cx, |frame, window, cx| {
+                let view = AnySurface::new(cx.new(|cx| Page(cx.focus_handle())));
+                frame.surfaces.insert(page.clone(), view);
+                frame.open(page.clone(), window, cx);
                 frame.open_prompt(
                     "attach host:",
                     Rc::new(|_, _, _| Vec::new()),
@@ -2868,73 +2900,47 @@ mod tests {
                 frame
                     .minibuffer_mut()
                     .unwrap()
-                    .set_input("lab=".to_owned(), window, cx);
-                let asked = git_asks(frame, 1, window, cx);
-                assert_eq!(prompt_of(frame).as_deref(), Some("attach host:"));
-                assert_eq!(frame.minibuffer.as_ref().unwrap().input(cx), "lab=");
-                asked
+                    .set_input("lab=iroh:".to_owned(), window, cx);
             })
             .unwrap();
-        assert!(asked.try_recv().is_err(), "neither answered nor dropped");
+        cx.run_until_parked();
+        let push = Address::new("git", "1");
+        waiting
+            .borrow_mut()
+            .push(asks(&push, jiff::SignedDuration::from_mins(0), false));
         frame
-            .update(cx, |frame, window, cx| frame.minibuffer_cancel(window, cx))
+            .update(cx, |frame, _, cx| frame.systems_changed(cx))
             .unwrap();
+        cx.run_until_parked();
         frame
-            .update(cx, |frame, _, _| {
-                assert!(prompt_of(frame).unwrap().contains("git asks"));
+            .update(cx, |frame, _, cx| {
+                assert_eq!(frame.current_address(), &page);
+                let prompt = frame.minibuffer.as_ref().expect("the prompt stays open");
+                assert_eq!(prompt.prompt(), "attach host:");
+                assert_eq!(prompt.input(cx), "lab=iroh:");
+                assert!(frame.signals.lamp_on, "the lamp is the only pull");
+                assert_eq!(frame.hand().cards[0].address, push);
             })
             .unwrap();
     }
 
+    /// On the phone, `done` on a push opens its answers rather than
+    /// settling it.
     #[gpui::test]
-    fn a_stray_y_and_enter_answer_nothing(cx: &mut gpui::TestAppContext) {
-        let (frame, _) = host_backed_frame(cx);
-        let mut asked = frame
-            .update(cx, |frame, window, cx| {
-                let asked = git_asks(frame, 1, window, cx);
-                answer(frame, "y", window, cx);
-                assert!(prompt_of(frame).is_some(), "the question stays open");
-                answer(frame, "", window, cx);
-                assert!(prompt_of(frame).is_some());
-                // Choosing a row is an answer.
-                frame.minibuffer_select(1, cx);
-                frame.minibuffer_confirm(window, cx);
-                asked
-            })
-            .unwrap();
-        assert_eq!(asked.try_recv(), Ok(GitApprovalDecision::Allow));
-    }
-
-    #[gpui::test]
-    fn moving_away_keeps_the_question_and_its_end_closes_it(cx: &mut gpui::TestAppContext) {
-        let (frame, _) = host_backed_frame(cx);
-        let mut asked = frame
-            .update(cx, |frame, window, cx| {
-                let asked = git_asks(frame, 1, window, cx);
-                // Something else moves the screen, such as an inspection
-                // a system opens: the question is set aside, not refused.
-                frame.close_overlays(window, cx);
-                assert!(frame.minibuffer.is_none());
-                asked
-            })
-            .unwrap();
-        assert!(asked.try_recv().is_err());
+    fn done_on_the_phone_asks_for_the_cards_own_words(cx: &mut gpui::TestAppContext) {
+        let (frame, waiting) = answers_frame(cx);
+        let push = Address::new("git", "1");
+        waiting
+            .borrow_mut()
+            .push(asks(&push, jiff::SignedDuration::from_mins(3), false));
         frame
             .update(cx, |frame, window, cx| {
-                assert!(
-                    prompt_of(frame).unwrap().contains("git asks"),
-                    "asked again"
-                );
-                // The host says the request ended: answered on another
-                // device, or timed out.
-                frame.host_event(
-                    HostId(0),
-                    ConnEvent::GitTransportDone { request_id: 1 },
-                    window,
-                    cx,
-                );
-                assert!(frame.minibuffer.is_none());
-                assert!(frame.questions.is_empty());
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &push);
+                frame.press_phone_button(crate::phone::Button::Done, window, cx);
+                let menu = frame.menu.as_ref().expect("the answers are offered");
+                assert_eq!(labels(&menu.rows)[0], "approve");
+                assert!(frame.marks().get(&push).facts.is_empty(), "nothing settled");
             })
             .unwrap();
     }

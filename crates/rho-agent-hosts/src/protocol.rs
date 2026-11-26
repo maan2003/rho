@@ -8,7 +8,8 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 pub enum Open {
     /// This GUI holds SSH credentials and carries Git transport for the
     /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
-    /// as long as the stream is open.
+    /// as long as the stream is open, starting with every request that
+    /// already waits.
     GitProvider,
     /// One [`rho_rpc::protocol::Call`], answered with one
     /// [`rho_rpc::protocol::Answer`]; then the stream closes.
@@ -17,30 +18,41 @@ pub enum Open {
     /// it. After [`rho_rpc::protocol::Opened::Ready`] the stream is raw Git
     /// data.
     GitTransport { request: GitTransportRequest },
-    /// A GUI's answer to [`GitProviderFrame::Requested`].
-    /// Answered with [`GitProvided`]; after `Ready` the stream is raw
-    /// Git data.
+    /// A GUI's answer to [`GitProviderFrame::Requested`]: the user's word.
+    /// Answered with [`GitProvided`]; after `Ready` the stream is raw Git
+    /// data.
     GitProvide {
         request_id: u64,
         provider_id: u64,
-        /// Whether this GUI claims the transport after approving the
-        /// operation. The first claim selects the credential provider.
-        claim: bool,
+        decision: GitDecision,
     },
+}
+
+/// What the user said to a request. The first answer from any GUI is the
+/// answer: an approval makes that GUI the one that carries the transport,
+/// and a denial refuses the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitDecision {
+    Approve,
+    Deny,
 }
 
 /// What a host pushes to a Git transport provider ([`Open::GitProvider`]).
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum GitProviderFrame {
-    /// A Git remote helper wants a transport. Sent to every provider; each
-    /// answers with [`Open::GitProvide`].
+    /// A Git remote helper wants a transport, and waits for the user for as
+    /// long as it takes. Sent to every provider, and again to each that
+    /// registers while it waits; one answers with [`Open::GitProvide`].
     Requested {
         request_id: u64,
         provider_id: u64,
         request: GitTransportRequest,
+        /// When the helper asked, in milliseconds since the Unix epoch on
+        /// the host's clock.
+        requested_at_ms: u64,
     },
-    /// An approval race completed or expired. Deliberately carries no
-    /// result or winner information.
+    /// The request no longer waits: answered, or its Git went away.
+    /// Deliberately carries no result or winner information.
     Done { request_id: u64 },
 }
 
@@ -227,8 +239,8 @@ pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 pub enum GitProvided {
     /// This GUI carries the transport: raw Git data follows.
     Ready,
-    /// The approval race completed or expired. Deliberately carries no
-    /// result or winner.
+    /// The answer is taken: a denial, or a request that no longer waits.
+    /// Deliberately carries no result or winner.
     Done,
 }
 
@@ -245,8 +257,7 @@ pub struct GitTransportRequest {
     pub user: String,
     pub repository: String,
     pub service: GitService,
-    /// Destination refs authorized by the first GUI approval for a push.
-    /// Fetches carry `None`.
+    /// Destination refs the user approves for a push. Fetches carry `None`.
     pub planned_refs: Option<Vec<String>>,
     /// The agent whose git asks, as the helper found it in
     /// `$RHO_AGENT_ID`; `None` outside an agent's shell. Agents are not
@@ -297,6 +308,20 @@ mod tests {
     #[test]
     fn git_provider_frames_round_trip() {
         round_trips(GitProviderFrame::Done { request_id: 9 });
+        round_trips(GitProviderFrame::Requested {
+            request_id: 9,
+            provider_id: 4,
+            request: GitTransportRequest {
+                host: "github.com".to_owned(),
+                port: 22,
+                user: "git".to_owned(),
+                repository: "acme/repo".to_owned(),
+                service: GitService::UploadPack,
+                planned_refs: None,
+                agent: None,
+            },
+            requested_at_ms: 1_764_000_000_000,
+        });
         round_trips(GitProvided::Done);
     }
 
@@ -325,10 +350,12 @@ mod tests {
         };
         opens_as(Open::GitProvider);
         opens_as(Open::GitTransport { request });
-        opens_as(Open::GitProvide {
-            request_id: 9,
-            provider_id: 4,
-            claim: true,
-        });
+        for decision in [GitDecision::Approve, GitDecision::Deny] {
+            opens_as(Open::GitProvide {
+                request_id: 9,
+                provider_id: 4,
+                decision,
+            });
+        }
     }
 }

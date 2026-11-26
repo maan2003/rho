@@ -256,23 +256,56 @@ impl Frame {
             skip_until: None,
         });
         let said = format!("{verb}: {called}");
-        if matches!(verdict, Verdict::Unmute) || self.own_card(cx).as_ref() != Some(address) {
+        if matches!(verdict, Verdict::Unmute) {
+            self.echo(&said, StyleClass::SystemInfo, cx);
+            self.systems_changed(cx);
+            return;
+        }
+        let empty_first = matches!(verdict, Verdict::Done)
+            && Layout::of(window.viewport_size().width) == Layout::Phone;
+        self.put_away(address, said, empty_first, window, cx);
+    }
+
+    /// `address` was answered by the system that owns it, such as a push
+    /// the user approved, and the echo line says `said`. As after a
+    /// verdict, the screen showing it closes and the next card is dealt; a
+    /// row on Desk stays where the reader is. Nothing is written to the
+    /// ledger, so there is nothing to undo.
+    pub fn answered(
+        &mut self,
+        address: &Address,
+        said: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attention.skips.clear(address);
+        self.put_away(address, said, false, window, cx);
+    }
+
+    /// Says `said`, and when the screen in view is the card at `address`,
+    /// closes it and deals the next. The last card put away says the deal
+    /// is empty too, after `said` or, when `empty_first`, before it.
+    fn put_away(
+        &mut self,
+        address: &Address,
+        said: String,
+        empty_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.own_card(cx).as_ref() != Some(address) {
             self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
             return;
         }
         self.close_current(window, cx);
-        // The verdict and what comes of it, on one line: the last card put
-        // away says the deal is empty too.
+        // The answer and what comes of it, on one line.
         match self.deal_next(None, window, cx) {
             true => self.echo(&said, StyleClass::SystemInfo, cx),
             false => {
-                let words = if matches!(verdict, Verdict::Done)
-                    && Layout::of(window.viewport_size().width) == Layout::Phone
-                {
-                    format!("{NOTHING_WAITS} · {said}")
-                } else {
-                    format!("{said} · {NOTHING_WAITS}")
+                let words = match empty_first {
+                    true => format!("{NOTHING_WAITS} · {said}"),
+                    false => format!("{said} · {NOTHING_WAITS}"),
                 };
                 self.echo(&words, StyleClass::SystemInfo, cx);
             }

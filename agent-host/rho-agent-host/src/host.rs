@@ -7,14 +7,15 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
-    GccpState, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove,
-    IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request,
-    Snapshot,
+    GccpState, GitDecision, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
+    IrohApprove, IrohPair, IrohRevoke, IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus,
+    Request, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
 
-use crate::{GitProviderClaim, Services, debug};
+use crate::git::{GitProviderClaim, GitTransportBroker, requester_left};
+use crate::{Services, debug};
 
 /// Serves one host stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -32,21 +33,29 @@ where
         Open::GitProvider => serve_git_provider(services, reader, writer).await,
         Open::Request(request) => serve_call(&services, &iroh_auth, request, &mut writer).await,
         Open::GitTransport { request } => {
-            serve_git_transport_request(services, reader, writer, request).await
+            serve_git_transport_request(&services.git_transport, reader, writer, request).await
         }
         Open::GitProvide {
             request_id,
             provider_id,
-            claim,
+            decision,
         } => {
-            serve_git_transport_provider(services, reader, writer, request_id, provider_id, claim)
-                .await
+            serve_git_transport_provider(
+                &services.git_transport,
+                reader,
+                writer,
+                request_id,
+                provider_id,
+                decision,
+            )
+            .await
         }
     }
 }
 
 /// A GUI carrying SSH Git transport: registered with the broker for as
-/// long as its stream is open, and told each request and its end.
+/// long as its stream is open, and told each request that waits and its
+/// end.
 async fn serve_git_provider<R, W>(
     services: Arc<Services>,
     mut reader: R,
@@ -57,7 +66,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<GitProviderFrame>();
-    services.git_transport.register(frames_tx).await;
+    services.git_transport.register(frames_tx);
     loop {
         tokio::select! {
             closed = rho_rpc::protocol::read_frame_optional::<_, ()>(&mut reader) => {
@@ -68,8 +77,10 @@ where
     }
 }
 
-async fn serve_git_transport_request<R, W>(
-    services: Arc<Services>,
+/// A Git remote helper's request: it waits until the user answers on a
+/// GUI or the helper goes away, then becomes the transport or a refusal.
+pub(crate) async fn serve_git_transport_request<R, W>(
+    broker: &GitTransportBroker,
     reader: R,
     mut writer: W,
     request: rho_agent_hosts::protocol::GitTransportRequest,
@@ -78,16 +89,21 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let provider = match services.git_transport.request(request).await {
+    let mut reader = tokio::io::BufReader::new(reader);
+    let answer = match broker.request(request) {
+        Ok(mut asked) => {
+            tokio::select! {
+                answer = asked.answer() => answer,
+                // Dropping `asked` withdraws the request from every GUI.
+                () = requester_left(&mut reader) => return Ok(()),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let provider = match answer {
         Ok(provider) => provider,
-        Err(error) => {
-            write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: error.to_string(),
-                },
-            )
-            .await?;
+        Err(reason) => {
+            write_frame(&mut writer, &Opened::Refused { reason }).await?;
             return Ok(());
         }
     };
@@ -97,23 +113,19 @@ where
     Ok(())
 }
 
-async fn serve_git_transport_provider<R, W>(
-    services: Arc<Services>,
+pub(crate) async fn serve_git_transport_provider<R, W>(
+    broker: &GitTransportBroker,
     reader: R,
     mut writer: W,
     request_id: u64,
     provider_id: u64,
-    claim: bool,
+    decision: GitDecision,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match services
-        .git_transport
-        .claim(request_id, provider_id, claim)
-        .await?
-    {
+    match broker.decide(request_id, provider_id, decision) {
         GitProviderClaim::Done => {
             write_frame(&mut writer, &GitProvided::Done).await?;
         }
@@ -434,5 +446,165 @@ mod tests {
             .to_string()
             .contains("exceeds")
         );
+    }
+}
+
+#[cfg(test)]
+mod git_tests {
+    use rho_agent_hosts::protocol::{
+        GitDecision, GitProvided, GitProviderFrame, GitService, GitTransportRequest,
+    };
+    use rho_rpc::protocol::{Opened, read_frame};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::{serve_git_transport_provider, serve_git_transport_request};
+    use crate::git::GitTransportBroker;
+
+    fn push() -> GitTransportRequest {
+        GitTransportRequest {
+            host: "github.com".to_owned(),
+            port: 22,
+            user: "git".to_owned(),
+            repository: "acme/repo".to_owned(),
+            service: GitService::ReceivePack,
+            planned_refs: Some(vec![
+                "refs/heads/main".to_owned(),
+                "refs/tags/v1".to_owned(),
+            ]),
+            agent: None,
+        }
+    }
+
+    /// A window, registered with `broker`; its frames arrive on the receiver.
+    fn window(
+        broker: &GitTransportBroker,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<GitProviderFrame> {
+        let (frames, received) = tokio::sync::mpsc::unbounded_channel();
+        broker.register(frames);
+        received
+    }
+
+    async fn requested(
+        window: &mut tokio::sync::mpsc::UnboundedReceiver<GitProviderFrame>,
+    ) -> (u64, u64) {
+        match window.recv().await {
+            Some(GitProviderFrame::Requested {
+                request_id,
+                provider_id,
+                ..
+            }) => (request_id, provider_id),
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    /// The agent's git is stopped while its push waits: the window hears
+    /// the request is done, and the card goes.
+    #[tokio::test]
+    async fn a_helper_that_goes_away_while_it_waits_ends_its_card() {
+        let broker = GitTransportBroker::default();
+        let mut window = window(&broker);
+        let (helper, host) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host);
+        let serving = serve_git_transport_request(&broker, reader, writer, push());
+        let helper_goes = async {
+            let (request_id, _) = requested(&mut window).await;
+            drop(helper);
+            request_id
+        };
+        let (served, request_id) = tokio::join!(serving, helper_goes);
+        served.unwrap();
+        assert_eq!(
+            window.recv().await,
+            Some(GitProviderFrame::Done { request_id })
+        );
+    }
+
+    /// The user denies: the agent's git reads why, in words that name
+    /// the push it asked for.
+    #[tokio::test]
+    async fn a_denial_reaches_the_agent_as_a_refusal() {
+        let broker = GitTransportBroker::default();
+        let mut window = window(&broker);
+        let (mut helper, host) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host);
+        let serving = serve_git_transport_request(&broker, reader, writer, push());
+        let deny = async {
+            let (request_id, provider_id) = requested(&mut window).await;
+            let (mut answer, host) = tokio::io::duplex(1024);
+            let (reader, writer) = tokio::io::split(host);
+            serve_git_transport_provider(
+                &broker,
+                reader,
+                writer,
+                request_id,
+                provider_id,
+                GitDecision::Deny,
+            )
+            .await
+            .unwrap();
+            let provided: GitProvided = read_frame(&mut answer).await.unwrap();
+            provided
+        };
+        let (served, provided) = tokio::join!(serving, deny);
+        served.unwrap();
+        assert_eq!(provided, GitProvided::Done);
+        let opened: Opened = read_frame(&mut helper).await.unwrap();
+        assert_eq!(
+            opened,
+            Opened::Refused {
+                reason: "the user denied this push to github.com:acme/repo \
+                         (refs/heads/main, refs/tags/v1)"
+                    .to_owned()
+            }
+        );
+    }
+
+    /// The user approves: the window that approved carries the agent's
+    /// git, both ways.
+    #[tokio::test]
+    async fn an_approval_joins_the_agent_to_the_window_that_approved() {
+        let broker = std::sync::Arc::new(GitTransportBroker::default());
+        let mut window = window(&broker);
+        let (mut helper, host) = tokio::io::duplex(1024);
+        let serving = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let (reader, writer) = tokio::io::split(host);
+                serve_git_transport_request(&broker, reader, writer, push()).await
+            })
+        };
+        let (request_id, provider_id) = requested(&mut window).await;
+        let (mut carrier, host) = tokio::io::duplex(1024);
+        let providing = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let (reader, writer) = tokio::io::split(host);
+                serve_git_transport_provider(
+                    &broker,
+                    reader,
+                    writer,
+                    request_id,
+                    provider_id,
+                    GitDecision::Approve,
+                )
+                .await
+            })
+        };
+        let provided: GitProvided = read_frame(&mut carrier).await.unwrap();
+        assert_eq!(provided, GitProvided::Ready);
+        providing.await.unwrap().unwrap();
+        let opened: Opened = read_frame(&mut helper).await.unwrap();
+        assert_eq!(opened, Opened::Ready);
+        helper.write_all(b"0000").await.unwrap();
+        let mut sent = [0; 4];
+        carrier.read_exact(&mut sent).await.unwrap();
+        assert_eq!(&sent, b"0000");
+        carrier.write_all(b"ok").await.unwrap();
+        let mut back = [0; 2];
+        helper.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ok");
+        drop(helper);
+        drop(carrier);
+        serving.await.unwrap().unwrap();
     }
 }
