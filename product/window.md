@@ -13,10 +13,10 @@ purpose: show one thing at a time, so the user is never looking at two things th
 principle: the user opens a `chat.Thread` from the desk; `Screen.back` returns to the desk exactly as they left it.
 sees: the screen's text or guest surface, filling the window under the `Status line`; nothing around it.
 does:
-- back `ctrl-k`: go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
-- forward `ctrl-j`: go to the screen after; from the newest screen, deal the next card, as `deal.Card.deal` does
+- back `ctrl-k` (or `f21`): go to the screen before, as it was left; on the oldest screen the echo line reads `at the oldest`
+- forward `ctrl-j` (or `f20`): go to the screen after; from the newest screen, deal the next card, as `deal.Card.deal` does
 - close `q`, or `ctrl-shift-backspace` while typing: close this screen; no back or forward reaches it again
-- close and deal `ctrl-shift-j`: close this screen and deal the next card
+- close and deal `ctrl-shift-j` (or `f16`): close this screen and deal the next card
 - desk `tab`: go to `desk.Desk`; on the desk, go back to the screen before
 
 The way back keeps the user's earlier screens, as they were left. While a host is still connecting after a restart, host-backed screens show a connecting placeholder instead of being erased from history; only a screen confirmed gone by an online host is passed over. Returning after more than ten minutes opens the desk; see `desk.a cold return opens the desk`.
@@ -58,6 +58,7 @@ does:
 - search: match every typed word anywhere in a row, in any order, and mark the matching letters; search the full text of messages and notes. A query that starts with `>` lists commands only; one that starts with `/` searches the text of messages and notes only; `chat:` and `note:` narrow the text search to one kind. The rows follow every keystroke without a pause the user can feel, on a history of ten thousand messages
 - choose `up`, `down`, `ctrl-p`, `ctrl-n`, or click a row: move through or pick rows, wrapping at both ends without changing the typed words
 - run `enter` or click: open the chosen place or run the chosen command; a command that needs a target or answer opens a `Prompt`. With nothing typed, `enter` opens the last place when there is one
+- quit, from `Palette`: close the rho window
 rejected:
 - menus for hosts, usage, and starting an agent · 2026-11-20 · each row is a palette row by its full name, such as `hosts › attach`; the palette is enough
 - a second key for threads, apart from `:` for commands · 2026-11-21 · one prompt with a `>` prefix keeps one habit; commands already rank first when the typed words start their name

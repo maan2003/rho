@@ -60,6 +60,7 @@ has:
 does:
 - open: from a `deal.Card` or by subject, open at the top of `Thread` (`Draft` and newest message); returning via `window.Screen.back` restores the view and point as left
 - reply: write in the `Draft` and send with `Message.reply`
+- rename, from `window.Palette` as `name this thread`: change the thread's subject
 - fork: take a tangent into a thread under its message; the prompt line says when to fork
 
 ## concept Message

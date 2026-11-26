@@ -17,7 +17,7 @@ costs: two devices agree only when both hold the user's secret phrase.
 ## bet The window holds the secrets
 instead of: a host holding the user's browser session or ssh login.
 serves: Reach anything.
-because: the window is the user's own device, and an agent that needs the user's login asks for it each time, so no agent uses it without the user's word.
+because: the window is the user's own device, and an agent that needs the user's ssh login (or pushes to `main` / `master`) asks for it each time, so no agent uses it without the user's word. Scoped platform tokens (such as `GITHUB_TOKEN` on `octo`, which blocks `main`/`master` and tags) may live on the host for feature-branch automation.
 costs: a prompt that opens over whatever the user is doing, and a push that fails when they do not answer in a minute.
 
 ## journey A new machine
@@ -41,6 +41,7 @@ does:
 - attach, by opening a pairing link the host prints, which starts `rho://`, or from the palette as `hosts › attach`: from a link, ask `name this host:` and attach the host under that name; from the palette, ask for a name and the way to reach the host, on one line, and show the form the line takes
 - detach, from the palette as `hosts › detach`: ask `detach host:`, listing the hosts with their state, and detach the one chosen, which `enter` takes from the list; the echo line reads `detached: rho`; its projects, agents, and their screens go from the window, and its message comes back from the host when it is attached again; drafts and unsent message stay
 - status, from `window.Palette`: typing `hosts` lists each attached host with its state (`hosts › rho · online`); picking a disconnected or unenrolled host copies its enrollment command or triggers reconnect
+- gccp, from `window.Palette` anywhere: list, approve, or remove external-harness (`GCCP`) agents on an attached host (prompting for host when more than one is attached)
 
 A host is reached in one of three ways:
 - on this machine, where being the same user on the same machine is the trust

@@ -9,6 +9,7 @@ sees: the chart's name and how far back it looks; the answer in words; the pictu
 does:
 - open, from `window.Palette` with `usage`: open a chart (typing `usage` puts `rate limit · 7d` first)
 - switch window or chart in place: change between `7d` and `30d`, or switch among the four pictures, without piling separate `usage` entries into `window.Screen` history
+- switch account, from `window.Palette` anywhere: pick an attached host (when more than one) and switch its active Claude account so the next agent starts on an account with room
 
 The four pictures are:
 - `rate limit`: how much of each account's allowance is left, over time
