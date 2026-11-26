@@ -1,7 +1,7 @@
 //! A thread: an editable draft above read-only mail, newest first, in one
 //! editor.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -135,6 +135,9 @@ enum Key {
     Private(NoteId),
     Pending(u64),
     PendingGap(u64),
+    /// A push or fetch that waits for the user's word, by its request.
+    Ask(u64),
+    AskGap(u64),
     MailGap(MessageId),
     Unavailable,
 }
@@ -235,9 +238,6 @@ enum InlineOpen {
 /// What `enter` does, as [`ThreadView::enter_action`] decides it.
 #[derive(Debug)]
 enum Enter {
-    Quote(std::ops::RangeInclusive<u32>),
-    /// More than one character is selected, but not in one message.
-    QuoteAcross,
     Inline(InlineOpen),
     Private(MessageId, NoteId),
     Inspect(AgentId, Message),
@@ -280,12 +280,29 @@ pub struct ThreadView {
     /// reply settles through this, never through what came while the
     /// reader was in the history below.
     seen_in_view: Option<ChatSeq>,
+    /// The pushes and fetches that were waiting the last time the top of
+    /// the thread was in view.
+    seen_asks: BTreeSet<u64>,
     /// Resolve against the new transcript before inferring motion direction.
     last_point: Anchor,
     expanded: Expanded,
     _subscriptions: Vec<Subscription>,
     /// Reads the thread again when a flash's age next changes.
     _ages: Option<Task<()>>,
+}
+
+/// Where the reader left a thread whose screen closed, so that the next
+/// open shows it as it was left when nothing new came (`chat.Thread.open`).
+pub(super) struct Left {
+    seen_in_view: Option<ChatSeq>,
+    seen_asks: BTreeSet<u64>,
+    /// The item the point was in, `None` for the draft; the line within it
+    /// and the column.
+    item: Option<Key>,
+    line: u32,
+    column: u32,
+    /// How many rows below the top of the window the point was.
+    rows_above: f64,
 }
 
 #[derive(Default)]
@@ -329,6 +346,27 @@ fn newest_version(system: &ChatSystem, thread: ThreadId) -> Option<ChatSeq> {
         .reading_order(thread.message)
         .map(|mail| mail.version().0)
         .max()
+}
+
+/// The newest log position of a message or an edit in the thread: what
+/// opens it at the top when the reader has not had it in view. A flash is
+/// the now, not news.
+fn newest_news(system: &ChatSystem, thread: ThreadId) -> Option<ChatSeq> {
+    system
+        .host_chat(thread.host)?
+        .reading_order(thread.message)
+        .filter(|mail| mail.voice != Voice::Flash)
+        .map(|mail| mail.version().0)
+        .max()
+}
+
+/// The pushes and fetches that wait in the thread now.
+fn waiting_asks(system: &ChatSystem, thread: ThreadId) -> BTreeSet<u64> {
+    system
+        .asks_in(thread)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 const MINUTE_MS: u64 = 60_000;
@@ -459,6 +497,7 @@ impl ThreadView {
             }),
         ];
         let draft_subscription = Self::subscribe_draft(&draft, cx);
+        let left = system.left.get(&thread);
         let mut view = Self {
             system: entity,
             thread,
@@ -469,8 +508,10 @@ impl ThreadView {
             private_edit: None,
             draft_subscription,
             latest_project_activity: latest_project_activity(system, thread),
-            // A new view starts at the top of the thread.
-            seen_in_view: newest_version(system, thread),
+            // What the reader had in view when they left the thread, or
+            // nothing: its open decides where it shows.
+            seen_in_view: left.map_or(Some(ChatSeq(0)), |left| left.seen_in_view),
+            seen_asks: left.map(|left| left.seen_asks.clone()).unwrap_or_default(),
             last_point: Anchor::Min,
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
@@ -491,6 +532,20 @@ impl ThreadView {
         });
         view.last_point = end;
         view.draft_point = Some(end);
+        if let Some(left) = left {
+            view.restore(left, window, cx);
+        }
+        // The next open of the thread finds it where the reader leaves it.
+        cx.on_release(|view, cx| {
+            let left = view.left(cx);
+            let (system, thread) = (view.system.clone(), view.thread);
+            cx.defer(move |cx| {
+                system.update(cx, |system, _| {
+                    system.left.insert(thread, left);
+                });
+            });
+        })
+        .detach();
         // The user's private replies come from the ledger, which is the
         // frame's and is leased while it opens this: the rows are read
         // again as soon as that is over, before the first draw. Not
@@ -535,7 +590,97 @@ impl ThreadView {
     /// With the top in view, the reader has seen everything in the thread.
     fn note_top(&mut self, cx: &mut Context<Self>) {
         if self.top_in_view(cx) {
-            self.seen_in_view = newest_version(self.system.read(cx), self.thread);
+            self.seen_top(cx);
+        }
+    }
+
+    fn seen_top(&mut self, cx: &App) {
+        let system = self.system.read(cx);
+        self.seen_in_view = newest_version(system, self.thread);
+        self.seen_asks = waiting_asks(system, self.thread);
+    }
+
+    /// Whether a message, an edit, or a push or fetch came that the reader
+    /// has not had in view at the top of the thread.
+    fn news(&self, cx: &App) -> bool {
+        let system = self.system.read(cx);
+        newest_news(system, self.thread) > self.seen_in_view
+            || !waiting_asks(system, self.thread).is_subset(&self.seen_asks)
+    }
+
+    /// `chat.Thread.open`, from the deal or by name: news opens the top,
+    /// the draft and the newest item; otherwise the thread is as the
+    /// reader left it. A remembered line opens on that line instead
+    /// ([`Surface::show_search_match`]).
+    fn open(&mut self, cx: &mut Context<Self>) {
+        if self.news(cx) {
+            self.open_at_draft(cx);
+        }
+    }
+
+    /// Where the reader is, for the next open after the screen goes.
+    fn left(&self, cx: &mut App) -> Left {
+        let cursor = self.cursor(cx);
+        let (item, start) = match self.on_draft(cx) {
+            true => (None, Some(self.draft_start(cx).row)),
+            false => {
+                let item = self
+                    .history_row(cursor.row, cx)
+                    .and_then(|row| self.transcript.key_at_row(row, cx))
+                    .cloned();
+                let start = item.as_ref().and_then(|key| self.item_row(key, cx));
+                (item, start)
+            }
+        };
+        let rows_above = self.editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            let row = cursor.to_display_point(&display).row().0 as f64;
+            row - editor.scroll_position(cx).y
+        });
+        let (item, line, column) = match start {
+            Some(start) => (item, cursor.row - start, cursor.column),
+            None => (None, 0, 0),
+        };
+        Left {
+            seen_in_view: self.seen_in_view,
+            seen_asks: self.seen_asks.clone(),
+            item,
+            line,
+            column,
+            rows_above,
+        }
+    }
+
+    /// The point and the scroll where the reader left them, when the item
+    /// they were in is still here; otherwise the view stays at the draft.
+    fn restore(&mut self, left: &Left, window: &mut Window, cx: &mut Context<Self>) {
+        let start = match &left.item {
+            None => self.draft_start(cx).row,
+            Some(key) => match self.item_row(key, cx) {
+                Some(row) => row,
+                None => return,
+            },
+        };
+        let point = self.editor.update(cx, |editor, cx| {
+            let display = editor.display_snapshot(cx);
+            let point = display.buffer_snapshot().clip_point(
+                Point::new(start + left.line, left.column),
+                editor::Bias::Left,
+            );
+            editor.selections.change_with(&display, |selections| {
+                selections.select_ranges([point..point]);
+            });
+            let row = point.to_display_point(&display).row().0 as f64;
+            editor.set_scroll_position(
+                gpui::point(0., (row - left.rows_above).max(0.)),
+                window,
+                cx,
+            );
+            editor.selections.newest_anchor().head()
+        });
+        self.last_point = point;
+        if self.on_draft(cx) {
+            self.draft_point = Some(point);
         }
     }
 
@@ -745,7 +890,7 @@ impl ThreadView {
         });
         self.last_point = point;
         self.draft_point = Some(point);
-        self.seen_in_view = newest_version(self.system.read(cx), self.thread);
+        self.seen_top(cx);
     }
 }
 
@@ -761,7 +906,42 @@ fn items(
     if system.work(thread) == Some(rho_agent_types::ThreadWork::StoppedByYou) {
         items.push(line(Key::Status, "stopped by you", Class::Crumb));
     }
+    items.extend(ask_items(system, thread, cx));
     items.extend(history_items(system, thread, expanded, private_edit, cx));
+    items
+}
+
+/// Each push or fetch that waits in the thread, the oldest first, right
+/// below the draft: what it would do, and the keys that answer it.
+fn ask_items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class, Meta>> {
+    let mut items = Vec::new();
+    for (id, waiting) in system.asks_in(thread) {
+        let asker = waiting.ask.request.agent.map_or_else(String::new, |agent| {
+            system
+                .agent_label(thread.host, agent, cx)
+                .unwrap_or_else(|| agent.encoded())
+        });
+        let asked = thread::when(waiting.since().as_millisecond());
+        let text = waiting.text(&asker, &asked);
+        let mut styles = Vec::new();
+        let mut start = 0;
+        for line in text.split('\n') {
+            let end = start + line.len();
+            let class = match line == super::git::HINT {
+                true => Class::Crumb,
+                false => Class::Name,
+            };
+            styles.push((class, start..end));
+            start = end + 1;
+        }
+        let lines = vec![Meta::None; text.split('\n').count()];
+        items.push(
+            Item::new(Key::Ask(id), text)
+                .with_styles(styles)
+                .with_lines(lines),
+        );
+        items.push(gap(Key::AskGap(id)));
+    }
     items
 }
 
@@ -909,10 +1089,12 @@ fn flash_groups<'a>(messages: impl Iterator<Item = &'a Message>) -> HashMap<Agen
 }
 
 fn without_trailing_gap(mut items: Vec<Item<Key, Class, Meta>>) -> Vec<Item<Key, Class, Meta>> {
-    if items
-        .last()
-        .is_some_and(|item| matches!(item.key, Key::PendingGap(_) | Key::MailGap(_)))
-    {
+    if items.last().is_some_and(|item| {
+        matches!(
+            item.key,
+            Key::PendingGap(_) | Key::MailGap(_) | Key::AskGap(_)
+        )
+    }) {
         items.pop();
     }
     items
@@ -1160,8 +1342,12 @@ impl ThreadView {
             .then_some(lines)
     }
 
+    /// `>`: the selected lines of one read-only message, quoted into the
+    /// draft. Where the user writes, in the draft or a private reply, `>`
+    /// stays the editor's indent.
     fn quote_selection(&mut self, _: &QuoteSelection, window: &mut Window, cx: &mut Context<Self>) {
-        if self.private_edit.is_some() {
+        if self.private_edit.is_some() || self.on_draft(cx) {
+            cx.propagate();
             return;
         }
         let Some(lines) = self.mail_selection(self.selection_range(cx), cx) else {
@@ -1522,34 +1708,50 @@ impl ThreadView {
         }
     }
 
-    /// What `enter` does with this selection (`chat.Thread`'s keys), in
-    /// strict order: more than one character selected quotes them; else,
-    /// at the character under the point, a link opens; else the message
-    /// of the project under it opens its transcript. Folds, private
-    /// replies and tangents are not message words and open themselves.
-    fn enter_action(&self, selection: Range<Point>, cx: &App) -> Option<Enter> {
-        if self.selected_chars(&selection, cx) > 1 {
-            return Some(match self.mail_selection(selection, cx) {
-                Some(lines) => Enter::Quote(lines),
-                None => Enter::QuoteAcross,
-            });
+    /// The character the cursor is on: Helix draws the cursor of a
+    /// selection on its last character, and a bare point on the
+    /// character after it.
+    fn cursor_char(&self, cx: &App) -> Point {
+        let editor = self.editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let head = selection.head().to_point(&snapshot);
+        if head <= selection.tail().to_point(&snapshot) {
+            return head;
         }
-        // A one-character selection is helix's block cursor: its start is
-        // the character the point is on.
-        let cursor = selection.start;
+        match head.column {
+            0 => Point::new(
+                head.row - 1,
+                snapshot.line_len(multi_buffer::MultiBufferRow(head.row - 1)),
+            ),
+            column => snapshot.clip_point(Point::new(head.row, column - 1), editor::Bias::Left),
+        }
+    }
+
+    /// What `enter` does on the character at `cursor` (`chat.Thread`'s
+    /// keys), whatever the selection around it: a word that `w` or `/`
+    /// selected still opens what it is in. In strict order: a private
+    /// reply edits in place; a tangent line opens the tangent; a link
+    /// opens as a page; a project's message or flash opens its work.
+    /// Folded quotes and flashes open themselves.
+    fn enter_action(&self, cursor: Point, cx: &App) -> Option<Enter> {
+        let host = self.thread.host;
+        let meta = self.line_meta(cursor.row, cx);
+        match meta {
+            Some(Meta::Private { note, mail }) => return Some(Enter::Private(*mail, *note)),
+            Some(Meta::Thread(id)) if *id != self.thread.message => {
+                return Some(Enter::Open(ThreadId { host, message: *id }.address()));
+            }
+            _ => {}
+        }
         if let Some(open) = self.inline_open(cursor, cx) {
             return Some(Enter::Inline(open));
-        }
-        let meta = self.line_meta(cursor.row, cx)?;
-        if let Meta::Private { note, mail } = meta {
-            return Some(Enter::Private(*mail, *note));
         }
         if let Some((agent, mail)) = self.agent_mail(cursor.row, cx) {
             return Some(Enter::Inspect(agent, mail.clone()));
         }
-        let host = self.thread.host;
-        match meta {
-            Meta::Thread(id) | Meta::Mail(id, _) if *id != self.thread.message => {
+        match meta? {
+            Meta::Mail(id, _) if *id != self.thread.message => {
                 Some(Enter::Open(ThreadId { host, message: *id }.address()))
             }
             Meta::Open(address) => Some(Enter::Open(address.clone())),
@@ -1557,24 +1759,11 @@ impl ThreadView {
         }
     }
 
-    fn selected_chars(&self, selection: &Range<Point>, cx: &App) -> usize {
-        self.document(cx)
-            .text_for_range(selection.clone())
-            .map(|chunk| chunk.chars().count())
-            .sum()
-    }
-
-    fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_row(&mut self, _: &OpenRow, _: &mut Window, cx: &mut Context<Self>) {
         if self.private_edit.is_some() {
             return;
         }
-        match self.enter_action(self.selection_range(cx), cx) {
-            Some(Enter::Quote(lines)) => self.quote(lines, window, cx),
-            Some(Enter::QuoteAcross) => self.system.read(cx).frame.clone().echo(
-                "select lines in one message to quote",
-                StyleClass::SystemInfo,
-                cx,
-            ),
+        match self.enter_action(self.cursor_char(cx), cx) {
             Some(Enter::Inline(open)) => self.open_inline(open, cx),
             Some(Enter::Private(mail, note)) => self.open_private(mail, Some(note), cx),
             Some(Enter::Inspect(agent, mail)) => self.inspect(agent, mail, cx),
@@ -1877,11 +2066,15 @@ impl Surface for ThreadView {
     }
 
     fn opened(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_at_draft(cx);
+        self.open(cx);
+    }
+
+    fn revisited(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open(cx);
     }
 
     fn show_card(&mut self, _card: &Card, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_at_draft(cx);
+        self.open(cx);
     }
 
     fn edits_at_point(&self, cx: &App) -> bool {
@@ -1937,15 +2130,18 @@ impl Surface for ThreadView {
             .is_some()
         {
             let view = this.clone();
-            commands.push(Command::simple(&QUOTE_MESSAGE, move |_, window, cx| {
-                view.update(cx, |view, cx| {
-                    let row = view.cursor_row(cx);
-                    let lines = view
-                        .mail_selection(view.selection_range(cx), cx)
-                        .unwrap_or(row..=row);
-                    view.quote(lines, window, cx);
-                });
-            }));
+            commands.push(
+                Command::simple(&QUOTE_MESSAGE, move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        let row = view.cursor_row(cx);
+                        let lines = view
+                            .mail_selection(view.selection_range(cx), cx)
+                            .unwrap_or(row..=row);
+                        view.quote(lines, window, cx);
+                    });
+                })
+                .bound_to(QuoteSelection),
+            );
         }
         if self.system.read(cx).refused_reply(self.thread).is_some() {
             let view = this.clone();
@@ -1964,7 +2160,7 @@ impl Surface for ThreadView {
         // `open transcript` is the agents system's, on every screen.
         // The thumb's Open action follows Enter at the point.
         if matches!(
-            self.enter_action(self.selection_range(cx), cx),
+            self.enter_action(self.cursor_char(cx), cx),
             Some(Enter::Inline(_) | Enter::Open(_))
         ) {
             commands.push(
@@ -2639,20 +2835,24 @@ mod tests {
         );
     }
 
-    /// A thread opened from the deal or by name shows its top: the draft
-    /// with the point where it was left, then the newest mail. Returning
-    /// through history keeps the place in the history below.
+    /// `chat.Thread.open`, one rule however the thread is reached: a
+    /// remembered line from `Places` opens on that line; a message, an
+    /// edit, or a push the reader has not had in view opens the top, the
+    /// draft and the newest item; otherwise the thread is as the reader
+    /// left it, by name, from the recent places or the deal, and after its
+    /// screen closed too.
     #[gpui::test]
-    fn an_open_starts_at_the_draft_and_back_keeps_the_view(cx: &mut gpui::TestAppContext) {
+    fn a_thread_opens_on_a_match_on_news_or_as_left(cx: &mut gpui::TestAppContext) {
         use editor::SelectionEffects;
         use rho_agent_types::{ChatEvent, ChatRecord, ThreadWork};
         use rho_dealer::Card;
         use rho_dealer::facts::Seen;
         use rho_dealer::rank::CardKind;
+        use rho_frame::System as _;
 
         let host = EndpointId([3; 32]);
-        let agent =
-            Party::Agent(AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap());
+        let worker = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let agent = Party::Agent(worker);
         let long = ThreadId {
             host,
             message: MessageId(ChatSeq(2)),
@@ -2661,52 +2861,114 @@ mod tests {
             host,
             message: MessageId(ChatSeq(3)),
         };
-        let mut log = HostChat::default();
-        let mut post = |seq: u64, parent: Option<u64>, from: Party, text: String| {
-            log.tell(&ChatRecord {
-                seq: ChatSeq(seq),
-                at: UnixMs(seq),
-                event: ChatEvent::Posted {
-                    parent: parent.map(|id| MessageId(ChatSeq(id))),
-                    retry_of: None,
-                    thread_reply: None,
-                    from,
-                    voice: Voice::Message,
-                    content: vec![ContentPart::Text { text }],
-                },
-            });
+        let posted = |seq: u64, parent: u64, from: Party, voice: Voice, text: String| ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs::now(),
+            event: ChatEvent::Posted {
+                parent: Some(MessageId(ChatSeq(parent))),
+                retry_of: None,
+                thread_reply: None,
+                from,
+                voice,
+                content: vec![ContentPart::Text { text }],
+            },
         };
-        post(1, None, Party::User, "Clock".into());
-        post(2, Some(1), Party::User, "Check the clocks.".into());
-        post(3, Some(1), Party::User, "Another thread.".into());
+        let mut log = HostChat::default();
+        log.tell(&ChatRecord {
+            seq: ChatSeq(1),
+            at: UnixMs(1),
+            event: ChatEvent::Posted {
+                parent: None,
+                retry_of: None,
+                thread_reply: None,
+                from: Party::User,
+                voice: Voice::Message,
+                content: vec![ContentPart::Text {
+                    text: "Clock".into(),
+                }],
+            },
+        });
+        log.tell(&posted(
+            2,
+            1,
+            Party::User,
+            Voice::Message,
+            "Check the clocks.".into(),
+        ));
+        log.tell(&posted(
+            3,
+            1,
+            Party::User,
+            Voice::Message,
+            "Another thread.".into(),
+        ));
         for n in 4..44 {
-            post(
+            log.tell(&posted(
                 n,
-                Some(2),
+                2,
                 agent,
+                Voice::Message,
                 format!("Reading {n}.\n\nThe clock drifted.\n\nAgain."),
-            );
+            ));
         }
+        log.tell(&ChatRecord {
+            seq: ChatSeq(44),
+            at: UnixMs(44),
+            event: ChatEvent::Joined {
+                thread: long.message,
+                agent: worker,
+            },
+        });
         let (window, mail, _db) = super::super::search_bench::fixture(cx, log);
+        let lab = rho_agent_hosts::HostId(7);
         cx.update(|cx| {
-            mail.update(cx, |system, _| {
+            mail.update(cx, |system, cx| {
                 system.set_draft(host, Some(long.message), "Keep clock A.".into());
                 system
                     .logs
                     .get_mut(&host)
                     .unwrap()
                     .set_work(vec![(long.message, ThreadWork::Working)]);
+                system.streams(
+                    lab,
+                    "lab",
+                    Some(host),
+                    &rho_agent_hosts::Link::detached(),
+                    cx,
+                );
             });
         });
+        let tell = |cx: &mut gpui::TestAppContext, record: ChatRecord| {
+            cx.update(|cx| {
+                mail.update(cx, |system, cx| {
+                    system.logs.get_mut(&host).unwrap().tell(&record);
+                    system.changed(host, cx);
+                })
+            });
+        };
+        // The line the point is on, its column, and how many rows below
+        // the top of the window it is: where the reader is, whatever came
+        // above it meanwhile.
         let view = |cx: &mut gpui::TestAppContext| {
+            cx.run_until_parked();
             cx.draw_window(window.into());
             window
                 .update(cx, |frame, _, cx| {
                     let editor = frame.current_surface().editor(cx).unwrap();
                     editor.update(cx, |editor, cx| {
-                        let snapshot = editor.buffer().read(cx).snapshot(cx);
-                        let head = editor.selections.newest_anchor().head().to_point(&snapshot);
-                        (head, editor.scroll_position(cx).y)
+                        let display = editor.display_snapshot(cx);
+                        let text = display.buffer_snapshot().text();
+                        let head = editor
+                            .selections
+                            .newest_anchor()
+                            .head()
+                            .to_point(display.buffer_snapshot());
+                        let row = head.to_display_point(&display).row().0 as f64;
+                        (
+                            text.lines().nth(head.row as usize).unwrap_or("").to_owned(),
+                            head.column,
+                            row - editor.scroll_position(cx).y,
+                        )
                     })
                 })
                 .unwrap()
@@ -2716,7 +2978,7 @@ mod tests {
                 .update(cx, |frame, window, cx| {
                     let editor = frame.current_surface().editor(cx).unwrap();
                     editor.update(cx, |editor, cx| {
-                        let deep = Point::new(150, 0);
+                        let deep = Point::new(150, 3);
                         editor.change_selections(
                             SelectionEffects::scroll(Autoscroll::center()),
                             window,
@@ -2726,66 +2988,556 @@ mod tests {
                     });
                 })
                 .unwrap();
+            view(cx)
         };
         let open = |address: Address, cx: &mut gpui::TestAppContext| {
             window
                 .update(cx, |frame, window, cx| frame.open(address, window, cx))
                 .unwrap();
         };
+        let close = |address: Address, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, window, cx| frame.close(&address, window, cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let deal = |cx: &mut gpui::TestAppContext| {
+            let card = Card {
+                address: long.address(),
+                title: "Check the clocks.".into(),
+                kind: CardKind::Waits,
+                context: "clock@lab".into(),
+                label: "waits".into(),
+                priority: 1.,
+                cursor: String::new(),
+                seen: Seen::Mail {
+                    message: 43,
+                    version: 43,
+                },
+                skipped: false,
+            };
+            window
+                .update(cx, |frame, window, cx| frame.open_card(card, window, cx))
+                .unwrap();
+        };
+        let top = ("Keep clock A.".to_owned(), "Keep clock A.".len() as u32, 0.);
 
         open(long.address(), cx);
-        let top = view(cx);
-        assert_eq!(top.0, Point::new(0, "Keep clock A.".len() as u32));
-        assert_eq!(top.1, 0.);
+        assert_eq!(view(cx), top);
         let status = cx.update(|cx| window.read(cx).unwrap().current_surface().status(cx));
         assert_eq!(status.as_deref(), Some("working"));
 
-        go_deep(cx);
-        let deep = view(cx);
-        assert_eq!(deep.0.row, 150);
-        assert!(deep.1 > 100., "the history is scrolled: {}", deep.1);
-
-        // Flipping back through the recent places: the view is as left.
-        open(other.address(), cx);
-        view(cx);
-        window
-            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
-            .unwrap();
-        assert_eq!(view(cx), deep);
-        window
-            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
-            .unwrap();
-        window
-            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
-            .unwrap();
-        assert_eq!(view(cx), deep);
-
-        // By name: the top, with the point where the draft was left.
+        // (3) Nothing new: as left, however the thread comes back.
+        let deep = go_deep(cx);
+        assert_eq!(deep.1, 3);
+        assert!(deep.2 > 0., "the point is below the top of the window");
+        assert_ne!(deep.0, top.0);
         open(other.address(), cx);
         open(long.address(), cx);
-        assert_eq!(view(cx), top);
-
-        // From the deal: the same.
-        go_deep(cx);
-        assert_eq!(view(cx), deep);
-        let card = Card {
-            address: long.address(),
-            title: "Check the clocks.".into(),
-            kind: CardKind::Waits,
-            context: "clock@lab".into(),
-            label: "waits".into(),
-            priority: 1.,
-            cursor: String::new(),
-            seen: Seen::Mail {
-                message: 43,
-                version: 43,
-            },
-            skipped: false,
-        };
+        assert_eq!(view(cx), deep, "by name");
+        open(other.address(), cx);
         window
-            .update(cx, |frame, window, cx| frame.open_card(card, window, cx))
+            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
             .unwrap();
-        assert_eq!(view(cx), top);
+        assert_eq!(view(cx), deep, "from the recent places");
+        deal(cx);
+        assert_eq!(view(cx), deep, "from the deal");
+        close(long.address(), cx);
+        open(long.address(), cx);
+        assert_eq!(view(cx), deep, "after its screen closed");
+
+        // A flash is the now, not news: it lands above, and the reader
+        // stays where they were.
+        open(other.address(), cx);
+        tell(cx, posted(45, 2, agent, Voice::Flash, "Rerunning.".into()));
+        open(long.address(), cx);
+        assert_eq!(view(cx), deep, "a flash");
+
+        // (2) A message the reader has not had in view: the top, with it
+        // right below the draft.
+        open(other.address(), cx);
+        tell(
+            cx,
+            posted(46, 2, agent, Voice::Message, "Reading 46.".into()),
+        );
+        open(long.address(), cx);
+        assert_eq!(view(cx), top, "a new message, the screen held");
+        let below_draft = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, _, cx| {
+                    let editor = frame.current_surface().editor(cx).unwrap();
+                    let text = editor.read(cx).text(cx);
+                    text.lines().nth(2).unwrap_or("").to_owned()
+                })
+                .unwrap()
+        };
+        assert_eq!(below_draft(cx), "Reading 46.");
+        // Its screen closed, and the newest message edited.
+        let deep = go_deep(cx);
+        close(long.address(), cx);
+        tell(
+            cx,
+            ChatRecord {
+                seq: ChatSeq(47),
+                at: UnixMs::now(),
+                event: ChatEvent::Revised {
+                    message: MessageId(ChatSeq(46)),
+                    author: worker,
+                    content: vec![ContentPart::Text {
+                        text: "Reading 46, again.".into(),
+                    }],
+                },
+            },
+        );
+        deal(cx);
+        assert_ne!(view(cx), deep);
+        assert_eq!(view(cx), top, "an edit, the screen closed");
+
+        // A push the agent's git asks for is news too.
+        let deep = go_deep(cx);
+        open(other.address(), cx);
+        let (ask, _answered) = rho_agent_hosts::git::GitAsk::for_test(
+            0xa1,
+            super::super::git::tests::push_to(&["refs/heads/main"], Some(worker)),
+            UnixMs::now().0,
+        );
+        cx.update(|cx| {
+            mail.update(cx, |system, cx| {
+                system.git_heard(
+                    rho_agent_hosts::git::GitEvent {
+                        host: lab,
+                        change: rho_agent_hosts::git::GitChange::Asked(ask),
+                    },
+                    cx,
+                )
+            })
+        });
+        open(long.address(), cx);
+        assert_ne!(view(cx), deep);
+        assert_eq!(view(cx), top, "a push");
+        assert_eq!(
+            below_draft(cx),
+            "worker asks to push with your ssh login".replace("worker", &worker.encoded())
+        );
+
+        // (1) A remembered line: on it, news or not.
+        go_deep(cx);
+        open(other.address(), cx);
+        tell(
+            cx,
+            posted(48, 2, agent, Voice::Message, "Reading 48.".into()),
+        );
+        for _ in 0..2 {
+            window
+                .update(cx, |frame, window, cx| {
+                    frame.open_text_match(
+                        &rho_frame::FoundText {
+                            address: long.address(),
+                            title: String::new(),
+                            line: String::new(),
+                            point: rho_frame::SearchPoint::Message {
+                                message: ThreadId {
+                                    host,
+                                    message: MessageId(ChatSeq(10)),
+                                }
+                                .address(),
+                                line: 0,
+                            },
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+            assert_eq!(view(cx).0, "Reading 10.");
+            // And again with the screen closed.
+            close(long.address(), cx);
+        }
+    }
+
+    /// A thread that `enter` and `>` act on, opened in a window that reads
+    /// keys as rho does: Helix, the bundled keymaps, and the screen's own
+    /// keys over them. Agent `1` works in it; its newest items are a
+    /// flash, an ask with a tangent under it, and a proof with a link.
+    struct Keyed {
+        window: gpui::WindowHandle<rho_frame::Frame>,
+        thread: ThreadId,
+        links: Rc<std::cell::RefCell<Vec<String>>>,
+        inspected: Rc<std::cell::RefCell<Vec<MessageId>>>,
+        _db: tempfile::TempDir,
+    }
+
+    const PROOF: MessageId = MessageId(ChatSeq(5));
+    const ASK: MessageId = MessageId(ChatSeq(6));
+    const FLASH: MessageId = MessageId(ChatSeq(8));
+    const URL: &str = "https://proof.example.invalid/clock";
+    const DRAFT: &str = "Keep clock A.";
+
+    /// Takes the links the user opens, as the browser would.
+    struct Links(Rc<std::cell::RefCell<Vec<String>>>);
+
+    impl rho_frame::System for Links {
+        fn kinds(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn open(
+            &mut self,
+            _: &Address,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> rho_frame::Opening {
+            rho_frame::Opening::Gone
+        }
+
+        fn open_link(&mut self, url: &url::Url, _: &mut Context<Self>) -> bool {
+            self.0.borrow_mut().push(url.to_string());
+            true
+        }
+    }
+
+    fn keyed(cx: &mut gpui::TestAppContext) -> Keyed {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+        use rho_frame::{Frame, FrameLink};
+
+        let host = EndpointId([3; 32]);
+        let worker = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let thread = ThreadId {
+            host,
+            message: MessageId(ChatSeq(3)),
+        };
+        let posted =
+            |seq: u64, parent: Option<u64>, from: Party, voice: Voice, text: &str| ChatRecord {
+                seq: ChatSeq(seq),
+                at: UnixMs(UnixMs::now().0 - 60_000 + seq),
+                event: ChatEvent::Posted {
+                    parent: parent.map(|id| MessageId(ChatSeq(id))),
+                    retry_of: None,
+                    thread_reply: None,
+                    from,
+                    voice,
+                    content: vec![ContentPart::Text { text: text.into() }],
+                },
+            };
+        let agent = Party::Agent(worker);
+        let mut log = HostChat::default();
+        log.tell(&posted(1, None, Party::User, Voice::Message, "tide"));
+        log.tell(&ChatRecord {
+            seq: ChatSeq(2),
+            at: UnixMs(2),
+            event: ChatEvent::Project {
+                project: rho_agent_types::ProjectId(MessageId(ChatSeq(1))),
+                config: rho_agent_types::ProjectConfig {
+                    place: rho_agent_types::ProjectPlace::parse("~/src/tide").unwrap(),
+                    mode: rho_agent_types::ProjectMode::One,
+                    runtime: rho_agent_types::RuntimeLabel::default(),
+                },
+            },
+        });
+        log.tell(&posted(
+            3,
+            Some(1),
+            Party::User,
+            Voice::Message,
+            "Check the clocks.",
+        ));
+        log.tell(&ChatRecord {
+            seq: ChatSeq(4),
+            at: UnixMs(4),
+            event: ChatEvent::Joined {
+                thread: thread.message,
+                agent: worker,
+            },
+        });
+        log.tell(&posted(
+            5,
+            Some(3),
+            agent,
+            Voice::Message,
+            &format!("Proof at {URL} today.\n\nThe clock drifted."),
+        ));
+        log.tell(&posted(
+            6,
+            Some(3),
+            agent,
+            Voice::Message,
+            "Which clock should I keep?",
+        ));
+        log.tell(&posted(
+            7,
+            Some(6),
+            Party::User,
+            Voice::Message,
+            "About the reference.",
+        ));
+        log.tell(&posted(
+            8,
+            Some(3),
+            agent,
+            Voice::Flash,
+            "Rerunning the clock test.",
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            rho_window::editor_config::init_vim_mode(cx).unwrap();
+        });
+        let links = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut mail = None;
+        let window = cx.add_window(|window, cx| {
+            let frame = FrameLink::new(window.window_handle().downcast::<Frame>().unwrap());
+            let notes = cx.new(|cx| rho_notes::NoteSystem::new(frame.clone(), cx));
+            let system = cx.new(|cx| {
+                let mut system = ChatSystem::new(db.clone(), frame, notes, cx);
+                system.logs.insert(host, log);
+                system.set_draft(host, Some(thread.message), DRAFT.into());
+                system
+            });
+            let catcher = cx.new(|_| Links(links.clone()));
+            mail = Some(system.clone());
+            Frame::new(
+                db,
+                vec![
+                    rho_frame::AnySystem::new(system),
+                    rho_frame::AnySystem::new(catcher),
+                ],
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        let mail = mail.unwrap();
+        let inspected = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = inspected.clone();
+        cx.update(|cx| {
+            cx.subscribe(&mail, move |_, event: &Event, _| {
+                if let Event::Inspect { mail, .. } = event {
+                    seen.borrow_mut().push(mail.id);
+                }
+            })
+            .detach()
+        });
+        // A private reply under the proof.
+        let notes = mail.read_with(cx, |system, _| system.notes.clone());
+        let subject = ThreadId {
+            host,
+            message: PROOF,
+        }
+        .address();
+        let note = window
+            .update(cx, |frame, _, cx| {
+                rho_notes::create_private(frame, &subject, cx)
+            })
+            .unwrap();
+        notes.update(cx, |notes, cx| {
+            notes.edited(note, "Ask about clock B.".into(), cx);
+            notes.save(note, cx);
+        });
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // The window opens editors to write in; reading is Helix's normal
+        // mode.
+        cx.simulate_keystrokes(window.into(), "escape");
+        cx.run_until_parked();
+        cx.draw_window(window.into());
+        Keyed {
+            window,
+            thread,
+            links,
+            inspected,
+            _db: temp,
+        }
+    }
+
+    impl Keyed {
+        fn view(&self, cx: &mut gpui::TestAppContext) -> Entity<ThreadView> {
+            self.window
+                .update(cx, |frame, _, _| {
+                    frame
+                        .current_surface()
+                        .view()
+                        .downcast::<ThreadView>()
+                        .unwrap()
+                })
+                .unwrap()
+        }
+
+        fn text(&self, cx: &mut gpui::TestAppContext) -> String {
+            let view = self.view(cx);
+            view.read_with(cx, |view, cx| view.document(cx).text())
+        }
+
+        /// The row of the document's line that is exactly `line`.
+        fn row(&self, cx: &mut gpui::TestAppContext, line: &str) -> u32 {
+            let text = self.text(cx);
+            text.lines()
+                .position(|candidate| candidate == line)
+                .unwrap_or_else(|| panic!("no line {line:?} in\n{text}")) as u32
+        }
+
+        /// The point on `column` of the line that is exactly `line`, in
+        /// Helix's normal mode.
+        fn at(&self, cx: &mut gpui::TestAppContext, line: &str, column: u32) {
+            let row = self.row(cx, line);
+            let view = self.view(cx);
+            self.window
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.editor.update(cx, |editor, cx| {
+                            let point = Point::new(row, column);
+                            editor.change_selections(Default::default(), window, cx, |s| {
+                                s.select_ranges([point..point])
+                            });
+                        });
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.draw_window(self.window.into());
+        }
+
+        fn keys(&self, cx: &mut gpui::TestAppContext, keys: &str) {
+            cx.simulate_keystrokes(self.window.into(), keys);
+            cx.run_until_parked();
+            cx.draw_window(self.window.into());
+        }
+
+        /// The selection's width, in characters.
+        fn selected(&self, cx: &mut gpui::TestAppContext) -> usize {
+            let view = self.view(cx);
+            view.read_with(cx, |view, cx| {
+                view.document(cx)
+                    .text_for_range(view.selection_range(cx))
+                    .map(|chunk| chunk.chars().count())
+                    .sum()
+            })
+        }
+
+        fn draft(&self, cx: &mut gpui::TestAppContext) -> String {
+            let view = self.view(cx);
+            view.read_with(cx, |view, cx| view.draft.read(cx).text())
+        }
+
+        fn current(&self, cx: &mut gpui::TestAppContext) -> Address {
+            self.window
+                .update(cx, |frame, _, _| frame.current_address().clone())
+                .unwrap()
+        }
+    }
+
+    /// `>` quotes what is selected in one read-only message into the
+    /// draft, above where the draft's caret was, a whole line or a word
+    /// that `w` selected alike; the draft keeps its words.
+    #[gpui::test]
+    fn greater_than_quotes_a_selection_in_a_message(cx: &mut gpui::TestAppContext) {
+        let thread = keyed(cx);
+        thread.at(cx, "Which clock should I keep?", 0);
+        thread.keys(cx, "x >");
+        assert_eq!(
+            thread.draft(cx),
+            format!("> Which clock should I keep?\n{DRAFT}")
+        );
+        // A word `w` selected quotes its line.
+        thread.at(cx, &format!("Proof at {URL} today."), 0);
+        thread.keys(cx, "w");
+        assert!(thread.selected(cx) > 1, "w selects a word");
+        thread.keys(cx, ">");
+        assert_eq!(
+            thread.draft(cx),
+            format!("> Which clock should I keep?\n> Proof at {URL} today.\n{DRAFT}")
+        );
+        assert!(thread.links.borrow().is_empty(), "quoting opens nothing");
+        assert!(thread.inspected.borrow().is_empty());
+    }
+
+    /// Inside the draft, `>` is Helix's indent, not a quote.
+    #[gpui::test]
+    fn greater_than_indents_in_the_draft(cx: &mut gpui::TestAppContext) {
+        let thread = keyed(cx);
+        thread.at(cx, DRAFT, 0);
+        thread.keys(cx, ">");
+        let draft = thread.draft(cx);
+        assert_ne!(draft, DRAFT, "the line is indented");
+        assert_eq!(draft.trim_start(), DRAFT);
+        assert!(draft.starts_with([' ', '\t']), "{draft:?}");
+    }
+
+    /// `enter` opens what is under the cursor however wide the selection
+    /// Helix left: after `w` on a link, the link; after `w` on a project
+    /// message or a flash, its work; after `/` found words in a message,
+    /// its work; after `w` on a private reply, the reply; after `w` on a
+    /// tangent's line, the tangent. It never quotes.
+    #[gpui::test]
+    fn enter_opens_what_is_under_the_cursor_whatever_the_selection(cx: &mut gpui::TestAppContext) {
+        let thread = keyed(cx);
+        let proof_line = format!("Proof at {URL} today.");
+
+        // A link a `w` landed in.
+        thread.at(cx, &proof_line, "Proof at ".len() as u32);
+        thread.keys(cx, "w");
+        assert!(thread.selected(cx) > 1);
+        thread.keys(cx, "enter");
+        assert_eq!(*thread.links.borrow(), [URL]);
+
+        // The project's message, a word selected in it.
+        thread.at(cx, "Which clock should I keep?", 0);
+        thread.keys(cx, "w");
+        assert!(thread.selected(cx) > 1);
+        thread.keys(cx, "enter");
+        assert_eq!(*thread.inspected.borrow(), [ASK]);
+
+        // The flash.
+        thread.at(cx, "Rerunning the clock test. · 1m", 0);
+        thread.keys(cx, "w enter");
+        assert_eq!(*thread.inspected.borrow(), [ASK, FLASH]);
+
+        // A search's whole match.
+        thread.at(cx, DRAFT, 0);
+        thread.keys(cx, "/ d r i f t e d enter");
+        assert_eq!(thread.selected(cx), "drifted".len());
+        thread.keys(cx, "enter");
+        assert_eq!(*thread.inspected.borrow(), [ASK, FLASH, PROOF]);
+        assert_eq!(thread.draft(cx), DRAFT, "nothing was quoted");
+
+        // A private reply edits in place.
+        thread.at(cx, "Ask about clock B.", 0);
+        thread.keys(cx, "w enter");
+        let view = thread.view(cx);
+        assert!(view.read_with(cx, |view, _| view.private_edit.is_some()));
+        thread.keys(cx, "escape");
+        assert!(view.read_with(cx, |view, _| view.private_edit.is_none()));
+
+        // A tangent's line opens the tangent.
+        let fold = thread
+            .text(cx)
+            .lines()
+            .find(|line| line.starts_with("  ↳ 1 reply"))
+            .unwrap()
+            .to_owned();
+        thread.at(cx, &fold, "  ↳ ".len() as u32);
+        thread.keys(cx, "w enter");
+        assert_eq!(
+            thread.current(cx),
+            ThreadId {
+                host: thread.thread.host,
+                message: ASK,
+            }
+            .address()
+        );
+        assert_eq!(*thread.links.borrow(), [URL]);
+        assert_eq!(thread.inspected.borrow().len(), 3);
     }
 
     #[gpui::test]
@@ -2798,16 +3550,7 @@ mod tests {
         check_thread(cx, CheckThread::WorkTarget);
     }
 
-    /// `enter` in strict order: more than one character quotes, even over
-    /// a link; a one-character point on a link opens it, wherever in the
-    /// link; anywhere else in a project message opens its transcript.
-    #[gpui::test]
-    fn enter_quotes_a_selection_then_opens_a_link_then_the_work(cx: &mut gpui::TestAppContext) {
-        check_thread(cx, CheckThread::EnterPrecedence);
-    }
-
     enum CheckThread {
-        EnterPrecedence,
         Inline,
         Stuck,
         ThreadReply,
@@ -2980,76 +3723,6 @@ mod tests {
                         Subject::Draft { worker: None },
                         "a draft with two participants must not guess a steering target"
                     );
-                })
-                .unwrap();
-            return;
-        }
-
-        if matches!(check, CheckThread::EnterPrecedence) {
-            let words = "Proof at https://proof.example.invalid/clock today.";
-            let url = "https://proof.example.invalid/clock";
-            let (link_start, link_end) = (9, 9 + url.len() as u32);
-            cx.update(|cx| {
-                mail.update(cx, |system, cx| {
-                    system.logs.get_mut(&thread.host).unwrap().tell(&post(
-                        5,
-                        Some(2),
-                        agent,
-                        words,
-                    ));
-                    cx.notify();
-                });
-            });
-            window
-                .update(cx, |view, window, cx| {
-                    let proof = MessageId(ChatSeq(5));
-                    assert!(view.cursor_to_item(&Key::Message(proof), Autoscroll::fit(), cx));
-                    let row = view.cursor_row(cx);
-                    let question = view
-                        .item_row(&Key::Message(MessageId(ChatSeq(4))), cx)
-                        .unwrap();
-                    assert_eq!(view.document(cx).text().lines().nth(row as usize), Some(words));
-                    let mut enter = |range: Range<Point>, reversed: bool| {
-                        view.editor.update(cx, |editor, cx| {
-                            editor.change_selections(Default::default(), window, cx, |s| {
-                                let (start, end) = (range.start, range.end);
-                                s.select_ranges([if reversed { end..start } else { start..end }]);
-                            });
-                        });
-                        let selection = view.selection_range(cx);
-                        view.enter_action(selection, cx)
-                    };
-                    let at = |column: u32| Point::new(row, column);
-                    let opens_link = |action: Option<Enter>| {
-                        matches!(action, Some(Enter::Inline(InlineOpen::Link(link))) if link.as_str() == url)
-                    };
-                    let inspects = |action: Option<Enter>| {
-                        matches!(action, Some(Enter::Inspect(by, mail)) if by == worker && mail.id == proof)
-                    };
-                    // (1) More than one character: a quote, also over the link.
-                    assert!(matches!(
-                        enter(at(5)..at(15), false),
-                        Some(Enter::Quote(lines)) if lines == (row..=row)
-                    ));
-                    assert!(matches!(
-                        enter(at(link_start)..at(link_end), true),
-                        Some(Enter::Quote(lines)) if lines == (row..=row)
-                    ));
-                    assert!(matches!(
-                        enter(Point::new(question, 0)..at(3), false),
-                        Some(Enter::QuoteAcross)
-                    ));
-                    // (2) One character on the link, at either end of it, or
-                    // a bare point inside it: the link.
-                    assert!(opens_link(enter(at(link_start)..at(link_start + 1), false)));
-                    assert!(opens_link(enter(at(link_end - 1)..at(link_end), false)));
-                    assert!(opens_link(enter(at(link_end - 1)..at(link_end), true)));
-                    assert!(opens_link(enter(at(20)..at(20), false)));
-                    // (3) One character anywhere else in the project's
-                    // message: its transcript.
-                    assert!(inspects(enter(at(0)..at(1), false)));
-                    assert!(inspects(enter(at(link_end)..at(link_end + 1), false)));
-                    assert!(inspects(enter(at(link_start - 1)..at(link_start), false)));
                 })
                 .unwrap();
             return;

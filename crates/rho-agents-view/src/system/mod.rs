@@ -955,17 +955,6 @@ impl AgentsSystem {
         Some(ThreadId { host, message })
     }
 
-    /// The work an agent does, as `<project> · <thread subject>`: its
-    /// workset's thread. `None` while the work has no thread.
-    pub fn agent_work(&self, agent: AgentId, cx: &App) -> Option<String> {
-        let lead = self.lead_of(agent).unwrap_or(agent);
-        let (subject, project) = self
-            .mail
-            .read(cx)
-            .thread_name(self.agent_thread(lead, cx)?, cx)?;
-        Some(format!("{project} · {subject}"))
-    }
-
     fn brief(&self, agent: AgentId, cx: &App) -> Option<String> {
         let mirrored = self.registry.mirrored(agent)?;
         let host = self.registry.host_endpoint(mirrored.host)?;

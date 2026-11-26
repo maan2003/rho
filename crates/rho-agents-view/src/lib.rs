@@ -6,11 +6,8 @@
 //! frame: the `agent:` address, the surface over the transcript, and the
 //! commands that steer agents and open their tools. [`usage`] is what the
 //! agents have spent, as charts the system opens from `usage:` addresses.
-//! [`git`] is the user's word on an agent's push or fetch that needs their ssh
-//! login, each a card the window deals.
 
 pub mod agent_view;
-pub mod git;
 pub mod render;
 pub mod system;
 pub mod transcript;
@@ -18,6 +15,5 @@ pub mod usage;
 mod visualization;
 
 pub use agent_view::{AgentModel, AgentModelEvent};
-pub use git::GitApprovals;
 pub use system::{AgentsSystem, SPELLINGS};
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};

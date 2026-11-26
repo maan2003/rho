@@ -94,6 +94,8 @@ enum Open<'a> {
     Recent,
     Deal(&'a Card),
     Inspect(CardInspection),
+    /// From a remembered line in `Places`: on that line.
+    Search(&'a crate::SearchPoint),
 }
 
 /// How many command names `Commands` remembers as recently run.
@@ -496,7 +498,7 @@ impl Frame {
     /// a verdict settles what is on screen and nothing that came while the
     /// reader was elsewhere. Anywhere else, the card as the
     /// hand holds it.
-    pub(crate) fn card_seen(&self, address: &Address, cx: &App) -> Option<Seen> {
+    pub fn card_seen(&self, address: &Address, cx: &App) -> Option<Seen> {
         if let ScreenEntry::Inspection(inspection) = self.recent.current()
             && &inspection.address == address
         {
@@ -633,10 +635,18 @@ impl Frame {
             }
             Open::Recent => {
                 // Nothing to come back to on a screen made just now.
-                if fresh {
-                    surface.opened(window, cx);
+                match fresh {
+                    true => surface.opened(window, cx),
+                    false => surface.revisited(window, cx),
                 }
                 (None, rho_journal::SurfaceShowMethod::Mru)
+            }
+            Open::Search(point) => {
+                surface.show_search_match(point, window, cx);
+                (
+                    Some(ScreenEntry::Opened),
+                    rho_journal::SurfaceShowMethod::Open,
+                )
             }
         };
         rho_journal::record(rho_journal::Event::SurfaceShown {
@@ -906,6 +916,17 @@ impl Frame {
 
     pub fn menu_open(&self) -> bool {
         self.menu.is_some()
+    }
+
+    /// The open menu's rows, as key and word.
+    pub fn menu_rows(&self) -> Vec<(String, String)> {
+        self.menu.as_ref().map_or_else(Vec::new, |menu| {
+            menu.rows
+                .rows
+                .iter()
+                .map(|row| (row.key.clone(), row.pick.label().to_owned()))
+                .collect()
+        })
     }
 
     pub fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1208,19 +1229,18 @@ impl Frame {
 
     /// Opens the place a remembered line is in, on that line: the message
     /// in a thread, the line in a note.
-    pub(crate) fn open_text_match(
+    pub fn open_text_match(
         &mut self,
         hit: &crate::FoundText,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.current_address() != &hit.address {
-            self.open(hit.address.clone(), window, cx);
-        }
-        if self.current_address() == &hit.address {
-            self.current_surface()
+        match self.current_address() == &hit.address {
+            true => self
+                .current_surface()
                 .clone()
-                .show_search_match(&hit.point, window, cx);
+                .show_search_match(&hit.point, window, cx),
+            false => self.open_by(hit.address.clone(), Open::Search(&hit.point), window, cx),
         }
     }
 

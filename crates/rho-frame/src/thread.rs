@@ -11,10 +11,11 @@ actions!(
     [
         /// Posts the draft as the thread's next message.
         SendMessage,
-        /// Opens what the cursor is on: a thread under a message, the
-        /// thread above, a link, or a quote.
+        /// Opens what the cursor is on, whatever the selection's width: a
+        /// private reply, a tangent, a link, or a message's work.
         OpenRow,
-        /// Quotes the selected lines of a mail in the draft.
+        /// `>`: quotes the selected lines of a read-only message in the
+        /// draft. In the draft itself it lets the editor indent.
         QuoteSelection,
     ]
 );
@@ -37,14 +38,16 @@ pub fn when(at_ms: i64) -> String {
 pub(crate) fn bind(cx: &mut App) {
     let screen = format!("{SCREEN} > Editor");
     let mut bindings = vec![KeyBinding::new("ctrl-enter", SendMessage, Some(&screen))];
-    for context in
-        crate::normal_contexts(SCREEN, " && vim_operator == none && !showing_completions")
-    {
-        bindings.push(KeyBinding::new("enter", OpenRow, Some(&context)));
-    }
-    for mode in ["visual", "helix_select"] {
-        let context = format!("{screen} && vim_mode == {mode}");
-        bindings.push(KeyBinding::new("enter", QuoteSelection, Some(&context)));
+    // A selection from `w`, `x`, `/` or `v` leaves `enter` what it is:
+    // the key that opens what is under the cursor. Quoting is `>`'s.
+    for mode in ["normal", "helix_normal", "visual", "helix_select"] {
+        let context = format!("{screen} && vim_mode == {mode} && vim_operator == none");
+        bindings.push(KeyBinding::new(
+            "enter",
+            OpenRow,
+            Some(&format!("{context} && !showing_completions")),
+        ));
+        bindings.push(KeyBinding::new(">", QuoteSelection, Some(&context)));
     }
     cx.bind_keys(bindings);
 }

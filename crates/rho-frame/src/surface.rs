@@ -162,6 +162,11 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// left and is not told (`window.Screen`).
     fn opened(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// The screen, held since the reader left it, is back in view through
+    /// the recent places. By default it shows as it was left; a screen
+    /// with an open rule of its own, such as a thread's, applies it.
+    fn revisited(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Positions the screen on what the card deals, including when the
     /// frame already holds the screen.
     fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -226,6 +231,7 @@ trait SurfaceHandle {
     fn edits_at_point(&self, cx: &App) -> bool;
     fn heading(&self, cx: &App) -> Option<String>;
     fn opened(&self, window: &mut Window, cx: &mut App);
+    fn revisited(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
     fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command>;
@@ -292,6 +298,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn opened(&self, window: &mut Window, cx: &mut App) {
         self.update(cx, |surface, cx| surface.opened(window, cx));
+    }
+
+    fn revisited(&self, window: &mut Window, cx: &mut App) {
+        self.update(cx, |surface, cx| surface.revisited(window, cx));
     }
 
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {
@@ -389,6 +399,10 @@ impl AnySurface {
 
     pub(crate) fn opened(&self, window: &mut Window, cx: &mut App) {
         self.0.opened(window, cx);
+    }
+
+    pub(crate) fn revisited(&self, window: &mut Window, cx: &mut App) {
+        self.0.revisited(window, cx);
     }
 
     pub(crate) fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App) {

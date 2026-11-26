@@ -63,6 +63,9 @@ pub struct HostChat {
     /// The first thread each agent joined: its thread, the one it started
     /// from, where a stop it did not choose draws the user.
     first_joined: BTreeMap<AgentId, MessageId>,
+    /// The thread each agent joined last: a standing agent joins each
+    /// idea's thread as it takes it up.
+    last_joined: BTreeMap<AgentId, MessageId>,
 }
 
 impl HostChat {
@@ -126,6 +129,7 @@ impl HostChat {
             ChatEvent::Joined { thread, agent } => {
                 self.members.insert((*thread, *agent), true);
                 self.first_joined.entry(*agent).or_insert(*thread);
+                self.last_joined.insert(*agent, *thread);
                 Told::Thread(*thread)
             }
             ChatEvent::Left { thread, agent } => {
@@ -446,6 +450,15 @@ impl HostChat {
     /// it joined.
     pub fn agent_thread(&self, agent: AgentId) -> Option<MessageId> {
         self.first_joined
+            .get(&agent)
+            .map(|joined| self.thread_of(*joined))
+    }
+
+    /// The thread an agent works in now: the one it joined last, read as
+    /// the thread its words show in. An agent another agent made joined
+    /// its brief, which hangs in the thread of the work it helps.
+    pub fn working_thread(&self, agent: AgentId) -> Option<MessageId> {
+        self.last_joined
             .get(&agent)
             .map(|joined| self.thread_of(*joined))
     }

@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use gpui::{App, AppContext as _, WindowOptions};
 use rho_agent_hosts::HostSpec;
-use rho_frame::{AnySystem, Frame, FrameLink, System as _};
+use rho_frame::{AnySystem, Frame, FrameLink};
 use rho_gui::rho_assets::RhoAssets;
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use tracing_subscriber::EnvFilter;
@@ -267,30 +267,10 @@ fn run() -> Result<()> {
                         cx,
                     )
                 });
-                // A push or fetch that waits for the user's ssh login names
-                // the agent that asks, and its work, as the agents system
-                // knows them.
-                let known = agents.downgrade();
-                let git = cx.new(|cx| {
-                    rho_agents_view::GitApprovals::new(
-                        rho_agent_hosts::git::GitStreams::new(),
-                        Rc::new(move |agent, cx| {
-                            let agents = known.upgrade()?;
-                            let agents = agents.read(cx);
-                            Some(rho_agents_view::git::KnownAgent {
-                                name: agents.agent_name(agent, cx)?,
-                                work: agents.agent_work(agent, cx),
-                            })
-                        }),
-                        frame.clone(),
-                        cx,
-                    )
-                });
                 let telemetry = cx.new(|_| rho_gui::telemetry::TelemetrySystem::new(frame));
                 let systems = vec![
                     AnySystem::new(chat),
                     AnySystem::new(agents),
-                    AnySystem::new(git),
                     AnySystem::new(browser),
                     AnySystem::new(notes),
                     AnySystem::new(telemetry),
@@ -421,7 +401,7 @@ fn init_app(cx: &mut App) -> Result<()> {
     release_channel::init(semver::Version::new(0, 1, 0), cx);
     editor::init(cx);
     search::init(cx);
-    rho_gui::init_vim_mode(cx).context("failed to initialize Rho Vim mode")?;
+    rho_window::editor_config::init_vim_mode(cx).context("failed to initialize Rho Vim mode")?;
     Ok(())
 }
 

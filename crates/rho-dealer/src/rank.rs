@@ -24,6 +24,9 @@ use crate::marks::Marks;
 pub enum CardKind {
     Waits,
     Stop(&'static str),
+    /// Something staged that runs only on the user's word, such as a
+    /// `push` or a `fetch`.
+    Approve(&'static str),
     Other,
 }
 
@@ -32,6 +35,7 @@ impl CardKind {
         match self {
             Self::Waits => "waits · {age}".to_owned(),
             Self::Stop(word) => format!("{word} · {{age}}"),
+            Self::Approve(what) => format!("approve {what} · {{age}}"),
             Self::Other => String::new(), // Deadlines supply their own words.
         }
     }

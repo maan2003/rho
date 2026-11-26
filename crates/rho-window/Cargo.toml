@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 camino.workspace = true
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = [
   "native",
@@ -25,10 +26,12 @@ languages = { path = "../../vendor/zed/crates/languages", features = [
 ] }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
+settings = { path = "../../vendor/zed/crates/settings" }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 vim = { path = "../../vendor/zed/crates/vim", default-features = false }
+vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
 [dev-dependencies]
 assets = { path = "../../vendor/zed/crates/assets" }

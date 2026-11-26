@@ -14303,7 +14303,6 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "vim",
- "vim_mode_setting",
  "zbus",
 ]
 
@@ -14676,6 +14675,7 @@ dependencies = [
 name = "rho-window"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assets",
  "camino",
  "editor",
@@ -14693,6 +14693,7 @@ dependencies = [
  "theme_settings",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
  "vim",
+ "vim_mode_setting",
 ]
 
 [[package]]

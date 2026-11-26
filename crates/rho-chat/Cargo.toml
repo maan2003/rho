@@ -83,6 +83,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
   "test-support",
 ] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
+rho-agent-hosts = { workspace = true, features = ["test-support"] }
 rho-chat = { path = ".", features = ["client"] }
 semver = "1"
 settings = { path = "../../vendor/zed/crates/settings", features = [

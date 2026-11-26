@@ -8,6 +8,7 @@
 //! user; this module supplies projects, moving threads, and the places
 //! `Places` lists.
 
+mod git;
 mod idea;
 mod pending;
 mod projects;
@@ -35,8 +36,8 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::{
     AnySurface, Candidate, Command, Found, FoundText, FoundThread, Frame, FrameLink, Opening,
-    Point, Project, SearchPoint, Spelling, System, TextIndex, TextKind, TextPresenter, TextSearch,
-    TextTarget,
+    Point, Project, Row, SearchPoint, Spelling, System, TextIndex, TextKind, TextPresenter,
+    TextSearch, TextTarget,
 };
 use rho_rpc::protocol::Answer as RpcAnswer;
 use rho_window::style::StyleClass;
@@ -150,7 +151,14 @@ pub struct ChatSystem {
     /// Whether an agent still exists on a host, its label, and what it is
     /// doing; the agents system knows.
     participants: Participants,
+    /// The pushes and fetches that wait for the user's word, each shown in
+    /// the thread its agent works in.
+    git: git::GitAsks,
+    /// Where the reader left each thread whose screen has closed, for the
+    /// next open (`chat.Thread.open`).
+    left: HashMap<ThreadId, thread::Left>,
     _pump: Task<()>,
+    _git_pump: Task<()>,
 }
 
 impl EventEmitter<Event> for ChatSystem {}
@@ -211,6 +219,17 @@ impl ChatSystem {
                 }
             }
         });
+        let (git_streams, mut git_events) = rho_agent_hosts::git::GitStreams::new();
+        let git_pump = cx.spawn(async move |this, cx| {
+            while let Some(event) = git_events.next().await {
+                if this
+                    .update(cx, |this, cx| this.git_heard(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             notes,
             cursors: Cursors::new(loaded.cursors),
@@ -235,7 +254,10 @@ impl ChatSystem {
                     stopped_because: None,
                 })
             }),
+            git: git::GitAsks::new(git_streams),
+            left: HashMap::new(),
             _pump: pump,
+            _git_pump: git_pump,
         }
     }
 
@@ -1061,11 +1083,14 @@ impl System for ChatSystem {
             endpoint,
         };
         self.hosts.insert(host, slot);
-        vec![Arc::new(MailStream::new(
-            host,
-            self.cursors.clone(),
-            self.events.clone(),
-        ))]
+        vec![
+            Arc::new(MailStream::new(
+                host,
+                self.cursors.clone(),
+                self.events.clone(),
+            )),
+            self.git.streams.stream(host),
+        ]
     }
 
     /// The host's threads and their screens go from the window with it. Its
@@ -1073,6 +1098,7 @@ impl System for ChatSystem {
     /// again if the host is attached again; what the user wrote and has
     /// not sent stays for then.
     fn detached(&mut self, host: HostId, cx: &mut Context<Self>) {
+        self.git.forget_host(host);
         let Some(endpoint) = self.hosts.remove(&host).and_then(|slot| slot.endpoint) else {
             cx.notify();
             return;
@@ -1149,7 +1175,14 @@ impl System for ChatSystem {
                 .unwrap_or_default(),
             );
         }
+        self.git_claims(&mut claims, cx);
         claims
+    }
+
+    /// A thread with a push or fetch that waits takes its answers in place
+    /// of done and mute.
+    fn verdicts(&mut self, address: &Address, cx: &mut Context<Self>) -> Option<Vec<Row>> {
+        self.git_verdicts(self.thread_of(address)?, cx)
     }
 
     fn name(
