@@ -26,6 +26,8 @@ rho-chat.workspace = true
 rho-claude.workspace = true
 rho-db.workspace = true
 rho-desktop-client.workspace = true
+rho-desktop-media = { workspace = true, features = ["encoder"] }
+rho-desktop-proto = { workspace = true, features = ["local"] }
 rho-files.workspace = true
 rho-fs-view.workspace = true
 rho-inference.workspace = true
@@ -39,7 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 text.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 
 # The driver's pointer: a headless seat has no pointer device, so `click`
@@ -47,6 +49,9 @@ tracing.workspace = true
 # keyboard for a keystroke. Linux only, because the session it drives is.
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
+
+[dev-dependencies]
+rho-desktop-media = { workspace = true, features = ["decoder", "encoder"] }
 
 [[bin]]
 name = "rho"

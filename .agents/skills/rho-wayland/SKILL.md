@@ -1,6 +1,6 @@
 ---
 name: rho-wayland
-description: Launch and control GUI applications in rho's isolated headless Wayland compositor, including screenshots, clicks, typing, and key presses. Use for GUI testing, visual QA, or any task that needs an agent to interact with a native Wayland application.
+description: Launch and control GUI applications in rho's isolated headless Wayland compositor, including screenshots, video recording, clicks, typing, and key presses. Use for GUI testing, visual QA, or any task that needs an agent to interact with a native Wayland application.
 ---
 
 # Headless Wayland control
@@ -69,6 +69,23 @@ steps are `key:CHORD`, `text:TEXT`, and `wait:MILLISECONDS`.
 After every input that changes the interface, wait briefly or check observable
 state, then take another screenshot. Do not assume a click succeeded solely
 because the command exited successfully.
+
+## Record video
+
+Record a browser-playable WebM video (`vp9` by default, or `--codec vp8`) around a sequence of UI steps with `record start` and `record stop`:
+
+```bash
+rho wayland --session gui record start --output /tmp/flow.webm --fps 15
+rho wayland --session gui click 500 300
+sleep 0.5
+rho wayland --session gui record stop
+```
+
+For a fixed-length foreground capture, pass `--duration` in seconds (or omit `--duration` and stop cleanly with `SIGINT`/`SIGTERM`):
+
+```bash
+rho wayland --session gui record --output /tmp/clip.webm --duration 3 --fps 15
+```
 
 ## Clean up
 

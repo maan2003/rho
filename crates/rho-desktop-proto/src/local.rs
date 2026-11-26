@@ -63,3 +63,31 @@ pub async fn request(
     })
     .await?
 }
+
+/// Captures one packed top-to-bottom BGRA8 frame from `output` into `pixels`,
+/// returning `(width, height)`.
+pub async fn capture(
+    stream: &mut BufReader<tokio::net::UnixStream>,
+    output: &str,
+    pixels: &mut Vec<u8>,
+) -> Result<(u32, u32)> {
+    let Response::Frame { width, height } = request(
+        stream,
+        Request::Capture {
+            output: output.to_owned(),
+        },
+    )
+    .await?
+    else {
+        anyhow::bail!("unexpected desktop capture response");
+    };
+    let len = crate::frame_len(width, height)
+        .ok_or_else(|| anyhow::anyhow!("invalid desktop frame dimensions: {width}x{height}"))?;
+    pixels.resize(len, 0);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_exact(pixels),
+    )
+    .await??;
+    Ok((width, height))
+}

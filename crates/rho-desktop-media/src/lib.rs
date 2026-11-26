@@ -5,6 +5,7 @@ pub const MAX_PACKET: usize = 16 * 1024 * 1024;
 #[cfg(any(feature = "encoder", feature = "decoder"))]
 pub mod codec;
 pub mod media;
+pub mod webm;
 
 /// Receiver-budgeted production, before frames acquire codec dependencies.
 pub mod sender;
