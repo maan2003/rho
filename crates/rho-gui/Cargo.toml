@@ -83,6 +83,8 @@ tikv-jemallocator = { version = "0.7", features = [
 ] }
 
 [dev-dependencies]
+# Its command spellings, ranked with every other system's.
 gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu", features = [
   "test-support",
 ] }
+rho-desktop-client = { workspace = true, features = ["ui"] }

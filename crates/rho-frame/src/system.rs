@@ -1,8 +1,9 @@
 //! What plugs into the frame.
 //!
 //! A system owns a few kinds of address and everything about them: the
-//! surfaces that open them, the rows a menu offers over them, what of
-//! them wants the user, the status changes the desk lists, what `find` finds,
+//! surfaces that open them, the commands `Commands` offers over them, what
+//! of them wants the user, the status changes the desk lists, the places
+//! `Places` lists,
 //! and the streams it keeps to each host. The frame holds systems as a list,
 //! asks each in turn, and names none of them.
 
@@ -18,6 +19,7 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
 
+use crate::command::Command;
 use crate::frame::Point;
 use crate::menu::Row;
 use crate::surface::AnySurface;
@@ -42,7 +44,7 @@ impl From<Option<AnySurface>> for Opening {
     }
 }
 
-/// A place the palette lists, which it opens.
+/// A place `Places` lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub address: Address,
@@ -62,7 +64,7 @@ pub struct Found {
 /// A project as the window shows it beside the places under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
-    /// The project's own address, as the palette lists it.
+    /// The project's own address, as `Places` lists it.
     pub address: Address,
     /// What the user calls it, such as `tide`, or `tide@lab` when two
     /// hosts have a `tide`.
@@ -128,8 +130,14 @@ pub trait System: Sized + 'static {
 
     fn detached(&mut self, _host: HostId, _cx: &mut Context<Self>) {}
 
-    /// Rows for the palette, given what is in view.
-    fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
+    /// Commands for `Commands`, given what is in view. A command about a
+    /// thing the screen does not name still lists, as `pick agent…`.
+    fn commands(
+        &mut self,
+        _point: &Point,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         Vec::new()
     }
 
@@ -182,14 +190,15 @@ pub trait System: Sized + 'static {
     }
 
     /// The project `address` is in, or is: Desk keeps a project's stops
-    /// on one row, and choosing a project in the palette narrows the
-    /// palette to its threads.
+    /// on one row, and choosing a project in `Places` narrows `Places` to
+    /// its threads.
     fn project(&self, _address: &Address, _cx: &App) -> Option<Project> {
         None
     }
 
-    /// Every place of the system's that the palette lists by title. The
-    /// frame joins them with the current hand and visit history.
+    /// Every place of the system's that `Places` lists by title: threads,
+    /// projects, pages, bookmarks, notes and charts, never a command. The
+    /// frame joins them with the hand and the places the user visited.
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
         Vec::new()
     }
@@ -221,7 +230,7 @@ trait SystemHandle {
         cx: &mut App,
     ) -> Vec<Arc<dyn HostStream>>;
     fn detached(&self, host: HostId, cx: &mut App);
-    fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn commands(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Command>;
     fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>>;
     fn claims(
         &self,
@@ -278,8 +287,8 @@ impl<S: System> SystemHandle for Entity<S> {
         self.update(cx, |system, cx| system.detached(host, cx))
     }
 
-    fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.update(cx, |system, cx| system.rows(point, window, cx))
+    fn commands(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Command> {
+        self.update(cx, |system, cx| system.commands(point, window, cx))
     }
 
     fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>> {
@@ -373,8 +382,8 @@ impl AnySystem {
         self.0.detached(host, cx)
     }
 
-    pub fn rows(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.0.rows(point, window, cx)
+    pub fn commands(&self, point: &Point, window: &mut Window, cx: &mut App) -> Vec<Command> {
+        self.0.commands(point, window, cx)
     }
 
     pub(crate) fn verdicts(&self, address: &Address, cx: &mut App) -> Option<Vec<Row>> {

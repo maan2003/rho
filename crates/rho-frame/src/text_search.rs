@@ -1,4 +1,4 @@
-//! Search snapshots for Palette. Sources own their documents; a keystroke
+//! Search snapshots for `Places`. Sources own their documents; a keystroke
 //! hands the worker only shared tree roots and resolves only displayed hits.
 use std::cmp::Reverse;
 use std::ops::Range;
@@ -10,7 +10,7 @@ use rho_agent_types::{EndpointId, MessageId};
 use rho_dealer::Address;
 use sum_tree::TreeMap;
 
-use crate::palette::{best_hit, text_marks};
+use crate::matching::{best_hit, text_marks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextKind {
@@ -21,7 +21,6 @@ pub enum TextKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextScope {
     All,
-    Commands,
     Text(Option<TextKind>),
 }
 
@@ -34,20 +33,16 @@ pub struct TextQuery<'a> {
 impl<'a> TextQuery<'a> {
     /// The caller supplies trimmed, lowercased input.
     pub fn parse(input: &'a str) -> Self {
-        let (scope, text) = if let Some(words) = input.strip_prefix('>') {
-            (TextScope::Commands, words)
+        let body = input.strip_prefix('/');
+        let text = body.unwrap_or(input).trim_start();
+        let (scope, text) = if let Some(words) = text.strip_prefix("chat:") {
+            (TextScope::Text(Some(TextKind::Chat)), words)
+        } else if let Some(words) = text.strip_prefix("note:") {
+            (TextScope::Text(Some(TextKind::Note)), words)
+        } else if body.is_some() {
+            (TextScope::Text(None), text)
         } else {
-            let body = input.strip_prefix('/');
-            let text = body.unwrap_or(input).trim_start();
-            if let Some(words) = text.strip_prefix("chat:") {
-                (TextScope::Text(Some(TextKind::Chat)), words)
-            } else if let Some(words) = text.strip_prefix("note:") {
-                (TextScope::Text(Some(TextKind::Note)), words)
-            } else if body.is_some() {
-                (TextScope::Text(None), text)
-            } else {
-                (TextScope::All, input)
-            }
+            (TextScope::All, input)
         };
         let text = text.trim();
         Self {
@@ -58,14 +53,13 @@ impl<'a> TextQuery<'a> {
     }
 
     pub(crate) fn wants_text(&self) -> bool {
-        !self.terms.is_empty() && self.scope != TextScope::Commands
+        !self.terms.is_empty()
     }
 
     fn includes(&self, kind: TextKind) -> bool {
         self.wants_text()
             && match self.scope {
                 TextScope::All | TextScope::Text(None) => true,
-                TextScope::Commands => false,
                 TextScope::Text(Some(only)) => only == kind,
             }
     }
@@ -484,10 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn scopes_disjointly_select_command_rows_and_text_sources() {
+    fn scopes_disjointly_select_text_sources() {
         for (input, expected) in [
             ("clock", [true, true]),
-            ("> clock", [false, false]),
+            // `>` once meant commands; commands are never in `Places`.
+            ("> clock", [true, true]),
             ("/ clock", [true, true]),
             ("chat: clock", [true, false]),
             ("/ chat: clock", [true, false]),

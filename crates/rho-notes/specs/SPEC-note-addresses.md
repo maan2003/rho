@@ -13,7 +13,7 @@ one of them owns its form.
   its simple form: 32 lowercase hex digits, no hyphens.
 - That form is the only one. The same UUID written any other way is not
   the note's address and opens nothing, so one note has one key in the
-  ledger, in history and in `find`.
+  ledger, among recent places and in `find`.
 - The id is minted once, by the device that makes the note, and never
   changes. A note's text and what it is about are said about the
   address; editing it never mints a new one.

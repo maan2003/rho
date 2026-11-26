@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use gpui::{Context, Entity, Window};
+use rho_agent_hosts::HostStatus;
 use rho_agent_types::{AgentId, RuntimeCatalogue};
 use rho_agents_client::protocol::transcript::RuntimeKind;
 use rho_agents_client::protocol::worksets::{Cancel, CancelResult, RewindAgent, StopAgent};
@@ -14,7 +15,27 @@ use rho_window::style::StyleClass;
 
 use super::AgentsSystem;
 
-const AWAY: &str = "the agent's host is not attached";
+/// The agent's host was detached, or never attached.
+pub(super) const NOT_ATTACHED: &str = "the agent's host is not attached";
+/// The agent's host is attached but does not answer now.
+pub(super) const DISCONNECTED: &str = "the agent's host is disconnected";
+
+/// What the echo line says when an agent's host cannot take a command now,
+/// given how the frame last heard the host: `None` when it is not attached.
+/// Only a host that is online takes one; a host that dials, reconnects or
+/// does not trust this device yet is away for now.
+pub(super) fn unreachable(status: Option<&HostStatus>) -> Option<&'static str> {
+    match status {
+        None => Some(NOT_ATTACHED),
+        Some(HostStatus::Online) => None,
+        Some(
+            HostStatus::Connecting
+            | HostStatus::Recovering(_)
+            | HostStatus::Disconnected(_)
+            | HostStatus::Unenrolled(_),
+        ) => Some(DISCONNECTED),
+    }
+}
 
 /// Takes back the agent's last `turns` turns; it waits for the user.
 pub(super) fn rewind(
@@ -26,7 +47,7 @@ pub(super) fn rewind(
     let system = system.read(cx);
     let frame = system.frame.clone();
     let Some(agents) = system.agents_for(agent) else {
-        frame.echo(AWAY, StyleClass::SystemInfo, cx);
+        frame.echo(NOT_ATTACHED, StyleClass::SystemInfo, cx);
         return;
     };
     let label = system.label(agent, cx).0;
@@ -40,7 +61,7 @@ pub(super) fn rewind(
                 cx,
             ),
             Err(error) => frame.echo(
-                format!("rewind turns: {error:#}"),
+                format!("rewind agent: {error:#}"),
                 StyleClass::SystemImportant,
                 cx,
             ),
@@ -55,7 +76,7 @@ pub(super) fn compact(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Co
         let label = system.label(agent, cx).0;
         system.eval(
             agent,
-            "compact context",
+            "compact agent",
             snippets::compact(agent),
             Some(format!("compacted: {label}")),
             cx,
@@ -64,28 +85,26 @@ pub(super) fn compact(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Co
 }
 
 /// Starts the agent's model cache afresh.
-pub(super) fn new_cache_key(
-    system: &Entity<AgentsSystem>,
-    agent: AgentId,
-    cx: &mut Context<Frame>,
-) {
+pub(super) fn reset_cache(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
     system.update(cx, |system, cx| {
         let label = system.label(agent, cx).0;
         system.eval(
             agent,
-            "new cache key",
+            "reset agent cache",
             snippets::new_cache_key(agent),
-            Some(format!("new cache key: {label}")),
+            Some(format!("reset cache: {label}")),
             cx,
         );
     });
 }
 
-/// Asks which runtime the agent changes to, offering what its host's
-/// catalogue has of the agent's kind, then changes it.
+/// Changes the agent's runtime to the one typed after the command's name,
+/// or asks which, offering what its host's catalogue has of the agent's
+/// kind.
 pub(super) fn set_runtime(
     system: &Entity<AgentsSystem>,
     agent: AgentId,
+    typed: Option<String>,
     frame: &mut Frame,
     window: &mut Window,
     cx: &mut Context<Frame>,
@@ -117,9 +136,40 @@ pub(super) fn set_runtime(
         let choices = switchable(&catalogue, spec.runtime, &current, can_change_kind);
         (current, catalogue, choices)
     };
+    let prompt = format!("runtime ({current}):");
     let system = system.clone();
+    let change = move |frame: &mut Frame, input: &str, cx: &mut Context<Frame>| {
+        let input = input.trim();
+        if input.is_empty() {
+            frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
+            return;
+        }
+        match catalogue.label(input) {
+            Ok(runtime) => system.update(cx, |system, cx| {
+                system.eval(
+                    agent,
+                    "set agent runtime",
+                    snippets::set_runtime(agent, &runtime),
+                    Some(format!(
+                        "runtime: {} · {} (was {current})",
+                        system.label(agent, cx).0,
+                        runtime.label(),
+                    )),
+                    cx,
+                );
+            }),
+            Err(error) => frame.echo(
+                &format!("set agent runtime: {error}"),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
+    };
+    if let Some(typed) = typed {
+        return change(frame, &typed, cx);
+    }
     frame.open_prompt(
-        format!("runtime ({current}):"),
+        prompt,
         Rc::new(move |_, needle, _| {
             let needle = needle.to_ascii_lowercase();
             choices
@@ -131,28 +181,7 @@ pub(super) fn set_runtime(
                 })
                 .collect()
         }),
-        Rc::new(move |frame, input, _, cx| {
-            if input.trim().is_empty() {
-                frame.echo("choose a runtime", StyleClass::SystemInfo, cx);
-                return;
-            }
-            match catalogue.label(&input) {
-                Ok(runtime) => system.update(cx, |system, cx| {
-                    system.eval(
-                        agent,
-                        "set runtime",
-                        snippets::set_runtime(agent, &runtime),
-                        Some(format!(
-                            "runtime: {} · {} (was {current})",
-                            system.label(agent, cx).0,
-                            runtime.label(),
-                        )),
-                        cx,
-                    );
-                }),
-                Err(error) => frame.echo(&error, StyleClass::SystemInfo, cx),
-            }
-        }),
+        Rc::new(move |frame, input, _, cx| change(frame, &input, cx)),
         window,
         cx,
     );
@@ -163,7 +192,7 @@ pub(super) fn stop(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Conte
     let system = system.read(cx);
     let frame = system.frame.clone();
     let Some(agents) = system.agents_for(agent) else {
-        frame.echo(AWAY, StyleClass::SystemImportant, cx);
+        frame.echo(NOT_ATTACHED, StyleClass::SystemImportant, cx);
         return;
     };
     let reply = agents.call(StopAgent { agent });
@@ -191,7 +220,7 @@ pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Con
     let system = system.read(cx);
     let frame = system.frame.clone();
     let Some(agents) = system.agents_for(agent) else {
-        frame.echo(AWAY, StyleClass::SystemInfo, cx);
+        frame.echo(NOT_ATTACHED, StyleClass::SystemInfo, cx);
         return;
     };
     let reply = agents.call(Cancel { agent });
@@ -208,7 +237,7 @@ pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Con
                 cx,
             ),
             Err(error) => frame.echo(
-                format!("cancel the request: {error:#}"),
+                format!("cancel agent request: {error:#}"),
                 StyleClass::SystemImportant,
                 cx,
             ),
@@ -259,7 +288,26 @@ fn rewound(label: &str, turns: u32, taken_back: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// A host that is attached but away is told apart from one that is not
+    /// attached: the first comes back by itself, the second needs the user.
+    #[test]
+    fn an_away_host_is_disconnected_and_a_missing_one_is_not_attached() {
+        assert_eq!(unreachable(None), Some(NOT_ATTACHED));
+        assert_eq!(unreachable(Some(&HostStatus::Online)), None);
+        for away in [
+            HostStatus::Connecting,
+            HostStatus::Recovering(Duration::from_secs(12)),
+            HostStatus::Disconnected("timed out".into()),
+            HostStatus::Unenrolled("rho enroll …".into()),
+        ] {
+            assert_eq!(unreachable(Some(&away)), Some(DISCONNECTED), "{away:?}");
+        }
+        assert_ne!(NOT_ATTACHED, DISCONNECTED);
+    }
 
     #[test]
     fn rewind_echo_uses_the_host_receipt_not_the_transcripts_current_text() {

@@ -26,7 +26,7 @@ use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Card, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage};
-use rho_frame::{CardHere, Layout, Row, Subject, Surface};
+use rho_frame::{CardHere, Command, Layout, Spelling, Subject, Surface};
 use rho_notes::NoteId;
 use rho_transcript::{BlockLine, BlockSpec, Item, Transcript};
 use rho_window::draft;
@@ -42,6 +42,44 @@ actions!(rho_chat, [GoToDraft, GoToOldestMessage]);
 
 const PRIVATE_SCREEN: &str = "RhoPrivateReply";
 const PRIVATE_KEY: &str = "alt-r";
+
+pub static REPLY_PRIVATELY: Spelling = Spelling {
+    name: "reply privately",
+    aliases: &[
+        ("private reply", 9),
+        ("note on message", 7),
+        ("annotate message", 5),
+    ],
+    argument: None,
+};
+
+pub static QUOTE_MESSAGE: Spelling = Spelling {
+    name: "quote message",
+    aliases: &[("quote", 9), ("cite", 6)],
+    argument: None,
+};
+
+pub static WRITE_REPLY_AGAIN: Spelling = Spelling {
+    name: "write reply again",
+    aliases: &[
+        ("retry reply", 8),
+        ("resend reply", 8),
+        ("edit refused reply", 6),
+    ],
+    argument: None,
+};
+
+pub static SEND_MESSAGE: Spelling = Spelling {
+    name: "send message",
+    aliases: &[("send", 9), ("reply", 6), ("post", 6)],
+    argument: None,
+};
+
+pub static OPEN_UNDER_CURSOR: Spelling = Spelling {
+    name: "open under cursor",
+    aliases: &[("follow link", 7), ("open link", 7), ("open", 4)],
+    argument: None,
+};
 const PRIVATE_SEPARATOR: &str = "── private · only you see this · escape keeps it";
 
 pub(super) fn bind(cx: &mut App) {
@@ -1869,18 +1907,23 @@ impl Surface for ThreadView {
         }))
     }
 
-    fn rows(&mut self, _: Option<Seen>, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn commands(
+        &mut self,
+        _: Option<Seen>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         if self.private_edit.is_some() {
             return Vec::new();
         }
         let this = cx.entity();
         let has_draft = self.has_draft(cx);
         let send = this.clone();
-        let mut rows = Vec::new();
+        let mut commands = Vec::new();
         if self.private_target(cx).is_some() {
             let view = this.clone();
-            rows.push(
-                Row::run(PRIVATE_KEY, "reply privately", move |_, window, cx| {
+            commands.push(
+                Command::simple(&REPLY_PRIVATELY, move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.reply_privately(&ReplyPrivately, window, cx)
                     });
@@ -1894,7 +1937,7 @@ impl Surface for ThreadView {
             .is_some()
         {
             let view = this.clone();
-            rows.push(Row::run("", "quote message line", move |_, window, cx| {
+            commands.push(Command::simple(&QUOTE_MESSAGE, move |_, window, cx| {
                 view.update(cx, |view, cx| {
                     let row = view.cursor_row(cx);
                     let lines = view
@@ -1906,32 +1949,32 @@ impl Surface for ThreadView {
         }
         if self.system.read(cx).refused_reply(self.thread).is_some() {
             let view = this.clone();
-            rows.push(Row::run("", "write this reply again", move |_, _, cx| {
+            commands.push(Command::simple(&WRITE_REPLY_AGAIN, move |_, _, cx| {
                 view.update(cx, |view, cx| view.write_reply_again(cx));
             }));
         }
         if has_draft {
-            rows.push(
-                Row::run("ctrl-enter", "send", move |_, window, cx| {
+            commands.push(
+                Command::simple(&SEND_MESSAGE, move |_, window, cx| {
                     send.update(cx, |view, cx| view.send(&SendMessage, window, cx));
                 })
                 .bound_to(SendMessage),
             );
         }
-        // `look into the work` is the agents system's, on every screen.
+        // `open transcript` is the agents system's, on every screen.
         // The thumb's Open action follows Enter at the point.
         if matches!(
             self.enter_action(self.selection_range(cx), cx),
             Some(Enter::Inline(_) | Enter::Open(_))
         ) {
-            rows.push(
-                Row::run("enter", "open", move |_, window, cx| {
+            commands.push(
+                Command::simple(&OPEN_UNDER_CURSOR, move |_, window, cx| {
                     this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
                 })
                 .bound_to(OpenRow),
             );
         }
-        rows
+        commands
     }
 }
 
@@ -2319,7 +2362,7 @@ mod tests {
             })
         });
         cx.run_until_parked();
-        const AGAIN: &str = "write this reply again";
+        const AGAIN: &str = "write reply again";
         let doc = |cx: &mut gpui::TestAppContext| {
             window
                 .update(cx, |frame, _, cx| {
@@ -2344,18 +2387,15 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
         };
-        // Runs the palette row, when the thread offers it.
+        // Runs the command, when the thread offers it.
         let again = |cx: &mut gpui::TestAppContext| {
             window
                 .update(cx, |frame, window, cx| {
-                    let rows = frame.current_surface().rows(None, window, cx);
-                    let run = rows.into_iter().find_map(|row| match row.pick {
-                        rho_frame::menu::Pick::Run { label, run, .. } if label == AGAIN => {
-                            Some(run)
-                        }
-                        _ => None,
-                    })?;
-                    run(frame, None, window, cx);
+                    let commands = frame.current_surface().commands(None, window, cx);
+                    let command = commands
+                        .into_iter()
+                        .find(|command| command.name() == AGAIN)?;
+                    command.run(None, frame, window, cx);
                     Some(())
                 })
                 .unwrap()
@@ -2705,18 +2745,18 @@ mod tests {
         assert_eq!(deep.0.row, 150);
         assert!(deep.1 > 100., "the history is scrolled: {}", deep.1);
 
-        // Back through history and forward again: the view is as left.
+        // Flipping back through the recent places: the view is as left.
         open(other.address(), cx);
         view(cx);
         window
-            .update(cx, |frame, window, cx| frame.back(window, cx))
+            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
             .unwrap();
         assert_eq!(view(cx), deep);
         window
-            .update(cx, |frame, window, cx| frame.forward_or_deal(window, cx))
+            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
             .unwrap();
         window
-            .update(cx, |frame, window, cx| frame.back(window, cx))
+            .update(cx, |frame, window, cx| frame.previous_place(window, cx))
             .unwrap();
         assert_eq!(view(cx), deep);
 
@@ -2900,13 +2940,12 @@ mod tests {
         if matches!(check, CheckThread::WorkTarget) {
             // The thread names who its draft steers; the agents system's
             // commands, on every screen, act on that. The thread offers no
-            // `look into the work` of its own, so the palette has one.
+            // `open transcript` of its own, so `Commands` has one.
             let own_look =
                 |view: &mut ThreadView, window: &mut Window, cx: &mut Context<ThreadView>| {
-                    view.rows(None, window, cx).into_iter().any(|row| {
-                        matches!(row.pick, rho_frame::menu::Pick::Run { label, .. }
-                        if label == "look into the work")
-                    })
+                    view.commands(None, window, cx)
+                        .iter()
+                        .any(|command| command.name() == "open transcript")
                 };
             window
                 .update(cx, |view, window, cx| {
@@ -3028,16 +3067,23 @@ mod tests {
                     cx.notify();
                 });
             });
-            window.update(cx, |view, window, cx| {
-                let key = Key::Message(MessageId(ChatSeq(5)));
-                assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
-                assert_eq!(view.link_at(view.cursor(cx), cx).unwrap().as_str(), "https://proof.example.invalid/clock");
-                let rows = view.rows(None, window, cx);
-                assert!(
-                    rows.into_iter().any(|row| matches!(row.pick, rho_frame::menu::Pick::Run { label, .. } if label == "open")),
-                    "the palette must offer open for this ordinary mail line"
-                );
-            }).unwrap();
+            window
+                .update(cx, |view, window, cx| {
+                    let key = Key::Message(MessageId(ChatSeq(5)));
+                    assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
+                    assert_eq!(
+                        view.link_at(view.cursor(cx), cx).unwrap().as_str(),
+                        "https://proof.example.invalid/clock"
+                    );
+                    let commands = view.commands(None, window, cx);
+                    assert!(
+                        commands
+                            .iter()
+                            .any(|command| command.name() == OPEN_UNDER_CURSOR.name),
+                        "Commands must offer open for this ordinary mail line"
+                    );
+                })
+                .unwrap();
             return;
         }
 
@@ -3064,10 +3110,12 @@ mod tests {
                     );
                     let key = Key::Message(MessageId(ChatSeq(2)));
                     assert!(view.cursor_to_item(&key, Autoscroll::fit(), cx));
-                    let rows = view.rows(None, host_window, cx);
-                    assert!(!rows.iter().any(|row| matches!(&row.pick,
-                        rho_frame::menu::Pick::Run { label, .. } if label.starts_with("answer this")
-                    )));
+                    let commands = view.commands(None, host_window, cx);
+                    assert!(
+                        !commands
+                            .iter()
+                            .any(|command| command.name().starts_with("answer"))
+                    );
                     let row = view.cursor_row(cx);
                     view.quote(row..=row, host_window, cx);
                     assert!(view.on_draft(cx));

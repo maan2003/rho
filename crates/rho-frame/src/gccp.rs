@@ -1,7 +1,7 @@
 //! What the user says about GCCP on a host: the other harnesses whose
 //! agents the host's agents may talk to, and the addresses on them its
 //! agents accepted. The same as `rho gccp` and
-//! `rho iroh approve --role gccp` on the host, from the palette on any
+//! `rho iroh approve --role gccp` on the host, from `Commands` on any
 //! screen (`hosts.Host`'s `gccp`).
 
 use std::future::Future;
@@ -13,26 +13,46 @@ use rho_agent_hosts::protocol::{GccpApprove, GccpContact, GccpList, GccpRemove, 
 use rho_agent_types::AgentId;
 use rho_window::style::StyleClass;
 
+use crate::command::{Command, Spelling};
 use crate::frame::Frame;
-use crate::menu::{Row, Rows};
 use crate::minibuffer::Candidate;
 
-const LIST: &str = "gccp list";
-const APPROVE: &str = "gccp approve";
-const REMOVE: &str = "gccp remove";
+const LIST: &str = "list gccp agents";
+const APPROVE: &str = "approve gccp agent";
+const REMOVE: &str = "remove gccp agent";
 
-/// `hosts › gccp › …`.
-pub(crate) fn rows() -> Rows {
-    Rows::new("gccp")
-        .row(Row::run("l", "list", |frame, window, cx| {
+pub static LIST_GCCP: Spelling = Spelling {
+    name: LIST,
+    aliases: &[("gccp", 8), ("harnesses", 6), ("endpoint", 5)],
+    argument: None,
+};
+
+pub static APPROVE_GCCP: Spelling = Spelling {
+    name: APPROVE,
+    aliases: &[("trust harness", 7), ("approve harness", 7), ("gccp", 5)],
+    argument: None,
+};
+
+pub static REMOVE_GCCP: Spelling = Spelling {
+    name: REMOVE,
+    aliases: &[("forget gccp address", 7), ("revoke gccp", 7), ("gccp", 4)],
+    argument: None,
+};
+
+/// The gccp commands, each asking for a host when more than one is
+/// attached.
+pub(crate) fn commands() -> Vec<Command> {
+    vec![
+        Command::simple(&LIST_GCCP, |frame, window, cx| {
             frame.choose_host(LIST, Rc::new(list), window, cx)
-        }))
-        .row(Row::run("a", "approve…", |frame, window, cx| {
+        }),
+        Command::simple(&APPROVE_GCCP, |frame, window, cx| {
             frame.choose_host(APPROVE, Rc::new(approve), window, cx)
-        }))
-        .row(Row::run("r", "remove…", |frame, window, cx| {
+        }),
+        Command::simple(&REMOVE_GCCP, |frame, window, cx| {
             frame.choose_host(REMOVE, Rc::new(remove), window, cx)
-        }))
+        }),
+    ]
 }
 
 /// Everything the host says of GCCP, one row each; enter copies the row's

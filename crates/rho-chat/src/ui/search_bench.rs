@@ -110,14 +110,14 @@ pub(super) fn fixture_on(
 
 #[gpui::test]
 #[ignore = "performance benchmark"]
-fn bench_palette_find_text(cx: &mut gpui::TestAppContext) {
+fn bench_places_find_text(cx: &mut gpui::TestAppContext) {
     let (_window, mail, _db) = fixture(cx, corpus());
     cx.update(|cx| {
         let mail = mail.read(cx);
         let current = Address::new("frame", "desk");
         let mut bench = criterion::Criterion::default().without_plots();
         for query in ["c", "clock", "clock beh"] {
-            bench.bench_function(&format!("palette/find-text-10000/{query}"), |b| {
+            bench.bench_function(&format!("places/find-text-10000/{query}"), |b| {
                 b.iter(|| {
                     let mut search = TextSearch::new(std::hint::black_box(query).to_owned(), 100);
                     mail.text_sources(&mut search, &current, cx);
@@ -129,7 +129,7 @@ fn bench_palette_find_text(cx: &mut gpui::TestAppContext) {
                         .collect::<Vec<_>>()
                 })
             });
-            bench.bench_function(&format!("palette/ui-10000/{query}"), |b| {
+            bench.bench_function(&format!("places/ui-10000/{query}"), |b| {
                 let mut search = TextSearch::new(query.to_owned(), 100);
                 mail.text_sources(&mut search, &current, cx);
                 let hits = search.find(&std::sync::atomic::AtomicBool::new(false));
@@ -148,12 +148,12 @@ fn bench_palette_find_text(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 #[ignore = "performance benchmark"]
-fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
+fn bench_places_ui_keys(cx: &mut gpui::TestAppContext) {
     use std::time::Instant;
 
-    // Opt-in: record timings for the Palette's own work independently of
+    // Opt-in: record timings for Places' own work independently of
     // GPUI's whole-window dispatch and paint, without printing query text.
-    let _profile = std::env::var_os("RHO_PALETTE_TRACE").map(|_| {
+    let _profile = std::env::var_os("RHO_PLACES_TRACE").map(|_| {
         let reporter = tracing_subscriber::fmt()
             .with_env_filter("rho_frame::minibuffer=trace")
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
@@ -169,7 +169,7 @@ fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
     let mut key_ms = Vec::new();
     let mut frame_ms = Vec::new();
     for _ in 0..20 {
-        cx.dispatch_action(window, rho_frame::keys::Palette);
+        cx.dispatch_action(window, rho_frame::keys::Places);
         cx.draw_window(window);
         cx.simulate_input(window, "chat: ");
         cx.draw_window(window);
@@ -193,7 +193,7 @@ fn bench_palette_ui_keys(cx: &mut gpui::TestAppContext) {
     for (what, mut times) in [("dispatch", key_ms), ("whole-window draw", frame_ms)] {
         times.sort_unstable_by(f64::total_cmp);
         println!(
-            "palette UI {what}, {} real keypresses (ms): median {:.3}, p95 {:.3}, max {:.3}",
+            "places UI {what}, {} real keypresses (ms): median {:.3}, p95 {:.3}, max {:.3}",
             times.len(),
             times[times.len() / 2],
             times[(times.len() * 95 / 100) - 1],

@@ -4,12 +4,12 @@
 //! revision per save and the newest is the note. It is the user's marks,
 //! which the frame holds ([`Frame::marks`]), so [`NoteSystem`] keeps
 //! no disk copy of it: it reads the marks and says what the user typed
-//! through [`Frame::write_marks`]. The palette's in-memory projection
+//! through [`Frame::write_marks`]. `Places`' in-memory projection
 //! follows those marks and the text not yet written. The machine never writes a
 //! note's text: every revision this crate says is a buffer's text as the user
 //! left it.
 //!
-//! Notes stay off Desk. The `notes` command opens [`NotesView`], where the
+//! Notes stay off Desk. The `list notes` command opens [`NotesView`], where the
 //! user can find or start a note without sending their words anywhere.
 //!
 //! Addresses are `note:<id>`
@@ -31,11 +31,31 @@ use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{
-    AnySurface, Found, FoundText, Frame, FrameLink, Opening, Point, Row, SearchPoint, System,
-    TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
+    AnySurface, Command, Found, FoundText, Frame, FrameLink, Opening, Point, SearchPoint, Spelling,
+    System, TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
 pub use view::NoteView;
 
+pub static NEW_NOTE: Spelling = Spelling {
+    name: "new note",
+    aliases: &[
+        ("note", 8),
+        ("write note", 8),
+        ("jot", 6),
+        ("memo", 6),
+        ("remember", 4),
+    ],
+    argument: None,
+};
+
+pub static LIST_NOTES: Spelling = Spelling {
+    name: "list notes",
+    aliases: &[("notes", 9), ("my notes", 7), ("find note", 5)],
+    argument: None,
+};
+
+/// How the notes' commands are spelled, for ranking every system's together.
+pub static SPELLINGS: &[&Spelling] = &[&NEW_NOTE, &LIST_NOTES];
 /// How long after the last keystroke a note's text is written.
 const SAVE_AFTER: Duration = Duration::from_millis(700);
 
@@ -200,7 +220,7 @@ fn excerpt<'a>(words: impl Iterator<Item = &'a str>) -> String {
     result
 }
 
-/// Every note as the palette lists it, by the first line `title` reads:
+/// Every note as `Places` lists it, by the first line `title` reads:
 /// a private reply as one, a note about nothing as a note, each as new as
 /// its last revision.
 fn found(marks: &Marks, title: impl Fn(NoteId) -> String) -> Vec<Found> {
@@ -427,14 +447,16 @@ impl System for NoteSystem {
         }
     }
 
-    fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        // Rare: a window-wide command, below what this screen offers.
-        rows.push(Row::run("w", "new note", make_note).window_wide());
-        // The one door to the notes, on every screen: one of the window's
-        // own commands.
-        rows.push(
-            Row::run("shift-w", "notes", |frame, window, cx| {
+    fn commands(
+        &mut self,
+        _point: &Point,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<Command> {
+        vec![
+            Command::simple(&NEW_NOTE, make_note),
+            // The one door to the notes, on every screen.
+            Command::simple(&LIST_NOTES, |frame, window, cx| {
                 let note = NoteId::from_address(frame.current_address());
                 frame.open(notes_address(), window, cx);
                 if let Some(note) = note
@@ -442,10 +464,8 @@ impl System for NoteSystem {
                 {
                     list.update(cx, |list, cx| list.return_to(note, cx));
                 }
-            })
-            .window_wide(),
-        );
-        rows
+            }),
+        ]
     }
 
     /// A note is called by its first line: the one being typed while the
@@ -459,8 +479,8 @@ impl System for NoteSystem {
         Some((title, String::new()))
     }
 
-    /// Every note, by its first line as the user is typing it, for the
-    /// palette.
+    /// Every note, by its first line as the user is typing it, for
+    /// `Places`.
     fn find(&self, marks: &Marks, _cx: &App) -> Vec<Found> {
         found(marks, |note| match self.pending_text(note) {
             Some(text) => title_of(text),

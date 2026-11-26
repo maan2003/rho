@@ -1,11 +1,11 @@
 //! The phone: the same frame, laid out for a thumb.
 //!
 //! A window at most [`PHONE_MAX_WIDTH`] wide is a phone's. It shows what
-//! the desk shows, the one surface from the one history with the status
-//! line, the minibuffer and the echo, and adds what a keyboard would have
-//! given: a bar along the bottom edge, menus as a sheet of rows a thumb
-//! can hit, and a flick on the surface for up and down through the
-//! history. Nothing here is a second place for state; every button runs
+//! the desk shows, the one surface in view with the status line, the
+//! minibuffer and the echo, and adds what a keyboard would have given: a
+//! bar along the bottom edge, menus as a sheet of rows a thumb can hit,
+//! and a flick on the surface to deal the next card or flip to the place
+//! before. Nothing here is a second place for state; every button runs
 //! what a key runs.
 
 use std::collections::BTreeSet;
@@ -22,8 +22,7 @@ use theme::ActiveTheme as _;
 
 use crate::attention::Verdict;
 use crate::frame::{Frame, snooze_rows};
-use crate::keys;
-use crate::menu::{Pick, Row, Rows};
+use crate::menu::{Pick, Rows};
 use crate::surface::{AnySurface, PhoneSend};
 
 /// The widest window that is laid out as a phone.
@@ -168,8 +167,8 @@ pub(crate) fn measure<'a>(
     }
 }
 
-/// Which ends of its buffer the surface is scrolled to. A flick only moves
-/// through the history from an end, so a flick in the middle scrolls.
+/// Which ends of its buffer the surface is scrolled to. A flick only deals
+/// or flips from an end, so a flick in the middle scrolls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollEdge {
     Top,
@@ -275,7 +274,8 @@ pub(crate) struct Phone {
 /// One button on the bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Button {
-    Back,
+    /// `Places`, as `space f` opens it.
+    Places,
     Desk,
     Menu,
     /// Deal the top card.
@@ -292,7 +292,7 @@ pub(crate) enum Button {
 impl Button {
     fn id(self) -> &'static str {
         match self {
-            Self::Back => "rho-phone-back",
+            Self::Places => "rho-phone-places",
             Self::Desk => "rho-phone-desk",
             Self::Menu => "rho-phone-menu",
             Self::Open => "rho-phone-open",
@@ -308,7 +308,7 @@ impl Button {
 
     fn face(self) -> (&'static str, &'static str) {
         match self {
-            Self::Back => ("‹", "back"),
+            Self::Places => ("⌕", "places"),
             Self::Desk => ("⌂", "desk"),
             Self::Menu => ("☰", "menu"),
             Self::Open => ("→", "open"),
@@ -358,7 +358,7 @@ fn buttons(state: BarState) -> Vec<Button> {
             card: Some(OpenCard::Here),
             writing: true,
             ..
-        } => vec![Back, Menu, Undo, Send],
+        } => vec![Places, Menu, Undo, Send],
         BarState {
             card,
             send,
@@ -366,9 +366,9 @@ fn buttons(state: BarState) -> Vec<Button> {
             ..
         } => {
             let mut buttons = match card {
-                Some(OpenCard::Here) => vec![Back, Menu, Done, Snooze, More],
-                Some(OpenCard::Related) => vec![Back, Done, Snooze, More, Menu],
-                None => vec![Back, Desk, Menu],
+                Some(OpenCard::Here) => vec![Places, Menu, Done, Snooze, More],
+                Some(OpenCard::Related) => vec![Places, Done, Snooze, More, Menu],
+                None => vec![Places, Desk, Menu],
             };
             if writing {
                 buttons.push(Undo);
@@ -540,8 +540,8 @@ impl Frame {
         cx.notify();
     }
 
-    /// A committed flick is the history's up and down: up the screen is
-    /// down the history, and off its newest entry the next card is dealt.
+    /// A committed flick: up the screen deals the next card, down it
+    /// flips to the place visited before.
     fn flick(
         &mut self,
         direction: PhoneFlickDirection,
@@ -550,8 +550,8 @@ impl Frame {
     ) {
         let before = self.current_address().clone();
         match direction {
-            PhoneFlickDirection::Up => self.forward_or_deal(window, cx),
-            PhoneFlickDirection::Down => self.back(window, cx),
+            PhoneFlickDirection::Up => self.pull_card(window, cx),
+            PhoneFlickDirection::Down => self.previous_place(window, cx),
         }
         rho_journal::record(rho_journal::Event::PhoneFlick {
             direction,
@@ -641,8 +641,8 @@ impl Frame {
             prompting,
             composing,
             desk: self.desk_in_view(),
-            // Working in a terminal or shell keeps the navigation bar and
-            // its Palette; that still offers the same related verdicts.
+            // Working in a terminal or shell keeps the navigation bar, and
+            // its leader still offers the related card's verdicts.
             card: (tools.iter().all(|tool| tool.replaces_desk) && self.phone_card(cx).is_some())
                 .then(|| {
                     if surface.inspects_card(cx) {
@@ -761,16 +761,16 @@ impl Frame {
         }
         let target = self.phone_card(cx);
         match button {
-            Button::Back => self.back(window, cx),
+            Button::Places => self.places(window, cx),
             Button::Desk => self.toggle_desk(window, cx),
-            Button::Menu => self.palette(window, cx),
+            Button::Menu => self.commands_prompt(window, cx),
             Button::Open => self.pull_card(window, cx),
             Button::Done => {
                 if let Some(target) = &target {
                     if self.own_verdicts(target, cx).is_some() {
                         // A card answered in its own words, such as a push
                         // to approve or deny, is never just done.
-                        self.verdict_menu(window, cx);
+                        self.leader(window, cx);
                     } else {
                         record_verdict(PhoneVerdict::Done);
                         self.verdict(target, Verdict::Done, "done".to_owned(), window, cx);
@@ -784,20 +784,7 @@ impl Frame {
                     self.open_menu(rows, window, cx);
                 }
             }
-            Button::More if self.desk_in_view() => {
-                let rows = Rows::new("desk")
-                    .row(Row::run("b", "back", |frame, window, cx| {
-                        frame.back(window, cx)
-                    }))
-                    .row(Row::run("i", "write an idea", |_, window, cx| {
-                        window.dispatch_action(Box::new(keys::PromptIdea), cx)
-                    }))
-                    .row(Row::run("u", "undo", |frame, window, cx| {
-                        frame.undo_verdict(window, cx)
-                    }));
-                self.open_menu(rows, window, cx);
-            }
-            Button::More => self.verdict_menu(window, cx),
+            Button::More => self.leader(window, cx),
             Button::Undo => {
                 if let Some(editor) = self.current_surface().editor(cx) {
                     editor.update(cx, |editor, cx| {
@@ -1087,24 +1074,24 @@ mod tests {
             card: Some(OpenCard::Here),
             ..BarState::default()
         };
-        assert_eq!(buttons(card), [Back, Menu, Done, Snooze, More]);
+        assert_eq!(buttons(card), [Places, Menu, Done, Snooze, More]);
         let thread = BarState { send: true, ..card };
-        assert_eq!(buttons(thread), [Back, Menu, Done, Snooze, More]);
+        assert_eq!(buttons(thread), [Places, Menu, Done, Snooze, More]);
         assert_eq!(
             buttons(BarState {
                 writing: true,
                 ..thread
             }),
-            [Back, Menu, Undo, Send]
+            [Places, Menu, Undo, Send]
         );
         assert_eq!(
             buttons(BarState {
                 card: Some(OpenCard::Related),
                 ..BarState::default()
             }),
-            [Back, Done, Snooze, More, Menu]
+            [Places, Done, Snooze, More, Menu]
         );
-        assert_eq!(buttons(BarState::default()), [Back, Desk, Menu]);
+        assert_eq!(buttons(BarState::default()), [Places, Desk, Menu]);
         assert_eq!(
             buttons(BarState {
                 composing: true,

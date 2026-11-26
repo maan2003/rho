@@ -5,7 +5,7 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_types::{Activity, AgentId, Message, MessageId};
-use rho_frame::{CardHere, Row, Subject, Surface};
+use rho_frame::{CardHere, Subject, Surface};
 use rho_window::style::StyleClass;
 
 use super::{AgentsSystem, Scope};
@@ -314,17 +314,6 @@ impl Surface for TranscriptSurface {
 
     fn card(&self, _cx: &App) -> CardHere {
         CardHere::Inspected
-    }
-
-    /// Every command about the work is the agents system's, from any
-    /// screen.
-    fn rows(
-        &mut self,
-        _: Option<rho_frame::surface::Seen>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Vec<Row> {
-        Vec::new()
     }
 }
 

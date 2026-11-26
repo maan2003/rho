@@ -4,7 +4,9 @@
 //! a transient block (`rho_window::transient`), reads the key, and runs
 //! the row. A row that opens another menu carries its rows; the frame
 //! keeps the menus a reader went down through, so escape returns one step
-//! and `shift` closes them all.
+//! and `shift` closes them all. Menus are only the short keyed lists
+//! (`window.Menu`): the `space` leader and the snooze times. Every other
+//! choice is a [`crate::Command`] or a prompt.
 
 use std::rc::Rc;
 
@@ -48,35 +50,11 @@ impl Pick {
     }
 }
 
-/// Whose command a row is, for the palette's order: the screen's and the
-/// thing's under the cursor come before the window's own, which every
-/// screen has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Scope {
-    /// For the screen in view, or for what the cursor is on.
-    #[default]
-    Here,
-    /// The window's own: the same on every screen.
-    Window,
-}
-
 #[derive(Clone)]
 pub struct Row {
     pub key: String,
-    /// Other words the palette finds the row by.
-    pub also: Vec<String>,
     pub pick: Pick,
-    pub scope: Scope,
-    pub(crate) shortcut: Option<Shortcut>,
     pub(crate) snooze: Option<crate::when::SnoozeUnit>,
-}
-
-#[derive(Clone)]
-pub(crate) enum Shortcut {
-    /// A binding to resolve in the screen's actual key context.
-    Action(Rc<dyn gpui::Action>),
-    /// A sequence beginning with a resolved binding into a real menu.
-    Menu(String),
 }
 
 impl Row {
@@ -87,27 +65,12 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            also: Vec::new(),
             pick: Pick::Run {
                 label: description.into(),
                 run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
             },
-            scope: Scope::Here,
-            shortcut: None,
             snooze: None,
         }
-    }
-
-    /// The row is one of the window's own commands, on every screen: the
-    /// palette lists it after the screen's.
-    pub fn window_wide(mut self) -> Self {
-        self.scope = Scope::Window;
-        self
-    }
-
-    pub fn bound_to(mut self, action: impl gpui::Action) -> Self {
-        self.shortcut = Some(Shortcut::Action(Rc::new(action)));
-        self
     }
 
     /// A row that reads the count typed before it: `45 m`.
@@ -118,13 +81,10 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            also: Vec::new(),
             pick: Pick::Run {
                 label: description.into(),
                 run: Rc::new(run),
             },
-            scope: Scope::Here,
-            shortcut: None,
             snooze: None,
         }
     }
@@ -137,32 +97,19 @@ impl Row {
     ) -> Self {
         Self {
             key: key.into(),
-            also: Vec::new(),
             pick: Pick::Infix {
                 label: description.into(),
                 value: value.into(),
                 run: Rc::new(move |frame, _, window, cx| run(frame, window, cx)),
             },
-            scope: Scope::Here,
-            shortcut: None,
             snooze: None,
         }
-    }
-
-    /// The row is found in the palette by `word` too, as a user who does
-    /// not know its name would ask for it: `rename` for `name this thread`.
-    pub fn also(mut self, word: impl Into<String>) -> Self {
-        self.also.push(word.into());
-        self
     }
 
     pub fn menu(key: impl Into<String>, rows: Rows) -> Self {
         Self {
             key: key.into(),
-            also: Vec::new(),
             pick: Pick::Menu(rows),
-            scope: Scope::Here,
-            shortcut: None,
             snooze: None,
         }
     }
@@ -220,28 +167,6 @@ impl Rows {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
-    }
-
-    /// The palette runs commands directly instead of opening a menu.
-    pub fn into_commands(self) -> Vec<Row> {
-        let mut result = Vec::new();
-        self.append_commands("", &mut result);
-        result
-    }
-
-    fn append_commands(self, parent: &str, result: &mut Vec<Row>) {
-        let prefix = format!("{parent}{} › ", self.title);
-        for mut row in self.rows {
-            match &mut row.pick {
-                Pick::Menu(menu) => menu.clone().append_commands(&prefix, result),
-                Pick::Run { label, .. } | Pick::Infix { label, .. } => {
-                    *label = format!("{prefix}{label}");
-                    row.key.clear();
-                    row.shortcut = None;
-                    result.push(row);
-                }
-            }
-        }
     }
 
     /// The block under the point: each item's action is its row's index.

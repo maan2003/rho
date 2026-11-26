@@ -2,8 +2,8 @@
 //!
 //! Always on and bounded: GPUI's frame, editor-stage and main-thread-work
 //! rings, and a rolling CPU profile of the last seconds, cost little and
-//! are what a report from the user's own device is made of. The palette
-//! row `upload performance report` sends a snapshot of them to an attached
+//! are what a report from the user's own device is made of. The command
+//! `upload performance report` sends a snapshot of them to an attached
 //! host, which stores it in its state directory. `--cpu-profile FILE`
 //! writes one whole run to a file instead, for a rig.
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use base64::Engine as _;
 use gpui::profiler::{EditorTiming, EditorTimingCollector, FrameTiming, FrameTimingCollector};
 use gpui::{App, AppContext as _, Context, Window};
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_frame::{Address, EndpointId, FrameLink, Opening, Point, Row, System};
+use rho_frame::{Address, Command, EndpointId, FrameLink, Opening, Point, Spelling, System};
 use rho_window::style::StyleClass;
 
 /// Seconds a rolling segment covers before the next starts.
@@ -282,7 +282,19 @@ impl Profile {
     }
 }
 
-/// The palette row that sends a report, and the host links to send it by.
+pub static UPLOAD_PERFORMANCE_REPORT: Spelling = Spelling {
+    name: "upload performance report",
+    aliases: &[
+        ("slow", 7),
+        ("lag", 7),
+        ("report performance", 9),
+        ("profile", 6),
+        ("bug report", 4),
+    ],
+    argument: None,
+};
+
+/// The command that sends a report, and the host links to send it by.
 pub struct TelemetrySystem {
     frame: FrameLink,
     hosts: HashMap<HostId, (String, Link)>,
@@ -375,15 +387,25 @@ impl System for TelemetrySystem {
         self.hosts.remove(&host);
     }
 
-    fn rows(&mut self, _point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn commands(
+        &mut self,
+        _point: &Point,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         let this = cx.entity();
-        vec![Row::run(
-            "",
-            "upload performance report",
-            move |_, _, cx| {
+        let to = self
+            .hosts
+            .values()
+            .map(|(name, _)| name)
+            .min()
+            .map_or("no host attached".to_owned(), |name| format!("to {name}"));
+        vec![
+            Command::simple(&UPLOAD_PERFORMANCE_REPORT, move |_, _, cx| {
                 this.update(cx, |system, cx| system.upload(cx));
-            },
-        )]
+            })
+            .target(to),
+        ]
     }
 }
 

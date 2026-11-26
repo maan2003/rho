@@ -18,25 +18,25 @@ use rho_agent_hosts::{HostEvent, HostId, HostSpec};
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 use rho_ledger::Pairing;
-use rho_window::history::History;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use crate::attention::{Attention, Verdict};
+use crate::command::{Command, Shortcut};
 use crate::deal::Signals;
 use crate::desk::DeskView;
-use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
+use crate::menu::{OpenMenu, Pick, Row, Rows};
 use crate::minibuffer::{
-    Answer, CancelHandler, Candidate, CandidateSource, Echo, Minibuffer, SubmitHandler,
-    bottom_strip,
+    Answer, CancelHandler, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
 };
 use crate::phone::{Layout, Phone};
+use crate::recent::Recent;
 use crate::search::Search;
 use crate::surface::{AnySurface, CardHere, Mode, Subject, Surface as _};
-use crate::system::{AnySystem, Found, Opening};
+use crate::system::{AnySystem, Found, Opening, Project};
 use crate::waiting::Waiting;
 use crate::when::SnoozeUnit;
-use crate::{keys, palette, place};
+use crate::{commands, keys, place, places};
 
 /// The kind of the frame's own surface: Desk.
 pub const FRAME_KIND: &str = "frame";
@@ -75,10 +75,10 @@ pub struct CardInspection {
     seen: Seen,
 }
 
-/// How a screen in history was reached. A dealt screen and one opened by
-/// name are the same: the screen shows its card live, so what the reader
-/// sees of it is the hand's. Only a step down into the work keeps the card
-/// as it stood, since the card's own screen is out of sight.
+/// How a recent place was reached. A dealt screen and one opened by name
+/// are the same: the screen shows its card live, so what the reader sees
+/// of it is the hand's. Only a step down into the work keeps the card as
+/// it stood, since the card's own screen is out of sight.
 #[derive(Default)]
 pub(crate) enum ScreenEntry {
     #[default]
@@ -86,11 +86,18 @@ pub(crate) enum ScreenEntry {
     Inspection(CardInspection),
 }
 
+/// How a screen comes into view. Opened by name, it starts where an open
+/// starts (a thread at its draft); come back to through the recent places,
+/// it is as the reader left it (`window.Screen`).
 enum Open<'a> {
     Explicit,
+    Recent,
     Deal(&'a Card),
     Inspect(CardInspection),
 }
+
+/// How many command names `Commands` remembers as recently run.
+const RECENT_COMMANDS: usize = 20;
 
 /// How long an echo stays on the line.
 const ECHO_FOR: Duration = Duration::from_secs(4);
@@ -100,9 +107,11 @@ pub struct Frame {
     pub(crate) hosts: Hosts,
     pub(crate) systems: Vec<AnySystem>,
     pub(crate) attention: Attention,
-    /// The surfaces the reader has been on, by address. The newest entry
-    /// is where down deals; Desk is the oldest and never closes.
-    history: History<Address, ScreenEntry>,
+    /// The places the reader has been, most recently visited first; the
+    /// first is in view. Desk is always among them and never closes.
+    recent: Recent<Address, ScreenEntry>,
+    /// The names of the commands run last, most recent first.
+    recent_commands: Vec<String>,
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
     pub(crate) minibuffer: Option<Minibuffer>,
@@ -128,7 +137,7 @@ pub struct Frame {
     _tasks: Vec<Task<()>>,
 }
 
-// The palette and the verdict menu answer the same card with the same words.
+/// Done and mute on a waiting card, in the leader's words.
 fn verdict_rows(target: Address) -> [Row; 2] {
     let done = target.clone();
     [
@@ -210,7 +219,8 @@ impl Frame {
             hosts: Hosts::new(Arc::new(host_sink)),
             systems,
             attention,
-            history: History::new(desk_address, ScreenEntry::Opened),
+            recent: Recent::new(desk_address, ScreenEntry::Opened),
+            recent_commands: place::recent_commands(&db),
             surfaces,
             desk,
             minibuffer: None,
@@ -275,23 +285,20 @@ impl Frame {
     }
 
     /// Opens the window where the user was when it last ran on this
-    /// device, with the way back and forward as it was. The screens behind
-    /// and ahead are made when the user reaches them; the one they were on
-    /// is made now, and when it no longer opens the window opens on Desk.
+    /// device, with the places visited before it in the order they were.
+    /// Those behind are made when the user reaches them; the one in view
+    /// is made now, and one that no longer opens leaves the order.
     fn return_to(&mut self, saved: place::Saved, window: &mut Window, cx: &mut Context<Self>) {
-        self.history = place::return_history(
+        self.recent = place::return_recent(
             &saved,
             &Self::desk_address(),
             self.last_input,
             Timestamp::now(),
         );
-        let address = self.current_address().clone();
-        if self.surfaces.contains_key(&address) || self.hold(&address, window, cx) {
-            return;
+        self.settle(window, cx);
+        if self.desk_in_view() {
+            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
         }
-        self.history.forget(&address);
-        self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-        self.history.show(Self::desk_address(), ScreenEntry::Opened);
     }
 
     /// What the system that owns `address`'s kind has for it.
@@ -336,8 +343,8 @@ impl Frame {
 
     /// Asks again for every address that waits on its hosts: one a host
     /// now holds gets its real surface in the waiting one's place, and
-    /// one no host holds leaves the history, as a closed screen does. A
-    /// prompt or a menu over the screen keeps the keyboard.
+    /// one no host holds leaves the recent places, as a closed screen
+    /// does. A prompt or a menu over the screen keeps the keyboard.
     pub(crate) fn reopen_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let waiting = self
             .surfaces
@@ -357,11 +364,11 @@ impl Frame {
                 }
                 Opening::Gone => {
                     self.surfaces.remove(&address);
-                    self.history.forget(&address);
+                    self.recent.remove(&address);
                 }
             }
         }
-        self.settle(false, window, cx);
+        self.settle(window, cx);
         if self.current_surface().entity_id() == shown {
             return;
         }
@@ -374,23 +381,18 @@ impl Frame {
         cx.notify();
     }
 
-    /// Makes the screen the cursor came to, when the history holds it by
-    /// address alone, as one it was given back at start does. One that no
-    /// longer opens leaves the history and the walk goes on the way it
-    /// went, or the other way from the end; Desk always opens.
-    fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Makes the screen in view when the recent places hold it by address
+    /// alone, as one given back at start is. One that no longer opens
+    /// leaves them, and the place visited before it is in view; Desk
+    /// always opens.
+    fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         loop {
             let address = self.current_address().clone();
             if self.surfaces.contains_key(&address) || self.hold(&address, window, cx) {
                 return;
             }
-            self.history.forget(&address);
-            let stepped = match forward {
-                true => self.history.forward().is_some() || self.history.back().is_some(),
-                false => self.history.back().is_some() || self.history.forward().is_some(),
-            };
-            if !stepped {
-                self.history.show(Self::desk_address(), ScreenEntry::Opened);
+            if !self.recent.remove(&address) {
+                self.recent.show(Self::desk_address(), ScreenEntry::Opened);
             }
         }
     }
@@ -398,7 +400,7 @@ impl Frame {
     /// Writes down where the user is now, for the next start.
     fn moved(&self) {
         self.place
-            .write(place::Write::Place(place::Saved::of(&self.history)));
+            .write(place::Write::Place(place::Saved::of(&self.recent)));
     }
 
     /// A key or deliberate pointer/touch input is activity by the user;
@@ -416,12 +418,12 @@ impl Frame {
     // ---- surfaces ----
 
     pub fn current_address(&self) -> &Address {
-        self.history.current_key()
+        self.recent.current_key()
     }
 
     pub fn current_surface(&self) -> &AnySurface {
         self.surfaces
-            .get(self.history.current_key())
+            .get(self.recent.current_key())
             .expect("the current surface is held")
     }
 
@@ -441,7 +443,7 @@ impl Frame {
         let card = match current.card(cx) {
             CardHere::Itself => Some(surface.clone()),
             CardHere::Row(row) => row,
-            CardHere::Inspected => match self.history.current() {
+            CardHere::Inspected => match self.recent.current() {
                 ScreenEntry::Inspection(inspection) if self.waits(&inspection.address) => {
                     Some(inspection.address.clone())
                 }
@@ -492,10 +494,10 @@ impl Frame {
     /// card as the hand holds it, as far as the screen has had it in view:
     /// a thread shows its mail live, however it was reached, so a reply or
     /// a verdict settles what is on screen and nothing that came while the
-    /// reader was in the history below. Anywhere else, the card as the
+    /// reader was elsewhere. Anywhere else, the card as the
     /// hand holds it.
     pub(crate) fn card_seen(&self, address: &Address, cx: &App) -> Option<Seen> {
-        if let ScreenEntry::Inspection(inspection) = self.history.current()
+        if let ScreenEntry::Inspection(inspection) = self.recent.current()
             && &inspection.address == address
         {
             return Some(inspection.seen);
@@ -515,7 +517,7 @@ impl Frame {
     /// Capture the card under the reader, keeping its observation while
     /// moving between the transcript, desktop, shell and terminal.
     pub fn card_to_inspect(&self, cx: &App) -> Option<CardInspection> {
-        if let ScreenEntry::Inspection(inspection) = self.history.current() {
+        if let ScreenEntry::Inspection(inspection) = self.recent.current() {
             return Some(inspection.clone());
         }
         let address = self.card_target(cx)?;
@@ -527,9 +529,27 @@ impl Frame {
         self.current_surface().entity_id() == self.desk.entity_id()
     }
 
-    /// Opens `address`: the system that owns its kind makes the surface,
-    /// or the one already made is shown again.
+    /// Opens `address` by name: the system that owns its kind makes the
+    /// surface, or the one already made starts again where an open starts.
     pub fn open(&mut self, address: Address, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_by(address, Open::Explicit, window, cx);
+    }
+
+    /// Comes back to `address` as the reader left it, scroll and point
+    /// included, as the recent places do.
+    pub fn revisit(&mut self, address: Address, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_by(address, Open::Recent, window, cx);
+    }
+
+    /// A place not yet made whose system resolves it later (`visit`) is
+    /// the system's to show; everything else shows now.
+    fn open_by(
+        &mut self,
+        address: Address,
+        open: Open<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.surfaces.contains_key(&address)
             && self
                 .systems
@@ -540,7 +560,7 @@ impl Frame {
         {
             return;
         }
-        self.open_with(address, Open::Explicit, window, cx);
+        self.open_with(address, open, window, cx);
     }
 
     pub fn open_inspection(
@@ -572,7 +592,13 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.surfaces.contains_key(&address) && !self.hold(&address, window, cx) {
+        let fresh = !self.surfaces.contains_key(&address);
+        if fresh && !self.hold(&address, window, cx) {
+            // A recent place that no longer opens is no longer a place.
+            if *self.current_address() != address {
+                self.recent.remove(&address);
+                self.moved();
+            }
             self.echo(
                 &format!("nothing opens {address}"),
                 StyleClass::SystemInfo,
@@ -581,28 +607,50 @@ impl Frame {
             return;
         }
         let surface = self.surfaces[&address].clone();
+        // How it was reached; a place come back to was reached as before,
+        // so a step down into the work still inspects its card.
         let (entry, method) = match open {
             Open::Deal(card) => {
                 surface.show_card(card, window, cx);
-                (ScreenEntry::Opened, rho_journal::SurfaceShowMethod::Deal)
+                (
+                    Some(ScreenEntry::Opened),
+                    rho_journal::SurfaceShowMethod::Deal,
+                )
             }
             Open::Inspect(inspection) => {
                 surface.opened(window, cx);
                 (
-                    ScreenEntry::Inspection(inspection),
+                    Some(ScreenEntry::Inspection(inspection)),
                     rho_journal::SurfaceShowMethod::Open,
                 )
             }
             Open::Explicit => {
                 surface.opened(window, cx);
-                (ScreenEntry::Opened, rho_journal::SurfaceShowMethod::Open)
+                (
+                    Some(ScreenEntry::Opened),
+                    rho_journal::SurfaceShowMethod::Open,
+                )
+            }
+            Open::Recent => {
+                // Nothing to come back to on a screen made just now.
+                if fresh {
+                    surface.opened(window, cx);
+                }
+                (None, rho_journal::SurfaceShowMethod::Mru)
             }
         };
         rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: journal_surface(&address),
             method,
         });
-        self.history.show(address, entry);
+        match entry {
+            Some(entry) => self.recent.show(address, entry),
+            None => {
+                if !self.recent.bring(&address) {
+                    self.recent.show(address, ScreenEntry::Opened);
+                }
+            }
+        }
         if self.desk_in_view() {
             self.refresh_desk(&self.hand().clone(), false, cx);
             self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
@@ -613,40 +661,54 @@ impl Frame {
         cx.notify();
     }
 
-    /// Shows `address` in place of the screen in view, for a screen that
-    /// switches what it shows (a usage chart's window or picture): the
-    /// history entry becomes `address` where it stands, so switching adds
-    /// nothing to walk back through. Desk is never replaced; from it this
-    /// opens `address` as usual.
-    pub fn replace_current(
+    /// `new` is `old` under another name, and takes its place among the
+    /// recent places rather than adding one: a usage chart switching its
+    /// window, or a queued idea becoming its thread. When `old` is in view,
+    /// `new` is shown in its place; Desk is never replaced, and from it
+    /// this opens `new` as usual.
+    pub fn replace(
         &mut self,
-        address: Address,
+        old: &Address,
+        new: Address,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let old = self.current_address().clone();
-        if old == address || old.kind() == FRAME_KIND {
-            return self.open(address, window, cx);
-        }
-        if !self.surfaces.contains_key(&address) && !self.hold(&address, window, cx) {
-            self.echo(
-                &format!("nothing opens {address}"),
-                StyleClass::SystemInfo,
-                cx,
-            );
+        if *old == new || *old == Self::desk_address() {
+            if self.current_address() == old {
+                self.open(new, window, cx);
+            }
             return;
         }
-        self.surfaces[&address].opened(window, cx);
+        if self.current_address() != old {
+            if self.recent.replace(old, new, ScreenEntry::Opened) {
+                self.surfaces.remove(old);
+                self.moved();
+            }
+            return;
+        }
+        if !self.surfaces.contains_key(&new) && !self.hold(&new, window, cx) {
+            self.echo(&format!("nothing opens {new}"), StyleClass::SystemInfo, cx);
+            return;
+        }
+        self.surfaces[&new].opened(window, cx);
         rho_journal::record(rho_journal::Event::SurfaceShown {
-            surface: journal_surface(&address),
+            surface: journal_surface(&new),
             method: rho_journal::SurfaceShowMethod::Open,
         });
-        self.history.replace_current(address, ScreenEntry::Opened);
-        self.surfaces.remove(&old);
+        self.recent.replace(old, new, ScreenEntry::Opened);
+        self.surfaces.remove(old);
         self.moved();
         self.close_overlays(window, cx);
         self.focus_surface(window, cx);
         cx.notify();
+    }
+
+    /// `address` was visited just now, though the reader is still where
+    /// they were, such as an idea sent from its own screen: it is the most
+    /// recent place behind the one in view, and ages from there.
+    pub fn remember(&mut self, address: Address) {
+        self.recent.remember(address, ScreenEntry::Opened);
+        self.moved();
     }
 
     /// Opens a web link the user chose: the system that shows the web
@@ -666,29 +728,41 @@ impl Frame {
         self.open(Self::desk_address(), window, cx);
     }
 
-    /// Closes `address`: its surface goes, and no walk reaches it again.
-    /// Desk only steps out of view.
+    /// `tab`: Desk, or from Desk the place visited before it.
+    pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.desk_in_view() {
+            true => self.previous_place(window, cx),
+            false => self.open_desk(window, cx),
+        }
+    }
+
+    /// The place visited before the one in view, as it was left.
+    pub fn previous_place(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.recent.previous().next().cloned();
+        match previous {
+            Some(previous) => self.revisit(previous, window, cx),
+            None => self.echo("no other place yet", StyleClass::SystemInfo, cx),
+        }
+    }
+
+    /// Closes `address`: its surface goes, and it leaves the recent
+    /// places. When it was in view, the place visited before it is now.
+    /// Desk never closes; closing it steps to the place before it.
     pub fn close(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_address() == address;
-        let desk = *address == Self::desk_address();
-        if !desk {
-            rho_journal::record(rho_journal::Event::HistoryRemoved {
-                identity: journal_surface(address),
-                method: rho_journal::HistoryRemoveMethod::Close,
-            });
-            self.history.forget(address);
-            self.surfaces.remove(address);
+        if *address == Self::desk_address() {
+            if current {
+                self.previous_place(window, cx);
+            }
+            return;
         }
+        rho_journal::record(rho_journal::Event::SurfaceClosed {
+            surface: journal_surface(address),
+        });
+        self.recent.remove(address);
+        self.surfaces.remove(address);
         if current {
-            if self.history.back().is_none() && self.history.forward().is_none() {
-                self.history.show(Self::desk_address(), ScreenEntry::Opened);
-            }
-            // A forgotten entry under the cursor is left on the first step
-            // either way; Desk closes by stepping off it.
-            if desk && self.current_address() == address {
-                self.history.show(Self::desk_address(), ScreenEntry::Opened);
-            }
-            self.settle(false, window, cx);
+            self.settle(window, cx);
             self.close_overlays(window, cx);
             self.focus_surface(window, cx);
         }
@@ -696,15 +770,21 @@ impl Frame {
         cx.notify();
     }
 
-    /// Closes every open surface whose address `which` picks: what a
-    /// detached host leaves behind.
+    /// Closes every place, made or only remembered, whose address `which`
+    /// picks: what a detached host leaves behind.
     pub fn close_all(
         &mut self,
         which: impl Fn(&Address) -> bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let picked: Vec<Address> = self.surfaces.keys().filter(|a| which(a)).cloned().collect();
+        let mut picked: Vec<Address> = self.surfaces.keys().filter(|a| which(a)).cloned().collect();
+        picked.extend(
+            self.recent
+                .keys()
+                .filter(|address| which(address) && !self.surfaces.contains_key(*address))
+                .cloned(),
+        );
         for address in picked {
             self.close(&address, window, cx);
         }
@@ -713,45 +793,6 @@ impl Frame {
     pub fn close_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let address = self.current_address().clone();
         self.close(&address, window, cx);
-    }
-
-    pub fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.minibuffer.is_some() {
-            return;
-        }
-        if self.history.back().is_none() {
-            self.echo("at the oldest", StyleClass::SystemInfo, cx);
-            return;
-        }
-        self.settle(false, window, cx);
-        self.moved();
-        rho_journal::record(rho_journal::Event::HistoryStepped {
-            direction: rho_journal::HistoryDirection::Back,
-            position: self.history.behind(),
-            len: self.history.len(),
-        });
-        self.close_overlays(window, cx);
-        self.focus_surface(window, cx);
-        cx.notify();
-    }
-
-    /// Down: forward through history, and off the newest entry the next
-    /// card is dealt.
-    pub fn forward_or_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.history.forward().is_none() {
-            self.pull_card(window, cx);
-            return;
-        }
-        self.settle(true, window, cx);
-        self.moved();
-        rho_journal::record(rho_journal::Event::HistoryStepped {
-            direction: rho_journal::HistoryDirection::Forward,
-            position: self.history.behind(),
-            len: self.history.len(),
-        });
-        self.close_overlays(window, cx);
-        self.focus_surface(window, cx);
-        cx.notify();
     }
 
     fn focus_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -989,29 +1030,37 @@ impl Frame {
         self.run_menu_row(index, count, closes, window, cx);
     }
 
-    /// The Palette joins the catalogue to the actual dealt cards and the
-    /// places this window has visited. It does not infer a card from mail.
-    pub(crate) fn palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.commands(window, cx);
-        let desk_address = Self::desk_address();
-        let desk_key = self.screen_binding(&keys::Desk, window, cx);
-        let commands = palette::commands(&rows, |action| self.screen_binding(action, window, cx));
+    /// `space f`: `Places`, every place by name and the words remembered
+    /// in messages and notes. The catalogue the systems list is joined to
+    /// the places this window visited and the cards that wait; Desk is
+    /// `tab`'s and is not listed.
+    pub(crate) fn places(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_places(None, window, cx);
+    }
+
+    /// `Places`, or with `scope` only the places in that project.
+    fn open_places(&mut self, scope: Option<Project>, window: &mut Window, cx: &mut Context<Self>) {
+        let desk = Self::desk_address();
+        let in_scope = |frame: &Self, address: &Address| {
+            *address != desk
+                && scope.as_ref().is_none_or(|scope| {
+                    *address != scope.address
+                        && frame
+                            .project_of(address, cx)
+                            .is_some_and(|project| project.address == scope.address)
+                })
+        };
         let mut found = Vec::new();
         for system in &self.systems {
             found.extend(system.find(&self.attention.marks, cx));
         }
-
+        found.retain(|place| in_scope(self, &place.address));
         let mut known: std::collections::HashSet<_> =
             found.iter().map(|place| place.address.clone()).collect();
-        let recent = self.history.recent();
-        let visits: HashMap<_, _> = recent
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(rank, key)| (key, rank))
-            .collect();
-        for address in recent {
-            if !known.insert(address.clone()) {
+        // A visited place stays reachable by name, whether or not its
+        // system lists it: a transcript, a terminal or a sent idea.
+        for address in self.recent.keys() {
+            if !in_scope(self, address) || !known.insert(address.clone()) {
                 continue;
             }
             if let Some((title, description)) = self
@@ -1030,9 +1079,8 @@ impl Frame {
                 });
             }
         }
-
         for card in &self.hand().cards {
-            if known.insert(card.address.clone()) {
+            if in_scope(self, &card.address) && known.insert(card.address.clone()) {
                 found.push(Found {
                     address: card.address.clone(),
                     title: card.title.clone(),
@@ -1050,41 +1098,46 @@ impl Frame {
             .enumerate()
             .map(|(rank, card)| (&card.address, (rank, card)))
             .collect();
-        // Preserve the deal's own order among waiting places on blank input.
+        // With nothing typed, waiting places keep the deal's own order.
         found.sort_by_key(|place| {
             cards
                 .get(&place.address)
                 .map_or(usize::MAX, |(rank, _)| *rank)
         });
-        let places = found
+        let visits: HashMap<_, _> = self
+            .recent
+            .keys()
+            .enumerate()
+            .map(|(rank, address)| (address, rank))
+            .collect();
+        let rows = found
             .into_iter()
-            .map(|found| palette::Place {
+            .map(|found| places::Place {
                 visit: visits.get(&found.address).copied(),
-                visited_ms: self
-                    .history
-                    .visit(&found.address)
-                    .and_then(|visit| visit.wall_ms),
+                visited_ms: self.recent.visited_ms(&found.address),
                 current: self.current_address() == &found.address,
-                shortcut: if found.address == desk_address {
-                    desk_key.clone()
-                } else {
-                    None
-                },
                 card: cards.get(&found.address).map(|(_, card)| (*card).clone()),
                 found,
             })
             .collect();
-        let mut listing = palette::Listing::new(commands, places);
+        let mut listing = places::Listing::new(rows);
         listing.desk = self.desk_in_view();
-        self.open_minibuffer(":", Answer::palette(listing), None, window, cx);
+        let prompt = match &scope {
+            Some(project) => format!("places · {}:", project.name),
+            None => "places:".to_owned(),
+        };
+        let scope = scope.map(|project| project.address);
+        self.open_minibuffer(prompt, Answer::places(listing, scope), None, window, cx);
     }
 
-    /// What choosing a place in the palette does. A project has no screen
-    /// of its own: choosing one narrows the palette to its threads, which
-    /// carry its address.
+    /// What choosing a place in `Places` does. A project has no screen of
+    /// its own: choosing one narrows `Places` to its threads. A place
+    /// chosen from the recent ones with nothing typed is come back to as
+    /// it was left; one chosen by name opens as an open does, and a
+    /// waiting one shows its card.
     pub(crate) fn choose_place(
         &mut self,
-        place: &palette::Place,
+        place: &places::Place,
         blank: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1094,16 +1147,13 @@ impl Frame {
             .project_of(address, cx)
             .filter(|project| &project.address == address)
         {
-            self.palette(window, cx);
-            if let Some(prompt) = self.minibuffer.as_mut() {
-                prompt.set_input(format!("{} ", project.name), window, cx);
-            }
-            return;
+            return self.open_places(Some(project), window, cx);
         }
-        match &place.card {
-            Some(card) if !blank || place.visit.is_none() => {
+        match (&place.card, blank, place.visit) {
+            (Some(card), false, _) | (Some(card), true, None) => {
                 self.open_card(card.clone(), window, cx)
             }
+            (_, true, Some(_)) => self.revisit(address.clone(), window, cx),
             _ => self.open(address.clone(), window, cx),
         }
     }
@@ -1118,9 +1168,12 @@ impl Frame {
         search
     }
 
-    pub(crate) fn describe_palette_text(
+    /// The rows for words found in messages and notes; within a project's
+    /// scope, only those in its threads.
+    pub(crate) fn describe_text(
         &self,
         hits: Vec<crate::TextHit>,
+        scope: Option<&Address>,
         cx: &App,
     ) -> Vec<(crate::FoundText, Vec<std::ops::Range<usize>>)> {
         let mut presenters: Vec<_> = self
@@ -1131,12 +1184,16 @@ impl Frame {
         hits.into_iter()
             .filter_map(|hit| {
                 let row = presenters.iter_mut().find_map(|describe| describe(&hit))?;
-                Some((row, hit.marks))
+                let in_scope = scope.is_none_or(|scope| {
+                    self.project_of(&row.address, cx)
+                        .is_some_and(|project| project.address == *scope)
+                });
+                in_scope.then_some((row, hit.marks))
             })
             .collect()
     }
 
-    pub(crate) fn finish_palette_search(
+    pub(crate) fn finish_places_search(
         &mut self,
         input: &str,
         hits: Vec<crate::TextHit>,
@@ -1149,6 +1206,8 @@ impl Frame {
         }
     }
 
+    /// Opens the place a remembered line is in, on that line: the message
+    /// in a thread, the line in a note.
     pub(crate) fn open_text_match(
         &mut self,
         hit: &crate::FoundText,
@@ -1185,169 +1244,121 @@ impl Frame {
             })
     }
 
-    /// The frame's rows, the surface's, and each system's for the point.
-    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
-        let point = self.point(cx);
-        let undo = Row::run("", "undo", |frame, window, cx| {
-            frame.undo_verdict(window, cx);
-        })
-        .window_wide();
-        let mut rows = vec![
-            Row::run("", "write an idea", |_, window, cx| {
-                window.dispatch_action(Box::new(keys::PromptIdea), cx)
-            })
-            .bound_to(keys::PromptIdea)
-            .window_wide(),
-            undo,
-        ];
-        rows.extend(
-            self.hosts_menu()
-                .into_commands()
-                .into_iter()
-                .map(Row::window_wide),
-        );
-        let phrase = match self.attention.secret() {
-            Some(secret) => Row::run("", "show my secret phrase", move |frame, window, cx| {
-                frame.show_secret(secret, "your secret phrase · enter:", window, cx)
-            }),
-            None => Row::run("", "pair this device", |frame, window, cx| {
-                frame.prompt_pair(String::new(), None, window, cx)
-            }),
-        };
-        rows.push(phrase.window_wide());
-        rows.push(Row::run("", "quit", |_, _, cx| cx.quit()).window_wide());
-        let surface = self.current_surface().clone();
-        rows.extend(surface.rows(self.card_seen(self.current_address(), cx), window, cx));
-        for system in self.systems.clone() {
-            rows.extend(system.rows(&point, window, cx));
-        }
-        if !self.desk_in_view() {
-            let opener = self.screen_binding(&keys::VerdictMenu, window, cx);
-            rows.extend(
-                self.verdict_rows(cx)
-                    .rows
-                    .into_iter()
-                    .filter_map(|mut row| {
-                        // The window-wide undo is the same verdict and has its
-                        // own key.
-                        if row.key == "u" {
-                            return None;
-                        }
-                        row.shortcut = opener
-                            .as_ref()
-                            .map(|key| Shortcut::Menu(format!("{key} {}", row.key)));
-                        Some(row)
-                    }),
-            );
-        }
-        rows
-    }
-
-    fn hosts_menu(&self) -> Rows {
-        let mut rows = Rows::new("hosts");
-        rows.push(Row::run("a", "attach", |frame, window, cx| {
-            frame.open_prompt(
-                "attach host · name=local (this machine), name=iroh:<id>@<ssh host> (ssh), \
-                 or name=iroh:<id> (security key):",
-                Rc::new(|_, _, _| Vec::new()),
-                Rc::new(
-                    |frame, input, _, cx| match HostSpec::parse(input.trim(), "rho") {
-                        Ok(spec) => {
-                            frame.attach_host(spec, cx);
-                        }
-                        Err(error) => {
-                            frame.echo(&format!("attach: {error}"), StyleClass::SystemInfo, cx)
-                        }
-                    },
-                ),
-                window,
-                cx,
-            );
-        }));
-        rows.push(Row::run("d", "detach", |frame, window, cx| {
-            frame.open_prompt(
-                "detach host:",
-                Rc::new(|frame, needle, _| {
-                    frame
-                        .hosts
-                        .iter()
-                        .filter(|host| host.name.contains(needle.trim()))
-                        .map(|host| Candidate {
-                            value: host.name.clone(),
-                            description: host.status.label(),
-                        })
-                        .collect()
-                }),
-                Rc::new(|frame, input, _, cx| {
-                    let name = input.trim();
-                    match frame.hosts.by_name(name).map(|host| host.id) {
-                        Some(host) => {
-                            frame.detach_host(host, cx);
-                            frame.echo(&format!("detached: {name}"), StyleClass::SystemInfo, cx);
-                        }
-                        None => frame.echo(
-                            &format!("detach: no host called {name}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        ),
+    /// `:`: `Commands`, every command there is, each with what it acts on
+    /// from where the user is.
+    pub(crate) fn commands_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self
+            .commands(window, cx)
+            .into_iter()
+            .map(|command| {
+                let keys = match &command.shortcut {
+                    Some(Shortcut::Action(action)) => {
+                        self.screen_binding(action.as_ref(), window, cx)
                     }
-                }),
-                window,
-                cx,
-            );
-        }));
-        rows.push(Row::menu("g", crate::gccp::rows()));
-        for (index, host) in self.hosts.iter().enumerate() {
-            let id = host.id;
-            rows.push(Row::run(
-                (index + 1).to_string(),
-                format!("{} · {}", host.name, host.status.label()),
-                move |frame, _, cx| frame.pick_host(id, cx),
-            ));
-        }
-        rows
+                    Some(Shortcut::Keys(keys)) => Some((*keys).to_owned()),
+                    None => None,
+                };
+                (command, keys.unwrap_or_default())
+            })
+            .collect();
+        let listing = commands::Listing::new(entries, &self.recent_commands);
+        self.open_minibuffer(":", Answer::commands(listing), None, window, cx);
     }
 
-    /// The verdicts over the card under the cursor.
-    pub(crate) fn verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.is_some() {
-            self.close_menu(window, cx);
-            self.toggle_desk(window, cx);
-            return;
+    /// The window's commands, the screen's, and each system's. A command
+    /// is listed once whatever the screen: one about something the screen
+    /// does not name asks for it (`window.commands are global`).
+    fn commands(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Command> {
+        let point = self.point(cx);
+        let mut commands = crate::own::commands(self, cx);
+        commands.extend(crate::hosts::commands(self));
+        commands.extend(crate::gccp::commands());
+        let surface = self.current_surface().clone();
+        commands.extend(surface.commands(self.card_seen(self.current_address(), cx), window, cx));
+        for system in self.systems.clone() {
+            commands.extend(system.commands(&point, window, cx));
         }
-        self.open_menu(self.verdict_rows(cx), window, cx);
+        debug_assert!(
+            {
+                let mut names: Vec<_> = commands.iter().map(Command::name).collect();
+                names.sort_unstable();
+                names.windows(2).all(|pair| pair[0] != pair[1])
+            },
+            "two commands share a name"
+        );
+        commands
     }
 
-    fn verdict_rows(&self, cx: &mut App) -> Rows {
-        let Some(target) = self.card_target(cx) else {
-            // With no card here there is nothing to judge, but the deal
-            // still goes on: `n` is how the user asks what waits.
-            let mut rows = Rows::new("no card here").counted();
-            self.push_deal_rows(&mut rows);
-            return rows;
-        };
-        let card = self.card_for(&target, cx);
-        let mut rows = Rows::new(if self.current_surface().inspects_card(cx) {
-            card.title.clone()
-        } else {
-            card.heading()
-        })
-        .counted();
-        if let Some(own) = self.own_verdicts(&target, cx) {
-            // A card its system answers is never muted: it ends when it is
-            // answered, and until then it can only wait.
-            rows.extend(own);
-            rows.push(Row::menu("s", snooze_rows(&target)));
-        } else if self.marks().get(&target).facts().muted() {
-            rows.push(Row::run("m", "unmute", move |frame, window, cx| {
-                frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
+    /// Runs `command` with what was typed after its name, and keeps it
+    /// among the commands run last.
+    pub(crate) fn run_command(
+        &mut self,
+        command: &Command,
+        argument: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = command.name().to_owned();
+        self.recent_commands.retain(|ran| *ran != name);
+        self.recent_commands.insert(0, name);
+        self.recent_commands.truncate(RECENT_COMMANDS);
+        self.place
+            .write(place::Write::Commands(place::SavedCommands {
+                names: self.recent_commands.clone(),
             }));
-        } else {
-            rows.extend(verdict_rows(target.clone()));
-            rows.push(Row::menu("s", snooze_rows(&target)));
+        command.run(argument, self, window, cx);
+    }
+
+    /// `space`: the leader. On every screen `f` opens `Places` and, while
+    /// there is a verdict to take back, `u` undoes it; on a waiting card,
+    /// its verdicts too, and on a muted one `m` unmutes it.
+    pub(crate) fn leader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.leader_rows(cx);
+        self.open_menu(rows, window, cx);
+    }
+
+    fn leader_rows(&self, cx: &mut App) -> Rows {
+        let card = self.card_in_view(cx);
+        let waiting = card.clone().filter(|address| self.waits(address));
+        let title = match &waiting {
+            Some(target) if self.current_surface().inspects_card(cx) => {
+                self.card_for(target, cx).title
+            }
+            Some(target) => self.card_for(target, cx).heading(),
+            None => self.current_surface().title(cx),
+        };
+        let mut rows = Rows::new(title).counted();
+        rows.push(Row::run("f", "places", |frame, window, cx| {
+            frame.places(window, cx)
+        }));
+        match (card, waiting) {
+            (Some(target), _) if self.marks().get(&target).facts().muted() => {
+                rows.push(Row::run("m", "unmute", move |frame, window, cx| {
+                    frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
+                }));
+            }
+            (_, Some(target)) => {
+                match self.own_verdicts(&target, cx) {
+                    // A card its system answers is never muted: it ends
+                    // when it is answered, and until then it can only wait.
+                    Some(own) => rows.extend(own),
+                    None => rows.extend(verdict_rows(target.clone())),
+                }
+                rows.push(Row::menu("s", snooze_rows(&target)));
+            }
+            _ => {}
         }
-        self.push_deal_rows(&mut rows);
+        if self.attention.can_undo() {
+            rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
+                frame.undo_verdict(window, cx)
+            }));
+        }
         rows
+    }
+
+    /// The card in view while it waits: what a verdict lands on.
+    pub(crate) fn waiting_card(&self, cx: &App) -> Option<Address> {
+        self.card_in_view(cx).filter(|address| self.waits(address))
     }
 
     /// The answers the system that owns `address` gives its cards in place
@@ -1358,27 +1369,6 @@ impl Frame {
             .find(|system| system.opens(address, cx))
             .cloned()
             .and_then(|system| system.verdicts(address, cx))
-    }
-
-    /// The verdict menu's rows that need no card: take back the last
-    /// verdict, and deal the next card. On a Desk that reads `0 wait` a
-    /// pull would deal nothing and stay, so it is not offered there.
-    fn push_deal_rows(&self, rows: &mut Rows) {
-        rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-            frame.undo_verdict(window, cx)
-        }));
-        if self.desk_in_view() && self.hand().cards.is_empty() {
-            return;
-        }
-        rows.push(Row::counted("n", "next card", |frame, _, window, cx| {
-            frame.pull_card(window, cx)
-        }));
-    }
-    pub(crate) fn toggle_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.desk_in_view() {
-            true => self.back(window, cx),
-            false => self.open_desk(window, cx),
-        }
     }
 
     pub fn open_prompt(
@@ -1838,10 +1828,7 @@ impl Render for Frame {
             .capture_any_mouse_down(
                 cx.listener(|this, _: &gpui::MouseDownEvent, _, _| this.note_input()),
             )
-            .on_action(cx.listener(|this, _: &keys::Back, window, cx| this.back(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &keys::Forward, window, cx| this.forward_or_deal(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &keys::Deal, window, cx| this.pull_card(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::Close, window, cx| this.close_current(window, cx)),
             )
@@ -1849,14 +1836,13 @@ impl Render for Frame {
                 this.close_current(window, cx);
                 this.pull_card(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &keys::Palette, window, cx| this.palette(window, cx)))
-            .on_action(cx.listener(|this, _: &keys::VerdictMenu, window, cx| {
-                if this.desk_in_view() {
-                    this.desk_space(window, cx);
-                } else {
-                    this.verdict_menu(window, cx);
-                }
-            }))
+            .on_action(cx.listener(|this, _: &keys::Places, window, cx| this.places(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &keys::Commands, window, cx| {
+                    this.commands_prompt(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &keys::Leader, window, cx| this.leader(window, cx)))
             .on_action(cx.listener(|this, _: &keys::Desk, window, cx| this.toggle_desk(window, cx)))
             .on_action(cx.listener(|this, _: &keys::RedoEdit, window, cx| {
                 let surface = this.current_surface();
@@ -2039,6 +2025,56 @@ mod tests {
         }
     }
 
+    /// A screen called `title` that counts the opens that tell it to
+    /// start over, as a thread's open moves its point to the draft.
+    struct Named {
+        focus: gpui::FocusHandle,
+        title: &'static str,
+        opened: Rc<std::cell::Cell<u32>>,
+    }
+
+    impl gpui::Focusable for Named {
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.focus.clone()
+        }
+    }
+
+    impl gpui::Render for Named {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl crate::Surface for Named {
+        fn title(&self, _: &App) -> String {
+            self.title.into()
+        }
+
+        fn opened(&mut self, _: &mut Window, _: &mut Context<Self>) {
+            self.opened.set(self.opened.get() + 1);
+        }
+    }
+
+    /// Holds a [`Named`] screen at `page/<title>`, and returns its address
+    /// and how many times it was opened.
+    fn hold_named(
+        frame: &mut Frame,
+        title: &'static str,
+        cx: &mut Context<Frame>,
+    ) -> (Address, Rc<std::cell::Cell<u32>>) {
+        let address = Address::new("page", title);
+        let opened = Rc::new(std::cell::Cell::new(0));
+        let view = cx.new(|cx| Named {
+            focus: cx.focus_handle(),
+            title,
+            opened: opened.clone(),
+        });
+        frame
+            .surfaces
+            .insert(address.clone(), AnySurface::new(view));
+        (address, opened)
+    }
+
     fn labels(rows: &Rows) -> Vec<String> {
         rows.rows
             .iter()
@@ -2115,11 +2151,16 @@ mod tests {
         (frame, holds)
     }
 
-    /// The way back as the last run left it: Desk, then `screen` in view.
+    /// The places as the last run left them: `screen` in view, Desk
+    /// before it.
     fn saved_on(screen: &Address) -> place::Saved {
-        let mut history = History::new(Frame::desk_address(), ScreenEntry::Opened);
-        history.show(screen.clone(), ScreenEntry::Opened);
-        place::Saved::of(&history)
+        let mut recent = Recent::new(Frame::desk_address(), ScreenEntry::Opened);
+        recent.show(screen.clone(), ScreenEntry::Opened);
+        place::Saved::of(&recent)
+    }
+
+    fn places_in_order(frame: &Frame) -> Vec<Address> {
+        frame.recent.keys().cloned().collect()
     }
 
     fn is_waiting(frame: &Frame) -> bool {
@@ -2136,11 +2177,11 @@ mod tests {
                 frame.return_to(saved_on(&agent), window, cx);
                 assert_eq!(frame.current_address(), &agent);
                 assert!(is_waiting(frame), "the screen waits for its host");
-                // Back and forward again before the host answers.
-                frame.back(window, cx);
+                // To Desk and back again before the host answers.
+                frame.toggle_desk(window, cx);
                 assert_eq!(frame.current_address(), &Frame::desk_address());
-                frame.forward_or_deal(window, cx);
-                assert_eq!(frame.current_address(), &agent, "the way back kept it");
+                frame.toggle_desk(window, cx);
+                assert_eq!(frame.current_address(), &agent, "the recent places kept it");
                 assert!(is_waiting(frame));
 
                 holds.set(Holds::Here);
@@ -2151,13 +2192,16 @@ mod tests {
                     frame.current_surface().focus_handle(cx).is_focused(window),
                     "the keyboard moves to the real screen"
                 );
-                assert_eq!(frame.history.len(), 2);
+                assert_eq!(
+                    places_in_order(frame),
+                    [agent.clone(), Frame::desk_address()]
+                );
             })
             .unwrap();
     }
 
     #[gpui::test]
-    fn an_early_back_reaches_a_screen_left_behind_the_desk(cx: &mut gpui::TestAppContext) {
+    fn an_early_tab_reaches_a_screen_left_behind_the_desk(cx: &mut gpui::TestAppContext) {
         let (frame, holds) = host_backed_frame(cx);
         let agent = Address::new("agent", "standing");
         frame
@@ -2166,7 +2210,7 @@ mod tests {
                 frame.last_input = None;
                 frame.return_to(saved_on(&agent), window, cx);
                 assert_eq!(frame.current_address(), &Frame::desk_address());
-                frame.back(window, cx);
+                frame.toggle_desk(window, cx);
                 assert_eq!(frame.current_address(), &agent);
                 assert!(is_waiting(frame));
                 // The host answers while the user is in a prompt: the prompt
@@ -2202,7 +2246,11 @@ mod tests {
                 frame.reopen_waiting(window, cx);
                 assert_eq!(frame.current_address(), &Frame::desk_address());
                 assert!(frame.desk.focus_handle(cx).contains_focused(window, cx));
-                assert_eq!(frame.history.len(), 1, "no walk reaches it again");
+                assert_eq!(
+                    places_in_order(frame),
+                    [Frame::desk_address()],
+                    "it is no longer a place"
+                );
             })
             .unwrap();
     }
@@ -2239,7 +2287,7 @@ mod tests {
                 frame
                     .surfaces
                     .insert(subject.clone(), AnySurface::new(card));
-                frame.history.show(subject.clone(), ScreenEntry::Opened);
+                frame.recent.show(subject.clone(), ScreenEntry::Opened);
                 assert_eq!(
                     frame.card_in_view(cx),
                     Some(subject),
@@ -2261,16 +2309,38 @@ mod tests {
                     .insert(agent.clone(), AnySurface::new(transcript));
                 frame.open(agent, window, cx);
                 assert_eq!(frame.card_target(cx), None);
-                frame.verdict_menu(window, cx);
+                frame.leader(window, cx);
                 let menu = &frame.menu.as_ref().expect("space still opens a menu").rows;
-                assert_eq!(menu.title, "no card here");
-                assert_eq!(labels(menu), ["undo", "next card"]);
+                assert_eq!(menu.title, "standing · lab");
+                assert_eq!(
+                    labels(menu),
+                    ["places"],
+                    "nothing to undo, no card to judge"
+                );
             })
             .unwrap();
     }
 
-    /// A system with one project, `tide@lab`, that `find` lists.
+    /// A system with one project, `tide@lab`, and a thread in it and one
+    /// outside it, all of which `find` lists.
     struct Projects;
+
+    impl Projects {
+        fn tide() -> Address {
+            Address::new("project", "tide")
+        }
+
+        fn thread(&self, key: &str, title: &str) -> Found {
+            Found {
+                address: Address::new("project", key),
+                title: title.into(),
+                description: String::new(),
+                thread: None,
+                recency: 0,
+                also: Vec::new(),
+            }
+        }
+    }
 
     impl crate::System for Projects {
         fn kinds(&self) -> &'static [&'static str] {
@@ -2282,50 +2352,77 @@ mod tests {
         }
 
         fn project(&self, address: &Address, _: &App) -> Option<crate::Project> {
-            (address == &Address::new("project", "tide")).then(|| crate::Project {
-                address: address.clone(),
+            matches!(address.rest(), "tide" | "tide/1").then(|| crate::Project {
+                address: Self::tide(),
                 name: "tide@lab".into(),
             })
         }
 
         fn find(&self, _: &rho_dealer::Marks, _: &App) -> Vec<Found> {
-            vec![Found {
-                address: Address::new("project", "tide"),
-                title: "tide@lab".into(),
-                description: "on /srv/tide · one agent · opus-high".into(),
-                thread: None,
-                recency: 0,
-                also: Vec::new(),
-            }]
+            vec![
+                Found {
+                    description: "on /srv/tide · one agent · opus-high".into(),
+                    ..self.thread("tide", "tide@lab")
+                },
+                self.thread("tide/1", "Flaky clock test"),
+                self.thread("reef/1", "Clock drift on reef"),
+            ]
         }
     }
 
-    /// A project has no screen: choosing it in the palette filters the
-    /// palette to its threads.
+    /// A project has no screen: choosing it in `Places` narrows `Places`
+    /// to its threads, and the prompt says so.
     #[gpui::test]
-    fn choosing_a_project_in_the_palette_filters_to_its_threads(cx: &mut gpui::TestAppContext) {
+    fn choosing_a_project_in_places_narrows_it_to_its_threads(cx: &mut gpui::TestAppContext) {
         let window = test_frame_with(cx, rho_db::RhoDb::in_memory(), |cx| {
             vec![AnySystem::new(cx.new(|_| Projects))]
         });
+        let typed = |text: &'static str, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, window, cx| {
+                    frame
+                        .minibuffer_mut()
+                        .unwrap()
+                        .set_input(text.into(), window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let rows = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |frame, _, _| {
+                    frame.minibuffer.as_ref().unwrap().row_names()
+                })
+                .unwrap()
+        };
         window
-            .update(cx, |frame, window, cx| {
-                frame.palette(window, cx);
-                frame
-                    .minibuffer_mut()
-                    .unwrap()
-                    .set_input("tide@lab".into(), window, cx);
-            })
+            .update(cx, |frame, window, cx| frame.places(window, cx))
             .unwrap();
-        cx.run_until_parked();
+        typed("clock", cx);
+        assert_eq!(rows(cx), ["Clock drift on reef", "Flaky clock test"]);
+        typed("tide@lab", cx);
+        assert_eq!(rows(cx)[0], "tide@lab");
         cx.dispatch_action(window.into(), keys::MinibufferConfirm);
         cx.run_until_parked();
         window
-            .update(cx, |frame, _, cx| {
+            .update(cx, |frame, _, _| {
                 assert_eq!(frame.current_address(), &Frame::desk_address());
-                let palette = frame.minibuffer_mut().expect("the palette stays open");
-                assert_eq!(palette.input(cx), "tide@lab ");
+                let places = frame.minibuffer.as_ref().expect("Places stays open");
+                assert_eq!(places.prompt(), "places · tide@lab:");
             })
             .unwrap();
+        typed("clock", cx);
+        assert_eq!(
+            rows(cx),
+            ["Flaky clock test"],
+            "the reef thread is out of scope"
+        );
+        typed("tide", cx);
+        assert_eq!(
+            rows(cx),
+            Vec::<String>::new(),
+            "the project is not one of its threads"
+        );
     }
 
     #[gpui::test]
@@ -2342,18 +2439,27 @@ mod tests {
                 frame.open(page.clone(), window, cx);
                 assert_eq!(frame.card_target(cx), None);
                 assert_eq!(frame.own_card(cx), None, "the status line keeps its title");
-                let menu = frame.verdict_rows(cx);
-                assert_eq!(menu.title, "no card here");
-                assert_eq!(labels(&menu), ["undo", "next card"]);
+                let menu = frame.leader_rows(cx);
+                assert_eq!(labels(&menu), ["places"], "no verdicts on a page");
+                // Commands are global, but say that nothing here waits.
                 let commands = frame.commands(window, cx);
-                let commands = commands
+                let snooze = commands
                     .iter()
-                    .map(|row| row.pick.label())
-                    .collect::<Vec<_>>();
-                assert!(commands.contains(&"next card"), "{commands:?}");
-                for verdict in ["done", "mute", "unmute", "snooze"] {
-                    assert!(!commands.contains(&verdict), "{verdict} in {commands:?}");
+                    .find(|command| command.name() == "snooze")
+                    .expect("snooze is a command everywhere")
+                    .clone();
+                assert_eq!(snooze.target_text(), Some("no waiting card"));
+                for verdict in ["done", "mute"] {
+                    assert!(
+                        commands.iter().all(|command| command.name() != verdict),
+                        "{verdict} is no command"
+                    );
                 }
+                frame.run_command(&snooze, Some("3h".into()), window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("snooze: no waiting card here")
+                );
                 assert!(!frame.marks().get(&page).facts().muted());
                 assert_eq!(frame.marks().get(&page).facts().seen_mail().next(), None);
             })
@@ -2413,18 +2519,18 @@ mod tests {
                 assert_eq!(frame.marks().get(&earlier).facts().seen_mail().next(), None);
                 assert_eq!(frame.current_address(), &agent, "stay on the transcript");
 
-                // The card has left the hand; `space` still offers undo
-                // and the next card, and undo stays on the transcript.
+                // The card has left the hand; `space` still offers undo,
+                // and undo stays on the transcript.
                 frame
                     .signals
                     .hand
                     .cards
                     .retain(|card| card.address != inspected);
                 assert_eq!(frame.card_target(cx), None);
-                frame.verdict_menu(window, cx);
+                frame.leader(window, cx);
                 let menu = &frame.menu.as_ref().expect("space opens a menu").rows;
-                assert_eq!(menu.title, "no card here");
-                assert_eq!(labels(menu), ["undo", "next card"]);
+                assert_eq!(menu.title, "standing · lab");
+                assert_eq!(labels(menu), ["places", "undo"]);
                 frame.close_menu(window, cx);
                 frame.undo_verdict(window, cx);
                 assert_eq!(settled(frame), []);
@@ -2434,11 +2540,19 @@ mod tests {
                     "undo stays on the transcript"
                 );
 
+                // Back in the hand, the card is the transcript's again
+                // when the reader comes back to it through Desk.
+                let card = frame.card_for(&inspected, cx);
+                frame.signals.hand.cards.push(card);
+                frame.toggle_desk(window, cx);
+                frame.toggle_desk(window, cx);
+                assert_eq!(frame.current_address(), &agent);
+                assert_eq!(frame.card_target(cx), Some(inspected.clone()));
                 frame.open(agent, window, cx);
                 assert_eq!(
                     frame.card_target(cx),
                     None,
-                    "a new visit has no stale origin"
+                    "an open by name has no stale origin"
                 );
             })
             .unwrap();
@@ -2481,7 +2595,7 @@ mod tests {
                 frame.signals.hand.cards = vec![card.clone()];
                 let view = AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle())));
                 frame.surfaces.insert(thread.clone(), view);
-                frame.history.show(thread.clone(), ScreenEntry::Opened);
+                frame.recent.show(thread.clone(), ScreenEntry::Opened);
                 assert_eq!(frame.card_seen(&thread, cx), Some(card.seen));
                 frame.signals.hand.cards.clear();
                 assert_eq!(
@@ -2603,8 +2717,113 @@ mod tests {
             .unwrap();
     }
 
+    /// Closing falls back along the order of visits, not of opens; `tab`
+    /// flips between Desk and the place before it; nothing piles up.
     #[gpui::test]
-    fn an_empty_desk_offers_undo_but_no_next_card(cx: &mut gpui::TestAppContext) {
+    fn navigation_is_by_recency(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let desk = Frame::desk_address();
+                let (a, _) = hold_named(frame, "a", cx);
+                let (b, _) = hold_named(frame, "b", cx);
+                let (c, _) = hold_named(frame, "c", cx);
+                frame.open(a.clone(), window, cx);
+                frame.open(b.clone(), window, cx);
+                frame.open(c.clone(), window, cx);
+                frame.open(a.clone(), window, cx);
+                for _ in 0..5 {
+                    frame.toggle_desk(window, cx);
+                }
+                assert_eq!(frame.current_address(), &desk);
+                frame.toggle_desk(window, cx);
+                assert_eq!(
+                    places_in_order(frame),
+                    [a.clone(), desk.clone(), c.clone(), b.clone()],
+                    "each place once, newest first"
+                );
+                frame.close_current(window, cx);
+                assert_eq!(frame.current_address(), &desk, "the place visited before a");
+                assert!(frame.surface(&a).is_none());
+                frame.close_current(window, cx);
+                assert_eq!(
+                    frame.current_address(),
+                    &c,
+                    "q on Desk flips to the place before"
+                );
+                assert_eq!(places_in_order(frame), [c.clone(), desk.clone(), b.clone()]);
+                frame.close_current(window, cx);
+                frame.close_current(window, cx);
+                frame.close_current(window, cx);
+                assert_eq!(places_in_order(frame), [desk.clone()]);
+                frame.close_current(window, cx);
+                assert_eq!(frame.current_address(), &desk, "Desk never closes");
+                assert_eq!(echo_of(frame).as_deref(), Some("no other place yet"));
+            })
+            .unwrap();
+    }
+
+    /// A place come back to is as it was left: only an open by name tells
+    /// the screen to start over.
+    #[gpui::test]
+    fn a_place_come_back_to_is_as_it_was_left(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let (thread, opened) = hold_named(frame, "thread", cx);
+                let (page, _) = hold_named(frame, "page", cx);
+                frame.open(thread.clone(), window, cx);
+                assert_eq!(opened.get(), 1);
+                frame.toggle_desk(window, cx);
+                frame.toggle_desk(window, cx);
+                assert_eq!(frame.current_address(), &thread);
+                frame.open(page.clone(), window, cx);
+                frame.previous_place(window, cx);
+                assert_eq!(frame.current_address(), &thread);
+                assert_eq!(opened.get(), 1, "tab and the recent places revisit");
+                frame.open(thread.clone(), window, cx);
+                assert_eq!(opened.get(), 2, "an open by name starts over");
+            })
+            .unwrap();
+    }
+
+    /// With nothing typed, `Places` lists where the reader has been, newest
+    /// first, without the screen in view or Desk, and `enter` flips back.
+    #[gpui::test]
+    fn blank_places_flip_back_to_the_previous_place(cx: &mut gpui::TestAppContext) {
+        let window = test_frame(cx, rho_db::RhoDb::in_memory());
+        let (thread, opened) = window
+            .update(cx, |frame, window, cx| {
+                let (thread, opened) = hold_named(frame, "Flaky clock test", cx);
+                let (page, _) = hold_named(frame, "web › Rust", cx);
+                let (term, _) = hold_named(frame, "tide · terminal 1", cx);
+                frame.open(term, window, cx);
+                frame.open(thread.clone(), window, cx);
+                frame.open_desk(window, cx);
+                frame.open(page, window, cx);
+                frame.places(window, cx);
+                assert_eq!(
+                    frame.minibuffer.as_ref().unwrap().row_names(),
+                    ["Flaky clock test", "tide · terminal 1"]
+                );
+                (thread, opened)
+            })
+            .unwrap();
+        cx.dispatch_action(window.into(), keys::MinibufferConfirm);
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, _| {
+                assert_eq!(frame.current_address(), &thread);
+                assert_eq!(opened.get(), 1, "the thread is as it was left");
+            })
+            .unwrap();
+    }
+
+    /// `space` is the same leader everywhere: `f` places, and `u` only
+    /// while there is a verdict to take back. A waiting card adds its
+    /// verdicts; nothing else ever does, and `n` is gone.
+    #[gpui::test]
+    fn the_leader_offers_verdicts_only_on_a_waiting_card(cx: &mut gpui::TestAppContext) {
         let (frame, wants) = wanting_frame(cx);
         let thread = Address::new("thread", "lab/1");
         wants.borrow_mut().push(titled(
@@ -2616,19 +2835,69 @@ mod tests {
                 frame.systems_changed(cx);
                 frame.pull_card(window, cx);
                 assert_eq!(frame.current_address(), &thread);
-                // Away from Desk, nothing waiting still deals: it opens Desk.
+                assert_eq!(
+                    labels(&frame.leader_rows(cx)),
+                    ["places", "done", "mute", "snooze"]
+                );
                 wants.borrow_mut().clear();
                 frame.systems_changed(cx);
-                assert_eq!(
-                    labels(&frame.verdict_rows(cx)),
-                    ["done", "mute", "snooze", "undo", "next card"]
-                );
                 frame.verdict(&thread, Verdict::Done, "done".to_owned(), window, cx);
-                assert!(frame.desk_in_view());
+                assert!(frame.desk_in_view(), "nothing else waits");
                 assert!(frame.attention.can_undo());
-                frame.desk_space(window, cx);
-                let menu = &frame.menu.as_ref().expect("space offers undo").rows;
-                assert_eq!(labels(menu), ["undo"], "0 wait: no next card on Desk");
+                frame.leader(window, cx);
+                let menu = &frame
+                    .menu
+                    .as_ref()
+                    .expect("space opens the leader on Desk")
+                    .rows;
+                assert_eq!(
+                    labels(menu),
+                    ["places", "undo"],
+                    "no verdicts and no deal on Desk"
+                );
+            })
+            .unwrap();
+    }
+
+    /// `:snooze 3h` snoozes the card in view in one line; a time it cannot
+    /// read is echoed and changes nothing; and what ran last leads the
+    /// blank `Commands`.
+    #[gpui::test]
+    fn a_command_takes_its_argument_on_the_line(cx: &mut gpui::TestAppContext) {
+        let (frame, wants) = wanting_frame(cx);
+        let thread = Address::new("thread", "lab/1");
+        wants.borrow_mut().push(titled(
+            asks(&thread, jiff::SignedDuration::from_hours(2), false),
+            "Clock drift",
+        ));
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.systems_changed(cx);
+                frame.pull_card(window, cx);
+                assert_eq!(frame.current_address(), &thread);
+                run_line(frame, "snooze 3x", window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("snooze: say how long, such as 3h, 2d, 1w, tomorrow or next week")
+                );
+                assert_eq!(frame.current_address(), &thread, "nothing changed");
+                assert!(!frame.attention.can_undo());
+                run_line(frame, "later 3h", window, cx);
+                assert!(frame.attention.can_undo(), "the snooze is a verdict");
+                assert!(frame.desk_in_view(), "the card is put away");
+                assert!(
+                    echo_of(frame).is_some_and(|echo| echo.starts_with("snooze until")),
+                    "{:?}",
+                    echo_of(frame)
+                );
+                run_line(frame, "quit", window, cx);
+            })
+            .unwrap();
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.commands_prompt(window, cx);
+                let rows = frame.minibuffer.as_ref().unwrap().row_names();
+                assert_eq!(rows[..2], ["quit", "snooze"], "the commands run last lead");
             })
             .unwrap();
     }
@@ -2742,10 +3011,10 @@ mod tests {
             .update(cx, |frame, window, cx| {
                 let card = cx.new(|cx| OpenCard(cx.focus_handle()));
                 frame.surfaces.insert(thread.clone(), AnySurface::new(card));
-                frame.history.show(thread.clone(), ScreenEntry::Opened);
+                frame.recent.show(thread.clone(), ScreenEntry::Opened);
                 assert!(!frame.attention.can_undo(), "the window just restarted");
                 assert!(frame.marks().get(&thread).facts().muted());
-                let mut rows = frame.verdict_rows(cx).rows;
+                let mut rows = frame.leader_rows(cx).rows;
                 let unmute = rows
                     .iter()
                     .position(|row| row.pick.label() == "unmute")
@@ -2847,10 +3116,10 @@ mod tests {
             asks(&second, jiff::SignedDuration::from_mins(1), false),
         ]);
         let approve = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
-            let rows = frame.verdict_rows(cx);
+            let rows = frame.leader_rows(cx);
             assert_eq!(
-                labels(&rows)[..2],
-                ["approve".to_owned(), "snooze".to_owned()],
+                labels(&rows),
+                ["places", "approve", "snooze"],
                 "its own words, and a snooze, in place of done and mute"
             );
             assert!(
@@ -2858,7 +3127,7 @@ mod tests {
                     .iter()
                     .any(|label| label == "done" || label == "mute")
             );
-            let Pick::Run { run, .. } = rows.rows[0].pick.clone() else {
+            let Pick::Run { run, .. } = rows.rows[1].pick.clone() else {
                 panic!("approve runs");
             };
             run(frame, None, window, cx);
@@ -2940,17 +3209,17 @@ mod tests {
                 assert_eq!(frame.current_address(), &push);
                 frame.press_phone_button(crate::phone::Button::Done, window, cx);
                 let menu = frame.menu.as_ref().expect("the answers are offered");
-                assert_eq!(labels(&menu.rows)[0], "approve");
+                assert_eq!(labels(&menu.rows)[1], "approve");
                 assert!(frame.marks().get(&push).facts.is_empty(), "nothing settled");
             })
             .unwrap();
     }
 
-    /// Switching a screen in place three times leaves history as long as
-    /// it was, with the screen where it stood, and what is written down
-    /// for the next start names the screen as it is now.
+    /// Switching a screen in place three times adds no place: the screen
+    /// keeps its rank, and what is written down for the next start names
+    /// the screen as it is now. One out of view is renamed where it stands.
     #[gpui::test]
-    fn switching_a_screen_in_place_adds_no_history(cx: &mut gpui::TestAppContext) {
+    fn switching_a_screen_in_place_adds_no_place(cx: &mut gpui::TestAppContext) {
         let frame = test_frame(cx, rho_db::RhoDb::in_memory());
         frame
             .update(cx, |frame, window, cx| {
@@ -2970,23 +3239,35 @@ mod tests {
                 }
                 frame.open(thread.clone(), window, cx);
                 frame.open(charts[0].clone(), window, cx);
-                let len = frame.history.len();
-                for chart in &charts[1..] {
-                    frame.replace_current(chart.clone(), window, cx);
+                for pair in charts.windows(2) {
+                    frame.replace(&pair[0], pair[1].clone(), window, cx);
                 }
-                assert_eq!(frame.history.len(), len);
-                assert_eq!(frame.current_address(), &charts[3]);
                 assert_eq!(
-                    frame.history.keys_back().cloned().collect::<Vec<_>>(),
-                    [thread.clone(), Frame::desk_address()]
+                    places_in_order(frame),
+                    [charts[3].clone(), thread.clone(), Frame::desk_address()]
                 );
                 for gone in &charts[..3] {
                     assert!(frame.surface(gone).is_none(), "{gone} went");
                 }
-                let saved = place::Saved::of(&frame.history);
+                let saved = place::Saved::of(&frame.recent);
                 assert_eq!(
-                    saved.history(&Frame::desk_address()).current_key(),
+                    saved.recent(&Frame::desk_address()).current_key(),
                     &charts[3]
+                );
+                // A sent idea becomes its thread where it stands, out of view.
+                let idea = Address::new("idea", "9");
+                let posted = Address::new("thread", "lab/9");
+                frame.remember(idea.clone());
+                assert_eq!(places_in_order(frame)[1], idea);
+                frame.replace(&idea, posted.clone(), window, cx);
+                assert_eq!(
+                    places_in_order(frame),
+                    [
+                        charts[3].clone(),
+                        posted,
+                        thread.clone(),
+                        Frame::desk_address()
+                    ]
                 );
             })
             .unwrap();
@@ -3082,17 +3363,17 @@ mod tests {
         host_backed_frame(cx).0
     }
 
-    /// Runs the palette's command called `label`, as `enter` on its row.
-    fn run_command(frame: &mut Frame, label: &str, window: &mut Window, cx: &mut Context<Frame>) {
-        let commands = frame.commands(window, cx);
-        let Some(row) = commands.iter().find(|row| row.pick.label() == label) else {
-            let labels: Vec<_> = commands.iter().map(|row| row.pick.label()).collect();
-            panic!("no {label:?} in {labels:?}");
-        };
-        let Pick::Run { run, .. } = &row.pick else {
-            panic!("{label} is no command");
-        };
-        run.clone()(frame, None, window, cx);
+    /// Types `line` into `Commands` and presses enter, as the user does.
+    fn run_line(frame: &mut Frame, line: &str, window: &mut Window, cx: &mut Context<Frame>) {
+        frame.commands_prompt(window, cx);
+        answer(frame, line, window, cx);
+        assert!(
+            frame
+                .minibuffer
+                .as_ref()
+                .is_none_or(|prompt| prompt.prompt() != ":"),
+            "{line:?} names no command"
+        );
     }
 
     fn echo_of(frame: &Frame) -> Option<String> {
@@ -3111,9 +3392,9 @@ mod tests {
     }
 
     const GCCP: [&str; 3] = [
-        "hosts › gccp › list",
-        "hosts › gccp › approve…",
-        "hosts › gccp › remove…",
+        "list gccp agents",
+        "approve gccp agent",
+        "remove gccp agent",
     ];
 
     /// The GCCP commands are the window's own: on the desk, on a page that
@@ -3132,18 +3413,18 @@ mod tests {
                     }
                     let commands = frame.commands(window, cx);
                     for label in GCCP {
-                        let row = commands
-                            .iter()
-                            .find(|row| row.pick.label() == label)
-                            .unwrap_or_else(|| panic!("{label} on {}", frame.current_address()));
-                        assert_eq!(row.scope, crate::menu::Scope::Window, "{label}");
+                        assert!(
+                            commands.iter().any(|command| command.name() == label),
+                            "{label} on {}",
+                            frame.current_address()
+                        );
                     }
                 }
-                run_command(frame, GCCP[0], window, cx);
+                run_line(frame, GCCP[0], window, cx);
                 assert_eq!(prompt_of(frame), None, "nothing to ask about");
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("gccp list: no agent host is attached")
+                    Some("list gccp agents: no agent host is attached")
                 );
             })
             .unwrap();
@@ -3157,9 +3438,7 @@ mod tests {
         let frame = gccp_frame(cx);
         let asked = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
         frame
-            .update(cx, |frame, window, cx| {
-                run_command(frame, GCCP[0], window, cx)
-            })
+            .update(cx, |frame, window, cx| run_line(frame, GCCP[0], window, cx))
             .unwrap();
         cx.run_until_parked();
         assert_eq!(*asked.borrow(), [HostRequest::GccpList(GccpList)]);
@@ -3206,7 +3485,7 @@ mod tests {
         let sea = attach_in_process(&frame, "sea", Ok(gccp_state()), cx);
         frame
             .update(cx, |frame, window, cx| {
-                run_command(frame, GCCP[2], window, cx);
+                run_line(frame, GCCP[2], window, cx);
                 assert_eq!(prompt_of(frame).as_deref(), Some("host:"));
                 let hosts: Vec<_> = candidates_of(frame)
                     .into_iter()
@@ -3263,7 +3542,7 @@ mod tests {
         let asked = attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
         frame
             .update(cx, |frame, window, cx| {
-                run_command(frame, GCCP[1], window, cx);
+                run_line(frame, GCCP[1], window, cx);
                 assert_eq!(
                     prompt_of(frame).as_deref(),
                     Some("approve a gccp harness on lab · <endpoint id> <name>:")
@@ -3271,9 +3550,9 @@ mod tests {
                 answer(frame, HARNESS, window, cx);
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("gccp approve: give the harness's endpoint id, then a name for it")
+                    Some("approve gccp agent: give the harness's endpoint id, then a name for it")
                 );
-                run_command(frame, GCCP[1], window, cx);
+                run_line(frame, GCCP[1], window, cx);
                 answer(frame, &format!("  {HARNESS}   fable lab  "), window, cx);
             })
             .unwrap();
@@ -3304,9 +3583,7 @@ mod tests {
         let frame = gccp_frame(cx);
         attach_in_process(&frame, "lab", Err("gccp needs an iroh endpoint"), cx);
         frame
-            .update(cx, |frame, window, cx| {
-                run_command(frame, GCCP[2], window, cx)
-            })
+            .update(cx, |frame, window, cx| run_line(frame, GCCP[2], window, cx))
             .unwrap();
         cx.run_until_parked();
         frame
@@ -3314,7 +3591,7 @@ mod tests {
                 assert_eq!(prompt_of(frame), None);
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("gccp remove: lab: gccp needs an iroh endpoint")
+                    Some("remove gccp agent: lab: gccp needs an iroh endpoint")
                 );
             })
             .unwrap();
@@ -3328,7 +3605,7 @@ mod tests {
         attach_in_process(&frame, "lab", Ok(gccp_state()), cx);
         frame
             .update(cx, |frame, window, cx| {
-                run_command(frame, GCCP[0], window, cx);
+                run_line(frame, GCCP[0], window, cx);
                 frame.open_prompt(
                     "attach host:",
                     Rc::new(|_, _, _| Vec::new()),
@@ -3344,7 +3621,7 @@ mod tests {
                 assert_eq!(prompt_of(frame).as_deref(), Some("attach host:"));
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("gccp list: lab answered while another prompt was open · run it again")
+                    Some("list gccp agents: lab answered while another prompt was open · run it again")
                 );
             })
             .unwrap();

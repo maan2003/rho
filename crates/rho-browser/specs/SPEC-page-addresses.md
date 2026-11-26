@@ -4,7 +4,7 @@
 
 The page id is minted by the bundled extension (`extension/service-worker.js`),
 read into `PageId` by the native-host bridge and by the `page` system
-(`ui`), and kept as text by the frame in history and in ledger keys, so no
+(`ui`), and kept as text by the frame among recent places and in ledger keys, so no
 one of them can own the format alone.
 
 ## Contract

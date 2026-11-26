@@ -8,10 +8,20 @@ use gpui::{
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use rho_dealer::Address;
-use rho_frame::{Row, Surface};
+use rho_frame::{Command, Spelling, Surface};
 
 use super::ChatSystem;
 use crate::outbox::OutgoingState;
+
+pub static WRITE_IDEA_AGAIN: Spelling = Spelling {
+    name: "write idea again",
+    aliases: &[
+        ("retry idea", 8),
+        ("resend idea", 8),
+        ("edit refused idea", 6),
+    ],
+    argument: None,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingIdeaId(pub(super) u64);
@@ -39,7 +49,7 @@ pub(super) fn title(text: &str) -> String {
         .to_owned()
 }
 
-/// What the palette says of an idea the outbox holds.
+/// What `Places` says of an idea the outbox holds.
 pub(super) fn status(state: &OutgoingState) -> &'static str {
     match state {
         OutgoingState::Queued => "queued",
@@ -140,19 +150,18 @@ impl Surface for PendingIdea {
     }
 
     /// A refused idea goes back into the draft to change and send again.
-    fn rows(
+    fn commands(
         &mut self,
         _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<Row> {
+    ) -> Vec<Command> {
         if self.refusal(cx).is_none() {
             return Vec::new();
         }
         let (system, id) = (self.system.clone(), self.id);
-        vec![Row::run(
-            "",
-            "write this idea again",
+        vec![Command::simple(
+            &WRITE_IDEA_AGAIN,
             move |frame, window, cx| {
                 let Some(idea) = system.read(cx).refused_idea(id) else {
                     return;

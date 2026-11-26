@@ -1,6 +1,6 @@
-# The frame: the one window, its history of surfaces, the minibuffer, the
+# The frame: the one window, its recent places, the minibuffer, the
 # menus, the keymap, the attached hosts and the ledger. Systems plug in
-# surfaces, menu rows, cards, channels and things to find, each under one
+# surfaces, commands, cards, channels and things to find, each under one
 # address scheme; the frame knows none of them by name.
 [package]
 edition.workspace = true

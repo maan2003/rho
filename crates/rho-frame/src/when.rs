@@ -56,6 +56,37 @@ pub fn snooze_target(unit: SnoozeUnit, count: i64, now: &Zoned) -> (Until, Strin
     (until, format!("{name} · {}", at.strftime(clock)))
 }
 
+/// What a snooze typed after its name says (`:snooze 3h`): a count and a
+/// unit, as `3` then `h` says in the snooze menu. `tomorrow` and `next
+/// week` are a day and a week, as the menu's rows are.
+pub fn parse_snooze(text: &str) -> Result<(SnoozeUnit, u32), &'static str> {
+    const HOW_LONG: &str = "say how long, such as 3h, 2d, 1w, tomorrow or next week";
+    let text = text.trim().to_lowercase();
+    match text.as_str() {
+        "tomorrow" => return Ok((SnoozeUnit::Days, 1)),
+        "next week" => return Ok((SnoozeUnit::Weeks, 1)),
+        _ => {}
+    }
+    let digits = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let count = match &text[..digits] {
+        "" => 1,
+        digits => digits
+            .parse::<u32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or(HOW_LONG)?,
+    };
+    let unit = match text[digits..].trim() {
+        "h" | "hr" | "hrs" | "hour" | "hours" => SnoozeUnit::Hours,
+        "d" | "day" | "days" => SnoozeUnit::Days,
+        "w" | "wk" | "week" | "weeks" => SnoozeUnit::Weeks,
+        _ => return Err(HOW_LONG),
+    };
+    Ok((unit, count))
+}
+
 /// The bar's words for a snooze: `snooze until 05:17`.
 pub fn snooze_said(at: &Zoned, now: &Zoned) -> String {
     format!("snooze {}", until_said(at, now))
@@ -87,6 +118,28 @@ mod tests {
             .at(10, 0, 0, 0)
             .to_zoned(TimeZone::fixed(Offset::constant(hours)))
             .unwrap()
+    }
+
+    #[test]
+    fn a_typed_snooze_reads_as_the_menu_counts_it() {
+        use SnoozeUnit::*;
+        for (typed, read) in [
+            ("3h", (Hours, 3)),
+            ("3 hours", (Hours, 3)),
+            ("1 hour", (Hours, 1)),
+            ("h", (Hours, 1)),
+            ("2d", (Days, 2)),
+            (" Tomorrow ", (Days, 1)),
+            ("12 days", (Days, 12)),
+            ("1w", (Weeks, 1)),
+            ("next week", (Weeks, 1)),
+            ("2 weeks", (Weeks, 2)),
+        ] {
+            assert_eq!(parse_snooze(typed), Ok(read), "{typed:?}");
+        }
+        for wrong in ["", "3", "0h", "3x", "h3", "-2d", "soon", "99999999999h"] {
+            assert!(parse_snooze(wrong).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]

@@ -790,7 +790,7 @@ mod tests {
     const A: u32 = 30;
     const O: u32 = 24;
 
-    /// `ctrl-shift-;` opens the palette: the app gets the modifier, which
+    /// `ctrl-shift-;` opens `Commands`: the app gets the modifier, which
     /// it cannot act on alone, and never the `;`.
     #[test]
     fn a_key_a_window_binding_takes_never_reaches_the_app() {

@@ -1,11 +1,11 @@
-//! Where the user was on this device: the screen in view and the screens
-//! back and forward from it, kept across a restart so the window opens
-//! where they left it (`product.md`: where they were on each device).
+//! Where the user was on this device: the places they visited, most
+//! recent first, the one in view at the front, kept across a restart so
+//! the window opens where they left it (`window.Screen`).
 //!
 //! One row in the device's own database, rewritten whole after every move
-//! on a thread of its own, so a move never waits on a commit. A screen is
-//! kept by its address; the window makes it again only when the user
-//! reaches it, and one that no longer opens leaves the history then.
+//! on a thread of its own, so a move never waits on a commit. A place is
+//! kept by its address; the window makes its screen again only when the
+//! user reaches it, and one that no longer opens leaves the order then.
 
 use std::sync::mpsc;
 
@@ -13,13 +13,15 @@ use jiff::{SignedDuration, Timestamp};
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_dealer::Address;
-use rho_window::history::{History, Visit};
 use senax_encoder::{Decode, Encode};
 
 use crate::frame::ScreenEntry;
+use crate::recent::Recent;
 
-const PLACE: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_place_v1");
+const RECENT: TableDefinition<(), Sen<Saved>> = TableDefinition::new("gui_frame_recent_v1");
 const LAST_INPUT: TableDefinition<(), i64> = TableDefinition::new("gui_frame_last_input_v1");
+const COMMANDS: TableDefinition<(), Sen<SavedCommands>> =
+    TableDefinition::new("gui_frame_recent_commands_v1");
 
 /// `desk.a cold return opens the desk`: exactly ten minutes is still warm.
 pub(crate) const COLD_RETURN: std::time::Duration = std::time::Duration::from_secs(600);
@@ -40,134 +42,167 @@ pub(crate) fn last_input(db: &RhoDb) -> Option<Timestamp> {
     Timestamp::from_millisecond(millis).ok()
 }
 
-/// The history as written down: every screen, oldest first, and which of
-/// them is in view.
+/// The places as written down, newest first: the first is in view.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct Saved {
-    screens: Vec<String>,
-    at: u32,
-    /// Same order as `screens`. Before the Palette recorded timestamps the
-    /// stack was all that was saved; those screens have no known visit time.
-    visits: Option<Vec<SavedVisit>>,
+    places: Vec<SavedPlace>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct SavedVisit {
-    order: u64,
-    wall_ms: Option<u64>,
+struct SavedPlace {
+    address: String,
+    visited_ms: Option<u64>,
 }
 
 impl Saved {
-    pub(crate) fn of(history: &History<Address, ScreenEntry>) -> Self {
-        let mut keys: Vec<_> = history.keys_back().collect();
-        keys.reverse();
-        let at = keys.len() as u32;
-        keys.push(history.current_key());
-        keys.extend(history.keys_forward());
-        let (screens, visits) = keys
-            .into_iter()
-            .map(|key| {
-                let visit = history.visit(key).unwrap_or_default();
-                (
-                    key.to_string(),
-                    SavedVisit {
-                        order: visit.order,
-                        wall_ms: visit.wall_ms,
-                    },
-                )
-            })
-            .unzip();
+    pub(crate) fn of(recent: &Recent<Address, ScreenEntry>) -> Self {
         Self {
-            screens,
-            at,
-            visits: Some(visits),
+            places: recent
+                .record()
+                .map(|(address, visited_ms)| SavedPlace {
+                    address: address.to_string(),
+                    visited_ms,
+                })
+                .collect(),
         }
     }
 
-    /// The history it describes, by address alone, with the desk in it
-    /// whatever was written: the desk is the screen nothing closes. An address
-    /// this build cannot read is left out.
-    pub(crate) fn history(&self, desk: &Address) -> History<Address, ScreenEntry> {
-        // Reuse the same stack record; the oldest releases called the desk
-        // Home. Translate that one surface instead of losing its position.
-        let address = |key: &str| {
-            if key == "frame:home" {
-                Some(desk.clone())
-            } else {
-                Address::parse(key)
-            }
-        };
-        let at = self
-            .screens
-            .get(self.at as usize)
-            .and_then(|key| address(key));
-        let mut screens: Vec<Address> =
-            self.screens.iter().filter_map(|key| address(key)).collect();
-        if !screens.contains(desk) {
-            screens.insert(0, desk.clone());
-        }
-        let mut history = History::new(screens[0].clone(), ScreenEntry::Opened);
-        for address in &screens[1..] {
-            history.show(address.clone(), ScreenEntry::Opened);
-        }
-        let at = at.unwrap_or_else(|| desk.clone());
-        while history.current_key() != &at && history.back().is_some() {}
-        let visits = self
-            .screens
+    /// The order it describes, by address alone, with the desk in it
+    /// whatever was written: the desk is the place nothing closes. An
+    /// address this build cannot read is left out.
+    pub(crate) fn recent(&self, desk: &Address) -> Recent<Address, ScreenEntry> {
+        let mut places: Vec<_> = self
+            .places
             .iter()
-            .enumerate()
-            .filter_map(|(index, key)| {
-                let key = address(key)?;
-                let visit = self
-                    .visits
-                    .as_ref()
-                    .and_then(|visits| visits.get(index))
-                    .map_or_else(
-                        || Visit {
-                            order: history.visit(&key).map_or(0, |visit| visit.order),
-                            wall_ms: None,
-                        },
-                        |saved| Visit {
-                            order: saved.order,
-                            wall_ms: saved.wall_ms,
-                        },
-                    );
-                Some((key, visit))
+            .filter_map(|place| {
+                Some((
+                    Address::parse(&place.address)?,
+                    ScreenEntry::Opened,
+                    place.visited_ms,
+                ))
             })
-            .collect::<Vec<_>>();
-        history.restore_visits(visits);
-        history
+            .collect();
+        if !places.iter().any(|(address, ..)| address == desk) {
+            places.push((desk.clone(), ScreenEntry::Opened, None));
+        }
+        Recent::restore(places).expect("the desk is always there")
     }
 
     /// What the last run wrote, if anything.
     pub(crate) fn load(db: &RhoDb) -> Option<Self> {
         let read = db.read();
-        if !read.has_table(PLACE.name()) {
-            return None;
+        if read.has_table(RECENT.name()) {
+            return Some(read.open_table(RECENT).get(())?.value().into_owned());
         }
-        let saved = read.open_table(PLACE).get(())?.value().into_owned();
-        Some(saved)
+        drop(read);
+        legacy::load(db)
     }
 }
 
-/// Starts on the desk after a cold return, with every other screen still
-/// in the stack and the screen we left immediately behind the desk.
-pub(crate) fn return_history(
+/// Temporary: the linear back-and-forward history this record replaced,
+/// read once so the first start of this build opens where the last one
+/// left off. Remove once every device has written `gui_frame_recent_v1`.
+mod legacy {
+    use super::*;
+
+    const PLACE: TableDefinition<(), Sen<History>> = TableDefinition::new("gui_frame_place_v1");
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+    pub(super) struct History {
+        pub screens: Vec<String>,
+        pub at: u32,
+        pub visits: Option<Vec<Visit>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub(super) struct Visit {
+        pub order: u64,
+        pub wall_ms: Option<u64>,
+    }
+
+    pub(super) fn load(db: &RhoDb) -> Option<Saved> {
+        let read = db.read();
+        if !read.has_table(PLACE.name()) {
+            return None;
+        }
+        let history = read.open_table(PLACE).get(())?.value().into_owned();
+        Some(convert(&history))
+    }
+
+    /// The screen in view first, then the rest by their last visit; the
+    /// oldest releases called the desk `home`.
+    pub(super) fn convert(history: &History) -> Saved {
+        let mut places: Vec<(usize, u64, SavedPlace)> = history
+            .screens
+            .iter()
+            .enumerate()
+            .map(|(index, screen)| {
+                let visit = history.visits.as_ref().and_then(|visits| visits.get(index));
+                let address = match screen.as_str() {
+                    "frame:home" => "frame:desk".to_owned(),
+                    other => other.to_owned(),
+                };
+                (
+                    index,
+                    visit.map_or(0, |visit| visit.order),
+                    SavedPlace {
+                        address,
+                        visited_ms: visit.and_then(|visit| visit.wall_ms),
+                    },
+                )
+            })
+            .collect();
+        let at = history.at as usize;
+        places.sort_by_key(|(index, order, _)| {
+            (
+                *index != at,
+                std::cmp::Reverse(*order),
+                // Without visits, nearer the screen in view is more recent.
+                index.abs_diff(at),
+            )
+        });
+        Saved {
+            places: places.into_iter().map(|(.., place)| place).collect(),
+        }
+    }
+}
+
+/// Starts on the desk after a cold return, with the place left right
+/// behind it.
+pub(crate) fn return_recent(
     saved: &Saved,
     desk: &Address,
     last: Option<Timestamp>,
     now: Timestamp,
-) -> History<Address, ScreenEntry> {
-    let mut history = saved.history(desk);
+) -> Recent<Address, ScreenEntry> {
+    let mut recent = saved.recent(desk);
     if is_cold(last, now) {
-        history.show(desk.clone(), ScreenEntry::Opened);
+        recent.show(desk.clone(), ScreenEntry::Opened);
     }
-    history
+    recent
+}
+
+/// The commands the user ran, most recent first, by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct SavedCommands {
+    pub names: Vec<String>,
+}
+
+pub(crate) fn recent_commands(db: &RhoDb) -> Vec<String> {
+    let read = db.read();
+    if !read.has_table(COMMANDS.name()) {
+        return Vec::new();
+    }
+    read.open_table(COMMANDS)
+        .get(())
+        .map(|saved| saved.value().into_owned().names)
+        .unwrap_or_default()
 }
 
 pub(crate) enum Write {
     Place(Saved),
     Input(Timestamp),
+    Commands(SavedCommands),
 }
 
 /// Saves the most recent update of each kind without waiting for disk in
@@ -186,23 +221,30 @@ impl Writer {
                 while let Ok(first) = receiver.recv() {
                     let mut place = None;
                     let mut input = None;
+                    let mut commands = None;
                     for write in std::iter::once(first).chain(receiver.try_iter()) {
                         match write {
                             Write::Place(value) => place = Some(value),
                             Write::Input(value) => input = Some(value),
+                            Write::Commands(value) => commands = Some(value),
                         }
                     }
                     futures::executor::block_on(async {
                         let mut write = db.write().await;
                         if let Some(place) = place {
                             write
-                                .open_table(PLACE)
+                                .open_table(RECENT)
                                 .insert((), SenValue::borrowed(&place));
                         }
                         if let Some(input) = input {
                             write
                                 .open_table(LAST_INPUT)
                                 .insert((), input.as_millisecond());
+                        }
+                        if let Some(commands) = commands {
+                            write
+                                .open_table(COMMANDS)
+                                .insert((), SenValue::borrowed(&commands));
                         }
                         write.commit();
                     })
@@ -239,197 +281,142 @@ mod tests {
         Address::parse(key).unwrap()
     }
 
-    /// The stack and the screen in view come back as they were, the way
-    /// back and the way forward both, after a write and a read.
+    fn order(recent: &Recent<Address, ScreenEntry>) -> Vec<Address> {
+        recent.keys().cloned().collect()
+    }
+
+    /// The order and the place in view come back as they were, after a
+    /// write and a read.
     #[test]
-    fn the_history_comes_back_with_the_screen_in_view() {
+    fn the_order_comes_back_with_the_place_in_view() {
         let desk = address("frame:desk");
-        let mut history = History::new(desk.clone(), ScreenEntry::Opened);
-        history.show(address("thread:a/1"), ScreenEntry::Opened);
-        history.show(address("agent:x"), ScreenEntry::Opened);
-        history.show(address("thread:a/2"), ScreenEntry::Opened);
-        history.back();
-        assert_eq!(history.current_key(), &address("agent:x"));
+        let mut recent = Recent::new(desk.clone(), ScreenEntry::Opened);
+        recent.show(address("thread:a/1"), ScreenEntry::Opened);
+        recent.show(address("agent:x"), ScreenEntry::Opened);
+        recent.show(address("thread:a/2"), ScreenEntry::Opened);
+        recent.show(address("agent:x"), ScreenEntry::Opened);
 
         let db = RhoDb::in_memory();
-        futures::executor::block_on(async {
-            let mut write = db.write().await;
-            write
-                .open_table(PLACE)
-                .insert((), SenValue::borrowed(&Saved::of(&history)));
-            write.commit();
-        });
-        let mut restored = Saved::load(&db).unwrap().history(&desk);
-        assert_eq!(restored.current_key(), &address("agent:x"));
+        let writer = Writer::spawn(db.clone());
+        writer.write(Write::Place(Saved::of(&recent)));
+        drop(writer);
+        let restored = Saved::load(&db).unwrap().recent(&desk);
+        assert_eq!(order(&restored), order(&recent));
         assert_eq!(
-            restored.keys_back().cloned().collect::<Vec<_>>(),
-            [address("thread:a/1"), desk.clone()]
-        );
-        assert_eq!(
-            restored.keys_forward().cloned().collect::<Vec<_>>(),
-            [address("thread:a/2")]
-        );
-        assert!(restored.back().is_some(), "ctrl-k is not at the oldest");
-    }
-
-    #[test]
-    fn visited_times_survive_restart_and_legacy_history_does_not_invent_them() {
-        #[derive(Encode, Decode)]
-        struct Legacy {
-            screens: Vec<String>,
-            at: u32,
-        }
-        let mut bytes = bytes::BytesMut::new();
-        use senax_encoder::{Decoder as _, Encoder as _};
-        Legacy {
-            screens: vec![
-                "frame:desk".into(),
-                "thread:old".into(),
-                "thread:recent".into(),
-            ],
-            at: 1,
-        }
-        .encode(&mut bytes)
-        .unwrap();
-        let saved = Saved::decode(&mut bytes.clone().freeze()).unwrap();
-        let desk = address("frame:desk");
-        let old = address("thread:old");
-        let recent = address("thread:recent");
-        let mut history = saved.history(&desk);
-        assert_eq!(history.current_key(), &old);
-        assert_eq!(history.visit(&old).unwrap().wall_ms, None);
-        assert_eq!(history.visit(&recent).unwrap().wall_ms, None);
-        history.restore_visits([
-            (
-                desk.clone(),
-                Visit {
-                    order: 1,
-                    wall_ms: Some(20),
-                },
-            ),
-            (
-                old.clone(),
-                Visit {
-                    order: 4,
-                    wall_ms: Some(70),
-                },
-            ),
-            (
-                recent.clone(),
-                Visit {
-                    order: 3,
-                    wall_ms: Some(70),
-                },
-            ),
-        ]);
-        let saved = Saved::of(&history);
-        let mut bytes = bytes::BytesMut::new();
-        saved.encode(&mut bytes).unwrap();
-        let downgrade = Legacy::decode(&mut bytes.clone().freeze()).unwrap();
-        assert_eq!(downgrade.at, 1);
-        assert_eq!(
-            downgrade.screens,
-            ["frame:desk", "thread:old", "thread:recent"]
-        );
-        let restored = Saved::decode(&mut bytes.clone().freeze())
-            .unwrap()
-            .history(&desk);
-        assert_eq!(restored.visit(&old), history.visit(&old));
-        assert_eq!(restored.visit(&recent), history.visit(&recent));
-        assert_eq!(restored.recent(), [&recent, &desk]);
-    }
-
-    /// The desk moved to the front of the stack stays where it was; one
-    /// written without it, or with a screen this build cannot read, still
-    /// has the desk at the oldest end.
-    #[test]
-    fn desk_is_always_in_the_history() {
-        let desk = address("frame:desk");
-        let saved = Saved {
-            screens: vec![
-                "thread:a/1".into(),
-                "not an address".into(),
-                "note:n".into(),
-            ],
-            at: 2,
-            visits: None,
-        };
-        let history = saved.history(&desk);
-        assert_eq!(history.current_key(), &address("note:n"));
-        assert_eq!(
-            history.keys_back().cloned().collect::<Vec<_>>(),
-            [address("thread:a/1"), desk.clone()]
-        );
-
-        let mut walked = History::new(desk.clone(), ScreenEntry::Opened);
-        walked.show(address("thread:a/1"), ScreenEntry::Opened);
-        walked.show(desk.clone(), ScreenEntry::Opened);
-        let history = Saved::of(&walked).history(&desk);
-        assert_eq!(history.current_key(), &desk);
-        assert_eq!(
-            history.keys_back().cloned().collect::<Vec<_>>(),
-            [address("thread:a/1")]
+            restored.visited_ms(&address("thread:a/1")),
+            recent.visited_ms(&address("thread:a/1"))
         );
     }
 
+    /// The history the last build wrote opens on its screen in view, with
+    /// the rest by when they were visited, not by where they stood.
     #[test]
-    fn a_cold_restart_keeps_the_stack_and_puts_the_screen_left_behind_the_desk() {
-        let last: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
-        let desk = address("frame:desk");
-        let old = address("thread:old");
-        let left = address("thread:left");
-        let later = address("thread:later");
-        let saved = Saved {
+    fn the_last_builds_history_opens_in_visit_order() {
+        let visit = |order, wall_ms| legacy::Visit { order, wall_ms };
+        let history = legacy::History {
             screens: ["frame:home", "thread:old", "thread:left", "thread:later"]
                 .map(str::to_owned)
                 .to_vec(),
             at: 2,
-            visits: None,
+            visits: Some(vec![
+                visit(1, Some(10)),
+                visit(4, Some(40)),
+                visit(5, Some(50)),
+                visit(3, None),
+            ]),
         };
+        let desk = address("frame:desk");
+        let recent = legacy::convert(&history).recent(&desk);
+        assert_eq!(
+            order(&recent),
+            [
+                address("thread:left"),
+                address("thread:old"),
+                address("thread:later"),
+                desk.clone(),
+            ]
+        );
+        assert_eq!(recent.visited_ms(&address("thread:old")), Some(40));
+
+        // An older record without visits: nearer the screen in view first.
+        let bare = legacy::History {
+            visits: None,
+            ..history
+        };
+        assert_eq!(
+            order(&legacy::convert(&bare).recent(&desk)),
+            [
+                address("thread:left"),
+                address("thread:old"),
+                address("thread:later"),
+                desk.clone(),
+            ]
+        );
+        let db = RhoDb::in_memory();
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            write
+                .open_table(TableDefinition::<(), Sen<legacy::History>>::new(
+                    "gui_frame_place_v1",
+                ))
+                .insert((), SenValue::borrowed(&bare));
+            write.commit();
+        });
+        assert_eq!(Saved::load(&db), Some(legacy::convert(&bare)));
+    }
+
+    /// A record without the desk, or with an address this build cannot
+    /// read, still has the desk, at the oldest end.
+    #[test]
+    fn desk_is_always_in_the_order() {
+        let desk = address("frame:desk");
+        let saved = Saved {
+            places: ["note:n", "not an address", "thread:a/1"]
+                .map(|place| SavedPlace {
+                    address: place.to_owned(),
+                    visited_ms: None,
+                })
+                .to_vec(),
+        };
+        assert_eq!(
+            order(&saved.recent(&desk)),
+            [address("note:n"), address("thread:a/1"), desk]
+        );
+    }
+
+    #[test]
+    fn a_cold_restart_opens_the_desk_with_the_place_left_right_behind_it() {
+        let last: Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let desk = address("frame:desk");
+        let left = address("thread:left");
+        let mut recent = Recent::new(desk.clone(), ScreenEntry::Opened);
+        recent.show(address("thread:old"), ScreenEntry::Opened);
+        recent.show(left.clone(), ScreenEntry::Opened);
+        let saved = Saved::of(&recent);
         for warm in ["2026-11-20T12:09:59.999Z", "2026-11-20T12:10:00Z"] {
-            let history = return_history(&saved, &desk, Some(last), warm.parse().unwrap());
-            assert_eq!(
-                history.current_key(),
-                &left,
-                "warm restart keeps the current screen"
-            );
-            assert_eq!(history.keys_forward().collect::<Vec<_>>(), [&later]);
-            assert_eq!(
-                history.keys_back().cloned().collect::<Vec<_>>(),
-                [old.clone(), desk.clone()]
-            );
+            let recent = return_recent(&saved, &desk, Some(last), warm.parse().unwrap());
+            assert_eq!(recent.current_key(), &left, "warm restart keeps the place");
         }
         let cold: Timestamp = "2026-11-20T12:10:00.001Z".parse().unwrap();
         for prior in [Some(last), None] {
-            let mut history = return_history(&saved, &desk, prior, cold);
-            assert_eq!(history.current_key(), &desk);
-            assert_eq!(
-                history.keys_back().cloned().collect::<Vec<_>>(),
-                [left.clone(), later.clone(), old.clone()]
-            );
-            let reopened = return_history(&Saved::of(&history), &desk, Some(cold), cold);
-            assert_eq!(
-                reopened.current_key(),
-                &desk,
-                "a warm restart keeps the new place"
-            );
-            history.back();
-            assert_eq!(
-                history.current_key(),
-                &left,
-                "back returns to where the user left"
-            );
+            let recent = return_recent(&saved, &desk, prior, cold);
+            assert_eq!(recent.current_key(), &desk);
+            assert_eq!(recent.previous().next(), Some(&left));
         }
     }
 
     #[test]
-    fn input_is_written_independently_of_navigation() {
+    fn input_and_commands_are_written_independently_of_navigation() {
         let db = RhoDb::in_memory();
         let at: Timestamp = "2026-11-20T12:09:59.999Z".parse().unwrap();
         let writer = Writer::spawn(db.clone());
         writer.write(Write::Input(at));
+        writer.write(Write::Commands(SavedCommands {
+            names: vec!["stop agent".into(), "quit".into()],
+        }));
         drop(writer);
         assert_eq!(last_input(&db), Some(at));
-        assert!(Saved::load(&db).is_none(), "typing did not move the stack");
+        assert_eq!(recent_commands(&db), ["stop agent", "quit"]);
+        assert!(Saved::load(&db).is_none(), "typing did not move the order");
     }
 }

@@ -1,5 +1,5 @@
 //! Project setup uses the same place and mode prompts from the idea's
-//! `to:` chooser and the palette. These prompts write to the host; only
+//! `to:` chooser and `Commands`. These prompts write to the host; only
 //! its mail session can change what every Desk shows.
 
 use std::rc::Rc;
@@ -9,13 +9,52 @@ use rho_agent_types::{
     EndpointId, ProjectChange, ProjectConfig, ProjectId, ProjectMode, ProjectName, ProjectPlace,
     RuntimeCatalogue, RuntimeLabel,
 };
-use rho_frame::{Candidate, Frame, Point, Row, Rows};
+use rho_frame::{Candidate, Command, Frame, Point, Spelling};
 use rho_window::style::StyleClass;
 
 use super::ChatSystem;
 use super::idea::IdeaProject;
 use crate::protocol::{ChangeProject, CreateProject};
 use crate::{ThreadId, names};
+
+pub static NEW_PROJECT: Spelling = Spelling {
+    name: "new project",
+    aliases: &[("create project", 9), ("add project", 8), ("project", 5)],
+    argument: Some("name or name@host"),
+};
+
+pub static SET_PROJECT_PLACE: Spelling = Spelling {
+    name: "set project place",
+    aliases: &[
+        ("works on", 8),
+        ("project directory", 7),
+        ("project folder", 7),
+        ("repo", 4),
+    ],
+    argument: Some("directory"),
+};
+
+pub static SET_PROJECT_MODE: Spelling = Spelling {
+    name: "set project mode",
+    aliases: &[
+        ("agents per idea", 7),
+        ("one agent", 6),
+        ("project agents", 6),
+        ("mode", 6),
+    ],
+    argument: Some("one or per idea"),
+};
+
+pub static SET_PROJECT_RUNTIME: Spelling = Spelling {
+    name: "set project runtime",
+    aliases: &[
+        ("project model", 8),
+        ("model", 5),
+        ("runtime", 5),
+        ("default model", 6),
+    ],
+    argument: Some("runtime"),
+};
 
 pub type KnownPlaces = Rc<dyn Fn(EndpointId, &App) -> Vec<Candidate>>;
 
@@ -52,10 +91,7 @@ impl ChatSystem {
 
     pub(super) fn project_details(&self, project: ThreadId) -> Option<String> {
         let config = self.project_config(project)?;
-        let mode = match config.mode {
-            ProjectMode::One => "one agent",
-            ProjectMode::PerIdea => "per idea",
-        };
+        let mode = mode_label(config.mode);
         Some(format!(
             "on {} · {mode} · {}",
             config.place.label(),
@@ -69,117 +105,152 @@ impl ChatSystem {
     }
 
     /// The project commands work from anywhere: on the current thread's
-    /// project, or on the one the user names.
-    pub(super) fn project_rows(&self, point: &Point, cx: &Context<Self>) -> Vec<Row> {
-        if self.hosts().is_empty() {
-            return Vec::new();
-        }
+    /// project, or on the one the user names. Each takes its new value on
+    /// the line (`set project runtime sol-high`), or asks for it.
+    pub(super) fn project_commands(&self, point: &Point, cx: &Context<Self>) -> Vec<Command> {
         let this = cx.entity();
         let here = self
             .thread_of(&point.surface)
             .and_then(|thread| self.project_root(thread));
-        // Each row has its own key: a menu keeps only the first row on a key.
-        let mut rows = Rows::new("project");
+        let here_config = here.and_then(|project| {
+            Some((
+                self.project_address(project)?,
+                self.project_config(project)?,
+            ))
+        });
+        let target = |value: &dyn Fn(&ProjectConfig) -> String| match &here_config {
+            Some((address, config)) => format!("{address} · {}", value(config)),
+            None => "pick project…".to_owned(),
+        };
         let create = this.clone();
-        rows.push(Row::run("n", "new", move |frame, window, cx| {
-            Self::prompt_project_address(create.clone(), frame, window, cx);
-        }));
         let place = this.clone();
-        rows.push(Row::run("w", "works on…", move |frame, window, cx| {
-            let this = place.clone();
-            Self::for_project(
-                place.clone(),
-                here,
-                Rc::new(move |frame, project, address, window, cx| {
-                    let current = this
-                        .read(cx)
-                        .project_config(project)
-                        .map(|config| config.place);
-                    let change = this.clone();
-                    Self::prompt_place(
-                        &this,
-                        project.host,
-                        &address,
-                        current.as_ref(),
-                        Rc::new(move |_, place, _, cx| {
+        let mode = this.clone();
+        vec![
+            Command::new(&NEW_PROJECT, move |frame, named, window, cx| match named {
+                Some(named) => Self::new_project_named(create.clone(), &named, frame, window, cx),
+                None => Self::prompt_project_address(create.clone(), frame, window, cx),
+            }),
+            Command::new(&SET_PROJECT_PLACE, move |frame, typed, window, cx| {
+                let this = place.clone();
+                Self::for_project(
+                    place.clone(),
+                    here,
+                    Rc::new(move |frame, project, address, window, cx| {
+                        let change = this.clone();
+                        let accept: PlaceAnswer = Rc::new(move |_, place, _, cx| {
                             change.update(cx, |mail, cx| {
                                 mail.change_project(project, ProjectChange::Place(place), cx)
                             });
-                        }),
-                        frame,
-                        window,
-                        cx,
-                    );
-                }),
-                frame,
-                window,
-                cx,
-            );
-        }));
-        let mode = this.clone();
-        rows.push(Row::run("a", "agents…", move |frame, window, cx| {
-            let this = mode.clone();
-            Self::for_project(
-                mode.clone(),
-                here,
-                Rc::new(move |frame, project, address, window, cx| {
-                    let Some(config) = this.read(cx).project_config(project) else {
-                        return no_project(frame, &address, cx);
-                    };
-                    let change = this.clone();
-                    prompt_mode(
-                        &address,
-                        config.mode,
-                        Rc::new(move |_, mode, _, cx| {
+                        });
+                        match &typed {
+                            Some(typed) => match ProjectPlace::parse(typed) {
+                                Ok(place) => accept(frame, place, window, cx),
+                                Err(reason) => echo_invalid(frame, &SET_PROJECT_PLACE, reason, cx),
+                            },
+                            None => {
+                                let current = this
+                                    .read(cx)
+                                    .project_config(project)
+                                    .map(|config| config.place);
+                                Self::prompt_place(
+                                    &this,
+                                    project.host,
+                                    &address,
+                                    current.as_ref(),
+                                    accept,
+                                    frame,
+                                    window,
+                                    cx,
+                                )
+                            }
+                        }
+                    }),
+                    frame,
+                    window,
+                    cx,
+                );
+            })
+            .target(target(&|config| config.place.label().to_owned())),
+            Command::new(&SET_PROJECT_MODE, move |frame, typed, window, cx| {
+                let this = mode.clone();
+                Self::for_project(
+                    mode.clone(),
+                    here,
+                    Rc::new(move |frame, project, address, window, cx| {
+                        let Some(config) = this.read(cx).project_config(project) else {
+                            return no_project(frame, &address, cx);
+                        };
+                        let change = this.clone();
+                        let accept: ModeAnswer = Rc::new(move |_, mode, _, cx| {
                             change.update(cx, |mail, cx| {
                                 mail.change_project(project, ProjectChange::Mode(mode), cx)
                             });
-                        }),
-                        frame,
-                        window,
-                        cx,
-                    );
-                }),
-                frame,
-                window,
-                cx,
-            );
-        }));
-        rows.push(Row::run("r", "runtime…", move |frame, window, cx| {
-            let runtime = this.clone();
-            Self::for_project(
-                this.clone(),
-                here,
-                Rc::new(move |frame, project, address, window, cx| {
-                    let Some(config) = runtime.read(cx).project_config(project) else {
-                        return no_project(frame, &address, cx);
-                    };
-                    let Some(catalogue) = runtime.read(cx).runtime_catalogue(project.host) else {
-                        return host_away(frame, cx);
-                    };
-                    let current = config.runtime;
-                    let change = runtime.clone();
-                    prompt_runtime(
-                        format!("{address} runtime ({current}):"),
-                        catalogue,
-                        current,
-                        "current",
-                        Rc::new(move |_, runtime, _, cx| {
+                        });
+                        match &typed {
+                            Some(typed) => match parse_mode(typed) {
+                                Some(mode) => accept(frame, mode, window, cx),
+                                None => echo_invalid(
+                                    frame,
+                                    &SET_PROJECT_MODE,
+                                    "choose one or per idea",
+                                    cx,
+                                ),
+                            },
+                            None => prompt_mode(&address, config.mode, accept, frame, window, cx),
+                        }
+                    }),
+                    frame,
+                    window,
+                    cx,
+                );
+            })
+            .target(target(&|config| mode_label(config.mode).to_owned())),
+            Command::new(&SET_PROJECT_RUNTIME, move |frame, typed, window, cx| {
+                let runtime = this.clone();
+                Self::for_project(
+                    this.clone(),
+                    here,
+                    Rc::new(move |frame, project, address, window, cx| {
+                        let Some(config) = runtime.read(cx).project_config(project) else {
+                            return no_project(frame, &address, cx);
+                        };
+                        let Some(catalogue) = runtime.read(cx).runtime_catalogue(project.host)
+                        else {
+                            return host_away(frame, cx);
+                        };
+                        let change = runtime.clone();
+                        let accept: RuntimeAnswer = Rc::new(move |_, runtime, _, cx| {
                             change.update(cx, |mail, cx| {
                                 mail.change_project(project, ProjectChange::Runtime(runtime), cx)
                             });
-                        }),
-                        frame,
-                        window,
-                        cx,
-                    );
-                }),
-                frame,
-                window,
-                cx,
-            );
-        }));
-        rows.into_commands()
+                        });
+                        let current = config.runtime;
+                        match &typed {
+                            Some(typed) => match catalogue.label(typed.trim()) {
+                                Ok(runtime) => accept(frame, runtime, window, cx),
+                                Err(reason) => {
+                                    echo_invalid(frame, &SET_PROJECT_RUNTIME, &reason, cx)
+                                }
+                            },
+                            None => prompt_runtime(
+                                format!("{address} runtime ({current}):"),
+                                catalogue,
+                                current,
+                                "current",
+                                accept,
+                                frame,
+                                window,
+                                cx,
+                            ),
+                        }
+                    }),
+                    frame,
+                    window,
+                    cx,
+                );
+            })
+            .target(target(&|config| config.runtime.to_string())),
+        ]
     }
 
     /// Runs `then` on the current thread's project, or asks `project:`
@@ -256,40 +327,49 @@ impl ChatSystem {
                     .collect()
             }),
             Rc::new(move |frame, input, window, cx| {
-                let hosts = this.read(cx).hosts();
-                let (name, alias) = names::split(&input);
-                // With one host, the name alone says where.
-                let host = match (alias, hosts.as_slice()) {
-                    (None, [(host, _)]) => Some(*host),
-                    (None, _) => {
-                        frame.echo("new project: enter name@host", StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                    (Some(alias), _) => hosts
-                        .iter()
-                        .find(|(_, host)| host.eq_ignore_ascii_case(alias))
-                        .map(|(host, _)| *host),
-                };
-                let Some(host) = host else {
-                    frame.echo("new project: no such host", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                let name = match ProjectName::parse(name) {
-                    Ok(name) => name,
-                    Err(reason) => {
-                        frame.echo(reason, StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                };
-                Self::prompt_project(
-                    this.clone(),
-                    NewProject { host, name },
-                    None,
-                    frame,
-                    window,
-                    cx,
-                );
+                Self::new_project_named(this.clone(), &input, frame, window, cx)
             }),
+            window,
+            cx,
+        );
+    }
+
+    /// Makes the project `input` names, `name` or `name@host`, asking
+    /// where it works and how.
+    fn new_project_named(
+        this: Entity<Self>,
+        input: &str,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        let hosts = this.read(cx).hosts();
+        let (name, alias) = names::split(input.trim());
+        // With one host, the name alone says where.
+        let host = match (alias, hosts.as_slice()) {
+            (None, [(host, _)]) => Some(*host),
+            (None, _) => {
+                frame.echo("new project: enter name@host", StyleClass::SystemInfo, cx);
+                return;
+            }
+            (Some(alias), _) => hosts
+                .iter()
+                .find(|(_, host)| host.eq_ignore_ascii_case(alias))
+                .map(|(host, _)| *host),
+        };
+        let Some(host) = host else {
+            frame.echo("new project: no such host", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let name = match ProjectName::parse(name) {
+            Ok(name) => name,
+            Err(reason) => return echo_invalid(frame, &NEW_PROJECT, reason, cx),
+        };
+        Self::prompt_project(
+            this.clone(),
+            NewProject { host, name },
+            None,
+            frame,
             window,
             cx,
         );
@@ -465,6 +545,34 @@ impl ChatSystem {
 
 type PlaceAnswer = Rc<dyn Fn(&mut Frame, ProjectPlace, &mut Window, &mut Context<Frame>)>;
 type ModeAnswer = Rc<dyn Fn(&mut Frame, ProjectMode, &mut Window, &mut Context<Frame>)>;
+
+fn mode_label(mode: ProjectMode) -> &'static str {
+    match mode {
+        ProjectMode::One => "one agent",
+        ProjectMode::PerIdea => "per idea",
+    }
+}
+
+/// A mode typed on the line, by its label or the start of it.
+fn parse_mode(typed: &str) -> Option<ProjectMode> {
+    let typed = typed.trim();
+    (!typed.is_empty())
+        .then(|| {
+            ProjectMode::ALL
+                .into_iter()
+                .find(|mode| mode.label().starts_with(typed))
+        })
+        .flatten()
+}
+
+/// The echo for a value on the line the command cannot take.
+fn echo_invalid(frame: &mut Frame, command: &Spelling, reason: &str, cx: &mut Context<Frame>) {
+    frame.echo(
+        &format!("{}: {reason}", command.name),
+        StyleClass::SystemInfo,
+        cx,
+    );
+}
 
 fn prompt_mode(
     address: &str,
@@ -705,8 +813,9 @@ mod tests {
         );
     }
 
-    /// Every project command is in the palette, from Desk and from a
-    /// thread alike.
+    /// Every project command is in `Commands`, from Desk and from a
+    /// thread alike, by its flat name, and asks for a project where the
+    /// screen names none.
     #[gpui::test]
     fn the_project_commands_work_from_anywhere(cx: &mut gpui::TestAppContext) {
         let (_window, mail, _db) =
@@ -721,24 +830,22 @@ mod tests {
                 subject: rho_frame::Subject::Own,
                 card: None,
             };
-            let labels = cx.update(|cx| {
+            let rows = cx.update(|cx| {
                 mail.update(cx, |mail, cx| {
-                    mail.project_rows(&point, cx)
+                    mail.project_commands(&point, cx)
                         .iter()
-                        .map(|row| match &row.pick {
-                            rho_frame::menu::Pick::Run { label, .. } => label.clone(),
-                            _ => String::new(),
-                        })
+                        .map(|command| (command.name(), command.target_text().map(str::to_owned)))
                         .collect::<Vec<_>>()
                 })
             });
+            let pick = Some("pick project…".to_owned());
             assert_eq!(
-                labels,
+                rows,
                 [
-                    "project › new",
-                    "project › works on…",
-                    "project › agents…",
-                    "project › runtime…"
+                    ("new project", None),
+                    ("set project place", pick.clone()),
+                    ("set project mode", pick.clone()),
+                    ("set project runtime", pick.clone()),
                 ]
             );
         }

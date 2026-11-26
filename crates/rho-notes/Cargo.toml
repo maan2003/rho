@@ -1,5 +1,5 @@
 # Notes as the frame shows them: the note surface, the list of every note,
-# and the palette's rows over them. Notes live in the user's
+# and the commands over them. Notes live in the user's
 # ledger, which the frame owns; this crate keeps no state of its own on disk.
 [package]
 edition.workspace = true

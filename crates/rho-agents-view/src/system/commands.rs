@@ -1,14 +1,14 @@
-//! The commands about agents and their work, on every screen
-//! (`window.commands are global in the palette`). A command acts on what
-//! the screen in view is about when that is one agent or one workset, and
-//! asks which otherwise.
+//! The commands about agents and their work, in `Commands` on every
+//! screen (`window.Commands`). A command acts on what the screen in view
+//! is about when that is one agent or one workset, shows it on its row,
+//! and asks which otherwise.
 
 use std::rc::Rc;
 
 use gpui::{App, Context, Entity, Window};
 use rho_agent_types::{Address as Party, AgentId, Message};
 use rho_chat::ui::Event as MailEvent;
-use rho_frame::{Addressed as _, Candidate, Frame, Point, Row, Subject};
+use rho_frame::{Addressed as _, Candidate, Command, Frame, Point, Spelling, Subject};
 use rho_terminal::protocol::TerminalInfo;
 use rho_window::style::StyleClass;
 
@@ -36,8 +36,8 @@ impl Target {
     }
 }
 
-/// The step that wrote a message the screen shows: what `look into the
-/// work` opens.
+/// The step that wrote a message the screen shows: what `open transcript`
+/// opens.
 #[derive(Clone)]
 pub(super) struct Written {
     pub agent: AgentId,
@@ -353,169 +353,381 @@ fn choose(
     );
 }
 
-/// A row that acts on what the screen is about ranks with the screen's
-/// commands; one that must ask ranks with the window's.
-fn ranked(row: Row, target: &Target) -> Row {
-    match target {
-        Target::Anything => row.window_wide(),
-        Target::One(_) | Target::Among(_) => row,
-    }
+/// `then`, once the agent's host can take a command: otherwise the echo
+/// line says whether the host is away or was never attached.
+fn reached(then: Then) -> Then {
+    Rc::new(move |system, agent, frame, window, cx| {
+        match system.read(cx).unreachable(agent, frame.hosts()) {
+            Some(why) => frame.echo(why, StyleClass::SystemInfo, cx),
+            None => then(system, agent, frame, window, cx),
+        }
+    })
 }
 
-/// Every command about agents and their work, each acting on `here`.
-pub(super) fn rows(system: Entity<AgentsSystem>, here: Here) -> Vec<Row> {
-    let mut rows = Vec::new();
-    let steering = |name: &'static str, act: Then| {
-        let system = system.clone();
-        let target = here.steer.clone();
-        ranked(
-            Row::run("", name, move |frame, window, cx| {
-                choose(&system, &target, Ask::Agent, act.clone(), frame, window, cx)
-            }),
-            &here.steer,
-        )
-    };
-    let rewind_target = here.steer.clone();
-    let rewind_system = system.clone();
-    rows.push(ranked(
-        Row::counted("", "rewind turns", move |frame, count, window, cx| {
-            let turns = count.unwrap_or(1);
-            choose(
-                &rewind_system,
-                &rewind_target,
-                Ask::Agent,
-                Rc::new(move |system, agent, _, _, cx| steer::rewind(system, agent, turns, cx)),
-                frame,
-                window,
-                cx,
-            )
-        }),
-        &here.steer,
-    ));
-    rows.push(steering(
-        "compact context",
-        Rc::new(|system, agent, _, _, cx| steer::compact(system, agent, cx)),
-    ));
-    rows.push(steering(
-        "new cache key",
-        Rc::new(|system, agent, _, _, cx| steer::new_cache_key(system, agent, cx)),
-    ));
-    rows.push(steering(
-        "set runtime…",
-        Rc::new(|system, agent, frame, window, cx| {
-            steer::set_runtime(system, agent, frame, window, cx)
-        }),
-    ));
-    rows.push(steering(
-        "stop agent",
-        Rc::new(|system, agent, _, _, cx| steer::stop(system, agent, cx)),
-    ));
-    rows.push(steering(
-        "cancel the request",
-        Rc::new(|system, agent, _, _, cx| steer::cancel(system, agent, cx)),
-    ));
+pub static REWIND_AGENT: Spelling = Spelling {
+    name: "rewind agent",
+    aliases: &[
+        ("rewind", 9),
+        ("rewind turns", 9),
+        ("undo turn", 7),
+        ("rollback", 6),
+        ("go back", 4),
+    ],
+    argument: Some("turns"),
+};
 
-    let working = |name: &'static str, act: Then| {
-        let system = system.clone();
-        let target = here.work.clone();
-        ranked(
-            Row::run("", name, move |frame, window, cx| {
-                choose(
-                    &system,
-                    &target,
-                    Ask::Workset,
-                    act.clone(),
-                    frame,
-                    window,
-                    cx,
-                )
-            }),
-            &here.work,
-        )
-    };
-    rows.push(working(
-        "shell",
-        Rc::new(|system, agent, frame, window, cx| {
-            if system.update(cx, |system, cx| system.attached(agent, cx)) {
-                let card = frame.card_to_inspect(cx);
-                frame.open_inspection(AgentAddress::shell(agent).address(), card, window, cx);
-            }
-        }),
-    ));
-    rows.push(working(
-        "close shell",
-        Rc::new(|system, agent, _, _, cx| {
-            system.update(cx, |system, cx| system.close_shell(agent, cx));
-        }),
-    ));
-    rows.push(working(
-        "terminal",
-        Rc::new(|system, agent, frame, _, cx| {
-            let card = frame.card_to_inspect(cx);
-            system.update(cx, |system, cx| {
-                system.open_terminal(agent, false, card, cx)
-            });
-        }),
-    ));
-    rows.push(working(
-        "new terminal",
-        Rc::new(|system, agent, frame, _, cx| {
-            let card = frame.card_to_inspect(cx);
-            system.update(cx, |system, cx| system.open_terminal(agent, true, card, cx));
-        }),
-    ));
-    rows.push(working(
-        "desktop…",
-        Rc::new(|system, agent, frame, _, cx| {
-            let card = frame.card_to_inspect(cx);
-            system.update(cx, |system, cx| system.open_desktop(agent, card, cx));
-        }),
-    ));
-    rows.push(working(
-        "open its thread",
-        Rc::new(|system, agent, frame, window, cx| {
-            let lead = system.read(cx).lead_of(agent).unwrap_or(agent);
-            match system.read(cx).agent_thread(lead, cx) {
-                Some(thread) => frame.open(thread.address(), window, cx),
-                None => frame.echo("the work has no thread", StyleClass::SystemInfo, cx),
-            }
-        }),
-    ));
-    rows.push(working("filter by agent…", Rc::new(filter)));
-    rows.push(match here.written {
-        // The step that wrote the message in view.
-        Some(Written {
-            agent,
-            mail,
-            under_point,
-        }) => {
-            let system = system.clone();
-            let row = Row::run("", "look into the work", move |_, _, cx| {
-                let mail = mail.clone();
-                system.update(cx, |system, cx| {
-                    system
-                        .mail
-                        .update(cx, |_, cx| cx.emit(MailEvent::Inspect { agent, mail }))
-                });
-            });
-            match under_point {
-                true => row.bound_to(rho_frame::thread::OpenRow),
-                false => row,
-            }
+pub static COMPACT_AGENT: Spelling = Spelling {
+    name: "compact agent",
+    aliases: &[
+        ("compact context", 9),
+        ("shrink context", 7),
+        ("summarize context", 6),
+        ("context", 4),
+    ],
+    argument: None,
+};
+
+pub static RESET_AGENT_CACHE: Spelling = Spelling {
+    name: "reset agent cache",
+    aliases: &[("new cache key", 9), ("clear cache", 8), ("cache", 6)],
+    argument: None,
+};
+
+pub static SET_AGENT_RUNTIME: Spelling = Spelling {
+    name: "set agent runtime",
+    aliases: &[
+        ("model", 8),
+        ("switch model", 9),
+        ("change model", 9),
+        ("runtime", 8),
+        ("effort", 6),
+    ],
+    argument: Some("runtime"),
+};
+
+pub static STOP_AGENT: Spelling = Spelling {
+    name: "stop agent",
+    aliases: &[("kill", 9), ("end agent", 8), ("terminate", 7), ("halt", 6)],
+    argument: None,
+};
+
+pub static CANCEL_AGENT_REQUEST: Spelling = Spelling {
+    name: "cancel agent request",
+    aliases: &[
+        ("cancel the request", 9),
+        ("interrupt", 8),
+        ("abort", 8),
+        ("kill", 7),
+        ("stop request", 7),
+    ],
+    argument: None,
+};
+
+pub static OPEN_SHELL: Spelling = Spelling {
+    name: "open shell",
+    aliases: &[("shell", 9), ("command line", 6), ("run command", 5)],
+    argument: None,
+};
+
+pub static CLOSE_SHELL: Spelling = Spelling {
+    name: "close shell",
+    aliases: &[("end shell", 8), ("exit shell", 8)],
+    argument: None,
+};
+
+pub static OPEN_TERMINAL: Spelling = Spelling {
+    name: "open terminal",
+    aliases: &[("terminal", 9), ("term", 8), ("console", 5)],
+    argument: None,
+};
+
+pub static NEW_TERMINAL: Spelling = Spelling {
+    name: "new terminal",
+    aliases: &[("another terminal", 8), ("start terminal", 7)],
+    argument: None,
+};
+
+pub static OPEN_DESKTOP: Spelling = Spelling {
+    name: "open desktop",
+    aliases: &[("desktop", 9), ("screen", 6), ("browser window", 4)],
+    argument: None,
+};
+
+pub static OPEN_THREAD: Spelling = Spelling {
+    name: "open thread",
+    aliases: &[
+        ("its thread", 8),
+        ("open its thread", 9),
+        ("conversation", 5),
+    ],
+    argument: None,
+};
+
+pub static FILTER_TRANSCRIPT: Spelling = Spelling {
+    name: "filter transcript",
+    aliases: &[
+        ("filter by agent", 9),
+        ("narrow transcript", 7),
+        ("whole workset", 6),
+        ("filter", 6),
+    ],
+    argument: Some("agent or whole workset"),
+};
+
+pub static OPEN_TRANSCRIPT: Spelling = Spelling {
+    name: "open transcript",
+    aliases: &[
+        ("look into the work", 9),
+        ("transcript", 9),
+        ("inspect work", 8),
+        ("what did it do", 6),
+        ("log", 5),
+    ],
+    argument: None,
+};
+
+/// Every command the agents system offers, for a test to rank.
+pub static SPELLINGS: &[&Spelling] = &[
+    &REWIND_AGENT,
+    &COMPACT_AGENT,
+    &RESET_AGENT_CACHE,
+    &SET_AGENT_RUNTIME,
+    &STOP_AGENT,
+    &CANCEL_AGENT_REQUEST,
+    &OPEN_SHELL,
+    &CLOSE_SHELL,
+    &OPEN_TERMINAL,
+    &NEW_TERMINAL,
+    &OPEN_DESKTOP,
+    &OPEN_THREAD,
+    &FILTER_TRANSCRIPT,
+    &OPEN_TRANSCRIPT,
+    &super::accounts::SWITCH_CLAUDE_ACCOUNT,
+    &crate::usage::OPEN_USAGE,
+];
+
+impl AgentsSystem {
+    /// What a steering command's row shows: the agent with what it does and
+    /// its runtime, `tide · Flaky clock test · working (opus-high)`.
+    fn agent_state(&self, agent: AgentId, cx: &App) -> String {
+        let label = self.label(agent, cx).0;
+        let runtime = self
+            .registry
+            .agent_spec(agent)
+            .map(|spec| spec.runtime_label());
+        let activity = self
+            .registry
+            .agent_facts(agent)
+            .runtime
+            .map(|heard| heard.state.activity().word().to_owned());
+        match (activity, runtime) {
+            (Some(activity), Some(runtime)) => format!("{label} · {activity} ({runtime})"),
+            (Some(word), None) | (None, Some(word)) => format!("{label} · {word}"),
+            (None, None) => label,
         }
-        None => working(
-            "look into the work",
-            Rc::new(|system, agent, frame, window, cx| {
-                let Some(workset) = system.read(cx).registry().agent_workset(agent) else {
-                    frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                let card = frame.card_to_inspect(cx);
-                frame.open_inspection(Scope::Workset(workset).address(), card, window, cx);
-            }),
-        ),
-    });
-    rows
+    }
+
+    /// Every command about agents and their work, each acting on `here`.
+    pub(super) fn agent_commands(
+        &self,
+        system: Entity<AgentsSystem>,
+        here: Here,
+        cx: &App,
+    ) -> Vec<Command> {
+        let steer_target = match &here.steer {
+            Target::One(agent) => self.agent_state(*agent, cx),
+            Target::Among(_) | Target::Anything => "pick agent…".to_owned(),
+        };
+        let work_target = match &here.work {
+            Target::One(lead) => self.work_label(*lead, cx).0,
+            Target::Among(_) | Target::Anything => "pick workset…".to_owned(),
+        };
+        // A command that resolves its agent, then runs `act` on it with the
+        // argument typed after its name.
+        let on = |target: &Target, ask: Ask, act: Rc<dyn Fn(Option<String>) -> Then>| {
+            let system = system.clone();
+            let target = target.clone();
+            move |frame: &mut Frame,
+                  typed: Option<String>,
+                  window: &mut Window,
+                  cx: &mut Context<Frame>| {
+                choose(&system, &target, ask, act(typed), frame, window, cx)
+            }
+        };
+        let steering = |spelling: &'static Spelling, act: Then| {
+            Command::new(
+                spelling,
+                on(
+                    &here.steer,
+                    Ask::Agent,
+                    Rc::new(move |_| reached(act.clone())),
+                ),
+            )
+            .target(steer_target.clone())
+        };
+        let working = |spelling: &'static Spelling, act: Then| {
+            Command::new(
+                spelling,
+                on(&here.work, Ask::Workset, Rc::new(move |_| act.clone())),
+            )
+            .target(work_target.clone())
+        };
+        let mut commands = vec![
+            Command::new(
+                &REWIND_AGENT,
+                on(
+                    &here.steer,
+                    Ask::Agent,
+                    Rc::new(|typed| {
+                        let turns = match typed.as_deref().map(str::trim) {
+                            None => Some(1),
+                            Some(typed) => typed.parse::<u32>().ok().filter(|turns| *turns > 0),
+                        }
+                        .ok_or(());
+                        reached(Rc::new(move |system, agent, frame, _, cx| match turns {
+                            Ok(turns) => steer::rewind(system, agent, turns, cx),
+                            Err(()) => frame.echo(
+                                &format!("{}: give a number of turns", REWIND_AGENT.name),
+                                StyleClass::SystemInfo,
+                                cx,
+                            ),
+                        }))
+                    }),
+                ),
+            )
+            .target(steer_target.clone()),
+            steering(
+                &COMPACT_AGENT,
+                Rc::new(|system, agent, _, _, cx| steer::compact(system, agent, cx)),
+            ),
+            steering(
+                &RESET_AGENT_CACHE,
+                Rc::new(|system, agent, _, _, cx| steer::reset_cache(system, agent, cx)),
+            ),
+            Command::new(
+                &SET_AGENT_RUNTIME,
+                on(
+                    &here.steer,
+                    Ask::Agent,
+                    Rc::new(|typed| {
+                        reached(Rc::new(move |system, agent, frame, window, cx| {
+                            steer::set_runtime(system, agent, typed.clone(), frame, window, cx)
+                        }))
+                    }),
+                ),
+            )
+            .target(steer_target.clone()),
+            steering(
+                &STOP_AGENT,
+                Rc::new(|system, agent, _, _, cx| steer::stop(system, agent, cx)),
+            ),
+            steering(
+                &CANCEL_AGENT_REQUEST,
+                Rc::new(|system, agent, _, _, cx| steer::cancel(system, agent, cx)),
+            ),
+            working(
+                &OPEN_SHELL,
+                reached(Rc::new(|system, agent, frame, window, cx| {
+                    if system.update(cx, |system, cx| system.attached(agent, cx)) {
+                        let card = frame.card_to_inspect(cx);
+                        frame.open_inspection(
+                            AgentAddress::shell(agent).address(),
+                            card,
+                            window,
+                            cx,
+                        );
+                    }
+                })),
+            ),
+            working(
+                &CLOSE_SHELL,
+                reached(Rc::new(|system, agent, _, _, cx| {
+                    system.update(cx, |system, cx| system.close_shell(agent, cx));
+                })),
+            ),
+            working(
+                &OPEN_TERMINAL,
+                reached(Rc::new(|system, agent, frame, _, cx| {
+                    let card = frame.card_to_inspect(cx);
+                    system.update(cx, |system, cx| {
+                        system.open_terminal(agent, false, card, cx)
+                    });
+                })),
+            ),
+            working(
+                &NEW_TERMINAL,
+                reached(Rc::new(|system, agent, frame, _, cx| {
+                    let card = frame.card_to_inspect(cx);
+                    system.update(cx, |system, cx| system.open_terminal(agent, true, card, cx));
+                })),
+            ),
+            working(
+                &OPEN_DESKTOP,
+                reached(Rc::new(|system, agent, frame, _, cx| {
+                    let card = frame.card_to_inspect(cx);
+                    system.update(cx, |system, cx| system.open_desktop(agent, card, cx));
+                })),
+            ),
+            working(
+                &OPEN_THREAD,
+                Rc::new(|system, agent, frame, window, cx| {
+                    let lead = system.read(cx).lead_of(agent).unwrap_or(agent);
+                    match system.read(cx).agent_thread(lead, cx) {
+                        Some(thread) => frame.open(thread.address(), window, cx),
+                        None => frame.echo("the work has no thread", StyleClass::SystemInfo, cx),
+                    }
+                }),
+            ),
+            Command::new(
+                &FILTER_TRANSCRIPT,
+                on(
+                    &here.work,
+                    Ask::Workset,
+                    Rc::new(|typed| {
+                        Rc::new(move |system, agent, frame, window, cx| {
+                            filter(system, agent, typed.clone(), frame, window, cx)
+                        })
+                    }),
+                ),
+            )
+            .target(work_target.clone()),
+        ];
+        commands.push(match here.written {
+            // The step that wrote the message in view.
+            Some(Written {
+                agent,
+                mail,
+                under_point,
+            }) => {
+                let system = system.clone();
+                let command = Command::simple(&OPEN_TRANSCRIPT, move |_, _, cx| {
+                    let mail = mail.clone();
+                    system.update(cx, |system, cx| {
+                        system
+                            .mail
+                            .update(cx, |_, cx| cx.emit(MailEvent::Inspect { agent, mail }))
+                    });
+                })
+                .target(self.label(agent, cx).0);
+                match under_point {
+                    true => command.bound_to(rho_frame::thread::OpenRow),
+                    false => command,
+                }
+            }
+            None => working(
+                &OPEN_TRANSCRIPT,
+                Rc::new(|system, agent, frame, window, cx| {
+                    let Some(workset) = system.read(cx).registry().agent_workset(agent) else {
+                        frame.echo("the agent is unavailable", StyleClass::SystemInfo, cx);
+                        return;
+                    };
+                    let card = frame.card_to_inspect(cx);
+                    frame.open_inspection(Scope::Workset(workset).address(), card, window, cx);
+                }),
+            ),
+        });
+        commands
+    }
 }
 
 /// Narrows the workset's transcript to one of its agents, or widens it to
@@ -524,6 +736,7 @@ pub(super) fn rows(system: Entity<AgentsSystem>, here: Here) -> Vec<Row> {
 fn filter(
     system: &Entity<AgentsSystem>,
     agent: AgentId,
+    typed: Option<String>,
     frame: &mut Frame,
     window: &mut Window,
     cx: &mut Context<Frame>,
@@ -555,13 +768,38 @@ fn filter(
             .filter(|scope| system.scope_workset(*scope) == Some(workset));
         (Rc::new(choices), current)
     };
+    let offered = choices.clone();
     let shown = current.map_or(WHOLE.to_owned(), |current| {
         choices
             .iter()
             .find(|(scope, _)| *scope == current)
             .map_or(WHOLE.to_owned(), |(_, candidate)| candidate.value.clone())
     });
-    let offered = choices.clone();
+    let pick =
+        move |frame: &mut Frame, input: &str, window: &mut Window, cx: &mut Context<Frame>| {
+            let input = input.trim();
+            let Some((scope, _)) = choices
+                .iter()
+                .find(|(_, choice)| choice.value.eq_ignore_ascii_case(input))
+            else {
+                frame.echo(
+                    &format!("{}: none called {input:?}", FILTER_TRANSCRIPT.name),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            };
+            match current {
+                Some(current) => frame.replace(&current.address(), scope.address(), window, cx),
+                None => {
+                    let card = frame.card_to_inspect(cx);
+                    frame.open_inspection(scope.address(), card, window, cx)
+                }
+            }
+        };
+    if let Some(typed) = typed {
+        return pick(frame, &typed, window, cx);
+    }
     frame.open_prompt(
         format!("filter ({shown}):"),
         Rc::new(move |_, needle, _| {
@@ -573,30 +811,13 @@ fn filter(
                 .cloned()
                 .collect()
         }),
-        Rc::new(move |frame, input, window, cx| {
-            let input = input.trim();
-            let Some((scope, _)) = choices.iter().find(|(_, choice)| choice.value == input) else {
-                frame.echo(
-                    &format!("filter: none called {input:?}"),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            };
-            match current {
-                Some(_) => frame.replace_current(scope.address(), window, cx),
-                None => {
-                    let card = frame.card_to_inspect(cx);
-                    frame.open_inspection(scope.address(), card, window, cx)
-                }
-            }
-        }),
+        Rc::new(move |frame, input, window, cx| pick(frame, &input, window, cx)),
         window,
         cx,
     );
 }
 
-/// Which terminal `terminal` opens in a workset.
+/// Which terminal `open terminal` opens in a workset.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TerminalPick {
     /// Start the owner's terminal with this number, or attach to it.
@@ -607,7 +828,7 @@ pub(super) enum TerminalPick {
     Ask(Vec<(AgentId, TerminalInfo)>),
 }
 
-/// What `terminal` (or `new terminal`, with `new`) opens for `owner`,
+/// What `open terminal` (or `new terminal`, with `new`) opens for `owner`,
 /// given the terminals that run in its workset and whose each is.
 pub(super) fn pick_terminal(
     owner: AgentId,
@@ -774,7 +995,7 @@ mod tests {
         );
         assert_eq!(worker.steer, Target::One(other));
 
-        // The desk names a card's newest writer for `look into the work`
+        // The desk names a card's newest writer for `open transcript`
         // without pinning a steering target on it.
         let desk = thread(
             Subject::None,

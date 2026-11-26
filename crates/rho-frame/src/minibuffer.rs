@@ -22,10 +22,10 @@ use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use crate::frame::Frame;
-use crate::menu::Pick;
-use crate::palette::{Choice, Listing, Matched};
 use crate::phone::{cut_at_word, measure};
-use crate::text_search::{TextHit, TextQuery, TextScope, TextSearch};
+use crate::places::Choice;
+use crate::text_search::{TextHit, TextQuery, TextSearch};
+use crate::{commands, places};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -165,10 +165,18 @@ pub(crate) enum Answer {
         submit: SubmitHandler,
         rows: Vec<Candidate>,
     },
-    Palette {
-        listing: Listing,
-        rows: Vec<Matched>,
+    /// `space f`: a place, or a remembered line, chosen from the rows.
+    Places {
+        listing: places::Listing,
+        rows: Vec<places::Matched>,
         search: Option<PendingText>,
+        /// The project the rows are narrowed to.
+        scope: Option<rho_dealer::Address>,
+    },
+    /// `:`: a command, with what was typed after its name.
+    Commands {
+        listing: commands::Listing,
+        rows: Vec<commands::Matched>,
     },
 }
 
@@ -181,25 +189,36 @@ impl Answer {
         }
     }
 
-    pub(crate) fn palette(listing: Listing) -> Self {
-        Self::Palette {
+    pub(crate) fn places(listing: places::Listing, scope: Option<rho_dealer::Address>) -> Self {
+        Self::Places {
             listing,
             rows: Vec::new(),
             search: None,
+            scope,
+        }
+    }
+
+    pub(crate) fn commands(listing: commands::Listing) -> Self {
+        Self::Commands {
+            listing,
+            rows: Vec::new(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Text { rows, .. } => rows.len(),
-            Self::Palette { rows, .. } => rows.len(),
+            Self::Places { rows, .. } => rows.len(),
+            Self::Commands { rows, .. } => rows.len(),
         }
     }
 }
 
+/// A row the user completed into the line with tab, so the line still
+/// picks it after the edit that tab made.
 enum Completed {
     Text(Candidate, usize),
-    Palette { index: usize, input: String },
+    Row { index: usize, input: String },
 }
 
 pub(crate) struct PendingText {
@@ -213,9 +232,7 @@ impl PendingText {
         let stop = cancelled.clone();
         let task = cx.spawn(async move |frame, cx| {
             let hits = cx.background_spawn(async move { search.find(&stop) }).await;
-            let _ = frame.update(cx, |frame, cx| {
-                frame.finish_palette_search(&input, hits, cx)
-            });
+            let _ = frame.update(cx, |frame, cx| frame.finish_places_search(&input, hits, cx));
         });
         Self {
             cancelled,
@@ -260,6 +277,22 @@ pub struct Minibuffer {
     /// What is typed here is a credential: the journal keeps none of it.
     secret: bool,
     _edits: Subscription,
+}
+
+/// Where the row tab completed into `input` now is, while the line is
+/// still what tab made it.
+fn completed_row(
+    completed: &Option<Completed>,
+    input: &str,
+    mut rows: impl Iterator<Item = usize>,
+) -> Option<usize> {
+    match completed {
+        Some(Completed::Row {
+            index,
+            input: value,
+        }) if input == value => rows.position(|row| row == *index),
+        _ => None,
+    }
 }
 
 /// Candidate rows shown at once; the list scrolls the selection into this
@@ -378,10 +411,11 @@ impl Minibuffer {
                     _ => None,
                 }
             }
-            Answer::Palette {
+            Answer::Places {
                 listing,
                 rows,
                 search,
+                ..
             } => {
                 // Cancel before preparing the new rows. Named results don't
                 // depend on the mailbox, so show them immediately.
@@ -391,19 +425,25 @@ impl Minibuffer {
                 let query = TextQuery::parse(&folded);
                 *rows = listing.rank_query(&query);
                 if query.wants_text() {
-                    let slots = crate::palette::LISTED - listing.text_position(rows);
+                    let slots = places::LISTED - listing.text_position(rows);
                     let batch = workspace.text_search(folded, slots, cx);
                     if !batch.is_empty() {
                         *search = Some(PendingText::start(batch, input.clone(), cx));
                     }
                 }
-                match &self.completed_selection {
-                    Some(Completed::Palette {
-                        index,
-                        input: value,
-                    }) if input == *value => rows.iter().position(|row| row.index == *index),
-                    _ => None,
-                }
+                completed_row(
+                    &self.completed_selection,
+                    &input,
+                    rows.iter().map(|row| row.index),
+                )
+            }
+            Answer::Commands { listing, rows } => {
+                *rows = listing.rank(&input);
+                completed_row(
+                    &self.completed_selection,
+                    &input,
+                    rows.iter().map(|row| row.index),
+                )
             }
         };
         self.moved_selection = completed_row.is_some();
@@ -426,10 +466,11 @@ impl Minibuffer {
         if self.input(cx) != input {
             return;
         }
-        let Answer::Palette {
+        let Answer::Places {
             listing,
             rows,
             search,
+            scope,
         } = &mut self.answer
         else {
             return;
@@ -441,7 +482,7 @@ impl Minibuffer {
             .moved_selection
             .then(|| rows.get(self.selected).map(|row| row.index))
             .flatten();
-        let resolved = workspace.describe_palette_text(hits, cx);
+        let resolved = workspace.describe_text(hits, scope.as_ref(), cx);
         listing.append_text(rows, resolved);
         self.selected = selected
             .and_then(|index| rows.iter().position(|row| row.index == index))
@@ -494,7 +535,7 @@ impl Minibuffer {
                 self.completed_selection = Some(Completed::Text(candidate, occurrence));
                 value
             }
-            Answer::Palette { listing, rows, .. } => {
+            Answer::Places { listing, rows, .. } => {
                 let Some(row) = rows.get(self.selected) else {
                     return;
                 };
@@ -503,15 +544,24 @@ impl Minibuffer {
                     // A body hit is not a completion of the typed words.
                     return;
                 }
-                let input = self.input(cx);
-                let folded = input.trim().to_lowercase();
-                let prefix = if TextQuery::parse(&folded).scope == TextScope::Commands {
-                    "> "
-                } else {
-                    ""
+                let value = choice.name().to_owned();
+                self.completed_selection = Some(Completed::Row {
+                    index: row.index,
+                    input: value.clone(),
+                });
+                value
+            }
+            // The name, and room for its argument when it takes one.
+            Answer::Commands { listing, rows } => {
+                let Some(row) = rows.get(self.selected) else {
+                    return;
                 };
-                let value = format!("{prefix}{}", choice.name());
-                self.completed_selection = Some(Completed::Palette {
+                let command = &listing.entries[row.index].command;
+                let value = match command.spelling().argument {
+                    Some(_) => format!("{} ", command.name()),
+                    None => command.name().to_owned(),
+                };
+                self.completed_selection = Some(Completed::Row {
                     index: row.index,
                     input: value.clone(),
                 });
@@ -553,7 +603,24 @@ impl Minibuffer {
     pub(crate) fn candidates(&self) -> &[Candidate] {
         match &self.answer {
             Answer::Text { rows, .. } => rows,
-            Answer::Palette { .. } => &[],
+            Answer::Places { .. } | Answer::Commands { .. } => &[],
+        }
+    }
+
+    /// The rows as listed: names in `Places` and `Commands`, values in a
+    /// prompt.
+    #[cfg(test)]
+    pub(crate) fn row_names(&self) -> Vec<String> {
+        match &self.answer {
+            Answer::Text { rows, .. } => rows.iter().map(|row| row.value.clone()).collect(),
+            Answer::Places { listing, rows, .. } => rows
+                .iter()
+                .map(|row| listing.choices[row.index].name().to_owned())
+                .collect(),
+            Answer::Commands { listing, rows } => rows
+                .iter()
+                .map(|row| listing.entries[row.index].command.name().to_owned())
+                .collect(),
         }
     }
 
@@ -591,12 +658,14 @@ impl Minibuffer {
         }
     }
 
-    pub(crate) fn is_palette(&self) -> bool {
-        matches!(self.answer, Answer::Palette { .. })
+    /// Whether enter takes only a row, as `Places` and `Commands` do,
+    /// rather than the text typed.
+    pub(crate) fn chooses_row(&self) -> bool {
+        !matches!(self.answer, Answer::Text { .. })
     }
 
     pub(crate) fn has_answer(&self) -> bool {
-        !self.is_palette() || self.selected < self.answer.len()
+        !self.chooses_row() || self.selected < self.answer.len()
     }
 
     pub(crate) fn delete_word(&mut self, window: &mut Window, cx: &mut App) {
@@ -613,19 +682,19 @@ impl Minibuffer {
                 let input = input.clone();
                 Box::new(move |frame, window, cx| submit(frame, input, window, cx))
             }
-            Answer::Palette { listing, rows, .. } => {
+            Answer::Places { listing, rows, .. } => {
                 let index = rows[self.selected].index;
                 let blank = input.trim().is_empty();
                 Box::new(move |frame, window, cx| match &listing.choices[index] {
                     Choice::Place(place) => frame.choose_place(place, blank, window, cx),
                     Choice::Words(hit) => frame.open_text_match(hit, window, cx),
-                    Choice::Command(entry) => match &entry.pick {
-                        Pick::Run { run, .. } | Pick::Infix { run, .. } => {
-                            run(frame, None, window, cx)
-                        }
-                        Pick::Menu(rows) => frame.open_menu(rows.clone(), window, cx),
-                    },
                 })
+            }
+            Answer::Commands { listing, mut rows } => {
+                let matched = rows.swap_remove(self.selected);
+                let command = listing.entries[matched.index].command.clone();
+                let argument = matched.argument;
+                Box::new(move |frame, window, cx| frame.run_command(&command, argument, window, cx))
             }
         };
         (input, submission)
@@ -648,7 +717,7 @@ impl Minibuffer {
         let inset = rems(0.5);
         let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
         let columns = match &self.answer {
-            Answer::Palette { listing, rows, .. } => Some(PaletteColumns::new(
+            Answer::Places { listing, rows, .. } => Some(PlaceColumns::new(
                 rows.iter()
                     .filter_map(|row| {
                         let choice = &listing.choices[row.index];
@@ -659,7 +728,7 @@ impl Minibuffer {
                 layout,
                 &measure,
             )),
-            Answer::Text { .. } => None,
+            Answer::Text { .. } | Answer::Commands { .. } => None,
         };
         let pages = (layout == crate::Layout::Phone && total > VISIBLE_CANDIDATES).then(|| {
             let page = |id, title, index: Option<usize>| {
@@ -707,7 +776,16 @@ impl Minibuffer {
                 // Padding lives on the row, not the strip, so the
                 // selection background spans the full width.
                 let mut row = div().flex().flex_row().gap(inset).w_full().px(inset);
-                if let Answer::Palette { listing, rows, .. } = &self.answer {
+                let accent = |range: &std::ops::Range<usize>, retained: usize| {
+                    (
+                        range.start..range.end.min(retained),
+                        HighlightStyle {
+                            color: Some(colors.text_accent.into()),
+                            ..HighlightStyle::default()
+                        },
+                    )
+                };
+                if let Answer::Places { listing, rows, .. } = &self.answer {
                     let matched = &rows[index];
                     let choice = &listing.choices[matched.index];
                     let field_colors = [
@@ -723,15 +801,7 @@ impl Minibuffer {
                         let marks = matched.marks[field]
                             .iter()
                             .filter(|range| range.start < retained)
-                            .map(|range| {
-                                (
-                                    range.start..range.end.min(retained),
-                                    HighlightStyle {
-                                        color: Some(colors.text_accent.into()),
-                                        ..HighlightStyle::default()
-                                    },
-                                )
-                            });
+                            .map(|range| accent(range, retained));
                         div()
                             .min_w_0()
                             .truncate()
@@ -739,7 +809,7 @@ impl Minibuffer {
                             .child(StyledText::new(value.to_owned()).with_highlights(marks))
                     };
                     let [title, detail, beside] = choice.fields();
-                    let columns = columns.as_ref().expect("palette has columns");
+                    let columns = columns.as_ref().expect("places have columns");
                     row = row.gap(columns.air);
                     match (choice, layout) {
                         (Choice::Place(_), crate::Layout::Phone) => {
@@ -786,13 +856,39 @@ impl Minibuffer {
                                 .child(part(0, title, title.len()))
                                 .child(part(1, detail, detail.len()).pl(inset));
                         }
-                        (Choice::Command(_), _) => {
-                            row = row.child(part(0, title, title.len())).children(
-                                (!beside.is_empty() && layout == crate::Layout::Desktop)
-                                    .then(|| part(2, beside, beside.len()).flex_none()),
-                            );
-                        }
                     }
+                } else if let Answer::Commands { listing, rows } = &self.answer {
+                    // The name, what it acts on, and its keys; a narrow
+                    // window shows the name and what it acts on.
+                    let matched = &rows[index];
+                    let entry = &listing.entries[matched.index];
+                    let name = entry.command.name();
+                    let marks = matched.marks.iter().map(|range| accent(range, name.len()));
+                    row = row
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(StyledText::new(name).with_highlights(marks)),
+                        )
+                        .children(entry.command.target_text().map(|target| {
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_color(colors.text_muted)
+                                .child(target.to_owned())
+                        }))
+                        .children(
+                            (layout == crate::Layout::Desktop && !entry.keys.is_empty()).then(
+                                || {
+                                    div()
+                                        .flex_none()
+                                        .ml_auto()
+                                        .text_color(colors.text_muted)
+                                        .child(entry.keys.clone())
+                                },
+                            ),
+                        );
                 } else if let Answer::Text { rows, .. } = &self.answer {
                     let candidate = &rows[index];
                     row = row.when(layout == crate::Layout::Phone, |row| row.flex_wrap());
@@ -829,12 +925,12 @@ impl Minibuffer {
             .collect::<Vec<_>>();
         // A prompt whose rows are its answers says when none answers, so
         // an empty list does not read as one still loading.
-        let palette = self.is_palette();
-        let missing = if total == 0 && palette && !self.input(cx).trim().is_empty() {
+        let chooses_row = self.chooses_row();
+        let missing = if total == 0 && chooses_row && !self.input(cx).trim().is_empty() {
             Some(
                 if matches!(
                     self.answer,
-                    Answer::Palette {
+                    Answer::Places {
                         search: Some(_),
                         ..
                     }
@@ -857,7 +953,7 @@ impl Minibuffer {
                 div()
                     .flex()
                     .flex_row()
-                    .when(!palette, |line| line.flex_wrap())
+                    .when(!chooses_row, |line| line.flex_wrap())
                     .items_center()
                     .gap_1()
                     .px(inset)
@@ -865,10 +961,10 @@ impl Minibuffer {
                     .child(
                         div()
                             .flex_grow(1.0)
-                            .min_w(if palette { px(0.) } else { px(160.) })
+                            .min_w(if chooses_row { px(0.) } else { px(160.) })
                             .child(self.editor.clone()),
                     )
-                    .children(palette.then(|| {
+                    .children(chooses_row.then(|| {
                         div()
                             .flex_none()
                             .text_color(colors.text_muted)
@@ -884,14 +980,14 @@ impl Minibuffer {
 
 /// A single column grid for all matching places, so it stays put when the
 /// visible rows scroll. As on Desk, the narrow grid moves detail down.
-struct PaletteColumns {
+struct PlaceColumns {
     title: Pixels,
     detail: Pixels,
     beside: Pixels,
     air: Pixels,
 }
 
-impl PaletteColumns {
+impl PlaceColumns {
     fn new<'a>(
         places: impl Iterator<Item = [&'a str; 3]>,
         width: Pixels,
@@ -961,7 +1057,7 @@ mod tests {
             ["A long project subject", "asks · 1h", "tide@lab"],
             ["Quiet work", "", "long-project@lab"],
         ];
-        let desktop = PaletteColumns::new(
+        let desktop = PlaceColumns::new(
             places.into_iter(),
             px(60.),
             crate::Layout::Desktop,
@@ -969,8 +1065,7 @@ mod tests {
         );
         assert_eq!(desktop.title + desktop.air, px(24.));
         assert_eq!(desktop.title + desktop.air * 2. + desktop.detail, px(35.));
-        let phone =
-            PaletteColumns::new(places.into_iter(), px(20.), crate::Layout::Phone, &measure);
+        let phone = PlaceColumns::new(places.into_iter(), px(20.), crate::Layout::Phone, &measure);
         assert_eq!(
             (phone.title, phone.air, phone.beside),
             (px(9.), px(2.), px(9.))

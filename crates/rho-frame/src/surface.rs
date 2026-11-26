@@ -1,5 +1,5 @@
-//! What a screen is: a surface the frame shows, keeps in history and
-//! asks about.
+//! What a screen is: a surface the frame shows, keeps among recent
+//! places and asks about.
 
 use std::rc::Rc;
 
@@ -8,7 +8,7 @@ use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Rend
 pub use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 
-use crate::menu::Row;
+use crate::command::Command;
 
 /// The action under Send on the phone bar, when a surface has a draft to send.
 pub type PhoneSend = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -157,11 +157,13 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
-    /// An explicit open, distinct from returning through history.
+    /// The surface was just made for an open by name: where it starts,
+    /// such as a thread's draft. A screen visited again is shown as it was
+    /// left and is not told (`window.Screen`).
     fn opened(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     /// Positions the screen on what the card deals, including when the
-    /// frame already holds the screen in history.
+    /// frame already holds the screen.
     fn show_card(&mut self, _card: &Card, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn show_search_match(
@@ -197,13 +199,13 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         false
     }
 
-    /// The surface's own rows for the palette, for what is in view.
-    fn rows(
+    /// The surface's own commands for `Commands`, for what is in view.
+    fn commands(
         &mut self,
         _card: Option<Seen>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> Vec<Row> {
+    ) -> Vec<Command> {
         Vec::new()
     }
 }
@@ -226,7 +228,7 @@ trait SurfaceHandle {
     fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
-    fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
     fn composes(&self, cx: &App) -> bool;
 }
@@ -302,8 +304,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         })
     }
 
-    fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.update(cx, |surface, cx| surface.rows(card, window, cx))
+    fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command> {
+        self.update(cx, |surface, cx| surface.commands(card, window, cx))
     }
 
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
@@ -410,8 +412,8 @@ impl AnySurface {
         self.0.composes(cx)
     }
 
-    pub fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.0.rows(card, window, cx)
+    pub fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command> {
+        self.0.commands(card, window, cx)
     }
 }
 

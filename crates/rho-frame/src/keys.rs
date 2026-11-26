@@ -4,14 +4,19 @@
 //! that means something in normal mode is bound for `vim_mode == normal`
 //! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
 //!
+//! Navigation is by recency, never by a back-and-forward stack
+//! (`window.Screen`): `space f` lists the places last visited ([`Places`],
+//! from the [`Leader`]), `tab` is Desk, [`Deal`] opens the next card, and
+//! `q` closes to the place visited before.
+//!
 //! A raw place (a page, a terminal, a desktop) is in one of two modes,
 //! and the keymap here is the whole of what each means
 //! (`window.raw places share one dual-escape model`). Its live input is
 //! drawn in [`LIVE`]: every key goes to the guest except `escape`
-//! ([`Normal`]), `f9` ([`GuestEscape`]), the palette and the idea chords.
-//! Escaped, a place that is no buffer is drawn in [`PLACE`], where the
-//! window's keys work as on any screen and `i` ([`Live`]) types again. A
-//! place answers the three actions; it binds no escape of its own.
+//! ([`Normal`]), the [`os`] gestures, the commands chord and the idea
+//! chord. Escaped, a place that is no buffer is drawn in [`PLACE`], where
+//! the window's keys work as on any screen and `i` ([`Live`]) types
+//! again. A place answers the three actions; it binds no escape of its own.
 
 use gpui::{App, KeyBinding, KeyBindingContextPredicate, NoAction, actions};
 
@@ -22,31 +27,51 @@ pub const LIVE: &str = "RhoLive";
 /// the keys: an escaped raw place, or one still connecting.
 pub const PLACE: &str = "RhoPlace";
 
+/// The gestures the OS keyboard layer (`keyd`) turns into function keys
+/// nothing types, so they reach the window even while a raw place takes
+/// every key. The one table that says which key each gesture arrives as;
+/// every binding below names the gesture. `f21` and `f24` are spare and
+/// bound to nothing.
+pub mod os {
+    /// `space-j`: `space` held while `j` is pressed. [`super::Deal`].
+    pub const SPACE_J: &str = "f20";
+    /// `space-shift-j`: `space` held while `shift-j` is pressed.
+    /// [`super::CloseAndDeal`].
+    pub const SPACE_SHIFT_J: &str = "f16";
+    /// `physical-escape`: the physical `escape` key, since a tapped
+    /// `capslock` is the `escape` rho sees. [`super::GuestEscape`], a
+    /// literal `escape` to the guest of a raw place.
+    pub const PHYSICAL_ESCAPE: &str = "f9";
+}
+
 actions!(
     rho_frame,
     [
-        /// Up through history.
-        Back,
-        /// Down through history, and from the newest entry the next card.
-        Forward,
-        /// Closes the surface in view.
+        /// `space-j`, or `ctrl-j` on an ordinary keyboard: the next card.
+        Deal,
+        /// `q`: closes the screen in view, back to the place visited
+        /// before it.
         Close,
-        /// Closes the surface in view and deals the next card.
+        /// `space-shift-j`, or `ctrl-shift-j`: closes the screen in view
+        /// and deals the next card.
         CloseAndDeal,
         /// `:`, and `ctrl-shift-;` where `:` would be typed: every command
-        /// by name.
-        Palette,
-        /// `space`: the verdicts over the card in view; `space` again is
-        /// Desk.
-        VerdictMenu,
-        /// `tab`: Desk, and from Desk the way back.
+        /// by name (`window.Commands`).
+        Commands,
+        /// `space f`: every place by name, the most recent first
+        /// (`window.Places`).
+        Places,
+        /// `space`: the leader menu (`f` places, `u` undo, and the card's
+        /// verdicts on a waiting card).
+        Leader,
+        /// `tab`: Desk, and from Desk the place visited before it.
         Desk,
         /// `escape` in a raw place's live input: the window's keys (`NOR`).
         Normal,
         /// `i` in an escaped raw place: the guest's keys again (`INS`).
         Live,
-        /// `f9` in a raw place's live input: a literal `escape` to the
-        /// guest, which `escape` itself never reaches.
+        /// [`os::PHYSICAL_ESCAPE`] in a raw place's live input: a literal
+        /// `escape` to the guest, which `escape` itself never reaches.
         GuestEscape,
         OpenRow,
         DeskNext,
@@ -113,43 +138,42 @@ fn end_of_document(cx: &App) -> KeyBinding {
 fn bindings() -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for context in ["RhoFrame", "RhoFrame > Editor"] {
-        // Ordinary navigation chords belong to the guest while a raw place
-        // takes live input, and do nothing in a prompt. The negation checks
-        // the whole focus stack, not just the context at which the binding
-        // would otherwise match.
+        // The ordinary-keyboard chords belong to the guest while a raw
+        // place takes live input, and do nothing in a prompt. The negation
+        // checks the whole focus stack, not just the context at which the
+        // binding would otherwise match.
         let window = format!("({context}) && !{LIVE} && !RhoMinibuffer");
         bindings.extend([
-            KeyBinding::new("ctrl-k", Back, Some(&window)),
-            KeyBinding::new("ctrl-j", Forward, Some(&window)),
-            KeyBinding::new("ctrl-shift-backspace", Close, Some(&window)),
+            KeyBinding::new("ctrl-j", Deal, Some(&window)),
             KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(&window)),
-            KeyBinding::new("f21", Back, Some(context)),
-            KeyBinding::new("f20", Forward, Some(context)),
-            KeyBinding::new("f16", CloseAndDeal, Some(context)),
+            KeyBinding::new("ctrl-shift-backspace", Close, Some(&window)),
+            // The OS gestures reach every place, live input included.
+            KeyBinding::new(os::SPACE_J, Deal, Some(context)),
+            KeyBinding::new(os::SPACE_SHIFT_J, CloseAndDeal, Some(context)),
             KeyBinding::new("ctrl-alt-m", PromptIdea, Some(context)),
-            // `ctrl-shift-;`, the palette where `:` would be typed: in a
+            // `ctrl-shift-;`, the commands where `:` would be typed: in a
             // terminal, on a desktop or a page. Spelled as gpui reads it on
             // Linux and macOS: shift turns `;` into `:` and is dropped, so
             // `ctrl-shift-;` would never match.
-            KeyBinding::new("ctrl-:", Palette, Some(context)),
+            KeyBinding::new("ctrl-:", Commands, Some(context)),
         ]);
     }
     bindings.extend([
         KeyBinding::new("escape", Normal, Some(LIVE)),
-        KeyBinding::new("f9", GuestEscape, Some(LIVE)),
+        KeyBinding::new(os::PHYSICAL_ESCAPE, GuestEscape, Some(LIVE)),
         // The bundled keymap binds `ctrl-k ctrl-o` under no context, which
         // would hold every `ctrl-k` for the guest until the next key.
         KeyBinding::new("ctrl-k ctrl-o", NoAction, Some(LIVE)),
-        KeyBinding::new(":", Palette, Some(PLACE)),
-        KeyBinding::new("space", VerdictMenu, Some(PLACE)),
+        KeyBinding::new(":", Commands, Some(PLACE)),
+        KeyBinding::new("space", Leader, Some(PLACE)),
         KeyBinding::new("tab", Desk, Some(PLACE)),
         KeyBinding::new("q", Close, Some(PLACE)),
         KeyBinding::new("i", Live, Some(PLACE)),
     ]);
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
         bindings.extend([
-            KeyBinding::new(":", Palette, Some(&context)),
-            KeyBinding::new("space", VerdictMenu, Some(&context)),
+            KeyBinding::new(":", Commands, Some(&context)),
+            KeyBinding::new("space", Leader, Some(&context)),
             KeyBinding::new("tab", Desk, Some(&context)),
             KeyBinding::new("q", Close, Some(&context)),
         ]);
@@ -247,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_semicolon_opens_the_palette_from_a_place_that_takes_every_key() {
+    fn ctrl_shift_semicolon_opens_commands_from_a_place_that_takes_every_key() {
         // A raw terminal, a live desktop and a page bind none of it
         // themselves: the frame's chord reaches through each.
         for surface in LIVE_PLACES {
@@ -255,7 +279,7 @@ mod tests {
             assert!(
                 bindings
                     .iter()
-                    .any(|binding| binding.action().as_any().is::<Palette>()),
+                    .any(|binding| binding.action().as_any().is::<Commands>()),
                 "ctrl-shift-; in {surface} matched {:?}",
                 bindings
                     .iter()
@@ -302,7 +326,42 @@ mod tests {
                 assert_eq!(action_at(place, key), None, "{key} in {place}");
             }
             assert_eq!(action_at(place, "escape"), Some(Normal.name()), "{place}");
-            assert_eq!(action_at(place, "f9"), Some(GuestEscape.name()), "{place}");
+            assert_eq!(
+                action_at(place, os::PHYSICAL_ESCAPE),
+                Some(GuestEscape.name()),
+                "{place}"
+            );
+        }
+    }
+
+    /// The OS gestures deal from everywhere, live input included, and the
+    /// spare function keys mean nothing anywhere.
+    #[test]
+    fn the_os_gestures_deal_everywhere_and_the_spare_keys_stay_unbound() {
+        assert_eq!(
+            (os::SPACE_J, os::SPACE_SHIFT_J, os::PHYSICAL_ESCAPE),
+            ("f20", "f16", "f9"),
+            "keyd sends these; change both sides together"
+        );
+        let everywhere = LIVE_PLACES.into_iter().chain(ESCAPED_PLACES).chain([
+            "Editor vim_mode=helix_normal",
+            "Editor vim_mode=insert",
+            "RhoDesk",
+        ]);
+        for surface in everywhere {
+            assert_eq!(
+                action_at(surface, os::SPACE_J),
+                Some(Deal.name()),
+                "{surface}"
+            );
+            assert_eq!(
+                action_at(surface, os::SPACE_SHIFT_J),
+                Some(CloseAndDeal.name()),
+                "{surface}"
+            );
+            for spare in ["f21", "f24"] {
+                assert_eq!(action_at(surface, spare), None, "{spare} in {surface}");
+            }
         }
     }
 
@@ -310,23 +369,30 @@ mod tests {
     fn an_escaped_place_has_the_same_screen_keys_as_any_buffer() {
         let buffer = "Editor vim_mode=helix_normal";
         for (key, action) in [
-            ("ctrl-k", Back.name()),
-            ("ctrl-j", Forward.name()),
+            ("ctrl-j", Deal.name()),
             ("ctrl-shift-j", CloseAndDeal.name()),
             ("tab", Desk.name()),
             ("q", Close.name()),
-            ("space", VerdictMenu.name()),
+            ("space", Leader.name()),
+            (":", Commands.name()),
         ] {
             assert_eq!(action_at(buffer, key), Some(action), "{key} in a buffer");
             for place in ESCAPED_PLACES {
                 assert_eq!(action_at(place, key), Some(action), "{key} in {place}");
             }
         }
+        for place in ESCAPED_PLACES.into_iter().chain([buffer]) {
+            // No back and forward: the chords that once walked a history
+            // are nothing of the window's.
+            assert_eq!(action_at(place, "ctrl-k"), None, "{place}");
+            assert_eq!(action_at(place, "f21"), None, "{place}");
+        }
         for place in ESCAPED_PLACES {
             assert_eq!(action_at(place, "i"), Some(Live.name()), "{place}");
-            // Escaped, `escape` and `f9` are nothing of the window's.
+            // Escaped, `escape` and the physical escape are nothing of the
+            // window's.
             assert_eq!(action_at(place, "escape"), None, "{place}");
-            assert_eq!(action_at(place, "f9"), None, "{place}");
+            assert_eq!(action_at(place, os::PHYSICAL_ESCAPE), None, "{place}");
         }
     }
 
@@ -335,7 +401,7 @@ mod tests {
         // As the bundled keymap has it: bound under no context, before the
         // frame's own.
         let mut keymap = Keymap::default();
-        keymap.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Palette, None)]);
+        keymap.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Commands, None)]);
         keymap.add_bindings(bindings());
         let typed = [Keystroke::parse("ctrl-k").unwrap()];
         let stack = |place: &str| {
@@ -350,7 +416,7 @@ mod tests {
         }
         // Without the live unbinding, the prefix would hold it.
         let mut bundled = Keymap::default();
-        bundled.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Palette, None)]);
+        bundled.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Commands, None)]);
         bundled.add_bindings(
             bindings()
                 .into_iter()

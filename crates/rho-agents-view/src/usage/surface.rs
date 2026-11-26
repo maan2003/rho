@@ -11,7 +11,7 @@ use gpui::{
 use language::Point;
 use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
-use rho_frame::{Addressed as _, Row, Surface};
+use rho_frame::{Addressed as _, Surface};
 use text::Bias;
 use theme::ActiveTheme as _;
 
@@ -99,7 +99,6 @@ impl UsageSurface {
     pub(crate) fn bind_keys(cx: &mut App) {
         for context in rho_frame::normal_contexts("RhoUsage", " && vim_operator == none") {
             cx.bind_keys([
-                // The palette names the binding added last.
                 KeyBinding::new("[ w", OtherWindow, Some(&context)),
                 KeyBinding::new("] w", OtherWindow, Some(&context)),
                 KeyBinding::new("] v", NextChart, Some(&context)),
@@ -108,11 +107,12 @@ impl UsageSurface {
         }
     }
 
-    /// Shows `chart` here instead, in place: history gains nothing.
+    /// Shows `chart` here instead, in place: no other place is added.
     fn switch(&self, chart: UsageChart, cx: &mut App) {
         let frame = self.system.read(cx).frame().clone();
+        let here = self.chart.address();
         frame.with(cx, move |frame, window, cx| {
-            frame.replace_current(chart.address(), window, cx)
+            frame.replace(&here, chart.address(), window, cx)
         });
     }
 
@@ -282,26 +282,6 @@ impl UsageSurface {
 impl Surface for UsageSurface {
     fn title(&self, _cx: &App) -> String {
         format!("usage › {}", self.chart.title())
-    }
-
-    fn rows(
-        &mut self,
-        _: Option<rho_frame::surface::Seen>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Vec<Row> {
-        let switch = |chart: UsageChart| {
-            Row::run(
-                "",
-                format!("show {}", chart.title()),
-                move |frame, window, cx| frame.replace_current(chart.address(), window, cx),
-            )
-        };
-        vec![
-            switch(self.chart.other_window()).bound_to(OtherWindow),
-            switch(self.chart.step(true)).bound_to(NextChart),
-            switch(self.chart.step(false)).bound_to(PreviousChart),
-        ]
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {

@@ -27,6 +27,7 @@ use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
 use super::ChatSystem;
+use super::pending::PendingIdeaId;
 use super::projects::{NewProject, ProjectCreated, runtime_choices};
 use crate::cache::IdeaDraft;
 use crate::{ThreadId, names};
@@ -522,10 +523,11 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
         None => None,
     };
     let echo = format!("queued for {}: {}", project.name, first_line(&text));
+    let client_id = rand::random();
     chat.update(cx, |chat, cx| {
         chat.send_idea(
             IdeaMail {
-                client_id: rand::random(),
+                client_id,
                 project: project.thread,
                 text,
                 runtime,
@@ -535,6 +537,9 @@ fn send(chat: Entity<ChatSystem>, frame: &mut Frame, window: &mut Window, cx: &m
         chat.clear_idea(cx);
     });
     frame.close(&address(), window, cx);
+    // The sent idea is a place now, the one just left (`chat.Write an
+    // idea`); it becomes its thread where it stands once the host has it.
+    frame.remember(PendingIdeaId(client_id).address());
     frame.echo(&echo, StyleClass::SystemInfo, cx);
 }
 
@@ -1118,13 +1123,13 @@ pub(super) mod tests {
             })
             .unwrap();
 
-        // Back and forward walk past the idea like any screen.
-        cx.dispatch_action(window.into(), keys::Back);
-        cx.run_until_parked();
+        // The recent places flip between the idea and what was under it
+        // like any screen.
         window
             .update(cx, |frame, window, cx| {
+                frame.previous_place(window, cx);
                 assert_eq!(frame.current_address(), &under);
-                frame.forward_or_deal(window, cx);
+                frame.previous_place(window, cx);
                 assert_eq!(frame.current_address(), &address());
             })
             .unwrap();
@@ -1397,7 +1402,7 @@ pub(super) mod tests {
 
     /// `chat.Project`: a project shows its bare name until a second host
     /// has a project of the same name; then both name their host on the
-    /// Desk, in the thread, and in the palette, while names one host alone
+    /// Desk, in the thread, and in `Places`, while names one host alone
     /// has stay bare.
     #[gpui::test]
     fn only_a_name_two_hosts_share_shows_its_host(cx: &mut gpui::TestAppContext) {
@@ -1430,7 +1435,7 @@ pub(super) mod tests {
             assert_eq!(desk.name, "tide@lab");
             // The thread's status line.
             assert_eq!(chat.project_of(on_box(3), cx), "tide@box");
-            // The palette: what it shows, and what finds it unshown.
+            // `Places`: what it shows, and what finds it unshown.
             let found = chat.find(&rho_dealer::Marks::default(), cx);
             let row = |title: &str| {
                 found

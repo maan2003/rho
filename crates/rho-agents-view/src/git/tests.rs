@@ -201,10 +201,10 @@ impl Window {
         cx.run_until_parked();
     }
 
-    /// Opens the verdict menu over the card in view and presses `key`, as
+    /// Opens the leader menu over the card in view and presses `key`, as
     /// `space` then `key` does.
     fn press(&self, key: &str, cx: &mut TestAppContext) {
-        cx.dispatch_action(self.frame.into(), rho_frame::keys::VerdictMenu);
+        cx.dispatch_action(self.frame.into(), rho_frame::keys::Leader);
         cx.run_until_parked();
         let rows = self
             .frame

@@ -10,9 +10,25 @@ mod view;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Task, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::{CardHere, Mode, Row, Surface};
+use rho_frame::{CardHere, Command, Mode, Spelling, Surface};
 use theme::ActiveTheme as _;
 pub use view::DesktopView;
+
+pub static DRAW_ON_DESKTOP: Spelling = Spelling {
+    name: "draw on desktop",
+    aliases: &[("annotate", 9), ("draw", 8), ("sketch", 6), ("mark up", 6)],
+    argument: None,
+};
+
+pub static BACK_TO_LIVE: Spelling = Spelling {
+    name: "back to live",
+    aliases: &[("live", 8), ("stop drawing", 8), ("resume desktop", 6)],
+    argument: None,
+};
+
+/// How the desktop's commands are spelled, for ranking every system's
+/// together.
+pub static SPELLINGS: &[&Spelling] = &[&DRAW_ON_DESKTOP, &BACK_TO_LIVE];
 
 /// What a desktop surface stands on.
 enum State {
@@ -103,23 +119,40 @@ impl Surface for DesktopSurface {
         }
     }
 
-    fn rows(
+    /// Drawing on the frame in view, and leaving it for the live app.
+    fn commands(
         &mut self,
         _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<Row> {
+    ) -> Vec<Command> {
         let State::Open(view) = &self.state else {
             return Vec::new();
         };
-        let description = match view.read(cx).annotating() {
-            true => "back to live",
-            false => "draw on this frame",
-        };
-        let view = view.clone();
-        vec![Row::run("a", description, move |_, window, cx| {
-            view.update(cx, |view, cx| view.toggle_annotation(window, cx));
-        })]
+        let drawing = view.read(cx).annotating();
+        let title = self.title(cx);
+        let (draw, live) = (view.clone(), view.clone());
+        vec![
+            // Already drawing, it stays drawing.
+            Command::simple(&DRAW_ON_DESKTOP, move |_, window, cx| {
+                draw.update(cx, |view, cx| {
+                    if !view.annotating() {
+                        view.toggle_annotation(window, cx)
+                    }
+                })
+            })
+            .target(title.clone()),
+            Command::simple(&BACK_TO_LIVE, move |_, window, cx| {
+                live.update(cx, |view, cx| match view.annotating() {
+                    true => view.toggle_annotation(window, cx),
+                    false => view.go_live(cx),
+                })
+            })
+            .target(match drawing {
+                true => format!("{title} · drawing"),
+                false => title,
+            }),
+        ]
     }
 }
 

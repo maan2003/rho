@@ -1,8 +1,9 @@
 //! Which Claude account a host's agents run on: `switch claude account`,
-//! from the palette on every screen (`usage.Chart`'s `switch account`).
-//! The user picks a host when more than one is attached, then one of the
-//! accounts the host has, each with what is left of its allowance, and
-//! the host's agents run on it from their next turn.
+//! from `Commands` on every screen (`usage.Chart`'s `switch claude
+//! account`). The user picks a host when more than one is attached, then
+//! one of the accounts the host has, each with what is left of its
+//! allowance, or names it on the line, and the host's agents run on it
+//! from their next turn.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -13,10 +14,22 @@ use rho_agents_client::protocol::{
     ClaudeAccountList, ClaudeAccounts, QuotaSummary, SetClaudeAccount,
 };
 use rho_agents_client::remote::AgentsLink;
-use rho_frame::{Candidate, Row};
+use rho_frame::{Candidate, Command, Spelling};
 use rho_window::style::StyleClass;
 
-const COMMAND: &str = "switch claude account";
+pub static SWITCH_CLAUDE_ACCOUNT: Spelling = Spelling {
+    name: "switch claude account",
+    aliases: &[
+        ("claude account", 9),
+        ("change account", 8),
+        ("account", 7),
+        ("log in", 4),
+        ("out of quota", 5),
+    ],
+    argument: Some("account"),
+};
+
+const COMMAND: &str = SWITCH_CLAUDE_ACCOUNT.name;
 
 /// The Claude allowances a host reports for each account, in the order
 /// the rate limit chart names them.
@@ -25,10 +38,11 @@ const ALLOWANCES: [&str; 3] = ["session", "opus", "fable"];
 /// What the window knows of a host's allowances: what it last reported.
 pub(super) type Reported = Rc<dyn Fn(HostId, &App) -> Vec<QuotaSummary>>;
 
-/// The palette row. It is the window's own: no screen hides it, and
-/// typing `usage` finds it after the charts.
-pub(super) fn row(reported: Reported) -> Row {
-    Row::run("", format!("{COMMAND}…"), move |frame, window, cx| {
+/// The window's own command: no screen hides it. An account typed after
+/// its name is switched to without a prompt, once the host is known.
+/// `target` names the host it acts on, as the row shows it.
+pub(super) fn command(reported: Reported, target: String) -> Command {
+    Command::new(&SWITCH_CLAUDE_ACCOUNT, move |frame, typed, window, cx| {
         let reported = reported.clone();
         frame.choose_host(
             COMMAND,
@@ -36,15 +50,35 @@ pub(super) fn row(reported: Reported) -> Row {
                 let link = AgentsLink::new(frame.hosts().link(host));
                 let answer = link.call(ClaudeAccounts);
                 let reported = reported.clone();
+                let typed = typed.clone();
                 frame.when_host_answers(
                     COMMAND,
                     host,
                     answer,
                     move |frame, list, window, cx| {
                         let name = frame.hosts().host_label(host);
+                        let prompt = format!("claude account on {name} ({}):", list.current);
                         let rows = Rc::new(account_rows(&list, &reported(host, cx)));
+                        let decide = move |frame: &mut rho_frame::Frame,
+                                           input: &str,
+                                           cx: &mut gpui::Context<rho_frame::Frame>| {
+                            match switch(&link, name.clone(), &list, input) {
+                                Ok(answer) => {
+                                    cx.spawn(async move |this, cx| {
+                                        let (said, class) = answer.await;
+                                        let _ = this
+                                            .update(cx, |frame, cx| frame.echo(&said, class, cx));
+                                    })
+                                    .detach();
+                                }
+                                Err(refused) => frame.echo(&refused, StyleClass::SystemInfo, cx),
+                            }
+                        };
+                        if let Some(typed) = &typed {
+                            return decide(frame, typed, cx);
+                        }
                         frame.open_prompt(
-                            format!("claude account on {name} ({}):", list.current),
+                            prompt,
                             Rc::new(move |_, needle, _| {
                                 let needle = needle.trim().to_lowercase();
                                 rows.iter()
@@ -52,22 +86,7 @@ pub(super) fn row(reported: Reported) -> Row {
                                     .cloned()
                                     .collect()
                             }),
-                            Rc::new(move |frame, input, _, cx| {
-                                match switch(&link, name.clone(), &list, &input) {
-                                    Ok(answer) => {
-                                        cx.spawn(async move |this, cx| {
-                                            let (said, class) = answer.await;
-                                            let _ = this.update(cx, |frame, cx| {
-                                                frame.echo(&said, class, cx)
-                                            });
-                                        })
-                                        .detach();
-                                    }
-                                    Err(refused) => {
-                                        frame.echo(&refused, StyleClass::SystemInfo, cx)
-                                    }
-                                }
-                            }),
+                            Rc::new(move |frame, input, _, cx| decide(frame, &input, cx)),
                             window,
                             cx,
                         );
@@ -80,8 +99,7 @@ pub(super) fn row(reported: Reported) -> Row {
             cx,
         );
     })
-    .also("usage")
-    .window_wide()
+    .target(target)
 }
 
 /// One row per account the host has: which one agents run on now, and
@@ -298,7 +316,6 @@ mod window_tests {
     use rho_agent_hosts::{AttachTarget, HostSpec};
     use rho_agents_client::protocol::worksets::{Open, Request};
     use rho_frame::Frame;
-    use rho_frame::menu::Pick;
     use rho_rpc::protocol::{Answer, Protocol, read_frame, write_frame};
 
     use super::*;
@@ -387,14 +404,17 @@ mod window_tests {
         (host, asked)
     }
 
-    /// Runs the row, with `reported` as what the hosts said is left.
-    fn run_row(window: &WindowHandle<Frame>, reported: Reported, cx: &mut TestAppContext) {
+    /// Runs the command, with `reported` as what the hosts said is left
+    /// and `typed` after its name on the line.
+    fn run_command(
+        window: &WindowHandle<Frame>,
+        reported: Reported,
+        typed: Option<&str>,
+        cx: &mut TestAppContext,
+    ) {
         window
             .update(cx, |frame, window, cx| {
-                let Pick::Run { run, .. } = row(reported).pick else {
-                    unreachable!("the row runs")
-                };
-                run(frame, None, window, cx);
+                command(reported, String::new()).run(typed.map(str::to_owned), frame, window, cx)
             })
             .unwrap();
         cx.run_until_parked();
@@ -429,23 +449,15 @@ mod window_tests {
         cx.run_until_parked();
     }
 
-    /// Whatever the hosts, the row is the window's, and found by `usage`.
-    #[test]
-    fn the_row_is_the_windows_own() {
-        let row = row(nothing_reported());
-        assert_eq!(row.scope, rho_frame::menu::Scope::Window);
-        assert_eq!(row.also, ["usage"]);
-    }
-
     /// With no host attached the echo line says so and nothing is asked.
     #[gpui::test]
     fn no_host_asks_nothing(cx: &mut TestAppContext) {
         let window = window(cx);
-        run_row(&window, nothing_reported(), cx);
+        run_command(&window, nothing_reported(), None, cx);
         assert_eq!(prompt(&window, cx), None);
     }
 
-    /// With one host attached the row asks it at once, offers its accounts
+    /// With one host attached the command asks it at once, offers its accounts
     /// with what is left of each, and switches it to the one chosen.
     #[gpui::test]
     fn one_host_switches_without_a_host_prompt(cx: &mut TestAppContext) {
@@ -464,7 +476,7 @@ mod window_tests {
                 reset_at_unix: None,
             }]
         });
-        run_row(&window, reported, cx);
+        run_command(&window, reported, None, cx);
         assert_eq!(*asked.borrow(), [Request::ClaudeAccounts(ClaudeAccounts)]);
         assert_eq!(
             prompt(&window, cx).as_deref(),
@@ -493,14 +505,44 @@ mod window_tests {
         assert_eq!(prompt(&window, cx), None);
     }
 
-    /// With two hosts attached the row asks `host:` first, and only the
+    /// An account named on the line is switched to without a prompt; one
+    /// the host does not have is refused, and nothing is switched.
+    #[gpui::test]
+    fn an_account_typed_on_the_line_switches_at_once(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let (_, asked) = attach(&window, "lab", cx);
+        run_command(&window, nothing_reported(), Some("work"), cx);
+        assert_eq!(prompt(&window, cx), None);
+        assert_eq!(
+            *asked.borrow(),
+            [
+                Request::ClaudeAccounts(ClaudeAccounts),
+                Request::SetClaudeAccount(SetClaudeAccount {
+                    name: "work".to_owned()
+                }),
+            ]
+        );
+        run_command(&window, nothing_reported(), Some("nobody"), cx);
+        assert_eq!(prompt(&window, cx), None);
+        assert_eq!(
+            asked.borrow().len(),
+            3,
+            "asked for the list, switched nothing"
+        );
+        assert!(
+            matches!(asked.borrow().last(), Some(Request::ClaudeAccounts(_))),
+            "the last request only listed the accounts"
+        );
+    }
+
+    /// With two hosts attached the command asks `host:` first, and only the
     /// chosen host is asked and switched.
     #[gpui::test]
     fn two_hosts_ask_which_first(cx: &mut TestAppContext) {
         let window = window(cx);
         let (_, lab) = attach(&window, "lab", cx);
         let (_, sea) = attach(&window, "sea", cx);
-        run_row(&window, nothing_reported(), cx);
+        run_command(&window, nothing_reported(), None, cx);
         assert_eq!(prompt(&window, cx).as_deref(), Some("host:"));
         assert!(lab.borrow().is_empty() && sea.borrow().is_empty());
         answer(&window, "sea", cx);

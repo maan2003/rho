@@ -5,8 +5,8 @@
 //! root anchors a project, and each reply directly below it starts a
 //! thread. Both open as a [`ThreadView`]. The idea being written opens
 //! at `chat:idea` ([`idea`]). [`crate::cards`] says which threads want the
-//! user; this module supplies projects, moving threads, and the rows for
-//! `find`.
+//! user; this module supplies projects, moving threads, and the places
+//! `Places` lists.
 
 mod idea;
 mod pending;
@@ -34,8 +34,9 @@ use rho_agent_types::{
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::{
-    AnySurface, Found, FoundText, FoundThread, FrameLink, Opening, Point, Project, Row,
-    SearchPoint, System, TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
+    AnySurface, Candidate, Command, Found, FoundText, FoundThread, Frame, FrameLink, Opening,
+    Point, Project, SearchPoint, Spelling, System, TextIndex, TextKind, TextPresenter, TextSearch,
+    TextTarget,
 };
 use rho_rpc::protocol::Answer as RpcAnswer;
 use rho_window::style::StyleClass;
@@ -49,6 +50,33 @@ use crate::outbox::{Delivery, Kept, Outbox, Outgoing, OutgoingState};
 use crate::protocol::{Name, Post, PostIdea, PostIdeaReply, RetryIdea};
 use crate::stream::{Cursors, MailEvent, MailStream};
 use crate::{ThreadId, cards};
+
+pub static RENAME_THREAD: Spelling = Spelling {
+    name: "rename thread",
+    aliases: &[
+        ("rename", 9),
+        ("title", 8),
+        ("subject", 8),
+        ("name thread", 8),
+    ],
+    argument: Some("subject"),
+};
+
+/// How the chat's commands are spelled, for ranking every system's
+/// together.
+pub static SPELLINGS: &[&Spelling] = &[
+    &RENAME_THREAD,
+    &projects::NEW_PROJECT,
+    &projects::SET_PROJECT_PLACE,
+    &projects::SET_PROJECT_MODE,
+    &projects::SET_PROJECT_RUNTIME,
+    &pending::WRITE_IDEA_AGAIN,
+    &thread::REPLY_PRIVATELY,
+    &thread::QUOTE_MESSAGE,
+    &thread::WRITE_REPLY_AGAIN,
+    &thread::SEND_MESSAGE,
+    &thread::OPEN_UNDER_CURSOR,
+];
 
 /// What the chat tells its listeners.
 pub enum Event {
@@ -579,6 +607,123 @@ impl ChatSystem {
         })
     }
 
+    /// Names `thread` `named`, or asks for its name with `current` to
+    /// edit.
+    fn rename_thread(
+        this: &Entity<Self>,
+        thread: ThreadId,
+        current: &str,
+        named: Option<String>,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        if let Some(named) = named {
+            return Self::send_name(this, thread, &named, frame, cx);
+        }
+        let this = this.clone();
+        frame.open_prompt(
+            "rename thread:",
+            Rc::new(|_, _, _| Vec::new()),
+            Rc::new(move |frame, input, _, cx| Self::send_name(&this, thread, &input, frame, cx)),
+            window,
+            cx,
+        );
+        if let Some(prompt) = frame.minibuffer_mut() {
+            prompt.set_input(current.to_owned(), window, cx);
+            prompt.validate(|text| {
+                text.trim()
+                    .is_empty()
+                    .then_some("rename thread: enter a subject")
+            });
+        }
+    }
+
+    fn send_name(
+        this: &Entity<Self>,
+        thread: ThreadId,
+        name: &str,
+        frame: &mut Frame,
+        cx: &mut Context<Frame>,
+    ) {
+        let name = rho_agent_types::one_line(name);
+        if name.trim().is_empty() {
+            return frame.echo("rename thread: enter a subject", StyleClass::SystemInfo, cx);
+        }
+        this.update(cx, |chat, cx| {
+            chat.call(
+                thread.host,
+                Name {
+                    thread: thread.message,
+                    name: name.clone(),
+                },
+                cx,
+                move |chat, reply, cx| {
+                    let words = match reply {
+                        Ok(()) => format!("named: {name}"),
+                        Err(error) => format!("rename thread: {error:#}"),
+                    };
+                    chat.frame.echo(words, StyleClass::SystemInfo, cx);
+                },
+            );
+        });
+    }
+
+    /// `rename thread` away from a thread: which one, by subject, then
+    /// its new name, unless it was typed on the line.
+    fn pick_thread_to_rename(
+        this: Entity<Self>,
+        named: Option<String>,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        let threads = this.clone();
+        frame.open_prompt(
+            "rename which thread:",
+            Rc::new(move |frame, needle, cx| {
+                let needle = needle.trim().to_lowercase();
+                threads
+                    .read(cx)
+                    .find(frame.marks(), cx)
+                    .into_iter()
+                    .filter(|found| found.thread.is_some())
+                    .filter(|found| found.title.to_lowercase().contains(&needle))
+                    .map(|found| Candidate {
+                        value: found.title,
+                        description: found.description,
+                    })
+                    .collect()
+            }),
+            Rc::new(move |frame, input, window, cx| {
+                let picked = this
+                    .read(cx)
+                    .find(frame.marks(), cx)
+                    .into_iter()
+                    .filter(|found| found.thread.is_some() && found.title == input.trim())
+                    .find_map(|found| this.read(cx).thread_of(&found.address));
+                match picked {
+                    Some(thread) => Self::rename_thread(
+                        &this,
+                        thread,
+                        input.trim(),
+                        named.clone(),
+                        frame,
+                        window,
+                        cx,
+                    ),
+                    None => frame.echo(
+                        &format!("rename thread: no thread called {:?}", input.trim()),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
     fn link_for(&self, endpoint: EndpointId) -> Option<Link> {
         self.hosts
             .values()
@@ -617,12 +762,10 @@ impl ChatSystem {
                 Some(project) => format!("sent to {project}: {idea}"),
                 None => format!("sent: {idea}"),
             };
+            // The thread takes the queued idea's place among the recent
+            // places, and in view when the user was reading it.
             self.frame.with(cx, move |frame, window, cx| {
-                let reading = frame.current_address() == &pending;
-                frame.close_all(|address| address == &pending, window, cx);
-                if reading {
-                    frame.open(posted, window, cx);
-                }
+                frame.replace(&pending, posted, window, cx);
                 frame.echo(&echo, StyleClass::SystemInfo, cx);
             });
         }
@@ -662,7 +805,7 @@ impl ChatSystem {
     }
 
     /// The host would not start the idea (`SPEC-project-delivery`). It
-    /// stays in the outbox as refused: readable by name in the palette,
+    /// stays in the outbox as refused: readable by name in `Places`,
     /// never posted again, and taken back into the draft from its screen.
     fn refuse_idea(&mut self, endpoint: EndpointId, reason: String, cx: &mut Context<Self>) {
         let echo = format!("idea not sent: {}", rho_agent_types::one_line(&reason));
@@ -950,56 +1093,35 @@ impl System for ChatSystem {
         self.changed(endpoint, cx);
     }
 
-    fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn commands(
+        &mut self,
+        point: &Point,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         let this = cx.entity();
-        let mut rows = Vec::new();
-        rows.extend(self.project_rows(point, cx));
+        let mut commands = self.project_commands(point, cx);
         // The name belongs to the open thread, wherever the point is in it.
-        let rename = self.thread_of(&point.surface).and_then(|thread| {
+        let here = self.thread_of(&point.surface).and_then(|thread| {
             let chat = self.logs.get(&thread.host)?;
             Some((thread, chat.name(thread.message)?))
         });
-        if let Some((thread, current)) = rename {
-            rows.push(
-                Row::run("", "name this thread", move |frame, window, cx| {
-                    let this = this.clone();
-                    frame.open_prompt(
-                        "name this thread:",
-                        Rc::new(|_, _, _| Vec::new()),
-                        Rc::new(move |_frame, input, _, cx| {
-                            let name = rho_agent_types::one_line(&input);
-                            this.update(cx, |chat, cx| {
-                                chat.call(
-                                    thread.host,
-                                    Name {
-                                        thread: thread.message,
-                                        name: name.clone(),
-                                    },
-                                    cx,
-                                    move |chat, reply, cx| {
-                                        let words = match reply {
-                                            Ok(()) => format!("named: {name}"),
-                                            Err(error) => format!("name: {error:#}"),
-                                        };
-                                        chat.frame.echo(words, StyleClass::SystemInfo, cx);
-                                    },
-                                );
-                            });
-                        }),
-                        window,
-                        cx,
-                    );
-                    if let Some(prompt) = frame.minibuffer_mut() {
-                        prompt.set_input(current.clone(), window, cx);
-                        prompt.validate(|text| {
-                            text.trim().is_empty().then_some("name: enter a subject")
-                        });
+        let target = here
+            .as_ref()
+            .map_or_else(|| "pick thread…".to_owned(), |(_, name)| name.clone());
+        commands.push(
+            Command::new(
+                &RENAME_THREAD,
+                move |frame, named, window, cx| match &here {
+                    Some((thread, current)) => {
+                        Self::rename_thread(&this, *thread, current, named, frame, window, cx)
                     }
-                })
-                .also("rename"),
-            );
-        }
-        rows
+                    None => Self::pick_thread_to_rename(this.clone(), named, frame, window, cx),
+                },
+            )
+            .target(target),
+        );
+        commands
     }
 
     fn claims(

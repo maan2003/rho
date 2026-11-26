@@ -269,7 +269,7 @@ impl Render for TerminalSurface {
             State::Failed(error) => format!("term {} of {}: {error}", self.terminal, self.agent),
         };
         // The placeholder is no buffer: the window's keys, so `q` closes it
-        // and `:` is the palette.
+        // and `:` opens `Commands`.
         div()
             .size_full()
             .key_context(keys::PLACE)

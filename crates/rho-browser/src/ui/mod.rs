@@ -25,7 +25,8 @@ use gpui::{
 use rho_db::RhoDb;
 use rho_dealer::{Address, Addressed};
 use rho_frame::{
-    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Mode, Opening, Point, Row, Surface, keys,
+    AnySurface, Candidate, Command, Found, Frame, FrameLink, Marks, Mode, Opening, Point, Spelling,
+    Surface, keys,
 };
 use rho_window::style::StyleClass;
 use url::Url;
@@ -54,6 +55,40 @@ impl Addressed for PageId {
         (id.hyphenated().to_string() == rest).then_some(Self(id))
     }
 }
+
+pub static OPEN_PAGE: Spelling = Spelling {
+    name: "open page",
+    aliases: &[
+        ("url", 9),
+        ("web", 8),
+        ("browse", 8),
+        ("open", 7),
+        ("go", 6),
+        ("website", 7),
+        ("link", 5),
+    ],
+    argument: Some("address or title"),
+};
+
+pub static BOOKMARK_PAGE: Spelling = Spelling {
+    name: "bookmark page",
+    aliases: &[("bookmark", 9), ("save page", 7), ("favorite", 6)],
+    argument: Some("name"),
+};
+
+pub static REMOVE_BOOKMARK: Spelling = Spelling {
+    name: "remove bookmark",
+    aliases: &[
+        ("unbookmark", 9),
+        ("delete bookmark", 8),
+        ("forget bookmark", 6),
+    ],
+    argument: Some("name"),
+};
+
+/// How the pages' commands are spelled, for ranking every system's
+/// together.
+pub static SPELLINGS: &[&Spelling] = &[&OPEN_PAGE, &BOOKMARK_PAGE, &REMOVE_BOOKMARK];
 
 pub struct PageSystem {
     browser: Browser,
@@ -193,23 +228,27 @@ impl PageSystem {
                     .into_iter()
                     .collect()
             }),
-            Rc::new(move |frame, input, _, cx| {
-                let title = input.split_whitespace().collect::<Vec<_>>().join(" ");
-                if title.is_empty() {
-                    return;
-                }
-                frame.write_marks(vec![bookmarks::save(&title, &url)], cx);
-                frame.echo(&format!("bookmarked: {title}"), StyleClass::SystemInfo, cx);
-            }),
+            Rc::new(move |frame, input, _, cx| Self::save_bookmark(&url, &input, frame, cx)),
             window,
             cx,
         );
     }
 
+    /// Bookmarks `url` as `name`, its words as typed with single spaces.
+    fn save_bookmark(url: &Url, name: &str, frame: &mut Frame, cx: &mut Context<Frame>) {
+        let title = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() {
+            return;
+        }
+        frame.write_marks(vec![bookmarks::save(&title, url)], cx);
+        frame.echo(&format!("bookmarked: {title}"), StyleClass::SystemInfo, cx);
+    }
+
     /// `remove bookmark:` asks which bookmark goes, the page in view's
-    /// own first.
+    /// own first, unless `named` says.
     fn remove_bookmark(
         current: Option<Url>,
+        named: Option<String>,
         frame: &mut Frame,
         window: &mut Window,
         cx: &mut Context<Frame>,
@@ -218,6 +257,9 @@ impl PageSystem {
         if kept.is_empty() {
             frame.echo("no bookmarks", StyleClass::SystemInfo, cx);
             return;
+        }
+        if let Some(named) = named {
+            return Self::remove_named(&kept, &named, frame, cx);
         }
         let offered = kept.clone();
         frame.open_prompt(
@@ -236,20 +278,31 @@ impl PageSystem {
                     })
                     .collect()
             }),
-            Rc::new(move |frame, input, _, cx| {
-                let input = input.trim();
-                let Some(gone) = kept.iter().find(|kept| kept.title == input) else {
-                    frame.echo("no such bookmark", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                frame.write_marks(vec![bookmarks::remove(gone.id)], cx);
-                frame.echo(
-                    &format!("removed bookmark: {}", gone.title),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            }),
+            Rc::new(move |frame, input, _, cx| Self::remove_named(&kept, &input, frame, cx)),
             window,
+            cx,
+        );
+    }
+
+    fn remove_named(
+        kept: &[bookmarks::Bookmark],
+        name: &str,
+        frame: &mut Frame,
+        cx: &mut Context<Frame>,
+    ) {
+        let name = name.trim();
+        let Some(gone) = kept.iter().find(|kept| kept.title == name) else {
+            frame.echo(
+                &format!("remove bookmark: no bookmark called {name:?}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        frame.write_marks(vec![bookmarks::remove(gone.id)], cx);
+        frame.echo(
+            &format!("removed bookmark: {}", gone.title),
+            StyleClass::SystemInfo,
             cx,
         );
     }
@@ -279,24 +332,40 @@ impl PageSystem {
                     .collect()
             }),
             Rc::new(move |frame, input, window, cx| {
-                let input = input.trim();
-                if input.is_empty() {
-                    return;
-                }
-                let open = recent_pages()
-                    .into_iter()
-                    .find(|(page, _)| title(*page) == input);
-                if let Some((page, _)) = open {
-                    return frame.open(page.address(), window, cx);
-                }
-                match typed_url(input) {
-                    Some(url) => this.update(cx, |system, cx| system.open_url(&url, cx)),
-                    None => frame.echo("not a web address", StyleClass::SystemInfo, cx),
-                }
+                Self::open_typed(&this, &input, frame, window, cx)
             }),
             window,
             cx,
         );
+    }
+
+    /// Opens the page the browser has open by the title typed, or a new
+    /// one at the address typed.
+    fn open_typed(
+        this: &Entity<Self>,
+        typed: &str,
+        frame: &mut Frame,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        let typed = typed.trim();
+        if typed.is_empty() {
+            return;
+        }
+        let open = recent_pages()
+            .into_iter()
+            .find(|(page, _)| title(*page) == typed);
+        if let Some((page, _)) = open {
+            return frame.open(page.address(), window, cx);
+        }
+        match typed_url(typed) {
+            Some(url) => this.update(cx, |system, cx| system.open_url(&url, cx)),
+            None => frame.echo(
+                &format!("open page: {typed:?} is not a web address"),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
     }
 }
 
@@ -396,31 +465,43 @@ impl rho_frame::System for PageSystem {
         true
     }
 
-    fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    fn commands(
+        &mut self,
+        point: &Point,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         let open = cx.entity();
-        let mut rows = vec![Row::run("o", "open page…", move |frame, window, cx| {
-            Self::ask_page(open.clone(), frame, window, cx)
-        })];
         let here = PageId::from_address(&point.surface)
             .and_then(|page| Some((page, crate::native_host::page_metadata(page)?)))
-            .and_then(|(page, meta)| Some((page, bookmarks::page_url(&meta.url)?)));
-        if let Some((page, url)) = &here {
-            let (url, title) = (url.clone(), title(*page));
-            rows.push(Row::run(
-                "",
-                "bookmark this page…",
-                move |frame, window, cx| {
-                    Self::bookmark_page(url.clone(), title.clone(), frame, window, cx)
-                },
-            ));
-        }
-        let current = here.map(|(_, url)| url);
-        rows.push(Row::run(
-            "",
-            "remove bookmark…",
-            move |frame, window, cx| Self::remove_bookmark(current.clone(), frame, window, cx),
-        ));
-        rows
+            .and_then(|(page, meta)| Some((title(page), bookmarks::page_url(&meta.url)?)));
+        let current = here.as_ref().map(|(_, url)| url.clone());
+        let in_view = here
+            .as_ref()
+            .map_or_else(|| "no page in view".to_owned(), |(title, _)| title.clone());
+        vec![
+            Command::new(&OPEN_PAGE, move |frame, typed, window, cx| match typed {
+                Some(typed) => Self::open_typed(&open, &typed, frame, window, cx),
+                None => Self::ask_page(open.clone(), frame, window, cx),
+            }),
+            Command::new(&BOOKMARK_PAGE, move |frame, name, window, cx| {
+                let Some((title, url)) = here.clone() else {
+                    return frame.echo(
+                        "bookmark page: no page in view",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                };
+                match name {
+                    Some(name) => Self::save_bookmark(&url, &name, frame, cx),
+                    None => Self::bookmark_page(url, title, frame, window, cx),
+                }
+            })
+            .target(in_view),
+            Command::new(&REMOVE_BOOKMARK, move |frame, name, window, cx| {
+                Self::remove_bookmark(current.clone(), name, frame, window, cx)
+            }),
+        ]
     }
 
     fn open_link(&mut self, url: &Url, cx: &mut Context<Self>) -> bool {

@@ -28,11 +28,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub use address::{AgentAddress, Part, Scope, WorksetAddress};
+pub use commands::SPELLINGS;
 use futures::StreamExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, Window,
 };
-use rho_agent_hosts::{HostId, HostStream, Link};
+use rho_agent_hosts::{HostId, HostStream, Hosts, Link};
 use rho_agent_types::{AgentId, EndpointId, MessageId, WorksetId};
 use rho_agents_client::model::{AgentsClient, ModelEvent, ModelMsg};
 use rho_agents_client::protocol::worksets::Eval;
@@ -47,13 +48,11 @@ use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
-    Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks,
-    Opening, Point, Row, System,
+    Address, Addressed as _, AnySurface, Candidate, CardInspection, Command, Found, FrameLink,
+    Marks, Opening, Point, System,
 };
 use rho_rpc::protocol::Call;
-use rho_shell_view::protocol::ShellInfo;
 use rho_shell_view::ui::ShellSurface;
-use rho_terminal::protocol::TerminalInfo;
 use rho_terminal::ui::TerminalSurface;
 use rho_window::style::StyleClass;
 use surface::TranscriptSurface;
@@ -62,7 +61,7 @@ use work_name::WorkName;
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::render::{self, Label, Labels};
 use crate::transcript::{TranscriptFrame, Transcripts};
-use crate::usage::{Request, Usage, UsageChart, UsageMoved, UsageSurface};
+use crate::usage::{OPEN_USAGE, Request, Usage, UsageChart, UsageMoved, UsageSurface};
 
 /// Every kind the system opens: agents, and the usage charts
 /// (`SPEC-usage-addresses`).
@@ -80,9 +79,6 @@ pub struct AgentsSystem {
     /// Each host's desktops stream, and the desktops it last said it runs.
     desktops: DesktopStreams,
     sessions: HashMap<HostId, Vec<DesktopSession>>,
-    /// The terminals and shells each host last said run, asked again
-    /// whenever the user moves: no stream tells of them.
-    running: HashMap<HostId, Running>,
     quotas: Quotas,
     /// What the hosts answered for the spend charts.
     usage: Usage,
@@ -180,7 +176,6 @@ impl AgentsSystem {
             links: HashMap::new(),
             desktops,
             sessions: HashMap::new(),
-            running: HashMap::new(),
             quotas: Quotas::default(),
             usage: Usage::default(),
             mail,
@@ -281,6 +276,17 @@ impl AgentsSystem {
 
     fn agents_for(&self, agent: AgentId) -> Option<AgentsLink> {
         self.agents_on(self.registry.host_of_agent(agent)?)
+    }
+
+    /// Why the agent's host cannot take a command now, in the echo line's
+    /// words: it is attached but away, or not attached at all. `hosts` is
+    /// the frame's, which alone knows how each connection stands.
+    pub(super) fn unreachable(&self, agent: AgentId, hosts: &Hosts) -> Option<&'static str> {
+        let host = self
+            .registry
+            .host_of_agent(agent)
+            .and_then(|host| hosts.get(host));
+        steer::unreachable(host.map(|host| &host.status))
     }
 
     /// What the agent's work is called (`work_name`): the project and
@@ -887,11 +893,8 @@ impl AgentsSystem {
         let (Some(agents), Some(workset)) =
             (self.agents_for(agent), self.registry.agent_workset(agent))
         else {
-            self.frame.echo(
-                "the agent's host is not attached",
-                StyleClass::SystemInfo,
-                cx,
-            );
+            self.frame
+                .echo(steer::NOT_ATTACHED, StyleClass::SystemInfo, cx);
             return;
         };
         let reply = agents.call(Eval { workset, code });
@@ -933,11 +936,8 @@ impl AgentsSystem {
     fn attached(&self, agent: AgentId, cx: &mut App) -> bool {
         let attached = self.workset_of(agent).is_some();
         if !attached {
-            self.frame.echo(
-                "the agent's host is not attached",
-                StyleClass::SystemInfo,
-                cx,
-            );
+            self.frame
+                .echo(steer::NOT_ATTACHED, StyleClass::SystemInfo, cx);
         }
         attached
     }
@@ -1022,33 +1022,6 @@ impl AgentsSystem {
             .collect()
     }
 
-    /// Asks every attached host which terminals and shells run, for the
-    /// palette to find them.
-    fn refresh_running(&mut self, cx: &mut Context<Self>) {
-        for (&host, link) in &self.links {
-            let terminals = rho_terminal::channel::list(link, None);
-            let shells = rho_shell_view::channel::list(link);
-            cx.spawn(async move |this, cx| {
-                let (terminals, shells) = futures::join!(terminals, shells);
-                this.update(cx, |this, _| {
-                    if !this.links.contains_key(&host) {
-                        return;
-                    }
-                    let running = this.running.entry(host).or_default();
-                    // A host that could not answer keeps what it said last.
-                    if let Ok(terminals) = terminals {
-                        running.terminals = terminals;
-                    }
-                    if let Ok(shells) = shells {
-                        running.shells = shells;
-                    }
-                })
-                .ok();
-            })
-            .detach();
-        }
-    }
-
     /// Opens a terminal of the agent's workset: with `new` a fresh one
     /// under the agent; else the one that runs, asking which when several
     /// do, and starting one when none does.
@@ -1085,7 +1058,6 @@ impl AgentsSystem {
                 ) else {
                     return;
                 };
-                this.running.entry(host).or_default().terminals = running.clone();
                 let in_workset = running
                     .into_iter()
                     .filter_map(|info| {
@@ -1117,7 +1089,7 @@ impl AgentsSystem {
         .detach();
     }
 
-    /// What a tool is called in the palette and the prompts that offer
+    /// What a tool is called in `Places` and the prompts that offer
     /// it: its workset's work and the tool, `tide · Flaky clock test ·
     /// term 1`. A tool is the workset's, whichever agent started it.
     fn tool_title(&self, at: &AgentAddress, cx: &App) -> String {
@@ -1194,7 +1166,6 @@ impl AgentsSystem {
                 Ok(()) => {
                     this.frame.echo("shell closed", StyleClass::SystemInfo, cx);
                     this.frame.close(AgentAddress::shell(agent).address(), cx);
-                    this.refresh_running(cx);
                 }
                 Err(error) => this.frame.echo(
                     format!("close shell: {error:#}"),
@@ -1396,13 +1367,11 @@ impl System for AgentsSystem {
         Opening::Surface(surface)
     }
 
-    /// Every move may have left a terminal or shell running that the
-    /// palette should find: the hosts are asked again.
+    /// A chart in view asks the hosts for what it draws.
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
         if let Some(chart) = address.and_then(UsageChart::from_address) {
             self.ask(chart, cx);
         }
-        self.refresh_running(cx);
     }
 
     fn streams(
@@ -1411,12 +1380,11 @@ impl System for AgentsSystem {
         name: &str,
         _endpoint: Option<EndpointId>,
         link: &Link,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Vec<Arc<dyn HostStream>> {
         self.links.insert(host, link.clone());
         self.registry.attach_host(host, name.to_owned());
         self.client.attach_host(host, name.to_owned());
-        self.refresh_running(cx);
         vec![self.client.stream(host), self.desktops.stream(host)]
     }
 
@@ -1424,7 +1392,6 @@ impl System for AgentsSystem {
         self.client.detach_host(host);
         self.links.remove(&host);
         self.sessions.remove(&host);
-        self.running.remove(&host);
         self.quotas.forget(host);
         self.usage.forget(host);
         cx.emit(UsageMoved::Host);
@@ -1433,24 +1400,46 @@ impl System for AgentsSystem {
     }
 
     /// The commands about agents are on every screen once any host has
-    /// agents to act on; the screen says only which they act on. Switching
-    /// the Claude account is on every screen always: with no host attached
-    /// it says so.
-    fn rows(&mut self, point: &Point, _window: &mut Window, cx: &mut Context<Self>) -> Vec<Row> {
+    /// agents to act on; the screen says only which they act on.
+    /// Switching the Claude account and opening the usage charts are on
+    /// every screen always: with no host attached the first says so.
+    fn commands(
+        &mut self,
+        point: &Point,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Command> {
         let this = cx.entity();
         let reported = this.downgrade();
-        let account = accounts::row(Rc::new(move |host, cx| {
-            reported
-                .upgrade()
-                .map(|system| system.read(cx).quotas.summaries(host).to_vec())
-                .unwrap_or_default()
-        }));
-        if self.registry.hosts().next().is_none() {
-            return vec![account];
-        }
-        let mut rows = commands::rows(this, self.here(point, cx));
-        rows.push(account);
-        rows
+        let hosts: Vec<String> = self
+            .registry
+            .hosts()
+            .map(|(_, name)| name.to_owned())
+            .collect();
+        let on = match hosts.as_slice() {
+            [] => "no host attached".to_owned(),
+            [host] => host.clone(),
+            _ => "pick host…".to_owned(),
+        };
+        let account = accounts::command(
+            Rc::new(move |host, cx| {
+                reported
+                    .upgrade()
+                    .map(|system| system.read(cx).quotas.summaries(host).to_vec())
+                    .unwrap_or_default()
+            }),
+            on,
+        );
+        let usage = Command::simple(&OPEN_USAGE, |frame, window, cx| {
+            frame.open(UsageChart::FIRST.address(), window, cx)
+        })
+        .target(UsageChart::FIRST.title());
+        let mut commands = match hosts.is_empty() {
+            true => Vec::new(),
+            false => self.agent_commands(this, self.here(point, cx), cx),
+        };
+        commands.extend([account, usage]);
+        commands
     }
 
     fn name(
@@ -1480,113 +1469,26 @@ impl System for AgentsSystem {
         Some(self.label(agent, cx).0)
     }
 
-    /// Every workset's transcript, by its lead, and every terminal, shell
-    /// and desktop that runs, by its agent: a running tool is a place.
-    fn find(&self, _marks: &Marks, cx: &App) -> Vec<Found> {
-        let mut worksets: HashMap<WorksetId, Vec<AgentId>> = HashMap::new();
-        for agent in self.registry.known_agents().copied() {
-            if let Some(workset) = self.registry.agent_workset(agent) {
-                worksets.entry(workset).or_default().push(agent);
-            }
-        }
-        let transcripts = worksets.into_iter().filter_map(|(workset, agents)| {
-            let (lead, _) = self.scope_agents(Scope::Workset(workset))?;
-            let (title, host) = self.work_label(lead, cx);
-            let mut description = vec![host];
-            description.extend(
-                self.registry
-                    .agent_facts(lead)
-                    .runtime
-                    .map(|heard| heard.state.activity().word().to_owned()),
-            );
-            if agents.len() > 1 {
-                description.push(format!("{} agents", agents.len()));
-            }
-            Some(Found {
-                address: Scope::Workset(workset).address(),
-                title,
-                description: description.join(" · "),
-                thread: None,
-                recency: agents
-                    .iter()
-                    .filter_map(|agent| self.registry.agent_last_active(*agent))
-                    .map(|at| at.0)
-                    .max()
-                    .unwrap_or(0),
-                also: Vec::new(),
-            })
-        });
-        let attached = |host: &HostId| self.links.contains_key(host);
-        let terminals = self
-            .running
-            .iter()
-            .filter(|(host, _)| attached(host))
-            .flat_map(|(host, running)| {
-                running.terminals.iter().filter_map(move |info| {
-                    let owner = self.tool_owner(*host, &info.agent)?;
-                    Some((
-                        AgentAddress::terminal(owner, info.terminal_id),
-                        info.title.clone(),
-                    ))
-                })
-            });
-        let shells = self
-            .running
-            .iter()
-            .filter(|(host, _)| attached(host))
-            .flat_map(|(host, running)| {
-                running.shells.iter().filter_map(move |info| {
-                    Some((
-                        AgentAddress::shell(self.tool_owner(*host, &info.agent)?),
-                        String::new(),
-                    ))
-                })
-            });
-        let desktops = self
-            .sessions
-            .iter()
-            .filter(|(host, _)| attached(host))
-            .flat_map(|(host, sessions)| {
-                sessions.iter().filter_map(move |session| {
-                    let owner = self.tool_owner(*host, &session.agent)?;
-                    Some((
-                        AgentAddress::desktop(owner, session.name.clone())?,
-                        String::new(),
-                    ))
-                })
-            });
-        let tools = terminals.chain(shells).chain(desktops).map(|(at, shows)| {
-            let host = self.host_label(at.agent);
-            let mut title = self.tool_title(&at, cx);
-            if !shows.is_empty() {
-                title = format!("{title} · {shows}");
-            }
-            Found {
-                address: at.address(),
-                title,
-                description: host,
-                thread: None,
-                recency: 0,
-                also: Vec::new(),
-            }
-        });
-        transcripts
-            .chain(tools)
-            .chain(UsageChart::all().map(|chart| Found {
+    /// The usage charts, each found by `usage` too. Transcripts and the
+    /// tools under them are places once visited ([`rho_frame::Frame`]
+    /// remembers them), so an unvisited one is not listed.
+    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+        UsageChart::all()
+            .map(|chart| Found {
                 address: chart.address(),
-                title: format!("usage › {}", chart.title()),
+                title: chart.title(),
                 description: String::new(),
                 thread: None,
                 recency: 0,
-                also: Vec::new(),
-            }))
+                also: vec!["usage".to_owned()],
+            })
             .collect()
     }
 }
 
-/// The terminals and shells a host said run.
-#[derive(Default)]
-struct Running {
-    terminals: Vec<TerminalInfo>,
-    shells: Vec<ShellInfo>,
+/// Whom a transcript screen is named after: its workset's lead, and the
+/// agent whose folder and runtime it shows.
+pub(super) struct ScopeName {
+    pub workset: AgentId,
+    pub shown: AgentId,
 }

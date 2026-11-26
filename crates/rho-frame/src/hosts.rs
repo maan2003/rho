@@ -14,8 +14,151 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 use rho_agent_hosts::{HostId, HostSpec};
 use rho_window::style::StyleClass;
 
+use crate::command::{Command, Spelling};
 use crate::frame::Frame;
 use crate::minibuffer::Candidate;
+
+pub(crate) static ATTACH_HOST: Spelling = Spelling {
+    name: "attach host",
+    aliases: &[
+        ("attach", 9),
+        ("connect host", 8),
+        ("add host", 8),
+        ("connect", 6),
+        ("ssh", 4),
+    ],
+    argument: Some("name=local, name=iroh:<id>@<ssh host> or name=iroh:<id>"),
+};
+
+pub(crate) static DETACH_HOST: Spelling = Spelling {
+    name: "detach host",
+    aliases: &[
+        ("detach", 9),
+        ("disconnect host", 8),
+        ("remove host", 8),
+        ("disconnect", 6),
+        ("forget host", 5),
+    ],
+    argument: Some("host"),
+};
+
+pub(crate) static LIST_HOSTS: Spelling = Spelling {
+    name: "list hosts",
+    aliases: &[
+        ("hosts", 9),
+        ("machines", 6),
+        ("reconnect", 6),
+        ("enroll", 5),
+        ("status", 3),
+    ],
+    argument: None,
+};
+
+/// What attaching a host asks, and what its answer reads as.
+const ATTACH_QUESTION: &str = "attach host · name=local (this machine), \
+     name=iroh:<id>@<ssh host> (ssh), or name=iroh:<id> (security key):";
+
+/// The commands about the hosts this window is attached to.
+pub(crate) fn commands(frame: &Frame) -> Vec<Command> {
+    let hosts = frame.hosts();
+    let detach_target = match hosts.iter().collect::<Vec<_>>().as_slice() {
+        [] => "no host attached".to_owned(),
+        [host] => host.name.clone(),
+        _ => "pick host…".to_owned(),
+    };
+    let listed = match hosts.worst_status() {
+        None => "no host attached".to_owned(),
+        Some((name, status)) if hosts.len() == 1 => format!("{name} · {}", status.label()),
+        Some(_) => format!("{} attached", hosts.len()),
+    };
+    vec![
+        Command::new(&ATTACH_HOST, |frame, argument, window, cx| match argument {
+            Some(spec) => attach(frame, &spec, cx),
+            None => frame.open_prompt(
+                ATTACH_QUESTION,
+                Rc::new(|_, _, _| Vec::new()),
+                Rc::new(|frame, input, _, cx| attach(frame, &input, cx)),
+                window,
+                cx,
+            ),
+        }),
+        Command::new(&DETACH_HOST, |frame, argument, window, cx| match argument {
+            Some(name) => detach(frame, &name, cx),
+            None => frame.open_prompt(
+                "detach host:",
+                Rc::new(|frame, needle, _| host_candidates(frame, needle)),
+                Rc::new(|frame, input, _, cx| detach(frame, &input, cx)),
+                window,
+                cx,
+            ),
+        })
+        .target(detach_target),
+        Command::simple(&LIST_HOSTS, |frame, window, cx| {
+            if frame.hosts().len() == 0 {
+                return frame.echo(
+                    "list hosts: no agent host is attached",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+            frame.open_prompt(
+                "hosts · enter dials, enrolls or says how it is:",
+                Rc::new(|frame, needle, _| host_candidates(frame, needle)),
+                Rc::new(|frame, input, _, cx| {
+                    let name = input.trim();
+                    match frame.hosts().by_name(name).map(|host| host.id) {
+                        Some(host) => frame.pick_host(host, cx),
+                        None => frame.echo(
+                            &format!("list hosts: no host called {name}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        ),
+                    }
+                }),
+                window,
+                cx,
+            );
+        })
+        .target(listed),
+    ]
+}
+
+fn attach(frame: &mut Frame, spec: &str, cx: &mut Context<Frame>) {
+    match HostSpec::parse(spec.trim(), "rho") {
+        Ok(spec) => {
+            frame.attach_host(spec, cx);
+        }
+        Err(error) => frame.echo(&format!("attach host: {error}"), StyleClass::SystemInfo, cx),
+    }
+}
+
+fn detach(frame: &mut Frame, name: &str, cx: &mut Context<Frame>) {
+    let name = name.trim();
+    match frame.hosts().by_name(name).map(|host| host.id) {
+        Some(host) => {
+            frame.detach_host(host, cx);
+            frame.echo(&format!("detached: {name}"), StyleClass::SystemInfo, cx);
+        }
+        None => frame.echo(
+            &format!("detach host: no host called {name}"),
+            StyleClass::SystemInfo,
+            cx,
+        ),
+    }
+}
+
+/// The attached hosts whose names hold `needle`, each with how it is.
+fn host_candidates(frame: &Frame, needle: &str) -> Vec<Candidate> {
+    frame
+        .hosts()
+        .iter()
+        .filter(|host| host.name.contains(needle.trim()))
+        .map(|host| Candidate {
+            value: host.name.clone(),
+            description: host.status.label(),
+        })
+        .collect()
+}
 
 impl Frame {
     /// Attaches an agent host: every system gets its streams before any
@@ -167,8 +310,7 @@ impl Frame {
 
     /// Runs `then` on the host a command means: the only one attached, or
     /// the one the user names at `host:`. With none attached the echo line
-    /// says so, under `command`'s name
-    /// (`window.commands are global in the palette`).
+    /// says so, under `command`'s name (`window.commands are global`).
     pub fn choose_host(
         &mut self,
         command: &'static str,
@@ -193,17 +335,7 @@ impl Frame {
         }
         self.open_prompt(
             "host:",
-            Rc::new(|frame, needle, _| {
-                frame
-                    .hosts
-                    .iter()
-                    .filter(|host| host.name.contains(needle.trim()))
-                    .map(|host| Candidate {
-                        value: host.name.clone(),
-                        description: host.status.label(),
-                    })
-                    .collect()
-            }),
+            Rc::new(|frame, needle, _| host_candidates(frame, needle)),
             Rc::new(move |frame, input, window, cx| {
                 let name = input.trim();
                 match frame.hosts.by_name(name).map(|host| host.id) {
@@ -261,7 +393,7 @@ impl Frame {
         .detach();
     }
 
-    /// What picking a host in the palette does: a host that does not
+    /// What choosing a host in `list hosts` does: a host that does not
     /// trust this device puts its enrollment command on the clipboard, to
     /// run on the host; one that is away dials again now; one that answers
     /// says so.

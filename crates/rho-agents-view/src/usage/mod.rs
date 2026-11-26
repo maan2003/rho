@@ -3,10 +3,10 @@
 //! Eight charts, each its own `usage:` address (`SPEC-usage-addresses`):
 //! four pictures over the two windows worth looking at. The chart screen
 //! switches window and picture in place ([`UsageSurface`]): the frame puts
-//! the other chart where this one stood in history
-//! ([`rho_frame::Frame::replace_current`]), so switching piles nothing up
-//! to walk back through, and what is restored after a restart is the
-//! chart in view. The agents system
+//! the other chart where this one stood among the recent places
+//! ([`rho_frame::Frame::replace`]), so switching adds no place to `tab`
+//! back through, and what is restored after a restart is the chart in
+//! view. The agents system
 //! asks every attached host for the series a chart needs when it opens,
 //! keeps each host's answer apart in [`Usage`], and merges them on the way
 //! out; a [`UsageSurface`] observes the system and paints the merge.
@@ -23,8 +23,23 @@ use std::collections::{BTreeMap, HashMap};
 
 use rho_agents_client::HostId;
 use rho_agents_client::protocol::{AgentCostSeries, AgentUsageSeries};
-use rho_frame::Addressed;
+use rho_frame::{Addressed, Spelling};
 pub use surface::UsageSurface;
+
+/// `open usage`: the first chart.
+pub static OPEN_USAGE: Spelling = Spelling {
+    name: "open usage",
+    aliases: &[
+        ("usage", 9),
+        ("rate limit", 8),
+        ("quota", 8),
+        ("allowance", 7),
+        ("spend", 6),
+        ("cost", 6),
+        ("chart", 5),
+    ],
+    argument: None,
+};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -135,7 +150,13 @@ impl Addressed for UsageChart {
 }
 
 impl UsageChart {
-    /// Every chart, in Palette order.
+    /// What `open usage` opens, and what `usage` finds first in `Places`.
+    pub const FIRST: Self = Self {
+        chart: Chart::RateLimit,
+        days: Days::Seven,
+    };
+
+    /// Every chart, in the order `Places` lists them.
     pub fn all() -> impl Iterator<Item = Self> {
         Chart::ALL.into_iter().flat_map(|chart| {
             [Days::Seven, Days::Thirty]

@@ -389,18 +389,6 @@ impl Frame {
         }
     }
 
-    /// On Desk, Space deals immediately if there is a card. If the deal
-    /// is empty, it still gives the last verdict a route to Undo.
-    pub(crate) fn desk_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.deal_next(self.card_in_view(cx), window, cx) {
-            if self.attention.can_undo() {
-                self.verdict_menu(window, cx);
-            } else {
-                self.echo(&self.nothing_waits(), StyleClass::SystemInfo, cx);
-            }
-        }
-    }
-
     /// Whether a card opened. An explicit pull passes over its open card,
     /// which it has already skipped; a verdict already put that card away
     /// and passes over nothing else. Empty lands on Desk, since there is

@@ -9,7 +9,7 @@ use futures::channel::mpsc as futures_mpsc;
 use rho_rpc::protocol::{Call, Opened, read_frame, write_frame, write_open};
 
 use crate::protocol::{
-    Open, ShellClientFrame, ShellClose, ShellInfo, ShellList, ShellServerFrame, ShellStart,
+    Open, ShellClientFrame, ShellClose, ShellList, ShellServerFrame, ShellStart,
 };
 
 /// Starts the agent's shell on the host `link` reaches when none runs,
@@ -27,13 +27,6 @@ pub fn close(
     agent: String,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(|dialer| async move { call(&dialer, ShellClose { agent }).await })
-}
-
-/// The running shells on the host `link` reaches.
-pub fn list(
-    link: &rho_agent_hosts::Link,
-) -> impl Future<Output = anyhow::Result<Vec<ShellInfo>>> + Send + 'static {
-    link.run(|dialer| async move { call(&dialer, ShellList { agent: None }).await })
 }
 
 /// One call on a stream of its own. A refusal is an error.

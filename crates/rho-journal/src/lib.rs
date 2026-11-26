@@ -307,40 +307,6 @@ pub enum SurfaceShowMethod {
     senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum HistoryDirection {
-    Back,
-    Forward,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryRemoveMethod {
-    Close,
-    Dedupe,
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    senax_encoder::Encode,
-    senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
 pub enum SignalState {
     On,
     Off,
@@ -397,14 +363,9 @@ pub enum Event {
         surface: SurfaceIdentity,
         method: SurfaceShowMethod,
     },
-    HistoryStepped {
-        direction: HistoryDirection,
-        position: usize,
-        len: usize,
-    },
-    HistoryRemoved {
-        identity: SurfaceIdentity,
-        method: HistoryRemoveMethod,
+    /// The user closed a screen: it leaves the recent places.
+    SurfaceClosed {
+        surface: SurfaceIdentity,
     },
     MinibufferOpened {
         prompt: String,
@@ -511,8 +472,7 @@ impl Event {
             Self::LampTransition { .. } => "lamp_transition",
             Self::ChimeRing { .. } => "chime_ring",
             Self::SurfaceShown { .. } => "surface_shown",
-            Self::HistoryStepped { .. } => "history_stepped",
-            Self::HistoryRemoved { .. } => "history_removed",
+            Self::SurfaceClosed { .. } => "surface_closed",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",
@@ -998,20 +958,16 @@ mod tests {
     }
 
     #[test]
-    fn history_events_round_trip_direction_position_and_methods() {
+    fn navigation_events_round_trip() {
         let surface = SurfaceIdentity::Transcript {
             agent_id: AgentIdentity("agent-a".into()),
         };
         for event in [
-            Event::HistoryStepped {
-                direction: HistoryDirection::Back,
-                position: 3,
-                len: 7,
+            Event::SurfaceShown {
+                surface: surface.clone(),
+                method: SurfaceShowMethod::Mru,
             },
-            Event::HistoryRemoved {
-                identity: surface,
-                method: HistoryRemoveMethod::Dedupe,
-            },
+            Event::SurfaceClosed { surface },
         ] {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);

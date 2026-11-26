@@ -228,11 +228,11 @@ fn a_cleared_reply_disappears_and_restores_at_the_same_identity() {
     assert_eq!(world.marks.replies_to(&about)[0].0, &note.address());
 }
 
-/// The palette lists every note that has text, by its first line, a
+/// `Places` lists every note that has text, by its first line, a
 /// private reply as one, with a later revision newer; a deleted note is
 /// not there.
 #[test]
-fn the_palette_finds_every_note_by_its_first_line() {
+fn places_find_every_note_by_its_first_line() {
     let mut world = World::default();
     let older = world.note("older\nand more");
     let reply = world.note("a reply");
