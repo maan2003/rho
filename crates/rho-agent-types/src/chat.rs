@@ -186,26 +186,6 @@ impl ThreadWork {
     }
 }
 
-/// Designated evidence in an outcome message.
-pub fn proof_section(text: &str) -> Option<std::ops::Range<usize>> {
-    let mut start = None;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim();
-        let level = trimmed.chars().take_while(|c| *c == '#').count();
-        let heading = (1..=2).contains(&level) && trimmed[level..].starts_with(' ');
-        match start {
-            None if heading && level == 2 && trimmed[2..].trim().eq_ignore_ascii_case("proof") => {
-                start = Some(offset);
-            }
-            Some(start) if heading => return Some(start..offset),
-            _ => {}
-        }
-        offset += line.len();
-    }
-    start.map(|start| start..text.len())
-}
-
 /// One entry of a host's chat log.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ChatRecord {
@@ -522,16 +502,6 @@ mod tests {
         });
         assert!(!message.pings_user());
         assert_eq!(message.text(), "carried on");
-    }
-
-    #[test]
-    fn proof_starts_at_its_heading_and_ends_before_the_next_section() {
-        let text =
-            "Proof in the prose\n## Proof\nTests passed\n### Output\nok\n## Next\nWhat to do";
-        assert_eq!(
-            &text[proof_section(text).unwrap()],
-            "## Proof\nTests passed\n### Output\nok\n"
-        );
     }
 
     #[test]

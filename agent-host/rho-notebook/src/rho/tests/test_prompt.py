@@ -42,13 +42,13 @@ class Templates(unittest.TestCase):
                 "edit it with new findings",
                 "read the thread with `chat.read`",
                 "Say what you answer in the first line",
-                "under `## proof`",
+                "Back a result with the evidence that fits the work",
                 "last output lines verbatim in a code block",
                 "a screenshot if the change is visible",
                 "Another agent is reached with `agents.message`, never through chat.",
             ]:
                 self.assertIn(rule, acting, family)
-            for obsolete in ["mail.", "human.", "message_agent", "chat.direct", "ping=", "replace_last", "reply_to", "## recap"]:
+            for obsolete in ["mail.", "human.", "message_agent", "chat.direct", "ping=", "replace_last", "reply_to", "## recap", "## proof"]:
                 self.assertNotIn(obsolete, text, family)
             communication = text.split("# Communication", 1)[1] if family == CLAUDE else text.split("## Working with the user", 1)[1]
             self.assertIn("A result message must be fully self-contained", communication, family)

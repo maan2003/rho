@@ -104,7 +104,6 @@ enum Key {
 enum Class {
     Crumb,
     User,
-    Proof,
     Time,
     Fold,
     Pending,
@@ -118,7 +117,7 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 10;
+    const COUNT: usize = 9;
 
     fn slot(self) -> usize {
         match self {
@@ -131,7 +130,6 @@ impl Class {
             Self::Name => 6,
             Self::Private => 7,
             Self::Link => 8,
-            Self::Proof => 9,
         }
     }
 }
@@ -143,19 +141,16 @@ impl rho_transcript::Style for Class {
 
     fn highlight_style(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
-        let (color, weight) = match self {
-            Self::Crumb | Self::Time | Self::Pending => (colors.text_muted, None),
-            Self::User => (colors.text_accent, None),
-            Self::Fold => (cx.theme().status().info, None),
-            Self::Quote => (colors.text_muted, None),
-            Self::Name => (colors.text, None),
-            Self::Proof => (colors.text, Some(gpui::FontWeight::BOLD)),
-            Self::Private => (colors.text_muted, None),
-            Self::Link => (colors.text_accent, None),
+        let color = match self {
+            Self::Crumb | Self::Time | Self::Pending | Self::Quote | Self::Private => {
+                colors.text_muted
+            }
+            Self::User | Self::Link => colors.text_accent,
+            Self::Fold => cx.theme().status().info,
+            Self::Name => colors.text,
         };
         HighlightStyle {
             color: Some(color.into()),
-            font_weight: weight,
             font_style: matches!(self, Self::Private).then_some(gpui::FontStyle::Italic),
             underline: matches!(self, Self::Link).then(|| gpui::UnderlineStyle {
                 thickness: gpui::px(1.),
@@ -1550,11 +1545,6 @@ fn message_item(
         edited.to_owned()
     };
     let body = body(&message.content);
-    let proof_heading = message
-        .pings_user()
-        .then(|| rho_agent_types::proof_section(&body))
-        .flatten()
-        .map(|range| range.start);
     let mut text = String::new();
     let mut styles = Vec::new();
     let mut lines = Vec::new();
@@ -1574,17 +1564,14 @@ fn message_item(
     } else {
         Class::Name
     };
-    let mut offset = 0;
     let mut body_lines = body.lines().enumerate().peekable();
     let mut first_body = true;
     while let Some((first_line, line)) = body_lines.next() {
-        let starts_proof = proof_heading == Some(offset);
-        offset += line.len() + 1;
         if !lines.is_empty() {
             text.push('\n');
         }
         let start = text.len();
-        text.push_str(if starts_proof { "Proof" } else { line });
+        text.push_str(line);
         if line.starts_with("> ") {
             let quote = QuoteId {
                 mail: message.id,
@@ -1598,7 +1585,6 @@ fn message_item(
                 .is_some_and(|(_, line)| line.starts_with("> "))
             {
                 let (source_line, quoted) = body_lines.next().expect("peeked a quote line");
-                offset += quoted.len() + 1;
                 more = true;
                 if expanded {
                     text.push('\n');
@@ -1611,10 +1597,7 @@ fn message_item(
             }
             styles.push((Class::Quote, start..text.len()));
         } else {
-            styles.push((
-                if starts_proof { Class::Proof } else { voice },
-                start..text.len(),
-            ));
+            styles.push((voice, start..text.len()));
             lines.push(Meta::Mail(message.id, Some(first_line)));
         }
         if first_body {
@@ -2762,30 +2745,39 @@ mod tests {
         assert!(message_item(&deleted, None, &HashSet::new(), Timestamp::UNIX_EPOCH).is_none());
     }
 
+    /// A result may use any headings, `## proof` among them; none is a
+    /// designated section, so each line reads as written in the project's
+    /// voice and still maps to its own source line.
     #[test]
-    fn an_old_markdown_summary_is_ordinary_text_and_proof_is_still_designated() {
+    fn markdown_headings_in_a_result_are_ordinary_text() {
         let writer = AgentId::from_counter(11, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let body = "## recap\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.";
         let mut result = mail(
             Party::Agent(writer),
             Revision::Edited {
                 seq: ChatSeq(2),
                 at: UnixMs(2),
             },
-            "## recap\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.",
+            body,
         );
         // A message in a thread: words at a root never ping.
         result.parent = Some(MessageId(ChatSeq(2)));
+        assert!(result.pings_user());
         let item = message_item(&result, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
         assert_eq!(
             item.text,
-            "## recap · edited\nEarlier plan.\n\n## Result\nDone.\n\nProof\n42 tests passed.\n"
+            "## recap · edited\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.\n"
         );
+        let proof = item.text.find("## proof").unwrap();
         assert!(
-            item.styles.iter().any(
-                |(class, bytes)| *class == Class::Proof && &item.text[bytes.clone()] == "Proof"
-            )
+            item.styles
+                .iter()
+                .any(|(class, bytes)| *class == Class::Name && bytes.contains(&proof)),
+            "{:?}",
+            item.styles
         );
-        assert_eq!(item.lines[1].source_line(), Some(1));
+        let sources: Vec<_> = item.lines.iter().map(Meta::source_line).collect();
+        assert_eq!(sources, (0..8).map(Some).collect::<Vec<_>>());
     }
 
     #[test]
