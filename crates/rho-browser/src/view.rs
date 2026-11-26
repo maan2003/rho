@@ -1147,7 +1147,12 @@ pub struct BrowserView {
     origin: Rc<Cell<(f32, f32)>>,
     last_pointer_position: (f64, f64),
     pressed_keys: HashSet<u32>,
+    /// A key pressed while the page takes keys, held from the page until
+    /// gpui has matched it ([`Self::physical_key`]).
     pending_key: Option<(u32, Option<u64>)>,
+    /// Whether the page takes the keyboard. Off, the window has every key
+    /// and the page none; a click on the page turns it back on.
+    takes_keys: bool,
     pressed_buttons: HashSet<u32>,
     queued_input: Option<QueuedInput>,
     claiming_pointer_focus: bool,
@@ -1203,6 +1208,7 @@ impl BrowserView {
             last_pointer_position: (0.0, 0.0),
             pressed_keys: HashSet::new(),
             pending_key: None,
+            takes_keys: true,
             pressed_buttons: HashSet::new(),
             queued_input: None,
             claiming_pointer_focus: false,
@@ -1232,6 +1238,35 @@ impl BrowserView {
 
     pub fn page_id(&self) -> PageId {
         self.page_id
+    }
+
+    pub fn takes_keys(&self) -> bool {
+        self.takes_keys
+    }
+
+    /// Gives the page the keyboard, or takes it away: every key the page
+    /// holds down is let go.
+    pub fn set_takes_keys(&mut self, takes_keys: bool, cx: &mut Context<Self>) {
+        if self.takes_keys == takes_keys {
+            return;
+        }
+        if !takes_keys {
+            self.release_keys(cx);
+        }
+        self.takes_keys = takes_keys;
+        cx.notify();
+    }
+
+    /// A press and release of escape for the page, which the window keeps
+    /// the escape key itself from.
+    pub fn send_escape(&mut self, cx: &mut Context<Self>) {
+        const KEY_ESC: u32 = 1;
+        if self.model.read(cx).presents(self.owner_id, self.page_id) {
+            let model = self.model.read(cx);
+            if model.key(KEY_ESC, true) {
+                model.key(KEY_ESC, false);
+            }
+        }
     }
 
     fn local_position(&self, position: gpui::Point<gpui::Pixels>) -> (f64, f64) {
@@ -1321,6 +1356,8 @@ impl BrowserView {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A click on the page gives it the keyboard again.
+        self.set_takes_keys(true, cx);
         let (x, y) = self.local_position(event.position);
         self.last_pointer_position = (x, y);
         let button = linux_button(event.button);
@@ -1475,8 +1512,12 @@ impl BrowserView {
             } else {
                 None
             };
+            // The key before never reached `key_down`: gpui either holds it
+            // as the start of a longer binding, so it is the page's, or a
+            // binding of the window's took it.
             if let Some(previous) = self.pending_key.replace((keycode, generation))
                 && previous.0 != keycode
+                && window.has_pending_keystrokes()
             {
                 self.forward_key_press(previous.0, previous.1, cx);
             }
@@ -1506,9 +1547,14 @@ impl BrowserView {
 
         if self.pending_key.is_some_and(|pending| pending.0 == keycode) {
             let (_, generation) = self.pending_key.take().unwrap();
-            self.forward_key_press(keycode, generation, cx);
-            if !self.queue_key_release(keycode) && self.pressed_keys.remove(&keycode) {
-                self.model.read(cx).key(keycode, false);
+            // Released without reaching `key_down`: a window binding took
+            // it, so the page never hears it, unless gpui still holds it as
+            // the start of a longer binding.
+            if window.has_pending_keystrokes() {
+                self.forward_key_press(keycode, generation, cx);
+                if !self.queue_key_release(keycode) && self.pressed_keys.remove(&keycode) {
+                    self.model.read(cx).key(keycode, false);
+                }
             }
         } else if self.queue_key_release(keycode) {
             // The matching press will be replayed after the handoff.
@@ -1597,10 +1643,9 @@ impl BrowserView {
         }
     }
 
-    fn release_input(&mut self, cx: &mut Context<Self>) {
-        self.queued_input = None;
+    /// Lets go of every key the page holds down from this view.
+    fn release_keys(&mut self, cx: &mut Context<Self>) {
         self.pending_key = None;
-        self.claiming_pointer_focus = false;
         let model = self.model.read(cx);
         let presents = model.presents(self.owner_id, self.page_id);
         for keycode in self.pressed_keys.drain() {
@@ -1608,6 +1653,14 @@ impl BrowserView {
                 model.key(keycode, false);
             }
         }
+    }
+
+    fn release_input(&mut self, cx: &mut Context<Self>) {
+        self.queued_input = None;
+        self.claiming_pointer_focus = false;
+        self.release_keys(cx);
+        let model = self.model.read(cx);
+        let presents = model.presents(self.owner_id, self.page_id);
         for button in self.pressed_buttons.drain() {
             if presents {
                 model.pointer_button(button, false);
@@ -2155,7 +2208,7 @@ impl Render for BrowserView {
         )
         .size_full();
 
-        div()
+        let page = div()
             .id("rho-browser")
             .track_focus(&self.focus_handle)
             .on_hover(cx.listener(Self::hover_changed))
@@ -2174,11 +2227,17 @@ impl Render for BrowserView {
             // record one surface-level scroll burst. Native pointer-axis
             // forwarding above remains the page's actual scroll path.
             .on_scroll_wheel(|_, _, _| {})
-            .on_pinch(|_, _, cx| cx.stop_propagation())
-            .on_physical_key(cx.listener(Self::physical_key))
-            .on_key_down(cx.listener(Self::key_down))
-            .on_key_up(|_, _, cx| cx.stop_propagation())
-            .size_full()
+            .on_pinch(|_, _, cx| cx.stop_propagation());
+        // Keys reach the page only while it takes them; otherwise they are
+        // the window's.
+        let page = if self.takes_keys {
+            page.on_physical_key(cx.listener(Self::physical_key))
+                .on_key_down(cx.listener(Self::key_down))
+                .on_key_up(|_, _, cx| cx.stop_propagation())
+        } else {
+            page
+        };
+        page.size_full()
             .relative()
             .overflow_hidden()
             .bg(colors.editor_background)

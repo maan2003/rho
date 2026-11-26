@@ -71,7 +71,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 5. `Idea` (`Write an idea`) is a half-baked overlay that breaks Helix editing, leaks keys to the hidden screen, and makes `to:`/`on:` pickers unreachable on phone
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (desktop and core, 2026-11-26, Loop 2 branch `loop2/c4-dual-escape-idea`: `Idea` is a frame screen in `History` with true modes; the phone `to:`/`on:` taps and phone-bar `Undo` stay on-hold with phone)
 - **Where:** `chat.Write an idea` (steps 1–3) / `design.Draft` / `window.Phone bar`
 - **Evidence:**
   - Product model: `index.md:13, 28` (*"An idea must become an agent at work in one short step, from either device"*); `index.md` Value 6 (*"An editor, not an app"*) and Value 9 (*"The phone is a full device"*); `chat.md:221-225`; `design.md:160` (*"writing an idea: cancel, undo, and send"*).
@@ -86,7 +86,7 @@ The core spine has a strong, coherent bet — one editor window, a single attent
 ### 6. One queued idea locks out writing any second idea while offline or waiting on a host
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/c4-dual-escape-idea`: the draft clears when the idea queues; a refused idea stays in `Outbox` as `not sent`)
 - **Where:** `chat.Write an idea` / `chat.Message` (offline queueing, `chat.md:83`)
 - **Evidence:**
   - Product model: `index.md:13` (*"Ideas come to them anywhere, at the laptop or on the go. An idea must become an agent at work in one short step, from either device"*); `chat.md:83` (*"A message written while the host is away waits on the device and goes out when the host is back. A submitted idea says `queued for` its project and can be found by name in `window.Palette` until the host's thread takes its place"*).

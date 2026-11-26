@@ -439,7 +439,7 @@ impl Surface for NotesView {
         Some(self.editor.clone())
     }
 
-    fn mode(&self, _cx: &App) -> Option<Mode> {
+    fn mode(&self, _window: &Window, _cx: &App) -> Option<Mode> {
         self.finding.then_some(Mode::Insert)
     }
 

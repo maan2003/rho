@@ -10,9 +10,6 @@ use theme::ActiveTheme as _;
 
 use crate::surface::{Subject, Surface};
 
-/// The key context a waiting screen is drawn in.
-pub(crate) const KEY_CONTEXT: &str = "RhoWaiting";
-
 pub(crate) struct Waiting {
     /// The hosts it waits for, by name: `rho`, or `rho, lab`.
     hosts: String,
@@ -49,7 +46,7 @@ impl Render for Waiting {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         div()
-            .key_context(KEY_CONTEXT)
+            .key_context(crate::keys::PLACE)
             .track_focus(&self.focus)
             .size_full()
             .p_2()

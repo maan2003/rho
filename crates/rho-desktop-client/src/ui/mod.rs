@@ -8,10 +8,9 @@
 mod view;
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Task, Window, div};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, Task, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::keys::{Close, Palette, VerdictMenu};
-use rho_frame::{CardHere, Row, Surface};
+use rho_frame::{CardHere, Mode, Row, Surface};
 use theme::ActiveTheme as _;
 pub use view::DesktopView;
 
@@ -88,6 +87,22 @@ impl Surface for DesktopSurface {
         CardHere::Inspected
     }
 
+    /// `INS` only while the app takes the keys: never while it connects,
+    /// once escaped, or while drawing.
+    fn mode(&self, _window: &Window, cx: &App) -> Option<Mode> {
+        Some(match &self.state {
+            State::Open(view) if view.read(cx).live() => Mode::Insert,
+            State::Open(_) | State::Dialing { .. } | State::Failed(_) => Mode::Normal,
+        })
+    }
+
+    /// An explicit open is to use the app.
+    fn opened(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let State::Open(view) = &self.state {
+            view.update(cx, |view, cx| view.go_live(cx));
+        }
+    }
+
     fn rows(
         &mut self,
         _: Option<rho_frame::surface::Seen>,
@@ -127,8 +142,9 @@ impl Render for DesktopSurface {
             }
             State::Failed(error) => format!("desktop {} of {}: {error}", self.name, self.agent),
         };
+        // Connecting is no buffer: the window's keys, so `q` closes it.
         div()
-            .key_context("RhoDesktopNote")
+            .key_context(rho_frame::keys::PLACE)
             .track_focus(&self.focus)
             .size_full()
             .p_2()
@@ -136,16 +152,4 @@ impl Render for DesktopSurface {
             .text_color(colors.text_muted)
             .child(note)
     }
-}
-
-/// The desktop's keys, bound once by whoever shows desktops.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        // Every key on a live desktop goes to it; the palette is on the
-        // frame's own chord, `ctrl-shift-;`, which no application sees.
-        KeyBinding::new(":", Palette, Some("RhoDesktopNote")),
-        KeyBinding::new("space", VerdictMenu, Some("RhoDesktopNote")),
-        KeyBinding::new("space", VerdictMenu, Some("RhoDesktop")),
-        KeyBinding::new("q", Close, Some("RhoDesktopNote")),
-    ]);
 }

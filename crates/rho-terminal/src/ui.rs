@@ -11,14 +11,12 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, Window, div};
 use multi_buffer::MultiBufferOffset;
 use rho_agent_hosts::Link;
-use rho_frame::keys::{Close, Desk, Palette, SearchForward, VerdictMenu};
+use rho_frame::keys::{self, GuestEscape, Live, Normal, SearchForward};
 use rho_frame::{CardHere, Mode, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::TerminalInfo;
-use crate::{
-    TerminalModel, TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalView, channel,
-};
+use crate::{TerminalModel, TerminalPaste, TerminalView, channel};
 
 /// Which of an agent's terminals to open, given the ones that run: with
 /// `new` a fresh id past them all, else the first that runs, or `0` when
@@ -100,7 +98,9 @@ impl TerminalSurface {
             phone_ctrl: Default::default(),
         }
     }
-    fn read(&mut self, _: &TerminalNormalMode, window: &mut Window, cx: &mut Context<Self>) {
+    /// `escape`: the window's keys, over a read-only copy of the screen
+    /// and its scrollback.
+    fn read(&mut self, _: &Normal, window: &mut Window, cx: &mut Context<Self>) {
         let State::Open(view) = &self.state else {
             return;
         };
@@ -137,7 +137,14 @@ impl TerminalSurface {
         cx.notify();
     }
 
-    fn type_again(&mut self, _: &TerminalRawMode, window: &mut Window, cx: &mut Context<Self>) {
+    /// `f9`: the escape that `escape` itself never sends.
+    fn guest_escape(&mut self, _: &GuestEscape, _: &mut Window, cx: &mut Context<Self>) {
+        if let State::Open(view) = &self.state {
+            view.update(cx, |view, cx| view.phone_key("escape", false, cx));
+        }
+    }
+
+    fn type_again(&mut self, _: &Live, window: &mut Window, cx: &mut Context<Self>) {
         if self.reader.take().is_some() {
             if let State::Open(view) = &self.state {
                 view.update(cx, |view, cx| view.show_live(cx));
@@ -176,7 +183,7 @@ impl Surface for TerminalSurface {
                     window.dispatch_action(Box::new(SearchForward), cx)
                 }),
                 PhoneTool::new("✎", "type", |window, cx| {
-                    window.dispatch_action(Box::new(TerminalRawMode), cx)
+                    window.dispatch_action(Box::new(Live), cx)
                 }),
             ];
         }
@@ -202,7 +209,7 @@ impl Surface for TerminalSurface {
             }),
         );
         tools.push(PhoneTool::new("≡", "read", |window, cx| {
-            window.dispatch_action(Box::new(TerminalNormalMode), cx)
+            window.dispatch_action(Box::new(Normal), cx)
         }));
         tools
     }
@@ -211,7 +218,12 @@ impl Surface for TerminalSurface {
         self.reader.clone()
     }
 
-    fn mode(&self, _cx: &App) -> Option<Mode> {
+    /// An explicit open is to type.
+    fn opened(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.type_again(&Live, window, cx);
+    }
+
+    fn mode(&self, _window: &Window, _cx: &App) -> Option<Mode> {
         match (&self.state, &self.reader) {
             (State::Open(_), None) => Some(Mode::Insert),
             (State::Open(_), Some(_)) => None,
@@ -237,10 +249,16 @@ impl Render for TerminalSurface {
         let colors = cx.theme().colors();
         let note = match &self.state {
             State::Open(view) => {
+                // Live, the pty takes every key the window does not keep.
+                let context = match self.reader {
+                    Some(_) => "RhoTerminalSurface".to_owned(),
+                    None => format!("RhoTerminalSurface {}", keys::LIVE),
+                };
                 return div()
                     .size_full()
-                    .key_context("RhoTerminalSurface")
+                    .key_context(context.as_str())
                     .on_action(cx.listener(Self::read))
+                    .on_action(cx.listener(Self::guest_escape))
                     .on_action(cx.listener(Self::type_again))
                     .child(if let Some(reader) = &self.reader {
                         let background = colors.terminal_background.into();
@@ -262,11 +280,11 @@ impl Render for TerminalSurface {
             }
             State::Failed(error) => format!("term {} of {}: {error}", self.terminal, self.agent),
         };
-        // The placeholder takes the keys of a terminal in normal mode, so
-        // `q` closes it and `:` is the palette.
+        // The placeholder is no buffer: the window's keys, so `q` closes it
+        // and `:` is the palette.
         div()
             .size_full()
-            .key_context("RhoTerminalNormal")
+            .key_context(keys::PLACE)
             .track_focus(&self.focus)
             .bg(colors.terminal_background)
             .text_color(colors.text_muted)
@@ -277,27 +295,18 @@ impl Render for TerminalSurface {
 
 /// The terminal's keys, bound once by whoever shows terminals.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        // Raw mode: every unbound key goes to the pty, so the terminal's
-        // own chords are ones shells do not see. `ctrl-\ ctrl-n` is vim's
-        // terminal escape; `ctrl-shift-n` the discoverable one. The palette
-        // chord, `ctrl-shift-;`, is the frame's own.
-        KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
-        // The frame walks history on ctrl-j and ctrl-k; in a shell they are
-        // the shell's.
-        KeyBinding::new("ctrl-j", NoAction, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-k", NoAction, Some("RhoTerminal")),
-        KeyBinding::new(":", Palette, Some("RhoTerminalNormal")),
-        KeyBinding::new("space", VerdictMenu, Some("RhoTerminalNormal")),
-        KeyBinding::new("tab", Desk, Some("RhoTerminalNormal")),
-        KeyBinding::new("q", Close, Some("RhoTerminalNormal")),
-    ]);
+    // Live, every key the window does not keep goes to the pty
+    // (`rho_frame::keys`); paste is the one chord of the terminal's own,
+    // and no shell sees it.
+    cx.bind_keys([KeyBinding::new(
+        "ctrl-shift-v",
+        TerminalPaste,
+        Some("RhoTerminal"),
+    )]);
     for context in rho_frame::normal_contexts("RhoTerminalSurface", " && vim_operator == none") {
         cx.bind_keys([
-            KeyBinding::new("i", TerminalRawMode, Some(&context)),
-            KeyBinding::new("a", TerminalRawMode, Some(&context)),
+            KeyBinding::new("i", Live, Some(&context)),
+            KeyBinding::new("a", Live, Some(&context)),
             KeyBinding::new("enter", NoAction, Some(&context)),
         ]);
     }

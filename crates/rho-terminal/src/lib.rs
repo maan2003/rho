@@ -10,11 +10,12 @@
 //! against the terminal's live modes there, so this side never tracks
 //! application cursor keys, bracketed paste, or anything else stateful.
 //!
-//! Views have two modes, vim-style: **raw** (the default) forwards every
-//! keystroke to the pty; **normal** (`ctrl-\ ctrl-n`, or `ctrl-shift-n`)
-//! releases the keyboard back to rho — `:` opens the command line, the
-//! space leader works, and j/k/ctrl-d/ctrl-u/gg/G browse scrollback.
-//! `i`/`a`/`enter` return to raw.
+//! A terminal surface has the two modes of every raw place
+//! (`rho_frame::keys`): **live** (the default) forwards every keystroke to
+//! the pty but `escape`, which releases the keyboard back to rho in a
+//! read-only copy of the screen and its scrollback, where the window's
+//! keys work and j/k/ctrl-d/ctrl-u/gg/G browse; `f9` sends the pty a
+//! literal escape. `i`/`a` return to live.
 //!
 //! Only the focused view's size is sent to the pty (tmux `window-size
 //! latest`): only the visible, focused terminal surface sizes the pty.

@@ -622,13 +622,21 @@ impl ChatSystem {
                 message,
             }
             .address();
+            let idea = pending::title(&rho_agent_types::content_text(&outgoing.content));
+            let echo = match self.project_address(ThreadId {
+                host: endpoint,
+                message: outgoing.parent.expect("an idea is under a project"),
+            }) {
+                Some(project) => format!("sent to {project}: {idea}"),
+                None => format!("sent: {idea}"),
+            };
             self.frame.with(cx, move |frame, window, cx| {
                 let reading = frame.current_address() == &pending;
                 frame.close_all(|address| address == &pending, window, cx);
                 if reading {
                     frame.open(posted, window, cx);
                 }
-                frame.finish_idea(client_id, Ok(()), cx);
+                frame.echo(&echo, StyleClass::SystemInfo, cx);
             });
         }
         cx.notify();
@@ -637,11 +645,51 @@ impl ChatSystem {
 
     fn refuse_reply(&mut self, endpoint: EndpointId, reason: String, cx: &mut Context<Self>) {
         let echo = format!("reply not sent: {}", rho_agent_types::one_line(&reason));
-        let kept = self.outbox.refuse_reply(endpoint, reason);
+        let (_, kept) = self.outbox.refuse(endpoint, reason);
         self.cache.write_outbox(endpoint, kept, None);
         self.changed(endpoint, cx);
         self.frame.echo(echo, StyleClass::SystemImportant, cx);
         self.send_unsent(endpoint, cx);
+    }
+
+    /// The host would not start the idea (`SPEC-project-delivery`). It
+    /// stays in the outbox as refused: readable by name in the palette,
+    /// never posted again, and taken back into the draft from its screen.
+    fn refuse_idea(&mut self, endpoint: EndpointId, reason: String, cx: &mut Context<Self>) {
+        let echo = format!("idea not sent: {}", rho_agent_types::one_line(&reason));
+        let (_, kept) = self.outbox.refuse(endpoint, reason);
+        self.cache.write_outbox(endpoint, kept, None);
+        self.changed(endpoint, cx);
+        self.frame.echo(echo, StyleClass::SystemImportant, cx);
+        self.send_unsent(endpoint, cx);
+    }
+
+    /// A refused idea as the draft takes it back.
+    fn refused_idea(&self, id: PendingIdeaId) -> Option<IdeaMail> {
+        let (host, _, outgoing) = self.outbox.ideas().find(|(_, client_id, outgoing)| {
+            *client_id == id.0 && matches!(outgoing.state, OutgoingState::Refused { .. })
+        })?;
+        Some(IdeaMail {
+            client_id: id.0,
+            project: ThreadId {
+                host,
+                message: outgoing.parent?,
+            }
+            .address(),
+            text: rho_agent_types::content_text(&outgoing.content),
+            runtime: outgoing.runtime.clone(),
+        })
+    }
+
+    /// The draft took the refused idea back: it leaves the outbox.
+    fn withdraw_refused_idea(&mut self, id: PendingIdeaId, cx: &mut Context<Self>) {
+        let Some((endpoint, kept)) = self.outbox.withdraw_refused(id.0) else {
+            return;
+        };
+        self.cache.write_outbox(endpoint, kept, None);
+        self.changed(endpoint, cx);
+        let pending = id.address();
+        self.frame.close_all(move |address| address == &pending, cx);
     }
 
     /// Posts the host's oldest unsent message, unless one is on its way.
@@ -710,18 +758,7 @@ impl ChatSystem {
                     this.outbox.posted(endpoint, message);
                     this.finish_posted(endpoint, cx);
                 }
-                Ok(PostAnswer::IdeaRefused(reason)) => {
-                    if let Some((client_id, _, kept)) = this.outbox.answered(endpoint) {
-                        this.cache.write_outbox(endpoint, kept, None);
-                        let pending = PendingIdeaId(client_id).address();
-                        this.frame.with(cx, move |frame, window, cx| {
-                            frame.close_all(|address| address == &pending, window, cx);
-                            frame.finish_idea(client_id, Err(reason), cx);
-                        });
-                    }
-                    cx.notify();
-                    this.send_unsent(endpoint, cx);
-                }
+                Ok(PostAnswer::IdeaRefused(reason)) => this.refuse_idea(endpoint, reason, cx),
                 Ok(PostAnswer::ReplyRefused(reason)) => this.refuse_reply(endpoint, reason, cx),
                 Err(error) => {
                     this.outbox.failed(endpoint);
@@ -809,9 +846,10 @@ impl ChatSystem {
         if let Some(id) = PendingIdeaId::from_address(address) {
             let (_, project, outgoing) = self.pending_ideas().find(|(queued, ..)| *queued == id)?;
             let content = rho_agent_types::content_text(&outgoing.content);
-            return Some(AnySurface::new(
-                cx.new(|cx| PendingIdea::new(project, content, window, cx)),
-            ));
+            let system = cx.entity();
+            return Some(AnySurface::new(cx.new(|cx| {
+                PendingIdea::new(system, id, project, content, window, cx)
+            })));
         }
         let thread = self.thread_of(address)?;
         let chat = self.logs.get(&thread.host)?;
@@ -1068,10 +1106,6 @@ impl System for ChatSystem {
         self.keep_outgoing(project.host, Some(project.message), kept, cx);
     }
 
-    fn idea_pending(&self, id: u64) -> bool {
-        self.outbox.contains(id)
-    }
-
     fn text_sources(&self, search: &mut TextSearch, current: &Address, _cx: &App) {
         if !search.includes(TextKind::Chat) {
             return;
@@ -1168,7 +1202,7 @@ impl System for ChatSystem {
                 title: pending::title(&rho_agent_types::content_text(&outgoing.content)),
                 description: project,
                 thread: Some(FoundThread {
-                    status: Some("queued".to_owned()),
+                    status: Some(pending::status(&outgoing.state).to_owned()),
                 }),
                 recency: outgoing.at.0,
             })
@@ -1326,6 +1360,73 @@ mod tests {
                     .address()
                 );
                 assert!(!mail.outbox.contains(id));
+            })
+        });
+    }
+
+    /// `SPEC-project-delivery`: a refused idea is not posted again and is
+    /// not lost; it waits, readable, until the draft takes it back.
+    #[gpui::test]
+    fn a_refused_idea_stays_until_the_draft_takes_it_back(cx: &mut gpui::TestAppContext) {
+        let endpoint = EndpointId([3; 32]);
+        let project = MessageId(ChatSeq(1));
+        let mut log = HostChat::default();
+        log.tell(&rho_agent_types::ChatRecord {
+            seq: project.0,
+            at: UnixMs(1),
+            event: rho_agent_types::ChatEvent::Posted {
+                kind: rho_agent_types::MessageKind::Kept,
+                parent: None,
+                reply_to: None,
+                thread_reply: None,
+                from: Party::User,
+                mentions: vec![],
+                content: vec![ContentPart::Text {
+                    text: "tide".into(),
+                }],
+            },
+        });
+        let (_, mail, _db) = search_bench::fixture(cx, log);
+        let title = "Test the thermocouple on sol-high.";
+        let id = PendingIdeaId(78);
+        let address = ThreadId {
+            host: endpoint,
+            message: project,
+        }
+        .address();
+        let runtime = rho_agent_types::RuntimeLabel::parse("sol-high").unwrap();
+        cx.update(|cx| {
+            mail.update(cx, |mail, cx| {
+                mail.send_idea(
+                    IdeaMail {
+                        client_id: id.0,
+                        project: address.clone(),
+                        text: title.into(),
+                        runtime: Some(runtime.clone()),
+                    },
+                    cx,
+                );
+                assert_eq!(mail.refused_idea(id).map(|idea| idea.text), None);
+                mail.outbox.next(endpoint).expect("the idea is posted");
+                mail.refuse_idea(endpoint, "eng-ka35 cannot change kind".into(), cx);
+                let status = |mail: &ChatSystem, cx: &App| {
+                    mail.find(&Marks::default(), cx)
+                        .into_iter()
+                        .filter(|row| row.address == id.address())
+                        .map(|row| row.thread.unwrap().status.unwrap())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(status(mail, cx), ["not sent"]);
+                assert!(mail.outbox.next(endpoint).is_none(), "never posted again");
+                let idea = mail.refused_idea(id).expect("the words are kept");
+                assert_eq!(
+                    (idea.client_id, &idea.project, idea.text.as_str()),
+                    (id.0, &address, title)
+                );
+                assert_eq!(idea.runtime, Some(runtime.clone()));
+                mail.withdraw_refused_idea(id, cx);
+                assert!(!mail.outbox.contains(id.0));
+                assert_eq!(status(mail, cx), Vec::<String>::new());
             })
         });
     }

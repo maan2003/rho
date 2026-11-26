@@ -2,6 +2,7 @@
 //! user's mouse and keys sent back, and a frozen frame to draw on and copy.
 //! Dropping the view drops the video subscription.
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -39,13 +40,31 @@ impl Yuv444Data for Planes {
     }
 }
 
+/// Where the desktop's keys go: the two modes of every raw place
+/// (`rho_frame::keys`), and a frozen frame to draw on.
+enum Keys {
+    /// The remote app takes keys, clicks and the wheel, all but the
+    /// window's reserved chords.
+    Live,
+    /// The window's keys; the app goes on live but hears nothing.
+    Normal,
+    /// A frame held still to draw on, in the window's keys.
+    Draw(Drawing),
+}
+
+struct Drawing {
+    frozen: Rc<Shown>,
+    strokes: Vec<Vec<(u32, u32)>>,
+    /// The pointer is down, drawing the last stroke.
+    pen_down: bool,
+    copied: bool,
+}
+
 pub struct DesktopView {
     viewer: crate::viewer::Viewer,
     image: Option<Rc<Shown>>,
-    frozen: Option<Rc<Shown>>,
-    strokes: Vec<Vec<(u32, u32)>>,
-    drawing: bool,
-    status: Option<String>,
+    keys: Keys,
+    physical: PhysicalKeys,
     size: (usize, usize),
     bounds: Rc<Cell<Bounds<Pixels>>>,
     focus: FocusHandle,
@@ -94,7 +113,7 @@ impl DesktopView {
                             }
                             match Shown::new(image) {
                                 Ok(shown) => {
-                                    if this.frozen.is_none() {
+                                    if !matches!(this.keys, Keys::Draw(_)) {
                                         this.size = (shown.image.width, shown.image.height);
                                     }
                                     this.image = Some(Rc::new(shown));
@@ -113,9 +132,10 @@ impl DesktopView {
         let focus = cx.focus_handle();
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
-                this.viewer.motion.send_replace(None);
-                this.send(Input::ReleaseAll, cx);
-                this.drawing = false;
+                this.release_all(cx);
+                if let Keys::Draw(drawing) = &mut this.keys {
+                    drawing.pen_down = false;
+                }
             }
         });
         Self {
@@ -124,10 +144,8 @@ impl DesktopView {
             _activation: activation,
             viewer,
             image: None,
-            frozen: None,
-            strokes: Vec::new(),
-            drawing: false,
-            status: None,
+            keys: Keys::Live,
+            physical: PhysicalKeys::default(),
             size: (1, 1),
             bounds: Rc::new(Cell::new(Bounds::default())),
             focus,
@@ -135,37 +153,166 @@ impl DesktopView {
             _updates: updates,
         }
     }
+
     /// Whether a frozen frame is up to draw on, rather than the live one.
     pub fn annotating(&self) -> bool {
-        self.frozen.is_some()
+        matches!(self.keys, Keys::Draw(_))
+    }
+
+    /// The status line's mode word: `INS` only while the app takes keys.
+    pub fn live(&self) -> bool {
+        matches!(self.keys, Keys::Live)
     }
 
     pub fn toggle_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        self.annotate(cx);
-    }
-    fn annotate(&mut self, cx: &mut Context<Self>) {
-        if self.frozen.is_some() {
-            self.frozen = None;
-            self.strokes.clear();
-            self.drawing = false;
-            if let Some(image) = self.viewer.images.borrow().as_ref() {
-                self.size = (image.width, image.height);
-            }
-        } else {
-            self.send(Input::ReleaseAll, cx);
-            self.viewer.motion.send_replace(None);
-            self.frozen = self.image.clone();
-            self.status = None;
+        match self.keys {
+            Keys::Draw(_) => self.go_live(cx),
+            Keys::Live | Keys::Normal => self.annotate(cx),
         }
+    }
+
+    /// Back to the app, live; a drawing is dropped.
+    pub(crate) fn go_live(&mut self, cx: &mut Context<Self>) {
+        if let Keys::Draw(_) = self.keys
+            && let Some(image) = self.viewer.images.borrow().as_ref()
+        {
+            self.size = (image.width, image.height);
+        }
+        self.keys = Keys::Live;
         cx.notify();
     }
-    /// Copies the frozen frame with what is drawn on it.
-    fn export(&mut self, cx: &mut Context<Self>) {
-        let Some(image) = self.frozen.as_ref() else {
+
+    fn go_normal(&mut self, _: &rho_frame::keys::Normal, _: &mut Window, cx: &mut Context<Self>) {
+        self.release_all(cx);
+        self.keys = Keys::Normal;
+        cx.notify();
+    }
+
+    /// Holds the frame in view still to draw on.
+    fn annotate(&mut self, cx: &mut Context<Self>) {
+        let Some(frozen) = self.image.clone() else {
             return;
         };
-        let mut pixels = match image.image.export_bgra() {
+        self.release_all(cx);
+        self.keys = Keys::Draw(Drawing {
+            frozen,
+            strokes: Vec::new(),
+            pen_down: false,
+            copied: false,
+        });
+        cx.notify();
+    }
+
+    /// Lets go of every key and button the app holds from this view.
+    fn release_all(&mut self, cx: &mut Context<Self>) {
+        self.physical = PhysicalKeys::default();
+        self.viewer.motion.send_replace(None);
+        self.send(Input::ReleaseAll, cx);
+    }
+
+    /// `f9` in live input: the escape that `escape` itself never sends.
+    fn guest_escape(
+        &mut self,
+        _: &rho_frame::keys::GuestEscape,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cfg!(target_os = "linux") {
+            for pressed in [true, false] {
+                self.send(
+                    Input::Physical {
+                        code: KEY_ESC,
+                        pressed,
+                    },
+                    cx,
+                );
+            }
+        } else {
+            self.send(Input::Key("escape".into()), cx);
+        }
+    }
+
+    /// Linux live input: the app hears a key only once gpui has matched
+    /// it and left it alone ([`PhysicalKeys`]).
+    fn physical_key(
+        &mut self,
+        event: &PhysicalKeyEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PhysicalKey::LinuxEvdev(code) = event.key;
+        let pending = window.has_pending_keystrokes();
+        for input in self.physical.event(code, event.pressed, pending) {
+            self.send(input, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn live_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if cfg!(target_os = "linux") {
+            if !event.is_held
+                && let Some(input) = self.physical.typed()
+            {
+                self.send(input, cx);
+            }
+            return;
+        }
+        let key = &event.keystroke;
+        if !key.modifiers.control
+            && !key.modifiers.platform
+            && !key.modifiers.alt
+            && let Some(text) = &key.key_char
+        {
+            self.send(Input::Text(text.clone()), cx);
+            return;
+        }
+        let mut chord = String::new();
+        if key.modifiers.control {
+            chord.push_str("ctrl+");
+        }
+        if key.modifiers.alt {
+            chord.push_str("alt+");
+        }
+        if key.modifiers.shift {
+            chord.push_str("shift+");
+        }
+        if key.modifiers.platform {
+            chord.push_str("super+");
+        }
+        chord.push_str(&key.key);
+        self.send(Input::Key(chord), cx);
+    }
+
+    /// The drawing's own keys, beside the window's.
+    fn draw_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
+        let plain = !key.modifiers.control && !key.modifiers.alt;
+        match key.key.as_str() {
+            "escape" => self.go_live(cx),
+            "g" if key.modifiers.control => self.go_live(cx),
+            "u" if plain => self.undo_stroke(cx),
+            "y" if plain => self.export(cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn undo_stroke(&mut self, cx: &mut Context<Self>) {
+        if let Keys::Draw(drawing) = &mut self.keys {
+            drawing.strokes.pop();
+            cx.notify();
+        }
+    }
+
+    /// Copies the frozen frame with what is drawn on it.
+    fn export(&mut self, cx: &mut Context<Self>) {
+        let Keys::Draw(drawing) = &self.keys else {
+            return;
+        };
+        let (frozen, strokes) = (drawing.frozen.clone(), drawing.strokes.clone());
+        let mut pixels = match frozen.image.export_bgra() {
             Ok(pixels) => pixels,
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -173,7 +320,7 @@ impl DesktopView {
                 return;
             }
         };
-        for stroke in &self.strokes {
+        for stroke in &strokes {
             if let Some(&point) = stroke.first() {
                 draw_line(&mut pixels, self.size, point, point);
             }
@@ -195,7 +342,9 @@ impl DesktopView {
         let bytes = png.into_inner();
         let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes);
         cx.write_to_clipboard(ClipboardItem::new_image(&image));
-        self.status = Some("Annotation copied".into());
+        if let Keys::Draw(drawing) = &mut self.keys {
+            drawing.copied = true;
+        }
         cx.notify();
     }
     fn send(&mut self, input: Input, cx: &mut Context<Self>) {
@@ -220,6 +369,73 @@ impl DesktopView {
         .map(|(x, y)| (x.min(self.size.0 as u32 - 1), y.min(self.size.1 as u32 - 1)))
     }
 }
+
+/// evdev's escape.
+const KEY_ESC: u32 = 1;
+
+/// evdev's modifier keys, which go to the app as they are pressed: they
+/// make no `key_down` to wait for.
+fn is_modifier(code: u32) -> bool {
+    matches!(code, 29 | 42 | 54 | 56 | 58 | 69 | 97 | 100 | 125 | 126)
+}
+
+/// The app's side of live physical keys (Linux). gpui matches a key
+/// against the window's keymap after the physical press and before the
+/// view's `key_down`, so a press is held from the app until then: one that
+/// reaches `key_down` ([`Self::typed`]) is the app's. One released, or
+/// followed by another press, without reaching it was taken by a window
+/// binding and never reaches the app, unless gpui still holds it as the
+/// first key of a longer binding (`pending`), which it then gives back.
+#[derive(Default)]
+struct PhysicalKeys {
+    held: Option<u32>,
+    /// Keys whose press the app has had, to release.
+    sent: HashSet<u32>,
+}
+
+impl PhysicalKeys {
+    fn event(&mut self, code: u32, pressed: bool, pending: bool) -> Vec<Input> {
+        let mut out = Vec::new();
+        if pressed {
+            if is_modifier(code) {
+                out.extend(self.press(code));
+            } else if let Some(previous) = self.held.replace(code)
+                && previous != code
+                && pending
+            {
+                out.extend(self.press(previous));
+            }
+            return out;
+        }
+        if self.held == Some(code) {
+            self.held = None;
+            if pending {
+                out.extend(self.press(code));
+            }
+        }
+        if self.sent.remove(&code) {
+            out.push(Input::Physical {
+                code,
+                pressed: false,
+            });
+        }
+        out
+    }
+
+    /// gpui left the held key alone: its press is the app's.
+    fn typed(&mut self) -> Option<Input> {
+        let code = self.held.take()?;
+        self.press(code)
+    }
+
+    fn press(&mut self, code: u32) -> Option<Input> {
+        self.sent.insert(code).then_some(Input::Physical {
+            code,
+            pressed: true,
+        })
+    }
+}
+
 impl Focusable for DesktopView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus.clone()
@@ -228,12 +444,14 @@ impl Focusable for DesktopView {
 
 impl Render for DesktopView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let image = self.frozen.clone().or_else(|| self.image.clone());
+        let (image, strokes) = match &self.keys {
+            Keys::Draw(drawing) => (Some(drawing.frozen.clone()), drawing.strokes.clone()),
+            Keys::Live | Keys::Normal => (self.image.clone(), Vec::new()),
+        };
         let first_paint = self.first_paint.clone();
         let painted = self.painted.clone();
         let started = self.viewer.started_at;
         let desktop_id = self.viewer.desktop_id;
-        let strokes = self.strokes.clone();
         let size = self.size;
         let bounds = self.bounds.clone();
         let canvas = canvas(
@@ -310,107 +528,69 @@ impl Render for DesktopView {
             },
         )
         .size_full();
+        // Live, the app takes every key the window does not keep; escaped
+        // or drawing, the window's keys work as on any screen.
+        let context = match self.keys {
+            Keys::Live => format!("RhoDesktop {}", rho_frame::keys::LIVE),
+            Keys::Normal | Keys::Draw(_) => format!("RhoDesktop {}", rho_frame::keys::PLACE),
+        };
         let mut surface = div()
             .id("remote-wayland")
+            .key_context(context.as_str())
             .track_focus(&self.focus)
             .flex_1()
             .min_h_0()
             .relative()
             .bg(rgb(0x161616))
+            .on_action(cx.listener(|this, _: &rho_frame::keys::Live, _, cx| this.go_live(cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if let Some(position) = this.position(event.position) {
-                    if this.frozen.is_some() {
-                        if this.drawing
-                            && let Some(stroke) = this.strokes.last_mut()
+                let Some(position) = this.position(event.position) else {
+                    return;
+                };
+                match &mut this.keys {
+                    Keys::Live | Keys::Normal => {
+                        this.viewer.motion.send_replace(Some(position));
+                    }
+                    Keys::Draw(drawing) => {
+                        if drawing.pen_down
+                            && let Some(stroke) = drawing.strokes.last_mut()
                             && stroke.last() != Some(&position)
                         {
                             stroke.push(position);
                             cx.notify();
                         }
-                    } else {
-                        this.viewer.motion.send_replace(Some(position));
                     }
                 }
-            }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                if this.frozen.is_some() {
-                    return;
-                }
-                let (horizontal, vertical) = match event.delta {
-                    ScrollDelta::Pixels(p) => (-f32::from(p.x) as f64, -f32::from(p.y) as f64),
-                    ScrollDelta::Lines(p) => (-p.x as f64 * 15., -p.y as f64 * 15.),
-                };
-                this.send(
-                    Input::Scroll {
-                        horizontal,
-                        vertical,
-                    },
-                    cx,
-                );
-                cx.stop_propagation();
-            }))
-            .on_physical_key(cx.listener(|this, event: &PhysicalKeyEvent, _, cx| {
-                if this.frozen.is_some() {
-                    return;
-                }
-                let PhysicalKey::LinuxEvdev(code) = event.key;
-                this.send(
-                    Input::Physical {
-                        code,
-                        pressed: event.pressed,
-                    },
-                    cx,
-                );
-                cx.stop_propagation();
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.frozen.is_some() {
-                    let key = &event.keystroke;
-                    match key.key.as_str() {
-                        "escape" => this.annotate(cx),
-                        "u" if !key.modifiers.control && !key.modifiers.alt => {
-                            this.strokes.pop();
-                            cx.notify();
-                        }
-                        "y" if !key.modifiers.control && !key.modifiers.alt => this.export(cx),
-                        "g" if key.modifiers.control => this.annotate(cx),
-                        _ => {}
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
-                if cfg!(target_os = "linux") {
-                    cx.stop_propagation();
-                    return;
-                }
-                let key = &event.keystroke;
-                if !key.modifiers.control
-                    && !key.modifiers.platform
-                    && !key.modifiers.alt
-                    && let Some(text) = &key.key_char
-                {
-                    this.send(Input::Text(text.clone()), cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                let mut chord = String::new();
-                if key.modifiers.control {
-                    chord.push_str("ctrl+");
-                }
-                if key.modifiers.alt {
-                    chord.push_str("alt+");
-                }
-                if key.modifiers.shift {
-                    chord.push_str("shift+");
-                }
-                if key.modifiers.platform {
-                    chord.push_str("super+");
-                }
-                chord.push_str(&key.key);
-                this.send(Input::Key(chord), cx);
-                cx.stop_propagation();
             }))
             .child(canvas);
+        surface = match self.keys {
+            Keys::Live => surface
+                .on_action(cx.listener(Self::go_normal))
+                .on_action(cx.listener(Self::guest_escape))
+                .on_physical_key(cx.listener(Self::physical_key))
+                .on_key_down(cx.listener(Self::live_key_down)),
+            Keys::Draw(_) => surface.on_key_down(cx.listener(Self::draw_key_down)),
+            Keys::Normal => surface,
+        };
+        // Only the keys wait for `i`: the pointer and the wheel work on a
+        // live app either way, as a click is how live input comes back.
+        if !matches!(self.keys, Keys::Draw(_)) {
+            surface =
+                surface.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    let (horizontal, vertical) = match event.delta {
+                        ScrollDelta::Pixels(p) => (-f32::from(p.x) as f64, -f32::from(p.y) as f64),
+                        ScrollDelta::Lines(p) => (-p.x as f64 * 15., -p.y as f64 * 15.),
+                    };
+                    this.send(
+                        Input::Scroll {
+                            horizontal,
+                            vertical,
+                        },
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }));
+        }
         for (button, code) in [
             (MouseButton::Left, 0x110),
             (MouseButton::Right, 0x111),
@@ -422,14 +602,16 @@ impl Render for DesktopView {
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         window.focus(&this.focus, cx);
                         if let Some((x, y)) = this.position(event.position) {
-                            if this.frozen.is_some() {
+                            if let Keys::Draw(drawing) = &mut this.keys {
                                 if button == MouseButton::Left {
-                                    this.strokes.push(vec![(x, y)]);
-                                    this.drawing = true;
+                                    drawing.strokes.push(vec![(x, y)]);
+                                    drawing.pen_down = true;
                                     cx.notify();
                                 }
                                 return;
                             }
+                            // A click on the app is live input again.
+                            this.go_live(cx);
                             this.viewer.motion.send_replace(None);
                             this.send(Input::Move { x, y }, cx);
                             this.send(
@@ -446,43 +628,22 @@ impl Render for DesktopView {
                 .on_mouse_up(
                     button,
                     cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                        this.drawing = false;
-                        if this.frozen.is_none() {
-                            this.send(
-                                Input::Button {
-                                    button: code,
-                                    pressed: false,
-                                },
-                                cx,
-                            );
-                        }
+                        this.button_up(code, cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_up_out(
                     button,
-                    cx.listener(move |this, _, _, cx| {
-                        this.drawing = false;
-                        if this.frozen.is_none() {
-                            this.send(
-                                Input::Button {
-                                    button: code,
-                                    pressed: false,
-                                },
-                                cx,
-                            );
-                        }
-                    }),
+                    cx.listener(move |this, _, _, cx| this.button_up(code, cx)),
                 );
         }
         let mut root = div()
-            .key_context("RhoDesktop")
             .size_full()
             .flex()
             .flex_col()
             .relative()
             .child(surface);
-        if self.frozen.is_some() {
+        if let Keys::Draw(drawing) = &self.keys {
             let action =
                 |id: &'static str, label: &'static str| div().id(id).cursor_pointer().child(label);
             let mut mode_line = div()
@@ -500,21 +661,19 @@ impl Render for DesktopView {
                         .child("DRAW"),
                 )
                 .child(
-                    action("undo", "u undo").on_click(cx.listener(|this, _, _, cx| {
-                        this.strokes.pop();
-                        cx.notify();
-                    })),
+                    action("undo", "u undo")
+                        .on_click(cx.listener(|this, _, _, cx| this.undo_stroke(cx))),
                 )
                 .child(
                     action("copy", "y copy")
                         .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
+                )
+                .child(
+                    action("resume", "esc live")
+                        .on_click(cx.listener(|this, _, _, cx| this.go_live(cx))),
                 );
-            mode_line = mode_line.child(
-                action("resume", "esc live")
-                    .on_click(cx.listener(|this, _, _, cx| this.annotate(cx))),
-            );
-            if let Some(status) = &self.status {
-                mode_line = mode_line.child(div().child(status.clone()));
+            if drawing.copied {
+                mode_line = mode_line.child(div().child("Annotation copied"));
             }
             root = root.child(mode_line);
         }
@@ -531,6 +690,22 @@ impl Render for DesktopView {
             );
         }
         root
+    }
+}
+
+impl DesktopView {
+    fn button_up(&mut self, code: u32, cx: &mut Context<Self>) {
+        match &mut self.keys {
+            Keys::Draw(drawing) => drawing.pen_down = false,
+            Keys::Live => self.send(
+                Input::Button {
+                    button: code,
+                    pressed: false,
+                },
+                cx,
+            ),
+            Keys::Normal => {}
+        }
     }
 }
 
@@ -591,8 +766,66 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{EmptyView, TestAppContext};
+    use rho_desktop_proto::Input;
 
-    use super::{draw_line, on_presented};
+    use super::{PhysicalKeys, draw_line, on_presented};
+
+    fn press(code: u32) -> Input {
+        Input::Physical {
+            code,
+            pressed: true,
+        }
+    }
+
+    fn release(code: u32) -> Input {
+        Input::Physical {
+            code,
+            pressed: false,
+        }
+    }
+
+    const CTRL: u32 = 29;
+    const SEMICOLON: u32 = 39;
+    const K: u32 = 37;
+    const A: u32 = 30;
+    const O: u32 = 24;
+
+    /// `ctrl-shift-;` opens the palette: the app gets the modifier, which
+    /// it cannot act on alone, and never the `;`.
+    #[test]
+    fn a_key_a_window_binding_takes_never_reaches_the_app() {
+        let mut keys = PhysicalKeys::default();
+        assert_eq!(keys.event(CTRL, true, false), [press(CTRL)]);
+        assert_eq!(keys.event(SEMICOLON, true, false), []);
+        // No `key_down`: the binding took it.
+        assert_eq!(keys.event(SEMICOLON, false, false), []);
+        assert_eq!(keys.event(CTRL, false, false), [release(CTRL)]);
+        assert_eq!(keys.typed(), None);
+    }
+
+    #[test]
+    fn a_key_the_window_leaves_reaches_the_app_once_matched() {
+        let mut keys = PhysicalKeys::default();
+        assert_eq!(keys.event(A, true, false), []);
+        assert_eq!(keys.typed(), Some(press(A)));
+        // A second press before the first is released is held in turn.
+        assert_eq!(keys.event(K, true, false), []);
+        assert_eq!(keys.event(A, false, false), [release(A)]);
+        assert_eq!(keys.typed(), Some(press(K)));
+        assert_eq!(keys.event(K, false, false), [release(K)]);
+    }
+
+    /// gpui holds `ctrl-k` while a longer binding could follow; a key it
+    /// still holds is the app's, not the window's.
+    #[test]
+    fn a_key_gpui_still_holds_goes_to_the_app() {
+        let mut keys = PhysicalKeys::default();
+        assert_eq!(keys.event(K, true, false), []);
+        assert_eq!(keys.event(K, false, true), [press(K), release(K)]);
+        assert_eq!(keys.event(K, true, false), []);
+        assert_eq!(keys.event(O, true, true), [press(K)]);
+        assert_eq!(keys.event(K, false, false), [release(K)]);
+    }
 
     #[gpui::test]
     fn presentation_feedback_waits_for_frame_and_ignores_repaints(cx: &mut TestAppContext) {

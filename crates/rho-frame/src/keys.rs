@@ -3,8 +3,24 @@
 //! rho's modal editing is Helix on top of vim (`init_vim_mode`), so a key
 //! that means something in normal mode is bound for `vim_mode == normal`
 //! and `vim_mode == helix_normal` both: [`normal_contexts`] says them.
+//!
+//! A raw place (a page, a terminal, a desktop) is in one of two modes,
+//! and the keymap here is the whole of what each means
+//! (`window.raw places share one dual-escape model`). Its live input is
+//! drawn in [`LIVE`]: every key goes to the guest except `escape`
+//! ([`Normal`]), `f9` ([`GuestEscape`]), the palette and the idea chords.
+//! Escaped, a place that is no buffer is drawn in [`PLACE`], where the
+//! window's keys work as on any screen and `i` ([`Live`]) types again. A
+//! place answers the three actions; it binds no escape of its own.
 
-use gpui::{App, KeyBinding, KeyBindingContextPredicate, actions};
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, NoAction, actions};
+
+/// The key context of a raw place's live input, beside the place's own.
+pub const LIVE: &str = "RhoLive";
+
+/// The key context of a screen that is no buffer while the window has
+/// the keys: an escaped raw place, or one still connecting.
+pub const PLACE: &str = "RhoPlace";
 
 actions!(
     rho_frame,
@@ -25,6 +41,13 @@ actions!(
         VerdictMenu,
         /// `tab`: Desk, and from Desk the way back.
         Desk,
+        /// `escape` in a raw place's live input: the window's keys (`NOR`).
+        Normal,
+        /// `i` in an escaped raw place: the guest's keys again (`INS`).
+        Live,
+        /// `f9` in a raw place's live input: a literal `escape` to the
+        /// guest, which `escape` itself never reaches.
+        GuestEscape,
         OpenRow,
         DeskNext,
         DeskPrevious,
@@ -35,7 +58,6 @@ actions!(
         RedoEdit,
         SendIdea,
         FocusIdeaAddress,
-        CancelIdea,
         /// `/`: search forward in what is in view.
         SearchForward,
         /// `?`: search back.
@@ -91,15 +113,16 @@ fn end_of_document(cx: &App) -> KeyBinding {
 fn bindings() -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for context in ["RhoFrame", "RhoFrame > Editor"] {
-        // Ordinary navigation chords belong to the site while a page has
-        // focus. The negation checks the whole focus stack, not just the
-        // context at which the binding would otherwise match.
-        let outside_page = format!("({context}) && !RhoBrowser && !RhoMinibuffer");
+        // Ordinary navigation chords belong to the guest while a raw place
+        // takes live input, and do nothing in a prompt. The negation checks
+        // the whole focus stack, not just the context at which the binding
+        // would otherwise match.
+        let window = format!("({context}) && !{LIVE} && !RhoMinibuffer");
         bindings.extend([
-            KeyBinding::new("ctrl-k", Back, Some(&outside_page)),
-            KeyBinding::new("ctrl-j", Forward, Some(&outside_page)),
-            KeyBinding::new("ctrl-shift-backspace", Close, Some(&outside_page)),
-            KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(&outside_page)),
+            KeyBinding::new("ctrl-k", Back, Some(&window)),
+            KeyBinding::new("ctrl-j", Forward, Some(&window)),
+            KeyBinding::new("ctrl-shift-backspace", Close, Some(&window)),
+            KeyBinding::new("ctrl-shift-j", CloseAndDeal, Some(&window)),
             KeyBinding::new("f21", Back, Some(context)),
             KeyBinding::new("f20", Forward, Some(context)),
             KeyBinding::new("f16", CloseAndDeal, Some(context)),
@@ -111,11 +134,17 @@ fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-:", Palette, Some(context)),
         ]);
     }
-    let page = Some("RhoFrame > RhoBrowser");
     bindings.extend([
-        KeyBinding::new("ctrl-shift-f9", Back, page),
-        KeyBinding::new("ctrl-shift-f10", Forward, page),
-        KeyBinding::new("ctrl-shift-f11", Close, page),
+        KeyBinding::new("escape", Normal, Some(LIVE)),
+        KeyBinding::new("f9", GuestEscape, Some(LIVE)),
+        // The bundled keymap binds `ctrl-k ctrl-o` under no context, which
+        // would hold every `ctrl-k` for the guest until the next key.
+        KeyBinding::new("ctrl-k ctrl-o", NoAction, Some(LIVE)),
+        KeyBinding::new(":", Palette, Some(PLACE)),
+        KeyBinding::new("space", VerdictMenu, Some(PLACE)),
+        KeyBinding::new("tab", Desk, Some(PLACE)),
+        KeyBinding::new("q", Close, Some(PLACE)),
+        KeyBinding::new("i", Live, Some(PLACE)),
     ]);
     for context in normal_contexts("RhoFrame", " && !showing_completions") {
         bindings.extend([
@@ -152,21 +181,15 @@ fn bindings() -> Vec<KeyBinding> {
     for context in normal_contexts("RhoDesk", " && vim_operator == none") {
         bindings.push(KeyBinding::new("i", PromptIdea, Some(&context)));
     }
-    // A screen waiting on its host is no buffer: the window's own keys.
-    let waiting = crate::waiting::KEY_CONTEXT;
-    bindings.extend([
-        KeyBinding::new(":", Palette, Some(waiting)),
-        KeyBinding::new("space", VerdictMenu, Some(waiting)),
-        KeyBinding::new("tab", Desk, Some(waiting)),
-        KeyBinding::new("q", Close, Some(waiting)),
-    ]);
     bindings.extend([
         KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", PromptIdea, Some("RhoIdeaAddress > Editor")),
         KeyBinding::new("enter", PromptIdeaRuntime, Some("RhoIdeaRuntime > Editor")),
         KeyBinding::new("shift-tab", FocusIdeaAddress, Some("RhoIdea > Editor")),
         KeyBinding::new("ctrl-enter", SendIdea, Some("RhoIdea > Editor")),
-        KeyBinding::new("ctrl-g", CancelIdea, Some("RhoIdea > Editor")),
+        // The idea is a screen: `ctrl-g` closes it as `q` does, from any
+        // mode, and the draft stays for next time.
+        KeyBinding::new("ctrl-g", Close, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("ctrl-g", MinibufferCancel, Some("RhoMinibuffer > Editor")),
@@ -235,7 +258,7 @@ mod tests {
     fn ctrl_shift_semicolon_opens_the_palette_from_a_place_that_takes_every_key() {
         // A raw terminal, a live desktop and a page bind none of it
         // themselves: the frame's chord reaches through each.
-        for surface in ["RhoTerminal", "RhoDesktop", "RhoBrowser"] {
+        for surface in LIVE_PLACES {
             let bindings = chord_in(surface);
             assert!(
                 bindings
@@ -250,28 +273,99 @@ mod tests {
         }
     }
 
+    /// The focus stacks of the three raw places, live and escaped, as the
+    /// places draw them.
+    const LIVE_PLACES: [&str; 3] = [
+        "RhoBrowser RhoLive",
+        "RhoTerminal RhoLive",
+        "RhoDesktop RhoLive",
+    ];
+    const ESCAPED_PLACES: [&str; 2] = ["RhoBrowser RhoPlace", "RhoDesktop RhoPlace"];
+
+    fn action_at(surface: &str, key: &'static str) -> Option<&'static str> {
+        bindings_for(surface, Keystroke::parse(key).unwrap())
+            .first()
+            .map(|binding| binding.action().name())
+    }
+
     #[test]
-    fn a_page_reserves_its_window_chords_and_leaves_site_chords_unbound() {
-        let action_at = |surface, key: &'static str| {
-            bindings_for(surface, Keystroke::parse(key).unwrap())
-                .first()
-                .map(|binding| binding.action().name())
-        };
-        let page = "RhoBrowser";
-        let editor = "Editor vim_mode=helix_normal";
-        for (legacy, reserved, action) in [
-            ("ctrl-k", "ctrl-shift-f9", Back.name()),
-            ("ctrl-j", "ctrl-shift-f10", Forward.name()),
-            ("ctrl-shift-backspace", "ctrl-shift-f11", Close.name()),
-        ] {
-            assert_eq!(action_at(page, reserved), Some(action));
-            assert_eq!(action_at(page, legacy), None);
-            assert_eq!(action_at(editor, legacy), Some(action));
-            assert_eq!(action_at(editor, reserved), None);
-            assert_eq!(action_at("RhoDesktop", legacy), Some(action));
+    fn live_input_leaves_every_window_chord_to_the_guest_but_the_escapes() {
+        for place in LIVE_PLACES {
+            for key in [
+                "ctrl-k",
+                "ctrl-j",
+                "ctrl-shift-backspace",
+                "ctrl-shift-j",
+                "space",
+                "q",
+                "tab",
+                "i",
+                "shift-;",
+                // The per-place chords this model replaced.
+                "ctrl-shift-f9",
+                "ctrl-shift-f10",
+                "ctrl-shift-f11",
+                "ctrl-shift-n",
+            ] {
+                assert_eq!(action_at(place, key), None, "{key} in {place}");
+            }
+            assert_eq!(action_at(place, "escape"), Some(Normal.name()), "{place}");
+            assert_eq!(action_at(place, "f9"), Some(GuestEscape.name()), "{place}");
         }
-        assert_eq!(action_at(page, "ctrl-shift-j"), None);
-        assert_eq!(action_at(editor, "ctrl-shift-j"), Some(CloseAndDeal.name()));
+    }
+
+    #[test]
+    fn an_escaped_place_has_the_same_screen_keys_as_any_buffer() {
+        let buffer = "Editor vim_mode=helix_normal";
+        for (key, action) in [
+            ("ctrl-k", Back.name()),
+            ("ctrl-j", Forward.name()),
+            ("ctrl-shift-j", CloseAndDeal.name()),
+            ("tab", Desk.name()),
+            ("q", Close.name()),
+            ("space", VerdictMenu.name()),
+        ] {
+            assert_eq!(action_at(buffer, key), Some(action), "{key} in a buffer");
+            for place in ESCAPED_PLACES {
+                assert_eq!(action_at(place, key), Some(action), "{key} in {place}");
+            }
+        }
+        for place in ESCAPED_PLACES {
+            assert_eq!(action_at(place, "i"), Some(Live.name()), "{place}");
+            // Escaped, `escape` and `f9` are nothing of the window's.
+            assert_eq!(action_at(place, "escape"), None, "{place}");
+            assert_eq!(action_at(place, "f9"), None, "{place}");
+        }
+    }
+
+    #[test]
+    fn a_context_free_prefix_does_not_hold_ctrl_k_from_the_guest() {
+        // As the bundled keymap has it: bound under no context, before the
+        // frame's own.
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Palette, None)]);
+        keymap.add_bindings(bindings());
+        let typed = [Keystroke::parse("ctrl-k").unwrap()];
+        let stack = |place: &str| {
+            [
+                KeyContext::parse("RhoFrame").unwrap(),
+                KeyContext::parse(place).unwrap(),
+            ]
+        };
+        for place in LIVE_PLACES {
+            let (matched, pending) = keymap.bindings_for_input(&typed, &stack(place));
+            assert!(matched.is_empty() && !pending, "ctrl-k waits in {place}");
+        }
+        // Without the live unbinding, the prefix would hold it.
+        let mut bundled = Keymap::default();
+        bundled.add_bindings([KeyBinding::new("ctrl-k ctrl-o", Palette, None)]);
+        bundled.add_bindings(
+            bindings()
+                .into_iter()
+                .filter(|binding| !binding.action().as_any().is::<NoAction>()),
+        );
+        let (_, pending) = bundled.bindings_for_input(&typed, &stack(LIVE_PLACES[0]));
+        assert!(pending);
     }
 
     #[test]
@@ -325,9 +419,9 @@ mod tests {
     #[test]
     fn the_idea_chord_reaches_raw_places_and_typing_editors() {
         for surface in [
-            "RhoTerminal",
-            "RhoDesktop",
-            "RhoBrowser",
+            "RhoTerminal RhoLive",
+            "RhoDesktop RhoLive",
+            "RhoBrowser RhoLive",
             "Editor vim_mode=insert",
             "Editor vim_mode=helix_normal",
         ] {

@@ -7,9 +7,9 @@
 //! closing it, and closes its tab. The browser stays in this process: no
 //! host knows a page.
 //!
-//! The site takes the keys, except for the window's reserved chords.
-//! `Surface::rows` makes the window's navigation discoverable from the
-//! palette, with shortcuts resolved in the page's actual key context.
+//! A page is a raw place (`rho_frame::keys`): live, the site takes every
+//! key but the window's reserved chords; after `escape`, the window's keys
+//! work as on any screen until `i` or a click on the page.
 
 mod bookmarks;
 mod pages;
@@ -18,11 +18,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
+use gpui::{
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TaskExt as _, Window, div,
+};
 use rho_db::RhoDb;
 use rho_dealer::{Address, Addressed};
 use rho_frame::{
-    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Opening, Point, Row, Surface, keys,
+    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Mode, Opening, Point, Row, Surface, keys,
 };
 use rho_window::style::StyleClass;
 use url::Url;
@@ -367,7 +370,7 @@ impl rho_frame::System for PageSystem {
         cx.observe_release(&view, move |this, _, cx| this.hidden(page, cx))
             .detach();
         self.pages.show(page);
-        Opening::Surface(AnySurface::new(view))
+        Opening::Surface(AnySurface::new(cx.new(|cx| PageSurface::new(view, cx))))
     }
 
     fn visit(&mut self, address: &Address, cx: &mut Context<Self>) -> bool {
@@ -456,29 +459,67 @@ impl rho_frame::System for PageSystem {
     }
 }
 
-impl Surface for PageView {
-    fn title(&self, _cx: &App) -> String {
-        format!("{PLACE} › {}", title(self.page_id()))
+/// A page as a screen: the page's view, in the two modes of every raw
+/// place. The view says whether it takes the keys; this says what that
+/// means to the window.
+pub struct PageSurface {
+    view: Entity<PageView>,
+    _changed: Subscription,
+}
+
+impl PageSurface {
+    fn new(view: Entity<PageView>, cx: &mut Context<Self>) -> Self {
+        Self {
+            _changed: cx.observe(&view, |_, _, cx| cx.notify()),
+            view,
+        }
     }
 
-    fn rows(
-        &mut self,
-        _: Option<rho_frame::surface::Seen>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Vec<Row> {
-        vec![
-            Row::run("", "go back", |frame, window, cx| frame.back(window, cx))
-                .bound_to(keys::Back),
-            Row::run("", "go forward", |frame, window, cx| {
-                frame.forward_or_deal(window, cx)
-            })
-            .bound_to(keys::Forward),
-            Row::run("", "close page", |frame, window, cx| {
-                frame.close_current(window, cx)
-            })
-            .bound_to(keys::Close),
-        ]
+    fn take_keys(&self, takes_keys: bool, cx: &mut Context<Self>) {
+        self.view
+            .update(cx, |view, cx| view.set_takes_keys(takes_keys, cx));
+    }
+}
+
+impl Surface for PageSurface {
+    fn title(&self, cx: &App) -> String {
+        format!("{PLACE} › {}", title(self.view.read(cx).page_id()))
+    }
+
+    fn mode(&self, _window: &Window, cx: &App) -> Option<Mode> {
+        Some(match self.view.read(cx).takes_keys() {
+            true => Mode::Insert,
+            false => Mode::Normal,
+        })
+    }
+
+    /// An explicit open is to use the page.
+    fn opened(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.take_keys(true, cx);
+    }
+}
+
+impl Focusable for PageSurface {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.view.focus_handle(cx)
+    }
+}
+
+impl Render for PageSurface {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let context = match self.view.read(cx).takes_keys() {
+            true => keys::LIVE,
+            false => keys::PLACE,
+        };
+        div()
+            .size_full()
+            .key_context(context)
+            .on_action(cx.listener(|this, _: &keys::Normal, _, cx| this.take_keys(false, cx)))
+            .on_action(cx.listener(|this, _: &keys::Live, _, cx| this.take_keys(true, cx)))
+            .on_action(cx.listener(|this, _: &keys::GuestEscape, _, cx| {
+                this.view.update(cx, |view, cx| view.send_escape(cx))
+            }))
+            .child(self.view.clone())
     }
 }
 

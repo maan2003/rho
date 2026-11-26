@@ -8,7 +8,7 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::keys::Close;
+use rho_frame::keys::{self, GuestEscape};
 use rho_frame::{CardHere, Surface};
 use theme::ActiveTheme as _;
 
@@ -151,6 +151,14 @@ impl ShellSurface {
         }
     }
 
+    /// `f9` while typing: a literal escape in the line, which `escape`,
+    /// back to the window's keys, never types.
+    fn guest_escape(&mut self, _: &GuestEscape, window: &mut Window, cx: &mut Context<Self>) {
+        if let State::Open { editor, .. } = &self.state {
+            editor.update(cx, |editor, cx| editor.insert("\u{1b}", window, cx));
+        }
+    }
+
     fn pager(&mut self, action: PagerAction, cx: &mut Context<Self>) {
         if let Some(model) = self.model() {
             model.read(cx).pager_action(action);
@@ -239,6 +247,7 @@ impl Render for ShellSurface {
             .capture_any_mouse_down(cx.listener(Self::tap_prompt))
             .on_action(cx.listener(Self::interrupt))
             .on_action(cx.listener(Self::eof))
+            .on_action(cx.listener(Self::guest_escape))
             .on_action(
                 cx.listener(|this, _: &ShellPagerMore, _, cx| {
                     this.pager(PagerAction::Continue, cx)
@@ -257,7 +266,7 @@ impl Render for ShellSurface {
         };
         root.child(
             div()
-                .key_context("RhoShellNote")
+                .key_context(keys::PLACE)
                 .track_focus(&self.focus)
                 .size_full()
                 .p_2()
@@ -280,11 +289,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-n", ShellNext, Some(insert)),
         KeyBinding::new("ctrl-c", ShellInterrupt, Some(insert)),
         KeyBinding::new("ctrl-d", ShellEof, Some(insert)),
+        KeyBinding::new("f9", GuestEscape, Some(insert)),
         KeyBinding::new("alt-enter", ShellPagerMore, Some("RhoShell > Editor")),
         KeyBinding::new("alt-a", ShellPagerAll, Some("RhoShell > Editor")),
         KeyBinding::new("alt-q", ShellPagerQuit, Some("RhoShell > Editor")),
-        // Before the shell is attached there is no editor: `q` still closes.
-        KeyBinding::new("q", Close, Some("RhoShellNote")),
     ]);
     for context in rho_frame::normal_contexts("RhoShell", " && vim_operator == none") {
         cx.bind_keys([

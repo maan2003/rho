@@ -605,7 +605,7 @@ impl Frame {
             || !self.desk_in_view()
             || self.minibuffer.is_some()
             || self.menu.is_some()
-            || self.idea_editor().is_some()
+            || self.idea_in_view()
             || self.phone.snap.is_some()
         {
             return;
@@ -632,7 +632,7 @@ impl Frame {
         let send = surface.phone_send(cx);
         let prompting = self.minibuffer.is_some();
         let typing = self.mode(window, cx).contains("insert");
-        let composing_idea = self.idea_editor().is_some() || (typing && self.idea_here(cx));
+        let composing_idea = self.idea_in_view();
         let mut tools = if prompting || composing_idea {
             Vec::new()
         } else {
@@ -783,22 +783,19 @@ impl Frame {
             }
             Button::More => self.verdict_menu(window, cx),
             Button::Undo => {
-                if let Some(editor) = self
-                    .idea_editor()
-                    .or_else(|| self.current_surface().editor(cx))
-                {
+                if let Some(editor) = self.current_surface().editor(cx) {
                     editor.update(cx, |editor, cx| {
                         editor.undo(&editor::actions::Undo, window, cx)
                     });
                 }
             }
-            Button::Send if self.idea_here(cx) => self.send_idea(window, cx),
+            Button::Send if self.idea_in_view() => self.send_idea(window, cx),
             Button::Send => {
                 if let Some(send) = send {
                     send(window, cx);
                 }
             }
-            Button::Cancel if self.idea_here(cx) && self.minibuffer.is_none() => {
+            Button::Cancel if self.idea_in_view() && self.minibuffer.is_none() => {
                 self.cancel_idea(window, cx)
             }
             Button::Cancel => self.minibuffer_cancel(window, cx),

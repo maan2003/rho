@@ -166,17 +166,28 @@ impl Outbox {
         Some((id, outgoing, Kept::Gone(id)))
     }
 
-    pub(crate) fn refuse_reply(&mut self, endpoint: EndpointId, reason: String) -> Kept {
+    /// The host refused the message in flight: a reply, or an idea whose
+    /// start it would not make. It stays, marked, and is not posted again.
+    pub(crate) fn refuse(&mut self, endpoint: EndpointId, reason: String) -> (u64, Kept) {
         let Some(Sending::Posting(id)) = self.sending.remove(&endpoint) else {
-            unreachable!("a refused reply was in flight")
+            unreachable!("a refused message was in flight")
         };
         let (_, _, outgoing) = self
             .waiting
             .iter_mut()
             .find(|(host, client_id, _)| *host == endpoint && *client_id == id)
-            .expect("the in-flight reply is still in the outbox");
+            .expect("the in-flight message is still in the outbox");
         outgoing.state = OutgoingState::Refused { reason };
-        Kept::Put(id, outgoing.clone())
+        (id, Kept::Put(id, outgoing.clone()))
+    }
+
+    /// Takes a refused message out, for the user to write it again.
+    pub(crate) fn withdraw_refused(&mut self, id: u64) -> Option<(EndpointId, Kept)> {
+        let at = self.waiting.iter().position(|(_, client_id, outgoing)| {
+            *client_id == id && matches!(outgoing.state, OutgoingState::Refused { .. })
+        })?;
+        let (host, id, _) = self.waiting.remove(at);
+        Some((host, Kept::Gone(id)))
     }
 
     pub(crate) fn settlements(&self, endpoint: EndpointId) -> impl Iterator<Item = MessageVersion> {

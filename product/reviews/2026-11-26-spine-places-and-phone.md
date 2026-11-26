@@ -14,7 +14,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 1. Four incompatible navigation & escape schemes across raw places — and `Desktop` hijacks `space`
 - **Kind:** product
 - **Level:** high-level
-- **Status:** decided (2026-11-26: universal dual-escape across all raw places — `Escape` enters rho `NOR`, `F9` forwards literal `Escape` to guest; code rewrite queued for Loop 2)
+- **Status:** decided (2026-11-26: universal dual-escape across all raw places — `Escape` enters rho `NOR`, `F9` forwards literal `Escape` to guest) → fixed (2026-11-26, Loop 2 branch `loop2/c4-dual-escape-idea`)
 - **Where:** `window.Screen`, `browser.Page`, `agents.Terminal`, `agents.Desktop`, `agents.Shell`
 - **Evidence:**
   - **Product state:** `product/index.md` promises *"The same keys reach a terminal, a desktop, and a page in the browser"* (`An editor, not an app`) and *"the way back is one key"* (`Moving between places costs nothing`). In reality, the product splits into four different exit/navigation schemes:
@@ -132,7 +132,7 @@ The window spine has a genuinely strong core: a single O(1) cross-area navigatio
 ### 7. The status line mode badge lies on `Browser` and `Desktop` (showing `NOR` while raw typing is active)
 - **Level:** high-level
 - **Action:** fix
-- **Status:** open
+- **Status:** fixed (2026-11-26, Loop 2 branch `loop2/c4-dual-escape-idea`: `PageSurface` and `DesktopSurface` report their own `Surface::mode`)
 - **Where:** `window.Status line`, `browser.Page`, `agents.Desktop`
 - **Evidence:**
   - **Product state:** `product/design.md` (`keys in motion`, `Status line`) defines the mode word at the top-right as telling the user *"how the keyboard will act"*. `TerminalSurface` correctly reports `INS` while typing and `NOR` while reading. However, neither `PageView` nor `DesktopSurface` implements `Surface::mode()`. Because neither has an `Editor`, `Frame::mode()` falls through to `self.mode_indicator.plain_mode()`, which displays **`NOR`** (or whatever stale vim mode the previous editor was in!) while every keystroke goes straight to Slack or the remote desktop app.

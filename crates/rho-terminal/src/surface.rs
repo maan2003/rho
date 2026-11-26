@@ -21,10 +21,7 @@ use crate::protocol::{
     TermKeystroke, TermRow, TermServerFrame, WireScreen,
 };
 
-gpui::actions!(
-    rho_terminal,
-    [TerminalPaste, TerminalNormalMode, TerminalRawMode,]
-);
+gpui::actions!(rho_terminal, [TerminalPaste]);
 
 /// Client-side scrollback retention; the agent host replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;

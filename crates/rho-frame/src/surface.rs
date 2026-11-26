@@ -122,9 +122,11 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         Subject::None
     }
 
-    /// The mode the surface is in, for a surface that keeps its own;
-    /// `None` leaves the mode word to the editor that has the keys.
-    fn mode(&self, _cx: &App) -> Option<Mode> {
+    /// The mode the keys are in on the surface, for one that keeps its
+    /// own, such as a raw place: `Insert` while its guest takes live input
+    /// ([`crate::keys::LIVE`]). `None` leaves the mode word to the editor
+    /// that has the keys.
+    fn mode(&self, _window: &Window, _cx: &App) -> Option<Mode> {
         None
     }
 
@@ -201,7 +203,7 @@ trait SurfaceHandle {
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subject(&self, card: Option<Seen>, cx: &App) -> Subject;
-    fn mode(&self, cx: &App) -> Option<Mode>;
+    fn mode(&self, window: &Window, cx: &App) -> Option<Mode>;
     fn card(&self, cx: &App) -> CardHere;
     fn edits_at_point(&self, cx: &App) -> bool;
     fn heading(&self, cx: &App) -> Option<String>;
@@ -249,8 +251,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).subject(card, cx)
     }
 
-    fn mode(&self, cx: &App) -> Option<Mode> {
-        self.read(cx).mode(cx)
+    fn mode(&self, window: &Window, cx: &App) -> Option<Mode> {
+        self.read(cx).mode(window, cx)
     }
 
     fn card(&self, cx: &App) -> CardHere {
@@ -338,8 +340,8 @@ impl AnySurface {
         self.0.subject(card, cx)
     }
 
-    pub fn mode(&self, cx: &App) -> Option<Mode> {
-        self.0.mode(cx)
+    pub fn mode(&self, window: &Window, cx: &App) -> Option<Mode> {
+        self.0.mode(window, cx)
     }
 
     pub fn card(&self, cx: &App) -> CardHere {

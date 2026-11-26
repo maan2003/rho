@@ -17,7 +17,7 @@ use theme::ActiveTheme as _;
 use crate::minibuffer::{Candidate, CandidateSource};
 use crate::place::{self, Write};
 use crate::system::AnySystem;
-use crate::{Frame, FrameLink};
+use crate::{Frame, FrameLink, Mode, Surface};
 
 /// A project address as it is written, with the stable identity of the
 /// project that owns delivery. Neither its displayed name nor its host's
@@ -88,33 +88,35 @@ pub struct IdeaMail {
     pub runtime: Option<RuntimeLabel>,
 }
 
+/// The idea the user is writing, kept across restarts until it is sent.
+/// Sending hands it to the outbox and clears it at once, so a second idea
+/// can be written while the first waits for its host.
 pub(crate) struct IdeaBox {
     pub(crate) text: Entity<Buffer>,
     project: Option<Address>,
     recipient: String,
     runtime: Option<String>,
-    client_id: Option<u64>,
-    overlay: Option<Overlay>,
     _edits: gpui::Subscription,
 }
 
-struct Overlay {
+/// The idea draft as a screen (`chat.Write an idea`): its `to:` and `on:`
+/// lines over its words, which fill the window. It is a screen like any
+/// other, so the window's keys act on it and never on the one before.
+pub struct IdeaView {
     editor: Entity<Editor>,
-    address: Entity<Editor>,
+    pub(crate) address: Entity<Editor>,
     runtime: Entity<Editor>,
-    return_focus: FocusHandle,
     _edits: [gpui::Subscription; 2],
 }
 
 impl IdeaBox {
     pub(crate) fn new(cx: &mut Context<Frame>, db: &rho_db::RhoDb) -> Self {
-        let (project, recipient, runtime, client_id, words) = place::idea_draft(db)
+        let (project, recipient, runtime, words) = place::idea_draft(db)
             .map(|saved| {
                 (
                     saved.address.and_then(|a| Address::parse(&a)),
                     saved.recipient,
                     saved.runtime,
-                    saved.client_id,
                     saved.text,
                 )
             })
@@ -126,21 +128,22 @@ impl IdeaBox {
             project,
             recipient,
             runtime,
-            client_id,
-            overlay: None,
         }
     }
 
     fn subscribe(text: &Entity<Buffer>, cx: &mut Context<Frame>) -> gpui::Subscription {
         cx.subscribe(text, |frame, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
-                if let Some(overlay) = &frame.idea.overlay {
-                    overlay.editor.update(cx, Self::style_draft);
+                if let Some(view) = frame.idea_view() {
+                    view.read(cx).editor.clone().update(cx, Self::style_draft);
                 }
-                frame.idea.client_id = None;
                 frame.save_idea(cx);
             }
         })
+    }
+
+    fn is_empty(&self, cx: &App) -> bool {
+        self.text.read(cx).is_empty() && self.recipient.is_empty() && self.runtime.is_none()
     }
 
     fn style_draft(editor: &mut Editor, cx: &mut Context<Editor>) {
@@ -152,6 +155,72 @@ impl IdeaBox {
             )
             .expect("the idea excerpt contains its buffer");
         crate::draft::style(editor, range, "idea", cx);
+    }
+}
+
+impl Surface for IdeaView {
+    fn title(&self, _cx: &App) -> String {
+        "idea".to_owned()
+    }
+
+    fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
+        Some(self.editor.clone())
+    }
+
+    /// The `to:` and `on:` lines are plain lines that always type; the
+    /// words are a modal buffer, whose mode is vim's to say.
+    fn mode(&self, window: &Window, cx: &App) -> Option<Mode> {
+        [&self.address, &self.runtime]
+            .into_iter()
+            .any(|line| line.focus_handle(cx).is_focused(window))
+            .then_some(Mode::Insert)
+    }
+
+    fn edits_at_point(&self, _cx: &App) -> bool {
+        true
+    }
+
+    /// A fresh idea opens ready to type.
+    fn opened(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        window.on_next_frame(move |window, cx| {
+            if editor.focus_handle(cx).is_focused(window) && editor.read(cx).is_empty(cx) {
+                vim::enter_insert_mode(&editor, window, cx);
+            }
+        });
+    }
+}
+
+impl Focusable for IdeaView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for IdeaView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let line = |context: &'static str, label: &'static str, field: &Entity<Editor>| {
+            div()
+                .key_context(context)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .text_color(colors.text_muted)
+                .child(label)
+                .child(div().flex_1().child(field.clone()))
+        };
+        div()
+            .id("rho-idea")
+            .key_context("RhoIdea")
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(line("RhoIdeaAddress", "to:", &self.address))
+            .child(line("RhoIdeaRuntime", "on:", &self.runtime))
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
 }
 
@@ -179,8 +248,22 @@ impl Frame {
         })
     }
 
-    pub(crate) fn idea_here(&self, _cx: &App) -> bool {
-        self.idea.overlay.is_some()
+    /// The idea's screen. The frame holds it in history like any other;
+    /// the draft itself is [`IdeaBox`]'s.
+    pub(crate) fn idea_address() -> Address {
+        Address::new(crate::frame::FRAME_KIND, "idea")
+    }
+
+    /// The idea's screen, while the window holds it.
+    pub(crate) fn idea_view(&self) -> Option<Entity<IdeaView>> {
+        self.surface(&Self::idea_address())?
+            .view()
+            .downcast::<IdeaView>()
+            .ok()
+    }
+
+    pub(crate) fn idea_in_view(&self) -> bool {
+        self.current_address() == &Self::idea_address()
     }
 
     fn resolved_idea_project(&self, cx: &App) -> Option<(AnySystem, IdeaProject)> {
@@ -214,7 +297,6 @@ impl Frame {
                 address: self.idea.project.as_ref().map(ToString::to_string),
                 recipient: self.idea.recipient.clone(),
                 runtime: self.idea.runtime.clone(),
-                client_id: self.idea.client_id,
                 text,
             });
         self.place.write(Write::IdeaDraft(draft));
@@ -224,16 +306,8 @@ impl Frame {
         if self.minibuffer.is_some() || self.menu.is_some() {
             return;
         }
-        if self.idea.overlay.is_some() {
+        if self.idea_in_view() {
             self.choose_idea_project(ProjectIntent::Address, window, cx);
-            return;
-        }
-        if self.idea.client_id.is_some_and(|id| {
-            self.systems
-                .iter()
-                .any(|system| system.idea_pending(id, cx))
-        }) {
-            self.echo("idea: waiting for the host", StyleClass::SystemInfo, cx);
             return;
         }
         // A saved addressee belongs to the draft; a default may only fill a
@@ -247,11 +321,24 @@ impl Frame {
             if let Some(project) = project {
                 self.idea.recipient = project.name;
                 self.idea.project = Some(project.address);
+                if let Some(view) = self.idea_view() {
+                    let recipient = self.idea.recipient.clone();
+                    view.read(cx).address.clone().update(cx, |address, cx| {
+                        address.set_text(recipient.as_str(), window, cx)
+                    });
+                }
             }
         }
-        let return_focus = window
-            .focused(cx)
-            .unwrap_or_else(|| self.current_surface().focus_handle(cx));
+        self.open(Self::idea_address(), window, cx);
+        self.refresh_idea_runtime(window, cx);
+    }
+
+    /// The idea's screen over the draft as it stands.
+    pub(crate) fn make_idea_view(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<IdeaView> {
         let buffer = cx.new(|cx| MultiBuffer::singleton(self.idea.text.clone(), cx));
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
@@ -289,7 +376,6 @@ impl Frame {
                     let recipient = address.read(cx).text(cx);
                     if frame.idea.recipient != recipient {
                         frame.idea.recipient = recipient;
-                        frame.idea.client_id = None;
                         frame.save_idea(cx);
                         frame_link.with(cx, |frame, window, cx| {
                             frame.refresh_idea_runtime(window, cx);
@@ -298,10 +384,16 @@ impl Frame {
                 }
             },
         );
+        let hint = self
+            .resolved_idea_project(cx)
+            .and_then(|(_, project)| project.runtime);
         let runtime = cx.new(|cx| {
             let mut field = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut field, window, cx);
             field.set_use_modal_editing(false);
+            if let Some(hint) = &hint {
+                field.set_placeholder_text(hint.as_str(), window, cx);
+            }
             if let Some(runtime) = &self.idea.runtime {
                 field.set_text(runtime.as_str(), window, cx);
             }
@@ -315,42 +407,30 @@ impl Frame {
                     let override_text = (!text.is_empty()).then_some(text);
                     if frame.idea.runtime != override_text {
                         frame.idea.runtime = override_text;
-                        frame.idea.client_id = None;
                         frame.save_idea(cx);
                     }
                 }
             },
         );
-        self.idea.overlay = Some(Overlay {
-            editor: editor.clone(),
+        cx.new(|_| IdeaView {
+            editor,
             address,
             runtime,
-            return_focus,
             _edits: [address_edits, runtime_edits],
-        });
-        self.refresh_idea_runtime(window, cx);
-        window.focus(&editor.focus_handle(cx), cx);
-        window.on_next_frame(move |window, cx| {
-            if editor.focus_handle(cx).is_focused(window) {
-                if editor.read(cx).is_empty(cx) {
-                    vim::enter_insert_mode(&editor, window, cx);
-                }
-            }
-        });
-        cx.notify();
+        })
     }
 
     /// The automatic answer is only a placeholder, not a copied setting
     /// or an explicit override. Editing the field replaces it with words.
     pub fn refresh_idea_runtime(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(overlay) = &self.idea.overlay else {
+        let Some(view) = self.idea_view() else {
             return;
         };
         let label = self
             .resolved_idea_project(cx)
             .and_then(|(_, project)| project.runtime);
         let hint = label.as_ref().map_or("", RuntimeLabel::as_str);
-        overlay.runtime.update(cx, |field, cx| {
+        view.read(cx).runtime.clone().update(cx, |field, cx| {
             if field.placeholder_text(cx).as_deref() != Some(hint) {
                 field.set_placeholder_text(hint, window, cx);
             }
@@ -358,7 +438,7 @@ impl Frame {
     }
 
     pub(crate) fn prompt_idea_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.idea_here(cx) {
+        if !self.idea_in_view() {
             return;
         }
         let project = self
@@ -386,27 +466,26 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(overlay) = &self.idea.overlay else {
+        let Some(view) = self.idea_view() else {
             return;
         };
-        self.idea.client_id = None;
+        let field = view.read(cx).runtime.clone();
         self.idea.runtime = Some(runtime.label());
-        overlay
-            .runtime
-            .update(cx, |field, cx| field.set_text(runtime.as_str(), window, cx));
+        field.update(cx, |field, cx| field.set_text(runtime.as_str(), window, cx));
         self.save_idea(cx);
-        window.focus(&overlay.runtime.focus_handle(cx), cx);
+        window.focus(&field.focus_handle(cx), cx);
         cx.notify();
     }
 
     pub(crate) fn focus_idea_address(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(overlay) = &self.idea.overlay {
-            let handle = if overlay.address.focus_handle(cx).is_focused(window) {
-                overlay.runtime.focus_handle(cx)
-            } else if overlay.runtime.focus_handle(cx).is_focused(window) {
-                overlay.editor.focus_handle(cx)
+        if let Some(view) = self.idea_view() {
+            let view = view.read(cx);
+            let handle = if view.address.focus_handle(cx).is_focused(window) {
+                view.runtime.focus_handle(cx)
+            } else if view.runtime.focus_handle(cx).is_focused(window) {
+                view.editor.focus_handle(cx)
             } else {
-                overlay.address.focus_handle(cx)
+                view.address.focus_handle(cx)
             };
             window.focus(&handle, cx);
         }
@@ -459,7 +538,7 @@ impl Frame {
                                 let before = before.clone();
                                 let place = place.clone();
                                 link.with(cx, move |frame, window, cx| {
-                                    if frame.idea.overlay.is_some()
+                                    if frame.idea_in_view()
                                         && frame.idea.recipient == before
                                         && frame.current_address() == &place
                                         && frame.minibuffer.is_none()
@@ -581,35 +660,31 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(overlay) = &self.idea.overlay else {
+        let Some(view) = self.idea_view() else {
             return;
         };
-        if self.idea.project.as_ref() != Some(&project.address) {
-            self.idea.client_id = None;
-        }
+        let (address, editor) = {
+            let view = view.read(cx);
+            (view.address.clone(), view.editor.clone())
+        };
         self.idea.project = Some(project.address);
         self.idea.recipient = project.name;
-        overlay.address.update(cx, |address, cx| {
-            address.set_text(self.idea.recipient.as_str(), window, cx)
+        let recipient = self.idea.recipient.clone();
+        address.update(cx, |address, cx| {
+            address.set_text(recipient.as_str(), window, cx)
         });
         self.save_idea(cx);
         self.refresh_idea_runtime(window, cx);
-        window.focus(&overlay.editor.focus_handle(cx), cx);
+        window.focus(&editor.focus_handle(cx), cx);
         cx.notify();
         if matches!(intent, ProjectIntent::Send) {
             self.send_idea(window, cx);
         }
     }
 
-    pub(crate) fn close_idea_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(overlay) = self.idea.overlay.take() {
-            window.focus(&overlay.return_focus, cx);
-            cx.notify();
-        }
-    }
-
+    /// Closes the idea's screen; the draft stays for next time.
     pub(crate) fn cancel_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_idea_overlay(window, cx);
+        self.close(&Self::idea_address(), window, cx);
     }
 
     fn clear_idea(&mut self, cx: &mut Context<Self>) {
@@ -619,12 +694,13 @@ impl Frame {
         self.idea.project = None;
         self.idea.recipient.clear();
         self.idea.runtime = None;
-        self.idea.client_id = None;
         self.save_idea(cx);
     }
 
+    /// Hands the idea in view to its project's outbox, which keeps it until
+    /// the host has it, and clears the draft for the next idea.
     pub(crate) fn send_idea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.idea_here(cx) {
+        if !self.idea_in_view() {
             return;
         }
         let text = self.idea.text.read(cx).text();
@@ -649,116 +725,68 @@ impl Frame {
                 return;
             }
         };
-        if self.idea.project.as_ref() != Some(&project.address) {
-            self.idea.client_id = None;
-        }
-        self.idea.project = Some(project.address.clone());
-        self.idea.recipient = project.name;
-        let client_id = *self.idea.client_id.get_or_insert_with(|| {
-            let bytes = *uuid::Uuid::new_v4().as_bytes();
-            u64::from_le_bytes(bytes[8..].try_into().expect("UUID halves are 8 bytes"))
-        });
-        self.save_idea(cx);
-        self.close_idea_overlay(window, cx);
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let client_id = u64::from_le_bytes(bytes[8..].try_into().expect("UUID halves are 8 bytes"));
         system.send_idea(
             IdeaMail {
                 client_id,
                 project: project.address,
-                text,
+                text: text.clone(),
                 runtime,
             },
             cx,
         );
+        self.clear_idea(cx);
+        self.close(&Self::idea_address(), window, cx);
         self.echo(
-            &format!("queued for {}", self.idea.recipient),
+            &format!("queued for {}: {}", project.name, first_line(&text)),
             StyleClass::SystemInfo,
             cx,
         );
     }
 
-    /// Keep the submitted draft until the host answers. A refusal removes
-    /// only its outbox attempt, so the words remain available to edit.
-    pub fn finish_idea(&mut self, id: u64, result: Result<(), String>, cx: &mut Context<Self>) {
-        if self.idea.client_id != Some(id) {
-            return;
-        }
-        match result {
-            Ok(()) => {
-                let name = self.idea.recipient.clone();
-                let idea: String = self
-                    .idea
-                    .text
-                    .read(cx)
-                    .text()
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("")
-                    .trim()
-                    .chars()
-                    .take(60)
-                    .collect();
-                self.clear_idea(cx);
-                self.echo(
-                    &format!("sent to {name}: {idea}"),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            }
-            Err(reason) => self.echo(
-                &format!("idea: {reason} · draft kept"),
-                StyleClass::SystemImportant,
+    /// Takes an idea the host refused back into the draft, to change and
+    /// send again, when no other idea is being written; `false` leaves it
+    /// where it was.
+    pub fn write_idea_again(
+        &mut self,
+        idea: IdeaMail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.idea.is_empty(cx) {
+            self.echo(
+                "idea: send or clear the idea being written first",
+                StyleClass::SystemInfo,
                 cx,
-            ),
+            );
+            return false;
         }
-    }
-
-    pub(crate) fn idea_editor(&self) -> Option<Entity<Editor>> {
+        self.close(&Self::idea_address(), window, cx);
         self.idea
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.editor.clone())
+            .text
+            .update(cx, |draft, cx| draft.set_text(idea.text, cx));
+        self.idea.recipient = self
+            .project_for(&idea.project, cx)
+            .map(|(_, project)| project.name)
+            .unwrap_or_default();
+        self.idea.project = Some(idea.project);
+        self.idea.runtime = idea.runtime.map(|runtime| runtime.label());
+        self.save_idea(cx);
+        self.prompt_idea(window, cx);
+        true
     }
+}
 
-    pub(crate) fn render_idea(&self, cx: &App) -> Option<gpui::AnyElement> {
-        let overlay = self.idea.overlay.as_ref()?;
-        let colors = cx.theme().colors();
-        Some(
-            div()
-                .id("rho-idea")
-                .key_context("RhoIdea")
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .key_context("RhoIdeaAddress")
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .text_color(colors.text_muted)
-                        .child("to:")
-                        .child(div().flex_1().child(overlay.address.clone())),
-                )
-                .child(
-                    div()
-                        .key_context("RhoIdeaRuntime")
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .text_color(colors.text_muted)
-                        .child("on:")
-                        .child(div().flex_1().child(overlay.runtime.clone())),
-                )
-                .child(div().flex_1().min_h_0().child(overlay.editor.clone()))
-                .into_any_element(),
-        )
-    }
+/// An idea as the echo names it: its first written line, cut short.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect()
 }
 
 #[cfg(test)]
@@ -929,9 +957,12 @@ mod tests {
             cx.run_until_parked();
             window
                 .update(cx, |frame, window, cx| {
-                    assert_eq!(frame.idea.recipient, name);
-                    assert_eq!(frame.idea.text.read(cx).text(), text);
-                    assert_eq!(frame.idea_here(cx), !sending);
+                    // A sent idea is the outbox's: the draft is clear for
+                    // the next one.
+                    let (recipient, words) = if sending { ("", "") } else { (name, text) };
+                    assert_eq!(frame.idea.recipient, recipient);
+                    assert_eq!(frame.idea.text.read(cx).text(), words);
+                    assert_eq!(frame.idea_in_view(), !sending);
                     assert_eq!(host.read(cx).sent.len(), sending as usize);
                     if !sending {
                         frame.cancel_idea(window, cx);
@@ -945,6 +976,134 @@ mod tests {
             assert_eq!(send.text, text);
             assert_eq!(send.project, Address::new("project", "stern"));
         });
+    }
+
+    /// `chat.Write an idea` step 3: a sent idea is the outbox's at once, so
+    /// a second can be written while the first still waits for its host.
+    #[gpui::test]
+    fn a_second_idea_is_written_while_the_first_waits(cx: &mut gpui::TestAppContext) {
+        let host = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            cx.new(|_| ProjectHost {
+                projects: vec![IdeaProject {
+                    address: Address::new("project", "tide"),
+                    name: "tide@lab".into(),
+                    runtime: None,
+                }],
+                sent: Vec::new(),
+            })
+        });
+        let db = rho_db::RhoDb::in_memory();
+        let window = cx.add_window(|window, cx| {
+            Frame::new(
+                db.clone(),
+                vec![AnySystem::new(host.clone())],
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        for words in ["Check the tide", "And the moon"] {
+            window
+                .update(cx, |frame, window, cx| {
+                    frame.prompt_idea(window, cx);
+                    assert!(frame.idea_in_view(), "{words}: the idea opens");
+                    let view = frame.idea_view().unwrap();
+                    assert_eq!(view.read(cx).editor.read(cx).text(cx), "", "{words}");
+                    view.read(cx)
+                        .address
+                        .clone()
+                        .update(cx, |address, cx| address.set_text("tide@lab", window, cx));
+                    frame.idea.text.update(cx, |draft, cx| {
+                        draft.edit([(0..0, words)], None, cx);
+                    });
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |frame, window, cx| {
+                    frame.send_idea(window, cx);
+                    assert!(!frame.idea_in_view());
+                    assert_eq!(frame.idea.text.read(cx).text(), "");
+                    assert_eq!(frame.idea.recipient, "");
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update(|cx| {
+            let sent = &host.read(cx).sent;
+            let words: Vec<_> = sent.iter().map(|mail| mail.text.as_str()).collect();
+            assert_eq!(words, ["Check the tide", "And the moon"]);
+            assert_ne!(sent[0].client_id, sent[1].client_id);
+            assert!(
+                sent.iter()
+                    .all(|mail| mail.project == Address::new("project", "tide"))
+            );
+        });
+        assert_eq!(
+            place::idea_draft(&db),
+            None,
+            "nothing is left to send twice"
+        );
+    }
+
+    #[gpui::test]
+    fn a_refused_idea_comes_back_only_into_an_empty_draft(cx: &mut gpui::TestAppContext) {
+        let host = cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            cx.new(|_| ProjectHost {
+                projects: vec![IdeaProject {
+                    address: Address::new("project", "tide"),
+                    name: "tide@lab".into(),
+                    runtime: None,
+                }],
+                sent: Vec::new(),
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            Frame::new(
+                rho_db::RhoDb::in_memory(),
+                vec![AnySystem::new(host.clone())],
+                Vec::new(),
+                Rc::new(|| {}),
+                window,
+                cx,
+            )
+        });
+        let refused = || IdeaMail {
+            client_id: 3,
+            project: Address::new("project", "tide"),
+            text: "Check the tide".into(),
+            runtime: Some(RuntimeLabel::parse("sol-high").unwrap()),
+        };
+        window
+            .update(cx, |frame, window, cx| {
+                frame.idea.text.update(cx, |draft, cx| {
+                    draft.edit([(0..0, "Another thought")], None, cx);
+                });
+                assert!(!frame.write_idea_again(refused(), window, cx));
+                assert_eq!(frame.idea.text.read(cx).text(), "Another thought");
+                frame.clear_idea(cx);
+                assert!(frame.write_idea_again(refused(), window, cx));
+                assert!(frame.idea_in_view());
+                assert_eq!(frame.idea.text.read(cx).text(), "Check the tide");
+                assert_eq!(frame.idea.recipient, "tide@lab");
+                assert_eq!(frame.idea.runtime.as_deref(), Some("sol-high"));
+                let view = frame.idea_view().unwrap();
+                assert_eq!(view.read(cx).address.read(cx).text(cx), "tide@lab");
+            })
+            .unwrap();
     }
 
     #[test]

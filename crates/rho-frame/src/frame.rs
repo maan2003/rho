@@ -310,6 +310,9 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Opening {
+        if *address == Self::idea_address() {
+            return Opening::Surface(AnySurface::new(self.make_idea_view(window, cx)));
+        }
         match self
             .systems
             .clone()
@@ -437,9 +440,6 @@ impl Frame {
     /// The surface in view's editor, or the chrome's for a surface that is
     /// no buffer.
     pub fn active_editor(&self, cx: &App) -> Entity<Editor> {
-        if let Some(editor) = self.idea_editor() {
-            return editor;
-        }
         self.current_surface()
             .editor(cx)
             .unwrap_or_else(|| self.chrome_editor.clone())
@@ -674,7 +674,8 @@ impl Frame {
     /// Desk only steps out of view.
     pub fn close(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_address() == address;
-        if address.kind() != FRAME_KIND {
+        let desk = *address == Self::desk_address();
+        if !desk {
             rho_journal::record(rho_journal::Event::HistoryRemoved {
                 identity: journal_surface(address),
                 method: rho_journal::HistoryRemoveMethod::Close,
@@ -687,8 +688,8 @@ impl Frame {
                 self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
             // A forgotten entry under the cursor is left on the first step
-            // either way; a frame surface closes by stepping off it.
-            if address.kind() == FRAME_KIND && self.current_address() == address {
+            // either way; Desk closes by stepping off it.
+            if desk && self.current_address() == address {
                 self.history.show(Self::desk_address(), ScreenEntry::Opened);
             }
             self.settle(false, window, cx);
@@ -720,10 +721,6 @@ impl Frame {
 
     pub fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.is_some() {
-            return;
-        }
-        if self.idea_here(cx) {
-            self.close_idea_overlay(window, cx);
             return;
         }
         if self.history.back().is_none() {
@@ -772,7 +769,7 @@ impl Frame {
     }
 
     fn return_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if *self.current_address() != Self::desk_address() || self.idea_here(cx) {
+        if *self.current_address() != Self::desk_address() {
             self.open_desk(window, cx);
         } else {
             self.report_active_surface(window, cx);
@@ -847,7 +844,6 @@ impl Frame {
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
-        self.close_idea_overlay(window, cx);
         self.overlay_return = None;
         self.ask_after(window, cx);
     }
@@ -1549,12 +1545,7 @@ impl Frame {
             Layout::Phone => Some(surface.phone_titles(cx)),
             Layout::Desktop => None,
         };
-        let composing_idea = self.idea_here(cx);
-        let surface_status = if composing_idea {
-            String::new()
-        } else {
-            surface.status(cx).unwrap_or_default()
-        };
+        let surface_status = surface.status(cx).unwrap_or_default();
         let measured = crate::phone::measure(text_style, window);
         // The pairing hint is secondary to a surface that has already
         // shed everything but the name of the work and its condition.
@@ -1610,9 +1601,7 @@ impl Frame {
         // Echo replaces the state, not the heading, so a verdict does
         // not hide which screen it left us on.
         let own_card = self.own_card(cx);
-        let (heading, state, state_color) = if composing_idea {
-            ("idea".to_owned(), String::new(), colors.text_muted)
-        } else if let Some(address) = own_card {
+        let (heading, state, state_color) = if let Some(address) = own_card {
             // The card's words while it waits; otherwise the surface says
             // what it is doing, as any other screen does.
             let heading = surface
@@ -1706,20 +1695,13 @@ impl Frame {
             .into_any_element()
     }
 
-    /// The mode the keys are in. The minibuffer and global idea strip
-    /// always type; the mode indicator follows the active surface editor.
+    /// The mode the keys are in: a surface's own while it has the keys,
+    /// such as a raw place taking live input; else the minibuffer's or the
+    /// surface editor's, as vim reads it.
     pub(crate) fn mode(&self, window: &Window, cx: &App) -> String {
-        let idea = self.idea_editor();
-        if idea
-            .as_ref()
-            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
-        {
-            return "insert".to_owned();
-        }
-        // A surface with a mode of its own says it while it has the keys;
-        // a menu or a prompt over it is the editor's to say.
+        // A menu or a prompt over the surface is the editor's to say.
         if self.menu.is_none() && self.minibuffer.is_none() {
-            match self.current_surface().mode(cx) {
+            match self.current_surface().mode(window, cx) {
                 Some(Mode::Normal) => return "normal".to_owned(),
                 Some(Mode::Insert) => return "insert".to_owned(),
                 None => {}
@@ -1837,7 +1819,7 @@ impl Focusable for Frame {
 
 impl Render for Frame {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = self.idea_editor().unwrap_or_else(|| self.active_editor(cx));
+        let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
         let layout = Layout::of(window.viewport_size().width);
@@ -1888,9 +1870,6 @@ impl Render for Frame {
             }))
             .on_action(
                 cx.listener(|this, _: &keys::SendIdea, window, cx| this.send_idea(window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &keys::CancelIdea, window, cx| this.cancel_idea(window, cx)),
             )
             .on_action(cx.listener(|this, _: &keys::RedoEdit, window, cx| {
                 let surface = this.current_surface();
@@ -1954,10 +1933,8 @@ impl Render for Frame {
                 cx,
             )
         });
-        let idea = self.render_idea(cx);
         if layout == Layout::Phone {
-            let body =
-                idea.unwrap_or_else(|| self.render_phone_surface(&surface, cx).into_any_element());
+            let body = self.render_phone_surface(&surface, cx);
             let bar = self.render_phone_bar(window, cx);
             let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
@@ -1966,19 +1943,11 @@ impl Render for Frame {
                 .child(bar)
                 .children(sheet);
         }
-        let keep_bottom = idea.is_none()
-            && surface
-                .editor(cx)
-                .is_some_and(|editor| editor.read(cx).keeps_bottom_visible());
+        let keep_bottom = surface
+            .editor(cx)
+            .is_some_and(|editor| editor.read(cx).keeps_bottom_visible());
         frame
-            .child(idea.unwrap_or_else(|| {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(surface.view())
-                    .into_any_element()
-            }))
+            .child(div().flex_1().min_h_0().w_full().child(surface.view()))
             .children(self.menu.as_ref().map(|open| {
                 let menu = div().track_focus(&self.menu_focus);
                 // A bottom-aligned document and a stuck excerpt need space
@@ -2312,6 +2281,90 @@ mod tests {
                 let menu = &frame.menu.as_ref().expect("space still opens a menu").rows;
                 assert_eq!(menu.title, "no card here");
                 assert_eq!(labels(menu), ["undo", "next card"]);
+            })
+            .unwrap();
+    }
+
+    /// `chat.Write an idea`: the draft is a screen of its own, so the
+    /// window's keys act on it and never on the screen it came from.
+    #[gpui::test]
+    fn the_idea_screen_takes_the_window_keys_from_the_screen_under_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = test_frame(cx, rho_db::RhoDb::in_memory());
+        let thread = Address::new("thread", "lab/7");
+        window
+            .update(cx, |frame, window, cx| {
+                let view = cx.new(|cx| OpenCard(cx.focus_handle()));
+                frame.surfaces.insert(thread.clone(), AnySurface::new(view));
+                let mut card = frame.card_for(&thread, cx);
+                card.kind = rho_dealer::rank::CardKind::Waits;
+                frame.signals.hand.cards = vec![card];
+                frame.open(thread.clone(), window, cx);
+                frame.prompt_idea(window, cx);
+                frame.idea.text.update(cx, |draft, cx| {
+                    draft.edit([(0..0, "Half a thought")], None, cx)
+                });
+                assert!(frame.idea_in_view());
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // `space` over the idea is about no card: never the thread's done.
+        cx.dispatch_action(window.into(), keys::VerdictMenu);
+        window
+            .update(cx, |frame, window, cx| {
+                let menu = &frame.menu.as_ref().expect("space opens a menu").rows;
+                assert_eq!(labels(menu), ["undo", "next card"]);
+                frame.close_overlays(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // The mode word is the editor's, not a fixed `INS`: this test runs
+        // without vim, so the words read `normal`; the `to:` line types.
+        window
+            .update(cx, |frame, window, cx| {
+                assert_eq!(frame.mode(window, cx), "normal");
+                let view = frame.idea_view().unwrap();
+                let address = view.read(cx).address.focus_handle(cx);
+                window.focus(&address, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, window, cx| {
+                assert_eq!(frame.mode(window, cx), "insert");
+                frame.focus_surface(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Back and forward walk past the idea like any screen.
+        cx.dispatch_action(window.into(), keys::Back);
+        window
+            .update(cx, |frame, _, _| {
+                assert_eq!(frame.current_address(), &thread)
+            })
+            .unwrap();
+        // The test card draws no focus of its own, so the step back in
+        // is the frame's call rather than a key.
+        window
+            .update(cx, |frame, window, cx| {
+                frame.forward_or_deal(window, cx);
+                assert!(frame.idea_in_view());
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // `q` closes the idea, not the thread under it, and keeps its words.
+        cx.dispatch_action(window.into(), keys::Close);
+        window
+            .update(cx, |frame, _, cx| {
+                assert_eq!(frame.current_address(), &thread);
+                assert!(frame.surfaces.contains_key(&thread));
+                assert!(frame.idea_view().is_none());
+                assert_eq!(frame.idea.text.read(cx).text(), "Half a thought");
             })
             .unwrap();
     }

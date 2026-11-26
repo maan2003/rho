@@ -125,7 +125,6 @@ impl AgentsSystem {
         UsageSurface::bind_keys(cx);
         rho_terminal::ui::bind_keys(cx);
         rho_shell_view::ui::bind_keys(cx);
-        rho_desktop_client::ui::bind_keys(cx);
         let delivered = cx.subscribe(&mail, |this, _, event: &MailEvent, cx| match event {
             MailEvent::Delivered {
                 endpoint,
