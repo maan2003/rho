@@ -12,7 +12,7 @@ use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, NoAction, W
 use multi_buffer::MultiBufferOffset;
 use rho_agent_hosts::Link;
 use rho_frame::keys::{Close, Desk, Palette, SearchForward, VerdictMenu};
-use rho_frame::{Mode, Surface};
+use rho_frame::{CardHere, Mode, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::TerminalInfo;
@@ -149,6 +149,11 @@ impl TerminalSurface {
 }
 
 impl Surface for TerminalSurface {
+    /// A workset's terminal is its work, looked into from its card.
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::Inspected
+    }
+
     fn title(&self, cx: &App) -> String {
         let mut title = format!("{} · term {}", self.label, self.terminal);
         if let State::Open(view) = &self.state {

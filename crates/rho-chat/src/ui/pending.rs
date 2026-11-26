@@ -7,7 +7,7 @@ use gpui::{
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use rho_dealer::Address;
-use rho_frame::{Subject, Surface};
+use rho_frame::Surface;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingIdeaId(pub(super) u64);
@@ -95,9 +95,5 @@ impl Surface for PendingIdea {
 
     fn editor(&self, _: &App) -> Option<Entity<Editor>> {
         Some(self.editor.clone())
-    }
-
-    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _: &App) -> Subject {
-        Subject::None
     }
 }

@@ -646,7 +646,7 @@ impl Frame {
             // its Palette; that still offers the same related verdicts.
             card: (tools.iter().all(|tool| tool.replaces_desk) && self.phone_card(cx).is_some())
                 .then(|| {
-                    if surface.inspects_card() {
+                    if surface.inspects_card(cx) {
                         OpenCard::Related
                     } else {
                         OpenCard::Here

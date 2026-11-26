@@ -29,8 +29,10 @@ const NOTHING_WAITS: &str = "nothing waits";
 #[derive(Default)]
 pub(crate) struct Signals {
     pub lamp_on: bool,
-    chime_above: bool,
-    initialized: bool,
+    /// The cards above the chime line as of the last evaluation, wherever
+    /// the reader was; `None` before the first, which rings for nothing.
+    /// The chime rings for a card that crosses the line, once.
+    above_chime: Option<BTreeSet<Address>>,
     scheduled: bool,
     /// Ranks again when the hand next changes with nobody touching
     /// anything, such as a card's words saying another age.
@@ -188,16 +190,11 @@ impl Frame {
         }
     }
 
-    /// The dealt snapshot takes precedence; a verdict on a list row instead
-    /// sees the card currently listed there.
+    /// What a verdict settles: what the reader has seen of the card, or
+    /// the whole of a card that does not wait, such as a thread muted
+    /// before it asks.
     fn seen(&self, address: &Address) -> Seen {
-        self.dealt_seen(address).unwrap_or_else(|| {
-            self.hand()
-                .cards
-                .iter()
-                .find(|card| &card.address == address)
-                .map_or(Seen::Whole, |card| card.seen)
-        })
+        self.card_seen(address).unwrap_or(Seen::Whole)
     }
 
     /// Says `writes`, and returns what takes them back.
@@ -252,10 +249,7 @@ impl Frame {
             skip_until: None,
         });
         let said = format!("{verb}: {called}");
-        if matches!(verdict, Verdict::Unmute)
-            || self.current_surface().inspects_card()
-            || self.card_in_view(cx).as_ref() != Some(address)
-        {
+        if matches!(verdict, Verdict::Unmute) || self.own_card(cx).as_ref() != Some(address) {
             self.echo(&said, StyleClass::SystemInfo, cx);
             self.systems_changed(cx);
             return;
@@ -302,7 +296,7 @@ impl Frame {
             StyleClass::SystemInfo,
             cx,
         );
-        if !self.current_surface().inspects_card() {
+        if !self.current_surface().inspects_card(cx) {
             self.open(address, window, cx);
         }
         self.systems_changed(cx);
@@ -440,18 +434,36 @@ impl Frame {
                 let _ = this.update(cx, |this, cx| this.systems_changed(cx));
             })
         });
-        // The lamp signals a card only when it cannot already be read here.
-        // Desk is itself a view of the hand, including its overflow.
+        // The lamp and the chime signal a card only when it cannot already
+        // be read here. Desk is itself a view of the hand, including its
+        // overflow, so on Desk neither signals anything.
         let in_view = self.card_in_view(cx);
-        let chime_card = hand
-            .cards
-            .iter()
-            .filter(|card| Some(&card.address) != in_view.as_ref())
-            .max_by(|a, b| a.priority.total_cmp(&b.priority));
-        let top = chime_card.filter(|_| !self.desk_in_view());
+        let on_desk = self.desk_in_view();
+        let elsewhere = || {
+            hand.cards
+                .iter()
+                .filter(|card| !on_desk && Some(&card.address) != in_view.as_ref())
+        };
+        let top = elsewhere().max_by(|a, b| a.priority.total_cmp(&b.priority));
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| journal_card(&card.address));
-        let chime_card = chime_card.map(|card| (card.priority, journal_card(&card.address)));
+        let above_chime: BTreeSet<Address> = hand
+            .cards
+            .iter()
+            .filter(|card| card.priority >= rho_dealer::curve::CHIME_THRESHOLD)
+            .map(|card| card.address.clone())
+            .collect();
+        // Only a crossing rings. A card already above the line last time
+        // rings no more, even when it crossed on Desk or in view, and a card
+        // long above the line holds back no other card's crossing.
+        let crossed = self.signals.above_chime.as_ref().and_then(|before| {
+            elsewhere()
+                .filter(|card| above_chime.contains(&card.address))
+                .filter(|card| !before.contains(&card.address))
+                .max_by(|a, b| a.priority.total_cmp(&b.priority))
+                .map(|card| (card.priority, journal_card(&card.address)))
+        });
+        self.signals.above_chime = Some(above_chime);
         self.signals.hand = hand;
         let lamp_on =
             max_priority.is_some_and(|priority| priority >= rho_dealer::curve::LAMP_THRESHOLD);
@@ -466,26 +478,13 @@ impl Frame {
                 card: card.clone(),
             });
         }
-        let chime_above = chime_card
-            .as_ref()
-            .is_some_and(|(priority, _)| *priority >= rho_dealer::curve::CHIME_THRESHOLD);
-        if !self.signals.initialized {
-            self.signals.initialized = true;
-            self.signals.chime_above = chime_above;
-            cx.notify();
-            return;
-        }
-        if chime_above
-            && !self.signals.chime_above
-            && let Some((priority, card)) = chime_card
-        {
+        if let Some((priority, card)) = crossed {
             (self.chime)();
             rho_journal::record(rho_journal::Event::ChimeRing {
                 top_priority: priority,
                 card,
             });
         }
-        self.signals.chime_above = chime_above;
         cx.notify();
     }
 

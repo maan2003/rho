@@ -8,8 +8,8 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_hosts::Link;
-use rho_frame::Surface;
 use rho_frame::keys::Close;
+use rho_frame::{CardHere, Surface};
 use theme::ActiveTheme as _;
 
 use crate::protocol::PagerAction;
@@ -161,6 +161,11 @@ impl ShellSurface {
 impl Surface for ShellSurface {
     fn title(&self, _cx: &App) -> String {
         format!("{} · shell", self.label)
+    }
+
+    /// A workset's shell is its work, looked into from its card.
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::Inspected
     }
 
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<rho_frame::PhoneTool> {

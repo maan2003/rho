@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use editor::Editor;
 use gpui::{AnyView, App, Context, Entity, EntityId, FocusHandle, Focusable, Render, Window};
-pub use rho_dealer::facts::Seen as Dealt;
+pub use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 
 use crate::menu::Row;
@@ -13,7 +13,8 @@ use crate::menu::Row;
 /// The action under Send on the phone bar, when a surface has a draft to send.
 pub type PhoneSend = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// What a verdict, a note or `file` pressed over the surface lands on.
+/// What a note, a tangent or a steer pressed over the surface lands on.
+/// Which card a verdict lands on is [`CardHere`]'s to say.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
     /// The thing the surface is of: its own address.
@@ -25,6 +26,22 @@ pub enum Subject {
     /// Something the surface lists: the row under the point.
     Address(Address),
     /// Nothing: a log, a picker, a page about nothing in particular.
+    None,
+}
+
+/// The card a verdict pressed over a surface is about. Only a surface that
+/// stands for, lists or looks into a dealt card has one; a page, a chart
+/// or a note is no card, so the verdicts never reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardHere {
+    /// The surface is a card: a thread, wherever the point is in it.
+    Itself,
+    /// The surface lists cards: the one under the point, if any.
+    Row(Option<Address>),
+    /// The surface looks into the work of the card the reader stepped
+    /// down from, while that card still waits. Opened by name, it has none.
+    Inspected,
+    /// No card: a page, a chart, a note, a list of notes.
     None,
 }
 
@@ -99,8 +116,10 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
-    fn subject(&self, _dealt: Option<Dealt>, _cx: &App) -> Subject {
-        Subject::Own
+    /// What the point is on. `card` is what the reader sees of the card
+    /// the surface stands for, when one waits.
+    fn subject(&self, _card: Option<Seen>, _cx: &App) -> Subject {
+        Subject::None
     }
 
     /// The mode the surface is in, for a surface that keeps its own;
@@ -109,11 +128,9 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
-    /// The card a verdict pressed over the surface is about: what holds
-    /// the subject as the dealer counts it. A thread is one card wherever
-    /// the point is in it; a list's row is its own card.
-    fn card(&self, cx: &App) -> Subject {
-        self.subject(None, cx)
+    /// The card a verdict pressed over the surface is about.
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::None
     }
 
     /// Whether the point is in the surface's writable text rather than on
@@ -125,7 +142,7 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// What the status line calls the surface while it is the card in
     /// view. By default the card's own heading; a surface that knows where
     /// the point is in it, such as the message under the cursor, says that
-    /// instead.
+    /// instead. A screen that is no card is called by its title.
     fn heading(&self, _cx: &App) -> Option<String> {
         None
     }
@@ -166,7 +183,7 @@ pub trait Surface: Render + Focusable + Sized + 'static {
     /// The surface's own rows for the palette, for what is in view.
     fn rows(
         &mut self,
-        _dealt: Option<Dealt>,
+        _card: Option<Seen>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Vec<Row> {
@@ -183,15 +200,15 @@ trait SurfaceHandle {
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool>;
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
-    fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject;
+    fn subject(&self, card: Option<Seen>, cx: &App) -> Subject;
     fn mode(&self, cx: &App) -> Option<Mode>;
-    fn card(&self, cx: &App) -> Subject;
+    fn card(&self, cx: &App) -> CardHere;
     fn edits_at_point(&self, cx: &App) -> bool;
     fn heading(&self, cx: &App) -> Option<String>;
     fn opened(&self, window: &mut Window, cx: &mut App);
     fn show_card(&self, card: &Card, window: &mut Window, cx: &mut App);
     fn show_search_match(&self, point: &crate::SearchPoint, window: &mut Window, cx: &mut App);
-    fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row>;
+    fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
 }
 
@@ -228,15 +245,15 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         self.read(cx).focus_handle(cx)
     }
 
-    fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject {
-        self.read(cx).subject(dealt, cx)
+    fn subject(&self, card: Option<Seen>, cx: &App) -> Subject {
+        self.read(cx).subject(card, cx)
     }
 
     fn mode(&self, cx: &App) -> Option<Mode> {
         self.read(cx).mode(cx)
     }
 
-    fn card(&self, cx: &App) -> Subject {
+    fn card(&self, cx: &App) -> CardHere {
         self.read(cx).card(cx)
     }
 
@@ -262,8 +279,8 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
         })
     }
 
-    fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.update(cx, |surface, cx| surface.rows(dealt, window, cx))
+    fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row> {
+        self.update(cx, |surface, cx| surface.rows(card, window, cx))
     }
 
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend> {
@@ -273,21 +290,16 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
 /// A surface of any type, as the frame holds it.
 #[derive(Clone)]
-pub struct AnySurface(Rc<dyn SurfaceHandle>, bool);
+pub struct AnySurface(Rc<dyn SurfaceHandle>);
 
 impl AnySurface {
     pub fn new<S: Surface>(entity: Entity<S>) -> Self {
-        Self(Rc::new(entity), false)
+        Self(Rc::new(entity))
     }
 
-    /// A screen for inspecting work, not a card in its own right.
-    pub fn for_inspection(mut self) -> Self {
-        self.1 = true;
-        self
-    }
-
-    pub fn inspects_card(&self) -> bool {
-        self.1
+    /// A screen for looking into work, not a card in its own right.
+    pub fn inspects_card(&self, cx: &App) -> bool {
+        self.card(cx) == CardHere::Inspected
     }
 
     pub fn view(&self) -> AnyView {
@@ -322,15 +334,15 @@ impl AnySurface {
         self.0.focus_handle(cx)
     }
 
-    pub fn subject(&self, dealt: Option<Dealt>, cx: &App) -> Subject {
-        self.0.subject(dealt, cx)
+    pub fn subject(&self, card: Option<Seen>, cx: &App) -> Subject {
+        self.0.subject(card, cx)
     }
 
     pub fn mode(&self, cx: &App) -> Option<Mode> {
         self.0.mode(cx)
     }
 
-    pub fn card(&self, cx: &App) -> Subject {
+    pub fn card(&self, cx: &App) -> CardHere {
         self.0.card(cx)
     }
 
@@ -363,8 +375,8 @@ impl AnySurface {
         self.0.phone_send(cx)
     }
 
-    pub fn rows(&self, dealt: Option<Dealt>, window: &mut Window, cx: &mut App) -> Vec<Row> {
-        self.0.rows(dealt, window, cx)
+    pub fn rows(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Row> {
+        self.0.rows(card, window, cx)
     }
 }
 

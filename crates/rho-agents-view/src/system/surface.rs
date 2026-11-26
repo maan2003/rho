@@ -9,7 +9,7 @@ use rho_agent_types::{Activity, AgentId, Message, MessageId};
 use rho_agents_client::protocol::transcript::{RuntimeKind, RuntimeState};
 use rho_agents_client::protocol::worksets::{Cancel, RewindAgent};
 use rho_agents_client::snippets::{self, RUNTIMES, Runtime};
-use rho_frame::{Addressed as _, Candidate, Row, Subject, Surface};
+use rho_frame::{Addressed as _, Candidate, CardHere, Row, Subject, Surface};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
@@ -317,13 +317,17 @@ impl Surface for AgentSurface {
         Some(self.editor.clone())
     }
 
-    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
+    fn subject(&self, _: Option<rho_frame::surface::Seen>, _cx: &App) -> Subject {
         Subject::Own
+    }
+
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::Inspected
     }
 
     fn rows(
         &mut self,
-        _: Option<rho_frame::surface::Dealt>,
+        _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Row> {

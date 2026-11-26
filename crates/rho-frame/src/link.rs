@@ -51,15 +51,15 @@ impl FrameLink {
         self.window.read(cx).ok().map(|frame| f(frame, cx))
     }
 
-    /// The observation attached to the currently dealt screen, after
-    /// the frame has finished dispatching the action that needs it.
-    pub fn with_dealt(
+    /// What the reader has seen of the card at `address` while it waits,
+    /// after the frame has finished dispatching the action that needs it.
+    pub fn with_seen(
         &self,
         address: Address,
         cx: &mut App,
         f: impl FnOnce(Option<rho_dealer::facts::Seen>, &mut App) + 'static,
     ) {
-        self.with(cx, move |frame, _, cx| f(frame.dealt_seen(&address), cx));
+        self.with(cx, move |frame, _, cx| f(frame.card_seen(&address), cx));
     }
 
     pub fn open(&self, address: Address, cx: &mut App) {

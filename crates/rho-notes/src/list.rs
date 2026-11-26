@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use language::{Buffer, Capability, Point, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_dealer::Addressed as _;
-use rho_frame::{FrameLink, Layout, Mode, PhoneTool, Subject, Surface, phone_editor_tap};
+use rho_frame::{FrameLink, Layout, Mode, PhoneTool, Surface, phone_editor_tap};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
@@ -439,10 +439,6 @@ impl Surface for NotesView {
 
     fn mode(&self, _cx: &App) -> Option<Mode> {
         self.finding.then_some(Mode::Insert)
-    }
-
-    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
-        Subject::None
     }
 
     fn phone_tools(&self, _typing: bool, _cx: &App) -> Vec<PhoneTool> {

@@ -25,7 +25,7 @@ use theme::ActiveTheme as _;
 use crate::idea::IdeaProject;
 use crate::keys;
 use crate::phone::Layout;
-use crate::surface::{Subject, Surface};
+use crate::surface::{CardHere, Subject, Surface};
 
 const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
@@ -542,6 +542,10 @@ impl Surface for DeskView {
 
     fn subject(&self, _: Option<rho_dealer::facts::Seen>, cx: &App) -> Subject {
         self.cursor_card(cx).map_or(Subject::None, Subject::Address)
+    }
+
+    fn card(&self, cx: &App) -> CardHere {
+        CardHere::Row(self.cursor_card(cx))
     }
 }
 

@@ -245,7 +245,7 @@ impl UsageSurface {
 
 impl Surface for UsageSurface {
     fn title(&self, _cx: &App) -> String {
-        self.chart.title()
+        format!("usage › {}", self.chart.title())
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {

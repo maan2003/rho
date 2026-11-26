@@ -28,7 +28,7 @@ use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Addressed as _, Marks};
 use rho_frame::surface::PhoneSend;
 use rho_frame::thread::{self, OpenRow, QuoteSelection, SendMessage, SendOnly};
-use rho_frame::{Candidate, Layout, Row, Subject, Surface, draft};
+use rho_frame::{Candidate, CardHere, Layout, Row, Subject, Surface, draft};
 use rho_notes::NoteId;
 use rho_transcript::{BlockLine, BlockSpec, Item, Transcript};
 use rho_window::style::StyleClass;
@@ -1233,7 +1233,7 @@ impl ThreadView {
                 .read(cx)
                 .frame
                 .clone()
-                .with_dealt(thread.address(), cx, move |seen, cx| {
+                .with_seen(thread.address(), cx, move |seen, cx| {
                     system.update(cx, |system, cx| {
                         system.reply(thread, seen.and_then(cards::card_version), text, cx);
                         system.set_draft(thread.host, Some(thread.message), String::new());
@@ -2031,11 +2031,15 @@ impl Surface for ThreadView {
     /// The thread the subject is in, as the dealer counts threads: in a
     /// thread, the thread wherever the point is in it; in a project, the
     /// thread under the point, as a row is on Home.
-    fn card(&self, cx: &App) -> Subject {
+    fn card(&self, cx: &App) -> CardHere {
         if !self.is_list() {
-            return Subject::Own;
+            return CardHere::Itself;
         }
-        self.subject(None, cx)
+        CardHere::Row(match self.subject(None, cx) {
+            Subject::Own | Subject::Draft { .. } => Some(self.thread.address()),
+            Subject::Address(address) => Some(address),
+            Subject::None => None,
+        })
     }
 
     fn edits_at_point(&self, cx: &App) -> bool {
@@ -2369,41 +2373,63 @@ mod tests {
         check_thread(cx, CheckThread::ThreadReply);
     }
 
-    #[gpui::test]
-    fn replying_from_the_deal_preserves_the_exact_observation(cx: &mut gpui::TestAppContext) {
-        use rho_agent_types::{ChatEvent, ChatRecord, MessageVersion};
-        use rho_dealer::Card;
-        use rho_dealer::facts::Seen;
-        use rho_dealer::rank::CardKind;
+    /// A thread where agent `a` asked (3), the user answered it (4), and
+    /// `a` asked again (5), with a draft ready to send.
+    fn answered_then_asked_again(
+        cx: &mut gpui::TestAppContext,
+        asked_again: bool,
+    ) -> (
+        gpui::WindowHandle<rho_frame::Frame>,
+        Entity<ChatSystem>,
+        tempfile::TempDir,
+        ThreadId,
+    ) {
+        use rho_agent_types::{ChatEvent, ChatRecord, MessageVersion, ThreadReply};
 
         let domain = rho_agent_types::AgentIdDomain(0);
         let a = AgentId::from_counter(1, &domain).unwrap();
-        let b = AgentId::from_counter(2, &domain).unwrap();
         let root = MessageId(ChatSeq(1));
         let thread = ThreadId {
             host: EndpointId([3; 32]),
             message: MessageId(ChatSeq(2)),
         };
-        let ask = MessageId(ChatSeq(3));
         let mut log = HostChat::default();
-        for (id, parent, from, words, mentions) in [
-            (1, None, Party::User, "Clock", Vec::new()),
-            (2, Some(root), Party::User, "Check the clocks.", Vec::new()),
+        let ask = |words: &'static str| {
             (
-                3,
-                Some(thread.message),
                 Party::Agent(a),
-                "Use clock A?",
+                words,
                 vec![Mention::User { ping: true }],
+                None,
+            )
+        };
+        let mut posts = vec![
+            (1, None, (Party::User, "Clock", Vec::new(), None)),
+            (
+                2,
+                Some(root),
+                (Party::User, "Check the clocks.", Vec::new(), None),
             ),
+            (3, Some(thread.message), ask("Use clock A?")),
             (
                 4,
                 Some(thread.message),
-                Party::Agent(b),
-                "Widen the retry window?",
-                vec![Mention::User { ping: true }],
+                (
+                    Party::User,
+                    "Yes, clock A.",
+                    Vec::new(),
+                    Some(ThreadReply {
+                        settles: Some(MessageVersion {
+                            message: MessageId(ChatSeq(3)),
+                            version: ChatSeq(3),
+                        }),
+                    }),
+                ),
             ),
-        ] {
+        ];
+        if asked_again {
+            posts.push((5, Some(thread.message), ask("Widen the retry window?")));
+        }
+        for (id, parent, (from, words, mentions, thread_reply)) in posts {
             log.tell(&ChatRecord {
                 seq: ChatSeq(id),
                 at: UnixMs(id),
@@ -2412,18 +2438,74 @@ mod tests {
                     from,
                     mentions,
                     reply_to: None,
-                    thread_reply: None,
+                    thread_reply,
                     kind: MessageKind::Kept,
                     content: vec![ContentPart::Text { text: words.into() }],
                 },
             });
         }
-        let (window, mail, _db) = super::super::search_bench::fixture(cx, log);
+        let (window, mail, db) = super::super::search_bench::fixture(cx, log);
         cx.update(|cx| {
             mail.update(cx, |system, _| {
-                system.set_draft(thread.host, Some(thread.message), "Keep clock A.".into());
+                system.set_draft(thread.host, Some(thread.message), "Widen it.".into());
             });
         });
+        (window, mail, db, thread)
+    }
+
+    fn sent_settles(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+        mail: &Entity<ChatSystem>,
+        thread: ThreadId,
+    ) -> Vec<rho_agent_types::MessageVersion> {
+        cx.run_until_parked();
+        cx.draw_window(window.into());
+        cx.dispatch_action(window.into(), SendMessage);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            mail.update(cx, |system, _| {
+                let (_, outgoing) = system.outbox.next(thread.host).expect("the draft was sent");
+                assert_eq!(outgoing.parent, Some(thread.message));
+                assert_eq!(
+                    rho_agent_types::content_text(&outgoing.content),
+                    "Widen it."
+                );
+                outgoing.settles.into_iter().collect()
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn a_reply_settles_the_waiting_card_of_a_thread_opened_by_name(cx: &mut gpui::TestAppContext) {
+        let (window, mail, _db, thread) = answered_then_asked_again(cx, true);
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            sent_settles(cx, window, &mail, thread),
+            [rho_agent_types::MessageVersion {
+                message: MessageId(ChatSeq(5)),
+                version: ChatSeq(5),
+            }],
+            "the ask on screen goes, however the thread was reached"
+        );
+    }
+
+    #[gpui::test]
+    fn a_reply_settles_the_ask_on_screen_rather_than_the_one_first_dealt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+        use rho_dealer::Card;
+        use rho_dealer::facts::Seen;
+        use rho_dealer::rank::CardKind;
+
+        // Dealt on the first ask; the answer to it and the next ask came
+        // while the thread stayed on screen.
+        let (window, mail, _db, thread) = answered_then_asked_again(cx, false);
         let card = Card {
             address: thread.address(),
             title: "Check the clocks.".into(),
@@ -2441,9 +2523,9 @@ mod tests {
         window
             .update(cx, |frame, window, cx| frame.open_card(card, window, cx))
             .unwrap();
-        // A later revision arrived while the dealt thread was open.
         cx.update(|cx| {
             mail.update(cx, |system, cx| {
+                let agent = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
                 system
                     .logs
                     .get_mut(&thread.host)
@@ -2451,12 +2533,15 @@ mod tests {
                     .tell(&ChatRecord {
                         seq: ChatSeq(5),
                         at: UnixMs(5),
-                        event: ChatEvent::Revised {
-                            message: ask,
-                            author: a,
-                            ping: None,
+                        event: ChatEvent::Posted {
+                            parent: Some(thread.message),
+                            from: Party::Agent(agent),
+                            mentions: vec![Mention::User { ping: true }],
+                            reply_to: None,
+                            thread_reply: None,
+                            kind: MessageKind::Kept,
                             content: vec![ContentPart::Text {
-                                text: "Use clock B instead?".into(),
+                                text: "Widen the retry window?".into(),
                             }],
                         },
                     });
@@ -2465,27 +2550,14 @@ mod tests {
                 });
             })
         });
-        cx.draw_window(window.into());
-        cx.dispatch_action(window.into(), SendMessage);
-        cx.update(|cx| {
-            mail.update(cx, |system, _| {
-                let (_, outgoing) = system.outbox.next(thread.host).expect("the draft was sent");
-                assert_eq!(outgoing.parent, Some(thread.message));
-                assert_eq!(
-                    outgoing.settles,
-                    Some(MessageVersion {
-                        message: ask,
-                        version: ChatSeq(3)
-                    })
-                );
-                assert_eq!(outgoing.failed_start, None);
-                assert!(outgoing.mentions.is_empty());
-                assert_eq!(
-                    rho_agent_types::content_text(&outgoing.content),
-                    "Keep clock A."
-                );
-            })
-        });
+        assert_eq!(
+            sent_settles(cx, window, &mail, thread),
+            [rho_agent_types::MessageVersion {
+                message: MessageId(ChatSeq(5)),
+                version: ChatSeq(5),
+            }],
+            "the follow-up ask goes, not the one already answered"
+        );
     }
 
     #[gpui::test]

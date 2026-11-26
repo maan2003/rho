@@ -11,7 +11,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Task, Window, div};
 use rho_agent_hosts::Link;
 use rho_frame::keys::{Close, Palette, VerdictMenu};
-use rho_frame::{Row, Surface};
+use rho_frame::{CardHere, Row, Surface};
 use theme::ActiveTheme as _;
 pub use view::DesktopView;
 
@@ -93,9 +93,14 @@ impl Surface for DesktopSurface {
         format!("{} · desktop {}", self.label, self.name)
     }
 
+    /// A workset's desktop is its work, looked into from its card.
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::Inspected
+    }
+
     fn rows(
         &mut self,
-        _: Option<rho_frame::surface::Dealt>,
+        _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Row> {

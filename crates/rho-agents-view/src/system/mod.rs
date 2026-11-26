@@ -831,12 +831,7 @@ impl AgentsSystem {
             return Vec::new();
         }
         let this = cx.entity();
-        let mut rows = vec![
-            Row::run("space", "verdicts", |_, window, cx| {
-                window.dispatch_action(Box::new(rho_frame::keys::VerdictMenu), cx);
-            }),
-            Self::stop_row(this.clone(), agent),
-        ];
+        let mut rows = vec![Self::stop_row(this.clone(), agent)];
         for (key, description, new) in [("t", "terminal", false), ("shift-t", "new terminal", true)]
         {
             let this = this.clone();
@@ -1164,7 +1159,7 @@ impl System for AgentsSystem {
                             cx,
                         )
                     });
-                    return Some(AnySurface::new(surface).for_inspection());
+                    return Some(AnySurface::new(surface));
                 };
                 if !self.desktops_of(agent).contains(&name) {
                     let surface = cx.new(|cx| {
@@ -1175,12 +1170,12 @@ impl System for AgentsSystem {
                             cx,
                         )
                     });
-                    return Some(AnySurface::new(surface).for_inspection());
+                    return Some(AnySurface::new(surface));
                 }
                 AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
             }
         };
-        Some(surface.for_inspection())
+        Some(surface)
     }
 
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {

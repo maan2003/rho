@@ -21,9 +21,7 @@ use std::rc::Rc;
 use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
 use rho_db::RhoDb;
 use rho_dealer::{Address, Addressed};
-use rho_frame::{
-    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Subject, Surface, keys,
-};
+use rho_frame::{AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Surface, keys};
 use rho_window::style::StyleClass;
 use url::Url;
 
@@ -267,6 +265,9 @@ fn page_open_echo(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// Where a page is, before its title.
+const PLACE: &str = "web";
+
 /// What a page is called: its title while the browser has it, or its
 /// host, or nothing better than "page" before the browser has said.
 fn title(page: PageId) -> String {
@@ -381,7 +382,7 @@ impl rho_frame::System for PageSystem {
         _cx: &App,
     ) -> Option<(String, String)> {
         let page = PageId::from_address(address)?;
-        Some((title(page), "web".to_owned()))
+        Some((title(page), PLACE.to_owned()))
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
@@ -414,16 +415,12 @@ impl rho_frame::System for PageSystem {
 
 impl Surface for PageView {
     fn title(&self, _cx: &App) -> String {
-        title(self.page_id())
-    }
-
-    fn subject(&self, _: Option<rho_frame::surface::Dealt>, _cx: &App) -> Subject {
-        Subject::Own
+        format!("{PLACE} › {}", title(self.page_id()))
     }
 
     fn rows(
         &mut self,
-        _: Option<rho_frame::surface::Dealt>,
+        _: Option<rho_frame::surface::Seen>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Vec<Row> {
