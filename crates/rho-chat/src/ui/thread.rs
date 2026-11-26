@@ -187,10 +187,23 @@ struct QuoteId {
     first_line: usize,
 }
 
+#[derive(Debug)]
 enum InlineOpen {
     Flashes(AgentId),
     Quote(QuoteId),
     Link(url::Url),
+}
+
+/// What `enter` does, as [`ThreadView::enter_action`] decides it.
+#[derive(Debug)]
+enum Enter {
+    Quote(std::ops::RangeInclusive<u32>),
+    /// More than one character is selected, but not in one message.
+    QuoteAcross,
+    Inline(InlineOpen),
+    Private(MessageId, NoteId),
+    Inspect(AgentId, Message),
+    Open(Address),
 }
 
 impl Meta {
@@ -1429,7 +1442,8 @@ impl ThreadView {
             cx.stop_propagation();
             return;
         }
-        if self.open_inline(cursor, cx) {
+        if let Some(open) = self.inline_open(cursor, cx) {
+            self.open_inline(open, cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -1443,75 +1457,92 @@ impl ThreadView {
         }
     }
 
-    /// A folded quote opens before links; an open quote closes only if
-    /// there is no link under the point. Both take precedence over the mail.
+    /// The fold under the point, or the link: a link first, as `enter`
+    /// takes it. A folded quote or flash opens; an open one closes.
     fn inline_open(&self, cursor: Point, cx: &App) -> Option<InlineOpen> {
-        let quote = match self.line_meta(cursor.row, cx) {
-            Some(Meta::Quote(quote, _)) => Some(*quote),
-            Some(Meta::EarlierFlashes(agent)) => return Some(InlineOpen::Flashes(*agent)),
-            _ => None,
-        };
-        if let Some(quote) = quote
-            && !self.expanded.quotes.contains(&quote)
-        {
-            return Some(InlineOpen::Quote(quote));
+        if let Some(url) = self.link_at(cursor, cx) {
+            return Some(InlineOpen::Link(url));
         }
-        self.link_at(cursor, cx)
-            .map(InlineOpen::Link)
-            .or_else(|| quote.map(InlineOpen::Quote))
+        match self.line_meta(cursor.row, cx)? {
+            Meta::Quote(quote, _) => Some(InlineOpen::Quote(*quote)),
+            Meta::EarlierFlashes(agent) => Some(InlineOpen::Flashes(*agent)),
+            _ => None,
+        }
     }
 
-    fn open_inline(&mut self, cursor: Point, cx: &mut Context<Self>) -> bool {
-        match self.inline_open(cursor, cx) {
-            Some(InlineOpen::Flashes(agent)) => {
+    fn open_inline(&mut self, open: InlineOpen, cx: &mut Context<Self>) {
+        match open {
+            InlineOpen::Flashes(agent) => {
                 if !self.expanded.flashes.remove(&agent) {
                     self.expanded.flashes.insert(agent);
                 }
                 self.refresh(cx);
                 self.cursor_to_item(&Key::EarlierFlashes(agent), Autoscroll::fit(), cx);
             }
-            Some(InlineOpen::Quote(quote)) => self.toggle_quote(quote, cx),
-            Some(InlineOpen::Link(url)) => self.system.read(cx).frame.clone().open_link(url, cx),
-            None => return false,
+            InlineOpen::Quote(quote) => self.toggle_quote(quote, cx),
+            InlineOpen::Link(url) => self.system.read(cx).frame.clone().open_link(url, cx),
         }
-        true
     }
 
-    /// Enter opens the thing under the point: a quote, link, agent's mail,
-    /// tangent or crumb.
+    /// What `enter` does with this selection (`chat.Thread`'s keys), in
+    /// strict order: more than one character selected quotes them; else,
+    /// at the character under the point, a link opens; else the message
+    /// of the project under it opens its transcript. Folds, private
+    /// replies and tangents are not message words and open themselves.
+    fn enter_action(&self, selection: Range<Point>, cx: &App) -> Option<Enter> {
+        if self.selected_chars(&selection, cx) > 1 {
+            return Some(match self.mail_selection(selection, cx) {
+                Some(lines) => Enter::Quote(lines),
+                None => Enter::QuoteAcross,
+            });
+        }
+        // A one-character selection is helix's block cursor: its start is
+        // the character the point is on.
+        let cursor = selection.start;
+        if let Some(open) = self.inline_open(cursor, cx) {
+            return Some(Enter::Inline(open));
+        }
+        let meta = self.line_meta(cursor.row, cx)?;
+        if let Meta::Private { note, mail } = meta {
+            return Some(Enter::Private(*mail, *note));
+        }
+        if let Some((agent, mail)) = self.agent_mail(cursor.row, cx) {
+            return Some(Enter::Inspect(agent, mail.clone()));
+        }
+        let host = self.thread.host;
+        match meta {
+            Meta::Thread(id) | Meta::Mail(id, _) if *id != self.thread.message => {
+                Some(Enter::Open(ThreadId { host, message: *id }.address()))
+            }
+            Meta::Open(address) => Some(Enter::Open(address.clone())),
+            _ => None,
+        }
+    }
+
+    fn selected_chars(&self, selection: &Range<Point>, cx: &App) -> usize {
+        self.document(cx)
+            .text_for_range(selection.clone())
+            .map(|chunk| chunk.chars().count())
+            .sum()
+    }
+
     fn open_row(&mut self, _: &OpenRow, window: &mut Window, cx: &mut Context<Self>) {
         if self.private_edit.is_some() {
             return;
         }
-        let selection = self.selection_range(cx);
-        if !selection.is_empty()
-            && let Some(lines) = self.mail_selection(selection, cx)
-        {
-            self.quote(lines, window, cx);
-            return;
+        match self.enter_action(self.selection_range(cx), cx) {
+            Some(Enter::Quote(lines)) => self.quote(lines, window, cx),
+            Some(Enter::QuoteAcross) => self.system.read(cx).frame.clone().echo(
+                "select lines in one message to quote",
+                StyleClass::SystemInfo,
+                cx,
+            ),
+            Some(Enter::Inline(open)) => self.open_inline(open, cx),
+            Some(Enter::Private(mail, note)) => self.open_private(mail, Some(note), cx),
+            Some(Enter::Inspect(agent, mail)) => self.inspect(agent, mail, cx),
+            Some(Enter::Open(address)) => self.system.read(cx).frame.clone().open(address, cx),
+            None => {}
         }
-        let cursor = self.cursor(cx);
-        if let Some(Meta::Private { note, mail }) = self.line_meta(cursor.row, cx) {
-            self.open_private(*mail, Some(*note), cx);
-            return;
-        }
-        if self.open_inline(cursor, cx) {
-            return;
-        }
-        if let Some((agent, mail)) = self.agent_mail(cursor.row, cx) {
-            self.inspect(agent, mail.clone(), cx);
-            return;
-        }
-        let meta = self.line_meta(cursor.row, cx).cloned();
-        let host = self.thread.host;
-        let address = match meta {
-            Some(Meta::Thread(id) | Meta::Mail(id, _)) if id != self.thread.message => {
-                ThreadId { host, message: id }.address()
-            }
-            Some(Meta::Open(address)) => address,
-            _ => return,
-        };
-        self.system.read(cx).frame.clone().open(address, cx);
     }
 
     fn toggle_quote(&mut self, quote: QuoteId, cx: &mut Context<Self>) {
@@ -1888,15 +1919,11 @@ impl Surface for ThreadView {
             );
         }
         // `look into the work` is the agents system's, on every screen.
-        let cursor = self.cursor(cx);
-        let opens_inline = self.inline_open(cursor, cx).is_some();
         // The thumb's Open action follows Enter at the point.
-        if opens_inline
-            || matches!(
-                self.line_meta(cursor.row, cx),
-                Some(Meta::Thread(_) | Meta::Open(_))
-            )
-        {
+        if matches!(
+            self.enter_action(self.selection_range(cx), cx),
+            Some(Enter::Inline(_) | Enter::Open(_))
+        ) {
             rows.push(
                 Row::run("enter", "open", move |_, window, cx| {
                     this.update(cx, |view, cx| view.open_row(&OpenRow, window, cx));
@@ -2731,7 +2758,16 @@ mod tests {
         check_thread(cx, CheckThread::WorkTarget);
     }
 
+    /// `enter` in strict order: more than one character quotes, even over
+    /// a link; a one-character point on a link opens it, wherever in the
+    /// link; anywhere else in a project message opens its transcript.
+    #[gpui::test]
+    fn enter_quotes_a_selection_then_opens_a_link_then_the_work(cx: &mut gpui::TestAppContext) {
+        check_thread(cx, CheckThread::EnterPrecedence);
+    }
+
     enum CheckThread {
+        EnterPrecedence,
         Inline,
         Stuck,
         ThreadReply,
@@ -2905,6 +2941,76 @@ mod tests {
                         Subject::Draft { worker: None },
                         "a draft with two participants must not guess a steering target"
                     );
+                })
+                .unwrap();
+            return;
+        }
+
+        if matches!(check, CheckThread::EnterPrecedence) {
+            let words = "Proof at https://proof.example.invalid/clock today.";
+            let url = "https://proof.example.invalid/clock";
+            let (link_start, link_end) = (9, 9 + url.len() as u32);
+            cx.update(|cx| {
+                mail.update(cx, |system, cx| {
+                    system.logs.get_mut(&thread.host).unwrap().tell(&post(
+                        5,
+                        Some(2),
+                        agent,
+                        words,
+                    ));
+                    cx.notify();
+                });
+            });
+            window
+                .update(cx, |view, window, cx| {
+                    let proof = MessageId(ChatSeq(5));
+                    assert!(view.cursor_to_item(&Key::Message(proof), Autoscroll::fit(), cx));
+                    let row = view.cursor_row(cx);
+                    let question = view
+                        .item_row(&Key::Message(MessageId(ChatSeq(4))), cx)
+                        .unwrap();
+                    assert_eq!(view.document(cx).text().lines().nth(row as usize), Some(words));
+                    let mut enter = |range: Range<Point>, reversed: bool| {
+                        view.editor.update(cx, |editor, cx| {
+                            editor.change_selections(Default::default(), window, cx, |s| {
+                                let (start, end) = (range.start, range.end);
+                                s.select_ranges([if reversed { end..start } else { start..end }]);
+                            });
+                        });
+                        let selection = view.selection_range(cx);
+                        view.enter_action(selection, cx)
+                    };
+                    let at = |column: u32| Point::new(row, column);
+                    let opens_link = |action: Option<Enter>| {
+                        matches!(action, Some(Enter::Inline(InlineOpen::Link(link))) if link.as_str() == url)
+                    };
+                    let inspects = |action: Option<Enter>| {
+                        matches!(action, Some(Enter::Inspect(by, mail)) if by == worker && mail.id == proof)
+                    };
+                    // (1) More than one character: a quote, also over the link.
+                    assert!(matches!(
+                        enter(at(5)..at(15), false),
+                        Some(Enter::Quote(lines)) if lines == (row..=row)
+                    ));
+                    assert!(matches!(
+                        enter(at(link_start)..at(link_end), true),
+                        Some(Enter::Quote(lines)) if lines == (row..=row)
+                    ));
+                    assert!(matches!(
+                        enter(Point::new(question, 0)..at(3), false),
+                        Some(Enter::QuoteAcross)
+                    ));
+                    // (2) One character on the link, at either end of it, or
+                    // a bare point inside it: the link.
+                    assert!(opens_link(enter(at(link_start)..at(link_start + 1), false)));
+                    assert!(opens_link(enter(at(link_end - 1)..at(link_end), false)));
+                    assert!(opens_link(enter(at(link_end - 1)..at(link_end), true)));
+                    assert!(opens_link(enter(at(20)..at(20), false)));
+                    // (3) One character anywhere else in the project's
+                    // message: its transcript.
+                    assert!(inspects(enter(at(0)..at(1), false)));
+                    assert!(inspects(enter(at(link_end)..at(link_end + 1), false)));
+                    assert!(inspects(enter(at(link_start - 1)..at(link_start), false)));
                 })
                 .unwrap();
             return;

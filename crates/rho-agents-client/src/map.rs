@@ -544,6 +544,20 @@ impl AgentMap {
 
     /// The start receipt names the host before its directory names the agent.
     pub fn agent_id_label_on_host(&self, agent_id: AgentId, host: Option<HostId>) -> String {
+        let label = self.agent_code_on_host(agent_id, host);
+        match host.filter(|_| self.hosts.len() > 1) {
+            Some(h) => format!("{}/{label}", self.host_name(h)),
+            None => label,
+        }
+    }
+
+    /// The agent's short code, `eng-q9tz`, without its host: what tells
+    /// two agents of one workset apart.
+    pub fn agent_code(&self, agent_id: AgentId) -> String {
+        self.agent_code_on_host(agent_id, self.host_of_agent(agent_id))
+    }
+
+    fn agent_code_on_host(&self, agent_id: AgentId, host: Option<HostId>) -> String {
         let counter = host
             .and_then(|h| self.hosts.get(&h))
             .map(|h| h.agent_counter)
@@ -559,11 +573,7 @@ impl AgentMap {
             .agent_identity(agent_id)
             .map(AgentIdentity::handle_prefix)
             .unwrap_or("eng");
-        let label = format!("{prefix}-{}", &agent_id.encoded()[..len]);
-        match host.filter(|_| self.hosts.len() > 1) {
-            Some(h) => format!("{}/{label}", self.host_name(h)),
-            None => label,
-        }
+        format!("{prefix}-{}", &agent_id.encoded()[..len])
     }
     /// Resolves a bare desk tag (`eng-x7y2`) to the unique matching agent on
     /// `host`. Prefixes written when the id space was smaller keep resolving

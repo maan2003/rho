@@ -22,6 +22,7 @@ use rho_transcript::{Item, Transcript};
 use text::{Bias, ToOffset as _, ToPoint as _};
 use theme::ActiveTheme as _;
 
+use crate::frame::Frame;
 use crate::keys;
 use crate::phone::Layout;
 use crate::surface::{CardHere, Subject, Surface};
@@ -89,6 +90,81 @@ impl DeskRows {
                 .position(|old| old.key == row.key)
                 .unwrap_or(usize::MAX)
         });
+    }
+}
+
+/// The attached hosts the Desk cannot count on now (`desk.Desk`). Some
+/// hosts away is an everyday state: the Desk says so calmly beside its
+/// count, and an empty deal says so after `nothing waits`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostsAway {
+    attached: usize,
+    offline: Vec<String>,
+    connecting: Vec<String>,
+}
+
+impl HostsAway {
+    pub(crate) fn of(hosts: &rho_agent_hosts::hosts::Hosts) -> Self {
+        Self::from_statuses(hosts.iter().map(|host| (host.name.as_str(), &host.status)))
+    }
+
+    /// A host that is dropped, gone quiet, or does not trust this device
+    /// is offline; one dialling for the first time is connecting.
+    fn from_statuses<'a>(
+        hosts: impl IntoIterator<Item = (&'a str, &'a rho_agent_hosts::hosts::HostStatus)>,
+    ) -> Self {
+        use rho_agent_hosts::hosts::HostStatus;
+        let mut away = Self::default();
+        for (name, status) in hosts {
+            away.attached += 1;
+            match status {
+                HostStatus::Online => {}
+                HostStatus::Connecting => away.connecting.push(name.to_owned()),
+                HostStatus::Recovering(_)
+                | HostStatus::Disconnected(_)
+                | HostStatus::Unenrolled(_) => away.offline.push(name.to_owned()),
+            }
+        }
+        away
+    }
+
+    /// `lab offline`, `2 hosts offline · lab connecting`; nothing while
+    /// every host answers.
+    fn note(&self) -> Option<String> {
+        let group = |names: &[String], state: &str| match names {
+            [] => None,
+            [name] => Some(format!("{name} {state}")),
+            many => Some(format!("{} hosts {state}", many.len())),
+        };
+        let parts: Vec<String> = group(&self.offline, "offline")
+            .into_iter()
+            .chain(group(&self.connecting, "connecting"))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The Desk's count. While every host is still connecting there is
+    /// no count to give, so it never reads a false `0 wait`.
+    pub(crate) fn count(&self, waiting: usize) -> String {
+        if self.attached > 0 && self.connecting.len() == self.attached {
+            return match self.connecting.as_slice() {
+                [name] => format!("connecting to {name}…"),
+                many => format!("connecting to {} hosts…", many.len()),
+            };
+        }
+        let count = format!("{waiting} wait");
+        match self.note() {
+            Some(note) => format!("{count} · {note}"),
+            None => count,
+        }
+    }
+
+    /// What the echo line says when a deal finds nothing.
+    pub(crate) fn nothing_waits(&self) -> String {
+        match self.note() {
+            Some(note) => format!("nothing waits · {note}"),
+            None => "nothing waits".to_owned(),
+        }
     }
 }
 
@@ -211,6 +287,8 @@ pub(crate) struct DeskView {
     transcript: Transcript<DeskKey, DeskClass, Address>,
     editor: Entity<Editor>,
     rows: DeskRows,
+    /// The frame, whose hosts say what the count notes beside it.
+    frame: gpui::WeakEntity<Frame>,
     layout: DeskLayout,
     text_system: Rc<WindowTextSystem>,
 }
@@ -266,7 +344,11 @@ impl DeskLayout {
 }
 
 impl DeskView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        frame: gpui::WeakEntity<Frame>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
@@ -293,6 +375,7 @@ impl DeskView {
             transcript: Transcript::new(buffer),
             editor,
             rows: DeskRows::default(),
+            frame,
             layout,
             text_system: window.text_system().clone(),
         };
@@ -717,6 +800,11 @@ impl Render for DeskView {
             .editor
             .update(cx, |editor, cx| editor.style(cx).text.clone());
         let colors = cx.theme().colors();
+        let away = self
+            .frame
+            .upgrade()
+            .map(|frame| HostsAway::of(frame.read(cx).hosts()))
+            .unwrap_or_default();
         div()
             .key_context("RhoDesk")
             .on_action(
@@ -748,8 +836,9 @@ impl Render for DeskView {
                     .font(text.font())
                     .text_size(text.font_size)
                     .line_height(text.line_height)
+                    // `quiet`, the host notes too: a host away is no alarm.
                     .text_color(colors.text_muted)
-                    .child(format!("{} wait", self.rows.wait_count)),
+                    .child(away.count(self.rows.wait_count)),
             )
             .child(div().flex_1().min_h_0().w_full().child(self.editor.clone()))
     }
@@ -757,9 +846,77 @@ impl Render for DeskView {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_hosts::hosts::HostStatus;
     use rho_dealer::Card;
 
     use super::*;
+
+    fn away(hosts: &[(&str, HostStatus)]) -> HostsAway {
+        HostsAway::from_statuses(hosts.iter().map(|(name, status)| (*name, status)))
+    }
+
+    #[test]
+    fn hosts_that_answer_leave_the_count_bare() {
+        for hosts in [
+            vec![],
+            vec![("lab", HostStatus::Online), ("reef", HostStatus::Online)],
+        ] {
+            let away = away(&hosts);
+            assert_eq!(away.count(0), "0 wait");
+            assert_eq!(away.count(3), "3 wait");
+            assert_eq!(away.nothing_waits(), "nothing waits");
+        }
+    }
+
+    #[test]
+    fn a_host_still_connecting_never_shows_a_bare_zero() {
+        let one = away(&[("lab", HostStatus::Connecting)]);
+        assert_eq!(one.count(0), "connecting to lab…");
+        assert_eq!(one.nothing_waits(), "nothing waits · lab connecting");
+        let both = away(&[
+            ("lab", HostStatus::Connecting),
+            ("reef", HostStatus::Connecting),
+        ]);
+        assert_eq!(both.count(0), "connecting to 2 hosts…");
+        assert_eq!(both.nothing_waits(), "nothing waits · 2 hosts connecting");
+        let some = away(&[
+            ("lab", HostStatus::Connecting),
+            ("reef", HostStatus::Online),
+        ]);
+        assert_eq!(some.count(0), "0 wait · lab connecting");
+        assert_eq!(some.count(3), "3 wait · lab connecting");
+    }
+
+    #[test]
+    fn hosts_away_are_noted_beside_the_count() {
+        let lab_away = away(&[
+            ("lab", HostStatus::Disconnected("refused".into())),
+            ("reef", HostStatus::Online),
+        ]);
+        assert_eq!(lab_away.count(0), "0 wait · lab offline");
+        assert_eq!(lab_away.count(3), "3 wait · lab offline");
+        assert_eq!(lab_away.nothing_waits(), "nothing waits · lab offline");
+        let all_away = away(&[
+            (
+                "lab",
+                HostStatus::Recovering(std::time::Duration::from_secs(12)),
+            ),
+            ("reef", HostStatus::Unenrolled("rho enroll".into())),
+        ]);
+        assert_eq!(all_away.count(3), "3 wait · 2 hosts offline");
+        assert_eq!(all_away.count(0), "0 wait · 2 hosts offline");
+        assert_eq!(all_away.nothing_waits(), "nothing waits · 2 hosts offline");
+        let mixed = away(&[
+            ("lab", HostStatus::Disconnected("refused".into())),
+            ("reef", HostStatus::Connecting),
+            ("sea", HostStatus::Online),
+        ]);
+        assert_eq!(mixed.count(0), "0 wait · lab offline · reef connecting");
+        assert_eq!(
+            mixed.nothing_waits(),
+            "nothing waits · lab offline · reef connecting"
+        );
+    }
 
     fn address(n: u32) -> Address {
         Address::new("thread", format!("t{n}"))

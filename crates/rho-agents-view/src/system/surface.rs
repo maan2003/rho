@@ -78,37 +78,29 @@ impl TranscriptSurface {
         }
     }
 
-    /// The workset, then the agent the screen is narrowed to, then the
-    /// folder and runtime of the one it shows: `fern › eng-q9tz · ~/rho ·
-    /// opus-high`, or `fern › eng-q9tz › eng-ka35 · …` narrowed.
+    /// The work, its host, and the folder and runtime of the agent it
+    /// shows: `tide · Flaky clock test · lab · ~/rho · opus-high`. Narrowed
+    /// to one of several agents, its code follows the work.
     fn title_with_folder(&self, compact: bool, cx: &App) -> String {
         let system = self.system.read(cx);
         let registry = system.registry();
-        let Some(named) = system.scope_name(self.scope) else {
+        let (Some((shown, _)), Some((label, host))) = (
+            system.scope_agents(self.scope),
+            system.scope_label(self.scope, cx),
+        ) else {
             return String::new();
         };
-        let label = |agent: AgentId| match compact {
-            true => registry.agent_id_label(agent),
-            false => registry.agent_display_label(agent),
-        };
-        let mut title = label(named.workset);
-        if let Some(host) = registry.host_of_agent(named.workset) {
-            title = format!("{} › {title}", registry.host_name(host));
-        }
-        if let Scope::Agent(agent) = self.scope {
-            title = format!("{title} › {}", label(agent));
-        }
-        if let Some(directory) = registry.working_directory(named.shown) {
-            let folder = match compact {
-                true => directory.file_name().unwrap_or(directory.as_str()),
-                false => directory.as_str(),
-            };
-            title = format!("{title} · {folder}");
-        }
-        match registry.agent_spec(named.shown) {
-            Some(spec) => format!("{title} · {}", spec.runtime_label()),
-            None => title,
-        }
+        let folder = registry
+            .working_directory(shown)
+            .map(|directory| match compact {
+                true => directory
+                    .file_name()
+                    .unwrap_or(directory.as_str())
+                    .to_owned(),
+                false => directory.to_string(),
+            });
+        let runtime = registry.agent_spec(shown).map(|spec| spec.runtime_label());
+        super::work_name::transcript_title(&label, &host, folder.as_deref(), runtime.as_deref())
     }
 
     /// What the screen's agents are doing, the most pressing first: one
@@ -179,7 +171,7 @@ impl TranscriptSurface {
     fn land(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.land_at(
             self.activity(cx)
-                .is_some_and(|activity| pressing(activity) < pressing(Activity::Waiting)),
+                .is_some_and(|activity| pressing(activity) < pressing(Activity::Working)),
             window,
             cx,
         )
@@ -271,28 +263,15 @@ impl Surface for TranscriptSurface {
 
     fn phone_titles(&self, cx: &App) -> Vec<String> {
         let system = self.system.read(cx);
-        let registry = system.registry();
-        let Some(named) = system.scope_name(self.scope) else {
+        let (Some((shown, _)), Some((label, _))) = (
+            system.scope_agents(self.scope),
+            system.scope_label(self.scope, cx),
+        ) else {
             return Vec::new();
         };
-        let mut label = registry.agent_id_label(named.workset);
-        if let Scope::Agent(agent) = self.scope {
-            label = format!("{label} › {}", registry.agent_id_label(agent));
-        }
-        let title = registry
-            .host_of_agent(named.workset)
-            .map(|host| format!("{} › {label}", registry.host_name(host)));
-        let full = self.title_with_folder(true, cx);
-        let runtime = registry
-            .agent_spec(named.shown)
-            .map(|spec| spec.runtime_label());
-        let mut titles = vec![full];
-        match runtime {
-            Some(runtime) => {
-                titles.extend(title.iter().map(|title| format!("{title} · {runtime}")));
-                titles.push(format!("{label} · {runtime}"));
-            }
-            None => titles.extend(title),
+        let mut titles = vec![self.title_with_folder(true, cx)];
+        if let Some(spec) = system.registry().agent_spec(shown) {
+            titles.push(format!("{label} · {}", spec.runtime_label()));
         }
         titles.push(label);
         if self.activity(cx).is_some() {
@@ -349,15 +328,16 @@ impl Surface for TranscriptSurface {
     }
 }
 
-/// How much an agent doing this wants looking at: lower is more.
+/// How much an agent doing this wants looking at: lower is more. Work in
+/// motion outweighs waiting: an agent between turns waits too, and an ask
+/// reaches the user as a card anyway.
 fn pressing(activity: Activity) -> u8 {
     match activity {
         Activity::Failed | Activity::Lost => 0,
         Activity::Retrying => 1,
-        Activity::Waiting => 2,
-        Activity::Working => 3,
-        Activity::Idle => 4,
-        Activity::Archived => 5,
+        Activity::Working => 2,
+        Activity::Waiting => 3,
+        Activity::Archived => 4,
     }
 }
 

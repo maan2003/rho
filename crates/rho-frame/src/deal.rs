@@ -17,14 +17,11 @@ use rho_dealer::{Address, Card, Claim};
 use rho_window::style::StyleClass;
 
 use crate::attention::{Takeback, Undo, Verdict, Write};
-use crate::desk::desk_rows;
+use crate::desk::{HostsAway, desk_rows};
 use crate::frame::Frame;
 use crate::phone::Layout;
 use crate::system::Project;
 use crate::when::{SnoozeUnit, snooze_said, snooze_target};
-
-/// What the echo line says when a pull finds nothing to deal.
-const NOTHING_WAITS: &str = "nothing waits";
 
 /// The lamp and the chime, as last evaluated.
 #[derive(Default)]
@@ -303,9 +300,10 @@ impl Frame {
         match self.deal_next(None, window, cx) {
             true => self.echo(&said, StyleClass::SystemInfo, cx),
             false => {
+                let nothing = self.nothing_waits();
                 let words = match empty_first {
-                    true => format!("{NOTHING_WAITS} · {said}"),
-                    false => format!("{said} · {NOTHING_WAITS}"),
+                    true => format!("{nothing} · {said}"),
+                    false => format!("{said} · {nothing}"),
                 };
                 self.echo(&words, StyleClass::SystemInfo, cx);
             }
@@ -384,7 +382,7 @@ impl Frame {
         });
         let words = match self.deal_next(in_view, window, cx) {
             true => skipped.map(|called| format!("skipped: {called}")),
-            false => Some(NOTHING_WAITS.to_owned()),
+            false => Some(self.nothing_waits()),
         };
         if let Some(words) = words {
             self.echo(&words, StyleClass::SystemInfo, cx);
@@ -398,7 +396,7 @@ impl Frame {
             if self.attention.can_undo() {
                 self.verdict_menu(window, cx);
             } else {
-                self.echo(NOTHING_WAITS, StyleClass::SystemInfo, cx);
+                self.echo(&self.nothing_waits(), StyleClass::SystemInfo, cx);
             }
         }
     }
@@ -538,6 +536,13 @@ impl Frame {
     /// Desk is a window onto the same ranking, rebuilt wherever the dealer
     /// is invalidated or the hand changes by itself, never on a timer of
     /// its own.
+    /// What the echo line says when a pull finds nothing to deal: and,
+    /// calmly, which hosts are away, so an empty deal is not taken for an
+    /// empty desk.
+    fn nothing_waits(&self) -> String {
+        HostsAway::of(&self.hosts).nothing_waits()
+    }
+
     pub(crate) fn refresh_desk(&mut self, hand: &Hand, hold: bool, cx: &mut Context<Self>) {
         let rows = desk_rows(
             hand,

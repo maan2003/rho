@@ -29,7 +29,7 @@ pub(super) fn rewind(
         frame.echo(AWAY, StyleClass::SystemInfo, cx);
         return;
     };
-    let label = system.registry().agent_display_label(agent);
+    let label = system.label(agent, cx).0;
     let reply = agents.call(RewindAgent { agent, turns });
     cx.spawn(async move |_, cx| {
         let result = reply.await;
@@ -52,7 +52,7 @@ pub(super) fn rewind(
 /// Shortens what the agent holds in mind.
 pub(super) fn compact(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
     system.update(cx, |system, cx| {
-        let label = system.registry().agent_display_label(agent);
+        let label = system.label(agent, cx).0;
         system.eval(
             agent,
             "compact context",
@@ -70,7 +70,7 @@ pub(super) fn new_cache_key(
     cx: &mut Context<Frame>,
 ) {
     system.update(cx, |system, cx| {
-        let label = system.registry().agent_display_label(agent);
+        let label = system.label(agent, cx).0;
         system.eval(
             agent,
             "new cache key",
@@ -144,7 +144,7 @@ pub(super) fn set_runtime(
                         snippets::set_runtime(agent, &runtime),
                         Some(format!(
                             "runtime: {} · {} (was {current})",
-                            system.registry().agent_display_label(agent),
+                            system.label(agent, cx).0,
                             runtime.label(),
                         )),
                         cx,
@@ -167,7 +167,7 @@ pub(super) fn stop(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Conte
         return;
     };
     let reply = agents.call(StopAgent { agent });
-    let label = system.registry().agent_display_label(agent);
+    let label = system.label(agent, cx).0;
     cx.spawn(async move |_, cx| {
         let reply = reply.await;
         cx.update(|cx| match reply {
@@ -195,7 +195,7 @@ pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Con
         return;
     };
     let reply = agents.call(Cancel { agent });
-    let label = system.registry().agent_display_label(agent);
+    let label = system.label(agent, cx).0;
     cx.spawn(async move |_, cx| {
         let result = reply.await;
         cx.update(|cx| match result {

@@ -127,7 +127,8 @@ def new_agent(*, runtime, **kwargs):
             let mail = run(&paths, root).await?;
             let live = run_live_ask(&paths, root).await?;
             let recovery = run_startup_failure(&paths, root).await?;
-            anyhow::Ok(format!("{mail}\n{live}\n{recovery}"))
+            let wakes = run_reply_wakes(&paths, root).await?;
+            anyhow::Ok(format!("{mail}\n{live}\n{recovery}\n{wakes}"))
         }
     })
     .await
@@ -147,8 +148,9 @@ def new_agent(*, runtime, **kwargs):
 async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
     let old = root.join("first-directory");
     let new = root.join("different-directory");
+    let corrected = root.join("corrected-directory");
     let repo = root.join("checkouts-tide");
-    for path in [&old, &new, &repo] {
+    for path in [&old, &new, &corrected, &repo] {
         std::fs::create_dir(path)?;
     }
     let git = |args: &[&str]| -> anyhow::Result<()> {
@@ -354,7 +356,7 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     );
     assert!(
         stop.text()
-            .contains("reply to retry, or change where it works from the project's palette.")
+            .contains("reply to retry, or change where it works with set project place")
     );
     assert_eq!(
         send(
@@ -392,14 +394,21 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     wait_for_delivery(paths, next_agent, next).await?;
     assert_eq!(idea_agent(paths, a).await?, standing);
 
-    call(
-        paths,
-        ChangeProject {
-            project: failed_project,
-            change: ProjectChange::Place(place(&old)),
-        },
-    )
-    .await?;
+    // The user fixes the place and the runtime between the refusal and the
+    // reply; the retry starts with both as they are now.
+    for change in [
+        ProjectChange::Place(place(&corrected)),
+        ProjectChange::Runtime(RuntimeLabel::parse("sol-low").unwrap()),
+    ] {
+        call(
+            paths,
+            ChangeProject {
+                project: failed_project,
+                change,
+            },
+        )
+        .await?;
+    }
     let retry = call(
         paths,
         RetryIdea {
@@ -464,9 +473,9 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
             (
                 failed_project,
                 ProjectConfig {
-                    place: place(&old),
+                    place: place(&corrected),
                     mode: ProjectMode::One,
-                    runtime: RuntimeLabel::default(),
+                    runtime: RuntimeLabel::parse("sol-low").unwrap(),
                 }
             ),
         ],
@@ -550,6 +559,16 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
     };
     assert_eq!(create_at(standing), old.to_str().unwrap());
     assert_eq!(create_at(next_agent), new.to_str().unwrap());
+    assert_eq!(
+        create_at(retry_agent),
+        corrected.to_str().unwrap(),
+        "a retried refused start works where the project works now"
+    );
+    assert_eq!(
+        runtime(retry_agent),
+        "sol-low",
+        "a retried refused start runs on the project's runtime now"
+    );
     assert_ne!(
         by_agent(next_agent),
         by_agent(fresh),
@@ -1246,6 +1265,79 @@ async fn run_startup_failure(paths: &RuntimePaths, root: &Path) -> anyhow::Resul
     Ok(format!(
         "failed launch #{}; three new replies retried, restart alone did not, and all mail reached native in order; later cross-kind switch refused",
         stop.id.0.0
+    ))
+}
+
+/// A reply in its thread is all it takes to get a stopped, failed or lost
+/// agent going again: the user never has to know which agent, or how it
+/// ended. The fake model answers only the brief; it fails every later user
+/// turn, which makes each wake also a real `failed` stop to reply to.
+async fn run_reply_wakes(paths: &RuntimePaths, root: &Path) -> anyhow::Result<String> {
+    let mut stream = connect_chat(paths).await?;
+    let ServerFrame::Hello { head, .. } = read_frame(&mut stream).await? else {
+        anyhow::bail!("no chat hello");
+    };
+    write_frame(&mut stream, &ClientFrame::Follow { since: head }).await?;
+    let project = post(paths, 130, None, "harbor").await?;
+    let thread = post(paths, 131, Some(project), "Keep the harbor clock honest.").await?;
+    let cwd = root.join("harbor");
+    std::fs::create_dir_all(&cwd)?;
+    let created = call(paths, CreateWorkset {
+        kind: WorksetKind::Host { cwd: cwd.to_str().unwrap().into() },
+        code: format!(
+            r#"new_agent(runtime={{"kind": "native", "model": "sol", "effort": "medium"}}, origin="chat:{}")"#,
+            thread.0.0
+        ),
+    }).await?;
+    let agent = created
+        .result
+        .agent
+        .with_context(|| format!("agent not created: {:?}", created.result.error))?;
+    wait_for_mail(&mut stream, |row| {
+        matches!(&row.event, ChatEvent::Posted {
+            parent: Some(parent), from: Address::Agent(from), voice: Voice::Message, ..
+        } if *parent == thread && *from == agent)
+    })
+    .await?;
+    let stopped_after = |after: MessageId, stop: Stop| {
+        move |row: &ChatRecord| {
+            row.seq > after.0
+                && matches!(&row.event, ChatEvent::Posted {
+                    parent: Some(parent), from: Address::System { agent: stopped, stop: said, .. }, ..
+                } if *parent == thread && *stopped == agent && *said == stop)
+        }
+    };
+
+    // (a) Stopped by the user: a reply wakes the same agent with the reply.
+    call(paths, StopAgent { agent }).await?;
+    let after_stop = post(paths, 132, Some(thread), "Carry on after the stop.").await?;
+    wait_for_delivery(paths, agent, after_stop).await?;
+    // The fake model refuses that turn, so the agent is now `failed`.
+    wait_for_mail(&mut stream, stopped_after(after_stop, Stop::Failed)).await?;
+
+    // (b) Failed: a reply retries it, with the reply.
+    let after_failure = post(paths, 133, Some(thread), "Try that again.").await?;
+    wait_for_delivery(paths, agent, after_failure).await?;
+    wait_for_mail(&mut stream, stopped_after(after_failure, Stop::Failed)).await?;
+
+    // Lost: its process ended under it. A reply brings it back on a new one.
+    let EvalResult { output, error, .. } = call(
+        paths,
+        Eval {
+            workset: created.workset,
+            code: "import os\nprint(os.getpid())".into(),
+        },
+    )
+    .await?;
+    anyhow::ensure!(error.is_none(), "{error:?}");
+    let worker = rustix::process::Pid::from_raw(output.trim().parse()?).context("no worker pid")?;
+    rustix::process::kill_process(worker, rustix::process::Signal::KILL)?;
+    wait_for_mail(&mut stream, stopped_after(after_failure, Stop::Lost)).await?;
+    let after_loss = post(paths, 134, Some(thread), "Carry on after the loss.").await?;
+    wait_for_delivery(paths, agent, after_loss).await?;
+    Ok(format!(
+        "reply wakes: agent {agent:?} read #{} after a stop, #{} after a failure and #{} after a loss",
+        after_stop.0.0, after_failure.0.0, after_loss.0.0
     ))
 }
 

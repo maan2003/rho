@@ -89,7 +89,9 @@ impl RuntimeState {
             _ if self.awaiting_human => Activity::Waiting,
             _ if self.is_working() => Activity::Working,
             _ if self.archived => Activity::Archived,
-            _ => Activity::Idle,
+            // An agent between turns waits for its next message, whether
+            // or not it asked for one.
+            _ => Activity::Waiting,
         }
     }
 }
@@ -161,4 +163,75 @@ pub enum ArgumentsFormat {
 pub enum TextPhase {
     Commentary,
     FinalAnswer,
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::UnixMs;
+
+    use super::*;
+
+    /// Every state a runtime reports reads as one of the product's words;
+    /// an agent between turns waits, and nothing says `idle`.
+    #[test]
+    fn every_runtime_state_reads_as_a_product_state_and_never_idle() {
+        let between_turns = RuntimeState::default();
+        let cases = [
+            (between_turns.clone(), "waiting"),
+            (
+                RuntimeState {
+                    awaiting_human: true,
+                    ..between_turns.clone()
+                },
+                "waiting",
+            ),
+            (
+                RuntimeState {
+                    inference: InferenceState::Responding,
+                    ..between_turns.clone()
+                },
+                "working",
+            ),
+            (
+                RuntimeState {
+                    running_tasks: 1,
+                    ..between_turns.clone()
+                },
+                "working",
+            ),
+            (
+                RuntimeState {
+                    inference: InferenceState::Retrying {
+                        at: UnixMs(2),
+                        error: "overloaded".into(),
+                        since: UnixMs(1),
+                    },
+                    ..between_turns.clone()
+                },
+                "retrying",
+            ),
+            (
+                RuntimeState {
+                    inference: InferenceState::Failed {
+                        error: "bad request".into(),
+                        since: None,
+                    },
+                    ..between_turns.clone()
+                },
+                "failed",
+            ),
+            (
+                RuntimeState {
+                    archived: true,
+                    // A stopped agent's tasks no longer count as work.
+                    running_tasks: 1,
+                    ..between_turns.clone()
+                },
+                "archived",
+            ),
+        ];
+        for (state, word) in cases {
+            assert_eq!(state.activity().word(), word, "{state:?}");
+        }
+    }
 }

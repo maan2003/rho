@@ -11,9 +11,9 @@ use crate::UnixMs;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Activity {
     Working,
-    /// It asked the user and waits for the answer.
+    /// Between turns: it asked the user, or ended its turn, and waits for
+    /// the next message. Users see no separate `idle` state.
     Waiting,
-    Idle,
     /// Its model kept failing and it stopped.
     Failed,
     /// Its model failed and it tries again.
@@ -30,7 +30,6 @@ impl Activity {
         match self {
             Self::Working => "working",
             Self::Waiting => "waiting",
-            Self::Idle => "idle",
             Self::Failed => "failed",
             Self::Retrying => "retrying",
             Self::Lost => "lost",
@@ -117,12 +116,7 @@ mod tests {
         let now = UnixMs(u64::MAX / 2);
         assert_eq!(doing(Activity::Failed).stop(now), Some(Stop::Failed));
         assert_eq!(doing(Activity::Lost).stop(now), Some(Stop::Lost));
-        for chosen in [
-            Activity::Working,
-            Activity::Waiting,
-            Activity::Idle,
-            Activity::Archived,
-        ] {
+        for chosen in [Activity::Working, Activity::Waiting, Activity::Archived] {
             assert_eq!(doing(chosen).stop(now), None, "{chosen:?}");
         }
     }

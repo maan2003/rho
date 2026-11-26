@@ -1539,6 +1539,89 @@ mod tests {
         });
     }
 
+    /// The device sends a reply to a refused start as its retry, also after
+    /// the user changed where the project works; any other reply, to a
+    /// stopped or failed agent too, is mail its agents read, and the host
+    /// wakes them with it.
+    #[gpui::test]
+    fn a_reply_retries_a_refused_start_and_is_mail_everywhere_else(cx: &mut gpui::TestAppContext) {
+        use rho_agent_types::{ChatEvent, ChatRecord, Stop};
+        let host = EndpointId([3; 32]);
+        let project = MessageId(ChatSeq(1));
+        let refused = MessageId(ChatSeq(3));
+        let stop = MessageId(ChatSeq(4));
+        let working = MessageId(ChatSeq(6));
+        let agent = AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let record = |id: MessageId, from: Party, parent: Option<MessageId>| ChatRecord {
+            seq: id.0,
+            at: UnixMs(id.0.0),
+            event: ChatEvent::Posted {
+                parent,
+                retry_of: None,
+                thread_reply: None,
+                from,
+                voice: Voice::Message,
+                content: vec![ContentPart::Text {
+                    text: format!("Mail #{}", id.0.0),
+                }],
+            },
+        };
+        let mut log = HostChat::default();
+        log.tell(&record(project, Party::User, None));
+        log.tell(&project_record(ChatSeq(2), project));
+        log.tell(&record(refused, Party::User, Some(project)));
+        log.tell(&record(stop, Party::StartFailed, Some(refused)));
+        // `set project place` after the refusal: the host reads it when
+        // the retry comes, so the device sends the same retry.
+        let mut moved = project_record(ChatSeq(5), project);
+        if let ChatEvent::Project { config, .. } = &mut moved.event {
+            config.place = rho_agent_types::ProjectPlace::parse("~/src/tide-fixed").unwrap();
+        }
+        log.tell(&moved);
+        log.tell(&record(working, Party::User, Some(project)));
+        log.tell(&record(
+            MessageId(ChatSeq(7)),
+            Party::Agent(agent),
+            Some(working),
+        ));
+        log.tell(&record(
+            MessageId(ChatSeq(8)),
+            Party::System {
+                agent,
+                stop: Stop::Failed,
+                since: UnixMs(8),
+            },
+            Some(working),
+        ));
+        let (_, mail, _db) = search_bench::fixture(cx, log);
+        cx.update(|cx| {
+            mail.update(cx, |mail, cx| {
+                let sent = |mail: &ChatSystem, thread: MessageId| {
+                    mail.local_under(host, Some(thread))
+                        .last()
+                        .map(|outgoing| (outgoing.delivery, outgoing.failed_start))
+                        .expect("the reply is queued")
+                };
+                let thread = |message| ThreadId { host, message };
+                let card = MessageVersion {
+                    message: stop,
+                    version: stop.0,
+                };
+                // Dealt from its card, and opened by name.
+                for settles in [Some(card), None] {
+                    mail.reply(thread(refused), settles, "Try the fixed place.".into(), cx);
+                    assert_eq!(
+                        sent(mail, refused),
+                        (Delivery::Retry, Some(stop)),
+                        "{settles:?}"
+                    );
+                }
+                mail.reply(thread(working), None, "Go on after the failure.".into(), cx);
+                assert_eq!(sent(mail, working), (Delivery::Mail, None));
+            })
+        });
+    }
+
     fn project_record(seq: ChatSeq, root: MessageId) -> rho_agent_types::ChatRecord {
         rho_agent_types::ChatRecord {
             seq,

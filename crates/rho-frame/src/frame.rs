@@ -155,7 +155,8 @@ impl Frame {
         keys::bind(cx);
         let (attention, ledger_events) = Attention::open(db.clone());
         let (host_sink, host_events) = futures::channel::mpsc::unbounded::<HostEvent>();
-        let desk = cx.new(|cx| DeskView::new(window, cx));
+        let frame = cx.weak_entity();
+        let desk = cx.new(|cx| DeskView::new(frame, window, cx));
         let chrome_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             rho_window::editor_config::configure(&mut editor, window, cx);

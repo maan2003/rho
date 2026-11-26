@@ -21,6 +21,7 @@ mod address;
 mod commands;
 mod steer;
 mod surface;
+mod work_name;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -56,6 +57,7 @@ use rho_terminal::protocol::TerminalInfo;
 use rho_terminal::ui::TerminalSurface;
 use rho_window::style::StyleClass;
 use surface::TranscriptSurface;
+use work_name::WorkName;
 
 use crate::agent_view::{AgentModel, AgentModelEvent};
 use crate::render::{self, Label, Labels};
@@ -281,14 +283,60 @@ impl AgentsSystem {
         self.agents_on(self.registry.host_of_agent(agent)?)
     }
 
-    /// The agent's label with its host, for the status line and `find`.
-    fn label(&self, agent: AgentId) -> (String, String) {
-        let host = self
+    /// What the agent's work is called (`work_name`): the project and
+    /// subject of the thread it works for, or of its workset's lead when
+    /// it joined none, as a child does.
+    fn work_name(&self, agent: AgentId, cx: &App) -> WorkName {
+        let thread = self.agent_thread(agent, cx).or_else(|| {
+            self.lead_of(agent)
+                .filter(|lead| *lead != agent)
+                .and_then(|lead| self.agent_thread(lead, cx))
+        });
+        let mail = self.mail.read(cx);
+        let (project, subject) = thread
+            .and_then(|thread| {
+                let root = mail.host_chat(thread.host)?.root_of(thread.message);
+                let project = mail.project_address(ThreadId {
+                    host: thread.host,
+                    message: root,
+                });
+                // A project's own root is not a piece of work's thread.
+                let subject = (thread.message != root)
+                    .then(|| mail.host_chat(thread.host)?.name(thread.message))
+                    .flatten()
+                    .filter(|subject| !subject.trim().is_empty());
+                Some((project, subject))
+            })
+            .unwrap_or_default();
+        let shared = self
             .registry
+            .agent_workset(agent)
+            .is_some_and(|workset| self.workset_agents(workset).len() > 1);
+        WorkName {
+            project,
+            subject,
+            code: self.registry.agent_code(agent),
+            shared,
+        }
+    }
+
+    fn host_label(&self, agent: AgentId) -> String {
+        self.registry
             .host_of_agent(agent)
             .map(|host| self.registry.host_name(host).to_owned())
-            .unwrap_or_default();
-        (self.registry.agent_display_label(agent), host)
+            .unwrap_or_default()
+    }
+
+    /// The agent by its work, with its host, for the status line, `find`
+    /// and the prompts that ask for an agent.
+    fn label(&self, agent: AgentId, cx: &App) -> (String, String) {
+        (self.work_name(agent, cx).agent(), self.host_label(agent))
+    }
+
+    /// The agent's workset by its work, with its host: what the workset
+    /// and its tools are called.
+    fn work_label(&self, agent: AgentId, cx: &App) -> (String, String) {
+        (self.work_name(agent, cx).work(), self.host_label(agent))
     }
 
     fn model_event(&mut self, host: HostId, msg: ModelMsg, cx: &mut Context<Self>) {
@@ -433,11 +481,14 @@ impl AgentsSystem {
         }
     }
 
-    /// Whom a transcript screen is named after.
-    fn scope_name(&self, scope: Scope) -> Option<ScopeName> {
+    /// What a transcript screen is called, with its host: the work of a
+    /// workset, or of the one agent it is narrowed to.
+    fn scope_label(&self, scope: Scope, cx: &App) -> Option<(String, String)> {
         let (shown, _) = self.scope_agents(scope)?;
-        let workset = self.lead_of(shown)?;
-        Some(ScopeName { workset, shown })
+        Some(match scope {
+            Scope::Workset(_) => self.work_label(shown, cx),
+            Scope::Agent(agent) => self.label(agent, cx),
+        })
     }
 
     /// Lands a frame on an agent's transcript and shows what moved on
@@ -870,15 +921,11 @@ impl AgentsSystem {
         .detach();
     }
 
-    /// What a surface under the agent dials with: its host's link, its
-    /// encoded id, and what to call it. `None` while the host is away.
-    fn workset_of(&self, agent: AgentId) -> Option<(&Link, String, String)> {
+    /// What a surface under the agent dials with: its host's link and its
+    /// encoded id. `None` while the host is away.
+    fn workset_of(&self, agent: AgentId) -> Option<(&Link, String)> {
         let link = self.links.get(&self.registry.host_of_agent(agent)?)?;
-        Some((
-            link,
-            agent.encoded(),
-            self.registry.agent_display_label(agent),
-        ))
+        Some((link, agent.encoded()))
     }
 
     /// Whether the agent's host is attached; the echo line says so when
@@ -1015,7 +1062,7 @@ impl AgentsSystem {
         if !self.attached(agent, cx) {
             return;
         }
-        let Some((link, _, _)) = self.workset_of(agent) else {
+        let Some((link, _)) = self.workset_of(agent) else {
             return;
         };
         let running = rho_terminal::channel::list(link, None);
@@ -1058,7 +1105,7 @@ impl AgentsSystem {
                             .into_iter()
                             .map(|(owner, info)| {
                                 let address = AgentAddress::terminal(owner, info.terminal_id);
-                                let value = this.tool_title(&address);
+                                let value = this.tool_title(&address, cx);
                                 (value, info.title, address)
                             })
                             .collect();
@@ -1071,9 +1118,10 @@ impl AgentsSystem {
     }
 
     /// What a tool is called in the palette and the prompts that offer
-    /// it: its agent's label and the tool, `eng-q9tz · term 1`.
-    fn tool_title(&self, at: &AgentAddress) -> String {
-        format!("{} · {}", self.label(at.agent).0, at.part)
+    /// it: its workset's work and the tool, `tide · Flaky clock test ·
+    /// term 1`. A tool is the workset's, whichever agent started it.
+    fn tool_title(&self, at: &AgentAddress, cx: &App) -> String {
+        work_name::tool_title(&self.work_label(at.agent, cx).0, &at.part)
     }
 
     fn open_tool(&self, at: AgentAddress, card: Option<CardInspection>, cx: &mut App) {
@@ -1136,7 +1184,7 @@ impl AgentsSystem {
         if !self.attached(agent, cx) {
             return;
         }
-        let Some((link, id, _)) = self.workset_of(agent) else {
+        let Some((link, id)) = self.workset_of(agent) else {
             return;
         };
         let closed = rho_shell_view::channel::close(link, id);
@@ -1178,7 +1226,7 @@ impl AgentsSystem {
             _ => {
                 let choices = desktops
                     .into_iter()
-                    .map(|at| (self.tool_title(&at), "desktop".to_owned(), at))
+                    .map(|at| (self.tool_title(&at, cx), "desktop".to_owned(), at))
                     .collect();
                 self.ask_tool("desktop:", choices, card, cx);
             }
@@ -1319,9 +1367,10 @@ impl System for AgentsSystem {
         let Some(host) = self.registry.host_of_agent(agent) else {
             return unknown();
         };
-        let Some((link, id, label)) = self.workset_of(agent) else {
+        let Some((link, id)) = self.workset_of(agent) else {
             return Opening::Gone;
         };
+        let label = self.work_label(agent, cx).0;
         let surface = match part {
             Part::Transcript => self.open_transcript(Scope::Agent(agent), window, cx),
             Part::Terminal(terminal) => AnySurface::new(
@@ -1408,32 +1457,32 @@ impl System for AgentsSystem {
         &self,
         address: &Address,
         _marks: &rho_frame::Marks,
-        _cx: &App,
+        cx: &App,
     ) -> Option<(String, String)> {
         if let Some(chart) = UsageChart::from_address(address) {
             return Some((chart.title(), "usage".to_owned()));
         }
         if let Some(scope @ Scope::Workset(_)) = Scope::from_address(address) {
             let (lead, _) = self.scope_agents(scope)?;
-            return Some(self.label(lead));
+            return Some(self.work_label(lead, cx));
         }
         let at = AgentAddress::from_address(address)?;
         self.registry.mirrored(at.agent)?;
-        let (label, host) = self.label(at.agent);
+        let (label, host) = self.label(at.agent, cx);
         Some(match at.part {
             Part::Transcript => (label, host),
-            _ => (self.tool_title(&at), host),
+            _ => (self.tool_title(&at, cx), host),
         })
     }
 
-    fn agent_name(&self, agent: AgentId, _cx: &App) -> Option<String> {
+    fn agent_name(&self, agent: AgentId, cx: &App) -> Option<String> {
         self.registry.mirrored(agent)?;
-        Some(self.label(agent).0)
+        Some(self.label(agent, cx).0)
     }
 
     /// Every workset's transcript, by its lead, and every terminal, shell
     /// and desktop that runs, by its agent: a running tool is a place.
-    fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
+    fn find(&self, _marks: &Marks, cx: &App) -> Vec<Found> {
         let mut worksets: HashMap<WorksetId, Vec<AgentId>> = HashMap::new();
         for agent in self.registry.known_agents().copied() {
             if let Some(workset) = self.registry.agent_workset(agent) {
@@ -1442,7 +1491,7 @@ impl System for AgentsSystem {
         }
         let transcripts = worksets.into_iter().filter_map(|(workset, agents)| {
             let (lead, _) = self.scope_agents(Scope::Workset(workset))?;
-            let (title, host) = self.label(lead);
+            let (title, host) = self.work_label(lead, cx);
             let mut description = vec![host];
             description.extend(
                 self.registry
@@ -1507,8 +1556,8 @@ impl System for AgentsSystem {
                 })
             });
         let tools = terminals.chain(shells).chain(desktops).map(|(at, shows)| {
-            let host = self.label(at.agent).1;
-            let mut title = self.tool_title(&at);
+            let host = self.host_label(at.agent);
+            let mut title = self.tool_title(&at, cx);
             if !shows.is_empty() {
                 title = format!("{title} · {shows}");
             }
@@ -1540,11 +1589,4 @@ impl System for AgentsSystem {
 struct Running {
     terminals: Vec<TerminalInfo>,
     shells: Vec<ShellInfo>,
-}
-
-/// Whom a transcript screen is named after: its workset's lead, and the
-/// agent whose folder and runtime it shows.
-pub(super) struct ScopeName {
-    pub workset: AgentId,
-    pub shown: AgentId,
 }

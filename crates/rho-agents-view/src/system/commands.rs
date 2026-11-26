@@ -208,8 +208,8 @@ impl AgentsSystem {
     }
 
     /// An agent as a prompt offers it: its label, and where and how it is.
-    fn agent_candidate(&self, agent: AgentId) -> Candidate {
-        let (label, host) = self.label(agent);
+    fn agent_candidate(&self, agent: AgentId, cx: &App) -> Candidate {
+        let (label, host) = self.label(agent, cx);
         let mut description = vec![host];
         description.extend(
             self.registry
@@ -230,8 +230,8 @@ impl AgentsSystem {
 
     /// A workset as a prompt offers it, by its lead: where it works, and
     /// how many agents work in it.
-    fn workset_candidate(&self, lead: AgentId) -> Candidate {
-        let (label, host) = self.label(lead);
+    fn workset_candidate(&self, lead: AgentId, cx: &App) -> Candidate {
+        let (label, host) = self.work_label(lead, cx);
         let mut description = vec![host];
         description.extend(
             self.registry
@@ -282,16 +282,29 @@ fn choose(
     };
     let choices: Rc<Vec<(AgentId, Candidate)>> = Rc::new({
         let system = system.read(cx);
-        agents
-            .into_iter()
-            .map(|agent| {
-                let candidate = match ask {
-                    Ask::Agent => system.agent_candidate(agent),
-                    Ask::Workset => system.workset_candidate(agent),
-                };
-                (agent, candidate)
+        let mut candidates: Vec<_> = agents
+            .iter()
+            .map(|agent| match ask {
+                Ask::Agent => system.agent_candidate(*agent, cx),
+                Ask::Workset => system.workset_candidate(*agent, cx),
             })
-            .collect()
+            .collect();
+        // Two pieces of work may read the same; their codes tell them apart.
+        let mut values: Vec<_> = candidates
+            .iter_mut()
+            .zip(&agents)
+            .map(|(candidate, agent)| {
+                (
+                    std::mem::take(&mut candidate.value),
+                    system.registry().agent_code(*agent),
+                )
+            })
+            .collect();
+        super::work_name::distinct(&mut values);
+        for (candidate, (value, _)) in candidates.iter_mut().zip(values) {
+            candidate.value = value;
+        }
+        agents.into_iter().zip(candidates).collect()
     });
     if choices.is_empty() {
         let words = match ask {
@@ -536,7 +549,7 @@ fn filter(
             system
                 .workset_agents(workset)
                 .into_iter()
-                .map(|agent| (Scope::Agent(agent), system.agent_candidate(agent))),
+                .map(|agent| (Scope::Agent(agent), system.agent_candidate(agent, cx))),
         );
         let current = Scope::from_address(frame.current_address())
             .filter(|scope| system.scope_workset(*scope) == Some(workset));

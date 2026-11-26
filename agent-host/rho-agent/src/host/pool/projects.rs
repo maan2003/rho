@@ -291,7 +291,7 @@ impl AgentPool {
             }
             Err(error) => {
                 self.write_start_failure(&mut write, message, format!(
-                    "failed · did not start · {} on {}: {}\n\nreply to retry, or change where it works from the project's palette.",
+                    "failed · did not start · {} on {}: {}\n\nreply to retry, or change where it works with set project place",
                     config.place.as_str(), one_line(&idea.host_label), one_line(&format!("{error:#}")),
                 ))?;
             }

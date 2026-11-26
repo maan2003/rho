@@ -640,7 +640,7 @@ mod tests {
         assert!(!is_working(retry, deadline));
         assert!(!is_working(
             Doing {
-                activity: Activity::Idle,
+                activity: Activity::Waiting,
                 ..retry
             },
             UnixMs(15)
