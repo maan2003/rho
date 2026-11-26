@@ -32,8 +32,8 @@ use rho_dealer::facts::Fact;
 use rho_dealer::{Address, Addressed, Marks};
 use rho_frame::attention::Write;
 use rho_frame::{
-    AnySurface, Found, FoundText, Frame, FrameLink, Point, Row, SearchPoint, System, TextIndex,
-    TextKind, TextPresenter, TextSearch, TextTarget,
+    AnySurface, Found, FoundText, Frame, FrameLink, Opening, Point, Row, SearchPoint, System,
+    TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
 pub use view::NoteView;
 
@@ -407,21 +407,18 @@ impl System for NoteSystem {
         &[Address::NOTE, NOTES]
     }
 
-    fn open(
-        &mut self,
-        address: &Address,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnySurface> {
+    fn open(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> Opening {
         let system = cx.entity();
         let frame = self.frame.clone();
         if *address == notes_address() {
             let view = cx.new(|cx| NotesView::new(system, frame, window, cx));
-            return Some(AnySurface::new(view));
+            return Opening::Surface(AnySurface::new(view));
         }
-        let note = NoteId::from_address(address)?;
+        let Some(note) = NoteId::from_address(address) else {
+            return Opening::Gone;
+        };
         let view = cx.new(|cx| NoteView::new(system, frame, note, window, cx));
-        Some(AnySurface::new(view))
+        Opening::Surface(AnySurface::new(view))
     }
 
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
@@ -432,7 +429,8 @@ impl System for NoteSystem {
 
     fn rows(&mut self, _point: &Point, _window: &mut Window, _cx: &mut Context<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        rows.push(Row::run("w", "new note", make_note));
+        // Rare: a window-wide command, below what this screen offers.
+        rows.push(Row::run("w", "new note", make_note).window_wide());
         // The one door to the notes, on every screen: one of the window's
         // own commands.
         rows.push(

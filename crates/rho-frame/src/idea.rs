@@ -775,13 +775,8 @@ mod tests {
             &["project"]
         }
 
-        fn open(
-            &mut self,
-            _: &Address,
-            _: &mut Window,
-            _: &mut Context<Self>,
-        ) -> Option<crate::AnySurface> {
-            None
+        fn open(&mut self, _: &Address, _: &mut Window, _: &mut Context<Self>) -> crate::Opening {
+            crate::Opening::Gone
         }
 
         fn idea_project_hosts(&self, _: &App) -> Vec<(EndpointId, String)> {

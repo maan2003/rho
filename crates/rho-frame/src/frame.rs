@@ -1,6 +1,6 @@
 //! The frame entity: the window's root view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use gpui::{
 };
 use jiff::Timestamp;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
-use rho_agent_hosts::{HostEvent, HostSpec};
+use rho_agent_hosts::{HostEvent, HostId, HostSpec};
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 use rho_ledger::Pairing;
@@ -25,6 +25,7 @@ use theme::ActiveTheme as _;
 use crate::attention::{Attention, Verdict};
 use crate::deal::Signals;
 use crate::desk::DeskView;
+use crate::hosts::HostQuestion;
 use crate::idea::IdeaBox;
 use crate::menu::{OpenMenu, Pick, Row, Rows, Shortcut};
 use crate::minibuffer::{
@@ -34,7 +35,8 @@ use crate::minibuffer::{
 use crate::phone::{Layout, Phone};
 use crate::search::Search;
 use crate::surface::{AnySurface, CardHere, Mode, Subject, Surface as _};
-use crate::system::{AnySystem, Found};
+use crate::system::{AnySystem, Found, Opening};
+use crate::waiting::Waiting;
 use crate::when::SnoozeUnit;
 use crate::{keys, palette, place};
 
@@ -107,6 +109,8 @@ pub struct Frame {
     pub(crate) desk: Entity<DeskView>,
     pub(crate) idea: IdeaBox,
     pub(crate) minibuffer: Option<Minibuffer>,
+    /// What hosts ask the user, oldest first, waiting for the prompt.
+    pub(crate) questions: VecDeque<HostQuestion>,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) menu_focus: FocusHandle,
     /// Where the keyboard was before a menu or a prompt took it.
@@ -216,6 +220,7 @@ impl Frame {
             desk,
             idea,
             minibuffer: None,
+            questions: VecDeque::new(),
             menu: None,
             menu_focus: cx.focus_handle(),
             overlay_return: None,
@@ -290,33 +295,92 @@ impl Frame {
             Timestamp::now(),
         );
         let address = self.current_address().clone();
-        if self.surfaces.contains_key(&address) {
+        if self.surfaces.contains_key(&address) || self.hold(&address, window, cx) {
             return;
         }
-        match self.make_surface(&address, window, cx) {
-            Some(surface) => {
-                self.surfaces.insert(address, surface);
-            }
-            None => {
-                self.history.forget(&address);
-                self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-                self.history.show(Self::desk_address(), ScreenEntry::Opened);
-            }
-        }
+        self.history.forget(&address);
+        self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
+        self.history.show(Self::desk_address(), ScreenEntry::Opened);
     }
 
-    /// The surface for `address`, from the system that owns its kind.
+    /// What the system that owns `address`'s kind has for it.
     fn make_surface(
         &self,
         address: &Address,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnySurface> {
-        self.systems
+    ) -> Opening {
+        match self
+            .systems
             .clone()
             .into_iter()
             .find(|system| system.opens(address, cx))
-            .and_then(|system| system.open(address, window, cx))
+        {
+            Some(system) => system.open(address, window, cx),
+            None => Opening::Gone,
+        }
+    }
+
+    /// Makes the surface for `address` and holds it: the real one, or a
+    /// waiting screen while the hosts that would hold it have not said.
+    /// `false` when nothing holds it.
+    fn hold(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let surface = match self.make_surface(address, window, cx) {
+            Opening::Surface(surface) => surface,
+            Opening::Waiting(hosts) => AnySurface::new(self.waiting_surface(&hosts, cx)),
+            Opening::Gone => return false,
+        };
+        self.surfaces.insert(address.clone(), surface);
+        true
+    }
+
+    fn waiting_surface(&self, hosts: &[HostId], cx: &mut Context<Self>) -> Entity<Waiting> {
+        let names = hosts
+            .iter()
+            .map(|host| self.hosts.host_label(*host))
+            .collect::<Vec<_>>()
+            .join(", ");
+        cx.new(|cx| Waiting::new(names, cx))
+    }
+
+    /// Asks again for every address that waits on its hosts: one a host
+    /// now holds gets its real surface in the waiting one's place, and
+    /// one no host holds leaves the history, as a closed screen does. A
+    /// prompt or a menu over the screen keeps the keyboard.
+    pub(crate) fn reopen_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let waiting = self
+            .surfaces
+            .iter()
+            .filter(|(_, surface)| surface.view().downcast::<Waiting>().is_ok())
+            .map(|(address, _)| address.clone())
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return;
+        }
+        let shown = self.current_surface().entity_id();
+        for address in waiting {
+            match self.make_surface(&address, window, cx) {
+                Opening::Waiting(_) => {}
+                Opening::Surface(surface) => {
+                    self.surfaces.insert(address, surface);
+                }
+                Opening::Gone => {
+                    self.surfaces.remove(&address);
+                    self.history.forget(&address);
+                }
+            }
+        }
+        self.settle(false, window, cx);
+        if self.current_surface().entity_id() == shown {
+            return;
+        }
+        let handle = self.current_surface().focus_handle(cx);
+        match &mut self.overlay_return {
+            Some(under) => *under = handle,
+            None => self.focus_surface(window, cx),
+        }
+        self.moved();
+        cx.notify();
     }
 
     /// Makes the screen the cursor came to, when the history holds it by
@@ -326,11 +390,7 @@ impl Frame {
     fn settle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         loop {
             let address = self.current_address().clone();
-            if self.surfaces.contains_key(&address) {
-                return;
-            }
-            if let Some(surface) = self.make_surface(&address, window, cx) {
-                self.surfaces.insert(address, surface);
+            if self.surfaces.contains_key(&address) || self.hold(&address, window, cx) {
                 return;
             }
             self.history.forget(&address);
@@ -516,16 +576,13 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.surfaces.contains_key(&address) {
-            let Some(surface) = self.make_surface(&address, window, cx) else {
-                self.echo(
-                    &format!("nothing opens {address}"),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            };
-            self.surfaces.insert(address.clone(), surface);
+        if !self.surfaces.contains_key(&address) && !self.hold(&address, window, cx) {
+            self.echo(
+                &format!("nothing opens {address}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
         }
         let surface = self.surfaces[&address].clone();
         let (entry, method) = match open {
@@ -736,16 +793,37 @@ impl Frame {
             Some(handle) => window.focus(&handle, cx),
             None => self.focus_surface(window, cx),
         }
+        self.ask_after(window, cx);
         cx.notify();
     }
 
     fn close_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        if self
+            .minibuffer
+            .as_ref()
+            .is_some_and(|prompt| prompt.question.is_some())
+        {
+            // A host's question is not the user's to lose by moving: it
+            // stays in line and is asked again.
+            self.minibuffer = None;
+        }
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
         }
         self.close_idea_overlay(window, cx);
         self.overlay_return = None;
+        self.ask_after(window, cx);
+    }
+
+    /// Asks the next host question once this update has run its course:
+    /// a prompt's answer may open another prompt, which goes first.
+    fn ask_after(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.questions.is_empty() {
+            cx.defer_in(window, |frame, window, cx| {
+                frame.ask_next(window, cx);
+            });
+        }
     }
 
     /// Draws `rows` under the point and gives them the keyboard.
@@ -1209,15 +1287,7 @@ impl Frame {
             rows.push(Row::run(
                 (index + 1).to_string(),
                 format!("{} · {}", host.name, host.status.label()),
-                move |frame, _, cx| {
-                    let label = frame.hosts.host_label(id);
-                    let status = frame
-                        .hosts
-                        .get(id)
-                        .map(|host| host.status.label())
-                        .unwrap_or_default();
-                    frame.echo(&format!("{label}: {status}"), StyleClass::SystemInfo, cx);
-                },
+                move |frame, _, cx| frame.pick_host(id, cx),
             ));
         }
         rows
@@ -1904,6 +1974,8 @@ impl Render for Frame {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
+
     use super::*;
     use crate::desk::desk_rows;
 
@@ -1985,6 +2057,14 @@ mod tests {
     }
 
     fn test_frame(cx: &mut gpui::TestAppContext, db: rho_db::RhoDb) -> gpui::WindowHandle<Frame> {
+        test_frame_with(cx, db, |_| Vec::new())
+    }
+
+    fn test_frame_with(
+        cx: &mut gpui::TestAppContext,
+        db: rho_db::RhoDb,
+        systems: impl FnOnce(&mut App) -> Vec<AnySystem>,
+    ) -> gpui::WindowHandle<Frame> {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             let settings = settings::SettingsStore::test(cx);
@@ -1993,9 +2073,148 @@ mod tests {
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
         });
-        cx.add_window(|window, cx| {
-            Frame::new(db, Vec::new(), Vec::new(), Rc::new(|| {}), window, cx)
-        })
+        let systems = cx.update(systems);
+        cx.add_window(|window, cx| Frame::new(db, systems, Vec::new(), Rc::new(|| {}), window, cx))
+    }
+
+    /// What a host has said of the agent its screens are about.
+    #[derive(Clone, Copy)]
+    enum Holds {
+        NotYetSaid,
+        Here,
+        Gone,
+    }
+
+    /// A system whose one address lives on a host, which has said `holds`.
+    struct HostBacked(Rc<std::cell::Cell<Holds>>);
+
+    impl crate::System for HostBacked {
+        fn kinds(&self) -> &'static [&'static str] {
+            &["agent"]
+        }
+
+        fn open(&mut self, _: &Address, _: &mut Window, cx: &mut Context<Self>) -> Opening {
+            match self.0.get() {
+                Holds::NotYetSaid => Opening::Waiting(vec![HostId(0)]),
+                Holds::Here => {
+                    Opening::Surface(AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle()))))
+                }
+                Holds::Gone => Opening::Gone,
+            }
+        }
+
+        fn agent_name(&self, agent: rho_agent_types::AgentId, _: &App) -> Option<String> {
+            (agent == Self::asker()).then(|| "eng-b8os".to_owned())
+        }
+    }
+
+    impl HostBacked {
+        fn asker() -> rho_agent_types::AgentId {
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()
+        }
+    }
+
+    fn host_backed_frame(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::WindowHandle<Frame>, Rc<std::cell::Cell<Holds>>) {
+        let holds = Rc::new(std::cell::Cell::new(Holds::NotYetSaid));
+        let system = holds.clone();
+        let frame = test_frame_with(cx, rho_db::RhoDb::in_memory(), move |cx| {
+            vec![AnySystem::new(cx.new(|_| HostBacked(system)))]
+        });
+        (frame, holds)
+    }
+
+    /// The way back as the last run left it: Desk, then `screen` in view.
+    fn saved_on(screen: &Address) -> place::Saved {
+        let mut history = History::new(Frame::desk_address(), ScreenEntry::Opened);
+        history.show(screen.clone(), ScreenEntry::Opened);
+        place::Saved::of(&history)
+    }
+
+    fn is_waiting(frame: &Frame) -> bool {
+        frame.current_surface().view().downcast::<Waiting>().is_ok()
+    }
+
+    #[gpui::test]
+    fn a_warm_restart_keeps_a_screen_whose_host_has_not_answered(cx: &mut gpui::TestAppContext) {
+        let (frame, holds) = host_backed_frame(cx);
+        let agent = Address::new("agent", "standing");
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.last_input = Some(Timestamp::now());
+                frame.return_to(saved_on(&agent), window, cx);
+                assert_eq!(frame.current_address(), &agent);
+                assert!(is_waiting(frame), "the screen waits for its host");
+                // Back and forward again before the host answers.
+                frame.back(window, cx);
+                assert_eq!(frame.current_address(), &Frame::desk_address());
+                frame.forward_or_deal(window, cx);
+                assert_eq!(frame.current_address(), &agent, "the way back kept it");
+                assert!(is_waiting(frame));
+
+                holds.set(Holds::Here);
+                frame.reopen_waiting(window, cx);
+                assert_eq!(frame.current_address(), &agent);
+                assert_eq!(frame.current_surface().title(cx), "The meter");
+                assert!(
+                    frame.current_surface().focus_handle(cx).is_focused(window),
+                    "the keyboard moves to the real screen"
+                );
+                assert_eq!(frame.history.len(), 2);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_early_back_reaches_a_screen_left_behind_the_desk(cx: &mut gpui::TestAppContext) {
+        let (frame, holds) = host_backed_frame(cx);
+        let agent = Address::new("agent", "standing");
+        frame
+            .update(cx, |frame, window, cx| {
+                // A cold return: Desk in view, the agent just behind it.
+                frame.last_input = None;
+                frame.return_to(saved_on(&agent), window, cx);
+                assert_eq!(frame.current_address(), &Frame::desk_address());
+                frame.back(window, cx);
+                assert_eq!(frame.current_address(), &agent);
+                assert!(is_waiting(frame));
+                // The host answers while the user is in a prompt: the prompt
+                // keeps the keyboard, and gives it to the real screen.
+                frame.open_prompt(
+                    "name:",
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+                holds.set(Holds::Here);
+                frame.reopen_waiting(window, cx);
+                assert!(frame.minibuffer.is_some(), "the prompt stays open");
+                let real = frame.current_surface().focus_handle(cx);
+                assert!(!real.is_focused(window));
+                frame.minibuffer_cancel(window, cx);
+                assert!(real.is_focused(window));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_screen_its_host_no_longer_holds_is_passed_over(cx: &mut gpui::TestAppContext) {
+        let (frame, holds) = host_backed_frame(cx);
+        let agent = Address::new("agent", "standing");
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.last_input = Some(Timestamp::now());
+                frame.return_to(saved_on(&agent), window, cx);
+                assert!(is_waiting(frame));
+                holds.set(Holds::Gone);
+                frame.reopen_waiting(window, cx);
+                assert_eq!(frame.current_address(), &Frame::desk_address());
+                assert!(frame.desk.focus_handle(cx).contains_focused(window, cx));
+                assert_eq!(frame.history.len(), 1, "no walk reaches it again");
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -2235,13 +2454,8 @@ mod tests {
             &["thread"]
         }
 
-        fn open(
-            &mut self,
-            _: &Address,
-            _: &mut Window,
-            cx: &mut Context<Self>,
-        ) -> Option<AnySurface> {
-            Some(AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle()))))
+        fn open(&mut self, _: &Address, _: &mut Window, cx: &mut Context<Self>) -> Opening {
+            Opening::Surface(AnySurface::new(cx.new(|cx| OpenCard(cx.focus_handle()))))
         }
 
         fn claims(
@@ -2405,6 +2619,162 @@ mod tests {
                     &thread,
                     "stay in the reopened thread"
                 );
+            })
+            .unwrap();
+    }
+
+    type Answered = tokio::sync::oneshot::Receiver<GitApprovalDecision>;
+
+    /// A host asks, as its connection says it: request `request`, for the
+    /// test system's agent.
+    fn git_asks(
+        frame: &mut Frame,
+        request: u64,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) -> Answered {
+        let (response, answered) = tokio::sync::oneshot::channel();
+        frame.host_event(
+            HostId(0),
+            ConnEvent::GitTransportApproval {
+                request_id: request,
+                agent: Some(HostBacked::asker()),
+                asks: format!("push to ssh://github.com:22/acme/repo: branch b{request}"),
+                response,
+            },
+            window,
+            cx,
+        );
+        answered
+    }
+
+    fn prompt_of(frame: &Frame) -> Option<String> {
+        frame
+            .minibuffer
+            .as_ref()
+            .map(|prompt| prompt.prompt().to_owned())
+    }
+
+    fn answer(frame: &mut Frame, text: &str, window: &mut Window, cx: &mut Context<Frame>) {
+        frame
+            .minibuffer_mut()
+            .expect("a prompt is open")
+            .set_input(text.to_owned(), window, cx);
+        frame.minibuffer_confirm(window, cx);
+    }
+
+    #[gpui::test]
+    fn a_second_push_waits_for_the_first(cx: &mut gpui::TestAppContext) {
+        let (frame, _) = host_backed_frame(cx);
+        let (mut first, mut second) = frame
+            .update(cx, |frame, window, cx| {
+                let first = git_asks(frame, 1, window, cx);
+                let second = git_asks(frame, 2, window, cx);
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some(
+                        "eng-b8os · git asks: push to ssh://github.com:22/acme/repo: branch b1 \
+                         · allow or deny:"
+                    ),
+                    "the agent is named, and the first question is asked first"
+                );
+                answer(frame, "allow", window, cx);
+                (first, second)
+            })
+            .unwrap();
+        assert_eq!(first.try_recv(), Ok(GitApprovalDecision::Allow));
+        assert!(second.try_recv().is_err(), "the second still waits");
+        frame
+            .update(cx, |frame, window, cx| {
+                assert!(prompt_of(frame).unwrap().contains("branch b2"));
+                frame.minibuffer_cancel(window, cx);
+            })
+            .unwrap();
+        assert_eq!(second.try_recv(), Ok(GitApprovalDecision::Deny));
+    }
+
+    #[gpui::test]
+    fn a_question_waits_for_the_users_prompt(cx: &mut gpui::TestAppContext) {
+        let (frame, _) = host_backed_frame(cx);
+        let mut asked = frame
+            .update(cx, |frame, window, cx| {
+                frame.open_prompt(
+                    "attach host:",
+                    Rc::new(|_, _, _| Vec::new()),
+                    Rc::new(|_, _, _, _| {}),
+                    window,
+                    cx,
+                );
+                frame
+                    .minibuffer_mut()
+                    .unwrap()
+                    .set_input("lab=".to_owned(), window, cx);
+                let asked = git_asks(frame, 1, window, cx);
+                assert_eq!(prompt_of(frame).as_deref(), Some("attach host:"));
+                assert_eq!(frame.minibuffer.as_ref().unwrap().input(cx), "lab=");
+                asked
+            })
+            .unwrap();
+        assert!(asked.try_recv().is_err(), "neither answered nor dropped");
+        frame
+            .update(cx, |frame, window, cx| frame.minibuffer_cancel(window, cx))
+            .unwrap();
+        frame
+            .update(cx, |frame, _, _| {
+                assert!(prompt_of(frame).unwrap().contains("git asks"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_stray_y_and_enter_answer_nothing(cx: &mut gpui::TestAppContext) {
+        let (frame, _) = host_backed_frame(cx);
+        let mut asked = frame
+            .update(cx, |frame, window, cx| {
+                let asked = git_asks(frame, 1, window, cx);
+                answer(frame, "y", window, cx);
+                assert!(prompt_of(frame).is_some(), "the question stays open");
+                answer(frame, "", window, cx);
+                assert!(prompt_of(frame).is_some());
+                // Choosing a row is an answer.
+                frame.minibuffer_select(1, cx);
+                frame.minibuffer_confirm(window, cx);
+                asked
+            })
+            .unwrap();
+        assert_eq!(asked.try_recv(), Ok(GitApprovalDecision::Allow));
+    }
+
+    #[gpui::test]
+    fn moving_away_keeps_the_question_and_its_end_closes_it(cx: &mut gpui::TestAppContext) {
+        let (frame, _) = host_backed_frame(cx);
+        let mut asked = frame
+            .update(cx, |frame, window, cx| {
+                let asked = git_asks(frame, 1, window, cx);
+                // Something else moves the screen, such as an inspection
+                // a system opens: the question is set aside, not refused.
+                frame.close_overlays(window, cx);
+                assert!(frame.minibuffer.is_none());
+                asked
+            })
+            .unwrap();
+        assert!(asked.try_recv().is_err());
+        frame
+            .update(cx, |frame, window, cx| {
+                assert!(
+                    prompt_of(frame).unwrap().contains("git asks"),
+                    "asked again"
+                );
+                // The host says the request ended: answered on another
+                // device, or timed out.
+                frame.host_event(
+                    HostId(0),
+                    ConnEvent::GitTransportDone { request_id: 1 },
+                    window,
+                    cx,
+                );
+                assert!(frame.minibuffer.is_none());
+                assert!(frame.questions.is_empty());
             })
             .unwrap();
     }

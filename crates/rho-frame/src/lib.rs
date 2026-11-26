@@ -43,6 +43,7 @@ pub mod surface;
 pub mod system;
 mod text_search;
 pub mod thread;
+mod waiting;
 pub mod when;
 
 pub use deal::dealer_policy_snapshot;
@@ -55,7 +56,9 @@ pub use phone::{Layout, phone_editor_tap};
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, CardHere, Mode, PhoneTool, Subject, Surface};
-pub use system::{AnySystem, Found, FoundText, FoundThread, SearchPoint, System, TextPresenter};
+pub use system::{
+    AnySystem, Found, FoundText, FoundThread, Opening, SearchPoint, System, TextPresenter,
+};
 pub use text_search::{TextHit, TextIndex, TextKind, TextSearch, TextTarget};
 
 /// The key context every surface is drawn in. A system binds its keys

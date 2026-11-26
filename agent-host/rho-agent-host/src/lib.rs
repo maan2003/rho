@@ -1676,6 +1676,7 @@ mod tests {
             repository: "team/repo.git".to_owned(),
             service: rho_agent_hosts::protocol::GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
+            agent: None,
         };
         let waiting = {
             let broker = broker.clone();
@@ -1736,6 +1737,7 @@ mod tests {
                 repository: "team/repo.git".to_owned(),
                 service: rho_agent_hosts::protocol::GitService::UploadPack,
                 planned_refs: None,
+                agent: None,
             })
             .await;
         let error = match result {
@@ -1762,6 +1764,7 @@ mod tests {
                             repository: "team/repo.git".to_owned(),
                             service: rho_agent_hosts::protocol::GitService::UploadPack,
                             planned_refs: None,
+                            agent: None,
                         },
                         std::time::Duration::from_millis(10),
                     )

@@ -92,9 +92,18 @@ pub enum ConnEvent {
     Recovering(std::time::Duration),
     Recovered,
     Disconnected(String),
+    /// The host does not trust this device yet: `command`, run on the host,
+    /// enrolls it, and the window tries again within half a minute.
+    Unenrolled {
+        command: String,
+    },
+    /// An agent's git wants the user's ssh login. `asks` says what for, in
+    /// the user's words: `push to ssh://github.com:22/acme/repo: branch
+    /// main`. Dropping `response` refuses.
     GitTransportApproval {
         request_id: u64,
-        prompt: String,
+        agent: Option<rho_agent_types::AgentId>,
+        asks: String,
         response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
     },
     GitTransportDone {
@@ -138,6 +147,8 @@ async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow:
 
 pub struct Connection {
     link: Link,
+    /// Cuts the wait before the next dial short.
+    retry: Arc<tokio::sync::Notify>,
     /// Dropping this aborts the IO task, tearing the connection down with the
     /// workspace. A test connection has none.
     _io_task: Option<AbortOnDrop<()>>,
@@ -228,6 +239,11 @@ impl Connection {
         self.link.clone()
     }
 
+    /// Dials again now, rather than after the wait since the last try.
+    pub fn retry_now(&self) {
+        self.retry.notify_one();
+    }
+
     /// Makes one call of the machine on a stream of its own. The answer
     /// needs no particular executor; a refusal is an error.
     pub fn call<C: rho_rpc::protocol::Call>(
@@ -272,10 +288,13 @@ pub fn spawn(
     };
     let streams = streams(link.clone());
     let dialer = link.dialer.clone();
-    let io_task = supervises()
-        .then(|| AbortOnDrop(runtime.spawn(supervise(target, events, streams, dialer))));
+    let retry = Arc::new(tokio::sync::Notify::new());
+    let io_task = supervises().then(|| {
+        AbortOnDrop(runtime.spawn(supervise(target, events, streams, dialer, retry.clone())))
+    });
     Connection {
         link,
+        retry,
         _io_task: io_task,
     }
 }
@@ -285,6 +304,7 @@ async fn supervise(
     events: EventSink,
     streams: Vec<Arc<dyn HostStream>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
+    retry: Arc<tokio::sync::Notify>,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     // Since when the host has been away, while it is.
@@ -345,6 +365,10 @@ async fn supervise(
         }
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
+            _ = retry.notified() => {
+                delay = INITIAL_RECONNECT_DELAY;
+                continue;
+            }
             _ = closed => break,
         }
         delay = next_reconnect_delay(delay);
@@ -523,13 +547,15 @@ async fn provide_git_transport(dialer: ChannelDialer, events: EventSink) -> anyh
 async fn request_git_approval(
     events: &EventSink,
     request_id: u64,
-    prompt: String,
+    agent: Option<rho_agent_types::AgentId>,
+    asks: String,
 ) -> anyhow::Result<GitApprovalDecision> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     events
         .unbounded_send(ConnEvent::GitTransportApproval {
             request_id,
-            prompt,
+            agent,
+            asks,
             response: tx,
         })
         .map_err(|_| anyhow::anyhow!("GUI closed before Git transport approval"))?;
@@ -550,22 +576,8 @@ async fn run_git_transport_provider(
         report_git_transport_decision(dialer, request_id, provider_id, false).await?;
         return Err(error);
     }
-    let prompt = match request.service {
-        GitService::UploadPack => format!(
-            "Fetch via SSH from {}:{}/{}? [shift-Y/N]",
-            display_field(&request.host),
-            request.port,
-            display_field(&request.repository),
-        ),
-        GitService::ReceivePack => git_push_prompt(
-            &request,
-            request
-                .planned_refs
-                .as_deref()
-                .context("SSH Git push is missing its destination ref plan")?,
-        ),
-    };
-    match request_git_approval(&events, request_id, prompt).await? {
+    let asks = git_asks(&request)?;
+    match request_git_approval(&events, request_id, request.agent, asks).await? {
         GitApprovalDecision::Allow => {}
         GitApprovalDecision::Deny => {
             report_git_transport_decision(dialer, request_id, provider_id, false).await?;
@@ -690,29 +702,40 @@ fn receive_pack_refs_match(
     planned.len() == planned_refs.len() && planned == actual
 }
 
-fn git_push_prompt(request: &GitTransportRequest, planned_refs: &[String]) -> String {
+/// What the request asks for, on one line: where it goes and, for a push,
+/// every branch and tag it would change.
+fn git_asks(request: &GitTransportRequest) -> anyhow::Result<String> {
     let destination = format!(
         "ssh://{}:{}/{}",
         display_field(&request.host),
         request.port,
         display_field(&request.repository)
     );
-    let mut prompt = format!("Push via SSH to {destination}:");
-    for reference in planned_refs {
-        use std::fmt::Write as _;
-        let reference = reference
-            .strip_prefix("refs/heads/")
-            .map(|name| format!("branch {name}"))
-            .or_else(|| {
-                reference
-                    .strip_prefix("refs/tags/")
-                    .map(|name| format!("tag {name}"))
-            })
-            .unwrap_or_else(|| reference.clone());
-        let _ = write!(prompt, "\n  {reference}");
-    }
-    prompt.push_str("\nApprove? [shift-Y/N]");
-    prompt
+    Ok(match request.service {
+        GitService::UploadPack => format!("fetch from {destination}"),
+        GitService::ReceivePack => {
+            let refs = request
+                .planned_refs
+                .as_deref()
+                .context("SSH Git push is missing its destination ref plan")?
+                .iter()
+                .map(|reference| {
+                    let reference = display_field(reference);
+                    reference
+                        .strip_prefix("refs/heads/")
+                        .map(|name| format!("branch {name}"))
+                        .or_else(|| {
+                            reference
+                                .strip_prefix("refs/tags/")
+                                .map(|name| format!("tag {name}"))
+                        })
+                        .unwrap_or(reference)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("push to {destination}: {refs}")
+        }
+    })
 }
 
 async fn report_git_transport_decision(
@@ -909,9 +932,9 @@ async fn connect_iroh(
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code)
             if matches!(access, IrohAccess::Fido | IrohAccess::Link { .. }) =>
         {
-            events.unbounded_send(ConnEvent::Disconnected(format!(
-                "enroll this rho on the host: rho iroh approve --role client {code}"
-            )))?;
+            events.unbounded_send(ConnEvent::Unenrolled {
+                command: format!("rho iroh approve --role client {code}"),
+            })?;
             // The server closes after our auth ack. Keep the per-connection
             // code visible long enough for approval, without racing
             // a new code.
@@ -977,10 +1000,16 @@ mod shutdown_tests {
     /// A sink that takes everything and never says it is closed, so the
     /// supervisor's own "nobody is listening" exit cannot be what ends the
     /// loop here.
-    struct Listening;
+    /// It counts the dials that failed, by the `Recovering` that follows
+    /// each.
+    #[derive(Default)]
+    struct Listening(std::sync::atomic::AtomicUsize);
 
     impl crate::HostSink for Listening {
-        fn send(&self, _event: crate::HostEvent) -> Result<(), crate::SinkClosed> {
+        fn send(&self, event: crate::HostEvent) -> Result<(), crate::SinkClosed> {
+            if matches!(event.event, ConnEvent::Recovering(_)) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(())
         }
 
@@ -996,10 +1025,12 @@ mod shutdown_tests {
     /// doing on a worker thread.
     ///
     /// The dial fails at once (no host ever ran there), so the loop is
-    /// in the delay within a few milliseconds; `close` has to bring it out
-    /// well before the 500ms that delay would otherwise take.
+    /// in the delay within a few milliseconds; `retry_now` dials again
+    /// inside it, and `close` has to bring it out well before the 500ms
+    /// that delay would otherwise take. One test, because `close` is
+    /// process-wide.
     #[test]
-    fn close_ends_a_supervisor_waiting_out_its_reconnect_delay() {
+    fn retry_and_close_cut_a_supervisors_reconnect_delay_short() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1007,22 +1038,30 @@ mod shutdown_tests {
         let directory = tempfile::tempdir().unwrap();
         let runtime_dir = directory.path().join("nothing");
 
+        let listening = Arc::new(Listening::default());
         let events = EventSink {
             host: crate::HostId(0),
-            events: Arc::new(Listening),
+            events: listening.clone(),
         };
+        let retry = Arc::new(tokio::sync::Notify::new());
         let supervisor = supervise(
             crate::AttachTarget::Local { runtime_dir },
             events,
             Vec::new(),
             Arc::new(Mutex::new(None)),
+            retry.clone(),
         );
+        let failed = || listening.0.load(std::sync::atomic::Ordering::SeqCst);
 
         let ended = runtime.block_on(async {
             let task = tokio::spawn(supervisor);
             // Long enough for the failed dial and the events that follow it,
             // short enough to be inside the 500ms delay.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(failed(), 1, "one dial, then the delay");
+            retry.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(failed(), 2, "the retry dialed again inside the delay");
             close();
             tokio::time::timeout(std::time::Duration::from_millis(200), task).await
         });
@@ -1044,7 +1083,7 @@ mod tests {
 
     use super::{
         INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY, abort_tasks, copy_planned_receive_pack,
-        display_field, git_push_prompt, next_reconnect_delay, receive_pack_refs_match,
+        display_field, git_asks, next_reconnect_delay, receive_pack_refs_match,
         validate_git_transport_request,
     };
     use crate::protocol::{GitService, GitTransportRequest};
@@ -1105,6 +1144,7 @@ mod tests {
             repository: "team/repo".to_owned(),
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
+            agent: None,
         };
         assert!(validate_git_transport_request(&valid).is_ok());
         let mut sourcehut = valid.clone();
@@ -1169,15 +1209,24 @@ mod tests {
                 "refs/heads/rho/test".to_owned(),
                 "refs/notes/review".to_owned(),
             ]),
+            agent: None,
         };
-        let prompt = git_push_prompt(&request, request.planned_refs.as_deref().unwrap());
-        assert!(prompt.contains("ssh://github.com:2222/acme/repo"));
-        assert!(!prompt.contains("git@"));
-        assert!(prompt.contains("branch main"));
-        assert!(prompt.contains("tag v1"));
-        assert!(prompt.contains("branch rho/test"));
-        assert!(prompt.contains("refs/notes/review"));
-        assert!(prompt.ends_with("Approve? [shift-Y/N]"));
+        // One line, and no answer keys of its own: the window's prompt
+        // says how to answer.
+        assert_eq!(
+            git_asks(&request).unwrap(),
+            "push to ssh://github.com:2222/acme/repo: branch main, tag v1, branch rho/test, \
+             refs/notes/review"
+        );
+        let fetch = GitTransportRequest {
+            service: GitService::UploadPack,
+            planned_refs: None,
+            ..request
+        };
+        assert_eq!(
+            git_asks(&fetch).unwrap(),
+            "fetch from ssh://github.com:2222/acme/repo"
+        );
     }
 
     #[test]

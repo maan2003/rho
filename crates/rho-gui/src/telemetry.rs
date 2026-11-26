@@ -16,7 +16,7 @@ use base64::Engine as _;
 use gpui::profiler::{EditorTiming, EditorTimingCollector, FrameTiming, FrameTimingCollector};
 use gpui::{App, AppContext as _, Context, Window};
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_frame::{Address, AnySurface, EndpointId, FrameLink, Point, Row, System};
+use rho_frame::{Address, EndpointId, FrameLink, Opening, Point, Row, System};
 use rho_window::style::StyleClass;
 
 /// Seconds a rolling segment covers before the next starts.
@@ -355,8 +355,8 @@ impl System for TelemetrySystem {
         _address: &Address,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-    ) -> Option<AnySurface> {
-        None
+    ) -> Opening {
+        Opening::Gone
     }
 
     fn streams(

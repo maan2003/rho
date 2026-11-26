@@ -150,6 +150,14 @@ fn bindings() -> Vec<KeyBinding> {
     for context in normal_contexts("RhoDesk", " && vim_operator == none") {
         bindings.push(KeyBinding::new("i", PromptIdea, Some(&context)));
     }
+    // A screen waiting on its host is no buffer: the window's own keys.
+    let waiting = crate::waiting::KEY_CONTEXT;
+    bindings.extend([
+        KeyBinding::new(":", Palette, Some(waiting)),
+        KeyBinding::new("space", VerdictMenu, Some(waiting)),
+        KeyBinding::new("tab", Desk, Some(waiting)),
+        KeyBinding::new("q", Close, Some(waiting)),
+    ]);
     bindings.extend([
         KeyBinding::new("ctrl-t", PromptIdea, Some("RhoIdea > Editor")),
         KeyBinding::new("enter", PromptIdea, Some("RhoIdeaAddress > Editor")),

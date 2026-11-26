@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 use rho_agent_hosts::protocol as host;
 use rho_agent_hosts::protocol::{GitService, GitTransportPolicy, GitTransportRequest};
+use rho_agent_types::AgentId;
 use rho_rpc::protocol::Opened;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -168,6 +169,7 @@ fn run_bridge() -> Result<()> {
         repository: std::env::var("RHO_GIT_REPOSITORY").context("RHO_GIT_REPOSITORY is missing")?,
         service: GitService::ReceivePack,
         planned_refs: Some(planned_refs),
+        agent: asking_agent(),
     };
     runtime()?.block_on(run_transport(request, false))
 }
@@ -933,8 +935,16 @@ fn parse_remote(value: &str) -> Result<Remote> {
             repository: repository.to_owned(),
             service: GitService::UploadPack,
             planned_refs: None,
+            agent: asking_agent(),
         },
     })
+}
+
+/// The agent whose shell runs this helper, which the user's approval
+/// prompt names. Outside an agent's shell, or with a value that is no
+/// agent id, nobody.
+fn asking_agent() -> Option<AgentId> {
+    AgentId::from_encoded(&std::env::var("RHO_AGENT_ID").ok()?).ok()
 }
 
 fn valid_host(value: &str) -> bool {

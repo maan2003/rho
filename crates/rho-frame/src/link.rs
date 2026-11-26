@@ -83,9 +83,13 @@ impl FrameLink {
     }
 
     /// What the frame draws from a system changed: its claims, its Desk
-    /// sections, its channels.
+    /// sections, its channels, and what it holds for a screen that waits
+    /// on its hosts.
     pub fn changed(&self, cx: &mut App) {
-        self.with(cx, |frame, _, cx| frame.systems_changed(cx));
+        self.with(cx, |frame, window, cx| {
+            frame.reopen_waiting(window, cx);
+            frame.systems_changed(cx);
+        });
     }
 
     /// Closes every open surface whose address `which` picks.

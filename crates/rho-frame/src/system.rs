@@ -13,7 +13,7 @@ use std::sync::Arc;
 use gpui::{App, Context, Entity, Window};
 use jiff::Timestamp;
 use rho_agent_hosts::{HostId, HostStream, Link};
-use rho_agent_types::EndpointId;
+use rho_agent_types::{AgentId, EndpointId};
 use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Claim, Marks};
 use url::Url;
@@ -23,6 +23,25 @@ use crate::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use crate::menu::Row;
 use crate::surface::AnySurface;
 use crate::text_search::{TextHit, TextSearch};
+
+/// What a system has for an address it was asked to open.
+pub enum Opening {
+    /// The surface for it.
+    Surface(AnySurface),
+    /// Nothing yet: these hosts have not yet said whether they hold it.
+    /// The frame keeps the address and shows that it waits, and asks
+    /// again when the system changes.
+    Waiting(Vec<HostId>),
+    /// Nothing: no host that could hold it does.
+    Gone,
+}
+
+impl From<Option<AnySurface>> for Opening {
+    /// A surface, or gone: for a system whose addresses never wait on a host.
+    fn from(surface: Option<AnySurface>) -> Self {
+        surface.map_or(Self::Gone, Self::Surface)
+    }
+}
 
 /// A place the palette lists, which it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,14 +84,11 @@ pub trait System: Sized + 'static {
     /// The address kinds this system opens.
     fn kinds(&self) -> &'static [&'static str];
 
-    /// A surface for an address of one of its kinds; `None` for an
-    /// address it has nothing for.
-    fn open(
-        &mut self,
-        address: &Address,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnySurface>;
+    /// The surface for an address of one of its kinds, or why there is
+    /// none. A system whose hosts have not yet said what they hold waits
+    /// rather than calls the address gone, and says the frame changed
+    /// (`FrameLink::changed`) once they have.
+    fn open(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> Opening;
 
     /// Take a named jump whose destination resolves asynchronously. The
     /// window keeps its current surface until the system opens the target.
@@ -126,6 +142,12 @@ pub trait System: Sized + 'static {
     /// card no claim named. `marks` are the frame's, which a system cannot
     /// read for itself while the frame draws.
     fn name(&self, _address: &Address, _marks: &Marks, _cx: &App) -> Option<(String, String)> {
+        None
+    }
+
+    /// What the window calls an agent, such as `eng-b8os`, where a host
+    /// asks on its behalf; `None` from a system that does not hold it.
+    fn agent_name(&self, _agent: AgentId, _cx: &App) -> Option<String> {
         None
     }
 
@@ -190,7 +212,7 @@ pub trait System: Sized + 'static {
 
 trait SystemHandle {
     fn kinds(&self, cx: &App) -> &'static [&'static str];
-    fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface>;
+    fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Opening;
     fn visit(&self, address: &Address, cx: &mut App) -> bool;
 
     fn active_surface(&self, address: Option<&Address>, cx: &mut App);
@@ -213,6 +235,7 @@ trait SystemHandle {
     ) -> Vec<Claim>;
     fn open_link(&self, url: &Url, cx: &mut App) -> bool;
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)>;
+    fn agent_name(&self, agent: AgentId, cx: &App) -> Option<String>;
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address>;
 
     fn desk_context(&self, address: &Address, cx: &App) -> Option<String>;
@@ -240,7 +263,7 @@ impl<S: System> SystemHandle for Entity<S> {
         self.read(cx).kinds()
     }
 
-    fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
+    fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Opening {
         self.update(cx, |system, cx| system.open(address, window, cx))
     }
 
@@ -289,6 +312,10 @@ impl<S: System> SystemHandle for Entity<S> {
 
     fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
         self.read(cx).name(address, marks, cx)
+    }
+
+    fn agent_name(&self, agent: AgentId, cx: &App) -> Option<String> {
+        self.read(cx).agent_name(agent, cx)
     }
 
     fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {
@@ -359,7 +386,7 @@ impl AnySystem {
         self.0.kinds(cx).contains(&address.kind())
     }
 
-    pub fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Option<AnySurface> {
+    pub fn open(&self, address: &Address, window: &mut Window, cx: &mut App) -> Opening {
         self.0.open(address, window, cx)
     }
 
@@ -406,6 +433,10 @@ impl AnySystem {
 
     pub fn name(&self, address: &Address, marks: &Marks, cx: &App) -> Option<(String, String)> {
         self.0.name(address, marks, cx)
+    }
+
+    pub fn agent_name(&self, agent: AgentId, cx: &App) -> Option<String> {
+        self.0.agent_name(agent, cx)
     }
 
     pub fn shown_in(&self, address: &Address, cx: &App) -> Option<Address> {

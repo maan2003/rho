@@ -60,6 +60,9 @@ struct HostSnapshot {
     /// The host's identity, once its agents stream has said hello.
     endpoint: Option<EndpointId>,
     agent_counter: u64,
+    /// Whether the host's whole directory has come since this client began
+    /// its copy: until then, an agent not held may still be on the host.
+    listed: bool,
 }
 
 /// The user's own filing of an agent, which lives on the desk and never on
@@ -207,6 +210,23 @@ impl AgentMap {
     /// before its agents stream has said hello.
     pub fn host_endpoint(&self, host: HostId) -> Option<EndpointId> {
         self.hosts.get(&host).and_then(|h| h.endpoint)
+    }
+
+    /// The host's whole directory came: an agent not held now is not on it.
+    pub fn set_listed(&mut self, host: HostId) {
+        if let Some(snapshot) = self.hosts.get_mut(&host) {
+            snapshot.listed = true;
+        }
+    }
+
+    /// The attached hosts whose directory has not yet come, which may
+    /// still hold an agent this client does not.
+    pub fn unlisted_hosts(&self) -> Vec<HostId> {
+        self.hosts
+            .iter()
+            .filter(|(_, snapshot)| !snapshot.listed)
+            .map(|(host, _)| *host)
+            .collect()
     }
 
     pub fn host_of_agent(&self, agent_id: AgentId) -> Option<HostId> {
@@ -741,6 +761,25 @@ mod tests {
     use super::*;
     use crate::protocol::transcript::RuntimeKind;
     use crate::protocol::worksets::AgentEntry;
+
+    /// An agent this client does not hold may still be on a host that has
+    /// not listed its agents; once every host has, it is on none.
+    #[test]
+    fn only_hosts_that_have_not_listed_may_still_hold_an_agent() {
+        let mut map = AgentMap::default();
+        map.attach_host(HostId(0), "rho".into());
+        map.attach_host(HostId(1), "lab".into());
+        assert_eq!(map.unlisted_hosts(), [HostId(0), HostId(1)]);
+        map.set_listed(HostId(1));
+        assert_eq!(map.unlisted_hosts(), [HostId(0)]);
+        // A host attached again starts unlisted.
+        map.detach_host(HostId(1));
+        map.attach_host(HostId(1), "lab".into());
+        assert_eq!(map.unlisted_hosts(), [HostId(0), HostId(1)]);
+        map.set_listed(HostId(0));
+        map.set_listed(HostId(1));
+        assert!(map.unlisted_hosts().is_empty());
+    }
 
     fn agent(nth: u64) -> AgentId {
         AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap()

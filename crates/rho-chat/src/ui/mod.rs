@@ -31,7 +31,7 @@ use rho_dealer::rank::Trace;
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::idea::{IdeaMail, IdeaProject, NewIdeaProject, ProjectCreated};
 use rho_frame::{
-    AnySurface, Found, FoundText, FoundThread, FrameLink, Point, Row, SearchPoint, System,
+    AnySurface, Found, FoundText, FoundThread, FrameLink, Opening, Point, Row, SearchPoint, System,
     TextIndex, TextKind, TextPresenter, TextSearch, TextTarget,
 };
 use rho_rpc::protocol::Answer as RpcAnswer;
@@ -799,12 +799,8 @@ impl ChatSystem {
     }
 }
 
-impl System for ChatSystem {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[ThreadId::KIND, PendingIdeaId::KIND]
-    }
-
-    fn open(
+impl ChatSystem {
+    fn surface_for(
         &mut self,
         address: &Address,
         window: &mut Window,
@@ -827,6 +823,18 @@ impl System for ChatSystem {
         let system = cx.entity();
         let view = cx.new(|cx| ThreadView::new(self, system, thread, window, cx));
         Some(AnySurface::new(view))
+    }
+}
+
+impl System for ChatSystem {
+    fn kinds(&self) -> &'static [&'static str] {
+        &[ThreadId::KIND, PendingIdeaId::KIND]
+    }
+
+    /// A thread opens from the copy this window keeps of its host's log,
+    /// so it never waits on the host.
+    fn open(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> Opening {
+        self.surface_for(address, window, cx).into()
     }
 
     fn streams(

@@ -37,16 +37,6 @@ pub struct DesktopSurface {
 }
 
 impl DesktopSurface {
-    pub fn unavailable(label: String, name: String, reason: &str, cx: &mut Context<Self>) -> Self {
-        Self {
-            agent: label.clone(),
-            label,
-            name,
-            state: State::Failed(reason.into()),
-            focus: cx.focus_handle(),
-        }
-    }
-
     /// Dials desktop `name` of `agent` (its encoded id) over `link`, the
     /// agent's host. `label` is what the title calls the agent.
     pub fn new(

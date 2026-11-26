@@ -239,6 +239,8 @@ pub struct Minibuffer {
     completed_selection: Option<Completed>,
     /// What is typed here is a credential: the journal keeps none of it.
     secret: bool,
+    /// The host's question this prompt asks, while it asks one.
+    pub(crate) question: Option<crate::hosts::QuestionKey>,
     _edits: Subscription,
 }
 
@@ -309,6 +311,7 @@ impl Minibuffer {
             moved_selection: false,
             completed_selection: None,
             secret: false,
+            question: None,
             _edits: edits,
         }
     }
@@ -542,8 +545,22 @@ impl Minibuffer {
         self.validate = Some(validate);
     }
 
+    /// Why enter cannot take what it would answer, if a validator says so.
     pub(crate) fn rejection(&self, cx: &App) -> Option<&'static str> {
-        self.validate.and_then(|validate| validate(&self.input(cx)))
+        self.validate
+            .and_then(|validate| validate(&self.answer_text(cx)))
+    }
+
+    /// What enter would answer: the chosen row completed into the line, or
+    /// the line as typed.
+    fn answer_text(&self, cx: &App) -> String {
+        let typed = self.input(cx);
+        match &self.answer {
+            Answer::Text { rows, .. } if self.takes_candidate() => rows
+                .get(self.selected)
+                .map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row)),
+            _ => typed,
+        }
     }
 
     pub(crate) fn is_palette(&self) -> bool {
@@ -574,13 +591,7 @@ impl Minibuffer {
     /// Consumes the minibuffer into its input and handler; the caller
     /// invokes the handler after restoring focus.
     pub(crate) fn into_submission(self, cx: &App) -> (String, Submission) {
-        let typed = self.input(cx);
-        let input = match &self.answer {
-            Answer::Text { rows, .. } if self.takes_candidate() => rows
-                .get(self.selected)
-                .map_or_else(|| typed.clone(), |row| self.completed_text(&typed, row)),
-            _ => typed,
-        };
+        let input = self.answer_text(cx);
         let submission: Submission = match self.answer {
             Answer::Text { submit, .. } => {
                 let input = input.clone();
@@ -617,9 +628,6 @@ impl Minibuffer {
         let total = self.answer.len();
         let visible = candidate_window(self.selected, total, layout);
         let address = matches!(self.completion_input, CompletionInput::Address);
-        let clickable = address
-            || matches!(self.completion_input, CompletionInput::Explicit)
-            || layout == crate::Layout::Phone;
         let measure = measure(text_style, window);
         let inset = rems(0.5);
         let row_width = (width - inset.to_pixels(window.rem_size()) * 2.).max(px(0.));
@@ -789,21 +797,18 @@ impl Minibuffer {
                 if selected {
                     row = row.bg(colors.element_selected);
                 }
-                let row = row.id(("rho-prompt-candidate", index));
-                if clickable {
-                    row.cursor_pointer()
-                        .on_click(cx.listener(move |frame, _, window, cx| {
-                            if frame
-                                .minibuffer_mut()
-                                .is_some_and(|prompt| prompt.select(index))
-                            {
-                                frame.minibuffer_confirm(window, cx);
-                            }
-                            cx.stop_propagation();
-                        }))
-                } else {
-                    row
-                }
+                // A click or a tap answers with the row, as on a menu.
+                row.id(("rho-prompt-candidate", index))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |frame, _, window, cx| {
+                        if frame
+                            .minibuffer_mut()
+                            .is_some_and(|prompt| prompt.select(index))
+                        {
+                            frame.minibuffer_confirm(window, cx);
+                        }
+                        cx.stop_propagation();
+                    }))
             })
             .collect::<Vec<_>>();
         // A prompt whose rows are its answers says when none answers, so

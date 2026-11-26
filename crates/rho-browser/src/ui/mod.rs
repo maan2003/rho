@@ -21,7 +21,9 @@ use std::rc::Rc;
 use gpui::{App, AppContext as _, Context, Entity, Subscription, TaskExt as _, Window};
 use rho_db::RhoDb;
 use rho_dealer::{Address, Addressed};
-use rho_frame::{AnySurface, Candidate, Found, Frame, FrameLink, Marks, Point, Row, Surface, keys};
+use rho_frame::{
+    AnySurface, Candidate, Found, Frame, FrameLink, Marks, Opening, Point, Row, Surface, keys,
+};
 use rho_window::style::StyleClass;
 use url::Url;
 
@@ -309,18 +311,15 @@ impl rho_frame::System for PageSystem {
         &[PageId::KIND, BookmarkId::KIND]
     }
 
-    fn open(
-        &mut self,
-        address: &Address,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnySurface> {
-        let page = PageId::from_address(address)?;
+    fn open(&mut self, address: &Address, _window: &mut Window, cx: &mut Context<Self>) -> Opening {
+        let Some(page) = PageId::from_address(address) else {
+            return Opening::Gone;
+        };
         let model = match self.browser.open_page(page, cx) {
             Ok(model) => model,
             Err(error) => {
                 self.cannot_open(error, cx);
-                return None;
+                return Opening::Gone;
             }
         };
         self.watch(&model, cx);
@@ -328,7 +327,7 @@ impl rho_frame::System for PageSystem {
         cx.observe_release(&view, move |this, _, cx| this.hidden(page, cx))
             .detach();
         self.pages.show(page);
-        Some(AnySurface::new(view))
+        Opening::Surface(AnySurface::new(view))
     }
 
     fn visit(&mut self, address: &Address, cx: &mut Context<Self>) -> bool {

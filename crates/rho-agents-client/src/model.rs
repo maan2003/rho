@@ -41,6 +41,9 @@ pub enum ModelMsg {
     Changed { agents: Vec<MirroredAgent> },
     /// Agents gone from their host's directory, and their copy with them.
     Deleted { agents: BTreeSet<AgentId> },
+    /// The host's directory came whole: every agent it has is told, so an
+    /// agent this client does not hold is not on the host.
+    Listed,
     /// Rows of an agent the main thread follows, for the fold behind its
     /// transcript, once its workset's log is read: what came before is
     /// [`ModelMsg::Read`].
@@ -587,6 +590,10 @@ impl Model {
         }
         self.refollow(host);
         out.extend(self.announce(host));
+        out.push(ModelEvent {
+            host,
+            msg: ModelMsg::Listed,
+        });
         out
     }
 
@@ -960,10 +967,11 @@ mod tests {
             directory(&[(agent(1), workset(1)), (agent(2), workset(2))]),
         );
         let out = model.ingest(HOST, directory(&[(agent(2), workset(2))]));
-        assert!(
-            matches!(&out[..], [ModelEvent { msg: ModelMsg::Deleted { agents }, .. }]
-            if agents == &BTreeSet::from([agent(1)]))
-        );
+        // The directory is whole, and the window hears that it is last.
+        assert!(matches!(&out[..], [
+                ModelEvent { msg: ModelMsg::Deleted { agents }, .. },
+                ModelEvent { msg: ModelMsg::Listed, .. },
+            ] if agents == &BTreeSet::from([agent(1)])));
         let live = ServerFrame::Live {
             agent_id: agent(1),
             live: Live::Snapshot {

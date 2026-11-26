@@ -5953,6 +5953,7 @@ dependencies = [
  "octo-types",
  "reqwest 0.13.5",
  "rho-agent-hosts",
+ "rho-agent-types",
  "rho-rpc",
  "tokio",
 ]

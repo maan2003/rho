@@ -24,6 +24,9 @@ pub enum HostStatus {
     /// still recover, or it dropped and the window is dialing again.
     Recovering(Duration),
     Disconnected(String),
+    /// The host does not trust this device yet; `command`, run on the
+    /// host, enrolls it.
+    Unenrolled(String),
 }
 
 impl HostStatus {
@@ -39,6 +42,9 @@ impl HostStatus {
             Self::Online => "online".to_owned(),
             Self::Recovering(elapsed) => format!("reconnecting · {}s", elapsed.as_secs()),
             Self::Disconnected(reason) => format!("disconnected · {reason}"),
+            Self::Unenrolled(command) => {
+                format!("disconnected · enroll this rho on the host: {command}")
+            }
         }
     }
 }
@@ -174,7 +180,7 @@ impl Hosts {
     /// name when there is more than one to tell apart.
     pub fn worst_status(&self) -> Option<(String, HostStatus)> {
         let rank = |status: &HostStatus| match status {
-            HostStatus::Disconnected(_) => 3,
+            HostStatus::Disconnected(_) | HostStatus::Unenrolled(_) => 3,
             HostStatus::Recovering(_) => 2,
             HostStatus::Connecting => 1,
             HostStatus::Online => 0,

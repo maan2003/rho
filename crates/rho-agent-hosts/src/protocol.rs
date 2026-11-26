@@ -257,6 +257,10 @@ pub struct GitTransportRequest {
     /// Destination refs authorized by the first GUI approval for a push.
     /// Fetches carry `None`.
     pub planned_refs: Option<Vec<String>>,
+    /// The agent whose git asks, as the helper found it in
+    /// `$RHO_AGENT_ID`; `None` outside an agent's shell. Agents are not
+    /// sandboxed, so this names the asker for the user; it proves nothing.
+    pub agent: Option<rho_agent_types::AgentId>,
 }
 
 #[cfg(test)]
@@ -326,6 +330,7 @@ mod tests {
             repository: "team/repo.git".to_owned(),
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
+            agent: None,
         };
         opens_as(Open::GitProvider);
         opens_as(Open::GitTransport { request });

@@ -42,8 +42,8 @@ use rho_desktop_client::protocol::DesktopSession;
 use rho_desktop_client::stream::{DesktopStreams, DesktopsEvent};
 use rho_desktop_client::ui::DesktopSurface;
 use rho_frame::{
-    Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks, Point,
-    Row, Subject, System,
+    Address, Addressed as _, AnySurface, Candidate, CardInspection, Found, FrameLink, Marks,
+    Opening, Point, Row, Subject, System,
 };
 use rho_rpc::protocol::Call;
 use rho_shell_view::ui::ShellSurface;
@@ -114,7 +114,7 @@ impl AgentsSystem {
             while let Some(DesktopsEvent { host, sessions }) = desktop_events.next().await {
                 let updated = this.update(cx, |this, cx| {
                     this.sessions.insert(host, sessions);
-                    cx.notify();
+                    this.changed(cx);
                 });
                 if updated.is_err() {
                     break;
@@ -282,6 +282,10 @@ impl AgentsSystem {
                 self.changed(cx);
             }
             ModelMsg::Deleted { agents } => self.deleted(agents, cx),
+            ModelMsg::Listed => {
+                self.registry.set_listed(host);
+                self.changed(cx);
+            }
             ModelMsg::Rows { agent_id, rows } => {
                 if let Some(delta) = self.transcripts.refold(agent_id, &rows) {
                     self.land(agent_id, TranscriptFrame::Folded(delta), cx);
@@ -1097,60 +1101,48 @@ impl System for AgentsSystem {
         KINDS
     }
 
-    fn open(
-        &mut self,
-        address: &Address,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnySurface> {
+    /// An agent this window does not hold may be on a host that has not
+    /// yet listed its agents, and a desktop on one that has not yet said
+    /// which it runs: those wait. Only what a host that has said is
+    /// without is gone.
+    fn open(&mut self, address: &Address, window: &mut Window, cx: &mut Context<Self>) -> Opening {
         if let Some(chart) = UsageChart::from_address(address) {
             let system = cx.entity();
             let surface = cx.new(|cx| UsageSurface::new(system, chart, window, cx));
-            return Some(AnySurface::new(surface));
+            return Opening::Surface(AnySurface::new(surface));
         }
-        let AgentAddress { agent, part } = AgentAddress::from_address(address)?;
-        if !matches!(part, Part::Desktop(_)) {
-            self.registry.mirrored(agent)?;
-        }
+        let Some(AgentAddress { agent, part }) = AgentAddress::from_address(address) else {
+            return Opening::Gone;
+        };
+        let Some(host) = self.registry.host_of_agent(agent) else {
+            let unlisted = self.registry.unlisted_hosts();
+            return match unlisted.is_empty() {
+                true => Opening::Gone,
+                false => Opening::Waiting(unlisted),
+            };
+        };
+        let Some((link, id, label)) = self.workset_of(agent) else {
+            return Opening::Gone;
+        };
         let surface = match part {
             Part::Transcript => self.open_transcript(agent, window, cx),
-            Part::Terminal(terminal) => {
-                let (link, id, label) = self.workset_of(agent)?;
-                AnySurface::new(
-                    cx.new(|cx| TerminalSurface::new(link, id, label, terminal, window, cx)),
-                )
-            }
+            Part::Terminal(terminal) => AnySurface::new(
+                cx.new(|cx| TerminalSurface::new(link, id, label, terminal, window, cx)),
+            ),
             Part::Shell => {
-                let (link, id, label) = self.workset_of(agent)?;
                 AnySurface::new(cx.new(|cx| ShellSurface::new(link, id, label, window, cx)))
             }
             Part::Desktop(name) => {
-                let Some((link, id, label)) = self.workset_of(agent) else {
-                    let surface = cx.new(|cx| {
-                        DesktopSurface::unavailable(
-                            agent.encoded(),
-                            name,
-                            "the agent's host is not attached",
-                            cx,
-                        )
-                    });
-                    return Some(AnySurface::new(surface));
-                };
+                if !self.sessions.contains_key(&host) {
+                    return Opening::Waiting(vec![host]);
+                }
                 if !self.desktops_of(agent).contains(&name) {
-                    let surface = cx.new(|cx| {
-                        DesktopSurface::unavailable(
-                            label,
-                            name,
-                            "the agent no longer runs this desktop",
-                            cx,
-                        )
-                    });
-                    return Some(AnySurface::new(surface));
+                    return Opening::Gone;
                 }
                 AnySurface::new(cx.new(|cx| DesktopSurface::new(link, id, label, name, window, cx)))
             }
         };
-        Some(surface)
+        Opening::Surface(surface)
     }
 
     fn active_surface(&mut self, address: Option<&Address>, cx: &mut Context<Self>) {
@@ -1289,6 +1281,11 @@ impl System for AgentsSystem {
             Part::Transcript => (label, host),
             part => (format!("{label} · {part}"), host),
         })
+    }
+
+    fn agent_name(&self, agent: AgentId, _cx: &App) -> Option<String> {
+        self.registry.mirrored(agent)?;
+        Some(self.label(agent).0)
     }
 
     fn find(&self, _marks: &Marks, _cx: &App) -> Vec<Found> {
