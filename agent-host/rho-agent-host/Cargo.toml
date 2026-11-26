@@ -76,6 +76,7 @@ moq-net.workspace = true
 rho-chat = { workspace = true, features = ["client"] }
 rho-dealer.workspace = true
 rho-fake-model.workspace = true
+rho-ledger = { workspace = true, features = ["client"] }
 rho-rpc = { workspace = true, features = ["native-client", "server"] }
 rho-shell.workspace = true
 senax-encoder.workspace = true

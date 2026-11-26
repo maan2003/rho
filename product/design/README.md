@@ -2,6 +2,95 @@
 
 The thread and idea captures show the leading draft and newest-first message; the full Desk captures show only what waits. The runtime captures show the project’s automatic choice on laptop and a draft override on phone. Other screens were captured from `9256e944` in rho's headless Wayland compositor with bundled Rho OKSolar P3. Laptop: 1300×850 at scale 1. Phone: 390×844 logical pixels (780×1688 at scale 2). Ages, clock times, the fixture directory, and the agent ID vary; these are not pixel goldens.
 
+## The heavy workday: capture matrix and QA sessions
+
+`capture-matrix.sh` and `qa-session.sh` put the real `rho-gui` in the middle of a
+messy eight-hour day. The `heavy_workday` example
+(`agent-host/rho-agent-host/examples/heavy_workday.rs`) writes every store in
+about half a second. Then real hosts and the window start on that state:
+
+| Host | What runs | What it holds |
+| --- | --- | --- |
+| `lab` | `rho-agent-host` and `rho-fake-model` (`clarifying-question`, reports an allowance) | Projects `tide`, `rho` and `infra`, with 203 messages. Waiting asks, three `infra` stops (stuck, failed, lost), a refused start, a muted and a snoozed ask, 26 settled threads, Claude allowance on `work` (74% left) and `home` (12% left), and 30 days of spend. The 20-message `Flaky clock test` has code blocks, a quote, PR links, an edited message, a fresh flash, a private reply and a draft. |
+| `ci` | A host whose fake model (`real-tool-rounds`) is stopped during the day | Project `nightly`. The checks thread runs real commands and sends its proof, then the agent retries a model that is gone (`working`, then `stuck` after three minutes). The bisect thread is `stopped by you`. |
+| `gpu-box` | Nothing: it is away | Projects `tide` and `train`, from the device's copy of its log. So `tide@lab` and `tide@gpu-box` collide. |
+
+The device is paired. It holds 15 notes, the private reply, the mute, the snooze and the done verdicts.
+
+Both scripts build what they need with two cargo runs, unless you give a binary directory.
+One run is not possible: when cargo builds the example with the GUI, it adds the
+example's dev-dependency features to `rho-gui`. Then `rho-agent-hosts` has
+`test-support`, its connections never start, and every host stays `connecting`.
+To build by hand, build in this order:
+
+```sh
+cargo build -p rho-agent-host --example heavy_workday
+cargo build -p rho-gui -p rho-agent-host -p rho-inference -p rho-fake-model -p rho-cli --bins
+```
+
+The scripts need `rho-agent-desktop` on `PATH`, `jq`, `git`, and `unshare` with
+unprivileged user namespaces. Each run has its own rig under `$TMPDIR` and removes it at the end.
+`WORKDAY_KEEP=1` keeps the rig. The rig runs in a network namespace that has only loopback, as your user.
+The hosts and the window use iroh, which otherwise reaches n0's relays and DNS. In the rig these calls fail (the window log shows `pkarr` errors).
+`WORKDAY_NETWORK=host` turns the namespace off.
+
+### Capture matrix
+
+```sh
+product/design/capture-matrix.sh /tmp/workday-captures [BIN_DIRECTORY]
+```
+
+It boots the rig at 1300×850, scale 1, and walks fixed keystroke journeys.
+A run takes about 55 seconds when the binaries are built: 0.6 to seed, 5.5 to boot in all, and the rest for journeys. The cargo check adds about 7 seconds when nothing changed.
+It writes these files:
+
+| File | Journey |
+| --- | --- |
+| `desk-full-overflow-away.png` | The first Desk: 7 rows, `and 6 more`, `gpu-box away` |
+| `thread-long-asking.png` | `space f`, `flaky clock test`, `enter` |
+| `thread-stuck-draft-new.png` | `ctrl-d` three times, then an agent posts: the draft stays at the edge and `↑ new` shows |
+| `transcript-errors.png` | The `ci` checks thread; `/exited`, `;`, `enter` on the agent's message: brief, commands, `retrying ×N` |
+| `usage-7d.png` | `:usage`, `enter` |
+| `notes-list.png` | `:list notes`, `enter` |
+| `places-mru.png` | `space f` with no query: the places just visited |
+| `places-fulltext-match.png` | `ManualClock` matches messages and a note |
+| `flow-deal-and-places.webm` | Desk, `space-j`, `space f` `watermark`, `enter`, `tab`. The script sends `ctrl-j`, because `rho wayland` cannot send `f20`, the key that `space-j` makes. |
+| `commands-kill-aliases.png` | In the long thread, `:kill` |
+| `commands-inline-arg.png` | `:model sol-medium` |
+| `idea-draft.png` | `ctrl-alt-m`, `ctrl-t` `tide@lab`, the words |
+| `idea-live-reply.png` | After `ctrl-enter`, the agent's question in the new thread |
+| `flow-commands-and-idea.webm` | The four captures above, as one recording |
+| `manifest.json` | For each capture: the screen, its state, the keys that led to it, the check, its SHA-256 and its time. Also the commit, the hosts, the thread ids and the timings. |
+
+The script stops with an error, and shows the end of the window log, when one of these occurs:
+
+- `rho-gui` exits, panics or loses its window. The script examines this before each capture.
+- A capture is blank: fewer than 16 colors, or less than 0.2% of it differs from the background.
+- A capture is the same frame as the capture before it. Each step changes the screen, so the window has stopped drawing.
+- A recording has no VP8/VP9 video track, no keyframe, or fewer than 10 frames.
+- A key step, a screenshot or a wait does not finish in time.
+
+`heavy_workday check-png FILE [PREVIOUS]` and `check-webm FILE` make these checks, and you can run them on any capture.
+
+### QA sessions
+
+```sh
+QA_SESSION=qa QA_READY_FILE=/tmp/qa.json product/design/qa-session.sh [BIN_DIRECTORY]
+```
+
+It boots the same rig and window, prints the session, the rig, the host and model PIDs, and the helper commands. Then it waits until you stop it (Ctrl-C) or until the window closes.
+`QA_READY_FILE` gets a JSON object with the same facts when the rig is ready. The helpers in
+`$rig/bin` work from any shell or agent, inside or outside the namespace:
+
+| Helper | Does |
+| --- | --- |
+| `way ARG...` | `rho wayland` on the window, from this build, so `record` works |
+| `host kill lab` / `host start lab` | Drops a host as a crash does, or starts it again on the same store. `ci` works too. |
+| `say lab/flaky TEXT [flash]` | A new agent posts in a seeded thread. `fixture.json` names the threads. Agent text must pass the host's Simplified Technical English check. |
+| `inside COMMAND...` | Runs anything in the rig's network, for example `heavy_workday py "$rig" lab CODE` to read the host's chat in Python |
+
+Ages, clock times, ids and the `reconnecting` timer change from run to run. The captures are not pixel goldens.
+
 ## Run the fixture
 
 In the repo's dev shell, build the GUI, host, worker, and fake model. Use `/src/cargo-one` in the shared workspace; elsewhere the same arguments work with `cargo`. Pass the directory with the four binaries to the fixture.

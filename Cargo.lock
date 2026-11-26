@@ -13731,6 +13731,7 @@ dependencies = [
  "rho-image",
  "rho-inference",
  "rho-iroh-auth",
+ "rho-ledger",
  "rho-ledger-server",
  "rho-openai-realtime",
  "rho-profiling",
