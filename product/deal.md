@@ -28,8 +28,9 @@ has:
 does:
 - deal `space` then `n`, `space` on the `desk.Desk`, `ctrl-j` from the newest screen, or a flick up on the phone: open the top card; if a card is in view, it goes behind the others for half an hour, still counted, and deals last
 
-The longest-waiting card deals first; `desk.Desk` follows the same order. Nothing addressed to the user disappears unread. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
+The highest-priority card deals first: waiting cards rise steadily with age (`+0.5/h`), and a thread the user wrote in within the last hour gets a recency boost so answers to active work jump to the front; `desk.Desk` follows the same order, and every deal re-evaluates to pull the top card at that moment. Nothing addressed to the user disappears unread. A stop is a message from the project, written by the system bot. It says why the work stopped, such as `failed · cargo exited 101 · last lines`. A card is answered with a reply or a `Verdict`.
 rejected:
+- strict oldest-first FIFO ordering · 2026-11-26 · put stale threads ahead of an agent that just answered active work; priority + recency puts what matters most in front of the user while aging prevents starvation
 - `asks` and `result` as two kinds of card · 2026-11-20 · both wait the same way; the message either pings or it does not
 - a card that drops out of the count while it is skipped · 2026-11-20 · a skipped card is still something left
 
@@ -42,11 +43,11 @@ purpose: let the user say once what a card means to them, so rho remembers their
 principle: the user replies if they have words; otherwise they say done. If they change their mind about a verdict, they can take it back.
 sees: the menu of verdicts and an echo naming the verdict and card, such as `done: Flaky clock test`. On the phone, the last `done` leads with `nothing waits · done: Flaky clock test`, so a long subject gives way first.
 does:
-- reply: send the user's words and settle the card, as in `chat.Answer a message`; the thread stays on screen, and the next card waits for `Card.deal`
-- done `space` then `d`, or `done` on the phone: the user has nothing more to say about this version of the message; put away its card, leave other pings in the thread waiting, and if it was on screen, open the next card
+- reply: send the user's words and settle the thread through its latest message in view, as in `chat.Answer a message`; the thread stays on screen, and the next card waits for `Card.deal`
+- done `space` then `d`, or `done` on the phone: the user has read through the thread's current latest message and has nothing more to say; put the thread's card away (only a newer message or edit deals it again), and if it was on screen, open the next card
 - mute `space` then `m`, or `mute` on the phone: nothing from it should reach the user until it is unmuted; put the card away, and if it was on screen, open the next one
 - unmute: reopen the thread by name; its heading says `muted` and its verdict menu and palette offer `unmute`. Restore any message that still waits without leaving the thread.
-- snooze `space` then `s` then a unit, with an optional count first: hide the card until then; each row names when that is, such as `1 hour · 17:26`, `tomorrow · 09:00`, or `next week · Mon 09:00`; a count typed first multiplies the row; the rows are the same on both devices, and there is no one-minute row
+- snooze `space` then `s` then a unit, with an optional count first: hide the card until then (except that a reply arriving within one hour of the user's own message breaks through an active snooze); each row names when that is, such as `1 hour · 17:26`, `tomorrow · 09:00`, or `next week · Mon 09:00`; a count typed first multiplies the row; the rows are the same on both devices, and there is no one-minute row
 - next `space` then `n`: open the next card; `nothing waits` comes only when the `desk.Desk` would read `0 wait`, and then the Desk opens
 - undo `space` then `u`: take back the last verdict and bring the card back as it was; with nothing to take back, the echo line reads `nothing to undo`. Inside a draft, `shift-u` redoes the last edit.
 
@@ -69,7 +70,7 @@ user: the reply or verdict, and the time for a snooze.
 cases: a result from days ago that has not been read; a stop reported as message; a snoozed card returns.
 
 ## rule a reply settles the card
-when the user replies to a `chat.Message` that waits, then its `Card` goes away. The reply is a message in the thread, read by every agent in it, and the card that goes is the one the user came from, which the deal remembers.
+when the user replies to a `chat.Thread` that waits, then the thread is settled through the latest message visible when they replied, and its `Card` goes away. The reply is a message in the thread, read by every agent in it; only a newer message or edit after that deals the thread again.
 
 ## rule opening is not reading
 when the user opens a `chat.Thread` and leaves it without a `Verdict` or a reply, then its `Card` stays as it was.
