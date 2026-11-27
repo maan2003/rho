@@ -15,8 +15,9 @@ async fn device(secret: Option<Secret>) -> Device {
     let dir = tempfile::tempdir().unwrap();
     let ledger = Ledger::open(RhoDb::open(dir.path().join("client.redb"))).await;
     let (streams, events) = LedgerStreams::new(ledger);
+    // A device that already holds the phrase, as one paired earlier does.
     if let Some(secret) = secret {
-        streams.set_secret(secret).await.unwrap();
+        streams.ledger().set_secret(secret).await.unwrap();
     }
     Device {
         streams,
@@ -301,4 +302,77 @@ async fn a_device_paired_later_brings_what_it_said_before() {
     assert_eq!(said(&first, Channel::Notes), notes);
     a.abort();
     b.abort();
+}
+
+/// A phrase typed before any host answered is held, sealing nothing: a
+/// typo that opens nothing the first host holds is refused then, and the
+/// device never wrote a log under it. The right phrase is kept when the
+/// host answers, and what was said before reaches the other device.
+#[tokio::test]
+async fn a_phrase_typed_before_any_host_answers_waits_for_its_ledger() {
+    let secret = Secret::generate();
+    let (server, _dir) = host().await;
+    let first = device(Some(secret)).await;
+    first
+        .streams
+        .append(Channel::Facts, vec![b"from the first".to_vec()])
+        .await;
+    let a = connect(&server, &first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.lengths().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("announced in time");
+
+    let mut typo = device(None).await;
+    typo.streams
+        .append(Channel::Facts, vec![b"said before".to_vec()])
+        .await;
+    assert!(matches!(next(&mut typo).await, LedgerEvent::Appended(_)));
+    let wrong = Secret::generate();
+    assert_eq!(
+        typo.streams.set_secret(wrong).await.unwrap(),
+        Pairing::Unverified
+    );
+    assert!(typo.streams.ledger().secret().is_none());
+    assert!(typo.streams.ledger().lengths().is_empty(), "nothing sealed");
+    let b = connect(&server, &typo);
+    assert!(
+        next(&mut typo).await == LedgerEvent::PhraseRefused(wrong),
+        "the first answer refuses it"
+    );
+    assert_eq!(typo.streams.ledger().pairing(), Pairing::Unasked);
+    let firsts: Vec<_> = first.streams.ledger().lengths().into_keys().collect();
+    let held = |lengths: std::collections::BTreeMap<_, _>| lengths.into_keys().collect::<Vec<_>>();
+    assert_eq!(
+        held(typo.streams.ledger().lengths()),
+        firsts,
+        "it sealed nothing"
+    );
+    assert_eq!(held(server.lengths()), firsts, "no second ledger");
+    b.abort();
+
+    let mut right = device(None).await;
+    right
+        .streams
+        .append(Channel::Facts, vec![b"said before".to_vec()])
+        .await;
+    assert!(matches!(next(&mut right).await, LedgerEvent::Appended(_)));
+    assert_eq!(
+        right.streams.set_secret(secret).await.unwrap(),
+        Pairing::Unverified
+    );
+    let c = connect(&server, &right);
+    let mut events = Vec::new();
+    while !events.contains(&LedgerEvent::Paired) {
+        events.push(next(&mut right).await);
+    }
+    assert!(!events.contains(&LedgerEvent::NeedsKey), "{events:?}");
+    assert_eq!(right.streams.ledger().pairing(), Pairing::Paired);
+    wait_for(&right, Channel::Facts, 2).await;
+    wait_for(&first, Channel::Facts, 2).await;
+    a.abort();
+    c.abort();
 }

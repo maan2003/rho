@@ -50,6 +50,9 @@ enum Phrase {
     /// The user chose to keep this device to itself.
     Declined,
     Held([u8; 16]),
+    /// The user typed this before any host's ledger answered: nothing is
+    /// sealed with it until one does and its logs open with it.
+    Unverified([u8; 16]),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Channel {
@@ -80,6 +83,25 @@ pub enum Pairing {
     /// The user chose to keep it to itself: what it says stays on it until
     /// the user pairs it.
     Unpaired,
+    /// It holds a phrase that no host has checked yet. What it says stays
+    /// on it until the first host's ledger answers.
+    Unverified,
+}
+
+/// What the first host's answer did with a phrase held unverified.
+#[derive(Default)]
+pub enum Verified {
+    /// There was no phrase waiting for an answer.
+    #[default]
+    Nothing,
+    /// The host lists logs whose first record has not arrived yet.
+    Waiting,
+    /// The phrase opens what the other devices wrote, or nothing was
+    /// written: it is kept, and what this device said is sealed.
+    Kept(Received),
+    /// The phrase opens none of what the other devices wrote. The device
+    /// is back to not having answered.
+    Refused(Secret),
 }
 #[derive(Default)]
 pub struct Received {
@@ -118,14 +140,17 @@ fn take_unsent(write: &mut rho_db::WriteTxn) -> Vec<Envelope> {
     pending.into_iter().map(|(_, envelope)| envelope).collect()
 }
 
-fn opens_first_record(write: &mut rho_db::WriteTxn, key: &[u8; 32], log: LogId) -> bool {
+/// The first record of `log`, once all of it is held.
+fn first_record(write: &mut rho_db::WriteTxn, log: LogId) -> Option<Vec<u8>> {
     let head = store::read_in(write, log, 0, 4);
-    let Ok(head) = <[u8; 4]>::try_from(head.as_slice()) else {
-        return false;
-    };
-    let len = u32::from_le_bytes(head) as usize;
-    let record = store::read_in(write, log, 0, len.saturating_add(4));
-    seal::open(key, log, 0, &record).is_some()
+    let len = u32::from_le_bytes(<[u8; 4]>::try_from(head.as_slice()).ok()?) as usize;
+    let size = len.saturating_add(4);
+    let record = store::read_in(write, log, 0, size);
+    (record.len() == size).then_some(record)
+}
+
+fn opens_first_record(write: &mut rho_db::WriteTxn, key: &[u8; 32], log: LogId) -> bool {
+    first_record(write, log).is_some_and(|record| seal::open(key, log, 0, &record).is_some())
 }
 
 #[derive(Clone, Debug)]
@@ -194,7 +219,7 @@ impl Ledger {
     pub fn secret(&self) -> Option<Secret> {
         match self.me().phrase {
             Phrase::Held(secret) => Some(Secret(secret)),
-            Phrase::Unasked | Phrase::Declined => None,
+            Phrase::Unasked | Phrase::Declined | Phrase::Unverified(_) => None,
         }
     }
     pub fn pairing(&self) -> Pairing {
@@ -202,6 +227,7 @@ impl Ledger {
             Phrase::Held(_) => Pairing::Paired,
             Phrase::Unasked => Pairing::Unasked,
             Phrase::Declined => Pairing::Unpaired,
+            Phrase::Unverified(_) => Pairing::Unverified,
         }
     }
     /// The user chose to keep this device to itself, for now: it is not
@@ -326,6 +352,70 @@ impl Ledger {
             Ok(())
         })
         .await
+    }
+    /// Holds the phrase the user typed before any host's ledger answered,
+    /// sealing nothing with it until [`Ledger::verify_unverified`] keeps it.
+    pub async fn hold_unverified(&self, secret: Secret) -> anyhow::Result<()> {
+        let mut write = self.db.write().await;
+        let mut table = write.open_table(SELF);
+        let mut me = table.get(()).expect("ledger identity").value().into_owned();
+        match me.phrase {
+            Phrase::Held(held) => anyhow::ensure!(
+                held == secret.0,
+                "this device already holds another secret phrase"
+            ),
+            Phrase::Unasked | Phrase::Declined | Phrase::Unverified(_) => {
+                me.phrase = Phrase::Unverified(secret.0);
+                table.insert((), SenValue::borrowed(&me));
+            }
+        }
+        drop(table);
+        write.commit();
+        Ok(())
+    }
+    /// Checks a phrase held unverified against the logs a host lists, once
+    /// it holds their first records: it is kept if it opens one of them or
+    /// the host lists none, and refused once every first record is held
+    /// and none opens.
+    pub async fn verify_unverified(
+        &self,
+        listed: &BTreeMap<LogId, u64>,
+    ) -> anyhow::Result<Verified> {
+        let Phrase::Unverified(phrase) = self.me().phrase else {
+            return Ok(Verified::Nothing);
+        };
+        let secret = Secret(phrase);
+        let key = secret.derive(KEY_CONTEXT);
+        let mut write = self.db.write().await;
+        let mut opens = false;
+        let mut waiting = false;
+        for log in listed
+            .iter()
+            .filter(|(_, len)| **len > 0)
+            .map(|(log, _)| *log)
+        {
+            match first_record(&mut write, log) {
+                Some(record) => opens |= seal::open(&key, log, 0, &record).is_some(),
+                None => waiting = true,
+            }
+        }
+        if !opens && waiting {
+            return Ok(Verified::Waiting);
+        }
+        let listed_any = listed.values().any(|len| *len > 0);
+        if listed_any && !opens {
+            let mut table = write.open_table(SELF);
+            let mut me = table.get(()).expect("ledger identity").value().into_owned();
+            me.phrase = Phrase::Unasked;
+            table.insert((), SenValue::borrowed(&me));
+            drop(table);
+            write.commit();
+            return Ok(Verified::Refused(secret));
+        }
+        drop(write);
+        Ok(Verified::Kept(
+            self.keep_secret(secret, false, |_, _| Ok(())).await?,
+        ))
     }
     /// Keeps `secret` once `fits` says it may, and seals with it what this
     /// device said before it held one. With `start_log` its log starts even

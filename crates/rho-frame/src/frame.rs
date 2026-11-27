@@ -151,7 +151,7 @@ pub struct Frame {
     focus_lost: Option<Instant>,
     /// The question whether to pair this device waits to be asked
     /// ([`Frame::ask_pairing`]).
-    pub(crate) pairing_due: bool,
+    pub(crate) pairing_due: Option<crate::attention::PairingAsk>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -237,7 +237,7 @@ impl Frame {
             place: place::Writer::spawn(db.clone()),
             last_input,
             focus_lost: None,
-            pairing_due: false,
+            pairing_due: None,
             _subscriptions: vec![prefix_keys, activation],
             _tasks: Vec::new(),
         };
@@ -248,9 +248,9 @@ impl Frame {
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
-                let updated = this.update(cx, |this, cx| {
+                let updated = this.update_in(cx, |this, window, cx| {
                     for event in batch {
-                        this.ledger_event(event, cx);
+                        this.ledger_event(event, window, cx);
                     }
                 });
                 if updated.is_err() {
@@ -4773,6 +4773,61 @@ mod tests {
                 assert!(frame.attention.secret().is_none());
                 frame.minibuffer_cancel(window, cx);
                 assert_eq!(frame.attention.pairing(), Pairing::Unpaired);
+            })
+            .unwrap();
+    }
+
+    /// A phrase typed before any host answered is held unverified and
+    /// says so. When the first host refuses it, the prompt comes back
+    /// with the words and the reason.
+    #[gpui::test]
+    fn a_phrase_before_any_host_waits_and_comes_back_if_refused(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        let secret = rho_ledger::Secret::generate();
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.ask_pairing(window, cx);
+                answer(frame, &secret.to_words(), window, cx);
+                assert_eq!(prompt_of(frame), None);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("secret phrase kept · it is checked when the first host answers")
+                );
+                assert_eq!(frame.attention.pairing(), Pairing::Unverified);
+                assert!(frame.attention.streams().ledger().lengths().is_empty());
+                // The first host holds a log another phrase sealed.
+                let ledger = frame.attention.streams().ledger().clone();
+                let verified = futures::executor::block_on(async {
+                    let other = rho_ledger::Ledger::open(rho_db::RhoDb::in_memory()).await;
+                    other.make_secret().await.unwrap();
+                    let listed = other.lengths();
+                    for log in listed.keys() {
+                        ledger
+                            .receive(*log, 0, other.bytes_after(*log, 0, usize::MAX))
+                            .await;
+                    }
+                    ledger.verify_unverified(&listed).await.unwrap()
+                });
+                let rho_ledger::Verified::Refused(refused) = verified else {
+                    panic!("another phrase's log refuses it");
+                };
+                assert!(refused == secret);
+                assert_eq!(frame.attention.pairing(), Pairing::Unasked);
+                frame.ledger_event(
+                    rho_ledger::stream::LedgerEvent::PhraseRefused(refused),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    prompt_of(frame).as_deref(),
+                    Some(
+                        "secret phrase (this phrase does not open what your other devices wrote):"
+                    )
+                );
+                assert_eq!(
+                    frame.minibuffer.as_ref().unwrap().input(cx),
+                    secret.to_words()
+                );
             })
             .unwrap();
     }

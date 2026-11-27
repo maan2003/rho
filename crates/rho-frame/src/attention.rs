@@ -81,6 +81,18 @@ pub struct Undo {
     pub verdict: rho_journal::DealerVerdict,
 }
 
+const PAIRED: &str = "paired: this device holds what your other devices said and wrote";
+const UNVERIFIED: &str = "secret phrase kept · it is checked when the first host answers";
+const REFUSED_PHRASE: &str = "this phrase does not open what your other devices wrote";
+
+/// The pairing question the frame still owes the user: the words to put
+/// back on the prompt, and why they were refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PairingAsk {
+    pub(crate) typed: String,
+    pub(crate) problem: Option<String>,
+}
+
 pub struct Attention {
     streams: Arc<LedgerStreams>,
     /// This device, as its entries name it.
@@ -139,8 +151,8 @@ impl Attention {
     }
 
     /// Takes the phrase the user typed, and everything the other devices
-    /// wrote that it opens.
-    pub fn pair(&self, secret: Secret) -> anyhow::Result<()> {
+    /// wrote that it opens. Before any host answers it is held unverified.
+    pub fn pair(&self, secret: Secret) -> anyhow::Result<Pairing> {
         futures::executor::block_on(self.streams.set_secret(secret))
     }
 
@@ -230,6 +242,9 @@ impl Attention {
             ),
             // The status line says it for as long as it lasts.
             LedgerEvent::NeedsKey => (BTreeSet::new(), Vec::new()),
+            LedgerEvent::Paired => (BTreeSet::new(), vec![PAIRED.to_owned()]),
+            // The frame asks for the phrase again.
+            LedgerEvent::PhraseRefused(_) => (BTreeSet::new(), Vec::new()),
         }
     }
 
@@ -255,7 +270,21 @@ impl Frame {
         &self.attention.marks
     }
 
-    pub(crate) fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
+    pub(crate) fn ledger_event(
+        &mut self,
+        event: LedgerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A phrase typed before any host answered opens nothing the first
+        // host holds: ask for it again, with the words and the reason.
+        if let LedgerEvent::PhraseRefused(secret) = &event {
+            self.pairing_due = Some(PairingAsk {
+                typed: secret.to_words(),
+                problem: Some(REFUSED_PHRASE.to_owned()),
+            });
+            self.ask_pairing_when_free(window, cx);
+        }
         let (touched, said) = self.attention.ledger_event(event);
         for line in said {
             self.echo(&line, StyleClass::SystemInfo, cx);
@@ -270,19 +299,21 @@ impl Frame {
     /// a prompt is open or an idea is being written, rather
     /// than take keys meant for them.
     pub fn ask_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.pairing_due = self.attention.pairing() == Pairing::Unasked;
+        self.pairing_due = (self.attention.pairing() == Pairing::Unasked).then(PairingAsk::default);
         self.ask_pairing_when_free(window, cx);
     }
 
     /// Asks the question [`Frame::ask_pairing`] keeps, once nothing the
     /// user is in the middle of would lose keys to it.
     pub(crate) fn ask_pairing_when_free(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.pairing_due || self.is_asking() || self.current_surface().composes(cx) {
+        if self.pairing_due.is_none() || self.is_asking() || self.current_surface().composes(cx) {
             return;
         }
-        self.pairing_due = false;
+        let Some(ask) = self.pairing_due.take() else {
+            return;
+        };
         if self.attention.pairing() == Pairing::Unasked {
-            self.prompt_pair(String::new(), None, window, cx);
+            self.prompt_pair(ask.typed, ask.problem, window, cx);
         }
     }
 
@@ -363,11 +394,8 @@ impl Frame {
                 let paired = Secret::from_words(&input)
                     .and_then(|secret| frame.attention.pair(secret).map_err(|e| e.to_string()));
                 match paired {
-                    Ok(()) => frame.echo(
-                        "paired: this device holds what your other devices said and wrote",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
+                    Ok(Pairing::Paired) => frame.echo(PAIRED, StyleClass::SystemInfo, cx),
+                    Ok(_) => frame.echo(UNVERIFIED, StyleClass::SystemInfo, cx),
                     Err(problem) => frame.prompt_pair(input, Some(problem), window, cx),
                 }
                 cx.notify();

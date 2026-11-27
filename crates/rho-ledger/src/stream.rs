@@ -1,6 +1,7 @@
 //! Connections exchange log suffixes and forward bytes held from other hosts.
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
@@ -9,7 +10,7 @@ use rho_agent_hosts::{Dialer, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 use tokio::sync::broadcast;
 
-use crate::ledger::{Channel, Item, Ledger, Received};
+use crate::ledger::{Channel, Item, Ledger, Pairing, Received, Verified};
 use crate::protocol::{ClientFrame, DeviceId, LogId, Open, ServerFrame};
 use crate::secret::Secret;
 
@@ -22,11 +23,19 @@ pub enum LedgerEvent {
     /// Another device's writes arrived, and this device has no phrase to
     /// read them with.
     NeedsKey,
+    /// The first host's ledger answered, and the phrase typed before it
+    /// did opens what it holds: it is kept now.
+    Paired,
+    /// The first host's ledger answered, and the phrase typed before it
+    /// did opens none of it. The device is back to not having answered.
+    PhraseRefused(Secret),
 }
 pub struct LedgerStreams {
     ledger: Ledger,
     events: futures_mpsc::UnboundedSender<LedgerEvent>,
     changed: broadcast::Sender<()>,
+    /// Whether a host's ledger has answered since this device started.
+    answered: AtomicBool,
 }
 impl LedgerStreams {
     pub fn new(ledger: Ledger) -> (Arc<Self>, futures_mpsc::UnboundedReceiver<LedgerEvent>) {
@@ -37,6 +46,7 @@ impl LedgerStreams {
                 ledger,
                 events,
                 changed,
+                answered: AtomicBool::new(false),
             }),
             receiver,
         )
@@ -64,11 +74,34 @@ impl LedgerStreams {
         let _ = self.events.unbounded_send(LedgerEvent::Appended(own));
         let _ = self.changed.send(());
     }
-    /// Takes the phrase the user typed, with what it opens.
-    pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<()> {
+    /// Takes the phrase the user typed, with what it opens. Typed before
+    /// any host's ledger answered, with nothing held to check it against,
+    /// it is held unverified: a typo must not start a second ledger.
+    pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<Pairing> {
+        if !self.answered.load(Ordering::SeqCst) && self.ledger.lengths().is_empty() {
+            self.ledger.hold_unverified(secret).await?;
+            return Ok(self.ledger.pairing());
+        }
         let received = self.ledger.set_secret(secret).await?;
         self.report(received, None);
         let _ = self.changed.send(());
+        Ok(Pairing::Paired)
+    }
+    /// A phrase held unverified meets what a host's ledger holds.
+    async fn verify(&self, host: &BTreeMap<LogId, u64>) -> anyhow::Result<()> {
+        match self.ledger.verify_unverified(host).await? {
+            Verified::Nothing | Verified::Waiting => {}
+            Verified::Kept(received) => {
+                self.report(received, None);
+                let _ = self.events.unbounded_send(LedgerEvent::Paired);
+                let _ = self.changed.send(());
+            }
+            Verified::Refused(secret) => {
+                let _ = self
+                    .events
+                    .unbounded_send(LedgerEvent::PhraseRefused(secret));
+            }
+        }
         Ok(())
     }
     /// Makes a phrase for a new user, and sends what this device said
@@ -80,7 +113,8 @@ impl LedgerStreams {
         Ok(secret)
     }
     fn report(&self, result: Received, log: Option<LogId>) {
-        if result.needs_key {
+        // A phrase held unverified reads them once it is kept.
+        if result.needs_key && self.ledger.pairing() != Pairing::Unverified {
             let _ = self.events.unbounded_send(LedgerEvent::NeedsKey);
         }
         if result.unreadable {
@@ -125,6 +159,8 @@ impl LedgerStreams {
             anyhow::bail!("host did not answer hello with lengths")
         };
         let mut host_lengths = logs;
+        self.answered.store(true, Ordering::SeqCst);
+        self.verify(&host_lengths).await?;
         self.send_missing(&mut writer, &mut host_lengths).await?;
         // A frame read half-way must not be dropped when a change wakes the
         // loop: the stream keeps the read in flight across it.
@@ -151,6 +187,7 @@ impl LedgerStreams {
                             }
                         }
                     }
+                    self.verify(&host_lengths).await?;
                     self.send_missing(&mut writer, &mut host_lengths).await?;
                 }
                 change = changed.recv() => {

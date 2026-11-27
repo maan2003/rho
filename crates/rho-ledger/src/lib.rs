@@ -14,6 +14,6 @@ pub mod store;
 #[cfg(feature = "client")]
 pub mod stream;
 #[cfg(feature = "client")]
-pub use ledger::{Channel, Item, Ledger, Pairing};
+pub use ledger::{Channel, Item, Ledger, Pairing, Verified};
 #[cfg(feature = "client")]
 pub use secret::Secret;
