@@ -120,7 +120,7 @@ Only a host reached over the network shows a desktop. From a host on this machin
 ## screen Transcript
 answers: what happened in this workset, and on what brief?
 shows:
-- in the `window.Status line`, `<workset label>` (and active agent filter or short code suffix if >1 agent), its host, folder, runtime, what it is doing, and the errors since its last successful step
+- in the borderless Left Ear of `window.Status line`, `<workset label>` (and active agent filter if >1 agent), project, and runtime/model (such as `opus-high` — moved here from `chat.Thread`), plus host/folder/activity and any errors since its last successful step inside the `128 ch` transcript sheet
 - inside the editor buffer itself (never truncated or pinned outside it): the full brief once, then the chronological transcript — messages with `design.Message header` (`you · 12:22`), commands showing their whole wrapped line, output open, and repeated errors folded (`×7`); nothing the work was given is shortened, and everything is searchable and copyable with Helix motions
 states:
 - empty: the brief and workset state while no steps have run yet
@@ -130,7 +130,7 @@ states:
 - full: full brief and chronological transcript (optionally filtered to one `Agent`)
 keys:
 - `]e`, `[e`: the next or previous error
-- `space`: universal `window.Menu` leader (`f` places, `u` undo, plus `deal.Verdict` on the workset's waiting thread when unambiguous); the transcript stays open
+- `space`: silent `window.Screen` prefix (`space f` places, `space u` undo, plus `deal.Verdict` chords on the workset's waiting thread when unambiguous); the transcript stays open
 - `space-j` (`ctrl-j`), `tab`, `q`, `:`: `window.Screen`
 starts: `Steer an agent`, `Work beside an agent`
 captures: [message's writing step on the laptop](design/laptop-agent.png) and [on the phone](design/phone-agent.png).

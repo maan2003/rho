@@ -19,7 +19,7 @@ sees: its first line, which is its title, or `untitled note`; open, its whole te
 does:
 - new note, from `window.Commands`: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit
-- remind `space` then `s` (or `:snooze` in `window.Commands`): schedule a device-only reminder using the same snooze times as `deal.Verdict.snooze`; when due, the note deals once on the user's paired devices (`space d` done clears the reminder, `space s` reschedules it; never seen by any host or agent)
+- remind `space` then `s` (prefilling `:snooze note ` in `window.Commands`): schedule a device-only reminder using the same live-preview snooze durations as `deal.Verdict.snooze`; when due, the note deals once on the user's paired devices (`space d` done clears the reminder, `space s` reschedules it; never seen by any host or agent)
 - list notes, from `window.Commands` (or `notes` in `window.Places`): open `Notes`, which lists every note
 - open `enter` on a note in `Notes` (or from `window.Places`, jumping to the matched line on full-text search): open the note
 

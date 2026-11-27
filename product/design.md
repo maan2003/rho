@@ -42,9 +42,9 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - stuck draft shadow · `4 px` down, `12 px` blur, black at `35%` · separate the draft from the history below its seam without dimming the draft.
 - draft gutter stroke · `2 px` teal left gutter bar beside every line of the thread draft and user messages · keeps the left edge fixed while distinguishing user voice from agent voice.
 - thumb target · `56 px` high · an action the thumb can hit at the bottom edge or in a menu sheet.
-- narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop menu grid.
+- narrow window · up to `600 px` wide · make room for thumb controls rather than using a desktop overlay.
 - row air · two text spaces · leave space between a row name and its words.
-- menu column · four rows, then the next column across · find choices without spending the whole screen's height.
+- prompt panel · `104 ch` upper-third floating square panel (`0 px` corners, `1 px` `seam` border, dimmed backdrop behind) · brings `Places`, `Commands`, and `:snooze` into natural eye line without jumping to the bottom edge.
 - prompt answers · up to eight visible rows · keep the answer being considered in sight without making a second screen.
 
 ## token time
@@ -83,13 +83,17 @@ used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 captures: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
-purpose: let the user pick a place, command, or answer by name and see just enough context beside it.
-looks: one row of `editor text`; name first in `reading text`, then the quieter context. On the laptop, `desk.Desk` puts `row air` between the subject and project address, or between a folded project's address and its stop count, with a fresh `chat.Flash` shown in `quiet` context when present. It shortens the subject only when it does not fit in the width left after the row's own detail; it never pads proportional text with spaces. The count uses the same face (adding any offline/connecting host note in `quiet`) and is not a selectable row. A narrow Desk row puts a folded project's stop count below its address. A prompt leaves a `reading inset` and gives the picked answer the `current answer` fill.
+decided: 2026-11-27 · Desk is a 1-line tabular sheet inside 128ch (row 1 = Card 1, count in Left Ear, no subheader, normal Helix cursor with no UI row-selection highlight or preview, columns: subject · exception tag · project · quiet right age; host away stays in Right Ear only); Places and Commands live inside the upper-third 104ch square prompt panel with keys shown quietly flush-right
+purpose: let the user scan waiting work on Desk or pick a place, command, or snooze time cleanly in tabular alignment.
+looks: one row of `editor text` (`0 px` corners).
+- on `desk.Desk`: laid out inside the `128 ch` centered sheet starting immediately at row 1 (global count like `13 wait` and any active dealer focus sit in the Left Ear; `away` hosts stay in the Right Ear — never repeated inside the Desk body). Each waiting card is one crisp tabular row: subject (truncated only if needed), optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age (`3.0h`). Normal Helix text cursor moves line-by-line (no separate UI row-selection box or inline preview expansion); `and N more · …` sits quietly below the visible rows.
+- on `window.Places`: inside the upper-third `104 ch` square prompt panel; columns show clean subject/name (never raw temp paths for visited transcripts), `attention` card words or `quiet` latest words (or matched text snippet for full-text search), `quiet` project/kind, and flush-right key sequence if the place has a shortcut. Query matches use `marked`; the highlighted prompt row uses `current answer` fill with a `2 px` left `keys in motion` bar.
+- on `window.Commands`: inside the upper-third `104 ch` square prompt panel; lists **every** action in rho (including `deal next`, `done`, `mute`, `snooze thread`, `snooze note`, `approve push`, `deny push`, `undo`, `open places`, `open desk`, `close screen`). Each row shows flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument (or live resolved snooze timestamp preview), live target/current value in `quiet` / `choice value`, and its key sequence quietly flush-right. Query matches use `marked`.
 states:
-- desk: a subject, a project address in `quiet`, and any fresh `chat.Flash` in `quiet`; a folded row of repeated stops uses the address in place of the subject and adds the count in `attention`.
-- places (`window.Places`): place rows use `row air` between columns: subject/name, `attention` card words or the project's `quiet` latest words (or matched text snippet for full-text search), and `quiet` address. On a narrow window the subject cuts at a word, the address stays on the first line, and the words move to the second. Query matches use `marked`; the chosen row keeps its fill all the way across.
-- commands (`window.Commands`): flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument when typed, live target and current value in `quiet` / `choice value` (or `pick …` when ambiguous), and `quiet` key sequence (name and target only on a narrow window). Query matches use `marked`.
-- empty: Desk reads `0 wait` (or `0 wait · lab away` in `quiet`) when no cards are due; `Places` and `Commands` show `no match` when no row fits the query.
+- desk: up to seven 1-line tabular rows in deal order, then `and N more · …` for overflow; cursor opens on row 1 (never stuck on the overflow line).
+- places (`window.Places`): MRU rows or search/full-text matches with highlighted matches.
+- commands (`window.Commands`): all rho commands (recents first when blank) with inline arguments, live target/preview, and flush-right shortcut keys.
+- empty: Desk reads `0 wait` in the Left Ear with a calm blank sheet; `Places` and `Commands` show `no match` when no row fits the query.
 used on: `desk.Desk`, `window.Places`, and `window.Commands`.
 captures: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), and [matched palette row](design/laptop-prompt.png).
 
@@ -140,26 +144,16 @@ states:
 used on: `chat.Thread` and the draft of `chat.Write an idea`.
 form: [empty reply](design/laptop-card.png), [empty idea with the project runtime](design/laptop-idea-empty.png), [idea with an explicit runtime on phone](design/phone-idea-runtime.png), and a stuck reply with new message on [laptop](design/laptop-reading-notice.png) and [phone](design/phone-reading-notice.png).
 
-## part Menu
-purpose: offer a few keyed choices without taking the user away from the thing they are on.
-looks: on a laptop an `emphasis` title and compact `menu column` grid sit in the `command strip` over the bottom of the work; `marked` keys lead each column. Available values in parentheses use `choice value`. On a phone `thumb target` rows start with their action, end with the key in `keys in motion`, and have `behind the sheet` over the work.
-states:
-- closed: the work fills its space, and no menu is visible.
-- open: title, actions, keys, and any values; on the phone the sheet has `close` at the top and a full-width `cancel` at the bottom edge.
-- sub-menu: it takes the same place; the phone sheet adds `‹ back`.
-- empty: no sheet or grid; the `Echo line` says `nothing here` with the menu name.
-used on: `window.Screen` wherever the `space` leader `window.Menu` opens (`f` places and `u` undo everywhere in `NOR`; `s` snooze reminder on `notes.Note`; card verdicts — or `a` approve / `x` deny / `s` snooze for a pending push — added on `chat.Thread` and `agents.Transcript` of a waiting card).
-form: [laptop verdict grid](design/laptop-menu.png) and [phone verdict sheet](design/phone-menu.png).
-
 ## part Prompt
-purpose: ask for a line of text and offer answers without a dialog.
-looks: `editor text` in the `command strip`, question and input first with a `reading inset`, then the candidate rows down the window. The input wraps below a long question on a narrow screen.
+decided: 2026-11-27 · upper-third floating 104ch square panel (0px corners, 1px seam border, dimmed screen AND dimmed Left Ear behind while framed Right Ear stays bright); Menu removed completely — space is a silent prefix key with no popup/hint, and space s prefills :snooze thread or :snooze note in this same Prompt
+purpose: ask for a line of text, pick a place, run any command, or pick a snooze duration in one consistent overlay.
+looks: on desktop, an upper-third floating `prompt panel` (`104 ch` wide, `0 px` corners, `1 px` `seam` border on `global status surface`). Because the borderless Left Ear belongs to the open page/card, opening a prompt dims **both** the screen body and the Left Ear behind it, leaving only the prompt panel and the framed Right Ear global status bar at full brightness. Question/prefix and input line sit at the top separated by a soft `1 px` divider, with selected position/total in `quiet` at the right end, followed by candidate rows below.
 states:
-- blank query: question and any initial answers.
-- typing: text narrows the list; moving the selection keeps the `current answer` among `prompt answers`. `Places` and `Commands` show the selected position and total in `quiet` at the right end of their prompt line.
+- blank query: question/prefix and initial answers (MRU places in `Places`, recent + all commands in `Commands`, or quick duration presets with live resolved timestamps when prefilled with `:snooze thread ` / `:snooze note `).
+- typing: text narrows the list (or previews custom snooze times live); moving the selection keeps the `current answer` among `prompt answers`.
 - no match: `no match` below the input when a choice is required and none fits.
-- closed: the strip goes away and the keys return.
-used on: `window.Places`, `window.Commands`, and other questions over `window.Screen`, as in `hosts.Attach a host`.
+- closed: the panel disappears immediately and keys return to the screen underneath.
+used on: `window.Places`, `window.Commands` (including `:snooze thread` / `:snooze note`), and other questions over `window.Screen`, as in `hosts.Attach a host`.
 form: [filtered laptop palette](design/laptop-prompt.png) and [blank phone palette](design/phone-prompt.png).
 
 ## part Phone bar
@@ -214,8 +208,8 @@ lasts: `while needed`; at a higher crossing the chime sounds once, not on each r
 means: relative ages change in place as the work waits, without moving the user's point.
 lasts: `age beat` on thread summaries; `card age step` for the deal's words.
 
-## motion A question or menu takes the keys
-means: the bottom strip or sheet is present while it can take a choice; a laptop menu covers the work instead of reflowing it.
+## motion A prompt takes the keys
+means: the upper-third square prompt panel is present while it takes a choice; it covers the dimmed work instead of reflowing it.
 lasts: `cut` on open, replacement, or close; otherwise `while needed`.
 
 ## motion A phone page settles
@@ -227,6 +221,3 @@ when the `Echo line` answers, then it appears inside the framed Right Ear global
 
 ## rule a prompt takes the phone bar
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.
-
-## rule the menu leaves the work where it is
-when a `Menu` opens, then the `Row` or `Draft` behind it keeps its point and the choices take the keys.

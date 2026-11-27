@@ -148,7 +148,7 @@ keys:
 - `gg`: go to the draft; `G`: go to the oldest message; `i`, `A` or `o`: `Draft.edit`; `ctrl-enter` or `send`: `Draft.send`
 - `alt-r` on a message: `notes.Private reply.reply privately`
 - `u`, `shift-u` in the draft: undo and redo the last edit
-- `space`: universal `window.Menu` leader (`f` places, `u` undo, plus `deal.Verdict` when waiting — or `a` approve / `x` deny / `s` snooze when a push/fetch awaits), anywhere in Normal mode
+- `space`: silent `window.Screen` prefix (`space f` places, `space u` undo, plus `deal.Verdict` chords when waiting — or `space a` approve / `space x` deny / `space s` → `:snooze thread ` when a push/fetch awaits), anywhere in Normal mode
 - `:`: `window.Commands`
 - `space-j` (`ctrl-j`), `tab`, `q`: `window.Screen`
 starts: `Answer a message`, `agents.Look into the work`, `agents.Approve a push or a fetch`, `notes.Reply privately`

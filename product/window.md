@@ -19,16 +19,17 @@ does:
 - close `q`, or `ctrl-shift-backspace` while typing: close this screen and return to the previous recent place (or `desk.Desk`)
 - close and deal `space-shift-j` (or `ctrl-shift-j` in `NOR`): close this screen and deal the next card
 - desk `tab`: go to `desk.Desk`; on the desk, return to the previous place
-- leader `space` in `NOR`: open the `Menu` (`f` places, `u` undo when undoable, plus card verdicts when the screen is a waiting card, or `s` snooze on a `notes.Note`)
+- prefix `space` in `NOR`: silent Helix prefix key with no popup menu or delayed hint (`space f` opens `Places`, `space u` undoes the last sealed verdict, plus card verdicts `space d` done / `space m` mute / `space s` → `:snooze thread ` / `space a` approve push / `space x` deny push on waiting cards, and `space s` → `:snooze note ` on a `notes.Note`). Every action (and its key) is discoverable in `Commands` (`:`).
 
 Navigation has no linear back/forward history stack: the user moves purely by `Places` MRU (`space` then `f`), `desk.Desk` (`tab`), and `deal.Card.deal` (`space-j`). Each open screen keeps its own scroll position and cursor when revisited. While a host is still connecting after a restart, a host-backed screen shows its locally cached view or a connecting placeholder instead of being discarded. Returning after more than ten minutes opens the desk; see `desk.a cold return opens the desk`.
 
-At the OS keyboard layer (`keyd`), logical gestures map to unused function keys so they work globally without colliding with typing: `space-j` (hold `space` + `j`) → `f20`, `space-shift-j` (hold `space` + `shift-j`) → `f16`, and `physical-escape` (physical `escape` key, forwarded as literal `escape` to a guest) → `f9`, while tapping `space` sends `space` (the `NOR` leader) and tapping `capslock` sends `escape` (rho `NOR`). Note on the user's keyboard setup: `keyd` uses a tuned `lettermod(movement, space, 95, 150)` home-layer hold that already handles typing rollover cleanly in daily use, so hold-`space` chords are intentional and reliable even in `INS`; reviewers should treat OS-level `keyd` rollover as solved. Code keeps one explicit constant table mapping these logical gestures to their key symbols so every binding stays readable. `space-j` and `space-shift-j` work globally, including from raw live places; other `space+` OS keys stay unbound.
+At the OS keyboard layer (`keyd`), logical gestures map to unused function keys so they work globally without colliding with typing: `space-j` (hold `space` + `j`) → `f20`, `space-shift-j` (hold `space` + `shift-j`) → `f16`, and `physical-escape` (physical `escape` key, forwarded as literal `escape` to a guest) → `f9`, while tapping `space` sends `space` (the `NOR` prefix key) and tapping `capslock` sends `escape` (rho `NOR`). Note on the user's keyboard setup: `keyd` uses a tuned `lettermod(movement, space, 95, 150)` home-layer hold that already handles typing rollover cleanly in daily use, so hold-`space` chords are intentional and reliable even in `INS`; reviewers should treat OS-level `keyd` rollover as solved. Code keeps one explicit constant table mapping these logical gestures to their key symbols so every binding stays readable. `space-j` and `space-shift-j` work globally, including from raw live places; other `space+` OS keys stay unbound.
 
 Every editor screen is text in an editor. Helix's selections, motions, search, and modes work on every editor screen, so the user moves through a list of threads the same way they move through a thread or a chart's numbers. `/` and `?` ask `search:`, `n` and `N` go on, a search wraps round the end and says so, and `G` goes to the end. A search selects the whole match, so `c` changes it and `d` deletes it.
 
-Only screens that represent a waiting item (`chat.Thread` — including one with a pending push/fetch approval — a `Workset` transcript inspecting a waiting card, or a snoozed `notes.Note` reminder when dealt) offer card verdicts in the `space` `Menu`; non-card screens (`desk.Desk`, `browser.Page`, `usage.Chart`, `agents.Terminal`, `agents.Shell`, `agents.Desktop`) only offer `f` places and `u` undo (and a standalone `notes.Note` adds `s` snooze for reminders).
+Only screens that represent a waiting item (`chat.Thread` — including one with a pending push/fetch approval — a `Workset` transcript inspecting a waiting card, or a snoozed `notes.Note` reminder when dealt) accept card verdict chords (`space d`, `space m`, `space a`, `space x`, `space s`); non-card screens (`desk.Desk`, `browser.Page`, `usage.Chart`, `agents.Terminal`, `agents.Shell`, `agents.Desktop`) only accept `space f` and `space u` (and a standalone `notes.Note` accepts `space s` for `:snooze note `).
 rejected:
+- a `window.Menu` popup grid or delayed `which-key` hint on `space` · 2026-11-27 · only 2–5 chords remain on `space`, fast chords should never flicker, `space s` opens `:snooze thread ` / `:snooze note ` directly in `Commands` with live previews, and `Commands` (`:`) is the single complete directory of every action and its keybinding
 - a linear back/forward history stack (`ctrl-k` / `ctrl-j` / `f21`) · 2026-11-26 · dealing through cards piled up dead history and broke 1-gesture return; pure MRU `Places` (`space f`), `Desk` (`tab`), and `Deal` (`space-j`) are simpler and never trap the user
 - a separate pre-deal return point or excluding dealt cards from `Places` MRU · 2026-11-26 · pure MRU is simpler and predictable; after clearing a batch of cards, the user jumps back to their place by name in `Places`
 
@@ -80,10 +81,11 @@ When nothing matches, `Places` offers no fallback rows. Nothing acts on a row be
 when an agent works in a `chat.Thread` and the project has not written since the user did, then the thread's row in `Places` reads `working` (or `<host> away` if its host is away), or the first line of the agent's newest fresh `chat.Flash` when it has one; the word goes away when the agent stops or the thread waits.
 
 ## screen Places
+decided: 2026-11-27 · upper-third floating 104ch square panel (0px corners, dimmed backdrop); clean labels (no raw temp paths on visited transcripts); show keybinding flush-right if a place has one
 answers: where can the user go, or which remembered line do they mean?
 shows:
-- the query in the `Places` prompt (and active project or state filter scope, if set), with the selected position and total at its right end
-- the `Places` rows in match order, with `deal.Card` words or the project's latest words on thread rows, and matched snippets on text matches
+- the query in the upper-third `104 ch` square `Places` prompt (and active project or state filter scope, if set), with the selected position and total at its right end
+- the `Places` rows in match order, with clean titles/transcript labels (never raw filesystem temp paths), `deal.Card` words or the project's latest words on thread rows, matched snippets on text matches, and a quiet flush-right keybinding if a place has one (e.g. `tab` on `desk`)
 states:
 - empty: an empty query lists recent places in MRU order (leaving out the current place), then what waits; a query with no match shows `no match`
 - loading: `searching…` if the text search is still running and no named rows match yet
@@ -98,9 +100,10 @@ starts: `Go to something by name`
 captures: [message search on laptop](design/laptop-prompt.png), [blank phone palette](design/phone-prompt.png), and the phone with [text only](design/phone-palette-text.png).
 
 ## concept Commands
-purpose: run any rho command by natural name or intent, with inline targets/arguments and live context, without ever colliding with place names.
-principle: the user presses `:` and types `kill` — seeing `stop agent · tide · Flaky clock test · working (opus-high)` and `cancel agent request` ranked by intent — or types `:model sol-medium` to switch the current agent, or `:stop agent clock` to override the context target directly.
-sees: with nothing typed, recently run commands pinned at the top, then all commands. Each command has a flat, natural verb-noun name with an explicit object noun (such as `compact agent`, `reset agent cache`, `rewind agent`, `rewind agent to here`, `stop agent`, `cancel agent request`, `set agent runtime`, `finish work`, `rename thread`, `fork thread`, `set project place`, `set project mode`, `set project runtime`, `rename project`, `retire project`, `new project`, `set dealer focus`, `clear dealer focus`, `attach host`, `detach host`, `list hosts`, `list devices`, `revoke device`, `open terminal`, `new terminal`, `open shell`, `close shell`, `open desktop`, `draw on desktop`, `open transcript`, `filter transcript`, `open thread`, `open page`, `bookmark page`, `remove bookmark`, `switch claude account`, `open usage`, `new note`, `list notes`, `write idea`, `pair device`, `show secret phrase`, `upload performance report`, `quit`) — never breadcrumb prefixes (`agent ›`, `project ›`, `hosts ›`) and never vague generic names (`compact`, `new cache key`). Each row shows the resolved target and current value from context (such as `tide · Flaky clock test · opus-high`, or `pick agent…` when ambiguous), plus its key sequence if it has one (name only on a narrow window). When the user types inline target or value words after the command, command words match first and the row visually separates the matched command from the parsed target/argument before `enter`. Every command defines weighted aliases/synonyms so natural phrasing matches what the user meant (for example, `kill` matches both `stop agent` and `cancel agent request` ranked by intent weight; `model` matches `set agent runtime` and `set project runtime`; `focus` / `quiet` / `dnd` match `set dealer focus`). Places and message text never appear in `Commands`.
+decided: 2026-11-27 · upper-third floating 104ch square panel (0px corners, dimmed backdrop); complete directory of EVERY action in rho (including deal next, done, mute, snooze thread, snooze note, approve push, deny push, undo, open places, open desk, close screen) with its shortcut key shown quietly flush-right; replaces window.Menu
+purpose: run any rho action by natural name or intent, with inline targets/arguments, live context/previews, and discoverable keybindings, without ever colliding with place names.
+principle: the user presses `:` and types `kill` — seeing `stop agent · tide · Flaky clock test · working (opus-high)` and `cancel agent request` ranked by intent — or presses `space s` to open `:snooze thread ` with live resolved timestamp previews, or types `:deal` to see `deal next` with `space-j` flush-right.
+sees: with nothing typed, recently run commands pinned at the top, then **every** action in rho. Each command has a flat, natural verb-noun name with an explicit object noun (such as `deal next`, `close and deal`, `done`, `mute`, `unmute`, `snooze thread`, `snooze note`, `approve push`, `deny push`, `undo`, `open places`, `open desk`, `close screen`, `compact agent`, `reset agent cache`, `rewind agent`, `rewind agent to here`, `stop agent`, `cancel agent request`, `set agent runtime`, `finish work`, `rename thread`, `fork thread`, `set project place`, `set project mode`, `set project runtime`, `rename project`, `retire project`, `new project`, `set dealer focus`, `clear dealer focus`, `attach host`, `detach host`, `list hosts`, `list devices`, `revoke device`, `open terminal`, `new terminal`, `open shell`, `close shell`, `open desktop`, `draw on desktop`, `open transcript`, `filter transcript`, `open thread`, `open page`, `bookmark page`, `remove bookmark`, `switch claude account`, `open usage`, `new note`, `list notes`, `write idea`, `pair device`, `show secret phrase`, `upload performance report`, `quit`) — never breadcrumb prefixes (`agent ›`, `project ›`, `hosts ›`) and never vague generic names (`compact`, `snooze`, `new cache key`). Each row shows the resolved target and current value (or live resolved snooze timestamp preview) from context, plus its key sequence quietly flush-right whenever it has one. When the user types inline target or value words after the command, command words match first and the row visually separates the matched command from the parsed target/argument before `enter`. Every command defines weighted aliases/synonyms so natural phrasing matches what the user meant (`kill` → `stop agent` / `cancel agent request`; `model` → `set agent runtime` / `set project runtime`; `snooze` → `snooze thread` / `snooze note`; `focus` / `quiet` / `dnd` → `set dealer focus`). Places and message text never appear in `Commands`.
 does:
 - open `:` in `NOR`, or `ctrl-shift-;` from a raw place or while typing: open the commands prompt; the screen underneath does not see the keys
 - search: match typed words against command names and weighted aliases/synonyms, ranking stronger intent matches first and marking matched letters
@@ -116,10 +119,11 @@ rejected:
 when the user opens `Commands` from any screen, then commands are never hidden merely because of which screen is open; if a command's target (such as a `chat.Project`, `agents.Workset`, or `agents.Agent`) is unambiguous from the current screen it shows and uses it by default (unless the user overrides it inline), and otherwise marks the row `pick …` and opens a `Prompt` to ask for it.
 
 ## screen Commands
-answers: what action can the user run here or globally?
+decided: 2026-11-27 · upper-third floating 104ch square panel (0px corners, dimmed backdrop); all actions live here with shortcuts flush-right
+answers: what action can the user run here or globally, and what key triggers it?
 shows:
-- the query (and any inline target/argument) in the `Commands` prompt, with the selected position and total at its right end
-- matching command rows in match order, each with its flat verb-noun name, visually distinct parsed inline target/argument, live target/current value, and quiet key sequence
+- the query (and any prefilled command like `snooze thread ` or inline target/argument) in the upper-third `104 ch` square `Commands` prompt, with the selected position and total at its right end
+- matching command rows in match order, each with its flat verb-noun name, visually distinct parsed inline target/argument, live target/current value or resolved snooze timestamp preview, and quiet flush-right key sequence
 states:
 - empty: recently run commands at the top, followed by all commands; a query with no match shows `no match`
 - loading: none; command list is local and instant
@@ -132,19 +136,6 @@ keys:
 - `escape`: `Prompt`
 starts: `Run a command I rarely use`
 captures: [commands only on phone](design/phone-palette-commands.png).
-
-## concept Menu
-purpose: offer a short list of keyed choices where the list itself is the information: the `space` leader (`Places`, `undo`, and card verdicts) and how long to snooze. Every other choice is in `Commands` or a `Prompt`.
-principle: the user presses `space` on a card open in a thread; a block of rows appears along the bottom edge, each a key and a word; they press `s`, the block becomes the snooze times; they type `3` then `h`, and the card sleeps for three hours. The rows show the resolved times. On any non-card screen (including `desk.Desk`, `browser.Page`, `agents.Terminal`, `agents.Desktop`, `usage.Chart`), `space` opens the same leader menu with `f` places and (when undoable) `u` undo. On a `notes.Note`, `space` also offers `s` snooze for a device-only reminder.
-sees: the menu's title, then its rows as key and words, laid out in columns; a row that holds a value shows the value.
-does:
-- pick a key, or click or tap a row: run the row; a row that opens another menu replaces this one
-- count digits before a key: give the row a number, such as `3` before `d` for three days
-- back `escape` or `ctrl-g`: return to the menu before, or close the menu
-
-A menu with nothing in it does not open; the echo line reads its title and `nothing here`.
-
-On the phone, a menu is a sheet of tall rows over the screen, with the key still shown at the end of each row. `‹ back` returns to the previous sheet. `close`, `cancel` at the bottom edge, or a tap in the dimmed area dismisses the whole menu without running a row or changing the work. A tap that starts outside a row cannot run it.
 
 ## concept Prompt
 purpose: ask the user for one line of text, with completion, so a question never needs a dialog.
@@ -213,8 +204,8 @@ system: keeps commands globally available in `Commands`, ranks weighted aliases 
 user: the command's name or alias, and any target or argument it needs.
 cases: running a project or agent command from `desk.Desk`; typing `kill` and choosing between `stop agent` and `cancel agent request`; overriding context with `:stop agent clock`; passing `:rename Fix clock race` inline; on the phone, tapping a command below the first row.
 
-## rule a menu or prompt takes the keys
-when a `Menu` or a `Prompt` is open, then every key goes to it, and the `Screen` under it does not move until it closes.
+## rule a prompt takes the keys
+when a `Prompt` (`Places`, `Commands`, or a follow-up question) is open, then every key goes to it, and the `Screen` under it does not move until it closes.
 
 ## flow Report a slow window
 runs: 1 a month
