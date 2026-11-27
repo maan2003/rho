@@ -462,7 +462,7 @@ impl Frame {
         self.systems_changed(cx);
     }
 
-    /// A snooze from the verdict menu: `count` of `unit`, or one.
+    /// A snooze of `count` of `unit`, or one.
     pub fn snooze(
         &mut self,
         address: &Address,
@@ -471,8 +471,20 @@ impl Frame {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (until, _) = snooze_target(unit, count.map_or(1, i64::from), &Zoned::now());
+        self.snooze_until(address, until, window, cx);
+    }
+
+    /// Puts the card at `address` away until `until`, as `snooze thread`
+    /// and `snooze note` do.
+    pub fn snooze_until(
+        &mut self,
+        address: &Address,
+        until: rho_dealer::Until,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let now = Zoned::now();
-        let (until, _) = snooze_target(unit, count.map_or(1, i64::from), &now);
         let said = snooze_said(&until.resolve(&now).to_zoned(now.time_zone().clone()), &now);
         self.verdict(address, Verdict::Snooze(until), said, window, cx);
     }
@@ -624,6 +636,7 @@ impl Frame {
                     .iter()
                     .find_map(|system| system.desk_context(address, cx))
             },
+            |address| self.away_host(address, cx).is_some(),
         );
         self.desk
             .update(cx, |desk, cx| desk.set_rows(rows, hold, cx));

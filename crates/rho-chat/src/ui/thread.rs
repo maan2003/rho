@@ -2142,6 +2142,11 @@ impl Surface for ThreadView {
         }))
     }
 
+    fn draft(&self, cx: &App) -> Option<String> {
+        let text = self.draft.read(cx).text();
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     fn commands(
         &mut self,
         _: Option<Seen>,

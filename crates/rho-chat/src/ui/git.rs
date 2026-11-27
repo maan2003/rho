@@ -753,9 +753,10 @@ pub(super) mod tests {
         assert_eq!(world.hand(cx).len(), 1);
     }
 
-    /// `space x` refuses the push and sends what the draft holds to the
-    /// thread's agents as a reply, empties the draft and deals on; with an
-    /// empty draft it only refuses. Neither leaves anything to undo.
+    /// `space x` opens `deny push <draft>`, and `enter` refuses the push
+    /// and sends what the draft holds to the thread's agents as a reply,
+    /// empties the draft and deals on; with an empty draft it only refuses.
+    /// Neither leaves anything to undo.
     #[gpui::test]
     fn deny_refuses_with_the_drafts_words_and_deals_on(cx: &mut TestAppContext) {
         let mut world = world(cx);
@@ -770,6 +771,22 @@ pub(super) mod tests {
         world.deal(cx);
         assert_eq!(world.current(cx), flaky());
         world.press(cx, "x");
+        assert!(
+            first.try_recv().is_err(),
+            "nothing refused before enter confirms"
+        );
+        let prompt = world
+            .window
+            .update(cx, |frame, _, cx| {
+                frame.minibuffer_mut().map(|prompt| prompt.input(cx))
+            })
+            .unwrap();
+        assert_eq!(
+            prompt.as_deref(),
+            Some("deny push Push a branch and open a PR instead.")
+        );
+        cx.simulate_keystrokes(world.window.into(), "enter");
+        cx.run_until_parked();
         assert_eq!(first.try_recv(), Ok(GitDecision::Deny));
         assert_eq!(world.sent(cx, FLAKY), [words]);
         assert_eq!(world.draft(cx, FLAKY), "");
@@ -782,6 +799,12 @@ pub(super) mod tests {
         assert_eq!(world.current(cx), second_thread, "the next card is dealt");
 
         world.press(cx, "x");
+        assert!(
+            other.try_recv().is_err(),
+            "nothing refused before enter confirms"
+        );
+        cx.simulate_keystrokes(world.window.into(), "enter");
+        cx.run_until_parked();
         assert_eq!(other.try_recv(), Ok(GitDecision::Deny));
         assert_eq!(world.sent(cx, second), Vec::<String>::new());
         assert!(world.hand(cx).is_empty());

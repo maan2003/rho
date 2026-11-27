@@ -1,5 +1,6 @@
-//! Emacs-style minibuffer: a completing-read strip at the bottom of the
-//! window.
+//! Emacs-style minibuffer: a completing read in the `Prompt` panel, a
+//! square floating in the upper third of the window over the dimmed work
+//! (`design.Prompt`), or along the bottom edge on a phone.
 //!
 //! Generic machinery — a caller opens it with a prompt, a candidate
 //! source, and a submit handler. The input is a single-line editor (no
@@ -73,14 +74,8 @@ pub fn completion_start(text_before_cursor: &str, whole_input: bool) -> usize {
     }
 }
 
-/// How long an echoed message stays visible.
-pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
-/// Long messages (`:help`) are capped in the echo area; the transcript
-/// keeps the full copy.
-const ECHO_MAX_LINES: usize = 12;
-
-/// The most recent system notice, temporarily substituted into the shared
-/// status line. Dropping it (replacement or timer) dismisses it.
+/// The most recent system notice, on the global status bar for a few
+/// seconds. Dropping it (replacement or timer) dismisses it.
 pub struct Echo {
     text: String,
     class: StyleClass,
@@ -91,6 +86,10 @@ pub struct Echo {
 impl Echo {
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn class(&self) -> StyleClass {
+        self.class
     }
 
     /// The echo is one line in the status line's place: of a text of
@@ -107,38 +106,11 @@ impl Echo {
             _dismiss: dismiss,
         }
     }
-
-    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Frame>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let style = self.class.resolve(cx);
-        let lines = self.text.lines().collect::<Vec<_>>();
-        let truncated = lines.len() > ECHO_MAX_LINES;
-        let mut rows = lines
-            .into_iter()
-            .take(ECHO_MAX_LINES)
-            .map(|line| div().px_2().child(line.to_owned()))
-            .collect::<Vec<_>>();
-        if truncated {
-            rows.push(
-                div()
-                    .px_2()
-                    .text_color(colors.text_muted)
-                    .child("… (full text in the transcript)"),
-            );
-        }
-        let mut area = bottom_strip(text_style, cx);
-        if let Some(color) = style.color {
-            area = area.text_color(color);
-        }
-        area.children(rows).into_any_element()
-    }
 }
 
-/// The shared chrome of the bottom line: same font and size as the
-/// editors above it — it reads as the vim command line, not a panel. The
-/// background is the editor's, nudged a few percent in lightness so the
-/// strip reads as its own region without a border.
-pub(crate) fn bottom_strip(text_style: &gpui::TextStyle, cx: &gpui::App) -> gpui::Div {
+/// The phone's prompt along the bottom edge: same font and size as the
+/// editors above it, on the `command strip` surface.
+fn bottom_strip(text_style: &gpui::TextStyle, cx: &gpui::App) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -800,8 +772,17 @@ impl Minibuffer {
             .map(|index| {
                 let selected = index == self.selected && self.takes_candidate();
                 // Padding lives on the row, not the strip, so the
-                // selection background spans the full width.
-                let mut row = div().flex().flex_row().gap(inset).w_full().px(inset);
+                // selection background spans the full width. The row enter
+                // would take is filled and barred in keys in motion; the
+                // rest keep the bar's room so no row shifts.
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .gap(inset)
+                    .w_full()
+                    .px(inset)
+                    .border_l_2()
+                    .border_color(gpui::transparent_black());
                 let accent = |range: &std::ops::Range<usize>, retained: usize| {
                     (
                         range.start..range.end.min(retained),
@@ -873,6 +854,13 @@ impl Minibuffer {
                                 }))
                                 .children((!beside.is_empty()).then(|| {
                                     part(2, beside, beside.len()).w(columns.beside).flex_none()
+                                }))
+                                .children(choice.key().map(|key| {
+                                    div()
+                                        .flex_none()
+                                        .ml_auto()
+                                        .text_color(colors.text_muted)
+                                        .child(key)
                                 }));
                         }
                         (Choice::Words(_), _) => {
@@ -943,7 +931,9 @@ impl Minibuffer {
                     }
                 }
                 if selected {
-                    row = row.bg(colors.element_selected);
+                    row = row
+                        .bg(colors.element_selected)
+                        .border_color(rho_window::style::keys_in_motion_color(cx));
                 }
                 // A click or a tap answers with the row, as on a menu.
                 row.id(("rho-prompt-candidate", index))
@@ -981,36 +971,70 @@ impl Minibuffer {
         };
         let position = if total == 0 { 0 } else { self.selected + 1 };
         // Input first, candidates beneath it, like emacs completing-read.
-        bottom_strip(text_style, cx)
-            .key_context("RhoMinibuffer")
+        let question = div()
+            .flex()
+            .flex_row()
+            // A long question wraps, and the answer goes under it rather
+            // than off the edge of a phone.
+            .when(!chooses_row, |line| line.flex_wrap())
+            .items_center()
+            .gap_1()
+            .px(inset)
+            .child(div().max_w_full().child(self.prompt.clone()))
             .child(
-                // A long question wraps, and the answer goes under it
-                // rather than off the edge of a phone.
                 div()
-                    .flex()
-                    .flex_row()
-                    .when(!chooses_row, |line| line.flex_wrap())
-                    .items_center()
-                    .gap_1()
-                    .px(inset)
-                    .child(div().max_w_full().child(self.prompt.clone()))
-                    .child(
-                        div()
-                            .flex_grow(1.0)
-                            .min_w(if chooses_row { px(0.) } else { px(160.) })
-                            .child(self.editor.clone()),
-                    )
-                    .children(chooses_row.then(|| {
-                        div()
-                            .flex_none()
-                            .text_color(colors.text_muted)
-                            .child(format!("{position}/{total}"))
-                    })),
+                    .flex_grow(1.0)
+                    .min_w(if chooses_row { px(0.) } else { px(160.) })
+                    .child(self.editor.clone()),
             )
-            .children(rows)
-            .children(pages)
-            .children(missing.map(|words| div().px_2().text_color(colors.text_muted).child(words)))
-            .into_any_element()
+            .children(chooses_row.then(|| {
+                div()
+                    .flex_none()
+                    .text_color(colors.text_muted)
+                    .child(format!("{position}/{total}"))
+            }));
+        let missing = missing.map(|words| div().px_2().text_color(colors.text_muted).child(words));
+        match layout {
+            crate::Layout::Phone => bottom_strip(text_style, cx)
+                .key_context("RhoMinibuffer")
+                .child(question)
+                .children(rows)
+                .children(pages)
+                .children(missing)
+                .into_any_element(),
+            // The square panel: the question over a soft divider, then the
+            // answers, on the global status surface with a crisp seam.
+            crate::Layout::Desktop => div()
+                .id("rho-prompt")
+                .key_context("RhoMinibuffer")
+                .occlude()
+                .flex()
+                .flex_col()
+                .w(width)
+                .bg(rho_window::style::global_status_surface(cx))
+                .border_1()
+                .border_color(colors.border)
+                .shadow(vec![gpui::BoxShadow {
+                    color: gpui::black().opacity(0.35),
+                    offset: gpui::point(px(0.), px(4.)),
+                    blur_radius: px(12.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+                .text_color(colors.text)
+                .font_family(text_style.font_family.clone())
+                .font_weight(text_style.font_weight)
+                .text_size(text_style.font_size)
+                .line_height(text_style.line_height)
+                .child(
+                    question
+                        .py(px(4.))
+                        .border_b_1()
+                        .border_color(colors.border_variant),
+                )
+                .child(div().py(px(2.)).children(rows).children(missing))
+                .into_any_element(),
+        }
     }
 }
 

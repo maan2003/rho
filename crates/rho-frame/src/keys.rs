@@ -27,6 +27,10 @@ pub const LIVE: &str = "RhoLive";
 /// the keys: an escaped raw place, or one still connecting.
 pub const PLACE: &str = "RhoPlace";
 
+/// The key context of the Desk, a glance that is no buffer and takes no
+/// cursor: only the window's keys and `i` work on it.
+pub const DESK: &str = "RhoDesk";
+
 /// The gestures the OS keyboard layer (`keyd`) turns into function keys
 /// nothing types, so they reach the window even while a raw place takes
 /// every key. The one table that says which key each gesture arrives as;
@@ -61,8 +65,8 @@ actions!(
         /// `space f`: every place by name, the most recent first
         /// (`window.Places`).
         Places,
-        /// `space`: the leader menu (`f` places, `u` undo, and the card's
-        /// verdicts on a waiting card).
+        /// `space`: the silent prefix ([`crate::prefix`]): `f` places, `u`
+        /// undo, and the card's verdicts on a waiting card.
         Leader,
         /// `tab`: Desk, and from Desk the place visited before it.
         Desk,
@@ -73,11 +77,6 @@ actions!(
         /// [`os::PHYSICAL_ESCAPE`] in a raw place's live input: a literal
         /// `escape` to the guest, which `escape` itself never reaches.
         GuestEscape,
-        OpenRow,
-        DeskNext,
-        DeskPrevious,
-        DeskFirst,
-        DeskDraft,
         /// `ctrl-alt-m` anywhere, `i` on Desk: write an idea
         /// (`chat.Write an idea`). The window offers it; the system that
         /// keeps ideas answers it.
@@ -190,21 +189,13 @@ fn bindings() -> Vec<KeyBinding> {
         ]);
     }
 
-    for context in normal_contexts(
-        "RhoDesk",
-        " && vim_operator == none && !showing_completions",
-    ) {
-        bindings.extend([
-            KeyBinding::new("j", DeskNext, Some(&context)),
-            KeyBinding::new("k", DeskPrevious, Some(&context)),
-            KeyBinding::new("g g", DeskFirst, Some(&context)),
-            KeyBinding::new("shift-g", DeskDraft, Some(&context)),
-            KeyBinding::new("enter", OpenRow, Some(&context)),
-        ]);
-    }
-    for context in normal_contexts("RhoDesk", " && vim_operator == none") {
-        bindings.push(KeyBinding::new("i", PromptIdea, Some(&context)));
-    }
+    // The Desk is no buffer: its few keys are bound on the view itself.
+    bindings.extend([
+        KeyBinding::new(":", Commands, Some(DESK)),
+        KeyBinding::new("space", Leader, Some(DESK)),
+        KeyBinding::new("tab", Desk, Some(DESK)),
+        KeyBinding::new("i", PromptIdea, Some(DESK)),
+    ]);
     bindings.extend([
         KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
@@ -331,6 +322,20 @@ mod tests {
                 Some(GuestEscape.name()),
                 "{place}"
             );
+        }
+    }
+
+    /// The Desk is a glance with no cursor: the window's keys and `i` work
+    /// on it, and the motion keys of a buffer do nothing.
+    #[test]
+    fn the_desk_takes_the_window_keys_and_no_motion() {
+        assert_eq!(action_at(DESK, ":"), Some(Commands.name()));
+        assert_eq!(action_at(DESK, "space"), Some(Leader.name()));
+        assert_eq!(action_at(DESK, "tab"), Some(Desk.name()));
+        assert_eq!(action_at(DESK, "i"), Some(PromptIdea.name()));
+        assert_eq!(action_at(DESK, "ctrl-j"), Some(Deal.name()));
+        for motion in ["j", "k", "enter", "shift-g", "q"] {
+            assert_eq!(action_at(DESK, motion), None, "{motion}");
         }
     }
 

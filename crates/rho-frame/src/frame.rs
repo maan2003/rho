@@ -1,6 +1,6 @@
 //! The frame entity: the window's root view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +9,7 @@ use editor::Editor;
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Pixels, Subscription, Task, Window,
-    div, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window, div, px,
 };
 use jiff::Timestamp;
 use rho_agent_hosts::hosts::Hosts;
@@ -18,30 +17,27 @@ use rho_agent_hosts::{HostEvent, HostId, HostSpec};
 use rho_dealer::facts::Seen;
 use rho_dealer::{Address, Card};
 use rho_ledger::Pairing;
+use rho_window::layout::{Notch, PROMPT_GAP_PX, PROMPT_MAX_CH, READING_INSET_PX, TOP_ROW_PX};
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
-use crate::attention::{Attention, Verdict};
+use crate::attention::Attention;
 use crate::command::{Command, Shortcut};
 use crate::deal::Signals;
 use crate::desk::DeskView;
 use crate::hosts::Reach;
-use crate::menu::{OpenMenu, Pick, Row, Rows};
-use crate::minibuffer::{
-    Answer, CancelHandler, CandidateSource, Echo, Minibuffer, SubmitHandler, bottom_strip,
-};
+use crate::minibuffer::{Answer, CancelHandler, CandidateSource, Echo, Minibuffer, SubmitHandler};
 use crate::phone::{Layout, Phone};
+use crate::prefix::{Prefix, Press, Row};
 use crate::recent::Recent;
 use crate::search::Search;
 use crate::surface::{AnySurface, CardHere, Mode, Subject, Surface as _};
 use crate::system::{AnySystem, Found, Opening, Project};
 use crate::waiting::Waiting;
-use crate::when::SnoozeUnit;
 use crate::{commands, keys, place, places};
 
 /// The kind of the frame's own surface: Desk.
 pub const FRAME_KIND: &str = "frame";
-pub(crate) const FRAME_PADDING: Pixels = px(2.);
 
 /// Where the reader is: the surface in view, what the point in it is
 /// on, which is the surface's own address when it is a page about one
@@ -105,6 +101,15 @@ const RECENT_COMMANDS: usize = 20;
 /// How long an echo stays on the line.
 const ECHO_FOR: Duration = Duration::from_secs(4);
 
+/// How many echoes `show messages` keeps.
+const ECHOES_KEPT: usize = 100;
+
+/// One echo as `show messages` lists it: what it said, and when.
+pub(crate) struct Said {
+    pub(crate) text: String,
+    pub(crate) at: Timestamp,
+}
+
 pub struct Frame {
     pub(crate) db: rho_db::RhoDb,
     pub(crate) hosts: Hosts,
@@ -118,11 +123,17 @@ pub struct Frame {
     surfaces: HashMap<Address, AnySurface>,
     pub(crate) desk: Entity<DeskView>,
     pub(crate) minibuffer: Option<Minibuffer>,
-    pub(crate) menu: Option<OpenMenu>,
-    pub(crate) menu_focus: FocusHandle,
-    /// Where the keyboard was before a menu or a prompt took it.
+    /// `space` was pressed and the next key is the prefix's.
+    prefix: Option<Prefix>,
+    /// Where the keyboard was before a prompt took it.
     overlay_return: Option<FocusHandle>,
     echo: Option<Echo>,
+    /// The echoes said lately, oldest first, for `show messages`; this
+    /// window's own, gone when it closes.
+    echoes: VecDeque<Said>,
+    /// Whether the notch is masked in black. On by default; `toggle notch
+    /// mask` turns it off for this window.
+    pub(crate) notch_mask: bool,
     /// The text style for a surface that is no buffer.
     chrome_editor: Entity<Editor>,
     mode_indicator: Entity<vim::ModeIndicator>,
@@ -143,19 +154,6 @@ pub struct Frame {
     pub(crate) pairing_due: bool,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
-}
-
-/// Done and mute on a waiting card, in the leader's words.
-fn verdict_rows(target: Address) -> [Row; 2] {
-    let done = target.clone();
-    [
-        Row::run("d", "done", move |frame, window, cx| {
-            frame.verdict(&done, Verdict::Done, "done".to_owned(), window, cx);
-        }),
-        Row::run("m", "mute", move |frame, window, cx| {
-            frame.verdict(&target, Verdict::Mute, "mute".to_owned(), window, cx);
-        }),
-    ]
 }
 
 impl Frame {
@@ -180,31 +178,23 @@ impl Frame {
             editor
         });
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
-        let desk_editor = desk.read(cx).editor(cx).expect("Desk is an editor");
-        let desk_selection = cx.subscribe(&desk_editor, |frame, _, event, cx| {
-            if frame.desk_in_view() {
-                if matches!(event, editor::EditorEvent::SelectionsChanged { .. }) {
-                    cx.notify();
-                }
-            }
-        });
         let desk_address = Self::desk_address();
         let mut surfaces = HashMap::new();
         surfaces.insert(desk_address.clone(), AnySurface::new(desk.clone()));
-        // A menu owns its keys before gpui resolves bindings: vim binds `g`
-        // as a prefix, and an ordinary key handler would not see a menu's
-        // one-stroke `g` until another key arrived.
+        // The key after `space` is the prefix's before gpui resolves
+        // bindings: vim binds `g` as a prefix of its own, and an ordinary
+        // key handler would not see it until another key arrived.
         let window_id = window.window_handle().window_id();
-        let menu_keys = cx.listener(move |this, event: &gpui::KeystrokeEvent, window, cx| {
+        let prefix_keys = cx.listener(move |this, event: &gpui::KeystrokeEvent, window, cx| {
             if window.window_handle().window_id() != window_id {
                 return;
             }
             this.note_input();
-            if this.menu.is_some() && this.menu_focus.is_focused(window) {
-                this.menu_keystroke(&event.keystroke, window, cx);
+            if this.prefix.is_some() {
+                this.prefix_keystroke(&event.keystroke, window, cx);
             }
         });
-        let menu_keys = cx.intercept_keystrokes(menu_keys);
+        let prefix_keys = cx.intercept_keystrokes(prefix_keys);
         let saved_place = place::Saved::load(&db);
         let last_input = place::last_input(&db);
         let activation = cx.observe_window_activation(window, |this, window, cx| {
@@ -232,10 +222,11 @@ impl Frame {
             surfaces,
             desk,
             minibuffer: None,
-            menu: None,
-            menu_focus: cx.focus_handle(),
+            prefix: None,
             overlay_return: None,
             echo: None,
+            echoes: VecDeque::new(),
+            notch_mask: true,
             chrome_editor,
             mode_indicator,
             signals: Signals::default(),
@@ -247,7 +238,7 @@ impl Frame {
             last_input,
             focus_lost: None,
             pairing_due: false,
-            _subscriptions: vec![menu_keys, activation, desk_selection],
+            _subscriptions: vec![prefix_keys, activation],
             _tasks: Vec::new(),
         };
         let ledger = cx.spawn_in(window, async move |this, cx| {
@@ -306,9 +297,6 @@ impl Frame {
             Timestamp::now(),
         );
         self.settle(window, cx);
-        if self.desk_in_view() {
-            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
-        }
     }
 
     /// What the system that owns `address`'s kind has for it.
@@ -452,7 +440,6 @@ impl Frame {
         let subject = current.subject(self.card_seen(&surface, cx), cx);
         let card = match current.card(cx) {
             CardHere::Itself | CardHere::Reminder => Some(surface.clone()),
-            CardHere::Row(row) => row,
             CardHere::Inspected => match self.recent.current() {
                 ScreenEntry::Inspection(inspection) if self.waits(&inspection.address) => {
                     Some(inspection.address.clone())
@@ -683,7 +670,6 @@ impl Frame {
         }
         if self.desk_in_view() {
             self.refresh_desk(&self.hand().clone(), false, cx);
-            self.desk.update(cx, |desk, cx| desk.focus_first_row(cx));
         }
         self.moved();
         self.close_overlays(window, cx);
@@ -866,9 +852,9 @@ impl Frame {
         self.surfaces.get(address)
     }
 
-    /// Whether a prompt or a menu has the keys.
+    /// Whether a prompt has the keys.
     pub fn is_asking(&self) -> bool {
-        self.minibuffer.is_some() || self.menu.is_some()
+        self.minibuffer.is_some()
     }
 
     // ---- echo ----
@@ -884,11 +870,75 @@ impl Frame {
                 cx.notify();
             });
         });
-        self.echo = Some(Echo::new(text, class, dismiss));
+        let echo = Echo::new(text, class, dismiss);
+        if self.echoes.len() == ECHOES_KEPT {
+            self.echoes.pop_front();
+        }
+        self.echoes.push_back(Said {
+            text: echo.text().to_owned(),
+            at: Timestamp::now(),
+        });
+        self.echo = Some(echo);
         cx.notify();
     }
 
-    // ---- overlays: menus and the minibuffer ----
+    /// The echoes said lately, oldest first.
+    pub(crate) fn echoes(&self) -> &VecDeque<Said> {
+        &self.echoes
+    }
+
+    /// Drops the echo when it still matches `predicate`, such as a stale
+    /// away notice for a host that just came back online.
+    pub(crate) fn clear_echo_if(&mut self, predicate: impl FnOnce(&str) -> bool) {
+        if self
+            .echo
+            .as_ref()
+            .is_some_and(|echo| predicate(echo.text()))
+        {
+            self.echo = None;
+        }
+    }
+
+    /// `show messages`: the echoes said lately, newest first, each with
+    /// its time; typing narrows them.
+    pub(crate) fn show_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.echoes.is_empty() {
+            return self.echo(
+                "show messages: nothing said yet",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+        let complete: CandidateSource = Rc::new(|frame: &Frame, typed: &str, _: &App| {
+            let typed = typed.trim().to_lowercase();
+            let zone = jiff::tz::TimeZone::system();
+            frame
+                .echoes
+                .iter()
+                .rev()
+                .filter(|said| said.text.to_lowercase().contains(&typed))
+                .map(|said| crate::minibuffer::Candidate {
+                    value: said.text.clone(),
+                    description: said
+                        .at
+                        .to_zoned(zone.clone())
+                        .strftime("%H:%M:%S")
+                        .to_string(),
+                })
+                .collect()
+        });
+        self.open_prompt("messages:", complete, Rc::new(|_, _, _, _| {}), window, cx);
+    }
+
+    /// `toggle notch mask`: the black over the notch, or the screen under
+    /// it.
+    pub(crate) fn toggle_notch_mask(&mut self, cx: &mut Context<Self>) {
+        self.notch_mask = !self.notch_mask;
+        let state = if self.notch_mask { "on" } else { "off" };
+        self.echo(&format!("notch mask {state}"), StyleClass::SystemInfo, cx);
+    }
+
+    // ---- overlays: the `space` prefix and the minibuffer ----
 
     fn take_keyboard(&mut self, window: &mut Window, cx: &App) {
         if self.overlay_return.is_none() {
@@ -905,169 +955,51 @@ impl Frame {
     }
 
     fn close_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
+        self.prefix = None;
         self.close_minibuffer(window, cx);
         self.overlay_return = None;
     }
 
-    /// Draws `rows` under the point and gives them the keyboard.
-    pub fn open_menu(&mut self, rows: Rows, window: &mut Window, cx: &mut Context<Self>) {
-        if rows.is_empty() {
-            self.echo(
-                &format!("{}: nothing here", rows.title),
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        self.close_minibuffer(window, cx);
-        self.take_keyboard(window, cx);
-        self.menu = Some(OpenMenu {
-            transient: rows.transient(),
-            rows,
-            carried_count: None,
-            under: Vec::new(),
-        });
-        self.menu.as_mut().unwrap().resolve_times();
-        window.focus(&self.menu_focus, cx);
-        cx.notify();
+    /// `space`: arms the silent prefix over the screen in view. Nothing is
+    /// drawn; the next key runs what it is bound to, and `escape` or a key
+    /// bound to nothing disarms it ([`crate::prefix`]).
+    pub(crate) fn leader(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.prefix = Some(crate::own::prefix(self, cx));
     }
 
-    pub fn menu_open(&self) -> bool {
-        self.menu.is_some()
-    }
-
-    /// The open menu's rows, as key and word.
+    /// The keys the armed `space` prefix binds, each with what it is
+    /// called; nothing while it is not armed.
     pub fn menu_rows(&self) -> Vec<(String, String)> {
-        self.menu.as_ref().map_or_else(Vec::new, |menu| {
-            menu.rows
-                .rows
-                .iter()
-                .map(|row| (row.key.clone(), row.pick.label().to_owned()))
-                .collect()
-        })
+        self.prefix.as_ref().map_or_else(Vec::new, Prefix::keys)
     }
 
-    pub fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
-            self.give_keyboard_back(window, cx);
-        }
-    }
-
-    /// One step back: to the menu this one is standing on, or out.
-    pub(crate) fn menu_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open) = self.menu.as_mut() else {
-            return;
-        };
-        match open.under.pop() {
-            Some(parent) => {
-                open.transient = parent.transient();
-                open.rows = parent;
-                open.carried_count = None;
-                open.resolve_times();
-                cx.notify();
-            }
-            None => self.close_menu(window, cx),
-        }
-    }
-
-    fn menu_keystroke(
+    fn prefix_keystroke(
         &mut self,
         keystroke: &gpui::Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Bare modifiers arrive as key events too; holding shift for an
-        // uppercase key must not dismiss the menu.
-        if matches!(
-            keystroke.key.as_str(),
-            "shift" | "control" | "alt" | "platform" | "function"
-        ) {
-            return;
-        }
-        let Some(open) = self.menu.as_mut() else {
+        let Some(prefix) = &self.prefix else {
             return;
         };
-        let carried = open.carried_count;
-        match open.transient.press(keystroke) {
-            rho_window::transient::Press::Count(_) => {
-                open.resolve_times();
-                cx.notify();
-            }
-            rho_window::transient::Press::Dismiss => self.menu_dismiss(window, cx),
-            rho_window::transient::Press::Unbound => {}
-            rho_window::transient::Press::Run {
-                item,
-                count,
-                closes,
-            } => {
-                let count = count.or(carried);
-                self.run_menu_row(item, count, closes, window, cx);
-            }
+        let press = prefix.press(keystroke);
+        if matches!(press, Press::Pending) {
+            return;
         }
+        self.prefix = None;
         cx.stop_propagation();
-    }
-
-    /// Row `index` of the open menu, done. A submenu replaces the menu over
-    /// the same point; everything else gives the keyboard back first, so
-    /// the command sees normal focus.
-    fn run_menu_row(
-        &mut self,
-        index: usize,
-        count: Option<u32>,
-        closes: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(open) = self.menu.as_mut() else {
-            return;
-        };
-        let Some(row) = open.rows.rows.get(index).cloned() else {
-            return;
-        };
-        rho_journal::record(rho_journal::Event::MenuRan {
-            action: format!("{} › {}", open.rows.title, row.pick.label()),
-            count,
-        });
-        match row.pick {
-            Pick::Menu(rows) => {
-                let parent = std::mem::replace(&mut open.rows, rows);
-                open.under.push(parent);
-                open.transient = open.rows.transient();
-                open.carried_count = count;
-                open.resolve_times();
-                cx.notify();
-            }
-            Pick::Run { run, .. } => {
-                if closes {
-                    self.close_menu(window, cx);
-                }
-                run(self, count, window, cx);
-                cx.notify();
-            }
-            Pick::Infix { run, .. } => {
-                run(self, count, window, cx);
+        match press {
+            Press::Pending | Press::Cancelled => {}
+            Press::Refused(reason) => self.echo(&reason, StyleClass::SystemInfo, cx),
+            Press::Run(run) => {
+                rho_journal::record(rho_journal::Event::MenuRan {
+                    action: format!("space {}", keystroke.key),
+                    count: None,
+                });
+                run(self, window, cx);
                 cx.notify();
             }
         }
-    }
-
-    /// Row `index` of the open menu, picked by pointer: a suffix closes
-    /// the menu, as its key would, and a count typed before carries.
-    pub(crate) fn click_menu_row(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let closes = self.menu.as_ref().is_some_and(|open| {
-            open.transient.items()[index].kind() == rho_window::transient::Kind::Suffix
-        });
-        let count = self
-            .menu
-            .as_ref()
-            .and_then(|open| open.transient.count().or(open.carried_count));
-        self.run_menu_row(index, count, closes, window, cx);
     }
 
     /// `space f`: `Places`, every place by name and the words remembered
@@ -1112,18 +1044,30 @@ impl Frame {
         found.retain(|place| in_scope(self, &place.address));
         let mut known: std::collections::HashSet<_> =
             found.iter().map(|place| place.address.clone()).collect();
+        // Desk is `tab`'s, and found by name like any place.
+        if scope.is_none() {
+            found.push(Found {
+                address: desk.clone(),
+                title: self.desk.read(cx).title(cx),
+                description: String::new(),
+                thread: None,
+                recency: 0,
+                also: Vec::new(),
+            });
+        }
         // A visited place stays reachable by name, whether or not its
-        // system lists it: a transcript, a terminal or a sent idea.
+        // system lists it: a transcript, a terminal or a sent idea. Its
+        // system's name for it comes first: a screen's own title can carry
+        // what only the screen needs, such as a transcript's folder.
         for address in self.recent.keys() {
             if !in_scope(self, address) || !known.insert(address.clone()) {
                 continue;
             }
-            if let Some((title, description)) = self
-                .surfaces
-                .get(address)
-                .map(|surface| (surface.title(cx), String::new()))
-                .or_else(|| self.name_of(address, cx))
-            {
+            if let Some((title, description)) = self.name_of(address, cx).or_else(|| {
+                self.surfaces
+                    .get(address)
+                    .map(|surface| (surface.title(cx), String::new()))
+            }) {
                 found.push(Found {
                     address: address.clone(),
                     title,
@@ -1175,6 +1119,7 @@ impl Frame {
                     .map(|host| format!("{} away", host.name));
                 let states = self.place_states(&found, card.as_ref(), away.is_some(), now);
                 places::Place {
+                    key: (found.address == desk).then_some("tab"),
                     visit: visits.get(&found.address).copied(),
                     visited_ms: self.recent.visited_ms(&found.address),
                     current: self.current_address() == &found.address,
@@ -1386,6 +1331,23 @@ impl Frame {
         self.open_minibuffer(":", Answer::commands(listing), None, window, cx);
     }
 
+    /// `Commands` with `line` already typed, as `space s` opens it at
+    /// `snooze thread `.
+    pub(crate) fn commands_prompt_at(
+        &mut self,
+        line: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commands_prompt(window, cx);
+        if let Some(mut prompt) = self.minibuffer.take() {
+            prompt.set_input(line.to_owned(), window, cx);
+            prompt.refresh(self, cx);
+            self.minibuffer = Some(prompt);
+            cx.notify();
+        }
+    }
+
     /// The window's commands, the screen's, and each system's. A command
     /// is listed once whatever the screen: one about something the screen
     /// does not name asks for it (`window.commands are global`).
@@ -1476,76 +1438,15 @@ impl Frame {
         command.run(argument, self, window, cx);
     }
 
-    /// `space`: the leader. On every screen `f` opens `Places` and, while
-    /// there is a verdict to take back, `u` undoes it; on a waiting card,
-    /// its verdicts too, and on a muted one `m` unmutes it. A reminder
-    /// takes `s` whether or not it waits, and only done besides.
-    pub(crate) fn leader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.leader_rows(cx);
-        self.open_menu(rows, window, cx);
-    }
-
-    fn leader_rows(&self, cx: &mut App) -> Rows {
-        let card = self.card_in_view(cx);
-        let waiting = card.clone().filter(|address| self.waits(address));
-        let title = match &waiting {
-            Some(target) if self.current_surface().inspects_card(cx) => {
-                self.card_for(target, cx).title
-            }
-            Some(target) => self.card_for(target, cx).heading(),
-            None => self.current_surface().title(cx),
-        };
-        let mut rows = Rows::new(title).counted();
-        rows.push(Row::run("f", "places", |frame, window, cx| {
-            frame.places(window, cx)
-        }));
-        match (card, waiting, self.reminder_in_view(cx)) {
-            (Some(target), _, _) if self.marks().get(&target).facts().muted() => {
-                rows.push(Row::run("m", "unmute", move |frame, window, cx| {
-                    frame.verdict(&target, Verdict::Unmute, "unmuted".to_owned(), window, cx);
-                }));
-            }
-            // A reminder is never muted: it is the user's own.
-            (_, Some(target), Some(_)) => {
-                let [done, _mute] = verdict_rows(target.clone());
-                rows.push(done);
-                rows.push(Row::menu("s", snooze_rows(&target)));
-            }
-            (_, None, Some(target)) => rows.push(Row::menu("s", snooze_rows(&target))),
-            (_, Some(target), None) => {
-                match self.own_verdicts(&target, cx) {
-                    // A card its system answers is never muted: it ends
-                    // when it is answered, and until then it can only wait.
-                    Some(own) => rows.extend(own),
-                    None => rows.extend(verdict_rows(target.clone())),
-                }
-                rows.push(Row::menu("s", snooze_rows(&target)));
-            }
-            _ => {}
-        }
-        if self.attention.can_undo() {
-            rows.push(Row::counted("u", "undo", |frame, _, window, cx| {
-                frame.undo_verdict(window, cx)
-            }));
-        }
-        rows
-    }
-
     /// The card in view while it waits: what a verdict lands on.
     pub(crate) fn waiting_card(&self, cx: &App) -> Option<Address> {
         self.card_in_view(cx).filter(|address| self.waits(address))
     }
 
     /// The reminder the screen in view is, due or not.
-    fn reminder_in_view(&self, cx: &App) -> Option<Address> {
+    pub(crate) fn reminder_in_view(&self, cx: &App) -> Option<Address> {
         (self.current_surface().card(cx) == CardHere::Reminder)
             .then(|| self.current_address().clone())
-    }
-
-    /// What a snooze lands on: the card in view while it waits, or the
-    /// reminder in view, which the user schedules before it ever waits.
-    pub(crate) fn snooze_target(&self, cx: &App) -> Option<Address> {
-        self.waiting_card(cx).or_else(|| self.reminder_in_view(cx))
     }
 
     /// The answers the system that owns `address` gives its cards in place
@@ -1599,7 +1500,7 @@ impl Frame {
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
         });
-        self.menu = None;
+        self.prefix = None;
         self.take_keyboard(window, cx);
         let text_style = self
             .active_editor(cx)
@@ -1707,45 +1608,51 @@ impl Frame {
         }
     }
 
-    /// Enter on Desk: the row under the cursor.
-    pub(crate) fn open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(address) = self.desk.read(cx).cursor_card(cx)
-            && let Some(card) = self
-                .hand()
-                .cards
-                .iter()
-                .find(|card| card.address == address)
-                .cloned()
+    /// A click on a Desk row: its card. On a phone, a press that lands
+    /// while a prompt or a snap is open is not a tap on the Desk.
+    pub(crate) fn open_row(
+        &mut self,
+        address: &Address,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.minibuffer.is_some() || self.phone.snapping() {
+            return;
+        }
+        if let Some(card) = self
+            .hand()
+            .cards
+            .iter()
+            .find(|card| &card.address == address)
+            .cloned()
         {
-            self.journal_deal(Some(&address), cx);
+            self.journal_deal(Some(address), cx);
             self.open_card(card, window, cx);
         }
     }
 
     // ---- render ----
 
-    fn render_status_line(
+    /// The phone's one status line: the heading and its words, then the
+    /// lamp, the hosts and the mode. A phone has no notch to split it.
+    fn render_phone_status_line(
         &mut self,
         text_style: &gpui::TextStyle,
-        layout: Layout,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
         let mode = self.mode(window, cx);
-        let mode_color = colors.terminal_ansi_bright_cyan;
         let mode = mode_word(&mode);
+        let mode_color = mode_color(&mode, cx);
         // Signal evaluation is deferred. Desk must not paint the lamp
         // from the previous screen while that update is still pending.
         let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
         let (screen_host, notices) = self.host_notices(cx);
         let focus = self.focus_note(Timestamp::now(), cx);
         let surface = self.current_surface();
-        let phone_titles = match layout {
-            Layout::Phone => Some(surface.phone_titles(cx)),
-            Layout::Desktop => None,
-        };
+        let phone_titles = surface.phone_titles(cx);
         let surface_status = match &screen_host {
             Some(name) => format!("{name} away"),
             None => surface.status(cx).unwrap_or_default(),
@@ -1753,34 +1660,29 @@ impl Frame {
         let measured = crate::phone::measure(text_style, window);
         // The pairing hint is secondary to a surface that has already
         // shed everything but the name of the work and its condition.
-        let show_phone_notice = phone_titles.as_ref().is_none_or(|titles| {
-            titles.len() < 2
-                || titles.last().is_none_or(|title| {
-                    let reserve = lamp
-                        .into_iter()
-                        .chain(focus.as_deref())
-                        .chain(notices.iter().map(|notice| notice.words.as_str()))
-                        .chain(["unpaired", mode.as_str()])
-                        .map(|words| measured(words) + px(12.))
-                        .fold(px(0.), |sum, width| sum + width);
-                    crate::phone::fit_heading(
-                        title,
-                        &surface_status,
-                        window.viewport_size().width - reserve,
-                        &measured,
-                    )
-                    .0 == *title
-                })
-        });
+        let show_phone_notice = phone_titles.len() < 2
+            || phone_titles.last().is_none_or(|title| {
+                let reserve = lamp
+                    .into_iter()
+                    .chain(focus.as_deref())
+                    .chain(notices.iter().map(|notice| notice.words.as_str()))
+                    .chain(["unpaired", mode.as_str()])
+                    .map(|words| measured(words) + px(12.))
+                    .fold(px(0.), |sum, width| sum + width);
+                crate::phone::fit_heading(
+                    title,
+                    &surface_status,
+                    window.viewport_size().width - reserve,
+                    &measured,
+                )
+                .0 == *title
+            });
         let unpaired = (self.echo.is_none() && self.attention.pairing() != Pairing::Paired)
-            .then_some(match layout {
-                Layout::Desktop => Some("verdicts stay on this device until it is paired"),
-                Layout::Phone => show_phone_notice.then_some("unpaired"),
-            })
+            .then_some(show_phone_notice.then_some("unpaired"))
             .flatten();
-        // A heading is cut to what the line has room for: on the desk a
-        // fixed length does, but a phone is too narrow to guess at, and a
-        // cut by length there would push the card's state off the edge.
+        // A heading is cut to what the line has room for: a phone is too
+        // narrow to guess at, and a cut by length there would push the
+        // card's state off the edge.
         let right_words = lamp
             .into_iter()
             .chain(focus.as_deref())
@@ -1788,21 +1690,18 @@ impl Frame {
             .chain(unpaired)
             .chain([mode.as_str()])
             .collect::<Vec<_>>();
-        let fit = |path: &str, state: &str| match layout {
-            Layout::Desktop => (truncate_path(path), state.to_owned()),
-            Layout::Phone => {
-                let measure = crate::phone::measure(text_style, window);
-                let right = right_words
-                    .iter()
-                    .map(|words| measure(words) + px(12.))
-                    .fold(px(0.), |sum, width| sum + width);
-                let fit = if self.echo.is_some() {
-                    crate::phone::fit_echo_heading
-                } else {
-                    crate::phone::fit_heading
-                };
-                fit(path, state, window.viewport_size().width - right, measure)
-            }
+        let fit = |path: &str, state: &str| {
+            let measure = crate::phone::measure(text_style, window);
+            let right = right_words
+                .iter()
+                .map(|words| measure(words) + px(12.))
+                .fold(px(0.), |sum, width| sum + width);
+            let fit = if self.echo.is_some() {
+                crate::phone::fit_echo_heading
+            } else {
+                crate::phone::fit_heading
+            };
+            fit(path, state, window.viewport_size().width - right, measure)
         };
         // Echo replaces the state, not the heading, so a verdict does
         // not hide which screen it left us on.
@@ -1827,16 +1726,12 @@ impl Frame {
                 None => (heading, surface_status, colors.text_muted),
             }
         } else {
-            let title = if let Some(titles) = phone_titles {
-                titles
-                    .iter()
-                    .find(|title| fit(title, &surface_status).0 == **title)
-                    .or_else(|| titles.last())
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                surface.title(cx)
-            };
+            let title = phone_titles
+                .iter()
+                .find(|title| fit(title, &surface_status).0 == **title)
+                .or_else(|| phone_titles.last())
+                .cloned()
+                .unwrap_or_default();
             (title, surface_status, colors.text_muted)
         };
         let (state, state_color) = self.echo.as_ref().map_or((state, state_color), |echo| {
@@ -1881,7 +1776,7 @@ impl Frame {
                     .text_color(colors.text_muted)
                     .child(text)
             }))
-            .child(div().flex_none().text_color(mode_color).child(mode));
+            .child(mode_element(mode, mode_color));
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -1911,6 +1806,218 @@ impl Frame {
             )
             .child(right)
             .into_any_element()
+    }
+
+    /// What the top-left corner says of the screen in view, for a screen
+    /// that does not draw its own (`window.Status line`): its name in
+    /// `unread text`, where it is in `quiet`, and the page's own markers.
+    /// A thread never repeats its card's age or its agent's model here;
+    /// the newest message below already shows the age.
+    fn left_ear(&self, cx: &App) -> LeftEar {
+        let surface = self.current_surface();
+        let colors = cx.theme().colors();
+        let attention = rho_window::style::attention_color(cx);
+        let own_card = self.own_card(cx);
+        let heading = match &own_card {
+            Some(address) => surface
+                .heading(cx)
+                .unwrap_or_else(|| self.card_for(address, cx).heading()),
+            None => surface.title(cx),
+        };
+        let (context, title) = match heading.rsplit_once(" › ") {
+            Some((context, title)) => (Some(context.to_owned()), title.to_owned()),
+            None => (None, heading),
+        };
+        let mut markers = Vec::new();
+        if let Some(address) = &own_card {
+            if self.marks().get(address).facts().muted() {
+                markers.push(("muted".to_owned(), colors.text_muted.into()));
+            }
+            let kind = self
+                .hand()
+                .cards
+                .iter()
+                .find(|card| &card.address == address)
+                .map(|card| card.kind);
+            match kind {
+                Some(rho_dealer::rank::CardKind::Approve(what)) => {
+                    markers.push((format!("approve {what}"), attention))
+                }
+                Some(rho_dealer::rank::CardKind::Stop(word)) => {
+                    markers.push((word.to_owned(), attention))
+                }
+                _ => {}
+            }
+        }
+        if let Some(status) = surface.status(cx).filter(|status| !status.is_empty())
+            && markers.iter().all(|(marker, _)| *marker != status)
+        {
+            markers.push((status, colors.text_muted.into()));
+        }
+        LeftEar {
+            title,
+            context,
+            markers,
+        }
+    }
+
+    /// The default top-left corner, drawn in the screen's own layer so a
+    /// prompt dims it with the screen.
+    fn render_left_ear(&self, notch: Notch, cx: &App) -> AnyElement {
+        let colors = cx.theme().colors();
+        let LeftEar {
+            title,
+            context,
+            markers,
+        } = self.left_ear(cx);
+        div()
+            .id("rho-left-ear")
+            .flex_none()
+            .h(px(TOP_ROW_PX))
+            .w(notch.start)
+            .pl(px(READING_INSET_PX))
+            .pr(px(EAR_GAP_PX))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(EAR_GAP_PX))
+            .overflow_hidden()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rho_window::style::unread_text_color(cx))
+                    .child(title),
+            )
+            .children(context.map(|context| {
+                div()
+                    .flex_none()
+                    .max_w(notch.start * 0.3)
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .child(context)
+            }))
+            .children(markers.into_iter().map(|(marker, color)| {
+                div().flex_none().truncate().text_color(color).child(marker)
+            }))
+            .into_any_element()
+    }
+
+    /// The square black mask over the camera notch, unless `toggle notch
+    /// mask` turned it off, and, right of it, the framed global status bar
+    /// (`window.Status line`): the echo, the dealer focus, hosts that do
+    /// not answer, the unpaired notice, the waiting lamp, and the mode.
+    /// While an echo shows, it has the room of every quiet note; a host
+    /// that needs the user stays. Drawn over the screen and over a
+    /// prompt's dimming, so what rho says stays bright while a prompt is
+    /// open.
+    fn render_top_row(
+        &mut self,
+        text_style: &gpui::TextStyle,
+        notch: Notch,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl Iterator<Item = AnyElement> + use<> {
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let mode = mode_word(&self.mode(window, cx));
+        let mode_color = mode_color(&mode, cx);
+        // Signal evaluation is deferred. Desk must not paint the lamp
+        // from the previous screen while that update is still pending.
+        let lamp = (self.signals.lamp_on && !self.desk_in_view()).then_some("●");
+        let StatusNotes {
+            focus,
+            notices,
+            unpaired,
+        } = self.status_notes(cx);
+        let echo = self.echo.as_ref().map(|echo| {
+            let color = match echo.class() {
+                StyleClass::StatusError | StyleClass::Disconnect => {
+                    rho_window::style::failed_color(cx)
+                }
+                StyleClass::StatusOk => status.success.into(),
+                _ => status.info.into(),
+            };
+            div()
+                .id("rho-echo")
+                .min_w_0()
+                .truncate()
+                .text_color(color)
+                .child(echo.text().to_owned())
+        });
+        let mask = self.notch_mask.then(|| {
+            div()
+                .id("rho-notch-mask")
+                .absolute()
+                .top_0()
+                .left(notch.start)
+                .w(notch.end - notch.start)
+                .h(px(TOP_ROW_PX))
+                .bg(rho_window::style::notch_mask_color())
+                .into_any_element()
+        });
+        let bar = div()
+            .id("rho-status-bar")
+            .absolute()
+            .top_0()
+            .left(notch.end)
+            .right_0()
+            .h(px(TOP_ROW_PX))
+            .px(px(EAR_GAP_PX))
+            .border_l_1()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(rho_window::style::global_status_surface(cx))
+            .occlude()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(EAR_GAP_PX))
+            .overflow_hidden()
+            .font_family(text_style.font_family.clone())
+            .text_size(text_style.font_size)
+            .text_color(colors.text_muted)
+            .child(div().flex_1().min_w_0().flex().children(echo))
+            .children(focus.map(|focus| div().flex_none().child(focus)))
+            // A host that needs the user, or one the screen in view needs,
+            // is red; the rest are an everyday state and quiet.
+            .children(notices.into_iter().map(|notice| {
+                div()
+                    .flex_none()
+                    .text_color(match notice.alarm {
+                        true => status.error,
+                        false => colors.text_muted,
+                    })
+                    .child(notice.words)
+            }))
+            .children(unpaired.map(|text| div().min_w_0().truncate().child(text)))
+            .children(lamp.map(|lamp| {
+                div()
+                    .flex_none()
+                    .text_color(rho_window::style::attention_color(cx))
+                    .child(lamp)
+            }))
+            .child(mode_element(mode, mode_color))
+            .into_any_element();
+        mask.into_iter().chain([bar])
+    }
+
+    /// The status bar's notes beside the echo. An echo takes the room of
+    /// every quiet one for its few seconds; a host that needs the user
+    /// stays.
+    pub(crate) fn status_notes(&self, cx: &App) -> StatusNotes {
+        let quiet = self.echo.is_none();
+        let (_, notices) = self.host_notices(cx);
+        StatusNotes {
+            focus: self.focus_note(Timestamp::now(), cx).filter(|_| quiet),
+            notices: notices
+                .into_iter()
+                .filter(|notice| quiet || notice.alarm)
+                .collect(),
+            unpaired: (quiet && self.attention.pairing() != Pairing::Paired)
+                .then_some("verdicts stay on this device until it is paired"),
+        }
     }
 
     /// The host the screen in view lives on when it is away, and the
@@ -1945,8 +2052,8 @@ impl Frame {
     /// such as a raw place taking live input; else the minibuffer's or the
     /// surface editor's, as vim reads it.
     pub(crate) fn mode(&self, window: &Window, cx: &App) -> String {
-        // A menu or a prompt over the surface is the editor's to say.
-        if self.menu.is_none() && self.minibuffer.is_none() {
+        // A prompt over the surface is the editor's to say.
+        if self.minibuffer.is_none() {
             match self.current_surface().mode(window, cx) {
                 Some(Mode::Normal) => return "normal".to_owned(),
                 Some(Mode::Insert) => return "insert".to_owned(),
@@ -1972,22 +2079,45 @@ impl Frame {
     }
 }
 
-/// How long `target` sleeps: a unit, and the count typed before it.
-pub(crate) fn snooze_rows(target: &Address) -> Rows {
-    let mut snooze = Rows::new("snooze").counted();
-    for (key, label, unit) in [
-        ("h", "hour", SnoozeUnit::Hours),
-        ("d", "tomorrow", SnoozeUnit::Days),
-        ("w", "next week", SnoozeUnit::Weeks),
-    ] {
-        let target = target.clone();
-        let mut row = Row::counted(key, label, move |frame, count, window, cx| {
-            frame.snooze(&target, unit, count, window, cx)
-        });
-        row.snooze = Some(unit);
-        snooze.push(row);
+/// What the status bar says besides the echo, the lamp and the mode.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StatusNotes {
+    /// The dealer focus: `focus tide`, `quiet 32m`.
+    pub(crate) focus: Option<String>,
+    /// Hosts that do not answer.
+    pub(crate) notices: Vec<crate::hosts::Notice>,
+    pub(crate) unpaired: Option<&'static str>,
+}
+
+/// What the top-left corner says of a screen that does not draw its own.
+struct LeftEar {
+    title: String,
+    context: Option<String>,
+    /// Page markers, each in its color: `approve push`, `working`, `muted`.
+    markers: Vec<(String, gpui::Hsla)>,
+}
+
+/// `same band gap`: the air between items in each ear.
+const EAR_GAP_PX: f32 = 12.;
+
+/// `NOR` is quiet; every other mode is keys in motion.
+fn mode_color(mode: &str, cx: &App) -> gpui::Hsla {
+    match mode {
+        "NOR" => cx.theme().colors().text_muted.into(),
+        _ => rho_window::style::keys_in_motion_color(cx),
     }
-    snooze
+}
+
+/// The mode word in its color: bold while keys are in motion, and never a
+/// fill behind it.
+fn mode_element(mode: String, color: gpui::Hsla) -> gpui::Div {
+    div()
+        .flex_none()
+        .text_color(color)
+        .when(mode != "NOR", |word| {
+            word.font_weight(gpui::FontWeight::BOLD)
+        })
+        .child(mode)
 }
 
 /// The status line's mode word: three letters, the way helix does it, so
@@ -2004,18 +2134,6 @@ fn mode_word(mode: &str) -> String {
         other => return other.to_uppercase(),
     }
     .to_owned()
-}
-
-fn truncate_path(path: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    if path.chars().count() <= MAX_CHARS {
-        return path.to_owned();
-    }
-    let parts = path.split(" › ").collect::<Vec<_>>();
-    if parts.len() < 3 {
-        return path.chars().take(MAX_CHARS - 1).collect::<String>() + "…";
-    }
-    format!("{} › … › {}", parts[0], parts[parts.len() - 1])
 }
 
 fn journal_surface(address: &Address) -> rho_journal::SurfaceIdentity {
@@ -2037,20 +2155,20 @@ impl Render for Frame {
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let surface = self.current_surface().clone();
         let layout = Layout::of(window.viewport_size().width);
-        let inset = FRAME_PADDING;
         let frame = div()
             .id("rho-frame")
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .p(inset)
             .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .key_context(crate::KEY_CONTEXT)
-            .capture_any_mouse_down(
-                cx.listener(|this, _: &gpui::MouseDownEvent, _, _| this.note_input()),
-            )
+            .capture_any_mouse_down(cx.listener(|this, _: &gpui::MouseDownEvent, _, _| {
+                this.note_input();
+                // A press anywhere disarms `space`, as any other key does.
+                this.prefix = None;
+            }))
             .on_action(cx.listener(|this, _: &keys::Deal, window, cx| this.pull_card(window, cx)))
             .on_action(
                 cx.listener(|this, _: &keys::Close, window, cx| this.close_current(window, cx)),
@@ -2077,7 +2195,6 @@ impl Render for Frame {
                     });
                 }
             }))
-            .on_action(cx.listener(|this, _: &keys::OpenRow, window, cx| this.open_row(window, cx)))
             .on_action(cx.listener(|this, _: &keys::SearchForward, window, cx| {
                 this.search(false, window, cx)
             }))
@@ -2118,64 +2235,78 @@ impl Render for Frame {
             )
             .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
                 this.minibuffer_clear(window, cx);
-            }))
-            .child(self.render_status_line(&text_style, layout, window, cx));
-        let minibuffer = self.minibuffer.as_ref().map(|minibuffer| {
-            minibuffer.render(
-                &text_style,
-                layout,
-                window.viewport_size().width - inset * 2.,
-                window,
-                cx,
-            )
-        });
+            }));
+        let width = window.viewport_size().width;
         if layout == Layout::Phone {
+            let status = self.render_phone_status_line(&text_style, window, cx);
+            let minibuffer = self
+                .minibuffer
+                .as_ref()
+                .map(|minibuffer| minibuffer.render(&text_style, layout, width, window, cx));
             let body = self.render_phone_surface(&surface, cx);
             let bar = self.render_phone_bar(window, cx);
-            let sheet = self.render_menu_sheet(&text_style, cx);
             return frame
+                .child(status)
                 .child(body)
                 .children(minibuffer)
-                .child(bar)
-                .children(sheet);
+                .child(bar);
         }
-        let keep_bottom = surface
-            .editor(cx)
-            .is_some_and(|editor| editor.read(cx).keeps_bottom_visible());
+        // The screen fills the window from its top edge; only the notch
+        // mask and the status bar right of it lie over it. A screen that
+        // does not draw its own top-left corner gets one here, in its own
+        // layer, so a prompt dims it with the screen.
+        let notch = Notch::of(width);
+        let content = div()
+            .size_full()
+            .font(text_style.font())
+            .text_size(text_style.font_size)
+            .line_height(text_style.line_height);
+        let content = match surface.draws_top_left(cx) {
+            true => content.child(surface.view()),
+            false => content
+                .flex()
+                .flex_col()
+                .child(self.render_left_ear(notch, cx))
+                .child(div().flex_1().min_h_0().w_full().child(surface.view())),
+        };
+        let prompt = self.minibuffer.as_ref().map(|minibuffer| {
+            let ch = rho_window::layout::ch(&text_style, window);
+            let panel = (ch * PROMPT_MAX_CH).min(width - px(READING_INSET_PX) * 2.);
+            let panel = minibuffer.render(&text_style, layout, panel, window, cx);
+            // The work stays where it is, dimmed behind the panel; a press
+            // on it closes the prompt.
+            [
+                div()
+                    .id("rho-prompt-dim")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(gpui::black().opacity(0.35))
+                    .on_click(cx.listener(|this, _, window, cx| this.minibuffer_cancel(window, cx)))
+                    .into_any_element(),
+                div()
+                    .absolute()
+                    .top(px(TOP_ROW_PX + PROMPT_GAP_PX))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(panel)
+                    .into_any_element(),
+            ]
+        });
+        let top_row = self.render_top_row(&text_style, notch, window, cx);
         frame
-            .child(div().flex_1().min_h_0().w_full().child(surface.view()))
-            .children(self.menu.as_ref().map(|open| {
-                let menu = div().track_focus(&self.menu_focus);
-                // A bottom-aligned document and a stuck excerpt need space
-                // above the choices. Other buffers keep their usual overlay.
-                let menu = if keep_bottom {
-                    menu.flex_none()
-                } else {
-                    menu.absolute().bottom_0().left_0().right_0()
-                };
-                menu.child(
-                    bottom_strip(&text_style, cx).child(open.transient.render_rows(
-                        &text_style,
-                        cx,
-                        |index, row| {
-                            row.id(("rho-menu-row", index))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.click_menu_row(index, window, cx);
-                                    cx.stop_propagation();
-                                }))
-                                .into_any_element()
-                        },
-                    )),
-                )
-            }))
-            .children(minibuffer)
+            .child(content)
+            .children(prompt.into_iter().flatten())
+            .children(top_row)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::Verdict;
     use crate::desk::desk_rows;
 
     mod focus_and_hosts;
@@ -2300,11 +2431,17 @@ mod tests {
         (address, opened)
     }
 
-    fn labels(rows: &Rows) -> Vec<String> {
-        rows.rows
-            .iter()
-            .map(|row| row.pick.label().to_owned())
-            .collect()
+    /// `space` over the screen in view: what each key it binds is called,
+    /// in order; then `space` is disarmed again.
+    fn space(frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>) -> Vec<String> {
+        frame.leader(window, cx);
+        let words = frame
+            .menu_rows()
+            .into_iter()
+            .map(|(_, word)| word)
+            .collect();
+        frame.prefix = None;
+        words
     }
 
     fn test_frame(cx: &mut gpui::TestAppContext, db: rho_db::RhoDb) -> gpui::WindowHandle<Frame> {
@@ -2481,7 +2618,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_row_on_desk_is_not_an_open_card(cx: &mut gpui::TestAppContext) {
+    fn a_row_on_desk_is_no_card_in_view(cx: &mut gpui::TestAppContext) {
         let frame = test_frame(cx, rho_db::RhoDb::in_memory());
         frame
             .update(cx, |frame, _, cx| {
@@ -2496,15 +2633,15 @@ mod tests {
                     cards: vec![card],
                     next_change: None,
                 };
-                let rows = desk_rows(&hand, |_| Some(project.clone()), |_| None);
+                let rows = desk_rows(&hand, |_| Some(project.clone()), |_| None, |_| false);
                 frame
                     .desk
                     .update(cx, |desk, cx| desk.set_rows(rows, false, cx));
                 assert!(frame.desk_in_view());
                 assert_eq!(
                     frame.card_target(cx),
-                    Some(subject.clone()),
-                    "a verdict can target the row"
+                    None,
+                    "the Desk is a glance: no row is under a cursor"
                 );
                 assert_eq!(frame.card_in_view(cx), None, "a pull must not skip the row");
 
@@ -2534,11 +2671,8 @@ mod tests {
                     .insert(agent.clone(), AnySurface::new(transcript));
                 frame.open(agent, window, cx);
                 assert_eq!(frame.card_target(cx), None);
-                frame.leader(window, cx);
-                let menu = &frame.menu.as_ref().expect("space still opens a menu").rows;
-                assert_eq!(menu.title, "standing · lab");
                 assert_eq!(
-                    labels(menu),
+                    space(frame, window, cx),
                     ["places"],
                     "nothing to undo, no card to judge"
                 );
@@ -2664,26 +2798,28 @@ mod tests {
                 frame.open(page.clone(), window, cx);
                 assert_eq!(frame.card_target(cx), None);
                 assert_eq!(frame.own_card(cx), None, "the status line keeps its title");
-                let menu = frame.leader_rows(cx);
-                assert_eq!(labels(&menu), ["places"], "no verdicts on a page");
+                assert_eq!(
+                    space(frame, window, cx),
+                    ["places"],
+                    "no verdicts on a page"
+                );
                 // Commands are global, but say that nothing here waits.
                 let commands = frame.commands(window, cx);
-                let snooze = commands
-                    .iter()
-                    .find(|command| command.name() == "snooze")
-                    .expect("snooze is a command everywhere")
-                    .clone();
-                assert_eq!(snooze.target_text(), Some("no waiting card"));
-                for verdict in ["done", "mute"] {
-                    assert!(
-                        commands.iter().all(|command| command.name() != verdict),
-                        "{verdict} is no command"
-                    );
-                }
+                let command = |name: &str| {
+                    commands
+                        .iter()
+                        .find(|command| command.name() == name)
+                        .unwrap_or_else(|| panic!("{name} is a command everywhere"))
+                        .clone()
+                };
+                let snooze = command("snooze thread");
+                assert_eq!(snooze.target_text(), Some("nothing to snooze"));
+                assert_eq!(command("done").target_text(), Some("not waiting here"));
+                assert_eq!(command("mute").target_text(), Some("no thread here"));
                 frame.run_command(&snooze, Some("3h".into()), window, cx);
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("snooze: no waiting card here")
+                    Some("snooze thread: nothing to snooze here")
                 );
                 assert!(!frame.marks().get(&page).facts().muted());
                 assert_eq!(frame.marks().get(&page).facts().seen_mail().next(), None);
@@ -2752,11 +2888,7 @@ mod tests {
                     .cards
                     .retain(|card| card.address != inspected);
                 assert_eq!(frame.card_target(cx), None);
-                frame.leader(window, cx);
-                let menu = &frame.menu.as_ref().expect("space opens a menu").rows;
-                assert_eq!(menu.title, "standing · lab");
-                assert_eq!(labels(menu), ["places", "undo"]);
-                frame.close_menu(window, cx);
+                assert_eq!(space(frame, window, cx), ["places", "undo"]);
                 frame.undo_verdict(window, cx);
                 assert_eq!(settled(frame), []);
                 assert_eq!(
@@ -3061,7 +3193,7 @@ mod tests {
                 frame.pull_card(window, cx);
                 assert_eq!(frame.current_address(), &thread);
                 assert_eq!(
-                    labels(&frame.leader_rows(cx)),
+                    space(frame, window, cx),
                     ["places", "done", "mute", "snooze"]
                 );
                 wants.borrow_mut().clear();
@@ -3069,14 +3201,8 @@ mod tests {
                 frame.verdict(&thread, Verdict::Done, "done".to_owned(), window, cx);
                 assert!(frame.desk_in_view(), "nothing else waits");
                 assert!(frame.attention.can_undo());
-                frame.leader(window, cx);
-                let menu = &frame
-                    .menu
-                    .as_ref()
-                    .expect("space opens the leader on Desk")
-                    .rows;
                 assert_eq!(
-                    labels(menu),
+                    space(frame, window, cx),
                     ["places", "undo"],
                     "no verdicts and no deal on Desk"
                 );
@@ -3197,9 +3323,22 @@ mod tests {
         frame
             .update(cx, |frame, window, cx| {
                 frame.open(note.clone(), window, cx);
-                assert_eq!(labels(&frame.leader_rows(cx)), ["places", "snooze"]);
-                assert_eq!(frame.snooze_target(cx), Some(note.clone()), ":snooze too");
-                frame.snooze(&note, SnoozeUnit::Hours, Some(3), window, cx);
+                assert_eq!(space(frame, window, cx), ["places", "snooze"]);
+                assert_eq!(
+                    frame.reminder_in_view(cx),
+                    Some(note.clone()),
+                    ":snooze note too"
+                );
+                let presets = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
+                    frame
+                        .commands(window, cx)
+                        .into_iter()
+                        .find(|command| command.name() == "snooze note")
+                        .map(|command| command.presets.to_vec())
+                        .expect("snooze note")
+                };
+                assert_eq!(presets(frame, window, cx)[0], "1h");
+                frame.snooze(&note, crate::when::SnoozeUnit::Hours, Some(3), window, cx);
                 assert_eq!(frame.current_address(), &note, "the note stays on screen");
                 assert!(!frame.desk_in_view());
                 let snooze = frame.marks().get(&note).facts().snooze().expect("set");
@@ -3208,9 +3347,14 @@ mod tests {
                     jiff::SignedDuration::from_hours(3)
                 );
                 assert_eq!(
-                    labels(&frame.leader_rows(cx)),
+                    space(frame, window, cx),
                     ["places", "snooze", "undo"],
                     "no done before it is due"
+                );
+                assert_eq!(
+                    presets(frame, window, cx)[..2],
+                    ["now", "clear"],
+                    "a reminder set can come due now or go"
                 );
                 // It came due: as if the time passed, a snooze that ended.
                 frame.write_marks(
@@ -3240,7 +3384,7 @@ mod tests {
         frame
             .update(cx, |frame, window, cx| {
                 assert_eq!(
-                    labels(&frame.leader_rows(cx)),
+                    space(frame, window, cx),
                     ["places", "done", "snooze", "undo"]
                 );
                 wants.borrow_mut().clear();
@@ -3289,9 +3433,9 @@ mod tests {
             .unwrap();
     }
 
-    /// `:snooze 3h` snoozes the card in view in one line; a time it cannot
-    /// read is echoed and changes nothing; and what ran last leads the
-    /// blank `Commands`.
+    /// `:later 3h` snoozes the thread in view in one line; a time it cannot
+    /// read is echoed, changes nothing and comes back on the line to fix;
+    /// and what ran last leads the blank `Commands`.
     #[gpui::test]
     fn a_command_takes_its_argument_on_the_line(cx: &mut gpui::TestAppContext) {
         let (frame, wants) = wanting_frame(cx);
@@ -3305,11 +3449,17 @@ mod tests {
                 frame.systems_changed(cx);
                 frame.pull_card(window, cx);
                 assert_eq!(frame.current_address(), &thread);
-                run_line(frame, "snooze 3x", window, cx);
+                frame.commands_prompt(window, cx);
+                answer(frame, "snooze 3x", window, cx);
                 assert_eq!(
                     echo_of(frame).as_deref(),
-                    Some("snooze: say how long, such as 3h, 2d, 1w, tomorrow or next week")
+                    Some(
+                        "snooze thread: say how long, such as 45m, 3h, 2d, evening, tomorrow or mon 9am"
+                    )
                 );
+                let prompt = frame.minibuffer.as_ref().expect("the line comes back to fix");
+                assert_eq!(prompt.input(cx), "snooze thread 3x");
+                frame.minibuffer_cancel(window, cx);
                 assert_eq!(frame.current_address(), &thread, "nothing changed");
                 assert!(!frame.attention.can_undo());
                 run_line(frame, "later 3h", window, cx);
@@ -3327,7 +3477,328 @@ mod tests {
             .update(cx, |frame, window, cx| {
                 frame.commands_prompt(window, cx);
                 let rows = frame.minibuffer.as_ref().unwrap().row_names();
-                assert_eq!(rows[..2], ["quit", "snooze"], "the commands run last lead");
+                assert_eq!(
+                    rows[..2],
+                    ["quit", "snooze thread"],
+                    "the commands run last lead"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The rows `Commands` shows for `line`: each command's name, the
+    /// words after it, and its target or where those words land.
+    fn rows_for(
+        frame: &mut Frame,
+        line: &str,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        frame.commands_prompt_at(line, window, cx);
+        frame.refresh_minibuffer(cx);
+        let rows = frame.minibuffer.as_ref().expect("Commands").command_rows();
+        frame.minibuffer_cancel(window, cx);
+        rows
+    }
+
+    /// `space` then `key`, as the user presses them.
+    fn press_space(
+        frame: &mut Frame,
+        key: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Frame>,
+    ) {
+        frame.leader(window, cx);
+        frame.prefix_keystroke(&gpui::Keystroke::parse(key).unwrap(), window, cx);
+    }
+
+    /// `space s` opens `Commands` at `snooze thread `, which offers each
+    /// preset with where it lands; a time typed lands too. Snoozed, the
+    /// thread offers `now` and `clear` first, and `unsnooze thread` wakes
+    /// it once.
+    #[gpui::test]
+    fn snooze_offers_where_each_time_lands_and_a_snooze_can_be_taken_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (frame, wants) = wanting_frame(cx);
+        let thread = Address::new("thread", "lab/1");
+        wants.borrow_mut().push(titled(
+            asks(&thread, jiff::SignedDuration::from_hours(2), false),
+            "Clock drift",
+        ));
+        frame
+            .update(cx, |frame, window, cx| {
+                frame.systems_changed(cx);
+                frame.pull_card(window, cx);
+                press_space(frame, "s", window, cx);
+                let prompt = frame.minibuffer.as_ref().expect("space s opens Commands");
+                assert_eq!(prompt.input(cx), "snooze thread ");
+                frame.minibuffer_cancel(window, cx);
+
+                let rows = rows_for(frame, "snooze thread ", window, cx);
+                let values = rows
+                    .iter()
+                    .map(|(name, value, _)| (name.as_str(), value.as_deref()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    values[..5],
+                    crate::when::SNOOZE_PRESETS.map(|preset| ("snooze thread", Some(preset))),
+                    "every preset first"
+                );
+                assert_eq!(
+                    values[5..],
+                    [("unsnooze thread", None)],
+                    "then words inside a name"
+                );
+                assert!(
+                    rows[..5].iter().all(|(.., lands)| lands
+                        .as_deref()
+                        .is_some_and(|lands| lands.starts_with("→ "))),
+                    "{rows:?}"
+                );
+                // A typed time is a row of its own, ahead of the presets it
+                // does not begin.
+                let typed = rows_for(frame, "snooze thread 2d", window, cx);
+                assert_eq!(typed.len(), 1, "{typed:?}");
+                assert_eq!(typed[0].1.as_deref(), Some("2d"));
+                assert!(
+                    typed[0]
+                        .2
+                        .as_deref()
+                        .is_some_and(|lands| lands.ends_with(" 09:00"))
+                );
+                let begun = rows_for(frame, "snooze thread ev", window, cx);
+                assert_eq!(begun.len(), 1);
+                assert_eq!(begun[0].1.as_deref(), Some("evening"));
+
+                run_line(frame, "later 3h", window, cx);
+                assert!(frame.desk_in_view(), "the card is put away");
+                frame.open(thread.clone(), window, cx);
+                assert_eq!(
+                    space(frame, window, cx),
+                    ["places", "mute", "snooze", "undo"],
+                    "asleep, it waits for nothing done, and can still snooze"
+                );
+                let rows = rows_for(frame, "snooze thread ", window, cx);
+                assert_eq!(
+                    rows[..2]
+                        .iter()
+                        .map(|(_, value, lands)| (value.as_deref(), lands.as_deref()))
+                        .collect::<Vec<_>>(),
+                    [
+                        (Some("now"), Some("→ now")),
+                        (Some("clear"), Some("→ no snooze"))
+                    ]
+                );
+                run_line(frame, "wake", window, cx);
+                let snooze = frame
+                    .marks()
+                    .get(&thread)
+                    .facts()
+                    .snooze()
+                    .expect("a snooze");
+                assert!(snooze.until <= Timestamp::now(), "the snooze is over");
+                assert!(echo_of(frame).is_some_and(|echo| echo.starts_with("unsnoozed: ")));
+                run_line(frame, "unsnooze thread", window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("unsnooze thread: nothing snoozed here")
+                );
+            })
+            .unwrap();
+    }
+
+    /// `snooze` names the snooze of what is on screen first: the note's
+    /// on a note, though it means a thread's more surely elsewhere.
+    #[gpui::test]
+    fn snooze_on_a_note_is_snooze_note(cx: &mut gpui::TestAppContext) {
+        let (frame, _, _) = reminders_frame(cx);
+        let note = Address::note(uuid::Uuid::new_v4());
+        frame
+            .update(cx, |frame, window, cx| {
+                let names = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
+                    rows_for(frame, "snooze", window, cx)
+                        .into_iter()
+                        .map(|(name, ..)| name)
+                        .take(2)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(names(frame, window, cx), ["snooze thread", "snooze note"]);
+                frame.open(note.clone(), window, cx);
+                assert_eq!(names(frame, window, cx), ["snooze note", "snooze thread"]);
+                press_space(frame, "s", window, cx);
+                let prompt = frame.minibuffer.as_ref().expect("space s opens Commands");
+                assert_eq!(prompt.input(cx), "snooze note ");
+            })
+            .unwrap();
+    }
+
+    /// A key `space` knows says why it does nothing here; any other key,
+    /// and `escape`, cancels without a word.
+    #[gpui::test]
+    fn a_refused_space_key_says_why_and_another_cancels_silently(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                assert!(frame.desk_in_view());
+                for (key, reason) in [
+                    ("d", "not waiting here"),
+                    ("m", "no thread here"),
+                    ("s", "nothing to snooze here"),
+                    ("a", "no push here"),
+                    ("x", "no push here"),
+                    ("u", "nothing to undo"),
+                ] {
+                    press_space(frame, key, window, cx);
+                    assert_eq!(echo_of(frame).as_deref(), Some(reason), "space {key}");
+                    assert!(frame.prefix.is_none());
+                    assert!(frame.minibuffer.is_none());
+                }
+                frame.echo = None;
+                for key in ["z", "escape", "ctrl-d"] {
+                    press_space(frame, key, window, cx);
+                    assert_eq!(echo_of(frame), None, "space {key}");
+                    assert!(frame.prefix.is_none(), "space {key}");
+                }
+            })
+            .unwrap();
+    }
+
+    /// `mute` works on any open thread, waiting or not; `done` only on a
+    /// card that waits.
+    #[gpui::test]
+    fn mute_takes_any_open_thread_and_done_only_a_waiting_one(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                let thread = Address::new("thread", "lab/9");
+                let view = cx.new(|cx| OpenCard(cx.focus_handle()));
+                frame.surfaces.insert(thread.clone(), AnySurface::new(view));
+                frame.open(thread.clone(), window, cx);
+                assert_eq!(space(frame, window, cx), ["places", "mute"]);
+                press_space(frame, "d", window, cx);
+                assert_eq!(echo_of(frame).as_deref(), Some("not waiting here"));
+                assert!(frame.marks().get(&thread).facts.is_empty());
+                press_space(frame, "m", window, cx);
+                assert!(frame.marks().get(&thread).facts().muted());
+                assert_eq!(frame.current_address(), &thread, "nothing to put away");
+                run_line(frame, "mute", window, cx);
+                assert_eq!(echo_of(frame).as_deref(), Some("mute: muted already"));
+            })
+            .unwrap();
+    }
+
+    /// `approve push` and `deny push` answer only the push on screen; from
+    /// elsewhere they open its thread to read first. `space x` puts `deny
+    /// push` on the line for `enter`, and words that are not the draft's
+    /// are refused rather than lost.
+    #[gpui::test]
+    fn a_push_is_answered_only_where_it_is_read(cx: &mut gpui::TestAppContext) {
+        let (frame, waiting) = answers_frame(cx);
+        let push = Address::new("git", "1");
+        waiting
+            .borrow_mut()
+            .push(asks(&push, jiff::SignedDuration::from_mins(3), false));
+        frame
+            .update(cx, |frame, _, cx| frame.systems_changed(cx))
+            .unwrap();
+        cx.run_until_parked();
+        frame
+            .update(cx, |frame, window, cx| {
+                assert!(frame.desk_in_view());
+                run_line(frame, "approve push", window, cx);
+                assert_eq!(frame.current_address(), &push, "the push opens to be read");
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("approve push: the push is on screen · read it, then answer")
+                );
+                assert_eq!(frame.hand().cards.len(), 1, "nothing answered yet");
+                assert_eq!(
+                    rows_for(frame, "approve", window, cx)[0].0,
+                    "approve push",
+                    "on the push, before any other approval"
+                );
+
+                press_space(frame, "x", window, cx);
+                let prompt = frame.minibuffer.as_ref().expect("deny push asks first");
+                assert_eq!(prompt.input(cx), "deny push ");
+                frame.minibuffer_cancel(window, cx);
+                assert_eq!(waiting.borrow().len(), 1, "nothing denied before enter");
+                run_line(frame, "deny push not on main", window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("deny push: only the draft's words go with it · write them in the draft")
+                );
+                assert_eq!(waiting.borrow().len(), 1, "still waiting");
+                run_line(frame, "deny push", window, cx);
+                assert!(waiting.borrow().is_empty(), "denied");
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("denied: push · nothing waits")
+                );
+            })
+            .unwrap();
+    }
+
+    /// `show messages` lists what the echo said lately, newest first, and
+    /// keeps a bounded number.
+    #[gpui::test]
+    fn show_messages_lists_recent_echoes_newest_first(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                run_line(frame, "show messages", window, cx);
+                assert_eq!(
+                    echo_of(frame).as_deref(),
+                    Some("show messages: nothing said yet")
+                );
+                frame.echo("lab away", StyleClass::SystemInfo, cx);
+                frame.echo("done: Flaky clock\nsecond line", StyleClass::SystemInfo, cx);
+                run_line(frame, "messages", window, cx);
+                let listed = candidates_of(frame)
+                    .into_iter()
+                    .map(|(text, at)| {
+                        assert_eq!(at.len(), "12:34:56".len(), "{at}");
+                        text
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    listed,
+                    [
+                        "done: Flaky clock",
+                        "lab away",
+                        "show messages: nothing said yet"
+                    ]
+                );
+                frame.minibuffer_cancel(window, cx);
+                for n in 0..150 {
+                    frame.echo(&format!("echo {n}"), StyleClass::SystemInfo, cx);
+                }
+                assert_eq!(frame.echoes().len(), 100);
+                assert_eq!(
+                    frame.echoes().front().map(|said| said.text.as_str()),
+                    Some("echo 50")
+                );
+                assert_eq!(
+                    frame.echoes().back().map(|said| said.text.as_str()),
+                    Some("echo 149")
+                );
+            })
+            .unwrap();
+    }
+
+    /// `toggle notch mask` turns the black over the notch off and on.
+    #[gpui::test]
+    fn the_notch_mask_toggles(cx: &mut gpui::TestAppContext) {
+        let frame = test_frame(cx, rho_db::RhoDb::in_memory());
+        frame
+            .update(cx, |frame, window, cx| {
+                assert!(frame.notch_mask, "on by default");
+                run_line(frame, "toggle notch mask", window, cx);
+                assert!(!frame.notch_mask);
+                assert_eq!(echo_of(frame).as_deref(), Some("notch mask off"));
+                run_line(frame, "notch", window, cx);
+                assert!(frame.notch_mask);
             })
             .unwrap();
     }
@@ -3444,15 +3915,17 @@ mod tests {
                 frame.recent.show(thread.clone(), ScreenEntry::Opened);
                 assert!(!frame.attention.can_undo(), "the window just restarted");
                 assert!(frame.marks().get(&thread).facts().muted());
-                let mut rows = frame.leader_rows(cx).rows;
-                let unmute = rows
-                    .iter()
-                    .position(|row| row.pick.label() == "unmute")
-                    .expect("the muted thread offers unmute");
-                let Pick::Run { run, .. } = rows.swap_remove(unmute).pick else {
-                    panic!("not an operation")
-                };
-                run(frame, None, window, cx);
+                let unmute = frame
+                    .commands(window, cx)
+                    .into_iter()
+                    .find(|command| command.name() == "unmute")
+                    .expect("unmute is a command");
+                assert_eq!(
+                    unmute.target_text(),
+                    Some("thread:lab/2"),
+                    "the muted thread"
+                );
+                frame.run_command(&unmute, None, window, cx);
                 assert!(!frame.marks().get(&thread).facts().muted());
                 assert!(
                     frame.marks().get(&other).facts().muted(),
@@ -3510,12 +3983,20 @@ mod tests {
         fn verdicts(&mut self, address: &Address, _: &mut Context<Self>) -> Option<Vec<Row>> {
             let waiting = self.0.clone();
             let address = address.clone();
-            Some(vec![Row::run("a", "approve", move |frame, window, cx| {
-                waiting
-                    .borrow_mut()
-                    .retain(|claim| claim.address != address);
-                frame.answered(&address, "approved: push".to_owned(), window, cx);
-            })])
+            let answer = |word: &'static str| {
+                let waiting = waiting.clone();
+                let address = address.clone();
+                move |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
+                    waiting
+                        .borrow_mut()
+                        .retain(|claim| claim.address != address);
+                    frame.answered(&address, format!("{word}: push"), window, cx);
+                }
+            };
+            Some(vec![
+                Row::run("a", "approve", answer("approved")),
+                Row::run("x", "deny", answer("denied")),
+            ])
         }
     }
 
@@ -3546,21 +4027,21 @@ mod tests {
             asks(&second, jiff::SignedDuration::from_mins(1), false),
         ]);
         let approve = |frame: &mut Frame, window: &mut Window, cx: &mut Context<Frame>| {
-            let rows = frame.leader_rows(cx);
             assert_eq!(
-                labels(&rows),
-                ["places", "approve", "snooze"],
+                space(frame, window, cx),
+                ["places", "approve", "deny", "snooze"],
                 "its own words, and a snooze, in place of done and mute"
             );
-            assert!(
-                !labels(&rows)
-                    .iter()
-                    .any(|label| label == "done" || label == "mute")
+            // `space d` decides nothing on a push, and says why.
+            frame.leader(window, cx);
+            frame.prefix_keystroke(&gpui::Keystroke::parse("d").unwrap(), window, cx);
+            assert_eq!(
+                echo_of(frame).as_deref(),
+                Some("a push waits · space a approves, space x denies")
             );
-            let Pick::Run { run, .. } = rows.rows[1].pick.clone() else {
-                panic!("approve runs");
-            };
-            run(frame, None, window, cx);
+            assert!(frame.prefix.is_none(), "the refusal spends the prefix");
+            frame.leader(window, cx);
+            frame.prefix_keystroke(&gpui::Keystroke::parse("a").unwrap(), window, cx);
         };
         frame
             .update(cx, |frame, window, cx| {
@@ -3624,8 +4105,8 @@ mod tests {
             .unwrap();
     }
 
-    /// On the phone, `done` on a push opens its answers rather than
-    /// settling it.
+    /// On the phone, `done` on a push opens `Commands` at its answers
+    /// rather than settling it.
     #[gpui::test]
     fn done_on_the_phone_asks_for_the_cards_own_words(cx: &mut gpui::TestAppContext) {
         let (frame, waiting) = answers_frame(cx);
@@ -3638,8 +4119,10 @@ mod tests {
                 frame.pull_card(window, cx);
                 assert_eq!(frame.current_address(), &push);
                 frame.press_phone_button(crate::phone::Button::Done, window, cx);
-                let menu = frame.menu.as_ref().expect("the answers are offered");
-                assert_eq!(labels(&menu.rows)[1], "approve");
+                frame.refresh_minibuffer(cx);
+                let prompt = frame.minibuffer.as_ref().expect("the answers are offered");
+                assert_eq!(prompt.input(cx), "push");
+                assert_eq!(prompt.row_names()[..2], ["approve push", "deny push"]);
                 assert!(frame.marks().get(&push).facts.is_empty(), "nothing settled");
             })
             .unwrap();

@@ -207,6 +207,11 @@ fn a_project_focus_deals_only_its_cards_while_desk_counts_all(cx: &mut gpui::Tes
                 frame.focus_note(Timestamp::now(), cx).as_deref(),
                 Some("focus reef")
             );
+            // The bar says the focus on every screen, once the echo is
+            // gone.
+            assert_eq!(frame.status_notes(cx).focus, None, "the echo has the room");
+            frame.echo = None;
+            assert_eq!(frame.status_notes(cx).focus.as_deref(), Some("focus reef"));
             // The host answers the done: reef's card goes.
             world
                 .borrow_mut()
@@ -497,8 +502,8 @@ fn an_away_hosts_cached_cards_stay_answerable(cx: &mut gpui::TestAppContext) {
                 "this screen needs lab"
             );
             assert_eq!(
-                crate::desk::HostsAway::of(frame.hosts()).count(frame.hand().cards.len(), None),
-                "1 wait · lab away"
+                crate::desk::HostsAway::of(frame.hosts()).note().as_deref(),
+                Some("lab away")
             );
             let row = frame
                 .place_rows(None, cx)
@@ -529,6 +534,54 @@ fn an_away_hosts_cached_cards_stay_answerable(cx: &mut gpui::TestAppContext) {
                     }]
                 ),
                 "Desk needs no host: calm"
+            );
+            // The echo has the bar to itself while it shows; a quiet host
+            // note comes back once it is gone.
+            assert_eq!(frame.status_notes(cx).notices, []);
+            frame.echo = None;
+            assert_eq!(
+                frame.status_notes(cx).notices,
+                [Notice {
+                    words: "lab away".into(),
+                    alarm: false
+                }]
+            );
+        })
+        .unwrap();
+}
+
+/// Reconnecting clears that host's stale away echo, while leaving any
+/// other echo on the line alone.
+#[gpui::test]
+fn reconnecting_clears_that_hosts_stale_away_echo(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_tokio::init);
+    let (frame, _, _) = work_frame(cx);
+    frame
+        .update(cx, |frame, _, cx| {
+            let spec = HostSpec {
+                name: "lab".to_owned(),
+                target: rho_agent_hosts::AttachTarget::Local {
+                    runtime_dir: "/nonexistent/lab".into(),
+                },
+            };
+            let (host, _) = frame.attach_host_in_process(spec, cx);
+            frame.host_event(
+                host,
+                rho_agent_hosts::connection::ConnEvent::Disconnected("connection lost".into()),
+                cx,
+            );
+            assert_eq!(
+                echo_of(frame).as_deref(),
+                Some("lab away · connection lost")
+            );
+            frame.host_event(host, rho_agent_hosts::connection::ConnEvent::Recovered, cx);
+            assert_eq!(echo_of(frame), None);
+
+            frame.echo("reef away · connection lost", StyleClass::SystemInfo, cx);
+            frame.host_event(host, rho_agent_hosts::connection::ConnEvent::Ready, cx);
+            assert_eq!(
+                echo_of(frame).as_deref(),
+                Some("reef away · connection lost")
             );
         })
         .unwrap();

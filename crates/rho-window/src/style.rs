@@ -140,19 +140,15 @@ pub fn hint_color(cx: &App) -> Hsla {
         .unwrap_or(cx.theme().status().hint.into())
 }
 
-/// The command strip sits one shade above the reading surface.
+/// `command strip`: the reading surface lifted a step, where a question,
+/// a choice or a stuck draft sits.
 pub fn command_strip_background(cx: &App) -> Hsla {
-    let mut background: Hsla = cx.theme().colors().editor_background.into();
-    if background.l < 0.5 {
-        background.l += 0.04;
-    } else {
-        background.l -= 0.04;
-    }
-    background
+    cx.theme().colors().surface_background.into()
 }
 
+/// `marked`'s gutter bar: the 2 px teal stroke beside the user's own words.
 pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
-    cx.theme().colors().text_accent.into()
+    cx.theme().colors().border_selected.into()
 }
 
 pub fn agent_message_gutter_color(cx: &App) -> Hsla {
@@ -161,6 +157,34 @@ pub fn agent_message_gutter_color(cx: &App) -> Hsla {
 
 fn agent_message_color(cx: &App) -> Hsla {
     cx.theme().colors().terminal_ansi_cyan.into()
+}
+
+/// `unread text`: the newest words and the page's own title.
+pub fn unread_text_color(cx: &App) -> Hsla {
+    cx.theme().colors().terminal_bright_foreground.into()
+}
+
+/// `global status surface`: the recessed field of the global status bar
+/// right of the notch, and of the prompt panel.
+pub fn global_status_surface(cx: &App) -> Hsla {
+    cx.theme().colors().status_bar_background.into()
+}
+
+/// `keys in motion`: a font color only, never a fill, for `INS` and the
+/// prompt row enter would take.
+pub fn keys_in_motion_color(cx: &App) -> Hsla {
+    cx.theme().colors().border_focused.into()
+}
+
+/// `attention`: something to act on, such as the waiting lamp.
+pub fn attention_color(cx: &App) -> Hsla {
+    cx.theme().status().warning.into()
+}
+
+/// `notch mask`: the camera notch's own black, whatever the theme, so the
+/// top edge reads as one square cut-out.
+pub fn notch_mask_color() -> Hsla {
+    gpui::black()
 }
 
 /// One editor row of compact media chips below a writable prompt, one
@@ -224,7 +248,6 @@ fn render_attachment_block(labels: &[String], cx: &mut BlockContext<'_, '_>) -> 
         row = row.child(
             div()
                 .px_1()
-                .rounded_sm()
                 .border_1()
                 .border_color(colors.border_variant)
                 .bg(colors.element_background)

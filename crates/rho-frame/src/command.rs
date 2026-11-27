@@ -18,6 +18,11 @@ use crate::frame::Frame;
 /// target asks with a `Prompt`.
 pub type Run = Rc<dyn Fn(&mut Frame, Option<String>, &mut Window, &mut Context<Frame>)>;
 
+/// What a value typed after a command's name comes to, as its row
+/// previews it: `→ today 19:56` for `snooze thread 45m`. `None` when the
+/// words are no such value.
+pub type Preview = Rc<dyn Fn(&str) -> Option<String>>;
+
 /// How strongly the name itself means its command; an alias weighs less.
 pub(crate) const NAME_WEIGHT: u8 = 10;
 
@@ -46,6 +51,13 @@ pub struct Command {
     /// `pick agent…` when the screen does not say.
     pub(crate) target: Option<Target>,
     pub(crate) shortcut: Option<Shortcut>,
+    /// Values offered as rows of their own before one is typed, such as
+    /// the snooze times, with what each value comes to.
+    pub(crate) presets: &'static [&'static str],
+    pub(crate) preview: Option<Preview>,
+    /// It acts on the screen in view: among commands the words mean as
+    /// surely, it comes first (`snooze` on a note is `snooze note`).
+    pub(crate) here: bool,
     pub(crate) run: Run,
 }
 
@@ -66,7 +78,7 @@ pub(crate) enum Target {
 pub(crate) enum Shortcut {
     /// A binding, resolved in the key context of the screen in view.
     Action(Rc<dyn gpui::Action>),
-    /// A literal sequence through a menu: `space s`.
+    /// A literal sequence: `space s`, `tab`.
     Keys(&'static str),
 }
 
@@ -90,6 +102,9 @@ impl Command {
             spelling,
             target: None,
             shortcut: None,
+            presets: &[],
+            preview: None,
+            here: false,
             run: Rc::new(run),
         }
     }
@@ -132,9 +147,34 @@ impl Command {
         self
     }
 
-    /// The row shows `keys`, a sequence through a menu such as `space s`.
+    /// The row shows `keys`, a sequence such as `space s`.
     pub fn keys(mut self, keys: &'static str) -> Self {
         self.shortcut = Some(Shortcut::Keys(keys));
+        self
+    }
+
+    /// Before a value is typed after its name, the line offers `presets`
+    /// as rows of their own; each row, and a value typed, shows what
+    /// `preview` makes of it.
+    pub fn presets(
+        mut self,
+        presets: &'static [&'static str],
+        preview: impl Fn(&str) -> Option<String> + 'static,
+    ) -> Self {
+        debug_assert!(
+            self.spelling.argument.is_some(),
+            "{} takes no value to preset",
+            self.spelling.name
+        );
+        self.presets = presets;
+        self.preview = Some(Rc::new(preview));
+        self
+    }
+
+    /// It acts on the screen in view, so it ranks before a command the
+    /// words mean as surely.
+    pub fn here(mut self) -> Self {
+        self.here = true;
         self
     }
 

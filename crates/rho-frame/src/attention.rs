@@ -267,7 +267,7 @@ impl Frame {
 
     /// Asks whether the user holds a phrase ([`Frame::prompt_pair`]) when
     /// the window starts on a device that has never asked. It waits while
-    /// a prompt or a menu is open or an idea is being written, rather
+    /// a prompt is open or an idea is being written, rather
     /// than take keys meant for them.
     pub fn ask_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pairing_due = self.attention.pairing() == Pairing::Unasked;

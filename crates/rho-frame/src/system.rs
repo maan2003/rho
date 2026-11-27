@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::command::Command;
 use crate::frame::Point;
-use crate::menu::Row;
+use crate::prefix::Row;
 use crate::surface::AnySurface;
 use crate::text_search::{TextHit, TextSearch};
 
@@ -145,8 +145,10 @@ pub trait System: Sized + 'static {
     }
 
     /// The answers a card of this system's takes in place of done and
-    /// mute, when it has its own: a push the user approves or denies. A
-    /// row that answers puts the card away with [`crate::Frame::answered`].
+    /// mute, when it has its own: a push the user approves (`a`) or denies
+    /// (`x`), bound after `space` and run by `approve push` and `deny push`
+    /// in `Commands`. A row that answers puts the card away with
+    /// [`crate::Frame::answered`].
     fn verdicts(&mut self, _address: &Address, _cx: &mut Context<Self>) -> Option<Vec<Row>> {
         None
     }

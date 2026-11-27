@@ -373,6 +373,8 @@ impl Frame {
         match event {
             ConnEvent::Ready | ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                let prefix = format!("{name} away · ");
+                self.clear_echo_if(|text| text.starts_with(&prefix));
             }
             ConnEvent::Many(events) => {
                 for event in events {
@@ -472,7 +474,7 @@ impl Frame {
     /// Waits for `host`'s `answer` and hands it to `then`, which asks the
     /// user what to do with it. Meanwhile the echo line says whom it asked;
     /// a refusal or a lost host is echoed under `command`'s name. An answer
-    /// that comes while the user has another prompt or menu open does not
+    /// that comes while the user has another prompt open does not
     /// take it from them.
     pub fn when_host_answers<T: 'static>(
         &mut self,
@@ -497,7 +499,7 @@ impl Frame {
                     StyleClass::StatusError,
                     cx,
                 ),
-                Ok(_) if frame.minibuffer.is_some() || frame.menu.is_some() => frame.echo(
+                Ok(_) if frame.minibuffer.is_some() => frame.echo(
                     &format!(
                         "{command}: {name} answered while another prompt was open · run it again"
                     ),

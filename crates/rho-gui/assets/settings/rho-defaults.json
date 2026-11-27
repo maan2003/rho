@@ -4,6 +4,7 @@
   "buffer_font_family": "Rho Font",
   "buffer_font_fallbacks": ["Noto Color Emoji"],
   "buffer_font_size": 15,
+  "buffer_line_height": { "custom": 1.54 },
   "ui_font_family": "Rho Font",
   "ui_font_fallbacks": ["Noto Color Emoji"],
   "text_rendering_mode": "grayscale",

@@ -37,8 +37,6 @@ pub enum Subject {
 pub enum CardHere {
     /// The surface is a card: a thread, wherever the point is in it.
     Itself,
-    /// The surface lists cards: the one under the point, if any.
-    Row(Option<Address>),
     /// The surface looks into the work of the card the reader stepped
     /// down from, while that card still waits. Opened by name, it has none.
     Inspected,
@@ -110,6 +108,16 @@ pub trait Surface: Render + Focusable + Sized + 'static {
 
     fn status(&self, _cx: &App) -> Option<String> {
         None
+    }
+
+    /// Whether the surface draws its own top-left corner, its name left of
+    /// the notch (`rho_window::layout::Notch`), from the window's top edge.
+    /// Otherwise the frame draws the name there from [`Self::title`],
+    /// [`Self::heading`] and [`Self::status`], and the surface starts below
+    /// the top row ([`rho_window::layout::TOP_ROW_PX`]). Either way the
+    /// global status bar right of the notch lies over the top row.
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        false
     }
 
     fn phone_tools(&self, _typing: bool, _cx: &App) -> Vec<PhoneTool> {
@@ -203,6 +211,13 @@ pub trait Surface: Render + Focusable + Sized + 'static {
         None
     }
 
+    /// The words of the draft in view, which a denial of a push carries to
+    /// the thread's agents: `space x` puts them on the `deny push` line for
+    /// the user to see before `enter`. `None` for a surface with no draft.
+    fn draft(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
     /// Whether the surface is a draft that fills the window, such as an
     /// idea: the phone's bar then offers only Cancel, which closes it, and
     /// Send.
@@ -227,6 +242,7 @@ trait SurfaceHandle {
     fn title(&self, cx: &App) -> String;
     fn phone_titles(&self, cx: &App) -> Vec<String>;
     fn status(&self, cx: &App) -> Option<String>;
+    fn draws_top_left(&self, cx: &App) -> bool;
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool>;
     fn editor(&self, cx: &App) -> Option<Entity<Editor>>;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -243,6 +259,7 @@ trait SurfaceHandle {
     fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command>;
     fn phone_send(&self, cx: &mut App) -> Option<PhoneSend>;
     fn composes(&self, cx: &App) -> bool;
+    fn draft(&self, cx: &App) -> Option<String>;
 }
 
 impl<S: Surface> SurfaceHandle for Entity<S> {
@@ -264,6 +281,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
 
     fn status(&self, cx: &App) -> Option<String> {
         self.read(cx).status(cx)
+    }
+
+    fn draws_top_left(&self, cx: &App) -> bool {
+        self.read(cx).draws_top_left(cx)
     }
 
     fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool> {
@@ -331,6 +352,10 @@ impl<S: Surface> SurfaceHandle for Entity<S> {
     fn composes(&self, cx: &App) -> bool {
         self.read(cx).composes(cx)
     }
+
+    fn draft(&self, cx: &App) -> Option<String> {
+        self.read(cx).draft(cx)
+    }
 }
 
 /// A surface of any type, as the frame holds it.
@@ -365,6 +390,10 @@ impl AnySurface {
 
     pub fn status(&self, cx: &App) -> Option<String> {
         self.0.status(cx)
+    }
+
+    pub fn draws_top_left(&self, cx: &App) -> bool {
+        self.0.draws_top_left(cx)
     }
 
     pub(crate) fn phone_tools(&self, typing: bool, cx: &App) -> Vec<PhoneTool> {
@@ -430,6 +459,10 @@ impl AnySurface {
 
     pub(crate) fn composes(&self, cx: &App) -> bool {
         self.0.composes(cx)
+    }
+
+    pub(crate) fn draft(&self, cx: &App) -> Option<String> {
+        self.0.draft(cx)
     }
 
     pub fn commands(&self, card: Option<Seen>, window: &mut Window, cx: &mut App) -> Vec<Command> {

@@ -1,73 +1,49 @@
-//! The Desk shows only what waits in the dealer's hand.
+//! The Desk shows only what waits in the dealer's hand (`desk.Desk`): a
+//! read-only sheet of one-line rows, card 1 on row 1, under its own name
+//! and count in the top-left corner. It is a glance: no cursor and no
+//! selected row. The deal walks the cards, and a click opens a row.
 
-use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
-use std::rc::Rc;
-use std::sync::Arc;
 
-use editor::display_map::Crease;
-use editor::scroll::Autoscroll;
-use editor::{Editor, EditorMode, FoldPlaceholder, HighlightKey, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Font, HighlightStyle, Pixels, TextRun, Window,
-    WindowTextSystem, div, px,
-};
-use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, MultiBufferOffset, ToPoint as _};
+use gpui::{App, Context, FocusHandle, Focusable, SharedString, WeakEntity, Window, div, px};
 use rho_dealer::Address;
-use rho_dealer::rank::{CardKind, Hand};
-use rho_transcript::{Item, Transcript};
-use text::{Bias, ToOffset as _, ToPoint as _};
+use rho_dealer::rank::{Card, CardKind, Hand};
+use rho_window::layout::{Notch, READING_INSET_PX, SHEET_MAX_CH, TOP_ROW_PX};
 use theme::ActiveTheme as _;
 
 use crate::frame::Frame;
 use crate::hosts::Reach;
-use crate::keys;
 use crate::phone::Layout;
 use crate::surface::{CardHere, Subject, Surface};
 use crate::system::Project;
 
-const DESK_KEY_BASE: usize = usize::MAX / 3;
 const WAITING_LIMIT: usize = 7;
+/// The share of the sheet the project column may take at most.
+const PROJECT_SHARE: f32 = 0.25;
+/// The space between a subject and its tag; columns stand twice as far
+/// apart.
+const CELL_GAP_PX: f32 = 12.;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DeskKey {
     Waiting(Address),
     Stops(Address),
-    WaitingMore,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum DeskClass {
-    Title,
-    Label,
-    Muted,
-}
-
+/// One waiting row: what it is about, why it is an exception when it is
+/// one, where it is, and how long it has waited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeskRow {
     key: DeskKey,
     subject: String,
-    detail: DeskDetail,
+    /// `approve push`, `3 stopped`, `away`.
+    tag: Option<String>,
+    project: String,
+    /// `3.0h`, as the card's words say it.
+    age: String,
     flash: Option<String>,
     card: Address,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DeskDetail {
-    Project(String),
-    Stops(String),
-}
-
-impl DeskDetail {
-    fn project(&self) -> Option<&str> {
-        match self {
-            Self::Project(project) => Some(project),
-            Self::Stops(_) => None,
-        }
-    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -94,12 +70,11 @@ impl DeskRows {
     }
 }
 
-/// The attached hosts the Desk cannot count on now (`desk.Desk`). Some
-/// hosts away is an everyday state: the Desk says so calmly beside its
-/// count, and an empty deal says so after `nothing waits`.
+/// The attached hosts the deal cannot count on now. Some hosts away is an
+/// everyday state: an empty deal says so after `nothing waits`, and the
+/// global status bar names them, never the Desk's own rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostsAway {
-    attached: usize,
     away: Vec<String>,
     connecting: Vec<String>,
 }
@@ -116,7 +91,6 @@ impl HostsAway {
     ) -> Self {
         let mut away = Self::default();
         for (name, status) in hosts {
-            away.attached += 1;
             match Reach::of(status) {
                 Reach::Online => {}
                 Reach::Connecting => away.connecting.push(name.to_owned()),
@@ -141,30 +115,6 @@ impl HostsAway {
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// The Desk's count of everything that waits, cached cards from a host
-    /// away among them, with the hosts and the dealer focus (`focus`, such
-    /// as `focus tide`) noted after it. While every host is still
-    /// connecting and nothing cached waits there is no count to give, so it
-    /// never reads a false `0 wait`.
-    pub(crate) fn count(&self, waiting: usize, focus: Option<&str>) -> String {
-        let connecting = self.attached > 0 && self.connecting.len() == self.attached;
-        let count = match self.connecting.as_slice() {
-            [name] if connecting && waiting == 0 => format!("connecting to {name}…"),
-            many if connecting && waiting == 0 => format!("connecting to {} hosts…", many.len()),
-            _ => {
-                let count = format!("{waiting} wait");
-                match self.note() {
-                    Some(note) => format!("{count} · {note}"),
-                    None => count,
-                }
-            }
-        };
-        match focus {
-            Some(focus) => format!("{count} · {focus}"),
-            None => count,
-        }
-    }
-
     /// What the echo line says when a deal finds nothing: in the project
     /// the deal is focused on, when it is.
     pub(crate) fn nothing_waits(&self, in_project: Option<&str>) -> String {
@@ -179,10 +129,33 @@ impl HostsAway {
     }
 }
 
+/// How long `card` has waited, as its words end: `3.0h` of `waits · 3.0h`.
+fn age_of(card: &Card) -> String {
+    match card.kind {
+        CardKind::Other => String::new(),
+        _ => card
+            .label
+            .rsplit_once(" · ")
+            .map_or_else(String::new, |(_, age)| age.to_owned()),
+    }
+}
+
+/// Why a card is an exception rather than a plain wait: a push to approve
+/// or a stop. A card cached from a host that is away says `away`.
+fn tag_of(card: &Card, away: bool) -> Option<String> {
+    match card.kind {
+        CardKind::Approve(what) => Some(format!("approve {what}")),
+        CardKind::Stop(word) => Some(word.to_owned()),
+        CardKind::Waits | CardKind::Due | CardKind::Other => None,
+    }
+    .or_else(|| away.then(|| "away".to_owned()))
+}
+
 pub(crate) fn desk_rows(
     hand: &Hand,
     project_of: impl Fn(&Address) -> Option<Project>,
     flash_at: impl Fn(&Address) -> Option<String>,
+    away: impl Fn(&Address) -> bool,
 ) -> DeskRows {
     // A project's stops occupy its first stop's place. Every pinging mail
     // remains a row, even when another came from the same project.
@@ -208,9 +181,9 @@ pub(crate) fn desk_rows(
             DeskRow {
                 key,
                 subject: card.title.clone(),
-                detail: DeskDetail::Project(
-                    project.map_or_else(|| card.context.clone(), |project| project.name),
-                ),
+                tag: tag_of(card, away(&card.address)),
+                project: project.map_or_else(|| card.context.clone(), |project| project.name),
+                age: age_of(card),
                 flash: flash_at(&card.address),
                 card: card.address.clone(),
             },
@@ -225,12 +198,9 @@ pub(crate) fn desk_rows(
         let mut words = format!("and {total} more");
         let mut projects = HashSet::new();
         for (row, ..) in hidden {
-            if let Some(project) = row.detail.project()
-                && !project.is_empty()
-                && projects.insert(project)
-            {
+            if !row.project.is_empty() && projects.insert(row.project.as_str()) {
                 words.push_str(" · ");
-                words.push_str(project);
+                words.push_str(&row.project);
             }
         }
         Some(WaitingOverflow {
@@ -242,13 +212,13 @@ pub(crate) fn desk_rows(
         .into_iter()
         .take(WAITING_LIMIT)
         .map(|(mut row, kind, count, mixed)| {
+            // A project's repeated stops are one row about the project.
             if let CardKind::Stop(reason) = kind
                 && count > 1
-                && let DeskDetail::Project(project) = row.detail
             {
-                row.subject = project;
+                row.subject = std::mem::take(&mut row.project);
                 let reason = if mixed { "stops" } else { reason };
-                row.detail = DeskDetail::Stops(format!("{count} {reason}"));
+                row.tag = Some(format!("{count} {reason}"));
                 row.flash = None;
             }
             row
@@ -261,367 +231,175 @@ pub(crate) fn desk_rows(
     }
 }
 
-impl DeskClass {
-    fn slot(self) -> usize {
-        match self {
-            Self::Title => 0,
-            Self::Label => 1,
-            Self::Muted => 2,
-        }
-    }
-
-    const COUNT: usize = 3;
-}
-
-impl rho_transcript::Style for DeskClass {
-    fn highlight_key(self, bucket: u32) -> HighlightKey {
-        HighlightKey::SyntaxTreeView(DESK_KEY_BASE + bucket as usize * Self::COUNT + self.slot())
-    }
-
-    fn highlight_style(self, cx: &App) -> HighlightStyle {
-        let colors = cx.theme().colors();
-        let color = match self {
-            Self::Title => colors.text,
-            Self::Label => cx.theme().status().warning,
-            Self::Muted => colors.text_muted,
-        };
-        HighlightStyle {
-            color: Some(color.into()),
-            ..HighlightStyle::default()
-        }
-    }
-}
-
-/// The Desk uses a keyed transcript so that changing the hand does not
-/// reset the reader's selection or scroll.
+/// The Desk's view: the rows of the hand, drawn as they are. Nothing on it
+/// takes a cursor; its keys are the window's.
 pub(crate) struct DeskView {
-    transcript: Transcript<DeskKey, DeskClass, Address>,
-    editor: Entity<Editor>,
     rows: DeskRows,
-    /// The frame, whose hosts say what the count notes beside it.
-    frame: gpui::WeakEntity<Frame>,
-    layout: DeskLayout,
-    text_system: Rc<WindowTextSystem>,
-}
-
-#[derive(PartialEq, Eq)]
-struct DeskLayout {
-    viewport: Pixels,
-    font: Font,
-    font_size: Pixels,
-    inset: Pixels,
-    content: Pixels,
-}
-
-impl DeskLayout {
-    fn read(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> Self {
-        editor.update(cx, |editor, cx| {
-            let style = editor.style(cx).clone();
-            let font = style.text.font();
-            let font_size = style.text.font_size.to_pixels(window.rem_size());
-            let font_id = window.text_system().resolve_font(&font);
-            let gutter = editor
-                .snapshot(window, cx)
-                .gutter_dimensions(font_id, font_size, &style, window, cx);
-            let viewport = window.viewport_size().width;
-            Self {
-                viewport,
-                font,
-                font_size,
-                inset: gutter.width,
-                content: (viewport
-                    - crate::frame::FRAME_PADDING * 2.
-                    - gutter.width
-                    - gutter.margin)
-                    .max(px(0.)),
-            }
-        })
-    }
-
-    fn measure(&self, text_system: &WindowTextSystem, text: &str) -> Pixels {
-        text_system
-            .layout_line(
-                text,
-                self.font_size,
-                &[TextRun {
-                    len: text.len(),
-                    font: self.font.clone(),
-                    ..Default::default()
-                }],
-                None,
-            )
-            .width
-    }
+    /// The frame, which opens a clicked row's card.
+    frame: WeakEntity<Frame>,
+    focus: FocusHandle,
+    /// Whether the rows were last drawn for a phone, where a row keeps its
+    /// place under the thumb.
+    phone: bool,
 }
 
 impl DeskView {
-    pub fn new(
-        frame: gpui::WeakEntity<Frame>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("", cx);
-            buffer.set_capability(Capability::Read, cx);
-            buffer
-        });
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::new(
-                EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: true,
-                    show_active_line_background: true,
-                    sizing_behavior: SizingBehavior::FullOverscrollMargin,
-                },
-                multi_buffer.clone(),
-                None,
-                window,
-                cx,
-            );
-            rho_window::editor_config::configure(&mut editor, window, cx);
-            editor
-        });
-        let layout = DeskLayout::read(&editor, window, cx);
-        let mut view = Self {
-            transcript: Transcript::new(buffer),
-            editor,
+    pub fn new(frame: WeakEntity<Frame>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
             rows: DeskRows::default(),
             frame,
-            layout,
-            text_system: window.text_system().clone(),
-        };
-        view.transcript.attach(&view.editor.clone(), cx);
-        view.reconcile(cx);
-        view.focus_first_row(cx);
-        view
-    }
-
-    pub(crate) fn cursor_card(&self, cx: &App) -> Option<Address> {
-        self.transcript.line_meta(self.cursor_row(cx), cx).cloned()
-    }
-
-    fn cursor_row(&self, cx: &App) -> u32 {
-        let editor = self.editor.read(cx);
-        let snapshot = editor.buffer().read(cx).snapshot(cx);
-        editor
-            .selections
-            .newest_anchor()
-            .head()
-            .to_point(&snapshot)
-            .row
-    }
-
-    /// Selects the tapped row for the caller to open. Either display line
-    /// on the phone maps to the same item; a heading or blank does not.
-    pub(crate) fn tap(
-        &mut self,
-        position: gpui::Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let editor = self.editor.read(cx);
-        let hit = editor
-            .buffer_location_for_window_position(position, Bias::Left)
-            .and_then(|(anchor, _, _)| {
-                let row = anchor.to_point(&editor.buffer().read(cx).snapshot(cx)).row;
-                self.transcript.line_meta(row, cx)?;
-                let key = self.transcript.key_at_row(row, cx)?;
-                let start = self.transcript.range_of(key)?.start;
-                let row = start
-                    .to_point(&self.transcript.buffer().read(cx).snapshot())
-                    .row;
-                Some(row)
-            });
-        let Some(row) = hit else { return false };
-        self.select_row(row, None, cx);
-        window.focus(&self.editor.focus_handle(cx), cx);
-        true
+            focus: cx.focus_handle(),
+            phone: Layout::of(window.viewport_size().width) == Layout::Phone,
+        }
     }
 
     pub(crate) fn set_rows(&mut self, mut rows: DeskRows, hold: bool, cx: &mut Context<Self>) {
-        if hold && Layout::of(self.layout.viewport) == Layout::Phone {
+        if hold && self.phone {
             // Update displayed words in place. A newly ranked row can't
             // take the place of one the user is about to tap.
             DeskRows::keep_order(&mut rows.waiting, &self.rows.waiting);
         }
-        if rows == self.rows {
-            return;
+        if rows != self.rows {
+            self.rows = rows;
+            cx.notify();
         }
-        self.rows = rows;
-        self.reconcile(cx);
-        if self.cursor_card(cx).is_none() {
-            self.focus_first_row(cx);
+    }
+
+    fn open(&self, card: Address, window: &mut Window, cx: &mut App) {
+        if let Some(frame) = self.frame.upgrade() {
+            frame.update(cx, |frame, cx| frame.open_row(&card, window, cx));
         }
-        cx.notify();
     }
 
-    pub(crate) fn focus_first_row(&mut self, cx: &mut Context<Self>) {
-        let row = self.selectable_rows(cx).next().unwrap_or(0);
-        self.select_row(row, None, cx);
-    }
-
-    /// The first buffer line of each selectable item; on a phone the
-    /// label's second line is part of the same stop, not one more keypress.
-    fn selectable_rows<'a>(&'a self, cx: &'a App) -> impl DoubleEndedIterator<Item = u32> + 'a {
-        let history = self.transcript.buffer().read(cx).snapshot();
-        self.transcript.keys().filter_map(move |key| {
-            let row = self.transcript.range_of(key)?.start.to_point(&history).row;
-            self.transcript.line_meta(row, cx).map(|_| row)
-        })
-    }
-
-    fn step(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let row = self.cursor_row(cx);
-        let count = vim::take_count(cx).unwrap_or(1);
-        let current = self
-            .transcript
-            .key_at_row(row, cx)
-            .and_then(|key| self.transcript.range_of(key))
-            .map_or(row, |range| {
-                range
-                    .start
-                    .to_point(&self.transcript.buffer().read(cx).snapshot())
-                    .row
-            });
-        let selected = if down {
-            self.selectable_rows(cx)
-                .filter(|&candidate| candidate > current)
-                .take(count)
-                .last()
-        } else {
-            self.selectable_rows(cx)
-                .rev()
-                .filter(|&candidate| candidate < current)
-                .take(count)
-                .last()
+    /// The laptop sheet: one column of subjects, each with its exception
+    /// tag, then the projects and the ages, each column as wide as its
+    /// widest cell and right-aligned, so every row lines up without
+    /// measuring a glyph. The project column takes at most its share of
+    /// the sheet. A click on any cell of a row opens its card.
+    fn sheet(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (text, muted) = {
+            let colors = cx.theme().colors();
+            (colors.text, colors.text_muted)
         };
-        if let Some(row) = selected {
-            self.select_row(row, Some(window), cx);
-        }
-    }
-
-    fn select_row(&mut self, row: u32, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        self.editor.update(cx, |editor, cx| {
-            let point = Point::new(row, 0);
-            if let Some(window) = window {
-                editor.change_selections(
-                    editor::SelectionEffects::scroll(Autoscroll::fit()),
-                    window,
-                    cx,
-                    |selections| selections.select_ranges([point..point]),
-                );
-            } else {
-                let snapshot = editor.display_snapshot(cx);
-                editor.selections.change_with(&snapshot, |selections| {
-                    selections.select_ranges([point..point]);
-                });
-                editor.request_autoscroll(Autoscroll::fit(), cx);
-                cx.notify();
-            }
-        });
-    }
-
-    fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let measure = |text: &str| self.layout.measure(&self.text_system, text);
-        let phone = Layout::of(self.layout.viewport) == Layout::Phone;
-        // The editor and count extend to the frame edge; keep the existing
-        // narrow-row inset, but spend the full text lane on desktop.
-        let room = if phone {
-            (self.layout.viewport - measure("0") * 4.).max(px(0.))
-        } else {
-            self.layout.content
-        };
-        let wide = RowLayout::new(measure);
-        let project_width = self
+        let warning = cx.theme().status().warning;
+        let subjects: Vec<_> = self
             .rows
             .waiting
             .iter()
-            .filter_map(|row| row.detail.project())
-            .map(|project| measure(first_line(project)))
-            .max()
-            .unwrap_or_default()
-            .min(room * 0.45);
-        let mut offsets = Vec::new();
-        let mut row_item = |row: &DeskRow| {
-            let (item, gaps) = if phone {
-                wide.compact(row, room, project_width)
-            } else {
-                wide.item(row, room)
-            };
-            offsets.extend(
-                gaps.into_iter()
-                    .map(|(offset, width)| (row.key.clone(), offset, width)),
-            );
-            item
-        };
-        let mut waiting = self
-            .rows
-            .waiting
-            .iter()
-            .map(&mut row_item)
-            .collect::<Vec<_>>();
-        if let Some(overflow) = &self.rows.overflow {
-            waiting.push(
-                Item::new(DeskKey::WaitingMore, overflow.words.clone())
-                    .with_styles(vec![(DeskClass::Muted, 0..overflow.words.len())])
-                    .with_lines(vec![overflow.first.clone()]),
-            );
-        }
-        self.transcript.reconcile(waiting, cx);
-        let snapshot = self.transcript.buffer().read(cx).snapshot();
-        // A separator is one buffer space, laid out at a measured width.
-        // The editor still owns the words, selection and hit testing.
-        struct ColumnGap;
-        let tag = TypeId::of::<ColumnGap>();
-        let columns = offsets
-            .into_iter()
-            .map(|(key, offset, width)| {
-                let range = self.transcript.range_of(&key).expect("row was reconciled");
-                let start = range.start.to_offset(&snapshot) + offset;
-                Crease::simple(
-                    MultiBufferOffset(start)..MultiBufferOffset(start + 1),
-                    FoldPlaceholder {
-                        render: Arc::new(move |_, _, _| div().w(width).into_any_element()),
-                        constrain_width: false,
-                        merge_adjacent: false,
-                        type_tag: Some(tag),
-                        ..Default::default()
-                    },
-                )
+            .map(|row| {
+                Self::cell("subject", row, cx)
+                    .flex()
+                    .gap(px(CELL_GAP_PX))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(text)
+                            .child(first_line(&row.subject).to_owned()),
+                    )
+                    .children(
+                        row.tag
+                            .clone()
+                            .map(|tag| div().flex_none().text_color(warning).child(tag)),
+                    )
             })
             .collect();
-        self.editor
-            .read(cx)
-            .display_map
-            .clone()
-            .update(cx, |map, cx| {
-                map.replace_folds_with_type(tag, columns, cx);
-            });
-        cx.notify();
+        let mut right = |column: &str, cell: fn(&DeskRow) -> &str| {
+            if self.rows.waiting.iter().all(|row| cell(row).is_empty()) {
+                return None;
+            }
+            let cells: Vec<_> = self
+                .rows
+                .waiting
+                .iter()
+                .map(|row| {
+                    Self::cell(column, row, cx)
+                        .text_right()
+                        .truncate()
+                        .text_color(muted)
+                        // An empty cell still holds its row's line.
+                        .child(match first_line(cell(row)) {
+                            "" => "\u{00a0}".to_owned(),
+                            words => words.to_owned(),
+                        })
+                })
+                .collect();
+            Some(div().flex_none().flex().flex_col().children(cells))
+        };
+        let projects = right("project", |row| &row.project)
+            .map(|column| column.max_w(gpui::relative(PROJECT_SHARE)));
+        let ages = right("age", |row| &row.age);
+        div()
+            .w_full()
+            .flex()
+            .gap(px(CELL_GAP_PX * 2.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .children(subjects),
+            )
+            .children(projects)
+            .children(ages)
     }
-}
 
-impl Surface for DeskView {
-    fn title(&self, _cx: &App) -> String {
-        "desk".into()
+    /// One cell of a laptop row: a single line that opens the row's card.
+    fn cell(column: &str, row: &DeskRow, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let card = row.card.clone();
+        div()
+            .id(SharedString::from(format!("desk-{column}-{}", row.card)))
+            .w_full()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .on_click(cx.listener(move |this, _, window, cx| this.open(card.clone(), window, cx)))
     }
 
-    fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
-        Some(self.editor.clone())
-    }
-
-    fn subject(&self, _: Option<rho_dealer::facts::Seen>, cx: &App) -> Subject {
-        self.cursor_card(cx).map_or(Subject::None, Subject::Address)
-    }
-
-    fn card(&self, cx: &App) -> CardHere {
-        CardHere::Row(self.cursor_card(cx))
-    }
-}
-
-impl Focusable for DeskView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor.focus_handle(cx)
+    /// A phone row: the subject and project, then the exception tag or the
+    /// card's current words on a second line.
+    fn compact(&self, row: &DeskRow, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let colors = cx.theme().colors();
+        let card = row.card.clone();
+        let extra = match &row.tag {
+            Some(tag) => Some((tag.clone(), cx.theme().status().warning)),
+            None => row.flash.clone().map(|words| (words, colors.text_muted)),
+        };
+        div()
+            .id(SharedString::from(format!("desk-row-{}", row.card)))
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(colors.text)
+                            .child(row.subject.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(gpui::relative(0.45))
+                            .truncate()
+                            .text_color(colors.text_muted)
+                            .child(row.project.clone()),
+                    ),
+            )
+            .children(extra.map(|(words, color)| {
+                div()
+                    .pl_4()
+                    .truncate()
+                    .text_color(color)
+                    .child(first_line(&words).to_owned())
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.open(card.clone(), window, cx)))
     }
 }
 
@@ -629,236 +407,120 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default()
 }
 
-/// The same shaped font determines clipping and the widths of separators.
-struct RowLayout<M> {
-    measure: M,
-    space: Pixels,
-}
-
-impl<M: Fn(&str) -> Pixels> RowLayout<M> {
-    fn new(measure: M) -> Self {
-        let space = measure(" ");
-        Self { measure, space }
+impl Surface for DeskView {
+    fn title(&self, _cx: &App) -> String {
+        "desk".into()
     }
 
-    fn item(&self, row: &DeskRow, room: Pixels) -> LaidOutRow {
-        let gap = self.space * 2.;
-        let (detail, class) = match &row.detail {
-            DeskDetail::Project(project) => (project, DeskClass::Muted),
-            DeskDetail::Stops(stops) => (stops, DeskClass::Label),
-        };
-        let detail = self.cut(detail, room - gap);
-        let has_detail = !detail.is_empty();
-        let subject_room = if has_detail {
-            room - (self.measure)(&detail) - gap
-        } else {
-            room
-        };
-        let subject = self.cut(&row.subject, subject_room);
-        let mut text = String::new();
-        let mut styles = Vec::new();
-        let mut gaps = Vec::new();
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &subject,
-            DeskClass::Title,
-            has_detail.then(|| (self.measure)(&subject) + gap),
-        );
-        let used = (self.measure)(&subject)
-            + if has_detail {
-                gap + (self.measure)(&detail)
-            } else {
-                px(0.)
-            };
-        let flash = row
-            .flash
-            .as_ref()
-            .map(|words| self.cut(words, room - used - gap))
-            .filter(|words| !words.is_empty());
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &detail,
-            class,
-            flash.as_ref().map(|_| (self.measure)(&detail) + gap),
-        );
-        if let Some(flash) = flash {
-            self.cell(
-                &mut text,
-                &mut styles,
-                &mut gaps,
-                &flash,
-                DeskClass::Muted,
-                None,
-            );
-        }
-        (
-            Item::new(row.key.clone(), text)
-                .with_styles(styles)
-                .with_lines(vec![row.card.clone()]),
-            gaps,
-        )
+    /// The Desk's name and count are its own top-left corner.
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
     }
 
-    fn compact(&self, row: &DeskRow, room: Pixels, project_width: Pixels) -> LaidOutRow {
-        let project = row
-            .detail
-            .project()
-            .map_or_else(String::new, |project| self.cut(project, project_width));
-        let has_project = !project.is_empty();
-        let column = room - project_width;
-        let subject_room = if has_project {
-            column - self.space * 2.
-        } else {
-            room
-        };
-        let subject = self.cut(&row.subject, subject_room);
-        let mut text = String::new();
-        let mut styles = Vec::new();
-        let mut gaps = Vec::new();
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &subject,
-            DeskClass::Title,
-            has_project.then_some(column),
-        );
-        self.cell(
-            &mut text,
-            &mut styles,
-            &mut gaps,
-            &project,
-            DeskClass::Muted,
-            None,
-        );
-        let mut lines = vec![row.card.clone()];
-        let extra = match &row.detail {
-            DeskDetail::Stops(stops) => Some((stops, DeskClass::Label)),
-            DeskDetail::Project(_) => row.flash.as_ref().map(|words| (words, DeskClass::Muted)),
-        };
-        if let Some((extra, class)) = extra {
-            let extra = self.cut(extra, room - 2. * self.space);
-            if !extra.is_empty() {
-                text.push_str("\n  ");
-                self.cell(&mut text, &mut styles, &mut gaps, &extra, class, None);
-                lines.push(row.card.clone());
-            }
-        }
-        (
-            Item::new(row.key.clone(), text)
-                .with_styles(styles)
-                .with_lines(lines),
-            gaps,
-        )
+    /// No row is ever the Desk's subject: it has no cursor.
+    fn subject(&self, _: Option<rho_dealer::facts::Seen>, _cx: &App) -> Subject {
+        Subject::None
     }
 
-    fn cell(
-        &self,
-        text: &mut String,
-        styles: &mut Vec<(DeskClass, Range<usize>)>,
-        gaps: &mut Vec<(usize, Pixels)>,
-        cell: &str,
-        class: DeskClass,
-        width: Option<Pixels>,
-    ) {
-        let start = text.len();
-        text.push_str(cell);
-        if start < text.len() {
-            styles.push((class, start..text.len()));
-        }
-        if let Some(width) = width {
-            gaps.push((text.len(), (width - (self.measure)(cell)).max(px(0.))));
-            text.push(' ');
-        }
-    }
-
-    fn cut(&self, text: &str, room: Pixels) -> String {
-        let text = first_line(text);
-        let mut shown = text.to_owned();
-        if (self.measure)(&shown) <= room {
-            return shown;
-        }
-        shown = "…".into();
-        if (self.measure)(&shown) > room {
-            return String::new();
-        }
-        for end in text.char_indices().skip(1).map(|(end, _)| end) {
-            let prefix = text[..end].trim_end();
-            let candidate = format!("{prefix}…");
-            if (self.measure)(&candidate) > room {
-                break;
-            }
-            shown = candidate;
-        }
-        shown
+    fn card(&self, _cx: &App) -> CardHere {
+        CardHere::None
     }
 }
 
-type LaidOutRow = (Item<DeskKey, DeskClass, Address>, Vec<(usize, Pixels)>);
+impl Focusable for DeskView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 
 impl Render for DeskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout = DeskLayout::read(&self.editor, window, cx);
-        if layout != self.layout {
-            self.layout = layout;
-            self.reconcile(cx);
-        }
-        let text = self
-            .editor
-            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let viewport = window.viewport_size().width;
+        self.phone = Layout::of(viewport) == Layout::Phone;
         let colors = cx.theme().colors();
-        let (away, focus) = self
-            .frame
-            .upgrade()
-            .map(|frame| {
-                let frame = frame.read(cx);
-                (
-                    HostsAway::of(frame.hosts()),
-                    frame.focus_note(jiff::Timestamp::now(), cx),
+        // The frame sets the buffer font on the screen's layer.
+        let ch = rho_window::layout::ch(&window.text_style(), window);
+        // The count is global and quiet. The dealer focus and hosts away
+        // are the status bar's to say.
+        let count = div()
+            .flex_none()
+            .text_color(colors.text_muted)
+            .child(format!("{} wait", self.rows.wait_count));
+        let overflow = self.rows.overflow.as_ref().map(|overflow| {
+            let first = overflow.first.clone();
+            div()
+                .id("desk-more")
+                .truncate()
+                .text_color(colors.text_muted)
+                .child(overflow.words.clone())
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.open(first.clone(), window, cx)),
                 )
-            })
-            .unwrap_or_default();
-        div()
-            .key_context("RhoDesk")
-            .on_action(
-                cx.listener(|this, _: &keys::DeskNext, window, cx| this.step(true, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &keys::DeskPrevious, window, cx| {
-                    this.step(false, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &keys::DeskFirst, window, cx| {
-                vim::take_count(cx);
-                let row = this.selectable_rows(cx).next().unwrap_or(0);
-                this.select_row(row, Some(window), cx);
-            }))
-            .on_action(cx.listener(|this, _: &keys::DeskDraft, window, cx| {
-                vim::take_count(cx);
-                let row = this.selectable_rows(cx).next_back().unwrap_or(0);
-                this.select_row(row, Some(window), cx);
-            }))
+        });
+        let root = div()
+            .key_context(crate::keys::DESK)
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
-            .bg(colors.editor_background)
+            .bg(colors.editor_background);
+        if self.phone {
+            // A phone's status line already names the Desk.
+            let rows: Vec<_> = self
+                .rows
+                .waiting
+                .iter()
+                .map(|row| self.compact(row, cx))
+                .collect();
+            return root.child(
+                div()
+                    .id("desk-sheet")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(count)
+                    .children(rows)
+                    .children(overflow),
+            );
+        }
+        let sheet = (viewport - px(READING_INSET_PX) * 2.).min(ch * SHEET_MAX_CH);
+        let rows = self.sheet(cx);
+        // On a laptop the Desk's name and count are its top-left corner,
+        // left of the notch; row 1 starts right under it.
+        let heading = div()
+            .flex_none()
+            .h(px(TOP_ROW_PX))
+            .w(Notch::of(viewport).start)
+            .pl(px(READING_INSET_PX))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .overflow_hidden()
             .child(
                 div()
                     .flex_none()
-                    .pl(self.layout.inset)
-                    .font(text.font())
-                    .text_size(text.font_size)
-                    .line_height(text.line_height)
-                    // `quiet`, the host and focus notes too: a host away is
-                    // no alarm, and a focus narrows the deal, not the Desk.
-                    .text_color(colors.text_muted)
-                    .child(away.count(self.rows.wait_count, focus.as_deref())),
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rho_window::style::unread_text_color(cx))
+                    .child(self.title(cx)),
             )
-            .child(div().flex_1().min_h_0().w_full().child(self.editor.clone()))
+            .child(count);
+        root.child(heading).child(
+            div()
+                .id("desk-sheet")
+                .flex_1()
+                .min_h_0()
+                .w(sheet)
+                .mx_auto()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .child(rows)
+                .children(overflow),
+        )
     }
 }
 
@@ -874,64 +536,41 @@ mod tests {
     }
 
     #[test]
-    fn hosts_that_answer_leave_the_count_bare() {
+    fn hosts_that_answer_leave_nothing_to_note() {
         for hosts in [
             vec![],
             vec![("lab", HostStatus::Online), ("reef", HostStatus::Online)],
         ] {
             let away = away(&hosts);
-            assert_eq!(away.count(0, None), "0 wait");
-            assert_eq!(away.count(3, None), "3 wait");
+            assert_eq!(away.note(), None);
             assert_eq!(away.nothing_waits(None), "nothing waits");
         }
     }
 
     #[test]
-    fn a_host_still_connecting_never_shows_a_bare_zero() {
+    fn a_host_still_connecting_is_noted() {
         let one = away(&[("lab", HostStatus::Connecting)]);
-        assert_eq!(one.count(0, None), "connecting to lab…");
+        assert_eq!(one.note().as_deref(), Some("lab connecting"));
         assert_eq!(one.nothing_waits(None), "nothing waits · lab connecting");
         let both = away(&[
             ("lab", HostStatus::Connecting),
             ("reef", HostStatus::Connecting),
         ]);
-        assert_eq!(both.count(0, None), "connecting to 2 hosts…");
         assert_eq!(
             both.nothing_waits(None),
             "nothing waits · 2 hosts connecting"
         );
-        let some = away(&[
-            ("lab", HostStatus::Connecting),
-            ("reef", HostStatus::Online),
-        ]);
-        assert_eq!(some.count(0, None), "0 wait · lab connecting");
-        assert_eq!(some.count(3, None), "3 wait · lab connecting");
-    }
-
-    /// Cards this device kept from before the restart count while every
-    /// host is still connecting: they wait whether or not the host is back.
-    #[test]
-    fn cached_cards_count_while_every_host_connects() {
-        let one = away(&[("lab", HostStatus::Connecting)]);
-        assert_eq!(one.count(3, None), "3 wait · lab connecting");
-        let both = away(&[
-            ("lab", HostStatus::Connecting),
-            ("reef", HostStatus::Connecting),
-        ]);
-        assert_eq!(both.count(1, None), "1 wait · 2 hosts connecting");
     }
 
     /// An away host is an everyday state, whatever kept it away: a drop, a
-    /// connection gone quiet, or a host that needs the user's hand. The
-    /// Desk names it calmly beside the count and never says how long.
+    /// connection gone quiet, or a host that needs the user's hand. It is
+    /// named calmly and never with how long.
     #[test]
-    fn hosts_away_are_noted_beside_the_count() {
+    fn hosts_away_are_noted_calmly() {
         let lab_away = away(&[
             ("lab", HostStatus::Disconnected("refused".into())),
             ("reef", HostStatus::Online),
         ]);
-        assert_eq!(lab_away.count(0, None), "0 wait · lab away");
-        assert_eq!(lab_away.count(3, None), "3 wait · lab away");
         assert_eq!(lab_away.nothing_waits(None), "nothing waits · lab away");
         let all_away = away(&[
             (
@@ -940,35 +579,26 @@ mod tests {
             ),
             ("reef", HostStatus::Unenrolled("rho enroll".into())),
         ]);
-        assert_eq!(all_away.count(3, None), "3 wait · 2 hosts away");
-        assert_eq!(all_away.count(0, None), "0 wait · 2 hosts away");
-        assert_eq!(all_away.nothing_waits(None), "nothing waits · 2 hosts away");
+        assert_eq!(all_away.note().as_deref(), Some("2 hosts away"));
         let mixed = away(&[
             ("lab", HostStatus::Disconnected("refused".into())),
             ("reef", HostStatus::Connecting),
             ("sea", HostStatus::Online),
         ]);
-        assert_eq!(mixed.count(0, None), "0 wait · lab away · reef connecting");
         assert_eq!(
             mixed.nothing_waits(None),
             "nothing waits · lab away · reef connecting"
         );
         assert!(
-            !mixed.count(0, None).contains("12s") && !all_away.count(0, None).contains("12s"),
+            !all_away.note().unwrap().contains("12s"),
             "no ticking counter"
         );
     }
 
-    /// The count stays global under a dealer focus, with the focus noted
-    /// last; an empty focused deal names the project it looked in.
+    /// An empty focused deal names the project it looked in.
     #[test]
-    fn the_dealer_focus_is_noted_after_the_global_count() {
+    fn an_empty_focused_deal_names_its_project() {
         let lab_away = away(&[("lab", HostStatus::Disconnected("refused".into()))]);
-        assert_eq!(
-            lab_away.count(3, Some("focus tide")),
-            "3 wait · lab away · focus tide"
-        );
-        assert_eq!(away(&[]).count(5, Some("quiet 45m")), "5 wait · quiet 45m");
         assert_eq!(
             lab_away.nothing_waits(Some("tide")),
             "nothing waits in tide · lab away"
@@ -997,52 +627,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn current_words_are_quiet_context_on_the_existing_card_only() {
-        let hand = Hand {
-            cards: [7, 2].map(card).to_vec(),
+    fn hand(cards: impl Into<Vec<Card>>) -> Hand {
+        Hand {
+            cards: cards.into(),
             next_change: None,
-        };
+        }
+    }
+
+    fn nowhere(_: &Address) -> bool {
+        false
+    }
+
+    /// A row is the card's subject, its exception, its project and how
+    /// long it waited, each cell from its own part of the card: the age is
+    /// the end of the card's words, never the words before it.
+    #[test]
+    fn a_row_takes_each_cell_from_its_own_part_of_the_card() {
+        let mut push = card(4);
+        push.kind = CardKind::Approve("push");
+        push.label = "approve push · 3.0h".into();
+        let mut stop = card(5);
+        stop.kind = CardKind::Stop("failed");
+        stop.label = "failed · 12m".into();
+        let mut other = card(6);
+        other.kind = CardKind::Other;
+        other.label = "something · 9m".into();
+        let rows = desk_rows(
+            &hand([card(7), push, stop, other]),
+            |_| None,
+            |_| None,
+            |at| *at == address(7),
+        );
+        let cells = rows
+            .waiting
+            .iter()
+            .map(|row| {
+                (
+                    row.subject.as_str(),
+                    row.tag.as_deref(),
+                    row.project.as_str(),
+                    row.age.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells,
+            [
+                // Cached from a host that is away.
+                ("idea 7", Some("away"), "unformatted channel", "7m"),
+                (
+                    "idea 4",
+                    Some("approve push"),
+                    "unformatted channel",
+                    "3.0h"
+                ),
+                ("idea 5", Some("failed"), "unformatted channel", "12m"),
+                // A card that is no wait says no age.
+                ("idea 6", None, "unformatted channel", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_words_are_kept_for_the_phone_on_the_existing_card_only() {
+        let hand = hand([7, 2].map(card));
         let with_flash = desk_rows(
             &hand,
             |_| None,
             |id| (*id == address(7)).then(|| "Running clock checks".into()),
+            nowhere,
         );
-        let without_flash = desk_rows(&hand, |_| None, |_| None);
+        let without_flash = desk_rows(&hand, |_| None, |_| None, nowhere);
         assert_eq!(with_flash.wait_count, without_flash.wait_count);
         assert_eq!(with_flash.waiting[1], without_flash.waiting[1]);
         let row = &with_flash.waiting[0];
         assert_eq!(row.subject, without_flash.waiting[0].subject);
-        assert_eq!(row.card, without_flash.waiting[0].card);
-        let layout = RowLayout::new(|s: &str| px(s.chars().count() as f32));
-        let (wide, _) = layout.item(row, px(55.));
-        assert_eq!(
-            wide.text,
-            "idea 7 unformatted channel Running clock checks\n"
-        );
-        let (phone, _) = layout.compact(row, px(40.), px(19.));
-        assert_eq!(phone.lines, vec![address(7), address(7)]);
-        assert_eq!(
-            phone.text,
-            "idea 7 unformatted channel\n  Running clock checks\n"
-        );
-        assert!(
-            phone
-                .styles
-                .iter()
-                .any(|(class, bytes)| *class == DeskClass::Muted
-                    && &phone.text[bytes.clone()] == "Running clock checks")
-        );
+        assert_eq!(row.flash.as_deref(), Some("Running clock checks"));
+        assert_eq!(row.tag, None, "current words are no exception");
     }
 
     #[test]
     fn waiting_comes_straight_from_the_hand_with_the_full_count() {
         // Ranking a second time by priority, subject, or project yields
         // different orders. Counting the displayed rows would say seven.
-        let hand = Hand {
-            cards: [7, 94, 2, 71, 28, 16, 48, 44, 12].map(card).to_vec(),
-            next_change: None,
-        };
+        let hand = hand([7, 94, 2, 71, 28, 16, 48, 44, 12].map(card));
         let rows = desk_rows(
             &hand,
             |address| {
@@ -1052,6 +720,7 @@ mod tests {
                 })
             },
             |_| None,
+            nowhere,
         );
         assert_eq!(rows.wait_count, 9);
         assert_eq!(
@@ -1063,7 +732,7 @@ mod tests {
                 "idea 7", "idea 94", "idea 2", "idea 71", "idea 28", "idea 16", "idea 48"
             ]
         );
-        assert_eq!(rows.waiting[1].detail.project(), Some("shoal@lab"));
+        assert_eq!(rows.waiting[1].project, "shoal@lab");
         assert_eq!(rows.waiting[1].card, address(94));
     }
 
@@ -1078,10 +747,7 @@ mod tests {
         cards[10].kind = CardKind::Stop("stuck");
         cards[8].label = "waits · 6m".into();
         cards[8].kind = CardKind::Waits;
-        let hand = Hand {
-            cards: cards.to_vec(),
-            next_change: None,
-        };
+        let hand = hand(cards);
         let project = |address: &Address| {
             let id = match address.rest() {
                 "t7" | "t2" | "t85" => 1,
@@ -1094,15 +760,15 @@ mod tests {
                 name: if id == 3 { "clock@lab" } else { "reef@lab" }.into(),
             })
         };
-        let rows = desk_rows(&hand, project, |_| None);
+        let rows = desk_rows(&hand, project, |_| None, nowhere);
         assert_eq!(rows.wait_count, 14);
         assert_eq!(rows.waiting[0].subject, "reef@lab");
-        assert_eq!(rows.waiting[0].detail, DeskDetail::Stops("2 failed".into()));
+        assert_eq!(rows.waiting[0].tag.as_deref(), Some("2 failed"));
         assert_eq!(rows.waiting[0].card, address(7));
         assert_eq!(rows.waiting[1].card, address(85));
-        assert_eq!(rows.waiting[1].detail.project(), Some("reef@lab"));
+        assert_eq!(rows.waiting[1].project, "reef@lab");
         assert_eq!(rows.waiting[6].card, address(44));
-        assert_eq!(rows.waiting[6].detail, DeskDetail::Stops("3 stops".into()));
+        assert_eq!(rows.waiting[6].tag.as_deref(), Some("3 stops"));
         let overflow = rows.overflow.unwrap();
         assert_eq!(overflow.first, address(12));
         assert_eq!(
@@ -1117,7 +783,7 @@ mod tests {
                 .collect(),
             next_change: None,
         };
-        let rows = desk_rows(&afterwards, project, |_| None);
+        let rows = desk_rows(&afterwards, project, |_| None, nowhere);
         assert_eq!(rows.waiting[1].card, address(2));
         assert_eq!(rows.waiting[1].subject, "idea 2");
     }
@@ -1129,17 +795,14 @@ mod tests {
             card.kind = CardKind::Waits;
             card.label = "waits · now".into();
         }
-        let hand = Hand {
-            cards: cards.into(),
-            next_change: None,
-        };
+        let hand = hand(cards);
         let project = |_: &Address| {
             Some(Project {
                 address: Address::new("project", 1),
                 name: "clock@lab".into(),
             })
         };
-        let rows = desk_rows(&hand, project, |_| None);
+        let rows = desk_rows(&hand, project, |_| None, nowhere);
         assert_eq!(rows.waiting[0].subject, "idea 7");
         assert_eq!(rows.waiting[1].subject, "idea 85");
         let overflow = rows.overflow.unwrap();
@@ -1150,7 +813,7 @@ mod tests {
             cards: hand.cards[8..].into(),
             next_change: None,
         };
-        let rows = desk_rows(&hand, project, |_| None);
+        let rows = desk_rows(&hand, project, |_| None, nowhere);
         assert_eq!(
             rows.waiting
                 .iter()
@@ -1161,88 +824,27 @@ mod tests {
         assert!(rows.overflow.is_none());
     }
 
-    #[test]
-    fn a_narrow_stop_group_opens_from_either_line() {
-        let row = DeskRow {
-            key: DeskKey::Stops(Address::new("project", 1)),
-            subject: "tide@lab".into(),
-            detail: DeskDetail::Stops("12 failed".into()),
+    fn row(n: u32, project: &str, age: &str) -> DeskRow {
+        DeskRow {
+            key: DeskKey::Waiting(address(n)),
+            subject: format!("row {n}"),
+            tag: None,
+            project: project.into(),
+            age: age.into(),
             flash: None,
-            card: address(7),
-        };
-        let layout = RowLayout::new(|text: &str| px(text.chars().count() as f32 * 5.));
-        let (item, gaps) = layout.compact(&row, px(64.), px(29.));
-        assert_eq!(item.text, "tide@lab\n  12 failed\n");
-        assert_eq!(
-            item.styles,
-            [(DeskClass::Title, 0..8), (DeskClass::Label, 11..20)]
-        );
-        assert!(gaps.is_empty());
-        assert_eq!(item.lines, [address(7), address(7)]);
-    }
-
-    #[test]
-    fn laptop_rows_clip_in_shaped_pixels_without_padding_to_other_rows() {
-        let measure = |text: &str| {
-            px(text
-                .chars()
-                .map(|ch| match ch {
-                    'W' => 9.,
-                    'i' => 2.,
-                    '…' => 6.,
-                    ' ' => 4.,
-                    _ => 5.,
-                })
-                .sum())
-        };
-        let waiting = DeskRow {
-            key: DeskKey::Waiting(address(3)),
-            subject: "WiWi".into(),
-            detail: DeskDetail::Project("mini".into()),
-            flash: None,
-            card: address(3),
-        };
-        let stops = DeskRow {
-            key: DeskKey::Stops(Address::new("project", 1)),
-            subject: "WWWW".into(),
-            detail: DeskDetail::Stops("2 failed".into()),
-            flash: None,
-            card: address(4),
-        };
-        let layout = RowLayout::new(measure);
-        // Waiting needs 22 + 8 + 14 = 44 px; the stop row needs the full
-        // 36 + 8 + 36 = 80 px. One pixel less must clip only the latter.
-        for (room, stops_title) in [(68., "WW…"), (79., "WWW…"), (80., "WWWW")] {
-            for (row, title, detail, class) in [
-                (&waiting, "WiWi", "mini", DeskClass::Muted),
-                (&stops, stops_title, "2 failed", DeskClass::Label),
-            ] {
-                let (item, gaps) = layout.item(row, px(room));
-                assert_eq!(item.text, format!("{title} {detail}\n"));
-                assert_eq!(
-                    item.styles,
-                    [
-                        (DeskClass::Title, 0..title.len()),
-                        (class, title.len() + 1..item.text.len() - 1)
-                    ]
-                );
-                assert_eq!(gaps, [(title.len(), px(8.))]);
-                assert_eq!(item.lines, std::slice::from_ref(&row.card));
-            }
+            card: address(n),
         }
     }
 
     #[test]
     fn an_arrival_does_not_reorder_visible_rows() {
-        let row = |n| DeskRow {
-            key: DeskKey::Waiting(address(n)),
-            subject: format!("row {n}"),
-            detail: DeskDetail::Project("lab".into()),
-            flash: None,
-            card: address(n),
-        };
-        let before = [row(5), row(9)];
-        let mut fresh = [row(3), row(9), row(5), row(2)];
+        let before = [row(5, "lab", ""), row(9, "lab", "")];
+        let mut fresh = [
+            row(3, "lab", ""),
+            row(9, "lab", ""),
+            row(5, "lab", ""),
+            row(2, "lab", ""),
+        ];
         DeskRows::keep_order(&mut fresh, &before);
         assert_eq!(
             fresh.map(|row| row.subject),

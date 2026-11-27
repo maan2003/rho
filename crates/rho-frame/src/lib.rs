@@ -2,11 +2,11 @@
 //!
 //! rho is an editor the way Emacs is one. Every screen is a surface in a
 //! buffer, keys do everything, and there are no modals: the minibuffer
-//! asks, the echo line answers, and a menu under the point offers keys.
+//! asks, the echo line answers, and `space` is a silent prefix.
 //! The frame is what holds that together and nothing else: the places
 //! the reader has been, most recent first (`recent`), `Places` and
-//! `Commands` on the minibuffer ([`minibuffer`], [`command`]), the leader
-//! and snooze menus ([`menu`]), the keymap
+//! `Commands` on the minibuffer ([`minibuffer`], [`command`]), the silent
+//! `space` prefix ([`prefix`]), the keymap
 //! ([`keys`]), the attached agent hosts ([`hosts`]), the user's own facts
 //! in the ledger and the dealer that ranks what wants them
 //! ([`attention`], [`deal`]), and Desk ([`desk`]). A window narrow
@@ -40,12 +40,12 @@ pub mod hosts;
 pub mod keys;
 pub mod link;
 mod matching;
-pub mod menu;
 pub mod minibuffer;
 pub mod own;
 mod phone;
 mod place;
 mod places;
+pub mod prefix;
 mod recent;
 mod search;
 pub mod surface;
@@ -62,9 +62,9 @@ pub use frame::{CardInspection, Frame, Point};
 pub use hosts::OnHost;
 pub use keys::normal_contexts;
 pub use link::FrameLink;
-pub use menu::{Row, Rows};
 pub use minibuffer::{CancelHandler, Candidate, CandidateSource, SubmitHandler};
 pub use phone::{Layout, phone_editor_tap};
+pub use prefix::Row;
 pub use rho_agent_types::EndpointId;
 pub use rho_dealer::{Address, Addressed, Marks};
 pub use surface::{AnySurface, CardHere, Mode, PhoneTool, Subject, Surface};
@@ -77,10 +77,24 @@ pub use text_search::{TextHit, TextIndex, TextKind, TextSearch, TextTarget};
 /// deal, this device and its hosts. Each system exports its own, so the
 /// words for every command can be ranked together.
 pub static SPELLINGS: &[&Spelling] = &[
-    &own::WRITE_IDEA,
-    &own::UNDO_VERDICT,
-    &own::SNOOZE,
+    &own::DEAL_NEXT,
+    &own::CLOSE_AND_DEAL,
+    &own::DONE,
+    &own::MUTE,
     &own::UNMUTE,
+    &own::SNOOZE_THREAD,
+    &own::SNOOZE_NOTE,
+    &own::UNSNOOZE_THREAD,
+    &own::UNSNOOZE_NOTE,
+    &own::APPROVE_PUSH,
+    &own::DENY_PUSH,
+    &own::UNDO,
+    &own::OPEN_PLACES,
+    &own::OPEN_DESK,
+    &own::CLOSE_SCREEN,
+    &own::WRITE_IDEA,
+    &own::TOGGLE_NOTCH_MASK,
+    &own::SHOW_MESSAGES,
     &focus::SET_DEALER_FOCUS,
     &focus::CLEAR_DEALER_FOCUS,
     &own::PAIR_DEVICE,

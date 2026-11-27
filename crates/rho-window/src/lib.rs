@@ -13,8 +13,8 @@ pub mod draft;
 pub mod editor_config;
 pub mod highlights;
 pub mod languages;
+pub mod layout;
 pub mod markdown;
 pub mod style;
-pub mod transient;
 
 pub use style::{Region, StyleClass};

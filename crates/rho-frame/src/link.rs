@@ -12,7 +12,6 @@ use rho_dealer::Address;
 use rho_window::style::StyleClass;
 
 use crate::frame::Frame;
-use crate::menu::Rows;
 
 #[derive(Clone)]
 pub struct FrameLink {
@@ -74,12 +73,6 @@ impl FrameLink {
     pub fn echo(&self, text: impl Into<String>, class: StyleClass, cx: &mut App) {
         let text = text.into();
         self.with(cx, move |frame, _, cx| frame.echo(&text, class, cx));
-    }
-
-    pub fn menu(&self, rows: Rows, cx: &mut App) {
-        self.with(cx, move |frame, window, cx| {
-            frame.open_menu(rows, window, cx)
-        });
     }
 
     /// What the frame draws from a system changed: its claims, its Desk

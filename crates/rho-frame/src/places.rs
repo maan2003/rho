@@ -19,6 +19,9 @@ const DAY_MS: u64 = 86_400_000;
 
 pub(crate) struct Place {
     pub found: Found,
+    /// The key that reaches it without `Places`, shown flush right: `tab`
+    /// for Desk.
+    pub key: Option<&'static str>,
     pub card: Option<Card>,
     // Index in the window's visit history (most recent first).
     pub visit: Option<usize>,
@@ -123,9 +126,13 @@ impl Choice {
 
     // Blank input lists only places we have been, then places that wait.
     // A visited waiting place keeps its card words in both cases.
+    // A place with a key of its own is reached by it, so it does not crowd
+    // the recent places.
     fn blank(&self, desk: bool) -> Option<(u8, usize)> {
         match self {
-            Self::Place(Place { current: true, .. }) | Self::Words(_) => None,
+            Self::Place(Place { current: true, .. })
+            | Self::Place(Place { key: Some(_), .. })
+            | Self::Words(_) => None,
             Self::Place(Place { card: Some(_), .. }) if desk => None,
             Self::Place(Place {
                 visit: Some(visit), ..
@@ -159,6 +166,14 @@ impl Choice {
 
     pub fn fields(&self) -> [&str; 3] {
         [self.name(), self.detail(), self.beside()]
+    }
+
+    /// The key that reaches it without `Places`, if it has one.
+    pub fn key(&self) -> Option<&'static str> {
+        match self {
+            Self::Place(place) => place.key,
+            Self::Words(_) => None,
+        }
     }
 
     pub fn attention(&self) -> bool {
@@ -488,6 +503,7 @@ mod tests {
                 recency: 0,
                 also: Vec::new(),
             },
+            key: None,
             card: card.map(|words| Card {
                 address,
                 title: title.into(),
@@ -697,6 +713,7 @@ mod tests {
                 recency: 0,
                 also: vec!["usage".into()],
             },
+            key: None,
             card: None,
             visit,
             visited_ms: None,

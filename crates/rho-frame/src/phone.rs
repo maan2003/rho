@@ -3,27 +3,25 @@
 //! A window at most [`PHONE_MAX_WIDTH`] wide is a phone's. It shows what
 //! the desk shows, the one surface in view with the status line, the
 //! minibuffer and the echo, and adds what a keyboard would have given: a
-//! bar along the bottom edge, menus as a sheet of rows a thumb can hit,
-//! and a flick on the surface to deal the next card or flip to the place
+//! bar along the bottom edge, the prompt as rows a thumb can hit, and a
+//! flick on the surface to deal the next card or flip to the place
 //! before. Nothing here is a second place for state; every button runs
 //! what a key runs.
 
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, MouseButton, MouseDownEvent, Pixels, Point,
-    TouchEvent, TouchId, TouchPhase, Window, div, ease_out_quint, px,
+    Animation, AnimationExt as _, AnyElement, Context, MouseButton, Pixels, Point, TouchEvent,
+    TouchId, TouchPhase, Window, div, ease_out_quint, px,
 };
 use rho_journal::{PhoneFlickDirection, PhoneVerdict};
 use theme::ActiveTheme as _;
 
 use crate::attention::Verdict;
-use crate::frame::{Frame, snooze_rows};
-use crate::menu::{Pick, Rows};
-use crate::surface::{AnySurface, PhoneSend};
+use crate::frame::Frame;
+use crate::surface::{AnySurface, CardHere, PhoneSend};
 
 /// The widest window that is laid out as a phone.
 pub(crate) const PHONE_MAX_WIDTH: Pixels = px(600.);
@@ -271,6 +269,13 @@ pub(crate) struct Phone {
     generation: u64,
 }
 
+impl Phone {
+    /// Whether a snap is still moving the body.
+    pub(crate) fn snapping(&self) -> bool {
+        self.snap.is_some()
+    }
+}
+
 /// One button on the bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Button {
@@ -379,20 +384,6 @@ fn buttons(state: BarState) -> Vec<Button> {
     }
 }
 
-/// `rows` with each pick also said to the journal as `verdict` by thumb.
-fn journaled(mut rows: Rows, verdict: PhoneVerdict) -> Rows {
-    for row in &mut rows.rows {
-        if let Pick::Run { run, .. } = &mut row.pick {
-            let action = run.clone();
-            *run = Rc::new(move |frame, count, window, cx| {
-                record_verdict(verdict);
-                action(frame, count, window, cx);
-            });
-        }
-    }
-    rows
-}
-
 fn record_verdict(verdict: PhoneVerdict) {
     rho_journal::record(rho_journal::Event::PhoneVerdict { verdict });
 }
@@ -426,11 +417,10 @@ impl Frame {
                 self.note_input();
                 self.phone.contacts.insert(event.id);
                 // One finger flicks; a second makes it a pinch, and an
-                // open prompt or menu is what the reader is answering.
+                // open prompt is what the reader is answering.
                 let free = self.phone.contacts.len() == 1
                     && self.phone.snap.is_none()
-                    && self.minibuffer.is_none()
-                    && self.menu.is_none();
+                    && self.minibuffer.is_none();
                 self.phone.gesture = match free {
                     true => Some(Gesture::new(event, self.scroll_edge(cx))),
                     false => None,
@@ -589,36 +579,8 @@ impl Frame {
             .w_full()
             .overflow_hidden()
             .capture_touch(cx.listener(Self::phone_touch))
-            .capture_any_mouse_down(cx.listener(Self::phone_desk_row))
             .child(body)
             .into_any_element()
-    }
-
-    fn phone_desk_row(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.button != MouseButton::Left
-            || event.modifiers.modified()
-            || !self.desk_in_view()
-            || self.minibuffer.is_some()
-            || self.menu.is_some()
-            || self.phone.snap.is_some()
-        {
-            return;
-        }
-        // Claim only an actual desk row. The editor must still see clicks
-        // in its draft and on its address separator.
-        if self
-            .desk
-            .update(cx, |desk, cx| desk.tap(event.position, window, cx))
-        {
-            self.open_row(window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-        }
     }
 
     /// The bar along the bottom edge.
@@ -642,7 +604,7 @@ impl Frame {
             composing,
             desk: self.desk_in_view(),
             // Working in a terminal or shell keeps the navigation bar, and
-            // its leader still offers the related card's verdicts.
+            // its verdicts still land on the related card.
             card: (tools.iter().all(|tool| tool.replaces_desk) && self.phone_card(cx).is_some())
                 .then(|| {
                     if surface.inspects_card(cx) {
@@ -770,21 +732,27 @@ impl Frame {
                     if self.own_verdicts(target, cx).is_some() {
                         // A card answered in its own words, such as a push
                         // to approve or deny, is never just done.
-                        self.leader(window, cx);
+                        self.commands_prompt_at("push", window, cx);
                     } else {
                         record_verdict(PhoneVerdict::Done);
                         self.verdict(target, Verdict::Done, "done".to_owned(), window, cx);
                     }
                 }
             }
-            // How long is a question, the one the snooze menu asks.
+            // How long is a question, the one `snooze thread ` asks with
+            // the same rows as on the laptop, each with its time.
             Button::Snooze => {
-                if let Some(target) = &target {
-                    let rows = journaled(snooze_rows(target), PhoneVerdict::Defer);
-                    self.open_menu(rows, window, cx);
+                if target.is_some() {
+                    record_verdict(PhoneVerdict::Defer);
+                    let line = match self.current_surface().card(cx) == CardHere::Reminder {
+                        true => "snooze note ",
+                        false => "snooze thread ",
+                    };
+                    self.commands_prompt_at(line, window, cx);
                 }
             }
-            Button::More => self.leader(window, cx),
+            // Every verdict, with its keys, is a command.
+            Button::More => self.commands_prompt(window, cx),
             Button::Undo => {
                 if let Some(editor) = self.current_surface().editor(cx) {
                     editor.update(cx, |editor, cx| {
@@ -802,147 +770,6 @@ impl Frame {
             Button::Enter => self.minibuffer_confirm(window, cx),
         }
         cx.notify();
-    }
-
-    /// The open menu as a sheet over the window: the same rows the desk
-    /// draws under the point, each a row a thumb can hit. The scrim and
-    /// bottom edge dismiss it; neither is part of the row hit area.
-    pub(crate) fn render_menu_sheet(
-        &self,
-        text_style: &gpui::TextStyle,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let open = self.menu.as_ref()?;
-        let colors = cx.theme().colors();
-        let target = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .h(TARGET_HEIGHT)
-                .min_w(TARGET_HEIGHT)
-                .flex()
-                .items_center()
-                .text_color(colors.text_muted)
-                .child(label)
-        };
-        let dismiss = || cx.listener(|this, _, window, cx| this.close_menu(window, cx));
-        let header = div()
-            .flex()
-            .flex_none()
-            .flex_row()
-            .items_center()
-            .min_h(TARGET_HEIGHT)
-            .px_3()
-            .gap_3()
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .children((!open.under.is_empty()).then(|| {
-                target("rho-sheet-back", "‹ back")
-                    .on_click(cx.listener(|this, _, window, cx| this.menu_dismiss(window, cx)))
-            }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(open.rows.title.clone()),
-            )
-            .child(
-                target("rho-sheet-close", "close")
-                    .justify_end()
-                    .on_click(dismiss()),
-            );
-        let rows = open.rows.rows.iter().enumerate().map(|(index, row)| {
-            div()
-                .id(("rho-menu-row", index))
-                .cursor_pointer()
-                .flex()
-                .flex_row()
-                .items_center()
-                .min_h(TARGET_HEIGHT)
-                .w_full()
-                .px_3()
-                .gap_3()
-                .border_b_1()
-                .border_color(colors.border_variant)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(open.transient.items()[index].description().to_owned()),
-                )
-                .children(
-                    row.pick
-                        .value()
-                        .map(|value| div().text_color(colors.text_muted).child(value.to_owned())),
-                )
-                .children(
-                    matches!(row.pick, Pick::Menu(_))
-                        .then(|| div().text_color(colors.text_muted).child("›")),
-                )
-                // The key is still the key: a phone with a keyboard
-                // presses it the way the desk does.
-                .child(
-                    div()
-                        .text_color(colors.terminal_ansi_bright_cyan)
-                        .child(row.key.clone()),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.click_menu_row(index, window, cx);
-                }))
-        });
-        let sheet = crate::minibuffer::bottom_strip(text_style, cx)
-            .occlude()
-            .max_h(gpui::relative(0.82))
-            .child(header)
-            .child(
-                div()
-                    .id("rho-sheet-rows")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows),
-            );
-        let cancel = crate::minibuffer::bottom_strip(text_style, cx)
-            .absolute()
-            .bottom_0()
-            .py_0()
-            .occlude()
-            .child(
-                target("rho-sheet-cancel", "cancel")
-                    .justify_center()
-                    .on_click(dismiss()),
-            );
-        Some(
-            div()
-                .track_focus(&self.menu_focus)
-                .absolute()
-                .inset_0()
-                // Keep the scrim a sibling, not a click listener on the
-                // sheet's parent. A press outside can't arm a menu row.
-                .child(
-                    div()
-                        .id("rho-sheet-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .bg(gpui::black().opacity(0.35))
-                        .on_click(dismiss()),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bottom(TARGET_HEIGHT)
-                        .flex()
-                        .flex_col()
-                        .justify_end()
-                        .child(sheet),
-                )
-                // Cover the work's bar with a dismiss target, not a command row.
-                .child(cancel)
-                .into_any_element(),
-        )
     }
 }
 

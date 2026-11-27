@@ -111,6 +111,9 @@ pub(crate) struct Matched {
     pub inline: Option<Inline>,
     /// Display bytes of the name the words matched.
     pub marks: Vec<Range<usize>>,
+    /// What the value given comes to, for a command that previews its
+    /// values: `→ today 19:56`.
+    pub preview: Option<String>,
     /// How many of the typed words name the command.
     naming: usize,
     tier: Tier,
@@ -249,6 +252,7 @@ impl Listing {
                     index,
                     inline: None,
                     marks: Vec::new(),
+                    preview: None,
                     naming: 0,
                     tier: Tier::Name,
                     weight: NAME_WEIGHT,
@@ -320,6 +324,7 @@ impl Listing {
                     index,
                     inline,
                     marks,
+                    preview: None,
                     naming,
                     tier,
                     weight,
@@ -334,11 +339,66 @@ impl Listing {
             (
                 Reverse(row.naming),
                 row.tier,
+                // `snooze` on a note means `snooze note`, though `snooze`
+                // means `snooze thread` more surely anywhere else.
+                !entry.command.here,
                 Reverse(row.weight),
                 entry.recent.unwrap_or(usize::MAX),
                 entry.command.name(),
             )
         });
+        let open_end = input.ends_with(char::is_whitespace);
+        let best = rows.first().map_or(0, |row| row.naming);
+        rows.into_iter()
+            .flat_map(|row| self.values(row, open_end, terms.len(), best))
+            .collect()
+    }
+
+    /// The rows of a command that previews its values: what the line gives
+    /// it, when that comes to something, then each preset the value begun
+    /// fits. With the name said and room after it (`snooze thread `), every
+    /// preset. A value that comes to nothing keeps its row only where the
+    /// line names that command best, so enter says why.
+    fn values(&self, row: Matched, open_end: bool, terms: usize, best: usize) -> Vec<Matched> {
+        let command = &self.entries[row.index].command;
+        let Some(preview) = &command.preview else {
+            return vec![row];
+        };
+        let said = matches!(
+            row.tier,
+            Tier::Name | Tier::NameWords | Tier::Alias | Tier::AliasWords
+        );
+        let typed = match &row.inline {
+            Some(Inline::Value(value)) => value.clone(),
+            None if open_end && said && row.naming == terms => String::new(),
+            _ => return vec![row],
+        };
+        let folded = typed.to_lowercase();
+        let given = |value: &str, preview: Option<String>| Matched {
+            index: row.index,
+            inline: Some(Inline::Value(value.to_owned())),
+            marks: row.marks.clone(),
+            preview,
+            naming: row.naming,
+            tier: row.tier,
+            weight: row.weight,
+        };
+        let mut rows = Vec::new();
+        if !command.presets.contains(&folded.as_str())
+            && let Some(lands) = preview(&typed)
+        {
+            rows.push(given(&typed, Some(lands)));
+        }
+        rows.extend(
+            command
+                .presets
+                .iter()
+                .filter(|preset| preset.starts_with(&folded))
+                .map(|preset| given(preset, preview(preset))),
+        );
+        if rows.is_empty() && row.naming == best {
+            rows.push(row);
+        }
         rows
     }
 
@@ -350,9 +410,10 @@ impl Listing {
         matched: &'a Matched,
     ) -> (&'static str, Option<&'a str>, Option<&'a str>) {
         let command = &self.entries[matched.index].command;
-        let target = match &matched.inline {
-            Some(Inline::Place { place, .. }) => Some(place.name.as_str()),
-            Some(Inline::Value(_)) | None => command.target_text(),
+        let target = match (&matched.inline, &matched.preview) {
+            (_, Some(preview)) => Some(preview.as_str()),
+            (Some(Inline::Place { place, .. }), None) => Some(place.name.as_str()),
+            (Some(Inline::Value(_)) | None, None) => command.target_text(),
         };
         (
             command.name(),

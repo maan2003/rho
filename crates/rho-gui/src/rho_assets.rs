@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn oksolar_body_foreground_is_quieter_and_remains_accessible() {
+    fn oksolar_carries_the_design_tokens_and_stays_accessible() {
         let registry = theme::ThemeRegistry::new(Box::new(RhoAssets));
         theme_settings::load_bundled_themes(&registry);
         let theme = registry
@@ -220,8 +220,31 @@ mod tests {
         ))
         .expect("valid Rho OKSolar P3 source");
         let style = &source["themes"][0]["style"];
-        assert_eq!(style["text"], "oklch(70.9% 0.012 95)");
-        assert_eq!(style["editor.foreground"], "oklch(70.9% 0.012 95)");
+        // `product/design.md`, token color.
+        for (key, token) in [
+            ("background", "oklch(23.0% 0.018 150)"),
+            ("status_bar.background", "oklch(20.6% 0.016 150)"),
+            ("terminal.bright_foreground", "oklch(89.5% 0.008 95)"),
+            ("text", "oklch(83.5% 0.010 95)"),
+            ("editor.foreground", "oklch(83.5% 0.010 95)"),
+            ("text.disabled", "oklch(73.5% 0.010 95)"),
+            ("text.muted", "oklch(56.0% 0.012 110)"),
+            ("warning", "oklch(79.5% 0.145 78)"),
+            ("text.accent", "oklch(81.0% 0.065 185)"),
+            ("border.selected", "oklch(68.0% 0.095 185)"),
+            ("border.focused", "oklch(82.0% 0.125 185)"),
+            ("border", "oklch(32.0% 0.018 150)"),
+            ("border.variant", "oklch(27.8% 0.016 150)"),
+            ("surface.background", "oklch(25.4% 0.019 150)"),
+            ("element.selected", "oklch(35.5% 0.022 150)"),
+        ] {
+            assert_eq!(style[key], token, "{key}");
+        }
+        assert!(
+            wcag_relative_luminance(colors.terminal_bright_foreground)
+                > wcag_relative_luminance(colors.editor_foreground),
+            "unread text reads brighter than read text"
+        );
         assert_eq!(
             colors.text, colors.editor_foreground,
             "general and editor body text use the same foreground"
@@ -233,10 +256,6 @@ mod tests {
         assert!(
             contrast >= 6.5,
             "body text contrast must remain at least 6.5:1, got {contrast:.2}:1"
-        );
-        assert!(
-            (contrast - 6.509).abs() < 0.005,
-            "unexpected contrast {contrast}"
         );
     }
 
