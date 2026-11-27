@@ -449,9 +449,9 @@ fn newest_news(system: &ChatSystem, thread: ThreadId) -> Option<ChatSeq> {
 }
 
 /// The pushes and fetches that wait in the thread now.
-fn waiting_asks(system: &ChatSystem, thread: ThreadId) -> BTreeSet<u64> {
+fn waiting_asks(system: &ChatSystem, thread: ThreadId, cx: &App) -> BTreeSet<u64> {
     system
-        .asks_in(thread)
+        .asks_in(thread, cx)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
@@ -699,7 +699,7 @@ impl ThreadView {
     fn seen_top(&mut self, cx: &App) {
         let system = self.system.read(cx);
         self.seen_in_view = newest_version(system, self.thread);
-        self.seen_asks = waiting_asks(system, self.thread);
+        self.seen_asks = waiting_asks(system, self.thread, cx);
     }
 
     /// Whether a message, an edit, or a push or fetch came that the reader
@@ -707,7 +707,7 @@ impl ThreadView {
     fn news(&self, cx: &App) -> bool {
         let system = self.system.read(cx);
         newest_news(system, self.thread) > self.seen_in_view
-            || !waiting_asks(system, self.thread).is_subset(&self.seen_asks)
+            || !waiting_asks(system, self.thread, cx).is_subset(&self.seen_asks)
     }
 
     /// `chat.Thread.open`, from the deal or by name: news opens the top,
@@ -1194,7 +1194,7 @@ fn short_tag(id: &str) -> String {
 /// below the draft: what it would do, and the keys that answer it.
 fn ask_items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, Class, Meta>> {
     let mut items = Vec::new();
-    for (id, waiting) in system.asks_in(thread) {
+    for (id, waiting) in system.asks_in(thread, cx) {
         let asker = waiting.ask.request.agent.map_or_else(String::new, |agent| {
             agent_name(system, thread.host, agent, cx)
         });
@@ -2620,7 +2620,7 @@ impl ThreadView {
             Some(subject) => Heading::new(subject).context(project),
             None => Heading::new(project),
         };
-        if !system.asks_in(self.thread).is_empty() {
+        if !system.asks_in(self.thread, cx).is_empty() {
             return heading.marker("approve push", token::attention());
         }
         match system.work(self.thread) {
@@ -4338,6 +4338,7 @@ mod tests {
                         created_at: Some(UnixMs(1)),
                         doing: None,
                         stopped_because: None,
+                        parent: None,
                     })
                 }));
                 let log = system.logs.entry(thread.host).or_default();

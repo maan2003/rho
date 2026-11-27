@@ -251,6 +251,7 @@ impl AgentsSystem {
                             .as_ref()
                             .and_then(|heard| heard.stopped_because())
                             .map(str::to_owned),
+                        parent: entry.identity.parent(),
                     }
                 }),
             None => Some(Participant {
@@ -260,6 +261,7 @@ impl AgentsSystem {
                 created_at: None,
                 doing: None,
                 stopped_because: None,
+                parent: None,
             }),
         }
     }

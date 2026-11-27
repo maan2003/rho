@@ -246,6 +246,7 @@ fn run() -> Result<()> {
                                     created_at: None,
                                     doing: None,
                                     stopped_because: None,
+                                    parent: None,
                                 })
                             },
                             |agents| agents.read(cx).participant(endpoint, agent),

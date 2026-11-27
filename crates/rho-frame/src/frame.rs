@@ -3706,6 +3706,16 @@ mod tests {
         frame
             .update(cx, |frame, window, cx| {
                 assert!(frame.desk_in_view());
+                // Off its thread, the rows say they open it.
+                for (line, target) in [
+                    ("approve push", "open thread to approve"),
+                    ("deny push", "open thread to deny"),
+                ] {
+                    assert_eq!(
+                        rows_for(frame, line, window, cx)[0],
+                        (line.to_owned(), None, Some(target.to_owned())),
+                    );
+                }
                 run_line(frame, "approve push", window, cx);
                 assert_eq!(frame.current_address(), &push, "the push opens to be read");
                 assert_eq!(
@@ -3981,6 +3991,15 @@ mod tests {
         }
 
         fn verdicts(&mut self, address: &Address, _: &mut Context<Self>) -> Option<Vec<Row>> {
+            // As the host's: only a push that still waits takes an answer.
+            if !self
+                .0
+                .borrow()
+                .iter()
+                .any(|claim| &claim.address == address)
+            {
+                return None;
+            }
             let waiting = self.0.clone();
             let address = address.clone();
             let answer = |word: &'static str| {

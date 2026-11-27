@@ -590,6 +590,12 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
             request: request.clone(),
         })
         .await?;
+    // The user answers in their thread, whenever they come to it; the
+    // agent may give the push up meanwhile.
+    eprintln!(
+        "rho: this waits for the user's approval in their thread; \
+         `rho git withdraw` takes it back"
+    );
     match client.recv().await? {
         Opened::Ready => {}
         Opened::Refused { reason } => anyhow::bail!("{reason}"),

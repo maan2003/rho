@@ -7,9 +7,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_hosts::protocol::{
     DebugReport, ForgetSavepoints, GccpApprove, GccpContact, GccpHost, GccpList, GccpRemove,
-    GccpState, GitDecision, GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload,
-    IrohApprove, IrohDevice, IrohDevices, IrohPair, IrohRevoke, IrohTrustInMemory, Open,
-    PlatformSecretsSet, PlatformStatus, Request, Snapshot,
+    GccpState, GitDecision, GitProvided, GitProviderFrame, GitTransportPolicy, GitWithdraw,
+    GuiTelemetryUpload, IrohApprove, IrohDevice, IrohDevices, IrohPair, IrohRevoke,
+    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Request, Snapshot,
 };
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -181,6 +181,12 @@ where
             respond(writer, call, |GitTransportPolicy { host }| async move {
                 Ok(host == "github.com"
                     && services.platform_secrets.contains_nonempty("GITHUB_TOKEN"))
+            })
+            .await
+        }
+        Request::GitWithdraw(call) => {
+            respond(writer, call, |GitWithdraw { agent }| async move {
+                Ok(services.git_transport.withdraw_agent(agent))
             })
             .await
         }
@@ -545,6 +551,40 @@ mod git_tests {
         assert_eq!(
             window.recv().await,
             Some(GitProviderFrame::Done { request_id })
+        );
+    }
+
+    /// The agent withdraws its push while it waits: the window hears the
+    /// request is done, so the card goes without a denial, and the agent's
+    /// git reads that it was withdrawn.
+    #[tokio::test]
+    async fn an_agent_that_withdraws_its_push_ends_its_card() {
+        let agent =
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let broker = GitTransportBroker::default();
+        let mut window = window(&broker);
+        let (mut helper, host) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host);
+        let mut request = push();
+        request.agent = Some(agent);
+        let serving = serve_git_transport_request(&broker, reader, writer, request);
+        let withdraw = async {
+            let (request_id, _) = requested(&mut window).await;
+            assert_eq!(broker.withdraw_agent(agent), 1);
+            request_id
+        };
+        let (served, request_id) = tokio::join!(serving, withdraw);
+        served.unwrap();
+        assert_eq!(
+            window.recv().await,
+            Some(GitProviderFrame::Done { request_id })
+        );
+        let opened: Opened = read_frame(&mut helper).await.unwrap();
+        assert_eq!(
+            opened,
+            Opened::Refused {
+                reason: "the agent withdrew this request".to_owned()
+            }
         );
     }
 

@@ -18,12 +18,14 @@ static STOP_AGENT: Spelling = Spelling {
     argument: None,
 };
 
-/// What the test sets: the claims, the host every thread lives on, and
-/// where `stop agent` was run from.
+/// What the test sets: the claims, the host every thread lives on, the
+/// threads a push waits in, and where `stop agent` was run from.
 #[derive(Default)]
 struct World {
     claims: Vec<rho_dealer::Claim>,
     host: Option<HostId>,
+    pushes: Vec<Address>,
+    approved: Vec<Address>,
     stopped: Vec<Address>,
 }
 
@@ -77,6 +79,26 @@ impl crate::System for Work {
 
     fn host(&self, _: &Address, _: &App) -> Option<HostId> {
         self.0.borrow().host
+    }
+
+    /// A push that waits takes `approve` and `deny`, which answer it.
+    fn verdicts(&mut self, address: &Address, _: &mut Context<Self>) -> Option<Vec<Row>> {
+        if !self.0.borrow().pushes.contains(address) {
+            return None;
+        }
+        let answer = |key: &'static str, said: &'static str| {
+            let world = self.0.clone();
+            let address = address.clone();
+            Row::run(key, said, move |frame, window, cx| {
+                let mut world = world.borrow_mut();
+                world.pushes.retain(|push| push != &address);
+                world.claims.retain(|claim| claim.address != address);
+                world.approved.push(address.clone());
+                drop(world);
+                frame.answered(&address, format!("{said}: push"), window, cx);
+            })
+        };
+        Some(vec![answer("a", "approved"), answer("x", "denied")])
     }
 
     fn find(&self, _: &rho_dealer::Marks, _: &App) -> Vec<Found> {
@@ -583,6 +605,55 @@ fn reconnecting_clears_that_hosts_stale_away_echo(cx: &mut gpui::TestAppContext)
                 echo_of(frame).as_deref(),
                 Some("reef away · connection lost")
             );
+        })
+        .unwrap();
+}
+
+/// A push on an away host takes no answer, so none waits offline: `space
+/// a`, `space x` and both commands say the host is away, and the push
+/// still waits. Once the host is back, the push on screen is answered.
+#[gpui::test]
+fn a_push_on_an_away_host_is_refused_until_it_is_back(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_tokio::init);
+    let (frame, world, _) = work_frame(cx);
+    let mut push = titled(asks(&clock(), hours(1), false), "Flaky clock test");
+    push.kind = rho_dealer::rank::CardKind::Approve("push");
+    world.borrow_mut().claims = vec![push];
+    world.borrow_mut().pushes = vec![clock()];
+    frame
+        .update(cx, |frame, window, cx| {
+            let spec = HostSpec {
+                name: "lab".to_owned(),
+                target: rho_agent_hosts::AttachTarget::Local {
+                    runtime_dir: "/nonexistent/lab".into(),
+                },
+            };
+            let (host, _) = frame.attach_host_in_process(spec, cx);
+            world.borrow_mut().host = Some(host);
+            frame
+                .hosts
+                .set_status(host, HostStatus::Disconnected("connection lost".into()));
+            frame.pull_card(window, cx);
+            assert_eq!(frame.current_address(), &clock(), "the push is read here");
+            let away = Some("lab away · approve when it is back");
+            for key in ["a", "x"] {
+                frame.echo = None;
+                press_space(frame, key, window, cx);
+                assert_eq!(echo_of(frame).as_deref(), away, "space {key}");
+                assert!(frame.minibuffer.is_none(), "space {key} asks nothing");
+            }
+            for line in ["approve push", "deny push"] {
+                frame.echo = None;
+                run_line(frame, line, window, cx);
+                assert_eq!(echo_of(frame).as_deref(), away, "{line}");
+            }
+            assert!(world.borrow().approved.is_empty(), "nothing was answered");
+            assert_eq!(frame.current_address(), &clock());
+
+            frame.hosts.set_status(host, HostStatus::Online);
+            press_space(frame, "a", window, cx);
+            assert_eq!(world.borrow().approved, [clock()]);
+            assert!(frame.desk_in_view(), "answered, and nothing else waits");
         })
         .unwrap();
 }

@@ -221,8 +221,16 @@ pub(crate) fn prefix(frame: &Frame, cx: &mut gpui::App) -> Prefix {
         frame.places(window, cx)
     }));
     let push = frame.push_here(cx);
-    match &push {
-        Some(rows) => {
+    let refused = push
+        .as_ref()
+        .and_then(|_| frame.own_card(cx))
+        .and_then(|card| frame.push_refused(&card, cx));
+    match (&push, refused) {
+        (Some(_), Some(reason)) => {
+            prefix.refuse("a", reason.clone());
+            prefix.refuse("x", reason);
+        }
+        (Some(rows), None) => {
             if let Some(approve) = rows.iter().find(|row| row.key == "a") {
                 prefix.push(Row {
                     word: "approve".to_owned(),
@@ -233,7 +241,7 @@ pub(crate) fn prefix(frame: &Frame, cx: &mut gpui::App) -> Prefix {
                 frame.deny_prompt(window, cx)
             }));
         }
-        None => {
+        (None, _) => {
             prefix.refuse("a", "no push here");
             prefix.refuse("x", "no push here");
         }
@@ -287,9 +295,28 @@ impl Frame {
 
     /// The answers a push on screen takes, from the system that staged it:
     /// only on the push's own thread, never from a list or another screen.
+    /// A push the user can read is theirs to answer, even on a thread they
+    /// muted or snoozed, which deals it to nobody.
     pub(crate) fn push_here(&self, cx: &mut gpui::App) -> Option<Vec<Row>> {
-        let target = self.own_card(cx).filter(|card| self.waits(card))?;
+        let target = self.own_card(cx)?;
         self.own_verdicts(&target, cx)
+    }
+
+    /// Why the push at `address` takes no answer now: its host is away,
+    /// and an answer never waits offline for it (`deal.Verdict`).
+    pub(crate) fn push_refused(&self, address: &Address, cx: &gpui::App) -> Option<String> {
+        self.away_host(address, cx)
+            .map(|host| format!("{} away · approve when it is back", host.name))
+    }
+
+    /// The first push that waits in the deal, which `approve push` and
+    /// `deny push` open from anywhere else.
+    fn first_push(&self, cx: &mut gpui::App) -> Option<rho_dealer::Card> {
+        self.hand()
+            .cards
+            .clone()
+            .into_iter()
+            .find(|card| self.own_verdicts(&card.address, cx).is_some())
     }
 
     /// Whether `address` sleeps under a snooze that has not ended; a
@@ -339,16 +366,16 @@ impl Frame {
         cx: &mut Context<Self>,
     ) {
         if let Some(rows) = self.push_here(cx) {
-            return answer(self, rows, window, cx);
+            let refused = self
+                .own_card(cx)
+                .and_then(|card| self.push_refused(&card, cx));
+            return match refused {
+                Some(reason) => self.echo(&reason, StyleClass::SystemInfo, cx),
+                None => answer(self, rows, window, cx),
+            };
         }
         // A push is a card its system answers in its own words.
-        let push = self
-            .hand()
-            .cards
-            .clone()
-            .into_iter()
-            .find(|card| self.own_verdicts(&card.address, cx).is_some());
-        match push {
+        match self.first_push(cx) {
             Some(card) => {
                 self.open_card(card, window, cx);
                 self.echo(
@@ -371,6 +398,12 @@ impl Frame {
     /// `space x`: `deny push` on the line with the draft's words after it,
     /// for `enter` to confirm.
     pub(crate) fn deny_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self
+            .own_card(cx)
+            .and_then(|card| self.push_refused(&card, cx))
+        {
+            return self.echo(&reason, StyleClass::SystemInfo, cx);
+        }
         let draft = self.current_surface().draft(cx).unwrap_or_default();
         let draft = draft.split_whitespace().collect::<Vec<_>>().join(" ");
         self.commands_prompt_at(&format!("{} {draft}", DENY_PUSH.name), window, cx);
@@ -518,6 +551,9 @@ fn reminded_note_lands(typed: &str) -> Option<String> {
 pub(crate) fn commands(frame: &Frame, cx: &mut gpui::App) -> Vec<Command> {
     let waiting = frame.waiting_card(cx);
     let push = frame.push_here(cx).and_then(|_| frame.own_card(cx));
+    // Off the push's thread, a row says it opens the thread rather than
+    // answering a push the user has not read.
+    let elsewhere = push.is_none() && frame.first_push(cx).is_some();
     let card_words = |address: &Address| frame.card_for(address, cx).heading();
     let note = frame.reminder_in_view(cx);
     let thread = frame.thread_here(cx);
@@ -581,7 +617,11 @@ pub(crate) fn commands(frame: &Frame, cx: &mut gpui::App) -> Vec<Command> {
             unsnooze_thread = unsnooze_thread.here();
         }
     }
-    let push_target = or(push.as_ref().map(card_words), "the push waiting first");
+    let push_target = |verb: &str| match (&push, elsewhere) {
+        (Some(push), _) => card_words(push),
+        (None, true) => format!("open thread to {verb}"),
+        (None, false) => "no push waits".to_owned(),
+    };
     // On the push's own thread, `approve` is its approval before any
     // other system's.
     let push_here = |command: Command| match push {
@@ -620,14 +660,14 @@ pub(crate) fn commands(frame: &Frame, cx: &mut gpui::App) -> Vec<Command> {
                 )
             })
             .keys("space a")
-            .target(push_target.clone()),
+            .target(push_target("approve")),
         ),
         push_here(
             Command::new(&DENY_PUSH, |frame, typed, window, cx| {
                 frame.deny_push(typed, window, cx)
             })
             .keys("space x")
-            .target(push_target),
+            .target(push_target("deny")),
         ),
         Command::simple(&UNDO, |frame, window, cx| frame.undo_verdict(window, cx)).keys("space u"),
         Command::simple(&OPEN_PLACES, |frame, window, cx| frame.places(window, cx)).keys("space f"),

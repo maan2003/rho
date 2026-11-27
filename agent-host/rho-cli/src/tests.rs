@@ -47,6 +47,18 @@ fn github_init_parses() {
 }
 
 #[test]
+fn git_withdraw_parses() {
+    let args = Args::try_parse(["git", "withdraw"].into_iter().map(str::to_owned)).unwrap();
+    assert!(matches!(
+        args.command,
+        Command::Git(GitArgs {
+            command: GitCommand::Withdraw,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn pr_commands_are_not_available() {
     assert!(Args::try_parse(["pr", "status"].into_iter().map(str::to_owned)).is_err());
 }

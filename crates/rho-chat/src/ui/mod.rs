@@ -117,6 +117,9 @@ pub struct Participant {
     pub doing: Option<Doing>,
     /// Why it stopped, in its host's words, while a failure stopped it.
     pub stopped_because: Option<String>,
+    /// The agent that made it, for one another agent made: the user meets
+    /// its work in the thread of the work it helps.
+    pub parent: Option<AgentId>,
 }
 
 /// What mail knows of an agent of the host with this identity, and `None`
@@ -262,6 +265,7 @@ impl ChatSystem {
                     created_at: None,
                     doing: None,
                     stopped_because: None,
+                    parent: None,
                 })
             }),
             git: git::GitAsks::new(git_streams),

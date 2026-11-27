@@ -302,22 +302,35 @@ impl ChatSystem {
         }
     }
 
-    /// The thread the agent behind a request works in, once this window
-    /// holds that thread.
-    fn ask_thread(&self, waiting: &Waiting) -> Option<ThreadId> {
+    /// The thread the user meets the agent behind a request in, once this
+    /// window holds that thread: the thread it works in, or, for an agent
+    /// another agent made and briefed in their own words, the thread of the
+    /// agent that made it, and so on up. A push never waits where the user
+    /// is never dealt.
+    fn ask_thread(&self, waiting: &Waiting, cx: &App) -> Option<ThreadId> {
         let host = self.hosts.get(&waiting.host)?.endpoint?;
-        let agent = waiting.ask.request.agent?;
-        let message = self.logs.get(&host)?.working_thread(agent)?;
-        Some(ThreadId { host, message })
+        let chat = self.logs.get(&host)?;
+        let mut agent = waiting.ask.request.agent?;
+        let mut asked = std::collections::BTreeSet::new();
+        while asked.insert(agent) {
+            if let Some(message) = chat
+                .working_thread(agent)
+                .filter(|thread| !chat.agent_only(*thread))
+            {
+                return Some(ThreadId { host, message });
+            }
+            agent = self.participant(host, agent, cx)?.parent?;
+        }
+        None
     }
 
     /// The requests that wait in `thread`, the oldest first: the one the
     /// thread's answers go to leads.
-    pub(crate) fn asks_in(&self, thread: ThreadId) -> Vec<(u64, &Waiting)> {
+    pub(crate) fn asks_in(&self, thread: ThreadId, cx: &App) -> Vec<(u64, &Waiting)> {
         let mut asks: Vec<_> = self
             .git
             .iter()
-            .filter(|(_, waiting)| self.ask_thread(waiting) == Some(thread))
+            .filter(|(_, waiting)| self.ask_thread(waiting, cx) == Some(thread))
             .collect();
         asks.sort_by_key(|(id, waiting)| (waiting.ask.requested_at_ms, *id));
         asks
@@ -329,7 +342,7 @@ impl ChatSystem {
     pub(super) fn git_claims(&self, claims: &mut Vec<Claim>, cx: &App) {
         let mut oldest: BTreeMap<ThreadId, (u64, &Waiting)> = BTreeMap::new();
         for (id, waiting) in self.git.iter() {
-            let Some(thread) = self.ask_thread(waiting) else {
+            let Some(thread) = self.ask_thread(waiting, cx) else {
                 continue;
             };
             let entry = oldest.entry(thread).or_insert((id, waiting));
@@ -370,7 +383,7 @@ impl ChatSystem {
         thread: ThreadId,
         cx: &mut Context<Self>,
     ) -> Option<Vec<Row>> {
-        let request = self.asks_in(thread).first()?.0;
+        let request = self.asks_in(thread, cx).first()?.0;
         let address = thread.address();
         let answer = |key, word, decision| {
             let chat = cx.entity();
@@ -913,6 +926,83 @@ pub(super) mod tests {
         assert_eq!(world.hand(cx), ["tide › Next idea · approve fetch · 1m"]);
         world.hears(cx, GitChange::Lost);
         assert!(world.hand(cx).is_empty());
+    }
+
+    /// A push from an agent another agent made, which works in their own
+    /// words to each other, waits in the thread of the work it helps: the
+    /// user is never dealt the agents' own words, so it would strand there.
+    /// A thread the user muted keeps a push that comes later silent until
+    /// it is unmuted.
+    #[gpui::test]
+    fn a_child_agents_push_waits_in_the_thread_of_the_work_it_helps(cx: &mut TestAppContext) {
+        let mut world = world(cx);
+        let (child, grandchild) = (agent(2), agent(3));
+        // The worker briefs its child in their own words, under the
+        // project, and the child briefs one of its own.
+        let brief = |seq, from, to| ChatRecord {
+            seq: ChatSeq(seq),
+            at: UnixMs(1_760_000_000_000 + seq),
+            event: ChatEvent::Posted {
+                parent: Some(PROJECT),
+                retry_of: None,
+                thread_reply: None,
+                from: Party::Agent(from),
+                voice: Voice::ToAgent(to),
+                content: vec![ContentPart::Text {
+                    text: "Look into the clock".into(),
+                }],
+            },
+        };
+        world.tell(cx, |seq| brief(seq, worker(), child));
+        let to_child = MessageId(ChatSeq(world.next - 1));
+        world.tell(cx, |seq| joined(seq, to_child, child));
+        world.tell(cx, |seq| brief(seq, child, grandchild));
+        let to_grandchild = MessageId(ChatSeq(world.next - 1));
+        world.tell(cx, |seq| joined(seq, to_grandchild, grandchild));
+        world.mail.update(cx, |chat, _| {
+            chat.set_participants(std::rc::Rc::new(move |_, agent, _| {
+                Some(super::super::Participant {
+                    label: agent.encoded(),
+                    code: agent.encoded(),
+                    runtime: None,
+                    created_at: None,
+                    doing: None,
+                    stopped_because: None,
+                    parent: match agent {
+                        agent if agent == child => Some(worker()),
+                        agent if agent == grandchild => Some(child),
+                        _ => None,
+                    },
+                })
+            }))
+        });
+        let mut answered = world.asks(cx, 0xc1, push_to(&["refs/heads/main"], Some(grandchild)), 4);
+        assert_eq!(
+            world.hand(cx),
+            ["tide › Flaky clock test · approve push · 4m"],
+            "the push bubbles up to the user's thread"
+        );
+        world.deal(cx);
+        assert_eq!(world.current(cx), flaky());
+        let label = format!("eng-{}", &grandchild.encoded()[..4]);
+        assert!(
+            world
+                .screen(cx)
+                .contains(&format!("{label} asks to push with your ssh login")),
+            "it says which agent asks"
+        );
+        world.press(cx, "a");
+        assert_eq!(answered.try_recv(), Ok(GitDecision::Approve));
+        assert!(world.hand(cx).is_empty());
+
+        // Muted, the thread deals nothing, a later push included.
+        world
+            .window
+            .update(cx, |frame, window, cx| frame.open(flaky(), window, cx))
+            .unwrap();
+        world.press(cx, "m");
+        let _later = world.asks(cx, 0xc2, push_to(&["refs/heads/main"], Some(child)), 1);
+        assert!(world.hand(cx).is_empty(), "the muted thread stays silent");
     }
 
     /// A request from outside every agent's work has no thread to show in:

@@ -61,6 +61,9 @@ rho_rpc::calls! {
     pub enum Request {
         /// Answered with whether a GitHub PAT is available.
         GitTransportPolicy(GitTransportPolicy) -> bool;
+        /// An agent takes back every Git transport request of its own that
+        /// still waits for the user. Answered with how many it took back.
+        GitWithdraw(GitWithdraw) -> u32;
         /// Answered with where the snapshot was stored.
         GuiTelemetryUpload(GuiTelemetryUpload) -> String, priority None;
         PlatformSecretsSet(PlatformSecretsSet) -> PlatformStatus;
@@ -107,6 +110,13 @@ impl rho_rpc::protocol::ProtocolOpen for Open {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GitTransportPolicy {
     pub host: String,
+}
+
+/// Every request whose [`GitTransportRequest::agent`] is `agent`, taken
+/// back by that agent.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GitWithdraw {
+    pub agent: rho_agent_types::AgentId,
 }
 
 /// A bounded, client-produced performance snapshot, kept under the

@@ -138,6 +138,28 @@ impl GitTransportBroker {
         }
     }
 
+    /// The agent takes back every request its git made that still waits,
+    /// as when the user's reply asks for something else or the agent gives
+    /// the push up: each no longer waits on any GUI, and its git reads that
+    /// the agent withdrew it. Says how many it took back.
+    pub(crate) fn withdraw_agent(&self, agent: rho_agent_types::AgentId) -> u32 {
+        let mut state = self.state.lock().unwrap();
+        let theirs: Vec<u64> = state
+            .waiting
+            .iter()
+            .filter(|(_, waiting)| waiting.request.agent == Some(agent))
+            .map(|(&request_id, _)| request_id)
+            .collect();
+        for &request_id in &theirs {
+            let waiting = state.waiting.remove(&request_id).expect("listed above");
+            let _ = waiting
+                .response
+                .send(Err("the agent withdrew this request".to_owned()));
+            Self::notify_done(&state.providers, request_id, None);
+        }
+        theirs.len() as u32
+    }
+
     /// The helper went away before an answer: the request no longer waits.
     fn withdraw(&self, request_id: u64) {
         let mut state = self.state.lock().unwrap();
@@ -411,5 +433,54 @@ mod tests {
         assert_eq!(&byte, b"0");
         drop(helper);
         requester_left(&mut reader).await;
+    }
+
+    /// An agent withdraws what its own git asked, and only that: each GUI
+    /// hears the request is done, its git reads why, and another agent's
+    /// request still waits.
+    #[tokio::test]
+    async fn an_agent_withdraws_only_its_own_requests() {
+        let agent = |n| {
+            rho_agent_types::AgentId::from_counter(n, &rho_agent_types::AgentIdDomain(0)).unwrap()
+        };
+        let broker = Arc::new(GitTransportBroker::default());
+        let mut window = provider(&broker);
+        let ask = |branch: &str, by| {
+            let broker = broker.clone();
+            let mut request = push(branch);
+            request.agent = Some(by);
+            tokio::spawn(async move {
+                let mut asked = broker.request(request).unwrap();
+                asked.answer().await.map(|_| ())
+            })
+        };
+        let mine = ask("main", agent(1));
+        let (mine_id, _, _) = requested(window.recv().await);
+        let theirs = ask("master", agent(2));
+        let (theirs_id, provider_id, _) = requested(window.recv().await);
+
+        assert_eq!(
+            broker.withdraw_agent(agent(3)),
+            0,
+            "nothing of its own waits"
+        );
+        assert_eq!(broker.withdraw_agent(agent(1)), 1);
+        assert_eq!(
+            mine.await.unwrap(),
+            Err("the agent withdrew this request".to_owned())
+        );
+        assert_eq!(
+            window.recv().await,
+            Some(GitProviderFrame::Done {
+                request_id: mine_id
+            })
+        );
+        assert_eq!(broker.withdraw_agent(agent(1)), 0, "taken back once");
+        assert!(!theirs.is_finished(), "another agent's push still waits");
+        assert!(matches!(
+            broker.decide(theirs_id, provider_id, GitDecision::Deny),
+            GitProviderClaim::Done
+        ));
+        assert!(theirs.await.unwrap().is_err());
     }
 }

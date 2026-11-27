@@ -68,6 +68,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Eval(args) => eval::run(*args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Gccp(args) => run_gccp(args).await,
+        Command::Git(args) => run_git(args).await,
         Command::Share(args) => share::run(args).await,
         Command::Github(args) => github::run(args).await,
         Command::Slack(args) => slack::run(args).await,
@@ -186,6 +187,31 @@ async fn run_gccp(args: GccpArgs) -> Result<()> {
 
 /// One call of the agent host, starting the agent host if it is not running. A
 /// refusal is an error.
+/// `rho git withdraw`, from an agent's shell: the agent is the one its
+/// shell names in `RHO_AGENT_ID`, as the remote helper that asked found it.
+async fn run_git(args: GitArgs) -> Result<()> {
+    match args.command {
+        GitCommand::Withdraw => {
+            let agent = std::env::var("RHO_AGENT_ID")
+                .ok()
+                .and_then(|agent| rho_agent_types::AgentId::from_encoded(&agent).ok())
+                .context("RHO_AGENT_ID names no agent: run this in an agent's shell")?;
+            let paths = rho_rpc::protocol::RuntimePaths::resolve(args.runtime_dir)?;
+            let withdrawn = client::call(&paths, host::GitWithdraw { agent }).await?;
+            println!("{}", withdrawn_words(withdrawn));
+            Ok(())
+        }
+    }
+}
+
+fn withdrawn_words(withdrawn: u32) -> String {
+    match withdrawn {
+        0 => "nothing of yours waits for the user's approval".to_owned(),
+        1 => "withdrew 1 request that waited for the user's approval".to_owned(),
+        n => format!("withdrew {n} requests that waited for the user's approval"),
+    }
+}
+
 pub(crate) async fn host_call<C: Call>(
     paths: &rho_rpc::protocol::RuntimePaths,
     call: C,
@@ -238,6 +264,7 @@ enum Command {
     Eval(Box<eval::EvalArgs>),
     Iroh(IrohArgs),
     Gccp(GccpArgs),
+    Git(GitArgs),
     Share(share::ShareArgs),
     Github(GithubArgs),
     Slack(SlackArgs),
@@ -277,6 +304,8 @@ enum CliCommand {
     /// See the hosts approved for GCCP, and see and take back what agents
     /// accepted on them.
     Gccp(GccpArgs),
+    /// The git you run through the user's ssh login.
+    Git(GitArgs),
     /// Print a link that pairs rho-gui with this machine's agent host (what
     /// `rho` alone does).
     Share(share::ShareArgs),
@@ -446,6 +475,22 @@ pub(crate) enum GccpCommand {
 }
 
 #[derive(Clone, clap::Args)]
+pub(crate) struct GitArgs {
+    #[arg(long = "runtime-dir")]
+    runtime_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: GitCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum GitCommand {
+    /// Take back every push or fetch of yours that waits for the user's
+    /// approval, as when they asked for something else or you gave the
+    /// push up: the card leaves their thread, and the waiting git fails.
+    Withdraw,
+}
+
+#[derive(Clone, clap::Args)]
 pub(crate) struct GithubArgs {
     #[arg(long = "runtime-dir")]
     runtime_dir: Option<PathBuf>,
@@ -542,6 +587,7 @@ impl Args {
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Gccp(args) => Command::Gccp(args),
+            CliCommand::Git(args) => Command::Git(args),
             CliCommand::Github(args) => Command::Github(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Notion(args) => Command::Notion(args),
