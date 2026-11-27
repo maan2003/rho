@@ -34,7 +34,8 @@ use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, ContentPart, Doing, EndpointId, Message, MessageId,
     MessageVersion, ProjectId, ThreadWork, UnixMs,
 };
-use rho_dealer::rank::Trace;
+use rho_dealer::curve::{AGENT_BLOCKED_HEAD_START, Curve};
+use rho_dealer::rank::{CardKind, Trace};
 use rho_dealer::{Address, Addressed as _, Claim, Marks};
 use rho_frame::{
     AnySurface, Candidate, Command, Found, FoundText, FoundThread, Frame, FrameLink, Opening,
@@ -873,15 +874,12 @@ impl ChatSystem {
 
     /// A refused idea as the draft takes it back.
     fn refused_idea(&self, id: PendingIdeaId) -> Option<IdeaMail> {
-        let (host, _, outgoing) = self.outbox.ideas().find(|(_, client_id, outgoing)| {
+        let (_, _, outgoing) = self.outbox.ideas().find(|(_, client_id, outgoing)| {
             *client_id == id.0 && matches!(outgoing.state, OutgoingState::Refused { .. })
         })?;
         Some(IdeaMail {
             client_id: id.0,
-            project: ThreadId {
-                host,
-                message: outgoing.parent?,
-            },
+            project: self.pending_idea_project(id)?,
             text: rho_agent_types::content_text(&outgoing.content),
             runtime: outgoing.runtime.clone(),
             mode: outgoing.mode,
@@ -1046,6 +1044,41 @@ impl ChatSystem {
 }
 
 impl ChatSystem {
+    /// The project an idea in the outbox goes to.
+    fn pending_idea_project(&self, id: PendingIdeaId) -> Option<ThreadId> {
+        let (host, _, outgoing) = self
+            .outbox
+            .ideas()
+            .find(|(_, client_id, _)| *client_id == id.0)?;
+        Some(ThreadId {
+            host,
+            message: outgoing.parent?,
+        })
+    }
+
+    /// An idea its host refused before it had a thread is a `not sent`
+    /// card of this device's own, until the user writes it again.
+    fn refused_idea_claims(&self, claims: &mut Vec<Claim>) {
+        for (id, project, outgoing) in self.pending_ideas() {
+            if !matches!(outgoing.state, OutgoingState::Refused { .. }) {
+                continue;
+            }
+            let curve = Curve::Waiting {
+                head_start: AGENT_BLOCKED_HEAD_START,
+                since: cards::unix(outgoing.at.0),
+            };
+            let mut claim = Claim::new(
+                id.address(),
+                curve,
+                CardKind::Stop("not sent"),
+                format!("idea/{}", id.0),
+            );
+            claim.title = pending::title(&rho_agent_types::content_text(&outgoing.content));
+            claim.context = project;
+            claims.push(claim);
+        }
+    }
+
     fn pending_ideas(&self) -> impl Iterator<Item = (PendingIdeaId, String, &Outgoing)> {
         let names = self.project_names();
         self.outbox.ideas().filter_map(move |(host, id, outgoing)| {
@@ -1211,6 +1244,7 @@ impl System for ChatSystem {
             );
         }
         self.git_claims(&mut claims, cx);
+        self.refused_idea_claims(&mut claims);
         claims
     }
 
@@ -1262,15 +1296,21 @@ impl System for ChatSystem {
 
     /// A thread lives on the host whose log holds it.
     fn host(&self, address: &Address, _cx: &App) -> Option<HostId> {
-        let thread = self.thread_of(address)?;
+        let endpoint = match PendingIdeaId::from_address(address) {
+            Some(id) => self.pending_idea_project(id)?.host,
+            None => self.thread_of(address)?.host,
+        };
         self.hosts
             .iter()
-            .find(|(_, slot)| slot.endpoint == Some(thread.host))
+            .find(|(_, slot)| slot.endpoint == Some(endpoint))
             .map(|(host, _)| *host)
     }
 
     fn project(&self, address: &Address, _cx: &App) -> Option<Project> {
-        let project = self.idea_project_of(address)?;
+        let project = match PendingIdeaId::from_address(address) {
+            Some(id) => self.idea_project_at(self.pending_idea_project(id)?)?,
+            None => self.idea_project_of(address)?,
+        };
         Some(Project {
             address: project.thread.address(),
             name: project.name,
@@ -1664,6 +1704,21 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(status(mail, cx), ["not sent"]);
+                // It has no thread on the host, so this device deals it.
+                let card = |mail: &ChatSystem, cx: &App| {
+                    let now = Timestamp::from_millisecond(60_000).unwrap();
+                    mail.claims(&Marks::default(), now, None, cx)
+                        .into_iter()
+                        .find(|claim| claim.address == id.address())
+                };
+                let claim = card(mail, cx).expect("a refused idea is a card");
+                assert_eq!(claim.kind, CardKind::Stop("not sent"));
+                assert_eq!(
+                    (claim.context.as_str(), claim.title.as_str()),
+                    ("tide", title)
+                );
+                // A project focus deals it with the project it goes to.
+                assert_eq!(mail.pending_idea_project(id), Some(address));
                 assert!(mail.outbox.next(endpoint).is_none(), "never posted again");
                 let idea = mail.refused_idea(id).expect("the words are kept");
                 assert_eq!(
@@ -1679,6 +1734,7 @@ mod tests {
                 mail.withdraw_refused_idea(id, cx);
                 assert!(!mail.outbox.contains(id.0));
                 assert_eq!(status(mail, cx), Vec::<String>::new());
+                assert_eq!(card(mail, cx), None);
             })
         });
     }

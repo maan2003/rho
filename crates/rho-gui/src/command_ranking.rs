@@ -95,6 +95,7 @@ fn every_name_is_its_own_and_plain() {
         "reply privately",
         "write idea",
         "write reply again",
+        "write idea again",
         "pair device",
         "show secret phrase",
         "list devices",

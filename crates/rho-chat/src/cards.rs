@@ -53,7 +53,7 @@ pub struct Host<'a> {
     pub names: &'a ProjectNames,
 }
 
-fn unix(ms: u64) -> Timestamp {
+pub(crate) fn unix(ms: u64) -> Timestamp {
     Timestamp::from_millisecond(ms as i64).expect("a message's time")
 }
 
