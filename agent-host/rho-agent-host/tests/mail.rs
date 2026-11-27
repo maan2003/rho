@@ -12,8 +12,7 @@ use rho_agent_types::{
 };
 use rho_agents_client::protocol::worksets;
 use rho_agents_client::protocol::worksets::{
-    AgentLog, CreateWorkset, Eval, EvalResult, FinishWork, LogEvent, RestartWorkset, RewindAgent,
-    StopAgent,
+    AgentLog, CreateWorkset, Eval, EvalResult, LogEvent, RestartWorkset, RewindAgent, StopAgent,
 };
 use rho_chat::protocol::{
     ChangeProject, ClientFrame, CreateProject, Open, Post, PostIdea, PostIdeaReply, Project,
@@ -631,57 +630,6 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         }).await?;
         assert_eq!(checkout.error, None);
         assert_eq!(checkout.output.trim(), "tide-checked-out");
-    }
-    // `finish work`: a checkout holding changes of its own stays, and a
-    // clean one with nothing unpushed goes.
-    let touched = call(
-        paths,
-        Eval {
-            workset: first_workset,
-            code:
-                "from pathlib import Path\nPath('/src/checkouts-tide/draft.txt').write_text('mine')"
-                    .into(),
-        },
-    )
-    .await?;
-    assert_eq!(touched.error, None);
-    // The fake model leaves its round counter in the checkout, as an
-    // agent leaves its work; the second workset's agent cleans up.
-    let cleaned = call(paths, Eval {
-        workset: second_workset,
-        code: "from pathlib import Path\nfor p in Path('/src/checkouts-tide').glob('.rho-fake-rounds-*'):\n    p.unlink()".into(),
-    }).await?;
-    assert_eq!(cleaned.error, None);
-    let kept = call(paths, FinishWork { agent: first_agent }).await?;
-    assert_eq!(
-        (kept.removed, kept.kept),
-        (
-            Vec::<String>::new(),
-            vec!["checkouts-tide: 2 uncommitted changes".to_owned()]
-        )
-    );
-    let removed = call(
-        paths,
-        FinishWork {
-            agent: second_agent,
-        },
-    )
-    .await?;
-    assert_eq!(
-        (removed.removed, removed.kept),
-        (vec!["checkouts-tide".to_owned()], Vec::<String>::new())
-    );
-    for (workset, there) in [(first_workset, "True"), (second_workset, "False")] {
-        let left = call(
-            paths,
-            Eval {
-                workset,
-                code: "from pathlib import Path\nprint(Path('/src/checkouts-tide').exists())"
-                    .into(),
-            },
-        )
-        .await?;
-        assert_eq!(left.output.trim(), there, "{workset}");
     }
     let create_at = |agent| {
         agents

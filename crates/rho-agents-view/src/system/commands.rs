@@ -207,23 +207,6 @@ impl AgentsSystem {
         leads
     }
 
-    /// The pieces of work whose label holds `words`: the one it names
-    /// outright, else every one it may mean for a prompt to choose among.
-    fn worksets_named(&self, words: &str, cx: &App) -> Target {
-        let words = words.to_lowercase();
-        let named: Vec<(AgentId, String)> = self
-            .every_workset()
-            .into_iter()
-            .map(|lead| (lead, self.work_label(lead, cx).0.to_lowercase()))
-            .filter(|(_, label)| label.contains(&words))
-            .collect();
-        match named.iter().find(|(_, label)| *label == words) {
-            Some((lead, _)) => Target::One(*lead),
-            None if named.len() == 1 => Target::One(named[0].0),
-            None => Target::Among(named.into_iter().map(|(lead, _)| lead).collect()),
-        }
-    }
-
     /// An agent as a prompt offers it: its label, and where and how it is.
     fn agent_candidate(&self, agent: AgentId, cx: &App) -> Candidate {
         let (label, host) = self.label(agent, cx);
@@ -513,22 +496,10 @@ pub static REWIND_AGENT_TO_HERE: Spelling = Spelling {
     argument: None,
 };
 
-pub static FINISH_WORK: Spelling = Spelling {
-    name: "finish work",
-    aliases: &[
-        ("done with work", 7),
-        ("archive workset", 8),
-        ("clean up workset", 7),
-        ("finish", 6),
-    ],
-    argument: Some("workset"),
-};
-
 /// Every command the agents system offers, for a test to rank.
 pub static SPELLINGS: &[&Spelling] = &[
     &REWIND_AGENT,
     &REWIND_AGENT_TO_HERE,
-    &FINISH_WORK,
     &COMPACT_AGENT,
     &RESET_AGENT_CACHE,
     &SET_AGENT_RUNTIME,
@@ -723,31 +694,6 @@ impl AgentsSystem {
                     }
                 }),
             ),
-            {
-                let system = system.clone();
-                let here = here.work.clone();
-                Command::new(
-                    &FINISH_WORK,
-                    move |frame: &mut Frame,
-                          typed: Option<String>,
-                          window: &mut Window,
-                          cx: &mut Context<Frame>| {
-                        // `:finish work clock` names the work over the one in
-                        // view.
-                        let target = match typed.as_deref().map(str::trim) {
-                            Some(typed) if !typed.is_empty() => {
-                                system.read(cx).worksets_named(typed, cx)
-                            }
-                            _ => here.clone(),
-                        };
-                        let act = reached(Rc::new(|system, agent, _, _, cx| {
-                            steer::finish_work(system, agent, cx)
-                        }));
-                        choose(&system, &target, Ask::Workset, act, frame, window, cx)
-                    },
-                )
-                .target(work_target.clone())
-            },
             Command::new(
                 &FILTER_TRANSCRIPT,
                 on(

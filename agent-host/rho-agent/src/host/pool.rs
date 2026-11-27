@@ -1170,61 +1170,6 @@ impl AgentPool {
         }
     }
 
-    /// Ends the work of the agent's workset (`agents.md` Workset, `finish
-    /// work`): archives its agents, ends its process with the shells and
-    /// terminals in it, and removes each checkout of an isolated workset
-    /// that is clean and pushed. A checkout with anything only it holds
-    /// stays, and the answer says why. A later reply wakes the agents
-    /// again, as it wakes any stopped agent.
-    pub async fn finish_work(
-        self: &Arc<Self>,
-        agent: AgentId,
-    ) -> anyhow::Result<rho_agents_client::protocol::worksets::FinishedWork> {
-        let workset = self.workset_of(agent)?;
-        let slot = self.execution_slot(workset).await;
-        let _admission = slot.admission.clone().write_owned().await;
-        let head = self
-            .db
-            .read()
-            .workset(workset)
-            .context("workset was deleted or does not exist")?;
-        for agent in head.agents {
-            let archived = self
-                .db
-                .read()
-                .agent(agent)
-                .is_some_and(|agent| agent.native.archived);
-            if !archived {
-                self.stop_agent(agent).await?;
-            }
-        }
-        if let Some(process) = slot.process.lock().await.take() {
-            process.shutdown().await;
-        }
-        let mut finished = rho_agents_client::protocol::worksets::FinishedWork::default();
-        if head.kind == WorksetKind::Isolated {
-            let directory = self.worksets.open_workset(workset).await?;
-            for repo in directory.repos()? {
-                let checkout = directory.root().join(&repo);
-                let git = |args: &[&str]| {
-                    let mut command = self.worksets.command("git");
-                    command.current_dir(&checkout).args(args);
-                    command
-                };
-                match held_only_here(git).await {
-                    None => {
-                        tokio::fs::remove_dir_all(&checkout)
-                            .await
-                            .with_context(|| format!("remove {checkout}"))?;
-                        finished.removed.push(repo);
-                    }
-                    Some(why) => finished.kept.push(format!("{repo}: {why}")),
-                }
-            }
-        }
-        Ok(finished)
-    }
-
     /// Rewind the visible turn, returning the headlines marked taken back.
     pub async fn rewind_agent(
         self: &Arc<Self>,
@@ -1778,51 +1723,6 @@ impl AgentPool {
     }
 }
 
-/// What only this checkout holds: uncommitted changes, or commits on
-/// its head or branches that no remote has. A checkout git cannot read
-/// holds whatever it holds, so the reason is git's. `git` runs git in
-/// the checkout.
-async fn held_only_here(git: impl Fn(&[&str]) -> tokio::process::Command) -> Option<String> {
-    let lines = |mut command: tokio::process::Command| async move {
-        let output = command.output().await.map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).lines().count())
-    };
-    let changed = match lines(git(&["status", "--porcelain"])).await {
-        Ok(changed) => changed,
-        Err(error) => return Some(format!("git status failed: {error}")),
-    };
-    let unpushed = match lines(git(&[
-        "log",
-        "--oneline",
-        "HEAD",
-        "--branches",
-        "--not",
-        "--remotes",
-    ]))
-    .await
-    {
-        Ok(unpushed) => unpushed,
-        Err(error) => return Some(format!("git log failed: {error}")),
-    };
-    let plural = |n: usize, one: &str| match n {
-        1 => format!("1 {one}"),
-        n => format!("{n} {one}s"),
-    };
-    match (changed, unpushed) {
-        (0, 0) => None,
-        (0, unpushed) => Some(plural(unpushed, "unpushed commit")),
-        (changed, 0) => Some(plural(changed, "uncommitted change")),
-        (changed, unpushed) => Some(format!(
-            "{} and {}",
-            plural(changed, "uncommitted change"),
-            plural(unpushed, "unpushed commit")
-        )),
-    }
-}
-
 /// Where a workset's process and its agents work: an isolated workset's
 /// `/src`, or a host workset's own directory.
 pub fn workset_root(kind: &WorksetKind) -> camino::Utf8PathBuf {
@@ -1867,89 +1767,6 @@ mod tests {
     use rho_agent_types::AgentIdDomain;
 
     use super::*;
-
-    /// Finishing work removes a checkout only when nothing in it is
-    /// missing from its remote. A commit made on the detached head an
-    /// agent starts on counts, as does one on a branch it left, and a
-    /// checkout with no remote keeps every commit it has.
-    #[tokio::test]
-    async fn only_a_clean_pushed_checkout_holds_nothing_of_its_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = |at: &std::path::Path, args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .current_dir(at)
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?}: {output:?}");
-        };
-        let origin = dir.path().join("origin");
-        std::fs::create_dir(&origin).unwrap();
-        run(&origin, &["init", "--quiet", "-b", "main"]);
-        std::fs::write(origin.join("a"), "a").unwrap();
-        run(&origin, &["add", "a"]);
-        run(&origin, &["commit", "--quiet", "-m", "a"]);
-        run(dir.path(), &["clone", "--quiet", "origin", "clone"]);
-        let clone = dir.path().join("clone");
-        run(&clone, &["checkout", "--quiet", "--detach"]);
-        let held = || {
-            let clone = clone.clone();
-            held_only_here(move |args: &[&str]| {
-                let mut command = tokio::process::Command::new("git");
-                command.current_dir(&clone).args(args);
-                command
-            })
-        };
-        assert_eq!(held().await, None, "a fresh clone is all on its remote");
-
-        std::fs::write(clone.join("b"), "b").unwrap();
-        assert_eq!(held().await.as_deref(), Some("1 uncommitted change"));
-
-        run(&clone, &["add", "b"]);
-        run(&clone, &["commit", "--quiet", "-m", "b"]);
-        assert_eq!(
-            held().await.as_deref(),
-            Some("1 unpushed commit"),
-            "a commit on the detached head"
-        );
-
-        run(&clone, &["switch", "--quiet", "-c", "work"]);
-        run(&clone, &["checkout", "--quiet", "--detach", "origin/main"]);
-        std::fs::write(clone.join("c"), "c").unwrap();
-        assert_eq!(
-            held().await.as_deref(),
-            Some("1 uncommitted change and 1 unpushed commit"),
-            "a commit on a branch the head left"
-        );
-        std::fs::remove_file(clone.join("c")).unwrap();
-
-        run(&clone, &["push", "--quiet", "origin", "work"]);
-        assert_eq!(held().await, None, "pushed, the branch is on its remote");
-
-        run(&clone, &["remote", "remove", "origin"]);
-        assert_eq!(
-            held().await.as_deref(),
-            Some("2 unpushed commits"),
-            "with no remote, every commit is only here"
-        );
-
-        let missing = dir.path().join("gone");
-        let error = held_only_here(move |args: &[&str]| {
-            let mut command = tokio::process::Command::new("git");
-            command.current_dir(&missing).args(args);
-            command
-        })
-        .await;
-        assert!(error.is_some_and(|why| why.starts_with("git status failed")));
-    }
 
     /// An agent's age counts from when it started what it does now: a
     /// status that changes something else keeps it; one that changes what

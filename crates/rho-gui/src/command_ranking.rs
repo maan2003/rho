@@ -64,7 +64,6 @@ fn every_name_is_its_own_and_plain() {
         "cancel agent request",
         "stop agent",
         "rewind agent to here",
-        "finish work",
         "rename thread",
         "fork thread",
         "rename project",
@@ -124,6 +123,9 @@ fn every_name_is_its_own_and_plain() {
     ] {
         assert!(seen.contains(named), "no command is called {named}");
     }
+    // Rejected in `product/agents.md`: workset lifecycle waits for its own
+    // design.
+    assert!(!seen.contains("finish work"), "finish work is rejected");
 }
 
 /// `kill` stops the agent first and cancels its request second, and
@@ -184,7 +186,6 @@ fn inline_arguments_reach_their_command() {
         ("attach lab=local", "attach host", "lab=local"),
         ("detach lab", "detach host", "lab"),
         ("filter whole workset", "filter transcript", "whole workset"),
-        ("finish work clock", "finish work", "clock"),
         ("rename project apart", "rename project", "apart"),
         ("retire project tide", "retire project", "tide"),
         (
@@ -247,7 +248,6 @@ fn everyday_words_find_what_they_mean() {
         ("slow", "upload performance report"),
         ("account", "switch claude account"),
         ("tangent", "fork thread"),
-        ("finish", "finish work"),
         ("rewind agent to here", "rewind agent to here"),
         ("rewind to here", "rewind agent to here"),
         ("rewind here", "rewind agent to here"),

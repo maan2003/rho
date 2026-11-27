@@ -8,9 +8,7 @@ use gpui::{Context, Entity, Window};
 use rho_agent_hosts::HostStatus;
 use rho_agent_types::{AgentId, Rewind, RuntimeCatalogue};
 use rho_agents_client::protocol::transcript::RuntimeKind;
-use rho_agents_client::protocol::worksets::{
-    Cancel, CancelResult, FinishWork, FinishedWork, RewindAgent, StopAgent,
-};
+use rho_agents_client::protocol::worksets::{Cancel, CancelResult, RewindAgent, StopAgent};
 use rho_agents_client::snippets;
 use rho_frame::{Candidate, Frame};
 use rho_window::style::StyleClass;
@@ -218,45 +216,6 @@ pub(super) fn stop(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Conte
     .detach();
 }
 
-/// Finishes the agent's work and echoes what became of its checkouts:
-/// `finished: tide · Flaky clock test · removed rho · kept web: 2 unpushed
-/// commits`.
-pub(super) fn finish_work(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
-    let system = system.read(cx);
-    let frame = system.frame.clone();
-    let Some(agents) = system.agents_for(agent) else {
-        frame.echo(NOT_ATTACHED, StyleClass::SystemImportant, cx);
-        return;
-    };
-    let reply = agents.call(FinishWork { agent });
-    let label = system.work_label(agent, cx).0;
-    cx.spawn(async move |_, cx| {
-        let reply = reply.await;
-        cx.update(|cx| match reply {
-            Ok(finished) => {
-                frame.echo(finished_echo(&label, &finished), StyleClass::SystemInfo, cx)
-            }
-            Err(error) => frame.echo(
-                format!("did not finish {label}: {error:#}"),
-                StyleClass::SystemImportant,
-                cx,
-            ),
-        });
-    })
-    .detach();
-}
-
-fn finished_echo(label: &str, finished: &FinishedWork) -> String {
-    let mut echo = format!("finished: {label}");
-    if !finished.removed.is_empty() {
-        echo.push_str(&format!(" · removed {}", finished.removed.join(", ")));
-    }
-    for kept in &finished.kept {
-        echo.push_str(&format!(" · kept {kept}"));
-    }
-    echo
-}
-
 /// Stops what the agent is asking its model now.
 pub(super) fn cancel(system: &Entity<AgentsSystem>, agent: AgentId, cx: &mut Context<Frame>) {
     let system = system.read(cx);
@@ -350,22 +309,6 @@ mod tests {
             assert_eq!(unreachable(Some(&away)), Some(AWAY), "{away:?}");
         }
         assert_ne!(NOT_ATTACHED, AWAY);
-    }
-
-    #[test]
-    fn finish_echo_names_each_removed_and_kept_checkout() {
-        let finished = FinishedWork {
-            removed: vec!["rho".to_owned(), "web".to_owned()],
-            kept: vec!["notes: 2 unpushed commits".to_owned()],
-        };
-        assert_eq!(
-            finished_echo("tide · Flaky clock test", &finished),
-            "finished: tide · Flaky clock test · removed rho, web · kept notes: 2 unpushed commits"
-        );
-        assert_eq!(
-            finished_echo("tide", &FinishedWork::default()),
-            "finished: tide"
-        );
     }
 
     #[test]
