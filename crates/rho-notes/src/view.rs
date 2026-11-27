@@ -18,6 +18,7 @@ use rho_frame::{CardHere, FrameLink, Surface, phone_editor_tap};
 use rho_window::draft::focus_writing_at;
 use theme::ActiveTheme as _;
 
+use crate::sheet::{self, Heading, token};
 use crate::{NoteId, NoteSystem, reminder, title_of};
 
 /// Sets a buffer's whole text, when it differs.
@@ -197,6 +198,10 @@ impl Surface for NoteView {
         title_of(&self.body.read(cx).text())
     }
 
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
+    }
+
     /// When the reminder comes due, quietly, while the note is no card.
     fn status(&self, _cx: &App) -> Option<String> {
         let now = Zoned::now();
@@ -226,11 +231,22 @@ impl Focusable for NoteView {
 }
 
 impl Render for NoteView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let mut heading = Heading::new(self.title(cx));
+        if let Some(reminder) = self.status(cx) {
+            heading = heading.marker(reminder, token::quiet());
+        }
+        // A note is prose: its words wrap at the prose measure, on the
+        // sheet's left edge.
+        let words = sheet::column_width(&text, window) * (sheet::PROSE_COLUMNS as f32 + 1.5);
+        let body = div().size_full().max_w(words).child(self.editor.clone());
         div()
             .capture_any_mouse_down(cx.listener(Self::tap_text))
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(self.editor.clone())
+            .child(sheet::page(&heading, &text, body, window, cx))
     }
 }

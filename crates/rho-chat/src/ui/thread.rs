@@ -9,7 +9,8 @@ use std::sync::Arc;
 use editor::display_map::ToDisplayPoint as _;
 use editor::scroll::Autoscroll;
 use editor::{
-    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, SelectionEffects, SizingBehavior,
+    Anchor, Editor, EditorEvent, EditorMode, HighlightKey, Inlay, InlayHighlight, SelectionEffects,
+    SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -17,7 +18,7 @@ use gpui::{
     MouseDownEvent, Subscription, Task, TextStyleRefinement, Window, actions, div,
 };
 use jiff::Timestamp;
-use language::{Buffer, BufferEvent, Capability, Point, ToPoint as _};
+use language::{Buffer, BufferEvent, Capability, InlayId, Point, ToOffset as _, ToPoint as _};
 use multi_buffer::{MultiBuffer, ToPoint as _};
 use rho_agent_types::{
     Address as Party, AgentId, ChatSeq, EndpointId, Message, MessageId, Revision, UnixMs, Voice,
@@ -33,6 +34,7 @@ use rho_window::draft;
 use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
+use super::sheet::{self, Heading, token};
 use super::{ChatSystem, Event, Participant, ago};
 use crate::reading::body;
 use crate::{HostChat, ThreadId, cards};
@@ -134,7 +136,6 @@ const KEY_BASE: usize = usize::MAX / 5;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Crumb,
-    Status,
     Separator,
     /// The message the thread hangs under, and each under it.
     Message(MessageId),
@@ -161,8 +162,10 @@ enum Class {
     Fold,
     Pending,
     Quote,
-    /// What the project says.
-    Name,
+    /// What the project says since the user's last message.
+    Unread,
+    /// What the project said before it, already read.
+    Read,
     /// A private reply: the user's own, seen by no agent.
     Private,
     /// A web link in a message: Enter on it opens it as a page.
@@ -170,7 +173,7 @@ enum Class {
 }
 
 impl Class {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn slot(self) -> usize {
         match self {
@@ -180,9 +183,12 @@ impl Class {
             Self::Fold => 3,
             Self::Pending => 4,
             Self::Quote => 5,
-            Self::Name => 6,
-            Self::Private => 7,
-            Self::Link => 8,
+            // A later slot paints over an earlier one where both apply: a
+            // link stays a link in any voice.
+            Self::Unread => 6,
+            Self::Read => 7,
+            Self::Private => 8,
+            Self::Link => 9,
         }
     }
 }
@@ -193,17 +199,18 @@ impl rho_transcript::Style for Class {
     }
 
     fn highlight_style(self, cx: &App) -> HighlightStyle {
-        let colors = cx.theme().colors();
+        let _ = cx;
         let color = match self {
-            Self::Crumb | Self::Time | Self::Pending | Self::Quote | Self::Private => {
-                colors.text_muted
+            Self::Crumb | Self::Time | Self::Pending | Self::Quote | Self::Private | Self::Fold => {
+                token::quiet()
             }
-            Self::User | Self::Link => colors.text_accent,
-            Self::Fold => cx.theme().status().info,
-            Self::Name => colors.text,
+            Self::User => token::marked(),
+            Self::Link => token::answer(),
+            Self::Unread => token::unread_text(),
+            Self::Read => token::read_text(),
         };
         HighlightStyle {
-            color: Some(color.into()),
+            color: Some(color),
             font_style: matches!(self, Self::Private).then_some(gpui::FontStyle::Italic),
             underline: matches!(self, Self::Link).then(|| gpui::UnderlineStyle {
                 thickness: gpui::px(1.),
@@ -298,8 +305,78 @@ pub struct ThreadView {
     last_point: Anchor,
     expanded: Expanded,
     _subscriptions: Vec<Subscription>,
-    /// Reads the thread again when a flash's age next changes.
+    /// The age each turn shows flush-right on its first line.
+    ages: Vec<Age>,
+    /// The words of the project's turns since the user's last message.
+    unread: Vec<Unread>,
+    /// The inlays that draw `ages` now.
+    age_inlays: Vec<InlayId>,
+    /// How many columns of text the sheet holds, as last drawn: where a
+    /// flush-right age ends.
+    columns: usize,
+    /// How wide the history's text is, in those columns.
+    measure: sheet::Measure,
+    /// Reads the thread again when an age next changes.
     _ages: Option<Task<()>>,
+}
+
+/// A turn's relative age, drawn flush-right on its first line and not part
+/// of its text: a yank or a quote of the line never carries it, and it
+/// changes as the turn waits without editing the history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Age {
+    key: Key,
+    at_ms: u64,
+    /// An unread project turn's age asks for the user (`attention`); the
+    /// rest are quiet.
+    unread: bool,
+}
+
+/// A turn the user has not answered yet: the ranges of its text, relative
+/// to its item, that are in the project's voice and no link. They are
+/// painted bright over the item's own read voice, apart from the item, so
+/// that the user's reply dims them without replacing a single item: a
+/// replaced item moves the text the scroll is anchored to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unread {
+    key: Key,
+    ranges: Vec<Range<usize>>,
+}
+
+/// Above every bucket's keys, so the bright voice paints over the read one.
+const UNREAD_TEXT: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX / 5 * 2);
+
+/// The ages' inlay ids, clear of the draft's.
+const AGE_INLAY_BASE: usize = usize::MAX / 7;
+const LOUD_AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 1);
+const QUIET_AGES: HighlightKey = HighlightKey::SyntaxTreeView(KEY_BASE - 2);
+const DRAFT_TEXT: HighlightKey =
+    HighlightKey::SyntaxTreeView(rho_window::style::PROMPT_DRAFT_HIGHLIGHT_KEY);
+
+/// The draft's own bar, in the user's colour.
+struct DraftGutter;
+
+/// A draft in the user's voice: muted teal words and the teal bar beside
+/// every line, with no placeholder when it is empty. In a thread row 1 is
+/// the reply, and an idea's `to:`, `in:` and `on:` lines say what its
+/// words are, so neither needs a word to say so.
+pub(super) fn style_draft_in(editor: &mut Editor, range: Range<Anchor>, cx: &mut Context<Editor>) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let empty = range.start.to_point(&snapshot) == range.end.to_point(&snapshot);
+    editor.highlight_text(
+        DRAFT_TEXT,
+        if empty {
+            Vec::new()
+        } else {
+            vec![range.clone()]
+        },
+        HighlightStyle {
+            color: Some(token::marked()),
+            ..HighlightStyle::default()
+        },
+        cx,
+    );
+    editor.highlight_gutter::<DraftGutter>(vec![range], token::marked_bar_in, cx);
 }
 
 /// Where the reader left a thread whose screen closed, so that the next
@@ -421,7 +498,7 @@ impl ThreadView {
             rho_window::editor_config::configure(&mut editor, window, cx);
             draft::stick(&mut editor, "↑ new".into(), cx);
             let doc = editor.buffer().read(cx).snapshot(cx);
-            draft::style(&mut editor, draft::range(&doc), "reply", cx);
+            style_draft_in(&mut editor, draft::range(&doc), cx);
             editor.disable_headers_for_buffers(
                 [buffer.read(cx).remote_id(), draft.read(cx).remote_id()],
                 cx,
@@ -452,6 +529,13 @@ impl ThreadView {
             editor
         });
         let subscriptions = vec![
+            // Inline code's backticks are hidden once the history is
+            // parsed, and the lines the ages follow grow shorter.
+            cx.subscribe(&buffer, |view, _, event: &BufferEvent, cx| {
+                if matches!(event, BufferEvent::Reparsed) {
+                    view.paint_ages(cx);
+                }
+            }),
             cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
                     let editor = editor.read(cx);
@@ -526,13 +610,20 @@ impl ThreadView {
             last_point: Anchor::Min,
             expanded: Expanded::default(),
             _subscriptions: subscriptions,
+            ages: Vec::new(),
+            unread: Vec::new(),
+            age_inlays: Vec::new(),
+            columns: sheet::SHEET_COLUMNS,
+            measure: sheet::Measure::Columns,
             _ages: None,
         };
-        view.transcript
-            .set_gutter(rho_window::style::user_prompt_gutter_color);
+        view.transcript.set_gutter(token::marked_bar_in);
         view.transcript.attach(&view.editor, cx);
-        let items = items(system, thread, &view.expanded, None, cx);
+        let (items, ages, unread) = items(system, thread, &view.expanded, None, cx);
         view.transcript.reconcile(items, cx);
+        view.ages = ages;
+        view.unread = unread;
+        view.paint_ages(cx);
         let end = view.editor.update(cx, |editor, cx| {
             let display = editor.display_snapshot(cx);
             let end = draft::range(display.buffer_snapshot()).end;
@@ -697,7 +788,7 @@ impl ThreadView {
 
     /// The draft is the first excerpt; a history edit cannot move it.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let items = items(
+        let (items, ages, unread) = items(
             self.system.read(cx),
             self.thread,
             &self.expanded,
@@ -705,21 +796,137 @@ impl ThreadView {
             cx,
         );
         self.transcript.reconcile(items, cx);
+        self.ages = ages;
+        self.unread = unread;
+        self.paint_ages(cx);
         self.schedule_ages(cx);
         cx.notify();
     }
 
+    /// Draws each turn's age flush-right on its first line, at the sheet's
+    /// right edge, or two columns after a line too long for that, and the
+    /// unanswered turns' words bright.
+    fn paint_ages(&mut self, cx: &mut Context<Self>) {
+        let now = Timestamp::now();
+        let history = self.transcript.buffer().read(cx).snapshot();
+        let doc = self.document(cx);
+        let start = draft::history_start(&doc).row;
+        let mut inlays = Vec::new();
+        let (mut loud, mut quiet) = (Vec::new(), Vec::new());
+        for (index, age) in self.ages.iter().enumerate() {
+            let Some(range) = self.transcript.range_of(&age.key) else {
+                continue;
+            };
+            let row = range.start.to_point(&history).row;
+            let len = history.line_len(row);
+            // The line as drawn: without the marks its syntax hides.
+            let (from, to) = (
+                Point::new(row, 0).to_offset(&history),
+                Point::new(row, len).to_offset(&history),
+            );
+            let mut line = String::new();
+            let mut at = from;
+            for hidden in history.concealed_ranges(from..to, from..to) {
+                line.extend(history.text_for_range(at..hidden.start.max(at)));
+                at = at.max(hidden.end.min(to));
+            }
+            line.extend(history.text_for_range(at..to));
+            let words = ago(age.at_ms, now);
+            let pad = self.measure.pad(&line, &words, self.columns, cx);
+            let anchor = doc.anchor_after(Point::new(start + row, len));
+            let id = AGE_INLAY_BASE + index;
+            inlays.push(Inlay::custom(
+                id,
+                anchor,
+                format!("{}{words}", " ".repeat(pad)),
+            ));
+            let highlight = InlayHighlight {
+                inlay: InlayId::Custom(id),
+                inlay_position: anchor,
+                range: pad..pad + words.len(),
+            };
+            match age.unread {
+                true => loud.push(highlight),
+                false => quiet.push(highlight),
+            }
+        }
+        let ids = (0..inlays.len())
+            .map(|index| InlayId::Custom(AGE_INLAY_BASE + index))
+            .collect();
+        let old = std::mem::replace(&mut self.age_inlays, ids);
+        let to_doc = |offset: usize| {
+            let point = history.offset_to_point(offset);
+            doc.anchor_after(Point::new(start + point.row, point.column))
+        };
+        let unread = self
+            .unread
+            .iter()
+            .filter_map(|unread| {
+                let at = self
+                    .transcript
+                    .range_of(&unread.key)?
+                    .start
+                    .to_offset(&history);
+                Some(
+                    unread
+                        .ranges
+                        .iter()
+                        .map(|range| to_doc(at + range.start)..to_doc(at + range.end))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect();
+        self.editor.update(cx, |editor, cx| {
+            // An inlay's highlight stays until its key is cleared, and an
+            // age that turned quiet would stay loud under the old one.
+            editor.clear_highlights(LOUD_AGES, cx);
+            editor.clear_highlights(QUIET_AGES, cx);
+            editor.highlight_text(
+                UNREAD_TEXT,
+                unread,
+                HighlightStyle {
+                    color: Some(token::unread_text()),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            editor.splice_inlays(&old, inlays, cx);
+            for (key, highlights, color) in [
+                (LOUD_AGES, loud, token::attention()),
+                (QUIET_AGES, quiet, token::quiet()),
+            ] {
+                editor.highlight_inlays(
+                    key,
+                    highlights,
+                    HighlightStyle {
+                        color: Some(color),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+            }
+        });
+    }
+
+    /// The sheet holds `columns` of text measured so now: the ages move to
+    /// its new right edge.
+    fn set_columns(&mut self, columns: usize, measure: sheet::Measure, cx: &mut Context<Self>) {
+        if self.columns != columns || self.measure != measure {
+            self.columns = columns;
+            self.measure = measure;
+            self.paint_ages(cx);
+        }
+    }
+
     /// Reads the thread again when an age it shows next says another.
     fn schedule_ages(&mut self, cx: &mut Context<Self>) {
-        let system = self.system.read(cx);
-        let thread = self.thread.message;
         let now = UnixMs::now().0;
-        let wait = system.host_chat(self.thread.host).and_then(|chat| {
-            chat.reading_order(thread)
-                .filter(|message| message.flash_deadline().is_some())
-                .map(|message| MINUTE_MS - now.saturating_sub(message.at.0) % MINUTE_MS)
-                .min()
-        });
+        let wait = self
+            .ages
+            .iter()
+            .map(|age| MINUTE_MS - now.saturating_sub(age.at_ms) % MINUTE_MS)
+            .min();
         self._ages = wait.map(|wait| {
             let wait = std::time::Duration::from_millis(wait);
             cx.spawn(async move |this, cx| {
@@ -755,7 +962,7 @@ impl ThreadView {
     fn style_draft(&self, cx: &mut App) {
         let range = draft::range(&self.document(cx));
         self.editor
-            .update(cx, |editor, cx| draft::style(editor, range, "reply", cx));
+            .update(cx, |editor, cx| style_draft_in(editor, range, cx));
     }
 
     fn cursor_row(&self, cx: &App) -> u32 {
@@ -905,21 +1112,82 @@ impl ThreadView {
     }
 }
 
-/// The rows of `thread` as `system` holds it, below the draft.
+/// The rows of `thread` as `system` holds it, below the draft, the age
+/// each turn among them shows, and which of them are unanswered. What the
+/// thread's agents do is the heading's to say ([`ThreadView::heading`]), not a
+/// row's.
 fn items(
     system: &ChatSystem,
     thread: ThreadId,
     expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
-) -> Vec<Item<Key, Class, Meta>> {
-    let mut items = vec![gap(Key::Separator)];
-    if system.work(thread) == Some(rho_agent_types::ThreadWork::StoppedByYou) {
-        items.push(line(Key::Status, "stopped by you", Class::Crumb));
-    }
+) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>, Vec<Unread>) {
+    let mut items = vec![seam()];
     items.extend(ask_items(system, thread, cx));
-    items.extend(history_items(system, thread, expanded, private_edit, cx));
-    items
+    let (history, ages, unread) = history_items(system, thread, expanded, private_edit, cx);
+    items.extend(history);
+    (items, ages, unread)
+}
+
+/// The blank line between the draft and the newest item, with a soft
+/// hairline across the sheet at its top: the draft's lower edge.
+/// The same block on every refresh, so an unchanged separator is never
+/// replaced: a replaced item moves the text the scroll is anchored to.
+fn seam() -> Item<Key, Class, Meta> {
+    static HAIRLINE: std::sync::LazyLock<editor::display_map::RenderBlock> =
+        std::sync::LazyLock::new(|| {
+            Arc::new(|cx| {
+                div()
+                    .block_mouse_except_scroll()
+                    .w_full()
+                    .h(cx.line_height)
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(div().w_full().h(gpui::px(1.)).bg(token::soft_seam()))
+                    .into_any_element()
+            })
+        });
+    gap(Key::Separator).with_blocks(vec![BlockSpec {
+        line: BlockLine::Above(0),
+        height: 1,
+        render: HAIRLINE.clone(),
+        priority: 0,
+    }])
+}
+
+/// What the thread calls an agent on a line of its own: its short code,
+/// `eng-q9tz`. An agent the host no longer describes, or one of a host
+/// not attached, is called by the same short form of its id rather than
+/// the whole of it.
+fn agent_tag(system: &ChatSystem, host: EndpointId, agent: AgentId, cx: &App) -> String {
+    let id = agent.encoded();
+    system
+        .participant(host, agent, cx)
+        .map(|participant| participant.code)
+        .filter(|code| *code != id)
+        .unwrap_or_else(|| short_tag(&id))
+}
+
+/// An agent's name for a third voice: its label, or its tag when the
+/// label is nothing but its id.
+fn agent_name(system: &ChatSystem, host: EndpointId, agent: AgentId, cx: &App) -> String {
+    let id = agent.encoded();
+    system
+        .agent_label(host, agent, cx)
+        .filter(|label| *label != id && !label.trim().is_empty())
+        .unwrap_or_else(|| agent_tag(system, host, agent, cx))
+}
+
+/// The short form the agents system gives an agent it knows nothing more
+/// of: the default prefix and the first four characters of its id.
+fn short_tag(id: &str) -> String {
+    let end = id
+        .char_indices()
+        .nth(4)
+        .map_or(id.len(), |(index, _)| index);
+    format!("eng-{}", &id[..end])
 }
 
 /// Each push or fetch that waits in the thread, the oldest first, right
@@ -928,9 +1196,7 @@ fn ask_items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, C
     let mut items = Vec::new();
     for (id, waiting) in system.asks_in(thread) {
         let asker = waiting.ask.request.agent.map_or_else(String::new, |agent| {
-            system
-                .agent_label(thread.host, agent, cx)
-                .unwrap_or_else(|| agent.encoded())
+            agent_name(system, thread.host, agent, cx)
         });
         let asked = thread::when(waiting.since().as_millisecond());
         let text = waiting.text(&asker, &asked);
@@ -940,7 +1206,7 @@ fn ask_items(system: &ChatSystem, thread: ThreadId, cx: &App) -> Vec<Item<Key, C
             let end = start + line.len();
             let class = match line == super::git::HINT {
                 true => Class::Crumb,
-                false => Class::Name,
+                false => Class::Unread,
             };
             styles.push((class, start..end));
             start = end + 1;
@@ -966,17 +1232,19 @@ fn history_items(
     expanded: &Expanded,
     private_edit: Option<&PrivateEdit>,
     cx: &App,
-) -> Vec<Item<Key, Class, Meta>> {
+) -> (Vec<Item<Key, Class, Meta>>, Vec<Age>, Vec<Unread>) {
     let host = thread.host;
     let Some(chat) = system.host_chat(host) else {
-        return vec![line(
+        let line = line(
             Key::Unavailable,
             "this host's messages are not held here",
             Class::Crumb,
-        )];
+        );
+        return (vec![line], Vec::new(), Vec::new());
     };
     let Some(head) = chat.thread(thread.message) else {
-        return vec![line(Key::Unavailable, "this thread is gone", Class::Crumb)];
+        let line = line(Key::Unavailable, "this thread is gone", Class::Crumb);
+        return (vec![line], Vec::new(), Vec::new());
     };
     let mut items = Vec::new();
     // The heading already names the project; the breadcrumb leads back to
@@ -1003,23 +1271,34 @@ fn history_items(
             private_items(frame.marks(), chat, host, thread.message, private_edit)
         })
         .unwrap_or_default();
-    let now = Timestamp::now();
-    // While more than one agent has a live message here, each project
-    // message says which agent wrote it, quietly, by its short code.
-    let several = live_writers(chat.reading_order(thread.message)).len() > 1;
-    let mail_item = |message: &Message| {
-        let voice = match (message.from, message.voice) {
-            (Party::Agent(agent), Voice::ToAgent(_)) => system
-                .agent_label(host, agent, cx)
-                .or_else(|| Some(agent.encoded())),
-            (Party::Agent(agent), Voice::Message) if several => Some(
-                system
-                    .participant(host, agent, cx)
-                    .map_or_else(|| agent.encoded(), |participant| participant.code),
-            ),
-            _ => None,
-        };
-        message_item(message, voice.as_deref(), &expanded.quotes, now)
+    let order: Vec<&Message> = chat.reading_order(thread.message).collect();
+    let voices = voices(
+        &order,
+        |agent| agent_tag(system, host, agent, cx),
+        |agent| agent_name(system, host, agent, cx),
+    );
+    let fresh = unread(&order);
+    let mut ages = Vec::new();
+    let mut unread = Vec::new();
+    let mut mail_item = |message: &Message| {
+        let item = message_item(
+            message,
+            voices.get(&message.id).map(String::as_str),
+            &expanded.quotes,
+        )?;
+        let asks = fresh.contains(&message.id) && message.voice == Voice::Message;
+        ages.push(Age {
+            key: item.key.clone(),
+            at_ms: message.at.0,
+            unread: asks,
+        });
+        if asks {
+            unread.push(Unread {
+                key: item.key.clone(),
+                ranges: bright(&item),
+            });
+        }
+        Some(item)
     };
     items.extend(pending_items(system, host, thread.message));
     let flashes = flash_groups(chat.reading_order(thread.message));
@@ -1074,13 +1353,48 @@ fn history_items(
         }
     }
     items.extend(crumb);
-    without_trailing_gap(items)
+    (without_trailing_gap(items), ages, unread)
 }
 
-/// The agents with a live message (`chat.the last message stays live`):
-/// one they sent since the user's last message, and did not take back.
-fn live_writers<'a>(messages: impl Iterator<Item = &'a Message>) -> BTreeSet<AgentId> {
-    let mut live = BTreeSet::new();
+/// The parts of a message in the read voice that are no link: what turns
+/// bright while the message is unanswered.
+fn bright(item: &Item<Key, Class, Meta>) -> Vec<Range<usize>> {
+    let links: Vec<_> = item
+        .styles
+        .iter()
+        .filter(|(class, _)| *class == Class::Link)
+        .map(|(_, range)| range.clone())
+        .collect();
+    let mut ranges = Vec::new();
+    for (_, voice) in item
+        .styles
+        .iter()
+        .filter(|(class, _)| *class == Class::Read)
+    {
+        let mut at = voice.start;
+        for link in links
+            .iter()
+            .filter(|link| link.start < voice.end && link.end > voice.start)
+        {
+            if link.start > at {
+                ranges.push(at..link.start);
+            }
+            at = at.max(link.end);
+        }
+        if at < voice.end {
+            ranges.push(at..voice.end);
+        }
+    }
+    ranges
+}
+
+/// The live messages (`chat.the last message stays live`), each with its
+/// agent: one an agent sent since the user's last message, and did not
+/// take back.
+fn live_messages<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+) -> std::collections::BTreeMap<MessageId, AgentId> {
+    let mut live = std::collections::BTreeMap::new();
     for message in messages.filter(|message| message.voice == Voice::Message) {
         match message.from {
             Party::User => live.clear(),
@@ -1090,12 +1404,59 @@ fn live_writers<'a>(messages: impl Iterator<Item = &'a Message>) -> BTreeSet<Age
                     Revision::Deleted | Revision::TakenBack { .. }
                 ) =>
             {
-                live.insert(agent);
+                live.insert(message.id, agent);
             }
             _ => {}
         }
     }
     live
+}
+
+/// The agents with a live message.
+#[cfg(test)]
+fn live_writers<'a>(messages: impl Iterator<Item = &'a Message>) -> BTreeSet<AgentId> {
+    live_messages(messages).into_values().collect()
+}
+
+/// The quiet name line above each message that has one, by message. The
+/// project speaks with one voice, so a message of its own has none, with
+/// one exception: while more than one agent holds a live message, each of
+/// those live messages, and only those, carries its agent's `tag`, as
+/// two open asks would otherwise read as one. A message from an agent to
+/// another is a third voice and is `named`.
+fn voices(
+    order: &[&Message],
+    tag: impl Fn(AgentId) -> String,
+    named: impl Fn(AgentId) -> String,
+) -> HashMap<MessageId, String> {
+    let live = live_messages(order.iter().copied());
+    let several = live.values().collect::<BTreeSet<_>>().len() > 1;
+    let mut voices = HashMap::new();
+    for message in order {
+        let voice = match (message.from, message.voice) {
+            (Party::Agent(agent), Voice::ToAgent(_)) => named(agent),
+            (Party::Agent(agent), Voice::Message) if several && live.contains_key(&message.id) => {
+                tag(agent)
+            }
+            _ => continue,
+        };
+        voices.insert(message.id, voice);
+    }
+    voices
+}
+
+/// The project's turns since the user's last message: what the reader has
+/// not answered yet, in the bright voice with an `attention` age.
+fn unread(order: &[&Message]) -> HashSet<MessageId> {
+    let since = order
+        .iter()
+        .rposition(|message| message.from == Party::User && message.voice == Voice::Message)
+        .map_or(0, |last| last + 1);
+    order[since..]
+        .iter()
+        .filter(|message| message.from != Party::User)
+        .map(|message| message.id)
+        .collect()
 }
 
 /// One group per author, independent of edit versions and display state.
@@ -1916,66 +2277,78 @@ fn message_item(
     message: &Message,
     third_voice: Option<&str>,
     expanded_quotes: &HashSet<QuoteId>,
-    now: Timestamp,
 ) -> Option<Item<Key, Class, Meta>> {
-    let edited = match message.revision {
+    let tag = match message.revision {
         Revision::Original => "",
         Revision::Edited { .. } | Revision::Recovered { .. } => " · edited",
         Revision::TakenBack { .. } => " · taken back",
         Revision::Deleted => return None,
-    };
-    let flash = message.voice == Voice::Flash;
-    let tag = if flash {
-        format!("{edited} · {}", ago(message.at.0, now))
-    } else {
-        edited.to_owned()
     };
     let body = body(&message.content);
     let mut text = String::new();
     let mut styles = Vec::new();
     let mut lines = Vec::new();
     if let Some(voice) = third_voice {
-        if !lines.is_empty() {
-            text.push('\n');
-        }
-        let start = text.len();
         text.push_str(voice);
-        styles.push((Class::Crumb, start..text.len()));
+        styles.push((Class::Crumb, 0..text.len()));
         lines.push(Meta::Mail(message.id, None));
     }
-    let voice = if message.from == Party::User {
-        Class::User
-    } else if flash {
-        Class::Time
-    } else {
-        Class::Name
+    // The project's words are in the read voice here; while unanswered
+    // they are painted bright over it ([`Unread`]).
+    let voice = match (message.from, message.voice) {
+        (Party::User, _) => Class::User,
+        (_, Voice::Flash) => Class::Time,
+        _ => Class::Read,
     };
-    let mut body_lines = body.lines().enumerate().peekable();
-    let mut first_body = true;
-    while let Some((first_line, line)) = body_lines.next() {
+    // Prose wraps at the prose measure; a wide block (code, a diff, a
+    // table) keeps its lines whole on the same left edge, for the sheet's
+    // width to hold.
+    let blocks = sheet::blocks(&body);
+    let push = |text: &mut String, lines: &mut Vec<Meta>, line: &str, meta: Meta| {
         if !lines.is_empty() {
             text.push('\n');
         }
-        let start = text.len();
         text.push_str(line);
+        lines.push(meta);
+    };
+    let wrapped = |line: &str, prose: bool| match prose {
+        true => sheet::wrap_line(line, sheet::PROSE_COLUMNS),
+        false => vec![line.to_owned()],
+    };
+    let mut at = 0;
+    while at < blocks.len() {
+        let (line, prose) = blocks[at];
+        let first_line = at;
+        at += 1;
+        // Where this line's words start, after the newline that ends the
+        // line before.
+        let start = text.len() + usize::from(!lines.is_empty());
         if line.starts_with("> ") {
             let quote = QuoteId {
                 mail: message.id,
                 first_line,
             };
             let expanded = expanded_quotes.contains(&quote);
-            let mut more = false;
-            lines.push(Meta::Quote(quote, first_line));
-            while body_lines
-                .peek()
-                .is_some_and(|(_, line)| line.starts_with("> "))
+            let mut quoted = vec![(first_line, line, prose)];
+            while blocks
+                .get(at)
+                .is_some_and(|(line, _)| line.starts_with("> "))
             {
-                let (source_line, quoted) = body_lines.next().expect("peeked a quote line");
-                more = true;
-                if expanded {
-                    text.push('\n');
-                    text.push_str(quoted);
-                    lines.push(Meta::Quote(quote, source_line));
+                quoted.push((at, blocks[at].0, blocks[at].1));
+                at += 1;
+            }
+            let more = quoted.len() > 1;
+            if !expanded {
+                quoted.truncate(1);
+            }
+            for (source_line, quoted, prose) in quoted {
+                for piece in wrapped(quoted, prose) {
+                    push(
+                        &mut text,
+                        &mut lines,
+                        &piece,
+                        Meta::Quote(quote, source_line),
+                    );
                 }
             }
             if more && !expanded {
@@ -1983,25 +2356,24 @@ fn message_item(
             }
             styles.push((Class::Quote, start..text.len()));
         } else {
-            styles.push((voice, start..text.len()));
-            lines.push(Meta::Mail(message.id, Some(first_line)));
-        }
-        if first_body {
-            let first_end = text[start..].find('\n').map_or(text.len(), |n| start + n);
-            text.insert_str(first_end, &tag);
-            // An expanded quote is still quiet after its tag.
-            if let Some((_, range)) = styles.last_mut() {
-                if first_end != range.end {
-                    range.end += tag.len();
-                }
+            for piece in wrapped(line, prose) {
+                push(
+                    &mut text,
+                    &mut lines,
+                    &piece,
+                    Meta::Mail(message.id, Some(first_line)),
+                );
             }
-            styles.push((Class::Crumb, first_end..first_end + tag.len()));
-            first_body = false;
+            styles.push((voice, start..text.len()));
         }
     }
     if lines.is_empty() {
         return None;
     }
+    // `· edited` or `· taken back` closes the prose, quietly.
+    let end = text.len();
+    text.push_str(tag);
+    styles.push((Class::Crumb, end..text.len()));
     styles.extend(links(&text).into_iter().map(|link| (Class::Link, link)));
     let len = text.len();
     let item = Item::new(Key::Message(message.id), text)
@@ -2016,16 +2388,11 @@ fn message_item(
 
 impl Surface for ThreadView {
     fn title(&self, cx: &App) -> String {
-        let system = self.system.read(cx);
-        let project = system.project_of(self.thread, cx);
-        let subject = system
-            .host_chat(self.thread.host)
-            .and_then(|chat| chat.name(self.thread.message))
-            .unwrap_or_default();
-        match subject.is_empty() {
-            true => project,
-            false => format!("{project} › {subject}"),
-        }
+        self.page_heading(cx).text()
+    }
+
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
     }
 
     fn show_search_match(
@@ -2101,10 +2468,11 @@ impl Surface for ThreadView {
         }
     }
 
-    /// What the thread's agents do while nothing in it waits.
+    /// The page's marker: a push or fetch that waits, or what the
+    /// thread's agents do. How long the thread has waited is not one: the
+    /// newest turn says it right below.
     fn status(&self, cx: &App) -> Option<String> {
-        let work = self.system.read(cx).work(self.thread)?;
-        Some(work.words().to_owned())
+        self.page_heading(cx).marker.map(|(words, _)| words)
     }
 
     fn opened(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2238,6 +2606,30 @@ impl Surface for ThreadView {
     }
 }
 
+impl ThreadView {
+    /// What the top-left of the page says: the subject, the project, and
+    /// the page's marker, with no breadcrumb, no model and no wait.
+    fn page_heading(&self, cx: &App) -> Heading {
+        let system = self.system.read(cx);
+        let project = system.project_of(self.thread, cx);
+        let subject = system
+            .host_chat(self.thread.host)
+            .and_then(|chat| chat.name(self.thread.message))
+            .filter(|subject| !subject.trim().is_empty());
+        let heading = match subject {
+            Some(subject) => Heading::new(subject).context(project),
+            None => Heading::new(project),
+        };
+        if !system.asks_in(self.thread).is_empty() {
+            return heading.marker("approve push", token::attention());
+        }
+        match system.work(self.thread) {
+            Some(work) => heading.marker(work.words(), token::quiet()),
+            None => heading,
+        }
+    }
+}
+
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.private_edit
@@ -2273,6 +2665,27 @@ impl Render for ThreadView {
             .absolute()
             .size_full()
         });
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let heading = self.page_heading(cx);
+        let this = cx.weak_entity();
+        let measured = text.clone();
+        let editor = div()
+            .size_full()
+            .child(self.editor.clone())
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(bounds) = bounds.first() else {
+                    return;
+                };
+                let measure = sheet::Measure::of(&measured, window);
+                let columns = measure.columns_in(bounds.size.width);
+                let this = this.clone();
+                window.defer(cx, move |_, cx| {
+                    let _ = this.update(cx, |view, cx| view.set_columns(columns, measure, cx));
+                });
+            });
+        let page = sheet::page(&heading, &text, editor, window, cx);
         div()
             .id("thread")
             .relative()
@@ -2291,7 +2704,7 @@ impl Render for ThreadView {
             // before it; GPUI also routes a completed tap this way.
             .capture_any_mouse_down(cx.listener(Self::tap_tail))
             .capture_any_mouse_down(cx.listener(Self::tap_mail))
-            .child(self.editor.clone())
+            .child(page)
             .children(gesture)
     }
 }
@@ -2363,6 +2776,246 @@ mod tests {
         cx.run_until_parked();
         cx.draw_window(window.into());
         (window, mail, db, thread)
+    }
+
+    /// A thread where agent `a` answered at length before the user's last
+    /// reply, then `a` and `b` each sent a message: two live asks from two
+    /// agents. Neither agent is described by the agents system, as with
+    /// an agent its host no longer runs.
+    fn two_voices(
+        cx: &mut gpui::TestAppContext,
+        second: bool,
+    ) -> (
+        gpui::WindowHandle<rho_frame::Frame>,
+        tempfile::TempDir,
+        [AgentId; 2],
+    ) {
+        use rho_agent_types::{ChatEvent, ChatRecord};
+
+        let domain = rho_agent_types::AgentIdDomain(0);
+        let a = AgentId::from_counter(1, &domain).unwrap();
+        let b = AgentId::from_counter(2, &domain).unwrap();
+        let thread = ThreadId {
+            host: EndpointId([3; 32]),
+            message: MessageId(ChatSeq(2)),
+        };
+        let mut posts = vec![
+            (None, Party::User, "tide"),
+            (Some(1), Party::User, "Fix the flaky clock test."),
+            (Some(2), Party::Agent(a), "The clock drifts under load."),
+            (Some(2), Party::Agent(a), "A per-test clock fixes it."),
+            (Some(2), Party::User, "Run the suite once more."),
+            (Some(2), Party::Agent(a), "Both clock tests pass 500/500."),
+        ];
+        if second {
+            posts.push((Some(2), Party::Agent(b), "I pushed the legacy-clock flag."));
+        }
+        let mut log = HostChat::default();
+        for (seq, (parent, from, text)) in (1..).zip(posts) {
+            log.tell(&ChatRecord {
+                seq: ChatSeq(seq),
+                at: UnixMs(1_760_000_000_000 + seq * 60_000),
+                event: ChatEvent::Posted {
+                    parent: parent.map(|id| MessageId(ChatSeq(id))),
+                    retry_of: None,
+                    thread_reply: None,
+                    from,
+                    voice: Voice::Message,
+                    content: vec![ContentPart::Text { text: text.into() }],
+                },
+            });
+        }
+        let (window, _mail, db) = super::super::search_bench::fixture(cx, log);
+        window
+            .update(cx, |frame, window, cx| {
+                frame.open(thread.address(), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.draw_window(window.into());
+        (window, db, [a, b])
+    }
+
+    /// The document's lines as drawn, ages and all.
+    fn display_lines(
+        cx: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<rho_frame::Frame>,
+    ) -> Vec<String> {
+        cx.run_until_parked();
+        window
+            .update(cx, |frame, _, cx| {
+                let editor = frame.current_surface().editor(cx).unwrap();
+                editor.update(cx, |editor, cx| {
+                    let display = editor.display_snapshot(cx);
+                    display.text().lines().map(str::to_owned).collect()
+                })
+            })
+            .unwrap()
+    }
+
+    /// The WF4 capture showed `0lv8s73v8b56` over every project message of
+    /// a long thread once a second agent spoke. The project speaks with
+    /// one voice: an ordinary thread has no name line at all, and while
+    /// two agents hold live asks only those two messages say which agent
+    /// wrote them, by a short tag, never by the agent's whole id.
+    #[gpui::test]
+    fn messages_never_carry_an_agents_raw_id(cx: &mut gpui::TestAppContext) {
+        let (window, _db, [a, b]) = two_voices(cx, false);
+        let one = display_lines(cx, window);
+        let ids = [a.encoded(), b.encoded()];
+        let tags = [short_tag(&ids[0]), short_tag(&ids[1])];
+        assert!(
+            one.iter().all(|line| ids
+                .iter()
+                .chain(&tags)
+                .all(|id| !line.contains(id.as_str()))),
+            "one agent, no name lines: {one:#?}"
+        );
+        assert_eq!(one[0], "", "the empty draft has no placeholder: {one:#?}");
+
+        let (window, _db, _) = two_voices(cx, true);
+        let two = display_lines(cx, window);
+        assert!(
+            two.iter()
+                .all(|line| ids.iter().all(|id| !line.contains(id.as_str()))),
+            "no raw id anywhere: {two:#?}"
+        );
+        let named: Vec<_> = two
+            .iter()
+            .filter(|line| {
+                tags.iter()
+                    .any(|tag| line.trim_end().starts_with(tag.as_str()))
+            })
+            .map(|line| line.split_whitespace().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            named,
+            [tags[1].clone(), tags[0].clone()],
+            "only the two live messages, newest first, are named: {two:#?}"
+        );
+        let older = two
+            .iter()
+            .position(|line| line.starts_with("A per-test clock fixes it."))
+            .unwrap();
+        assert!(
+            !tags
+                .iter()
+                .any(|tag| two[older - 1].starts_with(tag.as_str())),
+            "an answered message is the project's: {two:#?}"
+        );
+        // The posts are from 2025: their ages are in days, flush-right on
+        // each turn's first line, the name line when it has one.
+        let aged = |start: &str| {
+            two.iter().any(|line| {
+                line.starts_with(start)
+                    && line.ends_with('d')
+                    && line.chars().count() >= sheet::SHEET_COLUMNS - 2
+            })
+        };
+        assert!(aged("Run the suite once more."), "{two:#?}");
+        assert!(aged(&tags[0]), "{two:#?}");
+        assert!(
+            two.iter()
+                .any(|line| line == "Both clock tests pass 500/500."),
+            "the words below a name line have no age of their own: {two:#?}"
+        );
+    }
+
+    #[test]
+    fn only_live_messages_of_several_agents_are_named() {
+        let domain = rho_agent_types::AgentIdDomain(0);
+        let a = AgentId::from_counter(1, &domain).unwrap();
+        let b = AgentId::from_counter(2, &domain).unwrap();
+        let said = |seq, from: Party| Message {
+            id: MessageId(ChatSeq(seq)),
+            ..mail(from, Revision::Original, "words")
+        };
+        let history = [
+            said(3, Party::Agent(a)),
+            said(4, Party::Agent(b)),
+            said(5, Party::User),
+            said(6, Party::Agent(a)),
+            said(7, Party::Agent(b)),
+            said(8, Party::Agent(a)),
+        ];
+        let order: Vec<_> = history.iter().collect();
+        let tag = |agent: AgentId| short_tag(&agent.encoded());
+        let named_lines = voices(&order, tag, |agent| format!("named {}", tag(agent)));
+        let mut named: Vec<_> = named_lines.keys().map(|id| id.0.0).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [6, 7, 8],
+            "messages before the user's reply are the project's"
+        );
+        assert_eq!(named_lines[&MessageId(ChatSeq(7))], tag(b));
+
+        let alone = [
+            said(5, Party::User),
+            said(6, Party::Agent(a)),
+            said(8, Party::Agent(a)),
+        ];
+        let order: Vec<_> = alone.iter().collect();
+        assert!(
+            voices_of(&order).is_empty(),
+            "one live agent speaks as the project"
+        );
+
+        let id = a.encoded();
+        assert_eq!(short_tag(&id), format!("eng-{}", &id[..4]));
+        assert_ne!(short_tag(&id), id);
+
+        fn voices_of(order: &[&Message]) -> HashMap<MessageId, String> {
+            voices(order, |agent| agent.encoded(), |agent| agent.encoded())
+        }
+    }
+
+    #[test]
+    fn prose_wraps_at_the_measure_and_wide_blocks_keep_their_lines() {
+        let long = "word ".repeat(30);
+        let code = format!("let x = \"{}\";", "c".repeat(100));
+        let body = format!("{}\n```rust\n{code}\n```\nDone.", long.trim_end());
+        let message = mail(
+            Party::Agent(AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()),
+            Revision::Original,
+            &body,
+        );
+        let item = message_item(&message, None, &HashSet::new()).unwrap();
+        let lines: Vec<_> = item.text.lines().collect();
+        assert!(
+            lines[0].chars().count() <= sheet::PROSE_COLUMNS,
+            "{lines:#?}"
+        );
+        assert!(
+            lines[0].chars().count() > sheet::PROSE_COLUMNS - 5,
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[1].split_whitespace().count(),
+            30 - lines[0].split_whitespace().count()
+        );
+        assert_eq!(lines[3], code, "the code line is whole");
+        assert_eq!(
+            item.lines.iter().map(Meta::source_line).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(1), Some(2), Some(3), Some(4)],
+            "each wrapped line maps to the line it came from"
+        );
+        let link = "https://example.com/x";
+        let ask = Message {
+            content: vec![ContentPart::Text {
+                text: format!("See {link} now."),
+            }],
+            ..message.clone()
+        };
+        let ask = message_item(&ask, None, &HashSet::new()).unwrap();
+        assert_eq!(
+            bright(&ask)
+                .into_iter()
+                .map(|range| &ask.text[range])
+                .collect::<Vec<_>>(),
+            ["See ", " now."],
+            "an unanswered turn is bright around its links, which stay links"
+        );
     }
 
     /// Where the point is, how far the thread is scrolled, and whether
@@ -3181,7 +3834,10 @@ mod tests {
         assert_eq!(view(cx), top, "a push");
         assert_eq!(
             below_draft(cx),
-            "worker asks to push with your ssh login".replace("worker", &worker.encoded())
+            format!(
+                "{} asks to push with your ssh login",
+                short_tag(&worker.encoded())
+            )
         );
 
         // (1) A remembered line: on it, news or not.
@@ -3563,7 +4219,7 @@ mod tests {
         assert_eq!(*thread.inspected.borrow(), [ASK]);
 
         // The flash.
-        thread.at(cx, "Rerunning the clock test. · 1m", 0);
+        thread.at(cx, "Rerunning the clock test.", 0);
         thread.keys(cx, "w enter");
         assert_eq!(*thread.inspected.borrow(), [ASK, FLASH]);
 
@@ -3882,7 +4538,7 @@ mod tests {
                                 if start.row == 0 {
                                     return None; // the draft's own bar
                                 }
-                                assert_eq!(colour, rho_window::style::user_prompt_gutter_color(cx));
+                                assert_eq!(colour, token::marked_bar());
                                 let end = display.display_point_to_point(range.end, Bias::Left);
                                 Some((start.row, end.row, lines[start.row as usize].to_owned()))
                             })
@@ -4123,7 +4779,14 @@ mod tests {
             )
         };
         let live = |messages: &[Message]| {
-            live_writers(messages.iter())
+            let numbered: Vec<_> = (1..)
+                .zip(messages)
+                .map(|(seq, message)| Message {
+                    id: MessageId(ChatSeq(seq)),
+                    ..message.clone()
+                })
+                .collect();
+            live_writers(numbered.iter())
                 .into_iter()
                 .collect::<Vec<_>>()
         };
@@ -4175,22 +4838,16 @@ mod tests {
             (&bot, "cargo exited 101 · edited"),
             (&user, "Go ahead."),
         ] {
-            let item = message_item(mail, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
+            let item = message_item(mail, None, &HashSet::new()).unwrap();
             assert_eq!(item.text, format!("{first}\n"));
         }
-        let third_voice = message_item(
-            &original,
-            Some("eng-ab12"),
-            &HashSet::new(),
-            Timestamp::UNIX_EPOCH,
-        )
-        .unwrap();
+        let third_voice = message_item(&original, Some("eng-ab12"), &HashSet::new()).unwrap();
         assert_eq!(third_voice.text, "eng-ab12\nReady?\n");
         let deleted = Message {
             revision: Revision::Deleted,
             ..original
         };
-        assert!(message_item(&deleted, None, &HashSet::new(), Timestamp::UNIX_EPOCH).is_none());
+        assert!(message_item(&deleted, None, &HashSet::new()).is_none());
     }
 
     /// A result may use any headings, `## proof` among them; none is a
@@ -4211,16 +4868,16 @@ mod tests {
         // A message in a thread: words at a root never ping.
         result.parent = Some(MessageId(ChatSeq(2)));
         assert!(result.pings_user());
-        let item = message_item(&result, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
+        let item = message_item(&result, None, &HashSet::new()).unwrap();
         assert_eq!(
             item.text,
-            "## recap · edited\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed.\n"
+            "## recap\nEarlier plan.\n\n## Result\nDone.\n\n## proof\n42 tests passed. · edited\n"
         );
         let proof = item.text.find("## proof").unwrap();
         assert!(
             item.styles
                 .iter()
-                .any(|(class, bytes)| *class == Class::Name && bytes.contains(&proof)),
+                .any(|(class, bytes)| *class == Class::Read && bytes.contains(&proof)),
             "{:?}",
             item.styles
         );
@@ -4267,11 +4924,10 @@ mod tests {
             (groups[&b].latest, groups[&b].earlier),
             (MessageId(ChatSeq(5)), 0)
         );
-        let now = Timestamp::from_millisecond(840_000).unwrap();
-        let item = message_item(&edited, None, &HashSet::new(), now).unwrap();
+        let item = message_item(&edited, None, &HashSet::new()).unwrap();
         assert_eq!(
-            item.text,
-            "Running the suite. · edited · 12m\nNo retries.\n"
+            item.text, "Running the suite.\nNo retries. · edited\n",
+            "a flash's age is drawn beside it, not written into it"
         );
         assert_eq!(&item.text[item.styles[0].1.clone()], "Running the suite.");
         assert_eq!(item.styles[0].0, Class::Time);
@@ -4302,7 +4958,7 @@ mod tests {
             mail: message.id,
             first_line: 4,
         };
-        let folded = message_item(&message, None, &HashSet::new(), Timestamp::UNIX_EPOCH).unwrap();
+        let folded = message_item(&message, None, &HashSet::new()).unwrap();
         assert_eq!(
             folded.text,
             "preface\n> façade first …\nCan this ship?\n> another quote …\n",
@@ -4318,13 +4974,7 @@ mod tests {
             quote_text(&folded),
             ["> façade first …", "> another quote …"]
         );
-        let expanded = message_item(
-            &message,
-            None,
-            &HashSet::from([first]),
-            Timestamp::UNIX_EPOCH,
-        )
-        .unwrap();
+        let expanded = message_item(&message, None, &HashSet::from([first])).unwrap();
         assert_eq!(
             expanded.text,
             "preface\n> façade first\n> second\nCan this ship?\n> another quote …\n",

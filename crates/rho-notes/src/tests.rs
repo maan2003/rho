@@ -317,25 +317,97 @@ fn a_reply_shows_its_mails_words_and_its_notes_age_not_just_the_thread() {
         }),
         reminder: None,
     };
-    let (text, styles) = list::row(&listed, &now);
+    let (text, styles) = list::row(&listed, &now, 0, &chars);
     assert_eq!(
         text,
-        "  verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  · 7m"
+        "verify on CI too  it failed last night  ↳ Can this ship before noon on Friday? · Fix the flaky test  7m"
     );
     assert_eq!(&text[styles[0].1.clone()], "verify on CI too");
     assert_eq!(styles[1].0, list::Class::Muted);
     assert_eq!(
         &text[styles[1].1.clone()],
-        &text["  verify on CI too".len()..]
+        &text["verify on CI too".len()..]
     );
 
     listed.reply = Some(ReplyContext::default());
-    assert!(list::row(&listed, &now).0.contains("↳ private reply"));
+    assert!(
+        list::row(&listed, &now, 0, &chars)
+            .0
+            .contains("↳ private reply")
+    );
     listed.reply = None;
     assert_eq!(
-        list::row(&listed, &now).0,
-        "  verify on CI too  it failed last night  · 7m"
+        list::row(&listed, &now, 0, &chars).0,
+        "verify on CI too  it failed last night  7m"
     );
+}
+
+/// On the sheet a row's age sits at its right edge, and a long row is cut
+/// before it rather than running into it or wrapping under it.
+#[test]
+fn a_rows_age_is_flush_right_and_a_long_row_is_cut_before_it() {
+    let now = Timestamp::from_second(1_800_000_000)
+        .unwrap()
+        .to_zoned(TimeZone::UTC);
+    let mut listed = Listed {
+        note: NoteId(uuid::Uuid::new_v4()),
+        title: "verify on CI too".into(),
+        preview: "it failed last night".into(),
+        written: Timestamp::from_second(1_800_000_000 - 7 * 60).unwrap(),
+        reply: None,
+        reminder: None,
+    };
+    let (text, _) = list::row(&listed, &now, 60, &chars);
+    assert_eq!(text.chars().count(), 60);
+    assert!(text.starts_with("verify on CI too  it failed last night  "));
+    assert!(text.ends_with(" 7m"), "{text:?}");
+
+    listed.preview = "words ".repeat(20);
+    let (text, styles) = list::row(&listed, &now, 40, &chars);
+    assert_eq!(text.chars().count(), 40, "{text:?}");
+    assert!(text.ends_with("…  7m"), "{text:?}");
+    assert_eq!(&text[styles[0].1.clone()], "verify on CI too");
+
+    // Cut inside the title, the title's colour stops at the cut.
+    listed.title = "é".repeat(30);
+    let (text, styles) = list::row(&listed, &now, 20, &chars);
+    assert_eq!(text.chars().count(), 20, "{text:?}");
+    assert_eq!(&text[styles[0].1.clone()], "é".repeat(15));
+}
+
+/// Every character one column wide.
+fn chars(text: &str) -> f32 {
+    text.chars().count() as f32
+}
+
+/// The list's font is not monospace: a row is padded and cut by how wide
+/// its letters are, not by how many there are.
+#[test]
+fn a_row_of_narrow_letters_is_padded_and_cut_by_their_width() {
+    let now = Timestamp::from_second(1_800_000_000)
+        .unwrap()
+        .to_zoned(TimeZone::UTC);
+    let narrow = |text: &str| -> f32 {
+        text.chars()
+            .map(|character| if character == 'i' { 0.5 } else { 1. })
+            .sum()
+    };
+    let mut listed = Listed {
+        note: NoteId(uuid::Uuid::new_v4()),
+        title: "iiii".into(),
+        preview: String::new(),
+        written: Timestamp::from_second(1_800_000_000 - 7 * 60).unwrap(),
+        reply: None,
+        reminder: None,
+    };
+    let (text, _) = list::row(&listed, &now, 20, &narrow);
+    assert_eq!(narrow(&text), 20., "{text:?}");
+    assert_eq!(text.chars().count(), 22, "{text:?}");
+
+    listed.title = "i".repeat(60);
+    let (text, styles) = list::row(&listed, &now, 20, &narrow);
+    assert_eq!(narrow(&text), 20., "{text:?}");
+    assert_eq!(&text[styles[0].1.clone()], "i".repeat(30));
 }
 
 /// A row says when its reminder comes due, on the user's clock: the hour
@@ -354,18 +426,18 @@ fn a_row_says_when_its_reminder_is_due() {
         reply: None,
         reminder: None,
     };
-    let row = |listed: &Listed| list::row(listed, &now).0;
+    let row = |listed: &Listed| list::row(listed, &now, 0, &chars).0;
     let in_mins = |mins| Some(now.timestamp() + jiff::SignedDuration::from_mins(mins));
     listed.reminder = in_mins(90);
-    assert_eq!(row(&listed), "  Call the dentist  · reminder 09:30 · 7m");
+    assert_eq!(row(&listed), "Call the dentist  reminder 09:30  7m");
     listed.reminder = in_mins(25 * 60);
     assert_eq!(
         row(&listed),
-        "  Call the dentist  · reminder Sat 16 Jan 09:00 · 7m"
+        "Call the dentist  reminder Sat 16 Jan 09:00  7m"
     );
     listed.reminder = in_mins(-1);
-    assert_eq!(row(&listed), "  Call the dentist  · reminder due · 7m");
-    let styles = list::row(&listed, &now).1;
+    assert_eq!(row(&listed), "Call the dentist  reminder due  7m");
+    let styles = list::row(&listed, &now, 0, &chars).1;
     assert_eq!(styles[1].0, list::Class::Muted, "the reminder is quiet");
 }
 

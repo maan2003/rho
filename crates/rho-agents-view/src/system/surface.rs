@@ -5,6 +5,7 @@ use editor::Editor;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, KeyBinding, Window, div};
 use rho_agent_types::{Activity, AgentId, Message, MessageId};
+use rho_chat::ui::sheet::{self, Heading, token};
 use rho_frame::{CardHere, Subject, Surface};
 use rho_window::style::StyleClass;
 
@@ -78,29 +79,35 @@ impl TranscriptSurface {
         }
     }
 
-    /// The work, its host, and the folder and runtime of the agent it
-    /// shows: `tide · Flaky clock test · lab · ~/rho · opus-high`. Narrowed
-    /// to one of several agents, its code follows the work.
-    fn title_with_folder(&self, compact: bool, cx: &App) -> String {
+    /// What the top-left of the page says: `Flaky clock test  tide
+    /// opus-high`, with what the agents do, and how many errors since
+    /// their last good step, as its marker.
+    fn page_heading(&self, cx: &App) -> Heading {
         let system = self.system.read(cx);
-        let registry = system.registry();
-        let (Some((shown, _)), Some((label, host))) = (
-            system.scope_agents(self.scope),
-            system.scope_label(self.scope, cx),
-        ) else {
-            return String::new();
+        let Some((shown, _)) = system.scope_agents(self.scope) else {
+            return Heading::default();
         };
-        let folder = registry
-            .working_directory(shown)
-            .map(|directory| match compact {
-                true => directory
-                    .file_name()
-                    .unwrap_or(directory.as_str())
-                    .to_owned(),
-                false => directory.to_string(),
-            });
-        let runtime = registry.agent_spec(shown).map(|spec| spec.runtime_label());
-        super::work_name::transcript_title(&label, &host, folder.as_deref(), runtime.as_deref())
+        let runtime = system
+            .registry()
+            .agent_spec(shown)
+            .map(|spec| spec.runtime_label());
+        let heading = super::work_name::transcript_heading(
+            &system.work_name(shown, cx),
+            matches!(self.scope, Scope::Agent(_)),
+            runtime.as_deref(),
+        );
+        match (self.activity(cx), self.status(cx)) {
+            (Some(activity), Some(words)) => {
+                let color = match pressing(activity) {
+                    0 => token::failed(),
+                    1 => token::attention(),
+                    _ if self.model.read(cx).current_errors() != 0 => token::failed(),
+                    _ => token::quiet(),
+                };
+                heading.marker(words, color)
+            }
+            _ => heading,
+        }
     }
 
     /// What the screen's agents are doing, the most pressing first: one
@@ -258,22 +265,27 @@ impl Surface for TranscriptSurface {
     }
 
     fn title(&self, cx: &App) -> String {
-        self.title_with_folder(false, cx)
+        self.page_heading(cx).text()
     }
 
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
+    }
+
+    /// Shorter and shorter, for a phone's line: the whole heading, then
+    /// the subject and project, then the subject alone.
     fn phone_titles(&self, cx: &App) -> Vec<String> {
-        let system = self.system.read(cx);
-        let (Some((shown, _)), Some((label, _))) = (
-            system.scope_agents(self.scope),
-            system.scope_label(self.scope, cx),
-        ) else {
+        let heading = self.page_heading(cx);
+        if heading.title.is_empty() {
             return Vec::new();
-        };
-        let mut titles = vec![self.title_with_folder(true, cx)];
-        if let Some(spec) = system.registry().agent_spec(shown) {
-            titles.push(format!("{label} · {}", spec.runtime_label()));
         }
-        titles.push(label);
+        let mut titles = vec![heading.text()];
+        if let Some(project) = heading.context.first()
+            && heading.context.len() > 1
+        {
+            titles.push(format!("{}  {project}", heading.title));
+        }
+        titles.push(heading.title.clone());
         if self.activity(cx).is_some() {
             for title in &mut titles {
                 title.push_str(" ·");
@@ -361,7 +373,12 @@ impl Focusable for TranscriptSurface {
 }
 
 impl Render for TranscriptSurface {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let heading = self.page_heading(cx);
+        let page = sheet::page(&heading, &text, self.editor.clone(), window, cx);
         div()
             .id("rho-agent-transcript")
             .key_context("RhoAgent")
@@ -374,6 +391,6 @@ impl Render for TranscriptSurface {
                 }),
             )
             .size_full()
-            .child(self.editor.clone())
+            .child(page)
     }
 }

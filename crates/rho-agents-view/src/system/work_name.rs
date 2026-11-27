@@ -5,6 +5,8 @@
 //! which works on every idea sent to it. An agent's short code follows
 //! only where it tells two agents of one workset apart.
 
+use rho_chat::ui::sheet::Heading;
+
 /// What one agent's work is called, as the chat log and the directory say
 /// it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,20 +59,28 @@ pub(super) fn tool_title(work: &str, part: &super::Part) -> String {
     format!("{work} · {part}")
 }
 
-/// A transcript's title: what it is called, its host, and the folder and
-/// runtime of the agent it shows, each only when known.
-pub(super) fn transcript_title(
-    label: &str,
-    host: &str,
-    folder: Option<&str>,
+/// A transcript's heading (`agents.Transcript`): the subject of its work,
+/// then quietly the project, the code of the one agent it is narrowed to
+/// when the workset has several, and the runtime the agent thinks with.
+/// Where the work runs, its host and folder, is the transcript's to show,
+/// not its name's: a folder is often a temporary path.
+pub(super) fn transcript_heading(
+    name: &WorkName,
+    narrowed: bool,
     runtime: Option<&str>,
-) -> String {
-    std::iter::once(label)
-        .chain(Some(host).filter(|host| !host.is_empty()))
-        .chain(folder)
-        .chain(runtime)
-        .collect::<Vec<_>>()
-        .join(" · ")
+) -> Heading {
+    let code = (narrowed && name.shared).then_some(name.code.as_str());
+    let heading = match (&name.subject, &name.project) {
+        (Some(subject), project) if !name.standing => {
+            Heading::new(subject.as_str()).context(project.clone().unwrap_or_default())
+        }
+        (_, Some(project)) => Heading::new(project.as_str()),
+        (_, None) => Heading::new(name.code.as_str()),
+    };
+    let code = code.filter(|code| *code != heading.title);
+    heading
+        .context(code.unwrap_or_default())
+        .context(runtime.unwrap_or_default())
 }
 
 /// Gives each of `labels` that another shares its `code`, so a prompt
@@ -178,20 +188,35 @@ mod tests {
                 "tide · Flaky clock test · desktop browser"
             );
         }
+    }
+
+    /// The transcript is headed by its subject, project and model, and
+    /// never by where it runs: a folder such as `/tmp/rho-workday.x/w` is
+    /// no name.
+    #[test]
+    fn a_transcript_is_headed_by_subject_project_and_model() {
         let alone = name(Some("tide"), Some("Flaky clock test"), false);
+        let heading = transcript_heading(&alone, false, Some("opus-high"));
+        assert_eq!(heading.title, "Flaky clock test");
+        assert_eq!(heading.context, ["tide", "opus-high"]);
+        assert_eq!(heading.text(), "Flaky clock test  tide  opus-high");
+        // Narrowed to one of two agents, its code follows the project.
+        let shared = name(Some("tide"), Some("Flaky clock test"), true);
         assert_eq!(
-            transcript_title(&alone.work(), "lab", Some("~/src/tide"), Some("opus-high")),
-            "tide · Flaky clock test · lab · ~/src/tide · opus-high"
+            transcript_heading(&shared, true, Some("sol-low")).text(),
+            "Flaky clock test  tide  eng-q9tz  sol-low"
         );
-        // Narrowed to one of two agents, its code follows the work.
-        let narrowed = name(Some("tide"), Some("Flaky clock test"), true);
         assert_eq!(
-            transcript_title(&narrowed.agent(), "lab", None, Some("sol-low")),
-            "tide · Flaky clock test · eng-q9tz · lab · sol-low"
+            transcript_heading(&shared, false, Some("sol-low")).text(),
+            "Flaky clock test  tide  sol-low"
         );
         assert_eq!(
-            transcript_title("tide · eng-q9tz", "", None, None),
-            "tide · eng-q9tz"
+            transcript_heading(&standing(false), false, None).text(),
+            "tide"
+        );
+        assert_eq!(
+            transcript_heading(&name(None, None, false), false, Some("sol-low")).text(),
+            "eng-q9tz  sol-low"
         );
     }
 

@@ -44,7 +44,8 @@ use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
-use rho_window::highlights::{apply_class_highlights, excerpt_range};
+use rho_chat::ui::sheet::token;
+use rho_window::highlights::excerpt_range;
 use rho_window::style::{Region, StyleClass};
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
@@ -194,7 +195,7 @@ type PlacedSpans = (
 );
 
 struct UserMessageGutter;
-struct AgentMessageGutter;
+struct ToolOutputGutter;
 
 /// The document excerpt's tail policy. Replacing an excerpt gives it a
 /// new id (invalidating every anchor into it), so the tail changes shape
@@ -1550,20 +1551,22 @@ impl TranscriptModel {
                     .filter(|(class, _)| *class == StyleClass::UserMessage)
                     .map(|(_, range)| range.clone())
                     .collect();
-                let agent_ranges: Vec<_> = ranges
+                // The agent's words are the transcript's unmarked voice; a
+                // tool's output hangs off its call by a quiet bar.
+                let output_ranges: Vec<_> = ranges
                     .iter()
-                    .filter(|(class, _)| *class == StyleClass::AgentMessage)
+                    .filter(|(class, _)| *class == StyleClass::ToolDetail)
                     .map(|(_, range)| range.clone())
                     .collect();
                 editor.update(cx, |editor, cx| {
                     editor.highlight_gutter::<UserMessageGutter>(
                         user_ranges,
-                        rho_window::style::user_prompt_gutter_color,
+                        token::marked_bar_in,
                         cx,
                     );
-                    editor.highlight_gutter::<AgentMessageGutter>(
-                        agent_ranges,
-                        rho_window::style::agent_message_gutter_color,
+                    editor.highlight_gutter::<ToolOutputGutter>(
+                        output_ranges,
+                        |_| token::seam(),
                         cx,
                     );
                 });
@@ -2501,5 +2504,72 @@ mod tests {
         let edit = rendered_text_edit("a🙂c", "a🙂bc").expect("edit");
         assert_eq!(edit.old_range, "a🙂".len().."a🙂".len());
         assert_eq!(edit.inserted, "b");
+    }
+}
+
+/// Paints `styles` in `region` in the transcript's own colours: the
+/// window's classes, read as the design's tokens (`agents.Transcript`).
+/// The user's turns are marked teal, the agent's words are the unmarked
+/// voice, a call reads brighter than its output, and a failure or a retry
+/// is red.
+fn apply_class_highlights<'a, V: 'static>(
+    editor: &Entity<Editor>,
+    multi_buffer: &Entity<MultiBuffer>,
+    region: Region,
+    styles: impl IntoIterator<Item = (StyleClass, &'a [Range<Anchor>])>,
+    cx: &mut Context<V>,
+) {
+    let snapshot = multi_buffer.read(cx).snapshot(cx);
+    let updates = styles
+        .into_iter()
+        .map(|(class, ranges)| {
+            let ranges = ranges
+                .iter()
+                .filter_map(|range| excerpt_range(&snapshot, range))
+                .collect::<Vec<_>>();
+            (class, ranges)
+        })
+        .collect::<Vec<_>>();
+    editor.update(cx, |editor, cx| {
+        for (class, ranges) in updates {
+            editor.highlight_text(
+                class.highlight_key(region),
+                ranges,
+                transcript_style(class),
+                cx,
+            );
+        }
+    });
+}
+
+fn transcript_style(class: StyleClass) -> gpui::HighlightStyle {
+    let oklch = |l, c, h| gpui::Color::oklch(l, c, h, 1.).into();
+    let (color, bold) = match class {
+        StyleClass::Default => return gpui::HighlightStyle::default(),
+        StyleClass::UserMessage => (token::marked(), false),
+        StyleClass::MailSpeaker => (token::marked(), true),
+        StyleClass::AgentMessage => (token::reading_text(), false),
+        StyleClass::ToolName | StyleClass::ToolShell | StyleClass::ShellCommand => {
+            // `point`: the line that says what ran.
+            (oklch(0.78, 0.012, 95.), false)
+        }
+        // What a call gave back, a shade under the call.
+        StyleClass::ToolDetail => (token::read_text(), false),
+        StyleClass::SystemInfo | StyleClass::Time | StyleClass::AgentLabel => {
+            (token::quiet(), false)
+        }
+        StyleClass::StatusRunning => (token::answer(), false),
+        // The positive echo's green.
+        StyleClass::StatusOk | StyleClass::ShellPrompt => (oklch(0.74, 0.130, 145.), false),
+        StyleClass::StatusError => (token::failed(), false),
+        StyleClass::StatusCancelled => (token::attention(), false),
+        StyleClass::SystemImportant => (token::attention(), true),
+        // `lost connection`.
+        StyleClass::Disconnect => (oklch(0.631, 0.160, 21.6), false),
+    };
+    gpui::HighlightStyle {
+        color: Some(color),
+        font_weight: bold.then_some(gpui::FontWeight::BOLD),
+        ..gpui::HighlightStyle::default()
     }
 }

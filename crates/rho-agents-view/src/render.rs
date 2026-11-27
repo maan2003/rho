@@ -381,7 +381,9 @@ fn render_labelled(
             spans.extend(separator(prev, kind));
             // A call is what was run, shown as it was run: no markdown
             // grammar over it, so it keeps a plain buffer of its own.
+            let call = spans.len();
             inlay = push_tool_spans(&mut spans, tool, now_ms);
+            gutter_span = output_span(&spans, call);
         }
         UiBlock::Responded => return invisible(kind),
         UiBlock::Notice { text, times } => {
@@ -694,10 +696,23 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
         spans.push(Span::new("\n", StyleClass::Default));
     }
     if let Some(detail) = tool_detail(tool, &source) {
-        spans.push(Span::new(detail, StyleClass::Default));
+        spans.push(Span::new(detail, StyleClass::ToolDetail));
         spans.push(Span::new("\n", StyleClass::Default));
     }
     timer
+}
+
+/// The span of a tool's output, which a quiet bar marks off from the call
+/// above it and the words around it: the last text span after the call's
+/// line.
+fn output_span(spans: &[Span], from: usize) -> Option<usize> {
+    let call_end = spans[from..]
+        .iter()
+        .position(|span| span.text.ends_with('\n'))
+        .map(|index| from + index)?;
+    (call_end + 1..spans.len())
+        .rev()
+        .find(|&index| !spans[index].text.trim().is_empty())
 }
 
 fn chat_preview(source: &str) -> Option<String> {

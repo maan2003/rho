@@ -41,6 +41,7 @@ use rho_frame::{
     Point, Project, Row, SearchPoint, Spelling, System, TextIndex, TextKind, TextPresenter,
     TextSearch, TextTarget,
 };
+pub use rho_notes::sheet;
 use rho_rpc::protocol::Answer as RpcAnswer;
 use rho_window::style::StyleClass;
 pub use thread::ThreadView;

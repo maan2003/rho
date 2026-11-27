@@ -11,6 +11,7 @@ use gpui::{
 use language::Point;
 use multi_buffer::MultiBufferOffset;
 use rho_agents_client::{now_ms, usage};
+use rho_chat::ui::sheet::{self, Heading};
 use rho_frame::{Addressed as _, Surface};
 use text::Bias;
 use theme::ActiveTheme as _;
@@ -281,7 +282,11 @@ impl UsageSurface {
 
 impl Surface for UsageSurface {
     fn title(&self, _cx: &App) -> String {
-        format!("usage › {}", self.chart.title())
+        self.page_heading().text()
+    }
+
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -295,8 +300,22 @@ impl Focusable for UsageSurface {
     }
 }
 
+impl UsageSurface {
+    /// `usage  rate limit  7d`: the screen, then quietly which picture and
+    /// over how long.
+    fn page_heading(&self) -> Heading {
+        Heading::new("usage")
+            .context(self.chart.chart.title())
+            .context(format!("{}d", self.chart.days.count()))
+    }
+}
+
 impl Render for UsageSurface {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let heading = self.page_heading();
         // Measure the actual editor area, not the window: the frame has
         // already removed the phone bar and any prompt, and the editor
         // knows how many displayed rows the header took at this width.
@@ -318,32 +337,41 @@ impl Render for UsageSurface {
             )
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(self.editor.clone())
-            .on_children_prepainted(move |bounds, window, cx| {
-                let Some(bounds) = bounds.first() else {
-                    return;
-                };
-                let columns = bounds.size.width.as_f32().max(1.0) as usize;
-                let height = editor.update(cx, |editor, cx| {
-                    let line_height = editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size());
-                    let display = editor.display_snapshot(cx);
-                    let end = display.buffer_snapshot().max_point();
-                    let header_rows = display.point_to_display_point(end, Bias::Left).row().0 + 1;
-                    paint::height_for(bounds.size.height, line_height, header_rows)
-                });
-                if (columns, height) != (old_columns, old_height) {
-                    let this = this.clone();
-                    window.defer(cx, move |_, cx| {
-                        let _ = this.update(cx, |surface, cx| {
-                            surface.columns = columns;
-                            surface.height = height;
-                            surface.rebuild(cx);
+            .child(sheet::page(
+                &heading,
+                &text,
+                div()
+                    .size_full()
+                    .child(self.editor.clone())
+                    .on_children_prepainted(move |bounds, window, cx| {
+                        let Some(bounds) = bounds.first() else {
+                            return;
+                        };
+                        let columns = bounds.size.width.as_f32().max(1.0) as usize;
+                        let height = editor.update(cx, |editor, cx| {
+                            let line_height = editor
+                                .style(cx)
+                                .text
+                                .line_height_in_pixels(window.rem_size());
+                            let display = editor.display_snapshot(cx);
+                            let end = display.buffer_snapshot().max_point();
+                            let header_rows =
+                                display.point_to_display_point(end, Bias::Left).row().0 + 1;
+                            paint::height_for(bounds.size.height, line_height, header_rows)
                         });
-                    });
-                }
-            })
+                        if (columns, height) != (old_columns, old_height) {
+                            let this = this.clone();
+                            window.defer(cx, move |_, cx| {
+                                let _ = this.update(cx, |surface, cx| {
+                                    surface.columns = columns;
+                                    surface.height = height;
+                                    surface.rebuild(cx);
+                                });
+                            });
+                        }
+                    }),
+                window,
+                cx,
+            ))
     }
 }

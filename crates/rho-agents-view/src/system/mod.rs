@@ -526,16 +526,6 @@ impl AgentsSystem {
         }
     }
 
-    /// What a transcript screen is called, with its host: the work of a
-    /// workset, or of the one agent it is narrowed to.
-    fn scope_label(&self, scope: Scope, cx: &App) -> Option<(String, String)> {
-        let (shown, _) = self.scope_agents(scope)?;
-        Some(match scope {
-            Scope::Workset(_) => self.work_label(shown, cx),
-            Scope::Agent(agent) => self.label(agent, cx),
-        })
-    }
-
     /// Lands a frame on an agent's transcript and shows what moved on
     /// every screen of it.
     fn land(&mut self, agent: AgentId, frame: TranscriptFrame, cx: &mut Context<Self>) {

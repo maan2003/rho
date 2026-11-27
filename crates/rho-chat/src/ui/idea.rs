@@ -27,11 +27,11 @@ use rho_frame::minibuffer::NEW_PROJECT;
 use rho_frame::surface::PhoneSend;
 use rho_frame::{Candidate, CandidateSource, Frame, Mode, Surface, keys};
 use rho_window::style::StyleClass;
-use theme::ActiveTheme as _;
 
 use super::ChatSystem;
 use super::pending::PendingIdeaId;
 use super::projects::{NewProject, ProjectCreated, runtime_choices};
+use super::sheet::{self, Heading, token};
 use crate::cache::IdeaDraft;
 use crate::{ThreadId, names};
 
@@ -905,7 +905,7 @@ impl IdeaView {
                 buffer.anchor_before(Point::zero())..buffer.anchor_after(buffer.max_point()),
             )
             .expect("the idea excerpt contains its buffer");
-        rho_window::draft::style(editor, range, "idea", cx);
+        super::thread::style_draft_in(editor, range, cx);
     }
 
     /// The `in:` and `on:` lines' hints are the project's mode and runtime:
@@ -946,6 +946,10 @@ impl IdeaView {
 impl Surface for IdeaView {
     fn title(&self, _cx: &App) -> String {
         "idea".to_owned()
+    }
+
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -998,8 +1002,13 @@ impl Focusable for IdeaView {
 }
 
 impl Render for IdeaView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self
+            .editor
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        // The header lines start on the words' left edge, after the half
+        // column where the words' bar is drawn.
+        let gutter = sheet::column_width(&text, window) * 0.5;
         let line = |context: &'static str, label: &'static str, field: &Entity<Editor>| {
             div()
                 .key_context(context)
@@ -1007,14 +1016,14 @@ impl Render for IdeaView {
                 .flex_none()
                 .items_center()
                 .gap_2()
-                .px_2()
-                .text_color(colors.text_muted)
+                .pl(gutter)
+                .text_color(token::quiet())
                 .child(label)
                 .child(div().flex_1().child(field.clone()))
         };
-        div()
-            .id("rho-idea")
-            .key_context("RhoIdea")
+        // The words wrap at the prose measure, on the sheet's left edge.
+        let words = sheet::column_width(&text, window) * (sheet::PROSE_COLUMNS as f32 + 1.5);
+        let body = div()
             .size_full()
             .flex()
             .flex_col()
@@ -1031,7 +1040,20 @@ impl Render for IdeaView {
             .child(line("RhoIdeaAddress", "to:", &self.address))
             .child(line("RhoIdeaMode", "in:", &self.mode))
             .child(line("RhoIdeaRuntime", "on:", &self.runtime))
-            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .max_w(words)
+                    .pt(text.line_height_in_pixels(window.rem_size()) * 0.5)
+                    .child(self.editor.clone()),
+            );
+        div()
+            .id("rho-idea")
+            .key_context("RhoIdea")
+            .size_full()
+            .child(sheet::page(&Heading::new("idea"), &text, body, window, cx))
     }
 }
 

@@ -18,8 +18,8 @@ use rho_dealer::Addressed as _;
 use rho_frame::minibuffer::delete_word;
 use rho_frame::{FrameLink, Layout, Mode, PhoneTool, Surface, keys, phone_editor_tap};
 use rho_transcript::{Item, Transcript};
-use theme::ActiveTheme as _;
 
+use crate::sheet::{self, Heading, token};
 use crate::{
     Listed, NoteId, NoteSystem, NoteViewed, ReplyContext, excerpt, listed, make_note,
     notes_address, start_note,
@@ -58,14 +58,13 @@ impl rho_transcript::Style for Class {
         HighlightKey::SyntaxTreeView(KEY_BASE + bucket as usize * 2 + self as usize)
     }
 
-    fn highlight_style(self, cx: &App) -> HighlightStyle {
-        let colors = cx.theme().colors();
+    fn highlight_style(self, _cx: &App) -> HighlightStyle {
         let color = match self {
-            Self::Title => colors.text,
-            Self::Muted => colors.text_muted,
+            Self::Title => token::reading_text(),
+            Self::Muted => token::quiet(),
         };
         HighlightStyle {
-            color: Some(color.into()),
+            color: Some(color),
             ..HighlightStyle::default()
         }
     }
@@ -106,6 +105,11 @@ pub struct NotesView {
     phone: bool,
     /// A note may be left before its first write reaches the list.
     return_to: Option<NoteId>,
+    /// How many columns the sheet holds, as last drawn: where a row's age
+    /// ends.
+    columns: usize,
+    /// How wide the list's text is, in those columns.
+    measure: sheet::Measure,
     _subscriptions: Vec<Subscription>,
     _age_beat: Task<()>,
 }
@@ -194,6 +198,8 @@ impl NotesView {
             finding: false,
             phone: Layout::of(window.viewport_size().width) == Layout::Phone,
             return_to: None,
+            columns: sheet::SHEET_COLUMNS,
+            measure: sheet::Measure::Columns,
             _subscriptions: subscriptions,
             _age_beat: age_beat,
         }
@@ -254,8 +260,17 @@ impl NotesView {
             return;
         };
         let selected = self.cursor_note(cx);
-        self.transcript
-            .reconcile(items(&notes, filtering, self.phone, &Zoned::now()), cx);
+        let measure = &self.measure;
+        let width = |text: &str| measure.width(text, cx);
+        let rows = items(
+            &notes,
+            filtering,
+            self.phone,
+            self.columns,
+            &width,
+            &Zoned::now(),
+        );
+        self.transcript.reconcile(rows, cx);
         // Clearing the field on departure also emits an edit event. It
         // restores the full list without choosing its first row.
         let new_filter = changed_query && filtering;
@@ -379,13 +394,15 @@ fn items(
     notes: &[Listed],
     filtering: bool,
     phone: bool,
+    columns: usize,
+    width: &dyn Fn(&str) -> f32,
     now: &Zoned,
 ) -> Vec<Item<Key, Class, Option<NoteId>>> {
     if notes.is_empty() {
         let text = match (filtering, phone) {
-            (true, _) => "  no match · enter to start a note",
-            (false, true) => "  no notes yet · tap new to start",
-            (false, false) => "  no notes yet · i or o to start",
+            (true, _) => "no match · enter to start a note",
+            (false, true) => "no notes yet · tap new to start",
+            (false, false) => "no notes yet · i or o to start",
         };
         return vec![
             Item::new(Key::Empty, text)
@@ -396,7 +413,7 @@ fn items(
     notes
         .iter()
         .map(|listed| {
-            let (text, styles) = row(listed, now);
+            let (text, styles) = row(listed, now, columns, width);
             Item::new(Key::Note(listed.note), text)
                 .with_styles(styles)
                 .with_lines(vec![Some(listed.note)])
@@ -404,40 +421,85 @@ fn items(
         .collect()
 }
 
-pub(crate) fn row(listed: &Listed, now: &Zoned) -> (String, Vec<(Class, Range<usize>)>) {
-    let mut text = format!("  {}", listed.title);
-    let mut styles = vec![(Class::Title, 2..text.len())];
-    let muted = text.len();
+/// One note's row, `columns` wide: its title and quieter words from the
+/// rest at the left, and at the right edge, quietly, when its reminder
+/// comes due and how long ago it was written. The left side is cut, with
+/// `…`, before it reaches them. With no width known yet the right side
+/// follows the left after `row air`.
+pub(crate) fn row(
+    listed: &Listed,
+    now: &Zoned,
+    columns: usize,
+    width: &dyn Fn(&str) -> f32,
+) -> (String, Vec<(Class, Range<usize>)>) {
+    let mut left = listed.title.clone();
+    let title = left.len();
     if !listed.preview.is_empty() {
-        text.push_str("  ");
-        text.push_str(&listed.preview);
+        left.push_str("  ");
+        left.push_str(&listed.preview);
     }
     if let Some(reply) = &listed.reply {
-        text.push_str("  ↳ ");
+        left.push_str("  ↳ ");
         match (&reply.mail, &reply.thread) {
             (Some(mail), Some(thread)) if mail != thread => {
-                text.push_str(&excerpt(mail.split_whitespace()));
-                text.push_str(" · ");
-                text.push_str(&excerpt(thread.split_whitespace()));
+                left.push_str(&excerpt(mail.split_whitespace()));
+                left.push_str(" · ");
+                left.push_str(&excerpt(thread.split_whitespace()));
             }
-            (Some(name), _) | (_, Some(name)) => text.push_str(&excerpt(name.split_whitespace())),
-            (None, None) => text.push_str("private reply"),
+            (Some(name), _) | (_, Some(name)) => left.push_str(&excerpt(name.split_whitespace())),
+            (None, None) => left.push_str("private reply"),
         }
     }
-    text.push_str("  · ");
+    let mut right = String::new();
     if let Some(until) = listed.reminder {
         let until = until.to_zoned(now.time_zone().clone());
-        text.push_str(&rho_frame::when::reminder_said(&until, now));
-        text.push_str(" · ");
+        right.push_str(&rho_frame::when::reminder_said(&until, now));
+        right.push_str("  ");
     }
-    text.push_str(&rho_dealer::curve::age(listed.written, now.timestamp()));
-    styles.push((Class::Muted, muted..text.len()));
+    right.push_str(&rho_dealer::curve::age(listed.written, now.timestamp()));
+    let room = columns as f32 - width(&right) - 2. * width(" ");
+    let mut title = title;
+    if columns != 0 && width(&left) > room {
+        let mut used = width("…");
+        let kept = left
+            .char_indices()
+            .find(|(_, character)| {
+                used += width(character.encode_utf8(&mut [0; 4]));
+                used > room
+            })
+            .map_or(left.len(), |(at, _)| at);
+        left.truncate(kept);
+        title = title.min(kept);
+        left.push('…');
+    }
+    let gap = match columns {
+        0 => 2,
+        _ => sheet::pad(width, &left, &right, columns),
+    };
+    let text = format!("{left}{}{right}", " ".repeat(gap));
+    let styles = vec![(Class::Title, 0..title), (Class::Muted, title..text.len())];
     (text, styles)
+}
+
+impl NotesView {
+    /// The sheet holds `columns` of text measured so now: the rows are
+    /// laid out again for it.
+    fn set_columns(&mut self, columns: usize, measure: sheet::Measure, cx: &mut Context<Self>) {
+        if self.columns != columns || self.measure != measure {
+            self.columns = columns;
+            self.measure = measure;
+            self.refresh(false, cx);
+        }
+    }
 }
 
 impl Surface for NotesView {
     fn title(&self, _cx: &App) -> String {
         "notes".to_owned()
+    }
+
+    fn draws_top_left(&self, _cx: &App) -> bool {
+        true
     }
 
     fn editor(&self, _cx: &App) -> Option<Entity<Editor>> {
@@ -472,7 +534,68 @@ impl Render for NotesView {
         let style = self
             .editor
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let colors = cx.theme().colors();
+        // The find line starts on the rows' left edge, after the editor's
+        // half-column gutter.
+        let gutter = sheet::column_width(&style, window) * 0.5;
+        let this = cx.weak_entity();
+        let measured = style.clone();
+        let body = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .key_context("RhoNotesQuery")
+                    .on_action(
+                        cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
+                            this.query
+                                .update(cx, |query, cx| delete_word(query, window, cx));
+                        }),
+                    )
+                    .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
+                        this.query.update(cx, |query, cx| query.clear(window, cx));
+                    }))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .pl(gutter)
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(token::soft_seam())
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(token::quiet())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.find(window, cx);
+                                }),
+                            )
+                            .child("find or start:"),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.query.clone())),
+            )
+            .child(
+                div()
+                    .capture_any_mouse_down(cx.listener(Self::tap_list))
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.editor.clone())
+                    .on_children_prepainted(move |bounds, window, cx| {
+                        let Some(bounds) = bounds.first() else {
+                            return;
+                        };
+                        let measure = sheet::Measure::of(&measured, window);
+                        let columns = measure.columns_in(bounds.size.width);
+                        let this = this.clone();
+                        window.defer(cx, move |_, cx| {
+                            let _ =
+                                this.update(cx, |view, cx| view.set_columns(columns, measure, cx));
+                        });
+                    }),
+            );
+        let page = sheet::page(&Heading::new("notes"), &style, body, window, cx);
         div()
             .key_context("RhoNotes")
             .on_action(cx.listener(Self::open_note))
@@ -491,51 +614,6 @@ impl Render for NotesView {
             .on_action(cx.listener(|this, _: &NextNote, _, cx| this.step(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousNote, _, cx| this.step(false, cx)))
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(colors.editor_background)
-            .child(
-                div()
-                    .key_context("RhoNotesQuery")
-                    .on_action(
-                        cx.listener(|this, _: &keys::MinibufferDeleteWord, window, cx| {
-                            this.query
-                                .update(cx, |query, cx| delete_word(query, window, cx));
-                        }),
-                    )
-                    .on_action(cx.listener(|this, _: &keys::MinibufferClear, window, cx| {
-                        this.query.update(cx, |query, cx| query.clear(window, cx));
-                    }))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(colors.border_variant)
-                    .font_family(style.font_family)
-                    .text_size(style.font_size)
-                    .line_height(style.line_height)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(colors.text_muted)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.find(window, cx);
-                                }),
-                            )
-                            .child("find or start:"),
-                    )
-                    .child(div().flex_1().min_w_0().child(self.query.clone())),
-            )
-            .child(
-                div()
-                    .capture_any_mouse_down(cx.listener(Self::tap_list))
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.editor.clone()),
-            )
+            .child(page)
     }
 }

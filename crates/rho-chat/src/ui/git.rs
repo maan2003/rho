@@ -718,7 +718,9 @@ pub(super) mod tests {
         assert_eq!(world.current(cx), flaky());
         let screen = world.screen(cx);
         let lines: Vec<&str> = screen.lines().collect();
-        let label = worker().encoded();
+        // The worker is known by its id alone: the request names it by
+        // the short tag, never the whole id.
+        let label = format!("eng-{}", &worker().encoded()[..4]);
         assert_eq!(
             lines[..7],
             [
