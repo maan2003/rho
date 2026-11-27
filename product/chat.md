@@ -27,7 +27,7 @@ steps:
 5. if merging pushes to `main`/`master` or needs ssh, the user inspects the staged refs/commits/diff right in the thread and approves (`space a`) or denies with words (`space x`), `agents.Approve a push or a fetch`
 6. the user opens the result, `deal.Clear what waits`
 7. the user looks into the work if they need to see how it was done, `agents.Look into the work`
-8. the user reads the result and says done, `deal.Clear what waits` (and optionally runs `finish work` to archive the workset)
+8. the user reads the result and says done, `deal.Clear what waits`
 done when: the work is merged and nothing waits.
 day: Turn ideas into work.
 
@@ -73,7 +73,7 @@ sees: the words, with the voice told by colour and gutter alone: the project's m
 does:
 - ping: every message from the project pings the user. It is dealt as a `deal.Card` and reads `waits · 2h` on its row. An agent names the kind of everything it sends, `kind="message"` or `kind="flash"`, with no default, so it decides each time whether the user is needed
 - look into the work `enter` on a project message or `Flash` (when cursor is not on a private reply or link): open the `agents.Workset` transcript at the step that produced its current words; a failed stop opens its error
-- reply: the user's words go into the thread, and every agent in it reads them (mid-turn delivery is handled directly by the host harness, so the user does not need a separate cancel step); there is no addressee. With two asks open, the user names the agent in words. If no agent exists yet (a refused start), replying retries using the project's latest place and runtime; if an existing agent is `stopped` or `failed`, replying wakes it in its own workset on its own runtime (preserving any `set agent runtime` choice)
+- reply: the user's words go into the thread, and every agent in it reads them (mid-turn delivery is handled directly by the host harness, so the user does not need a separate cancel step); there is no addressee. With two asks open, the user names the agent in words. If no agent exists yet (a refused start), replying retries using the idea's recorded `in:` and `on:` overrides together with the project's latest place (falling back to project defaults if untouched); if an existing agent is `stopped` or `failed`, replying wakes it in its own workset on its own runtime (preserving any `set agent runtime` choice)
 - edit or delete: agents may change or take back their own messages, except that a message the user has answered stays as it was. A real edit reads `edited` and deals the thread again (with a recovered system stop as the one clearing exception, see `agents.a stuck agent asks`)
 - reply privately `alt-r`: write a remark directly beneath this message, as in `notes.Reply privately`
 rejected:
@@ -125,10 +125,10 @@ rejected:
 A thread has one draft on each device, not shared with other devices.
 
 ## screen Thread
-decided: 2026-11-26 · title & project in borderless Left Ear (no model name, no waits·age), Draft on row 1 with no placeholder, 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images, Mono + Balanced, 0px square corners
+decided: 2026-11-26 · title & project in Thread's top-left title row (no model name, no waits·age; muted / snoozed until … / approve push / working / stopped shown when active), Draft on row 1 with no placeholder, 128ch centered sheet with 80ch prose wrap and full-sheet code/diffs/tables/images, Mono + Balanced, 0px square corners
 answers: what is this piece of work waiting for from the user?
 shows:
-- the `Thread` subject, `Project` address, and any page-level marker (`pinned`, `approve push`, `working`, `stopped by you`, `stuck`) in the borderless Left Ear of `window.Status line` (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
+- the `Thread` subject, `Project` address, and any active page marker (`muted`, `snoozed until …`, `approve push`, `working`, `stopped by you`, `stuck`) in Thread's top-left title row beside the notch (omitting redundant `waits · age` and model name, which lives in `agents.Transcript`)
 - inside a `128 ch` centered sheet (`80 ch` wrap for prose/quotes/private replies; full `128 ch` width for code blocks, diffs, markdown tables, push cards, and images):
 - the `Draft` first on row 1 (no `reply` placeholder, `2 px` teal left gutter bar, soft hairline below), or stuck to the top edge while the user reads history below
 - any pending staged push/fetch approval right below the draft (naming repo, refs, force-push dropped count, commits, bounded diff, and `space a approves · space x denies (with draft reply) · space s snoozes`)
@@ -187,12 +187,12 @@ when: the user has an idea, wherever they are in the window
 want: send it to the right project without losing their place
 so that: work starts and the user can carry on where they were
 steps:
-1. the user presses the idea key (`i` anywhere on `desk.Desk`, `ctrl-alt-m` globally, or `write idea` from `window.Commands`); a `Draft` fills the window, with `to:` addressed to the project picked from context (including transcripts/tools), `in:` quietly pre-filled with the project's mode (`one` or `new`), and `on:` quietly pre-filled with that project's runtime
+1. the user presses the idea key (`i` anywhere on `desk.Desk`, `ctrl-alt-m` globally, or `write idea` from `window.Commands`); a `Draft` fills the window (reopening any unsent idea draft on this device, which is also listed in `window.Places`), with `to:` addressed to the project picked from context (including transcripts/tools), `in:` quietly pre-filled with the project's mode (`one` or `new`), and `on:` quietly pre-filled with that project's runtime
 2. the user writes, in the usual Helix modes (with keys isolated from the screen underneath)
    - if it is for a different project, the user edits `to:` with project completion, or `ctrl-t` asks for the project; a name with no match offers a `new project …` row, which is `Start a project`
    - if this one idea should use a fresh agent in a `one agent` project (or the standing agent in a `per idea` project), the user edits `in:` (`one` or `new`)
    - if this one idea should think on another model, the user edits `on:`, with the host's runtimes as completions; `shift-tab` moves between the header lines and the words; an untouched quiet `on:` leaves a standing agent's current runtime unchanged; a runtime the host does not know is refused in the echo and the idea stays
-3. the user sends with `ctrl-enter` or `send`; the idea queues durably, its thread enters `window.Places` MRU immediately (aging normally as other places are visited), the draft clears immediately so another idea can be written even while offline, the echo names the idea and the project, and the screen before is back
+3. the user sends with `ctrl-enter` or `send`; the idea queues durably (recording its explicit `in:` and `on:` on the opening message so any retry after a refused start honors them), enters `window.Places` using its first line until titled, the draft clears immediately so another idea can be written even while offline, the echo names the idea and the project, and the screen before is back. If a queued offline idea is later refused by the host before a host thread exists, it surfaces locally as a `not sent` card with `write idea again` in `window.Commands`
 system: picks the thread's or workset's project, or the last project the user wrote to; quietly fills `in:` and `on:` from the project (updating untouched defaults when `to:` changes); starts the work as `Project.receive an idea`.
 user: the words and, if different from the defaults, the project, mode, or runtime.
 cases: a multiline idea edited before sending; an unsent idea still present on this device after restart; writing a second idea while the first is still queued offline; sending a fresh-agent idea inside a `one agent` project via `in: new`; an idea on another runtime to a `one agent` project whose agent cannot change kind, refused as `set agent runtime` refuses it, with the idea kept.

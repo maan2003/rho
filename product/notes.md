@@ -15,7 +15,7 @@ day: Keep their own memory.
 ## concept Note
 purpose: keep something the user wants to remember, in their own words, where no agent can read it.
 principle: the user thinks of something to check tomorrow; they run `new note` from `window.Commands`, type it, and optionally press `space` then `s` for tomorrow morning; the next morning it deals once on their devices, and is always findable in `window.Places` or `Notes`.
-sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text (with its reminder time in `design.quiet` in the status line if snoozed).
+sees: its first line, which is its title, or `untitled note`; open, its whole text, to edit like any text (with its scheduled reminder time in `design.quiet` in the note's top-left title row if snoozed).
 does:
 - new note, from `window.Commands`: open a new, empty note ready to type in Insert; it reads `a note · its first line is its title` until the user types
 - edit: type in it; what is typed is kept in under a second after the user stops, and on quit

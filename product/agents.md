@@ -50,7 +50,10 @@ does:
 - open `enter` on a project message or `Flash` in `chat.Thread` (or `open transcript` from `window.Commands`): open the workset transcript at the step that wrote the message or flash (or the last error / newest step when opened by command); once visited, the open transcript stays in `window.Places` MRU recents
 - filter transcript, from `window.Commands` on the transcript: narrow the workset transcript to one `Agent`, or clear the filter to show the whole workset
 - open thread, from `window.Commands`: open the `chat.Thread` it started from
-- finish work, from `window.Commands` anywhere (context default, overridable inline): archive the workset's agents, close its open tools, and remove its clone once pushed; the thread stays searchable in `window.Places` and a later reply re-opens work
+todo:
+- workset lifecycle and cleanup (archiving finished clones/tools without a half-baked `finish work` command) · 2026-11-27 · design clean workset archival/cleanup later; removed ad-hoc `finish work` command
+rejected:
+- an ad-hoc `finish work` command · 2026-11-27 · collided with standing `one agent` worksets and felt awkward; revisit workset lifecycle properly under `todo:`
 
 ## concept Agent
 purpose: do a piece of the user's work inside a `Workset` on a host.
@@ -66,6 +69,8 @@ does:
 - cancel agent request, from `window.Commands` anywhere (also matched by weighted aliases such as `kill` / `abort`): stops what it is asking its model now; the echo reads `cancelled: tide · Flaky clock test` or `not cancelled: tide · Flaky clock test · it was not asking its model`
 
 While the agent's host is `away`, each of these echoes `the agent's host is away`; when the host is not attached at all, it echoes `the agent's host is not attached`.
+todo:
+- meta-agent / supervisor that detects silent or dead agents (e.g. ending a turn with flashes only and no `chat.Message`) · 2026-11-27 · intentionally deferred; keep turn completion unblocked for now and revisit with a dedicated supervisor design later
 
 ## concept Runtime
 purpose: choose the model an agent thinks with and how hard it thinks.
@@ -161,7 +166,7 @@ when: an agent is stuck, going the wrong way, or on the wrong model
 want: change its course without starting over
 so that: its work goes on from a good point
 steps:
-1. from anywhere (`chat.Thread`, `Transcript`, `desk.Desk`), the user opens `window.Commands` (`:`) and chooses `cancel agent request`, `stop agent`, `rewind agent`, `rewind agent to here`, `compact agent`, `reset agent cache`, `set agent runtime`, or `finish work` (optionally with an inline target or argument such as `:model sol-medium` or `:stop agent clock`)
+1. from anywhere (`chat.Thread`, `Transcript`, `desk.Desk`), the user opens `window.Commands` (`:`) and chooses `cancel agent request`, `stop agent`, `rewind agent`, `rewind agent to here`, `compact agent`, `reset agent cache`, or `set agent runtime` (optionally with an inline target or argument such as `:model sol-medium` or `:stop agent clock`)
    - when one agent is unambiguous from context, the row shows it by default (overridable inline); otherwise a `window.Prompt` asks which agent (by workset label)
 2. if the work needs new instructions, the user writes to the project in `chat.Thread`, `chat.Answer a message`
 system: carries the change to the agent's host.
@@ -190,8 +195,8 @@ when: an agent pushes to `main` or `master`, or pushes to / fetches from a repos
 want: see exactly which work asks, where it goes, and what it pushes, right in its thread, and say yes or no when ready — without being interrupted mid-typing or failing after a minute away
 so that: no agent pushes to a protected branch or uses the user's ssh login without their word, denying can carry instructions, and background work does not time out while the user is busy or away
 steps:
-1. the host stages the exact push or fetch intent (target repository, ref changes including force-push dropped count, up to 50 commits, and bounded diff) and surfaces it right at the top of its originating `chat.Thread` (lighting only the `window.Status line` lamp — never popping a modal over what the user is typing)
-2. when the user deals or opens the thread, they inspect the repository, ref changes, commits, and diff in full thread context and give `approve` (`space` then `a`), `deny` (`space` then `x`, sending any words typed in the thread's `chat.Draft` to the agent), or `snooze` (`space` then `s`); the thread never offers `done` or `mute` while a push/fetch awaits, and `approve`/`deny` are host-visible acting decisions (not undoable with `space u` once executed)
+1. the host stages the exact push or fetch intent (target repository, ref changes including force-push dropped count, up to 50 commits, and bounded diff) and surfaces it right at the top of its originating user `chat.Thread` (a child agent's staged push bubbles up to the parent user thread so it never strands in an agent-to-agent thread; a thread the user explicitly muted stays silenced). Lights only the Top-Right Global Status Bar lamp — never popping a modal over what the user is typing
+2. when the user deals or opens the thread, they inspect the repository, ref changes, commits, and diff in full thread context and give `approve` (`space` then `a`, refused if the host is `away`), `deny` (`space` then `x`, opening `:deny push ` prefilled with any current draft text so `enter` confirms), or `snooze` (`space` then `s` → `:snooze thread `); the thread never offers `done` or `mute` while a push/fetch awaits, and `approve`/`deny` are host-visible acting decisions (not undoable with `space u` once executed). Agents may also withdraw their own staged push so a plain reply can resolve it
 system: keeps the user uninterrupted; holds the staged push asynchronously with no 60-second timeout, also while no window is open; executes using the user's ssh login once approved only if Git sets the exact refs and commits shown; takes the pending push away when the agent's git goes away, such as when the agent is stopped. For non-`main`/non-`master` branches on GitHub, a host configured with `GITHUB_TOKEN` may push directly through `octo`, which refuses `main`, `master`, and tags.
 user: the approve or deny decision (plus optional draft instructions on deny).
 cases: two agents request protected pushes at once (two waiting threads in the deal); a push requested while the user is typing in a terminal or while the laptop is shut; denying with "push a branch and open a PR instead"; a push to a repository the user does not recognise.

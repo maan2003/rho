@@ -13,39 +13,38 @@ done when: the user knows what waits and can carry on where they left off, draft
 day: Know what wants them, and where they were.
 
 ## concept Desk
-decided: 2026-11-27 · count (`13 wait` and any active focus) sits in the borderless Left Ear; row 1 is Card 1 with no subheader; clean 1-line tabular sheet inside 128ch (subject · exception tag · project · quiet right age) navigated with normal Helix cursor (no separate UI row-selection highlight or preview); away hosts live in the Right Ear only (never repeated inside Desk)
+decided: 2026-11-27 · pure view-only glance (NO text cursor, NO editor buffer, NO row selection); count (`desk · 13 wait`) sits in Desk's top-left title row; row 1 is Card 1 with no subheader; clean 1-line tabular sheet inside 128ch (subject · exception tag · project · quiet right age); away hosts live in the Top-Right Global Status Bar only (never repeated inside Desk)
 purpose: show what wants the user, and where to put the next idea.
-principle: the user comes back after lunch, sees three things waiting in a crisp tabular sheet starting on row 1, and deals the first.
-sees: in the Left Ear, `desk` and `N wait` (plus any active dealer focus like `focus tide` in `quiet`; `away` hosts stay calmly in the Right Ear and are never repeated inside the Desk body); in the `128 ch` centered sheet starting directly at row 1 (no subheader), up to seven 1-line tabular `deal.Card` rows in deal order (including locally cached waiting cards from away hosts), each showing subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age, then `and N more · …` quietly below for the rest. Navigated with the normal Helix cursor (no separate UI row-selection highlight).
+principle: the user comes back after lunch, glances at three things waiting in a crisp view-only tabular sheet starting on row 1, and hits `space-j` to deal the first.
+sees: in Desk's own top-left title row, `desk` and `N wait` (counted from local cache while hosts connect — never flashing a false `0 wait`; `away` hosts and active dealer focus stay in the Top-Right Global Status Bar and are never repeated inside the Desk body); in the `128 ch` centered sheet starting directly at row 1 (no subheader), up to seven 1-line tabular `deal.Card` rows in deal order (including locally cached waiting cards from away hosts), each showing subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age, then `and N more · …` quietly below for the rest. Pure view-only glance — no cursor and no row selection.
 does:
 - open `tab` (or `open desk` in `window.Commands`): show the desk, as `window.Screen`
-- deal `space-j` (`ctrl-j`), or `enter` on a row: open the top card or the card under the Helix cursor; `enter` on the overflow line opens the first hidden card
+- deal `space-j` (`ctrl-j`), or click/tap a row: open the top card in active dealer focus (or the clicked/tapped card)
 - prefix `space`: silent `window.Screen` prefix (`space f` places, `space u` undo — never card verdicts)
 - write an idea `i` (anywhere on Desk, including when empty): open the idea draft, as `chat.Write an idea`
 rejected:
-- a separate UI "selected row" highlight box or inline preview expansion on Desk · 2026-11-27 · rho is a Helix editor buffer, not a list app; the normal text cursor is enough
-- repeating `away` host notes inside the Desk body or adding a subheader/key-hint bar above row 1 · 2026-11-27 · count sits in the Left Ear and `away` hosts sit in the Right Ear; row 1 starts directly with Card 1
+- making Desk an interactive Helix editor buffer with a cursor or UI row-selection highlight/preview · 2026-11-27 · Desk is strictly a calm view-only glance; you read what waits and hit `space-j`, `i`, `space f`, `tab`, or `:`
+- repeating `away` host notes inside the Desk body or adding a subheader/key-hint bar above row 1 · 2026-11-27 · count sits in Desk's top-left title row and `away` hosts / dealer focus sit in the Top-Right Global Status Bar; row 1 starts directly with Card 1
 - a narrowed Desk screen per `chat.Project` · 2026-11-26 · Desk is one global glance of what waits; filtering by project belongs in `window.Places`, and scoping what deals belongs to `deal.Card.set dealer focus`
-- deleting `Desk` and staying on the previous screen across cold returns · 2026-11-26 · after ten minutes idle the user's mental context has flushed; a calm home buffer screen is easier to return to than a stale mid-file view, and `tab` or `space f` + `enter` returns to the previous place immediately
-- immediate deal on bare `space` on `Desk` · 2026-11-26 · broke `space f` on `Desk`; `space-j` and `enter` already deal in one gesture, keeping `space` a uniform prefix everywhere
+- deleting `Desk` and staying on the previous screen across cold returns · 2026-11-26 · after ten minutes idle the user's mental context has flushed; a calm home buffer screen is easier to return to than a stale mid-file view, and `tab` or `space f` returns to the previous place immediately
+- immediate deal on bare `space` on `Desk` · 2026-11-26 · broke `space f` on `Desk`; `space-j` already deals in one gesture, keeping `space` a uniform prefix everywhere
 
 ## screen Desk
-decided: 2026-11-27 · 128ch tabular sheet starting on row 1 (subject · exception tag · project · quiet age), normal Helix cursor opening on row 1 (never on overflow), Left Ear holds `desk · N wait`, Right Ear holds `away` hosts
+decided: 2026-11-27 · pure view-only 128ch tabular glance starting on row 1 (no cursor, no row selection; subject · exception tag · project · quiet age), top-left title row holds `desk · N wait`, Top-Right Global Status Bar holds `away` hosts and active focus
 answers: what needs the user now?
 shows:
-- Left Ear: `desk`, the global waiting count (`N wait`), and any active dealer focus (`focus tide` / `quiet 45m`) in `quiet`
-- `deal.Card` tabular sheet (`128 ch`, starting on row 1): up to seven 1-line waiting rows in deal order, each with subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project, and right-aligned `quiet` age. Repeated stops in one project share a row at the first stop's place. The overflow sits quietly below (`and 2 more · clock`).
+- top-left title row: `desk` and the global waiting count (`N wait`, counted from local cache while hosts connect)
+- `deal.Card` view-only tabular sheet (`128 ch`, starting on row 1): up to seven 1-line waiting rows in deal order, each with subject, optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project, and right-aligned `quiet` age. Repeated stops in one project share a row at the first stop's place. The overflow sits quietly below (`and 2 more · clock`).
 states:
-- empty: Left Ear reads `desk · 0 wait`; calm empty sheet (connecting hosts note `connecting` calmly in the Right Ear rather than flashing a bare empty error)
-- loading: Left Ear reads `desk · 0 wait` while hosts connect calmly in the Right Ear
-- partial: waiting rows include locally cached cards from away hosts (marked calmly with `away` tag on those rows and `<host> away` once in the Right Ear)
-- error: hosts that are `away` stay calm in the Right Ear; hosts in `needs you` state (key touch / enrollment) surface in red in the Right Ear and `list hosts`
-- full: the tabular waiting rows and quiet overflow line; cursor starts on row 1 (never on the overflow line)
+- empty: top-left title row reads `desk · 0 wait` once every attached host answers; calm empty sheet
+- loading: counts from local cache (never flashes a false `0 wait` while hosts connect) while `connecting` shows calmly in the Top-Right Global Status Bar
+- partial: waiting rows include locally cached cards from away hosts (marked calmly with `away` tag on those rows and `<host> away` once in the Top-Right Global Status Bar)
+- error: hosts that are `away` stay calm in the Top-Right Global Status Bar; hosts in `needs you` state (key touch / enrollment) surface in red in the Top-Right Global Status Bar and `list hosts`
+- full: the view-only tabular waiting rows and quiet overflow line (no cursor)
 keys:
 - `space-j` (`ctrl-j`): deal the first card in focus, `deal.Card.deal`
-- `enter`: open the row under the Helix cursor, `Desk.deal`
+- click or tap a row: open that card directly (overflow opens the first hidden card)
 - `space`: silent `window.Screen` prefix (`space f` places, `space u` undo)
-- `j` and `k`: move between waiting and overflow rows; `gg`: first row; `G`: last row
 - `i`: `chat.Write an idea`
 - `tab`: `window.Screen` (return to the previous place)
 - `:`: `window.Commands`

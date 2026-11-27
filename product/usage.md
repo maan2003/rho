@@ -9,7 +9,9 @@ sees: the chart's name and how far back it looks; the answer in words; the pictu
 does:
 - open, from `window.Places` with `usage` (or `open usage` from `window.Commands`): open a chart (typing `usage` puts `rate limit · 7d` first)
 - switch window or chart in place: change between `7d` and `30d`, or switch among the four pictures, keeping one `Chart` screen rather than opening separate screens
-- switch claude account, from `window.Commands` anywhere (inline or prompt): pick an attached host (when more than one) and switch its active Claude account; **both already-running Claude agents (on their next request) and newly started Claude agents** use the switched account so stalled work unblocks immediately. (GPT account switching is already automatic on the host, so no manual GPT switch command is needed.)
+- switch claude account, from `window.Commands` anywhere (inline or prompt): pick an attached host (when more than one) and switch its active Claude account; **both already-running Claude agents (on their next request) and newly started Claude agents** use the switched account so stalled work unblocks immediately. When a Claude account's allowance runs empty, blocked Claude agents post a stop card (`stopped · claude/<account> allowance empty · resets …`) so the user knows immediately instead of waiting for work to feel slow. (GPT account switching is already automatic on the host.)
+todo:
+- auto-rotate Claude accounts on the host like GPT · 2026-11-27 · keep manual `switch claude account` plus empty-allowance stop cards for now; design automatic Claude rotation later
 
 The four pictures are:
 - `rate limit`: how much of each account's allowance is left, over time
@@ -28,7 +30,7 @@ states:
 - empty: `no account has reported its allowance yet`, or `nothing spent in the last 7 days` (or 30); no empty picture
 - loading: `waiting for the agent hosts' answer`
 - partial: a known account without a report says `allowance not reported` beside accounts that have reported
-- error: `no agent host is attached`; an away host is noted quietly on `desk.Desk` (or in red on this screen if it is the only attached host)
+- error: `no agent host is attached`; an away host is noted calmly in the Top-Right Global Status Bar (turning red if it is the only attached host)
 - full: the allowance rows or spending totals, then the picture
 keys:
 - `] w`, `[ w`: switch between `7d` and `30d` in place

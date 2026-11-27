@@ -8,12 +8,13 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - notch mask · `#000000` · solid square black rectangle framing the physical top-center notch so it reads as crisp square geometry.
 - unread text · `oklch(89.5% 0.008 95)` · the newest unread agent turn and active page title.
 - reading text · `oklch(83.5% 0.010 95)` · primary readable body text (`oklch(73.5% 0.010 95)` for already-read history).
-- quiet · `oklch(56.0% 0.012 110)` · context that can wait: read ages, settled things, host tags, calm offline host notes on Desk, `NOR` mode, and hints.
+- quiet · `oklch(56.0% 0.012 110)` · context that can wait: read ages, settled things, host tags, calm `away` host notes in the Top-Right Global Status Bar, `NOR` mode, and hints.
 - attention · `oklch(79.5% 0.145 78)` · something to act on: unread message age, pending push approval, or the waiting lamp.
 - lost connection · `oklch(63.1% 0.160 21.6)` · a host the user cannot reach (`needs you`, or an `away` host required by the open screen).
 - failed · `oklch(75.0% 0.145 25)` · a step that did not finish successfully.
 - answer · `oklch(78.0% 0.105 230)` · links and short explanatory notices (`oklch(74.0% 0.130 145)` for positive echoes).
-- marked · `oklch(81.0% 0.065 185)` text with `oklch(68.0% 0.095 185)` `2 px` left gutter bar · muted teal marking the user's own Draft and messages in a thread, plus search matches and choice keys.
+- marked · `oklch(81.0% 0.065 185)` text with `oklch(68.0% 0.095 185)` `2 px` left gutter bar · muted teal marking the user's own Draft and messages in a thread, plus prompt query matches and choice keys.
+- search match · `oklch(35.0% 0.085 85)` background highlight with `unread text` · makes `/` and `?` matches stand out clearly inside both agent prose and muted-teal user messages.
 - keys in motion · `oklch(82.0% 0.125 185)` · font color only (never a background pill) for `INS` mode and active keyboard hints.
 - choice value · `oklch(66.0% 0.120 135)` · the value attached to a choice, not its name or key.
 - point · `oklch(78.0% 0.012 95)` · where the user's attention is in the editor, and marks that guide the eye through text.
@@ -32,7 +33,7 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 
 ## token space
 - corner radius · `0 px` · sharp square corners on every bar, border, notch mask, code block, table, and callout.
-- top line · `32–36 px` · three-part notch-native band: borderless Left Ear (`1fr`), square black center notch mask (`~210 px`), and framed Right Ear global status bar (`1fr`).
+- top line · `32–34 px` · global top overlays only: center square black notch mask (`~210 px`, toggleable via `toggle notch mask`) and framed Top-Right Global Status Bar (right of notch to window edge). Screen content owns `100%` of the window from `y = 0`, reserving space for those overlays (raw guest surfaces start below the `32 px` top row with a quiet rho title row at top-left).
 - sheet measure · `128 ch` centered · gives a calm side margin on a 13"–14" display while keeping Draft, prose, gutter bars, code blocks, diffs, tables, and images on one straight left vertical edge.
 - prose measure · `80 ch` · wraps conversational prose, quotes, and private replies inside the `128 ch` sheet while letting code blocks, diffs, markdown tables, push cards, and images flow to the full `128 ch` sheet width.
 - same band gap · `12 px` · separate items inside each top ear.
@@ -48,7 +49,7 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - prompt answers · up to eight visible rows · keep the answer being considered in sight without making a second screen.
 
 ## token time
-- echo life · `4 s` · long enough to see the result of the last action before the heading returns.
+- echo life · `4 s` · long enough to see the result of the last action in the Top-Right Global Status Bar (temporarily hiding quiet notices; full history in `show messages`).
 - age beat · `1 min` · refresh elapsed ages on the thread and its list without a ticking clock on every row.
 - card age step · `now` during the first minute, nearest minute thereafter under an hour, tenth of an hour under a day, tenth of a day after that · change the words when the displayed age changes.
 - while needed · event-bound, no fixed duration · the signal or open choice stays while it is true or still takes the next action.
@@ -59,40 +60,40 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 decided: 2026-11-26 · no frame-owned left ear; active screen content fills 100% from y=0 and reserves space for only two global top overlays — center square `#000` notch mask (~210px × 32px) and full-width square-bordered Top-Right Global Status Bar (echo, host exceptions, waiting lamp, quiet NOR / font-color-only teal INS with no pill)
 purpose: keep global rho status (echo, degraded hosts, waiting lamp, mode) in the free top-right space next to the laptop's physical notch without adding a full-width chrome bar or stealing vertical pixels from the screen's own content.
 looks: the active screen fills 100% of the window from `y = 0` and owns the top-left zone beside the notch for its own content (page title, project/count, page markers — omitting model name and redundant `waits · 4m` on `chat.Thread`; `agents.Transcript` puts its model name there). Over the top edge (`32–34 px`, `0 px` radius), the frame paints only:
-- **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle (`~210 px`) framing the physical top-center camera notch with crisp `0 px` square corners.
-- **Top-Right Global Status Bar:** fills from the right edge of the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line`, exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
+- **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle (`~210 px`) framing the physical top-center camera notch with crisp `0 px` square corners. Can be toggled off manually via `toggle notch mask` in `window.Commands` (when off, the black rectangle disappears cleanly).
+- **Top-Right Global Status Bar:** fills from the right edge of the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line` (which temporarily hides quiet notices during its `echo life` so it has full room), active dealer focus (`focus tide` / `quiet 32m` in `quiet`), exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
 states:
-- ordinary: screen content owns the full canvas (including top-left beside the notch); the Top-Right Global Status Bar shows the waiting lamp (when other cards wait) and `NOR` (`INS` while typing or in live raw places).
-- attention elsewhere: a steady `attention` dot `●` in the Top-Right Global Status Bar before the mode; absent on `desk.Desk` or when nothing within active dealer focus waits.
+- ordinary: screen content owns the full canvas (including top-left title row beside the notch; raw guest surfaces like Terminal/Browser/Desktop start below the `32 px` top row with a quiet rho title row at top-left); the Top-Right Global Status Bar shows active dealer focus (when set), the waiting lamp (when other cards wait), and `NOR` (`INS` while typing or in live raw places).
+- attention elsewhere: a steady `attention` dot `●` in the Top-Right Global Status Bar before the mode; absent on `desk.Desk` or when nothing within active dealer focus waits (away-host cards stay off the lamp and chime).
 - host state: silent when all hosts are online; an `away` host shows calmly in `quiet` in the Top-Right Global Status Bar (turning `lost connection` red only when a host is in `needs you` state or when an `away` host is required by the screen currently in view).
 - unpaired: a `quiet` notice in the Top-Right Global Status Bar that verdicts stay on this device.
-- echo: the `Echo line` appears inside the framed Top-Right Global Status Bar without disturbing the screen's content or the mode word.
-- prompt open: the dim backdrop covers the entire screen content layer (including the screen's top-left title/header), leaving only the `104 ch` prompt panel, the center notch mask, and the Top-Right Global Status Bar bright.
+- echo: the `Echo line` appears inside the framed Top-Right Global Status Bar, temporarily hiding quiet notices (`gpu-box away`, unpaired note) during its `echo life` without disturbing the screen's content, lamp, or mode word; recent echoes remain readable via `show messages` in `window.Commands`.
+- prompt open: the dim backdrop covers the entire screen content layer (including the screen's top-left title row), leaving only the `104 ch` prompt panel, the center notch mask (if enabled), and the Top-Right Global Status Bar bright.
 used on: `window.Screen`, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `browser.Page`, `notes.Notes`, and `usage.Chart`.
 captures: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [transcript with its host, folder and activity](design/laptop-agent.png).
 
 ## part Echo line
-decided: 2026-11-26 · lives inside the framed Right Ear global status bar; leaves the Left Ear page title untouched
-purpose: answer the action the user just took without opening anything or shifting the page title.
-looks: one line in `editor text` inside the framed Right Ear global status bar (`answer` / positive green for confirmations, `failed` for refusals), truncating cleanly if needed before the lamp and mode.
+decided: 2026-11-26 · lives inside the framed Top-Right Global Status Bar, temporarily hiding quiet notices so it has full room; full history via `show messages`; leaves screen content untouched
+purpose: answer the action the user just took without opening anything or shifting screen content.
+looks: one line in `editor text` inside the framed Top-Right Global Status Bar (`answer` / positive green for confirmations, `failed` for refusals), temporarily hiding quiet notices (`gpu-box away`) so it fits cleanly before the lamp and mode.
 states:
-- quiet: absent; the Right Ear stays calm with only exception notices, lamp, and mode.
-- answer or refusal: the first line of the latest notice appears in the Right Ear, then clears after `echo life` or on the next prompt/key.
+- quiet: absent; the Top-Right Global Status Bar stays calm with focus, exception notices, lamp, and mode.
+- answer or refusal: the first line of the latest notice appears in the Top-Right Global Status Bar, then clears after `echo life` or on the next prompt/key; recent echoes stay available via `show messages`.
 used on: `window.Screen`, including `chat.Thread` and `desk.Desk`.
 captures: [done echo back on Desk](design/laptop-echo.png).
 
 ## part Row
-decided: 2026-11-27 · Desk is a 1-line tabular sheet inside 128ch (row 1 = Card 1, count in Left Ear, no subheader, normal Helix cursor with no UI row-selection highlight or preview, columns: subject · exception tag · project · quiet right age; host away stays in Right Ear only); Places and Commands live inside the upper-third 104ch square prompt panel with keys shown quietly flush-right
-purpose: let the user scan waiting work on Desk or pick a place, command, or snooze time cleanly in tabular alignment.
+decided: 2026-11-27 · Desk is a pure view-only 1-line tabular glance inside 128ch (no cursor, no row selection; row 1 = Card 1, count in Desk's top-left title row, no subheader; columns: subject · exception tag · project · quiet right age; host away stays in Top-Right Global Status Bar only); Places and Commands live inside the upper-third 104ch square prompt panel with keys shown quietly flush-right
+purpose: let the user glance at waiting work on Desk or pick a place, command, or snooze time cleanly in tabular alignment.
 looks: one row of `editor text` (`0 px` corners).
-- on `desk.Desk`: laid out inside the `128 ch` centered sheet starting immediately at row 1 (global count like `13 wait` and any active dealer focus sit in the Left Ear; `away` hosts stay in the Right Ear — never repeated inside the Desk body). Each waiting card is one crisp tabular row: subject (truncated only if needed), optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age (`3.0h`). Normal Helix text cursor moves line-by-line (no separate UI row-selection box or inline preview expansion); `and N more · …` sits quietly below the visible rows.
+- on `desk.Desk`: pure view-only tabular glance laid out inside the `128 ch` centered sheet starting immediately at row 1 (`desk · N wait` sits in Desk's own top-left title row beside the notch; `away` hosts stay in the Top-Right Global Status Bar — never repeated inside the Desk body). Each waiting card is one crisp tabular row: subject (truncated only if needed), optional exception tag (`approve push`, `3 stopped`, `away`), right-aligned `quiet` project address, and right-aligned `quiet` age (`3.0h`). **No text cursor and no row-selection highlight** — the user glances and presses `space-j`, `i`, `space f`, `tab`, or `:` (clicking/tapping a row opens it directly). `and N more · …` sits quietly below the visible rows.
 - on `window.Places`: inside the upper-third `104 ch` square prompt panel; columns show clean subject/name (never raw temp paths for visited transcripts), `attention` card words or `quiet` latest words (or matched text snippet for full-text search), `quiet` project/kind, and flush-right key sequence if the place has a shortcut. Query matches use `marked`; the highlighted prompt row uses `current answer` fill with a `2 px` left `keys in motion` bar.
-- on `window.Commands`: inside the upper-third `104 ch` square prompt panel; lists **every** action in rho (including `deal next`, `done`, `mute`, `snooze thread`, `snooze note`, `approve push`, `deny push`, `undo`, `open places`, `open desk`, `close screen`). Each row shows flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument (or live resolved snooze timestamp preview), live target/current value in `quiet` / `choice value`, and its key sequence quietly flush-right. Query matches use `marked`.
+- on `window.Commands`: inside the upper-third `104 ch` square prompt panel; lists **every** action in rho (including `deal next`, `close and deal`, `done`, `mute`, `unmute`, `snooze thread`, `snooze note`, `unsnooze thread`, `unsnooze note`, `approve push`, `deny push`, `undo`, `open places`, `open desk`, `close screen`, `show messages`, `toggle notch mask`). Each row shows flat verb-noun command name in `reading text`, visually distinct parsed inline target/argument (or live resolved snooze timestamp preview), live target/current value in `quiet` / `choice value`, and its key sequence quietly flush-right. Query matches use `marked`.
 states:
-- desk: up to seven 1-line tabular rows in deal order, then `and N more · …` for overflow; cursor opens on row 1 (never stuck on the overflow line).
+- desk: up to seven 1-line tabular rows in deal order, then `and N more · …` for overflow; counts from local cache while hosts connect (`connecting` in Top-Right Global Status Bar — never flashing a false `0 wait`).
 - places (`window.Places`): MRU rows or search/full-text matches with highlighted matches.
 - commands (`window.Commands`): all rho commands (recents first when blank) with inline arguments, live target/preview, and flush-right shortcut keys.
-- empty: Desk reads `0 wait` in the Left Ear with a calm blank sheet; `Places` and `Commands` show `no match` when no row fits the query.
+- empty: Desk reads `desk · 0 wait` in its top-left title row once all attached hosts answer; `Places` and `Commands` show `no match` when no row fits the query.
 used on: `desk.Desk`, `window.Places`, and `window.Commands`.
 captures: [laptop Desk columns](design/laptop-desk.png), [phone Desk rows](design/phone-desk.png), and [matched palette row](design/laptop-prompt.png).
 
@@ -170,33 +171,32 @@ used on: `window.Screen` at `narrow window` width, including `desk.Desk`, `chat.
 form: [Desk](design/phone-desk.png), [card with send](design/phone-card.png), [transcript without send](design/phone-agent.png), and [palette](design/phone-prompt.png).
 
 ## part Card's words
-purpose: say how long something has waited for the user, or why the work stopped.
-looks: `waits`, or a stop's word, a centered dot, and the age in `attention`, beside the heading in the `Status line` and on a thread row in `window.Places`. On a phone the heading shortens before these words.
+purpose: say how long a thread has waited for the user, or why the work stopped, when scanning rows in `window.Places`.
+looks: `waits`, or a stop's word, a centered dot, and the age in `attention`, on a thread row in `window.Places`. (Omitted from an open `chat.Thread`'s title row, where the newest unread message already shows its age.)
 states:
 - waiting or stopped: the word and the age, not just the color.
-- snoozed thread: it leaves the Desk waiting rows until it can be dealt again.
+- snoozed thread: shows `snoozed` in `window.Places` and leaves `desk.Desk` until due.
 - nothing waiting: no card words; ordinary row information remains.
-- echo: the words give way on the top line until the answer is gone.
-used on: `chat.Thread` when open as a card, and `window.Places`; not on `desk.Desk`, which is a glance.
+used on: `window.Places` (and phone narrow headings); not on an open desktop `chat.Thread` title row.
 form: [ask on the phone's top line](design/phone-card.png).
 
 ## part Allowance row
 purpose: say how much an account has left and when it resets without making the user read the picture.
-looks: one line of `editor text` per account above the picture, with `row air` before the share left and a centered dot before the reset time. The row uses its line's color, and `★` marks the active account the host is using (for GPT or Claude).
+looks: one line of `editor text` per account above the picture, with `row air` before the share left and a centered dot before the reset time. The row uses its line's color, and `★` (adding host name like `★ lab` when more than one host is attached) marks the active account each host is using.
 states:
-- reported: `★ gpt/work  66% left · resets in 5.0d`.
+- reported: `★ lab · gpt/work  66% left · resets in 5.0d`.
 - no reset time: `gpt/home  18% left · reset time not reported`.
 - reset time passed: `gpt/home  18% left · last report before reset`.
 - no allowance from this account yet: `gpt/home  allowance not reported`.
 used on: `usage.Chart`.
 form:
 ```text
-★ gpt/work  66% left · resets in 5.0d
+★ lab · gpt/work  66% left · resets in 5.0d
 gpt/home  18% left · resets in 2.1d
 ```
 
-## motion An answer replaces the heading
-means: the last action has an answer; the ordinary name and card words return without the user doing anything.
+## motion An answer shows in the status bar
+means: the last action has an answer; the Echo line shows in the Top-Right Global Status Bar (temporarily hiding quiet notices) without moving screen content, then clears automatically.
 lasts: `echo life`; a new answer replaces the old one and a prompt takes it away.
 
 ## motion The lamp switches on or off
@@ -215,8 +215,8 @@ lasts: `cut` on open, replacement, or close; otherwise `while needed`.
 means: a flick either turns the page or gives it back; the brief slide shows which happened.
 lasts: `thumb settle`.
 
-## rule the echo lives in the right ear
-when the `Echo line` answers, then it appears inside the framed Right Ear global status bar beside the lamp and mode without displacing the Left Ear's page title or page markers.
+## rule the echo lives in the top-right status bar
+when the `Echo line` answers, then it appears inside the framed Top-Right Global Status Bar (temporarily hiding quiet notices during `echo life`) beside the lamp and mode without displacing the screen's title row.
 
 ## rule a prompt takes the phone bar
 when a `Prompt` opens on a phone, then the `Phone bar` offers its cancel and enter instead of the work's actions.

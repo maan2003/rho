@@ -34,8 +34,8 @@ day: Turn ideas into work.
 goal: the user wakes their laptop in the morning or after offline travel and picks up cleanly with zero false alarms and nothing lost.
 starts when: the laptop wakes from sleep or regains network after time away.
 steps:
-1. after more than ten minutes away, `desk.Desk` is on screen (`desk.a cold return opens the desk`) showing locally cached waiting cards and calm `quiet` host notes (`lab connecting`, `lab away`) — never flashing a false `0 wait` or red ticking counters across screens
-2. queued offline ideas and replies flush cleanly to hosts as they reconnect (any refused reply returns its card; any refused offline idea surfaces clearly as a stop)
+1. after more than ten minutes away, `desk.Desk` is on screen (`desk.a cold return opens the desk`) showing locally cached waiting cards (counted from cache — never flashing a false `0 wait`) while `lab connecting` or `lab away` stays calmly in `quiet` in the Top-Right Global Status Bar — never red ticking counters across screens
+2. queued offline ideas and replies flush cleanly to hosts as they reconnect (any refused reply returns its card; any refused offline idea surfaces locally as a `not sent` card with `write idea again`)
 3. chime pressure counts awake unseen time so overnight sleep does not blast chimes on wake
 4. any host that actually needs the user's hand (`needs you` — security key touch or enrollment) surfaces clearly; the user clears what waits, `deal.Clear what waits`
 done when: hosts are reconnected or calmly noted as `away`, queued sends are delivered, and the user is dealing cleanly.
@@ -87,7 +87,7 @@ so that: the user's verdicts, notes, and bookmarks stay in sync across devices a
 steps:
 1. on **first launch of the GUI** on a new device (before any host is attached), rho asks once: existing user (`secret phrase:` with word completion) or new user (empty / generate a fresh twelve-word phrase to write down), with `escape` as the explicit choice to stay unpaired on this device only
 2. on an unpaired device, the status line reads `verdicts stay on this device until it is paired`, in muted text; the user can pair later via `pair device` in `window.Commands` (which merges any local verdicts/notes made before pairing into the sealed ledger)
-3. a word that is not a phrase word, a wrong count, or a phrase that opens nothing on attached hosts reopens the prompt with the reason and keeps the text
+3. a word that is not a BIP39 phrase word, a wrong count, a checksum mismatch, or a phrase that opens nothing on attached hosts reopens the prompt with the reason and keeps the text; if entered on first launch before any host is attached, the device keeps the phrase unverified (writing no sealed records) until the first host ledger answers so a typo never splits the ledger
 4. the echo line reads `paired: this device holds what your other devices said and wrote`, and the notice goes
 system: asks explicitly on first GUI launch instead of guessing from an empty host or interrupting an open idea draft; mirrors the sealed ledger across every attached host; keeps no word of the phrase in prompt history.
 user: choosing new vs existing user, keeping the phrase, and typing it once per device.
@@ -119,7 +119,7 @@ when: the user wants details on an `away` host or sees a host in `needs you` sta
 want: check each host's status and reconnect or enroll if needed
 so that: the user stays aware of host reachability without noisy red alarms for normal offline hosts
 steps:
-1. on `desk.Desk`, any `away` or `connecting` host appears calmly in `quiet` beside the count; any host in `needs you` state (key touch / enroll) or an `away` host needed by the current screen shows in red on the top line
+1. any `away` or `connecting` host appears calmly in `quiet` in the Top-Right Global Status Bar (never repeated inside Desk); any host in `needs you` state (key touch / enroll) or an `away` host needed by the current screen shows in red in the Top-Right Global Status Bar
 2. for full details and reasons, the user runs `list hosts` in `window.Commands`; each row shows host name, state, and drop reason, and picking it reconnects or copies its enrollment command
 system: reconnects quietly by itself in the background (waiting up to ten seconds between tries) and keeps the latest drop reason on the host's `list hosts` row.
 user: nothing for an `away` host; key touch or enrollment only for `needs you`.
