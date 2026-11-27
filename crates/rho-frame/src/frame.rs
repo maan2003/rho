@@ -3751,13 +3751,7 @@ mod tests {
                         runtime_dir: format!("/nonexistent/{name}").into(),
                     },
                 };
-                let host = frame.attach_host(spec, cx);
-                frame
-                    .hosts()
-                    .connection(host)
-                    .unwrap()
-                    .link()
-                    .connect_in_process()
+                frame.attach_host_in_process(spec, cx).1
             })
             .unwrap();
         let asked = Asked::default();

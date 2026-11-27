@@ -17,15 +17,12 @@ about half a second. Then real hosts and the window start on that state:
 
 The device is paired. It holds 15 notes, the private reply, the mute, the snooze and the done verdicts.
 
-Both scripts build what they need with two cargo runs, unless you give a binary directory.
-One run is not possible: when cargo builds the example with the GUI, it adds the
-example's dev-dependency features to `rho-gui`. Then `rho-agent-hosts` has
-`test-support`, its connections never start, and every host stays `connecting`.
-To build by hand, build in this order:
+Both scripts build what they need with one cargo run, unless you give a binary directory.
+To build by hand:
 
 ```sh
-cargo build -p rho-agent-host --example heavy_workday
-cargo build -p rho-gui -p rho-agent-host -p rho-inference -p rho-fake-model -p rho-cli --bins
+cargo build -p rho-agent-host --example heavy_workday \
+    -p rho-gui -p rho-inference -p rho-fake-model -p rho-cli --bins
 ```
 
 The scripts need `rho-agent-desktop` on `PATH`, `jq`, `git`, and `unshare` with

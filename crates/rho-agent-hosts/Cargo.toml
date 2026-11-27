@@ -55,5 +55,7 @@ zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# The tests exercise the client too.
-rho-agent-hosts = { path = ".", features = ["client"] }
+# The tests exercise the client too, with what other crates' tests turn on.
+rho-agent-hosts = { path = ".", features = ["client", "test-support"] }
+# The restart tests run a host of their own.
+rho-rpc = { workspace = true, features = ["server"] }

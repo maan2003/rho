@@ -118,6 +118,32 @@ impl LocalDiscovery {
         Ok(Some(TransportAddr::Custom(addr)))
     }
 
+    /// Watch the process that owns `id` now, to learn when it has gone.
+    /// `None` when no live process owns it.
+    ///
+    /// A crashed owner sends nothing to say so, and a successor bound to the
+    /// same identity takes over its socket: what its peers sent to the old
+    /// process now reaches one that does not know them. The watch is of the
+    /// owner, not of the identity, so it tells the two apart.
+    pub async fn watch(&self, id: EndpointId) -> io::Result<Option<OwnerWatch>> {
+        if !tokio::fs::try_exists(&self.root).await? {
+            return Ok(None);
+        }
+        let _guard = self.guard().await?;
+        let lease = match tokio::fs::File::open(self.lease_path(id)).await {
+            Ok(file) => std::sync::Arc::new(file.into_std().await),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !crate::locking::held_elsewhere(lease.clone()).await? {
+            return Ok(None);
+        }
+        Ok(Some(OwnerWatch {
+            discovery: self.clone(),
+            lease,
+        }))
+    }
+
     pub(crate) fn record_path(&self, id: EndpointId) -> PathBuf {
         self.root.join(format!("{id}.ipc"))
     }
@@ -154,6 +180,25 @@ impl LocalDiscovery {
     }
 }
 
+/// The process that owned an identity when [`LocalDiscovery::watch`] looked.
+///
+/// It keeps that owner's lease file open. Every owner locks a lease file of
+/// its own, so a successor never holds this one.
+#[derive(Debug)]
+pub struct OwnerWatch {
+    discovery: LocalDiscovery,
+    lease: std::sync::Arc<std::fs::File>,
+}
+
+impl OwnerWatch {
+    /// Whether the owner watched still runs. Once it has gone this stays
+    /// false, also after another process binds the same identity.
+    pub async fn lives(&self) -> io::Result<bool> {
+        let _guard = self.discovery.guard().await?;
+        crate::locking::held_elsewhere(self.lease.clone()).await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Lease {
     discovery: LocalDiscovery,
@@ -165,6 +210,21 @@ pub(crate) struct Lease {
 impl Lease {
     // Caller holds the directory guard until publication or failure cleanup.
     pub(crate) async fn acquire(discovery: LocalDiscovery, id: EndpointId) -> io::Result<Self> {
+        // A lease file left by an owner that is gone goes first: each owner
+        // locks a file of its own, so a watch of the old owner
+        // ([`OwnerWatch`]) never sees the new one in it.
+        match Lock::open(&discovery.lease_path(id), false).await {
+            Ok(stale) => {
+                drop(stale);
+                remove_if_present(&discovery.lease_path(id)).await?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
         let lock = Lock::open(&discovery.lease_path(id), true)
             .await
             .map_err(|error| {

@@ -120,7 +120,7 @@ pub struct Connection {
     /// Cuts the wait before the next dial short.
     retry: Arc<tokio::sync::Notify>,
     /// Dropping this aborts the IO task, tearing the connection down with the
-    /// workspace. A test connection has none.
+    /// workspace. A host in this process has none.
     _io_task: Option<AbortOnDrop<()>>,
 }
 
@@ -146,8 +146,10 @@ impl Link {
 
     /// Puts the host in this process: every stream opened from now on is
     /// handed over here, far end first, for a test to answer as the host
-    /// would. A supervisor's next connection takes the host back.
-    pub fn connect_in_process(&self) -> tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream> {
+    /// would. For a link nothing dials: a detached one, or one from
+    /// [`in_process`]; a supervisor's next connection would take the host
+    /// back.
+    pub fn connect_in_process(&self) -> crate::InProcessHost {
         let (streams, opened) = tokio::sync::mpsc::unbounded_channel();
         *self.dialer.lock().unwrap() = Some(ChannelDialer::InProcess(streams));
         opened
@@ -225,21 +227,6 @@ impl Connection {
     }
 }
 
-/// Whether `spawn` starts the supervisor that dials the target and keeps
-/// reconnecting. A test binary gets none: nothing in a test should reach a
-/// socket, and a supervisor that outlives the test's tokio runtime is
-/// polled while that runtime shuts down, which panics inside tokio's timer
-/// ("A Tokio 1.x context was found, but it is being shutdown").
-///
-/// `cfg!(test)` alone said this wrong: it is true only inside this crate's
-/// own tests, so every downstream test binary, rho-gui's suite among them,
-/// got a live supervisor dialing a socket that is not there.
-/// `test-support` is the feature those binaries turn on, so it is the one
-/// that answers here.
-pub fn supervises() -> bool {
-    !cfg!(test) && !cfg!(feature = "test-support")
-}
-
 /// Attaches one agent host. Its events join `events`, tagged with `host`, so
 /// several agent hosts feed the workspace through a single ordered stream.
 /// `streams` is handed the host's [`Link`] and returns the streams that
@@ -259,14 +246,30 @@ pub fn spawn(
     let streams = streams(link.clone());
     let dialer = link.dialer.clone();
     let retry = Arc::new(tokio::sync::Notify::new());
-    let io_task = supervises().then(|| {
-        AbortOnDrop(runtime.spawn(supervise(target, events, streams, dialer, retry.clone())))
-    });
+    let io_task = runtime.spawn(supervise(target, events, streams, dialer, retry.clone()));
     Connection {
         link,
         retry,
-        _io_task: io_task,
+        _io_task: Some(AbortOnDrop(io_task)),
     }
+}
+
+/// A host in this process, for a test: nothing dials, and every stream
+/// opened to the host is handed to the receiver, far end first, for the
+/// test to answer as the host would. `streams` is called as [`spawn`]
+/// calls it, but they never run: nothing connects.
+pub fn in_process(
+    streams: impl FnOnce(Link) -> Vec<Arc<dyn HostStream>>,
+) -> (Connection, crate::InProcessHost) {
+    let link = Link::detached();
+    let opened = link.connect_in_process();
+    drop(streams(link.clone()));
+    let connection = Connection {
+        link,
+        retry: Arc::new(tokio::sync::Notify::new()),
+        _io_task: None,
+    };
+    (connection, opened)
 }
 
 async fn supervise(
@@ -359,12 +362,18 @@ async fn run(
 ) -> anyhow::Result<()> {
     // Held for the whole connection: the endpoint is what the iroh
     // connection runs on.
-    let (connection, _endpoint) = match target {
-        AttachTarget::Local { runtime_dir } => connect_local(&runtime_dir).await?,
+    let (connection, _endpoint, process) = match target {
+        AttachTarget::Local { runtime_dir } => {
+            let (connection, endpoint, process) = connect_local(&runtime_dir).await?;
+            (connection, endpoint, Some(process))
+        }
         AttachTarget::Iroh {
             endpoint_id,
             access,
-        } => connect_iroh(endpoint_id, &access, events).await?,
+        } => {
+            let (connection, endpoint) = connect_iroh(endpoint_id, &access, events).await?;
+            (connection, endpoint, None)
+        }
     };
     let media = rho_rpc::media::Mux::new(connection.clone());
     let uni = media.clone();
@@ -399,6 +408,7 @@ async fn run(
 
     let health_task = {
         let events = events.clone();
+        let connection = connection.clone();
         tokio::spawn(async move {
             const RECOVERY_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -431,16 +441,47 @@ async fn run(
         })
     };
 
-    let ended = stream_tasks.join_next().await;
+    let ended = tokio::select! {
+        ended = stream_tasks.join_next() => match ended {
+            Some(Ok((name, Ok(())))) => anyhow::anyhow!("agent host {name} stream closed"),
+            Some(Ok((name, Err(error)))) => error.context(format!("agent host {name} stream")),
+            Some(Err(error)) => anyhow::anyhow!("agent host stream task failed: {error}"),
+            None => anyhow::anyhow!("agent host connection has no streams"),
+        },
+        gone = exited(process) => {
+            connection.close(0u32.into(), b"the agent host process exited");
+            gone
+        }
+    };
     abort_tasks(&mut stream_tasks).await;
     health_task.abort();
     let _ = health_task.await;
-    Err(match ended {
-        Some(Ok((name, Ok(())))) => anyhow::anyhow!("agent host {name} stream closed"),
-        Some(Ok((name, Err(error)))) => error.context(format!("agent host {name} stream")),
-        Some(Err(error)) => anyhow::anyhow!("agent host stream task failed: {error}"),
-        None => anyhow::anyhow!("agent host connection has no streams"),
-    })
+    Err(ended)
+}
+
+/// How often a local host's process is looked at while connected.
+const HOST_PROCESS_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ends when the local host's process has gone, with why; a remote host's
+/// connection is the only word on it, so then it never ends. A killed
+/// host sends no close over the IPC socket, and one started again at the
+/// same identity ignores what was meant for the old one: without this the
+/// connection would wait out the recovery window a roaming host gets.
+async fn exited(process: Option<rho_rpc::OwnerWatch>) -> anyhow::Error {
+    let Some(process) = process else {
+        return futures::future::pending().await;
+    };
+    let mut interval = tokio::time::interval(HOST_PROCESS_CHECK);
+    loop {
+        interval.tick().await;
+        match process.lives().await {
+            Ok(true) => {}
+            Ok(false) => return anyhow::anyhow!("the agent host process exited"),
+            Err(error) => {
+                return anyhow::Error::new(error).context("watch the local agent host process");
+            }
+        }
+    }
 }
 
 /// The client's iroh identity, bound once and shared by every attached
@@ -466,17 +507,25 @@ impl std::fmt::Display for EnrollmentPending {
 impl std::error::Error for EnrollmentPending {}
 
 /// The host in `runtime_dir`, over its IPC socket: the way it knows this
-/// process is the user's own.
+/// process is the user's own. With the connection comes the host process
+/// it reached, to tell when that process has gone.
 async fn connect_local(
     runtime_dir: &std::path::Path,
-) -> anyhow::Result<(iroh::endpoint::Connection, iroh::Endpoint)> {
+) -> anyhow::Result<(
+    iroh::endpoint::Connection,
+    iroh::Endpoint,
+    rho_rpc::OwnerWatch,
+)> {
     let paths = rho_rpc::protocol::RuntimePaths::new(Some(runtime_dir))?;
     let host = rho_rpc::local_host(&paths)?;
+    // Before the dial: a host that restarts between the two is then the
+    // old process gone, and the next dial reaches the new one.
+    let process = rho_rpc::watch_local_host(&paths, host).await?;
     let endpoint = client_endpoint().await?;
     let connection =
         rho_rpc::connect_host(&endpoint, host, rho_rpc::protocol::IROH_ALPN, Some(&paths)).await?;
     match rho_rpc::authenticate_iroh_client(&connection, endpoint.id(), None).await? {
-        rho_iroh_auth::ClientAuthResult::Approved => Ok((connection, endpoint)),
+        rho_iroh_auth::ClientAuthResult::Approved => Ok((connection, endpoint, process)),
         other => anyhow::bail!("the local agent host did not trust this process: {other:?}"),
     }
 }
@@ -576,6 +625,9 @@ fn is_safe_remote_executable(value: &str) -> bool {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
         })
 }
+
+#[cfg(test)]
+mod restart_tests;
 
 #[cfg(test)]
 mod shutdown_tests {

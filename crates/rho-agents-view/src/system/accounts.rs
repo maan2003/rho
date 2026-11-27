@@ -363,7 +363,7 @@ mod window_tests {
     ) -> (HostId, Asked) {
         let (host, streams) = window
             .update(cx, |frame, _, cx| {
-                let host = frame.attach_host(
+                frame.attach_host_in_process(
                     HostSpec {
                         name: name.to_owned(),
                         target: AttachTarget::Local {
@@ -371,9 +371,7 @@ mod window_tests {
                         },
                     },
                     cx,
-                );
-                let link = frame.hosts().connection(host).unwrap().link();
-                (host, link.connect_in_process())
+                )
             })
             .unwrap();
         let asked = Asked::default();

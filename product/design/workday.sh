@@ -29,19 +29,14 @@ workday_isolate() {
     ' workday "$(id -u)" "$(id -g)" bash "$@"
 }
 
-# workday_build: the binaries, in two cargo runs. One run would unify the
-# features of the fixture's dev-dependencies into rho-gui's: it would link
-# rho-agent-hosts with `test-support`, which turns its connections off, and
-# the window would say "connecting" forever. The window's run comes last,
-# so target/debug holds its rho-gui.
+# workday_build: the binaries and the fixture, in one cargo run.
 workday_build() {
     local root
     root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
     (
         cd "$root" || exit
-        cargo build --quiet -p rho-agent-host --example heavy_workday
-        cargo build --quiet -p rho-gui -p rho-agent-host -p rho-inference \
-            -p rho-fake-model -p rho-cli --bins
+        cargo build --quiet -p rho-agent-host --example heavy_workday \
+            -p rho-gui -p rho-inference -p rho-fake-model -p rho-cli --bins
     )
 }
 

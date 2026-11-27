@@ -11,7 +11,7 @@ use std::rc::Rc;
 use gpui::{Context, Window};
 use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_hosts::hosts::{HostStatus, Hosts};
-use rho_agent_hosts::{HostId, HostSpec};
+use rho_agent_hosts::{AttachTarget, HostId, HostSpec, HostStream, InProcessHost, Link};
 use rho_window::style::StyleClass;
 
 use crate::command::{Command, Spelling};
@@ -258,22 +258,50 @@ impl Frame {
             tracing::warn!(host = %spec.name, "this machine is already attached; skipped");
             return held.id;
         }
+        let runtime = gpui_tokio::Tokio::handle(cx);
+        self.attach_with(spec, cx, |hosts, name, target, streams| {
+            hosts.attach(name, target, streams, &runtime)
+        })
+    }
+
+    /// Attaches a host that lives in this process, for a test: nothing
+    /// dials it, and every stream opened to it arrives on the receiver,
+    /// far end first, for the test to answer as the host would.
+    pub fn attach_host_in_process(
+        &mut self,
+        spec: HostSpec,
+        cx: &mut gpui::Context<Self>,
+    ) -> (HostId, InProcessHost) {
+        let mut opened = None;
+        let host = self.attach_with(spec, cx, |hosts, name, target, streams| {
+            let (host, streams) = hosts.attach_in_process(name, target, streams);
+            opened = Some(streams);
+            host
+        });
+        (host, opened.expect("attach_with attaches"))
+    }
+
+    fn attach_with(
+        &mut self,
+        spec: HostSpec,
+        cx: &mut gpui::Context<Self>,
+        attach: impl FnOnce(&mut Hosts, String, AttachTarget, HostStreams<'_>) -> HostId,
+    ) -> HostId {
         let systems = self.systems.clone();
         let ledger = self.attention.stream();
-        let runtime = gpui_tokio::Tokio::handle(cx);
         let name = spec.name.clone();
         let endpoint = spec.target.endpoint();
-        let host = self.hosts.attach(
-            spec.name.clone(),
+        let host = attach(
+            &mut self.hosts,
+            spec.name,
             spec.target,
-            |host, link| {
+            Box::new(|host, link| {
                 let mut opened = vec![ledger];
                 for system in &systems {
                     opened.extend(system.streams(host, &name, endpoint, &link, cx));
                 }
                 opened
-            },
-            &runtime,
+            }),
         );
         self.save_hosts();
         cx.notify();
@@ -507,6 +535,9 @@ impl Frame {
         self.echo(&said, StyleClass::SystemInfo, cx);
     }
 }
+
+/// What a host gets its streams from, once it has an id and a link.
+type HostStreams<'a> = Box<dyn FnOnce(HostId, Link) -> Vec<std::sync::Arc<dyn HostStream>> + 'a>;
 
 /// What a host command does once it knows which host it means.
 pub type OnHost = Rc<dyn Fn(&mut Frame, HostId, &mut Window, &mut Context<Frame>)>;

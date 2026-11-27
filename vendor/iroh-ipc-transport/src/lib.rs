@@ -27,7 +27,7 @@ mod lookup;
 mod selector;
 mod transport;
 
-pub use discovery::LocalDiscovery;
+pub use discovery::{LocalDiscovery, OwnerWatch};
 pub use selector::PreferIpcTransport;
 pub use transport::IpcTransport;
 

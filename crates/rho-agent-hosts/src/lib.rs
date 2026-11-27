@@ -32,6 +32,12 @@ pub use connection::{ConnEvent, Connection, HostEvent, Link, spawn};
 /// bi-stream on the host's authenticated iroh connection.
 #[cfg(feature = "client")]
 pub type Dialer = rho_rpc::Dialer;
+
+/// A host in this process, as a test sees it: every stream opened to the
+/// host, far end first, for the test to answer as the host would.
+#[cfg(feature = "client")]
+pub type InProcessHost = tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>;
+
 #[cfg(feature = "client")]
 pub use hosts::{Host, HostStatus, Hosts};
 

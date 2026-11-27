@@ -477,7 +477,7 @@ fn an_away_hosts_cached_cards_stay_answerable(cx: &mut gpui::TestAppContext) {
                     runtime_dir: "/nonexistent/lab".into(),
                 },
             };
-            let host = frame.attach_host(spec, cx);
+            let (host, _) = frame.attach_host_in_process(spec, cx);
             world.borrow_mut().host = Some(host);
             frame
                 .hosts

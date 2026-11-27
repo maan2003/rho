@@ -57,3 +57,18 @@ impl Lock {
         })
     }
 }
+
+/// Whether some other open file holds `file`'s lock, tried without waiting.
+/// Trying takes the lock for a moment, which would turn a binder away, so
+/// call it under the directory guard; the lock is let go before it returns.
+pub(crate) async fn held_elsewhere(file: std::sync::Arc<std::fs::File>) -> io::Result<bool> {
+    tokio::task::spawn_blocking(move || match fs2::FileExt::try_lock_exclusive(&*file) {
+        Ok(()) => fs2::FileExt::unlock(&*file).map(|()| false),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    })
+    .await
+    .map_err(io::Error::other)?
+}

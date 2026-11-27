@@ -29,6 +29,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Bu
 
 pub mod protocol;
 
+#[cfg(feature = "native-client")]
+pub use iroh_ipc_transport::OwnerWatch;
+
 /// Zstd's maximum history window in each direction (128 KiB).
 ///
 /// Setting both sides prevents an untrusted compressed header from requesting
@@ -115,6 +118,22 @@ pub fn local_host(paths: &protocol::RuntimePaths) -> anyhow::Result<iroh::Endpoi
         .with_context(|| format!("no agent host has run in {}", paths.directory().display()))?;
     iroh::EndpointId::from_z32(text.trim())
         .with_context(|| format!("{} does not hold an endpoint id", file.display()))
+}
+
+/// The process the local host `host` runs as now, to learn when it has
+/// gone. A killed host sends no close over its IPC socket, and one started
+/// again in its place answers what was sent to the old one with silence,
+/// so the connection alone would not end before its idle timeout.
+#[cfg(feature = "native-client")]
+pub async fn watch_local_host(
+    paths: &protocol::RuntimePaths,
+    host: iroh::EndpointId,
+) -> anyhow::Result<OwnerWatch> {
+    iroh_ipc_transport::LocalDiscovery::new(paths.ipc_dir())
+        .watch(host)
+        .await
+        .context("look the local agent host up")?
+        .with_context(|| format!("no agent host runs in {}", paths.directory().display()))
 }
 
 /// Connects to a host on the application ALPN. Through `local`, the host

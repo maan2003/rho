@@ -84,7 +84,6 @@ impl Hosts {
         runtime: &tokio::runtime::Handle,
     ) -> HostId {
         let id = HostId(self.next_id);
-        self.next_id += 1;
         let connection = crate::connection::spawn(
             id,
             target.clone(),
@@ -92,6 +91,28 @@ impl Hosts {
             |link| streams(id, link),
             runtime,
         );
+        self.push(name, target, connection)
+    }
+
+    /// Attaches a host that lives in this process, for a test: nothing
+    /// dials `target`, which only names the machine, and every stream
+    /// opened to the host arrives on the receiver, far end first, for the
+    /// test to answer as the host would. It stays `Connecting` until the
+    /// test says otherwise.
+    pub fn attach_in_process(
+        &mut self,
+        name: String,
+        target: AttachTarget,
+        streams: impl FnOnce(HostId, crate::Link) -> Vec<Arc<dyn HostStream>>,
+    ) -> (HostId, crate::InProcessHost) {
+        let id = HostId(self.next_id);
+        let (connection, opened) = crate::connection::in_process(|link| streams(id, link));
+        (self.push(name, target, connection), opened)
+    }
+
+    fn push(&mut self, name: String, target: AttachTarget, connection: Connection) -> HostId {
+        let id = HostId(self.next_id);
+        self.next_id += 1;
         self.hosts.push(Host {
             id,
             name,

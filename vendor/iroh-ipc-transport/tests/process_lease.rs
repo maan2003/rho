@@ -51,6 +51,8 @@ async fn killed_owner_is_undiscoverable_and_identity_can_restart() {
     let id = SecretKey::from([42; 32]).public();
     let discovery = LocalDiscovery::new(dir.path());
     assert!(discovery.resolve(id).await.unwrap().is_some());
+    let killed = discovery.watch(id).await.unwrap().expect("the child owns the id");
+    assert!(killed.lives().await.unwrap());
     assert_eq!(
         IpcTransport::prepare(discovery.clone(), id)
             .await
@@ -61,8 +63,19 @@ async fn killed_owner_is_undiscoverable_and_identity_can_restart() {
     child.kill().await.unwrap();
     child.wait().await.unwrap();
     assert!(discovery.resolve(id).await.unwrap().is_none());
+    assert!(!killed.lives().await.unwrap(), "the killed owner is gone");
+    assert!(discovery.watch(id).await.unwrap().is_none());
+    // No sweep: the successor finds the killed owner's lease file where it
+    // left it, and still holds a lease of its own.
     let restarted = IpcTransport::prepare(discovery.clone(), id).await.unwrap();
     assert!(discovery.resolve(id).await.unwrap().is_some());
+    assert!(
+        !killed.lives().await.unwrap(),
+        "the successor is not the owner watched"
+    );
+    let successor = discovery.watch(id).await.unwrap().expect("the successor owns the id");
+    assert!(successor.lives().await.unwrap());
     restarted.close().await.unwrap();
+    assert!(!successor.lives().await.unwrap(), "a closed owner is gone");
     dir.close().await;
 }
