@@ -51,8 +51,9 @@ fn retry() -> Address {
 }
 
 impl crate::System for Work {
+    /// Threads, and the user's notes, whose reminders are in no project.
     fn kinds(&self) -> &'static [&'static str] {
-        &["thread"]
+        &["thread", "note"]
     }
 
     fn open(&mut self, _: &Address, _: &mut Window, cx: &mut Context<Self>) -> Opening {
@@ -656,4 +657,140 @@ fn a_push_on_an_away_host_is_refused_until_it_is_back(cx: &mut gpui::TestAppCont
             assert!(frame.desk_in_view(), "answered, and nothing else waits");
         })
         .unwrap();
+}
+
+fn lamp(frame: &gpui::WindowHandle<Frame>, cx: &mut gpui::TestAppContext) -> bool {
+    frame
+        .update(cx, |frame, _, _| frame.signals.lamp_on)
+        .unwrap()
+}
+
+/// A quiet holds every card, notes included: `space-j` opens Desk and says
+/// how long is left rather than dealing, from a thread in view too, which
+/// it does not skip; a done in the quiet lands on Desk the same way.
+#[gpui::test]
+fn a_quiet_deals_nothing_until_it_ends(cx: &mut gpui::TestAppContext) {
+    let (frame, world, _) = work_frame(cx);
+    let note = Address::note(uuid::Uuid::new_v4());
+    world.borrow_mut().claims = vec![
+        titled(asks(&clock(), hours(3), false), "Flaky clock test"),
+        titled(asks(&note, hours(2), false), "Call the bank"),
+    ];
+    settle(&frame, cx, |_, _, _| {});
+    settle(&frame, cx, |frame, window, cx| {
+        frame.open(clock(), window, cx);
+        run_line(frame, "quiet 45m", window, cx);
+        frame.pull_card(window, cx);
+        assert!(frame.desk_in_view(), "Desk, not a card");
+        assert_eq!(echo_of(frame).as_deref(), Some("quiet 45m"));
+        frame.echo = None;
+        frame.pull_card(window, cx);
+        assert!(frame.desk_in_view());
+        assert_eq!(echo_of(frame).as_deref(), Some("quiet 45m"));
+        assert!(
+            !frame.attention.skips.contains(&clock()),
+            "the thread left in view is not skipped"
+        );
+        assert_eq!(frame.hand().cards.len(), 2, "Desk still counts both");
+
+        frame.open(clock(), window, cx);
+        world
+            .borrow_mut()
+            .claims
+            .retain(|claim| claim.address != clock());
+        frame.verdict(&clock(), Verdict::Done, "done".into(), window, cx);
+        assert!(frame.desk_in_view(), "the note is held too");
+        assert_eq!(
+            echo_of(frame).as_deref(),
+            Some("done: Flaky clock test · quiet 45m")
+        );
+
+        run_line(frame, "unquiet", window, cx);
+        frame.pull_card(window, cx);
+        assert_eq!(frame.current_address(), &note, "dealt once the quiet ends");
+    });
+}
+
+/// A project focus lets the user's own due notes through, in rank order
+/// with the project's cards, for the deal and for the lamp; other
+/// projects' cards stay held.
+#[gpui::test]
+fn a_project_focus_lets_due_notes_through(cx: &mut gpui::TestAppContext) {
+    let (frame, world, rings) = work_frame(cx);
+    let note = Address::note(uuid::Uuid::new_v4());
+    world.borrow_mut().claims = vec![
+        titled(asks(&clock(), hours(3), false), "Flaky clock test"),
+        titled(asks(&note, hours(2), false), "Call the bank"),
+        titled(asks(&retry(), hours(1), false), "Retry window"),
+    ];
+    settle(&frame, cx, |frame, window, cx| {
+        run_line(frame, "focus reef", window, cx);
+        frame.pull_card(window, cx);
+        assert_eq!(
+            frame.current_address(),
+            &note,
+            "the note, though in no project"
+        );
+        frame.pull_card(window, cx);
+        assert_eq!(frame.current_address(), &retry());
+        frame.pull_card(window, cx);
+        assert_eq!(frame.current_address(), &note, "tide's card stays held");
+    });
+
+    // The lamp and the chime hear a due note in the focus too.
+    world.borrow_mut().claims = Vec::new();
+    settle(&frame, cx, on_page);
+    assert!(!lamp(&frame, cx));
+    let rang = rings.get();
+    world
+        .borrow_mut()
+        .claims
+        .push(asks(&note, SignedDuration::ZERO, true));
+    settle(&frame, cx, |_, _, _| {});
+    assert!(lamp(&frame, cx), "the due note lights the lamp");
+    assert_eq!(rings.get(), rang + 1, "and rings");
+}
+
+/// A card an away host's cache holds counts on Desk and deals in its
+/// order, but lights no lamp and rings no chime: it is only what the host
+/// last said. Back, the host's card lights the lamp.
+#[gpui::test]
+fn an_away_hosts_cards_stay_off_the_lamp_and_chime(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_tokio::init);
+    let (frame, world, rings) = work_frame(cx);
+    settle(&frame, cx, |frame, _, cx| {
+        let spec = HostSpec {
+            name: "lab".to_owned(),
+            target: rho_agent_hosts::AttachTarget::Local {
+                runtime_dir: "/nonexistent/lab".into(),
+            },
+        };
+        let (host, _) = frame.attach_host_in_process(spec, cx);
+        world.borrow_mut().host = Some(host);
+        frame
+            .hosts
+            .set_status(host, HostStatus::Disconnected("connection lost".into()));
+    });
+    settle(&frame, cx, on_page);
+    world.borrow_mut().claims.push(titled(
+        asks(&clock(), SignedDuration::ZERO, true),
+        "Flaky clock test",
+    ));
+    settle(&frame, cx, |_, _, _| {});
+    assert!(!lamp(&frame, cx), "the away host's card lights nothing");
+    assert_eq!(rings.get(), 0, "and rings nothing");
+    frame
+        .update(cx, |frame, window, cx| {
+            assert_eq!(frame.hand().cards.len(), 1, "it still counts");
+            frame.pull_card(window, cx);
+            assert_eq!(frame.current_address(), &clock(), "and deals");
+            on_page(frame, window, cx);
+        })
+        .unwrap();
+
+    settle(&frame, cx, |frame, _, _| {
+        let host = world.borrow().host.unwrap();
+        frame.hosts.set_status(host, HostStatus::Online);
+    });
+    assert!(lamp(&frame, cx), "back, its card lights the lamp");
 }

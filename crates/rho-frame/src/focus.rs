@@ -63,20 +63,23 @@ impl DealerFocus {
         }
     }
 
-    /// Whether a card in `project` deals on `space-j`.
-    pub(crate) fn deals(&self, project: Option<&Address>, now: Timestamp) -> bool {
-        match self.at(now) {
-            Self::All | Self::QuietUntil(_) => true,
-            Self::Project(focus) => project == Some(focus),
-        }
-    }
-
-    /// Whether a card in `project` may light the lamp or ring the chime.
-    pub(crate) fn signals(&self, project: Option<&Address>, now: Timestamp) -> bool {
+    /// Whether the card at `card`, in `project`, deals on `space-j` and
+    /// may light the lamp or ring the chime. A project focus lets the
+    /// user's own due notes through, which belong to no project; a quiet
+    /// holds everything until it ends.
+    pub(crate) fn admits(&self, card: &Address, project: Option<&Address>, now: Timestamp) -> bool {
         match self.at(now) {
             Self::All => true,
             Self::QuietUntil(_) => false,
-            Self::Project(focus) => project == Some(focus),
+            Self::Project(focus) => card.as_note().is_some() || project == Some(focus),
+        }
+    }
+
+    /// What `space-j` says in a quiet in place of a deal: `quiet 32m`.
+    pub(crate) fn quiet_left(&self, now: Timestamp) -> Option<String> {
+        match self.at(now) {
+            Self::QuietUntil(until) => Some(format!("quiet {}", left(now, *until))),
+            Self::All | Self::Project(_) => None,
         }
     }
 
@@ -87,7 +90,7 @@ impl DealerFocus {
         match self.at(now) {
             Self::All => None,
             Self::Project(project) => Some(format!("focus {}", name(project))),
-            Self::QuietUntil(until) => Some(format!("quiet {}", left(now, *until))),
+            Self::QuietUntil(_) => self.quiet_left(now),
         }
     }
 
@@ -435,26 +438,39 @@ mod tests {
         );
     }
 
-    /// A project focus deals and signals only its own cards; quiet deals
-    /// everything and signals nothing until it ends, then is all again.
+    /// A project focus admits only its own cards and the user's due
+    /// notes, which are in no project; a quiet admits nothing, notes
+    /// included, until it ends, then is all again.
     #[test]
-    fn focus_decides_what_deals_and_what_signals() {
+    fn focus_decides_what_deals_and_signals() {
         let tide = Address::new("thread", "lab/1");
         let reef = Address::new("thread", "lab/9");
+        let clock = Address::new("thread", "lab/2");
+        let retry = Address::new("thread", "lab/10");
+        let note = Address::note(uuid::Uuid::new_v4());
         let focus = DealerFocus::Project(tide.clone());
-        for (project, deals) in [(Some(&tide), true), (Some(&reef), false), (None, false)] {
-            assert_eq!(focus.deals(project, noon()), deals, "{project:?}");
-            assert_eq!(focus.signals(project, noon()), deals, "{project:?}");
+        for (card, project, admits) in [
+            (&clock, Some(&tide), true),
+            (&retry, Some(&reef), false),
+            (&retry, None, false),
+            (&note, None, true),
+        ] {
+            assert_eq!(focus.admits(card, project, noon()), admits, "{card:?}");
         }
         let until = noon() + SignedDuration::from_mins(45);
         let quiet = DealerFocus::QuietUntil(until);
-        for project in [Some(&tide), None] {
-            assert!(quiet.deals(project, noon()));
-            assert!(!quiet.signals(project, noon()));
-            assert!(quiet.signals(project, until), "a quiet that ended is all");
-            assert!(DealerFocus::All.signals(project, noon()));
+        for (card, project) in [(&clock, Some(&tide)), (&note, None)] {
+            assert!(!quiet.admits(card, project, noon()), "{card:?}");
+            assert!(
+                quiet.admits(card, project, until),
+                "a quiet that ended is all"
+            );
+            assert!(DealerFocus::All.admits(card, project, noon()));
         }
         assert_eq!(quiet.at(until), &DealerFocus::All);
+        assert_eq!(quiet.quiet_left(noon()).as_deref(), Some("quiet 45m"));
+        assert_eq!(quiet.quiet_left(until), None);
+        assert_eq!(focus.quiet_left(noon()), None);
     }
 
     #[test]

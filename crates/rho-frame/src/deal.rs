@@ -125,15 +125,21 @@ impl Frame {
             cards: hand
                 .cards
                 .iter()
-                .filter(|card| {
-                    let project = self.project_of(&card.address, cx);
-                    self.dealer_focus
-                        .deals(project.as_ref().map(|project| &project.address), now)
-                })
+                .filter(|card| self.focus_admits(card, now, cx))
                 .cloned()
                 .collect(),
             next_change: hand.next_change,
         }
+    }
+
+    /// Whether the dealer focus lets `card` deal and signal.
+    fn focus_admits(&self, card: &Card, now: Timestamp, cx: &gpui::App) -> bool {
+        let project = self.project_of(&card.address, cx);
+        self.dealer_focus.admits(
+            &card.address,
+            project.as_ref().map(|project| &project.address),
+            now,
+        )
     }
 
     /// The ranking as of the last change.
@@ -384,6 +390,14 @@ impl Frame {
     /// card in view that is all that waits stays, unskipped: passing over
     /// it would only deal it again.
     pub fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A quiet holds every card until it ends: `space-j` shows Desk and
+        // says how long is left, and skips nothing.
+        if let Some(quiet) = self.dealer_focus.quiet_left(Timestamp::now()) {
+            if !self.desk_in_view() {
+                self.open_desk(window, cx);
+            }
+            return self.echo(&quiet, StyleClass::SystemInfo, cx);
+        }
         let in_view = self.card_in_view(cx);
         let hand = self.dealable(&self.rank(cx), cx);
         let held = in_view
@@ -552,18 +566,17 @@ impl Frame {
         // The lamp and the chime signal a card only when it cannot already
         // be read here, and only one the dealer focus lets signal. Desk is
         // itself a view of the hand, including its overflow, so on Desk
-        // neither signals anything.
+        // neither signals anything. A card an away host's cache holds
+        // counts and deals, but signals nothing: it is only what the host
+        // last said.
         let in_view = self.card_in_view(cx);
         let on_desk = self.desk_in_view();
         let elsewhere: Vec<&Card> = hand
             .cards
             .iter()
             .filter(|card| !on_desk && Some(&card.address) != in_view.as_ref())
-            .filter(|card| {
-                let project = self.project_of(&card.address, cx);
-                self.dealer_focus
-                    .signals(project.as_ref().map(|project| &project.address), at)
-            })
+            .filter(|card| self.focus_admits(card, at, cx))
+            .filter(|card| self.away_host(&card.address, cx).is_none())
             .collect();
         let top = elsewhere
             .iter()
@@ -620,6 +633,11 @@ impl Frame {
     /// calmly, which hosts are away, so an empty deal is not taken for an
     /// empty desk.
     fn nothing_waits(&self, cx: &gpui::App) -> String {
+        // In a quiet, cards may wait: they are held, and it says for how
+        // long.
+        if let Some(quiet) = self.dealer_focus.quiet_left(Timestamp::now()) {
+            return quiet;
+        }
         let focus = match self.dealer_focus() {
             DealerFocus::Project(project) => Some(self.project_name(project, cx)),
             DealerFocus::All | DealerFocus::QuietUntil(_) => None,
