@@ -275,7 +275,7 @@ where
                      mut content,
                      host_label,
                  }| async move {
-                    let (parent, project) = {
+                    let (parent, project, choices) = {
                         let read = services.db.read();
                         let stop = read
                             .message(failed_start)
@@ -285,7 +285,9 @@ where
                         let project = rho_agent_types::ProjectId(
                             read.root_of(parent).context("no such thread")?,
                         );
-                        (parent, project)
+                        // The retry asks for what the idea's own `in:` and
+                        // `on:` lines asked for; the rest is the project's now.
+                        (parent, project, read.idea_choices(parent))
                     };
                     prepare_image_content(&mut content).await?;
                     let pool = services.pool.clone();
@@ -297,8 +299,8 @@ where
                             failed_start: Some(failed_start),
                             content,
                             host_label,
-                            runtime: None,
-                            mode: None,
+                            runtime: choices.runtime,
+                            mode: choices.mode,
                         })
                         .await
                     })

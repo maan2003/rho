@@ -16,7 +16,8 @@ use tokio::sync::Mutex;
 
 use super::AgentPool;
 use crate::store::{
-    MailRead as _, MailWrite as _, NewMessage, ProjectRead as _, ProjectWrite as _, StoreRead as _,
+    IdeaChoices, MailRead as _, MailWrite as _, NewMessage, ProjectRead as _, ProjectWrite as _,
+    StoreRead as _,
 };
 
 #[derive(Default)]
@@ -271,6 +272,16 @@ impl AgentPool {
                 idea.content,
                 idea.client_id,
             )?;
+            // A retry reads these from the idea that opened its thread.
+            if idea.failed_start.is_none() {
+                write.choose_for_idea(
+                    message,
+                    &IdeaChoices {
+                        runtime: idea.runtime.clone(),
+                        mode: idea.mode,
+                    },
+                );
+            }
             if let Some(agent) = standing {
                 // The standing agent works in the idea's thread from now
                 // on, and reads the idea that started it.

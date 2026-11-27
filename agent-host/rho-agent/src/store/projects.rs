@@ -9,8 +9,11 @@
 //! leaves a retired project off its `to:` line.
 
 use redb::TableDefinition;
-use rho_agent_types::{AgentId, MessageId, ProjectConfig, ProjectId, Revision};
+use rho_agent_types::{
+    AgentId, MessageId, ProjectConfig, ProjectId, ProjectMode, Revision, RuntimeLabel,
+};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
+use senax_encoder::{Decode, Encode};
 
 use super::MailRead as _;
 
@@ -25,6 +28,17 @@ const RETIRED: TableDefinition<u64, ()> = TableDefinition::new("project_retired"
 // Set in the same transaction as an existing agent's idea, or after a new
 // agent or a failure stop is recorded. A lost receipt cannot start it twice.
 const STARTED: TableDefinition<u64, ()> = TableDefinition::new("mail_project_starts");
+/// The `in:` and `on:` lines an idea named, by the idea, written with it.
+/// A retry after a refused start asks for the same.
+const CHOICES: TableDefinition<u64, Sen<IdeaChoices>> = TableDefinition::new("mail_idea_choices");
+
+/// What an idea's own lines chose over the project's settings; `None` is
+/// the project's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct IdeaChoices {
+    pub runtime: Option<RuntimeLabel>,
+    pub mode: Option<ProjectMode>,
+}
 
 pub trait ProjectRead {
     /// A live project's settings; `None` for any other message.
@@ -35,6 +49,7 @@ pub trait ProjectRead {
     fn standing_agents(&self) -> Vec<(ProjectId, AgentId)>;
     fn project_retired(&self, project: ProjectId) -> bool;
     fn project_start_complete(&self, idea: MessageId) -> bool;
+    fn idea_choices(&self, idea: MessageId) -> IdeaChoices;
 }
 
 impl ProjectRead for ReadTxn {
@@ -87,6 +102,13 @@ impl ProjectRead for ReadTxn {
     fn project_start_complete(&self, idea: MessageId) -> bool {
         self.open_table(STARTED).get(idea.0.0).is_some()
     }
+
+    fn idea_choices(&self, idea: MessageId) -> IdeaChoices {
+        self.open_table(CHOICES)
+            .get(idea.0.0)
+            .map(|row| row.value().into_owned())
+            .unwrap_or_default()
+    }
 }
 
 pub trait ProjectWrite {
@@ -103,6 +125,7 @@ pub trait ProjectWrite {
     /// Folds a logged [`rho_agent_types::ChatEvent::Retired`] into the index.
     fn index_retired(&mut self, project: ProjectId);
     fn complete_project_start(&mut self, idea: MessageId);
+    fn choose_for_idea(&mut self, idea: MessageId, choices: &IdeaChoices);
 }
 
 impl ProjectWrite for WriteTxn {
@@ -111,6 +134,7 @@ impl ProjectWrite for WriteTxn {
         self.open_table(STANDING);
         self.open_table(RETIRED);
         self.open_table(STARTED);
+        self.open_table(CHOICES);
     }
 
     fn held_project(&mut self, ProjectId(anchor): ProjectId) -> Option<ProjectConfig> {
@@ -148,5 +172,12 @@ impl ProjectWrite for WriteTxn {
 
     fn complete_project_start(&mut self, idea: MessageId) {
         self.open_table(STARTED).insert(idea.0.0, ());
+    }
+
+    fn choose_for_idea(&mut self, idea: MessageId, choices: &IdeaChoices) {
+        if *choices != IdeaChoices::default() {
+            self.open_table(CHOICES)
+                .insert(idea.0.0, SenValue::borrowed(choices));
+        }
     }
 }

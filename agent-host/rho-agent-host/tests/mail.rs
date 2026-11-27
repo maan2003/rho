@@ -452,6 +452,26 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         .await?,
         failed
     );
+    // An idea that named its own agent and runtime is refused the same
+    // way; its retry below still asks for both.
+    let PostIdeaReply::Posted(chosen) = post_in(
+        failed_project,
+        822,
+        "Try this apart, on the strongest runtime.",
+        Some(RuntimeLabel::parse("sol-xhigh").unwrap()),
+        Some(ProjectMode::PerIdea),
+    )
+    .await?
+    else {
+        anyhow::bail!("an idea with its own lines was refused before it was posted");
+    };
+    let chosen_stop = wait_for_mail(&mut first_device, |row| {
+        matches!(row.event, ChatEvent::Posted {
+        from: Address::StartFailed, parent: Some(idea), ..
+    } if idea == chosen)
+    })
+    .await?;
+    let chosen_stop = rho_agent_types::Message::from_record(&chosen_stop).unwrap();
 
     call(
         paths,
@@ -528,6 +548,31 @@ async fn run_projects(paths: &RuntimePaths, root: &Path) -> anyhow::Result<Strin
         .filter_map(|input| input.message)
         .collect();
     assert_eq!(deliveries[..2], [failed, retry]);
+    assert_eq!(
+        standing_agent(paths, failed_project).await?,
+        Some(retry_agent)
+    );
+    // The project now has a standing agent and a newer runtime, but the
+    // retried idea asked for its own agent on `sol-xhigh`.
+    call(
+        paths,
+        RetryIdea {
+            client_id: 823,
+            failed_start: chosen_stop.id,
+            content: vec![ContentPart::Text {
+                text: "The place is fixed now.".into(),
+            }],
+            host_label: "lab".into(),
+        },
+    )
+    .await?;
+    let chosen_agent = idea_agent(paths, chosen).await?;
+    assert_ne!(chosen_agent, retry_agent);
+    assert_eq!(agent_runtime(paths, chosen_agent).await?, "sol-xhigh");
+    assert_eq!(
+        standing_agent(paths, failed_project).await?,
+        Some(retry_agent)
+    );
 
     call(
         paths,
