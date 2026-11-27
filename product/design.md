@@ -1,6 +1,6 @@
 # design
 
-The built window puts the work in one editor with sharp `0 px` square corners throughout (no rounded pills or cards), tuned primarily for a fullscreen 13" laptop display (`MacBook Air M2`, Asahi Linux + Niri, with a physical top-center camera notch). The top strip splits across the notch into a borderless **Left Ear** (belonging to the open page/card), a **square black center notch mask**, and a full-width framed **Right Ear** (the global status bar). Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
+The built window puts the work in one editor with sharp `0 px` square corners throughout (no rounded pills or cards), tuned primarily for a fullscreen 13" laptop display (`MacBook Air M2`, Asahi Linux + Niri, with a physical top-center camera notch). There is no frame-owned left header bar: each screen's own content fills 100% of the window from `y = 0` and reserves space for only two global top overlays — a **square black center notch mask** and a full-width framed **Top-Right Global Status Bar**. Values are for the bundled dark appearance, Rho OKSolar P3; sizes are in logical pixels. The [laptop and phone renders](design/README.md) show the states and how to reproduce them.
 
 ## token color
 - reading surface · `oklch(23.0% 0.018 150)` · the continuous field the user reads and writes on.
@@ -56,19 +56,18 @@ The built window puts the work in one editor with sharp `0 px` square corners th
 - thumb settle · `180 ms` · finish the phone page move or return it to where it was.
 
 ## part Status line
-decided: 2026-11-26 · notch-native 3-part top row: borderless Left Ear owns page/card identity and page markers (no model name, no waits·age on Thread); center paints a square `#000` notch mask; full-width square-bordered Right Ear is the global status bar (echo, host exceptions, waiting lamp, quiet NOR / font-color-only teal INS with no pill)
-purpose: separate what page/card is open from what rho is saying globally, using the two ears flanking the laptop's physical notch without spending vertical pixels below it.
-looks: one `top line` (`32–36 px`, `0 px` radius) split into three columns:
-- **Left Ear (page/card):** borderless on `reading surface`, visually part of the open buffer; holds the page title in `unread text` with `emphasis`, quiet project/context name (truncating title with ellipsis well before the center notch), and page-level markers (`pinned`, `approve push`, `working`, `stopped by you`, `stuck`, or active dealer focus on `desk.Desk`). Never shows the agent's model name on `chat.Thread` (model belongs in `agents.Transcript` and `:switch model`), and never repeats `waits · 4m` on `chat.Thread` (the newest unread message right below already displays its age).
-- **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle framing the physical top-center camera notch so it reads with crisp `0 px` square corners.
-- **Right Ear (global status bar):** fills the full right ear from the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line`, exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
+decided: 2026-11-26 · no frame-owned left ear; active screen content fills 100% from y=0 and reserves space for only two global top overlays — center square `#000` notch mask (~210px × 32px) and full-width square-bordered Top-Right Global Status Bar (echo, host exceptions, waiting lamp, quiet NOR / font-color-only teal INS with no pill)
+purpose: keep global rho status (echo, degraded hosts, waiting lamp, mode) in the free top-right space next to the laptop's physical notch without adding a full-width chrome bar or stealing vertical pixels from the screen's own content.
+looks: the active screen fills 100% of the window from `y = 0` and owns the top-left zone beside the notch for its own content (page title, project/count, page markers — omitting model name and redundant `waits · 4m` on `chat.Thread`; `agents.Transcript` puts its model name there). Over the top edge (`32–34 px`, `0 px` radius), the frame paints only:
+- **Center (notch mask):** a solid `notch mask` (`#000000`) square rectangle (`~210 px`) framing the physical top-center camera notch with crisp `0 px` square corners.
+- **Top-Right Global Status Bar:** fills from the right edge of the notch mask to the right window edge on `global status surface` with crisp `1 px` `seam` borders on its left and bottom edges (`0 px` radius); holds the `Echo line`, exception-only host notices (`<host> away` in `quiet`, `<host> needs you` in `lost connection`), the steady `attention` waiting lamp `●`, and the mode word (`NOR` in `quiet`, `INS` in bold `keys in motion` font color only — never a background pill).
 states:
-- ordinary: Left Ear shows the screen/thread title and project; Right Ear shows the waiting lamp (when other cards wait) and `NOR` (`INS` while typing or in live raw places).
-- page exception: `pinned`, `approve push` (in `attention`), `working`, `stopped by you`, or `stuck` appear in the Left Ear beside the title/project.
-- attention elsewhere: a steady `attention` dot `●` in the Right Ear before the mode; absent when nothing within active dealer focus waits.
-- host state: silent when all hosts are online; an `away` host shows calmly in `quiet` in the Right Ear (turning `lost connection` red only when a host is in `needs you` state or when an `away` host is required by the screen currently in view).
-- unpaired: a `quiet` notice in the Right Ear that verdicts stay on this device.
-- echo: the `Echo line` appears inside the framed Right Ear without disturbing the Left Ear's page title or the mode word.
+- ordinary: screen content owns the full canvas (including top-left beside the notch); the Top-Right Global Status Bar shows the waiting lamp (when other cards wait) and `NOR` (`INS` while typing or in live raw places).
+- attention elsewhere: a steady `attention` dot `●` in the Top-Right Global Status Bar before the mode; absent on `desk.Desk` or when nothing within active dealer focus waits.
+- host state: silent when all hosts are online; an `away` host shows calmly in `quiet` in the Top-Right Global Status Bar (turning `lost connection` red only when a host is in `needs you` state or when an `away` host is required by the screen currently in view).
+- unpaired: a `quiet` notice in the Top-Right Global Status Bar that verdicts stay on this device.
+- echo: the `Echo line` appears inside the framed Top-Right Global Status Bar without disturbing the screen's content or the mode word.
+- prompt open: the dim backdrop covers the entire screen content layer (including the screen's top-left title/header), leaving only the `104 ch` prompt panel, the center notch mask, and the Top-Right Global Status Bar bright.
 used on: `window.Screen`, including `desk.Desk`, `chat.Thread`, `agents.Transcript`, `browser.Page`, `notes.Notes`, and `usage.Chart`.
 captures: [dealt clock thread on the laptop](design/laptop-card.png); [short heading on the phone](design/phone-menu.png); [transcript with its host, folder and activity](design/laptop-agent.png).
 
